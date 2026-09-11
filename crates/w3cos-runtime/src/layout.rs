@@ -1809,6 +1809,7 @@ impl LayoutEngine {
 
         project_fixed_table_cell_rects(&mut results, root);
         project_forced_break_lines(&mut results, root);
+        project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
@@ -1934,6 +1935,7 @@ pub fn compute_with_scroll(
 
     project_fixed_table_cell_rects(&mut results, &layout_root);
     project_forced_break_lines(&mut results, root);
+    project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
@@ -2491,6 +2493,168 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         .copied()
         .map_or(0.0, |position| layouts[position].0.width);
     visit(root, 0, root_width, layouts, &layout_position);
+}
+
+fn project_leading_descendant_margin_groups(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let layout_position = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    let collapse = |margins: &[f32]| {
+        let positive = margins.iter().copied().fold(0.0_f32, f32::max);
+        let negative = margins.iter().copied().fold(0.0_f32, f32::min);
+        positive + negative
+    };
+    let resolve_margin = |spacing: WSpacing, style: &w3cos_std::style::Style, width: f32| {
+        resolve_spacing_for_layout(spacing, width, style.font_size, viewport_w, viewport_h)
+    };
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+        viewport_w: f32,
+        viewport_h: f32,
+        collapse: &impl Fn(&[f32]) -> f32,
+        resolve_margin: &impl Fn(WSpacing, &w3cos_std::style::Style, f32) -> f32,
+    ) {
+        let Some(parent_position) = layout_position.get(&component_index).copied() else {
+            return;
+        };
+        let containing_width = layouts[parent_position].0.width;
+        let mut children = Vec::new();
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            if !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && child.style.display != WDisplay::None
+                && child.style.float == WFloat::None
+            {
+                children.push((child_index, child));
+            }
+            child_index += count_nodes(child);
+        }
+
+        for pair in children.windows(2) {
+            let (_, previous) = pair[0];
+            let (current_index, current) = pair[1];
+            if current.style.display != WDisplay::Block
+                || current
+                    .style
+                    .border_top_width
+                    .unwrap_or(current.style.border_width)
+                    > 0.0
+                || current.style.padding_lengths().top.abs() > f32::EPSILON
+            {
+                continue;
+            }
+
+            let Some(current_position) = layout_position.get(&current_index).copied() else {
+                continue;
+            };
+            let current_width = layouts[current_position].0.width;
+            let mut descendant_margins = Vec::new();
+            let mut descendant_index = current_index + 1;
+            for descendant in &current.children {
+                let descendant_count = count_nodes(descendant);
+                if matches!(descendant.style.position, WPos::Absolute | WPos::Fixed)
+                    || descendant.style.display == WDisplay::None
+                    || descendant.style.float != WFloat::None
+                {
+                    descendant_index += descendant_count;
+                    continue;
+                }
+                descendant_margins.push(resolve_margin(
+                    descendant.style.margin.top,
+                    &descendant.style,
+                    current_width,
+                ));
+                let empty_collapsible = layout_position
+                    .get(&descendant_index)
+                    .is_some_and(|position| layouts[*position].0.height.abs() <= f32::EPSILON)
+                    && descendant.style.display == WDisplay::Block
+                    && matches!(descendant.style.height, WDim::Auto | WDim::Px(0.0))
+                    && descendant.style.padding_lengths().top.abs() <= f32::EPSILON
+                    && descendant.style.padding_lengths().bottom.abs() <= f32::EPSILON
+                    && descendant
+                        .style
+                        .border_top_width
+                        .unwrap_or(descendant.style.border_width)
+                        <= 0.0
+                    && descendant
+                        .style
+                        .border_bottom_width
+                        .unwrap_or(descendant.style.border_width)
+                        <= 0.0;
+                if empty_collapsible {
+                    descendant_margins.push(resolve_margin(
+                        descendant.style.margin.bottom,
+                        &descendant.style,
+                        current_width,
+                    ));
+                    descendant_index += descendant_count;
+                    continue;
+                }
+                break;
+            }
+            if descendant_margins.is_empty() {
+                continue;
+            }
+
+            let previous_bottom = resolve_margin(
+                previous.style.margin.bottom,
+                &previous.style,
+                containing_width,
+            );
+            let current_top =
+                resolve_margin(current.style.margin.top, &current.style, containing_width);
+            let mut full_group = vec![previous_bottom, current_top];
+            full_group.extend(descendant_margins);
+            let delta = collapse(&full_group) - collapse(&[previous_bottom, current_top]);
+            if delta.abs() <= f32::EPSILON {
+                continue;
+            }
+            let parent_end = component_index + count_nodes(component);
+            for index in current_index..parent_end {
+                if let Some(position) = layout_position.get(&index).copied() {
+                    layouts[position].0.y += delta;
+                }
+            }
+        }
+
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            visit(
+                child,
+                child_index,
+                layouts,
+                layout_position,
+                viewport_w,
+                viewport_h,
+                collapse,
+                resolve_margin,
+            );
+            child_index += count_nodes(child);
+        }
+    }
+
+    visit(
+        root,
+        0,
+        layouts,
+        &layout_position,
+        viewport_w,
+        viewport_h,
+        &collapse,
+        &resolve_margin,
+    );
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
@@ -8312,6 +8476,77 @@ mod tests {
         let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
         assert_eq!(float.y, 24.0);
         assert_eq!(following.y, 80.0);
+    }
+
+    #[test]
+    fn empty_leading_block_propagates_its_collapsed_margin_group_to_the_parent() {
+        let zero_edges = w3cos_std::style::Edges::ZERO;
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Flex,
+                        height: WDim::Px(19.2),
+                        margin: w3cos_std::style::Edges {
+                            bottom: WSpacing::Px(16.0),
+                            ..zero_edges
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(192.0),
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                position: WPos::Absolute,
+                                height: WDim::Px(3.0),
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                margin: w3cos_std::style::Edges {
+                                    bottom: WSpacing::Percent(50.0),
+                                    ..zero_edges
+                                },
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                height: WDim::Px(3.0),
+                                margin: w3cos_std::style::Edges {
+                                    top: WSpacing::Px(-96.0),
+                                    ..zero_edges
+                                },
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                    ],
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let paragraph = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let wrapper = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(wrapper.y, paragraph.y + paragraph.height);
     }
 
     #[test]
