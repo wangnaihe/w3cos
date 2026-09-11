@@ -1810,6 +1810,7 @@ impl LayoutEngine {
         project_fixed_table_cell_rects(&mut results, root);
         project_forced_break_lines(&mut results, root);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
+        project_inline_after_leading_empty_blocks(&mut results, root);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
@@ -1936,6 +1937,7 @@ pub fn compute_with_scroll(
     project_fixed_table_cell_rects(&mut results, &layout_root);
     project_forced_break_lines(&mut results, root);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
+    project_inline_after_leading_empty_blocks(&mut results, root);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
@@ -2657,6 +2659,102 @@ fn project_leading_descendant_margin_groups(
         &collapse,
         &resolve_margin,
     );
+}
+
+fn project_inline_after_leading_empty_blocks(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+) {
+    let layout_position = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+    ) {
+        let Some(parent_position) = layout_position.get(&component_index).copied() else {
+            return;
+        };
+        let mut children = Vec::new();
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            if !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && child.style.display != WDisplay::None
+                && child.style.float == WFloat::None
+            {
+                children.push((child_index, child));
+            }
+            child_index += count_nodes(child);
+        }
+
+        let leading_empty_count = children
+            .iter()
+            .take_while(|(index, child)| {
+                layout_position
+                    .get(index)
+                    .is_some_and(|position| layouts[*position].0.height.abs() <= f32::EPSILON)
+                    && child.style.display == WDisplay::Block
+                    && matches!(child.style.height, WDim::Auto | WDim::Px(0.0))
+                    && child.style.padding_lengths().top.abs() <= f32::EPSILON
+                    && child.style.padding_lengths().bottom.abs() <= f32::EPSILON
+                    && child
+                        .style
+                        .border_top_width
+                        .unwrap_or(child.style.border_width)
+                        <= 0.0
+                    && child
+                        .style
+                        .border_bottom_width
+                        .unwrap_or(child.style.border_width)
+                        <= 0.0
+            })
+            .count();
+        if leading_empty_count > 0
+            && let Some((first_content_index, first_content)) = children.get(leading_empty_count)
+            && matches!(
+                first_content.style.display,
+                WDisplay::Inline
+                    | WDisplay::InlineBlock
+                    | WDisplay::InlineFlex
+                    | WDisplay::InlineTable
+            )
+            && component.style.display == WDisplay::Block
+        {
+            let border_top = component
+                .style
+                .border_top_width
+                .unwrap_or(component.style.border_width);
+            let padding_top = component.style.padding_lengths().top;
+            if border_top <= 0.0
+                && padding_top.abs() <= f32::EPSILON
+                && let Some(content_position) = layout_position.get(first_content_index).copied()
+            {
+                let target_y = layouts[parent_position].0.y;
+                let delta = target_y - layouts[content_position].0.y;
+                if delta < -f32::EPSILON {
+                    let component_end = component_index + count_nodes(component);
+                    for index in *first_content_index..component_end {
+                        if let Some(position) = layout_position.get(&index).copied() {
+                            layouts[position].0.y += delta;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            visit(child, child_index, layouts, layout_position);
+            child_index += count_nodes(child);
+        }
+    }
+
+    visit(root, 0, layouts, &layout_position);
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
@@ -8650,6 +8748,41 @@ mod tests {
         let paragraph = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         let wrapper = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!(wrapper.y, paragraph.y + paragraph.height);
+    }
+
+    #[test]
+    fn leading_empty_block_does_not_offset_following_inline_content() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        margin: w3cos_std::style::Edges::all(50.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::text(
+                    "B",
+                    Style {
+                        display: WDisp::Inline,
+                        font_size: 50.0,
+                        line_height: 1.2,
+                        ..Style::default()
+                    },
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(text.y, root.y);
     }
 
     #[test]
