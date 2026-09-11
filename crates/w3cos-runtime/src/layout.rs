@@ -6219,13 +6219,16 @@ fn collect_layouts_fast(
                 && !matches!(info.style.position, WPos::Absolute | WPos::Fixed)
             {
                 let padding = info.style.padding_lengths();
+                let line_height = info.style.font_size * info.style.line_height;
+                let half_leading = (line_height - info.style.font_size) * 0.5;
                 passive_inline_top_edge = padding.top
                     + info
                         .style
                         .border_top_width
                         .unwrap_or(info.style.border_width);
-                rect.y -= passive_inline_top_edge;
-                rect.height += padding.top
+                rect.y += half_leading - passive_inline_top_edge;
+                rect.height = info.style.font_size
+                    + padding.top
                     + padding.bottom
                     + info
                         .style
@@ -11412,6 +11415,32 @@ mod tests {
             (padded_width - content_width - 16.0).abs() < 1.0,
             "normal inline padding should contribute once, got {content_width} -> {padded_width}"
         );
+    }
+
+    #[test]
+    fn normal_inline_vertical_edges_wrap_the_content_area_not_line_height() {
+        let inline = Component::text(
+            "X",
+            Style {
+                display: WDisp::Inline,
+                font_size: 100.0,
+                line_height: 1.5,
+                padding: w3cos_std::style::Edges::xy(0.0, 50.0),
+                ..Style::default()
+            },
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![inline],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+
+        assert_eq!(inline.height, 200.0);
     }
 
     #[test]
