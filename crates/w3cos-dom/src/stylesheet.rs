@@ -172,7 +172,7 @@ impl CompoundSelector {
             return false;
         }
         if let Some(tag) = &self.tag {
-            let actual_tag = if self.any_namespace {
+            let actual_tag = if self.any_namespace || !tag.contains(':') {
                 ctx.tag
                     .rsplit_once(':')
                     .map_or(ctx.tag.as_str(), |(_, local)| local)
@@ -2281,6 +2281,15 @@ mod tests {
             ctx("div", None, &["b"]),
         ];
         let hit = matching_declarations("span", None, &["c"], &ancestors);
+        assert_eq!(hit.len(), 1);
+    }
+
+    #[test]
+    fn unqualified_type_selector_matches_a_prefixed_elements_local_name() {
+        setup();
+        register_rule("svg", &[("height", "100px")]);
+
+        let hit = matching_declarations("svg:svg", None, &[], &[]);
         assert_eq!(hit.len(), 1);
     }
 
