@@ -8578,6 +8578,14 @@ fn hoist_floats_into_block_formatting_context(
             row_style.font_size = formatting_context_style.font_size;
             row_style.font_family = formatting_context_style.font_family.clone();
             row_style.line_height = formatting_context_style.line_height;
+            if force_formatting_context {
+                row_style.float = w3cos_std::style::Float::Left;
+                row_style.clear = left_floats
+                    .first()
+                    .map_or(w3cos_std::style::Clear::None, |component| {
+                        component.style.clear
+                    });
+            }
             grouped.push(w3cos_std::Component::row(
                 row_style,
                 std::mem::take(left_floats),
@@ -9421,6 +9429,8 @@ mod image_component_tests {
         assert_eq!(fixed.len(), 2);
         assert!(fixed.iter().all(|component| {
             component.style.display == Display::Flex
+                && component.style.float == Float::Left
+                && component.style.clear == w3cos_std::style::Clear::Left
                 && component.style.width == Dimension::Percent(100.0)
                 && matches!(component.children.as_slice(), [child] if child.style.float == Float::Left)
         }));
