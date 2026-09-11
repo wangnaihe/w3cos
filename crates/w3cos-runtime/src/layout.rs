@@ -4809,6 +4809,31 @@ fn build_taffy_tree(
             ),
         };
     }
+    if comp.style.display == WDisplay::Inline
+        && comp.children.is_empty()
+        && matches!(comp.kind, ComponentKind::Row | ComponentKind::Box)
+        && matches!(comp.style.width, WDim::Auto)
+        && comp.style.padding_lengths().left == 0.0
+        && comp.style.padding_lengths().right == 0.0
+        && comp
+            .style
+            .border_left_width
+            .unwrap_or(comp.style.border_width)
+            == 0.0
+        && comp
+            .style
+            .border_right_width
+            .unwrap_or(comp.style.border_width)
+            == 0.0
+    {
+        // An empty non-replaced inline with only block-axis decorations has
+        // zero inline advance. Taffy's block fallback otherwise stretches its
+        // auto width across the containing block and paints full-width top and
+        // bottom borders.
+        style.size.width = Dimension::length(0.0);
+        style.min_size.width = Dimension::length(0.0);
+        style.max_size.width = Dimension::length(0.0);
+    }
     // CSS resolves every percentage padding side against the containing
     // block's width. Taffy leaves vertical percentages unresolved when that
     // block has an indefinite height, so provide their pixel basis here.
