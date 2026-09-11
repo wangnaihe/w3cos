@@ -1200,6 +1200,34 @@ impl Document {
             }
         }
         let edge_ex_size = css_ex_size(&style);
+        let ex_dimension = |properties: &[&str]| {
+            declared_property_value(properties).and_then(|(_, value)| {
+                value
+                    .trim()
+                    .strip_suffix("ex")
+                    .and_then(|number| number.trim().parse::<f32>().ok())
+                    .filter(|number| number.is_finite() && *number >= 0.0)
+                    .map(|number| w3cos_std::style::Dimension::Px(number * edge_ex_size))
+            })
+        };
+        if let Some(value) = ex_dimension(&["width"]) {
+            style.width = value;
+        }
+        if let Some(value) = ex_dimension(&["height"]) {
+            style.height = value;
+        }
+        if let Some(value) = ex_dimension(&["min-width", "minWidth"]) {
+            style.min_width = value;
+        }
+        if let Some(value) = ex_dimension(&["min-height", "minHeight"]) {
+            style.min_height = value;
+        }
+        if let Some(value) = ex_dimension(&["max-width", "maxWidth"]) {
+            style.max_width = value;
+        }
+        if let Some(value) = ex_dimension(&["max-height", "maxHeight"]) {
+            style.max_height = value;
+        }
         let ex_edge_spacing = |shorthand: &str, longhand: &str, side: usize| {
             declared_property_value(&[shorthand, longhand]).and_then(|(property, value)| {
                 let value = if css_property_eq(property, shorthand) {
@@ -12137,6 +12165,33 @@ mod computed_style_cache_tests {
                 left: w3cos_std::style::Spacing::Px(16.0),
             }
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn ex_box_dimensions_use_the_computed_ahem_x_height() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[
+                ("font", "20px/1 Ahem"),
+                ("width", "2ex"),
+                ("height", "6ex"),
+                ("min-height", "+1ex"),
+                ("max-width", "3ex"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.width, w3cos_std::style::Dimension::Px(32.0));
+        assert_eq!(style.height, w3cos_std::style::Dimension::Px(96.0));
+        assert_eq!(style.min_height, w3cos_std::style::Dimension::Px(16.0));
+        assert_eq!(style.max_width, w3cos_std::style::Dimension::Px(48.0));
         crate::stylesheet::clear_rules();
     }
 
