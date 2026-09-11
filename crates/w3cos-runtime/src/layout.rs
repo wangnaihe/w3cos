@@ -1823,6 +1823,7 @@ impl LayoutEngine {
             &mut scroll_ancestor,
         );
 
+        project_rtl_fixed_block_alignment(&mut results, flat, viewport_w, viewport_h);
         project_empty_painted_inline_boxes(&mut results, flat);
         project_fixed_table_cell_rects(&mut results, root);
         project_forced_break_lines(&mut results, root);
@@ -1953,6 +1954,7 @@ pub fn compute_with_scroll(
         &mut scroll_ancestor,
     );
 
+    project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h);
     project_empty_painted_inline_boxes(&mut results, &flat);
     project_fixed_table_cell_rects(&mut results, &layout_root);
     project_forced_break_lines(&mut results, root);
@@ -2025,6 +2027,67 @@ fn project_empty_painted_inline_boxes(
             layouts[position].0.y = parent.y;
             layouts[position].0.height = parent.height;
         }
+    }
+}
+
+fn project_rtl_fixed_block_alignment(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for (index, node) in flat.iter().enumerate() {
+        if node.style.display != WDisplay::Block
+            || matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+            || matches!(node.style.width, WDim::Auto)
+            || matches!(node.style.margin.left, WSpacing::Auto)
+            || matches!(node.style.margin.right, WSpacing::Auto)
+        {
+            continue;
+        }
+        let Some(parent_index) = node.parent else {
+            continue;
+        };
+        let parent_node = &flat[parent_index];
+        if parent_node.style.direction != w3cos_std::style::TextDirection::Rtl
+            || parent_node.style.display != WDisplay::Block
+            || matches!(parent_node.style.width, WDim::Auto)
+        {
+            continue;
+        }
+        let (Some(position), Some(parent_position)) = (
+            positions.get(&index).copied(),
+            positions.get(&parent_index).copied(),
+        ) else {
+            continue;
+        };
+        let parent = layouts[parent_position].0;
+        let parent_padding = parent_node.style.padding_lengths();
+        let parent_content_right = parent.x + parent.width
+            - parent_padding.right
+            - parent_node
+                .style
+                .border_right_width
+                .unwrap_or(parent_node.style.border_width);
+        let containing_width = component_content_width(
+            parent_node.style,
+            parent.width,
+            viewport_w,
+            viewport_h,
+        );
+        let margin_right = resolve_spacing_for_layout(
+            node.style.margin.right,
+            containing_width,
+            node.style.font_size,
+            viewport_w,
+            viewport_h,
+        );
+        layouts[position].0.x = parent_content_right - margin_right - layouts[position].0.width;
     }
 }
 
@@ -10243,6 +10306,37 @@ mod tests {
         assert_eq!(inner.y, line.y);
         assert_eq!(outer.height, line.height);
         assert_eq!(inner.height, line.height);
+    }
+
+    #[test]
+    fn rtl_fixed_block_aligns_its_margin_box_to_the_content_right_edge() {
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(96.0),
+                    border_right_width: Some(5.0),
+                    direction: w3cos_std::style::TextDirection::Rtl,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(96.0),
+                        border_right_width: Some(5.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(parent.x + parent.width - 5.0, child.x + child.width);
     }
 
     #[test]
