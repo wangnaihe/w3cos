@@ -272,14 +272,18 @@ impl CSSStyleDeclaration {
                 }
             }
             "max-width" | "maxWidth" => {
-                if let Some(value) =
+                if value.trim().eq_ignore_ascii_case("none") {
+                    self.inner.max_width = Dimension::Auto;
+                } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.max_width = value;
                 }
             }
             "max-height" | "maxHeight" => {
-                if let Some(value) =
+                if value.trim().eq_ignore_ascii_case("none") {
+                    self.inner.max_height = Dimension::Auto;
+                } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.max_height = value;
@@ -3019,6 +3023,19 @@ mod tests {
         assert_eq!(declaration.get_property("width"), "10ch");
     }
 }
+#[test]
+fn max_size_none_overrides_an_earlier_constraint() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("max-width", "10px");
+    declaration.set_property("max-height", "20px");
+    declaration.set_property("max-width", "none");
+    declaration.set_property("max-height", "none");
+
+    let style = declaration.to_style();
+    assert_eq!(style.max_width, Dimension::Auto);
+    assert_eq!(style.max_height, Dimension::Auto);
+}
+
 #[test]
 fn inline_flex_round_trips_without_falling_back_to_block_flex() {
     let mut declaration = CSSStyleDeclaration::new();
