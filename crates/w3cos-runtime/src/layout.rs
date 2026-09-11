@@ -4474,6 +4474,17 @@ fn build_taffy_tree(
             .as_deref()
             .filter(|tracks| !tracks.is_empty())
             .or(inherited_table_tracks);
+        let float_only_auto_block = comp.style.display == WDisplay::Block
+            && matches!(comp.style.height, WDim::Auto)
+            && comp
+                .children
+                .iter()
+                .any(|child| child.style.float != WFloat::None)
+            && comp.children.iter().all(|child| {
+                child.style.display == WDisplay::None
+                    || matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                    || child.style.float != WFloat::None
+            });
         let mut next_table_column = 0;
         let child_table_columns = comp
             .children
@@ -4520,6 +4531,15 @@ fn build_taffy_tree(
                         ) && !matches!(comp.style.height, WDim::Auto),
                         active_border_spacing,
                     )?;
+                    if float_only_auto_block && c.style.float != WFloat::None {
+                        // Floats do not contribute to their ordinary block
+                        // parent's auto height. Treat the Taffy fallback as
+                        // out-of-flow here; the float projection retains its
+                        // static position and margin box after layout.
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.position = Position::Absolute;
+                        tree.set_style(node, child_style)?;
+                    }
                     if c.style.display == WDisplay::TableCaption
                         && matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
                     {
@@ -9017,6 +9037,73 @@ mod tests {
             .0;
         assert_eq!(direct_content.y, 50.0);
         assert_eq!(nested_content.y, 50.0);
+    }
+
+    #[test]
+    fn float_only_auto_block_collapses_through_adjacent_margins() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(50.0),
+                        height: WDim::Px(50.0),
+                        margin: w3cos_std::style::Edges {
+                            bottom: WSpacing::Px(50.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        position: WPos::Relative,
+                        margin: w3cos_std::style::Edges {
+                            top: WSpacing::Px(100.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            float: WFloat::Left,
+                            width: WDim::Px(50.0),
+                            height: WDim::Px(50.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(50.0),
+                        height: WDim::Px(50.0),
+                        margin: w3cos_std::style::Edges {
+                            top: WSpacing::Px(150.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let collapsed = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let floating = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        let following = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
+        assert_eq!(collapsed.height, 0.0);
+        assert_eq!(floating.y, collapsed.y);
+        assert_eq!(following.y, 200.0);
     }
 
     #[test]
