@@ -4652,6 +4652,44 @@ impl Document {
                     }
                 }
 
+                if block_in_inline {
+                    children = children
+                        .into_iter()
+                        .flat_map(|mut child| {
+                            let passive_split_fragment = child
+                                .style
+                                .custom_properties
+                                .as_ref()
+                                .is_some_and(|properties| {
+                                    properties.contains_key(
+                                        "--w3cos-internal-split-inline-fragment",
+                                    )
+                                });
+                            if passive_split_fragment {
+                                let mut fragment_children = std::mem::take(&mut child.children);
+                                for fragment_child in &mut fragment_children {
+                                    if matches!(
+                                        fragment_child.kind,
+                                        w3cos_std::ComponentKind::Text { .. }
+                                    ) && fragment_child.style.width
+                                        == w3cos_std::style::Dimension::Percent(100.0)
+                                        && fragment_child.style.min_width
+                                            == w3cos_std::style::Dimension::Px(0.0)
+                                    {
+                                        fragment_child.style.width =
+                                            w3cos_std::style::Dimension::Auto;
+                                        fragment_child.style.min_width =
+                                            w3cos_std::style::Dimension::Auto;
+                                    }
+                                }
+                                fragment_children
+                            } else {
+                                vec![child]
+                            }
+                        })
+                        .collect();
+                }
+
                 if block_in_inline
                     && !self.events.has_listeners(id)
                     && children.len() >= 2
