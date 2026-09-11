@@ -1827,6 +1827,7 @@ impl LayoutEngine {
         project_forced_break_lines(&mut results, root);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_inline_after_leading_empty_blocks(&mut results, root);
+        project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
         project_simple_float_margin_boxes(&mut results, root);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
@@ -1955,6 +1956,7 @@ pub fn compute_with_scroll(
     project_forced_break_lines(&mut results, root);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_inline_after_leading_empty_blocks(&mut results, root);
+    project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
     project_simple_float_margin_boxes(&mut results, root);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
@@ -2849,6 +2851,146 @@ fn project_inline_after_leading_empty_blocks(
     }
 
     visit(root, 0, layouts, &layout_position);
+}
+
+fn project_min_height_trailing_margin_containment(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let layout_position = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn collapse(left: f32, right: f32) -> f32 {
+        left.max(right).max(0.0) + left.min(right).min(0.0)
+    }
+
+    fn shift_range(
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+        start: usize,
+        end: usize,
+        delta_y: f32,
+    ) {
+        for index in start..end {
+            if let Some(position) = layout_position.get(&index).copied() {
+                layouts[position].0.y += delta_y;
+            }
+        }
+    }
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) {
+        let Some(component_position) = layout_position.get(&component_index).copied() else {
+            return;
+        };
+        let containing_height = layouts[component_position].0.height;
+        let component_end = component_index + count_nodes(component);
+        let mut children = Vec::new();
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            if !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && child.style.display != WDisplay::None
+                && child.style.float == WFloat::None
+            {
+                children.push((child_index, child));
+            }
+            child_index += count_nodes(child);
+        }
+
+        for pair in children.windows(2) {
+            let (previous_index, previous) = pair[0];
+            let (following_index, following) = pair[1];
+            if previous.style.display != WDisplay::Block
+                || !matches!(previous.style.height, WDim::Auto)
+                || matches!(previous.style.min_height, WDim::Auto)
+                || previous.style.padding_lengths().bottom.abs() > f32::EPSILON
+                || previous
+                    .style
+                    .border_bottom_width
+                    .unwrap_or(previous.style.border_width)
+                    > 0.0
+            {
+                continue;
+            }
+            let Some(last_child) = previous.children.iter().rev().find(|child| {
+                !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                    && child.style.display != WDisplay::None
+                    && child.style.float == WFloat::None
+            }) else {
+                continue;
+            };
+            let previous_position = *layout_position
+                .get(&previous_index)
+                .expect("in-flow child layout");
+            let trailing_margin = resolve_spacing_for_layout(
+                last_child.style.margin.bottom,
+                layouts[previous_position].0.width,
+                last_child.style.font_size,
+                viewport_w,
+                viewport_h,
+            );
+            if trailing_margin <= 0.01 {
+                continue;
+            }
+            let Some(min_height) = previous.style.min_height.resolve(
+                containing_height,
+                ROOT_FONT_SIZE,
+                previous.style.font_size,
+                viewport_w,
+                viewport_h,
+            ) else {
+                continue;
+            };
+            let Some(following_position) = layout_position.get(&following_index).copied() else {
+                continue;
+            };
+            let previous_rect = layouts[previous_position].0;
+            if previous_rect.height > min_height + 0.01 {
+                continue;
+            }
+            let previous_margin = previous.style.margin_lengths();
+            let following_margin = following.style.margin_lengths();
+            let expected_y = previous_rect.y
+                + previous_rect.height
+                + collapse(previous_margin.bottom, following_margin.top);
+            let excess = layouts[following_position].0.y - expected_y;
+            if excess > 0.01 {
+                shift_range(
+                    layouts,
+                    layout_position,
+                    following_index,
+                    component_end,
+                    -excess.min(trailing_margin),
+                );
+            }
+        }
+
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            visit(
+                child,
+                child_index,
+                layouts,
+                layout_position,
+                viewport_w,
+                viewport_h,
+            );
+            child_index += count_nodes(child);
+        }
+    }
+
+    visit(root, 0, layouts, &layout_position, viewport_w, viewport_h);
 }
 
 fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: &Component) {
@@ -9090,6 +9232,52 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!(first.y, 16.0);
         assert_eq!(second.y, 122.0);
+    }
+
+    #[test]
+    fn min_height_contains_the_last_childs_collapsed_bottom_margin() {
+        let zero_edges = w3cos_std::style::Edges::ZERO;
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                border_top_width: Some(1.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        min_height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            margin: w3cos_std::style::Edges {
+                                bottom: WSpacing::Px(50.0),
+                                ..zero_edges
+                            },
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let parent = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(parent.height, 50.0);
+        assert_eq!(following.y, parent.y + parent.height);
     }
 
     #[test]
