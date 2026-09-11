@@ -6335,6 +6335,7 @@ fn collect_layouts_fast(
         height: layout.size.height,
     };
     let mut passive_inline_top_edge = 0.0;
+    let mut passive_inline_half_leading = 0.0;
 
     let mut new_scroll_container = current_scroll_container;
     let mut descendant_containing_block = absolute_containing_block;
@@ -6367,6 +6368,7 @@ fn collect_layouts_fast(
                 let padding = info.style.padding_lengths();
                 let line_height = info.style.font_size * info.style.line_height;
                 let half_leading = (line_height - info.style.font_size) * 0.5;
+                passive_inline_half_leading = half_leading;
                 passive_inline_top_edge = padding.top
                     + info
                         .style
@@ -6532,7 +6534,7 @@ fn collect_layouts_fast(
             tree,
             child,
             rect.x,
-            rect.y + passive_inline_top_edge,
+            rect.y + passive_inline_top_edge - passive_inline_half_leading,
             viewport_w,
             viewport_h,
             descendant_containing_block,
@@ -11841,6 +11843,45 @@ mod tests {
         assert_eq!(inline.y, parent.y);
         assert_eq!(text.y, inline.y + 20.0);
         assert_eq!(inline.height, 40.0);
+    }
+
+    #[test]
+    fn nested_inline_content_applies_half_leading_once() {
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(200.0),
+                    font_size: 20.0,
+                    line_height: 1.2,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::Inline,
+                        font_size: 20.0,
+                        line_height: 1.2,
+                        ..Style::default()
+                    },
+                    vec![Component::text(
+                        "text",
+                        Style {
+                            display: WDisp::Inline,
+                            font_size: 20.0,
+                            line_height: 1.2,
+                            ..Style::default()
+                        },
+                    )],
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(text.y, inline.y);
     }
 
     #[test]
