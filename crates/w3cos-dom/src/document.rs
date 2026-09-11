@@ -1369,6 +1369,43 @@ impl Document {
                     _ => {}
                 }
             }
+            let inherited_margin_edges = [
+                parent.margin.top,
+                parent.margin.right,
+                parent.margin.bottom,
+                parent.margin.left,
+            ];
+            let mut margin_edges = [
+                style.margin.top,
+                style.margin.right,
+                style.margin.bottom,
+                style.margin.left,
+            ];
+            for (side, properties) in [
+                ["margin", "margin-top", "marginTop"],
+                ["margin", "margin-right", "marginRight"],
+                ["margin", "margin-bottom", "marginBottom"],
+                ["margin", "margin-left", "marginLeft"],
+            ]
+            .iter()
+            .enumerate()
+            {
+                if let Some((_, value)) = declared_property_value(properties) {
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "inherit" => margin_edges[side] = inherited_margin_edges[side],
+                        "initial" | "unset" | "revert" | "revert-layer" => {
+                            margin_edges[side] = w3cos_std::style::Spacing::Px(0.0)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            style.margin = w3cos_std::style::Edges {
+                top: margin_edges[0],
+                right: margin_edges[1],
+                bottom: margin_edges[2],
+                left: margin_edges[3],
+            };
             if declared_property_value(&["direction"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
@@ -11285,6 +11322,27 @@ mod computed_style_cache_tests {
         assert_eq!(child_style.border_width, parent_style.border_width);
         assert_eq!(child_style.border_top_width, parent_style.border_top_width);
         assert_eq!(child_style.border_color, parent_style.border_color);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn margin_shorthand_inherit_copies_all_parent_edges() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("margin", "96px 24px 192px 48px")]);
+        crate::stylesheet::register_rule("#child", &[("margin", "inherit")]);
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(
+            document.computed_style_for(child.id).margin,
+            document.computed_style_for(parent.id).margin
+        );
         crate::stylesheet::clear_rules();
     }
 
