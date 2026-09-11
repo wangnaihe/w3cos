@@ -4638,7 +4638,13 @@ fn build_taffy_tree(
         style.size.height = Dimension::length(height);
     }
     let child_quirks_height_basis = own_quirks_height_basis.or(quirks_height_basis);
-    let passive_inline_edges = matches!(
+    let marked_replaced_element = comp
+        .style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key("--w3cos-internal-replaced-element"));
+    let passive_inline_edges = !marked_replaced_element
+        && matches!(
         comp.kind,
         ComponentKind::Row
             | ComponentKind::Column
@@ -5347,6 +5353,22 @@ fn build_taffy_tree(
         // Absolutely positioned inline boxes are blockified for their used
         // box. Preserve authored dimensions even though the semantic display
         // remains inline for hypothetical static-position calculations.
+        style.size = Size {
+            width: to_taffy_dim(
+                comp.style.width,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+            height: to_taffy_dim(
+                comp.style.height,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+        };
+    }
+    if marked_replaced_element && comp.style.display == WDisplay::Inline {
         style.size = Size {
             width: to_taffy_dim(
                 comp.style.width,
@@ -6208,7 +6230,15 @@ fn collect_layouts_fast(
             }
             let info = &flat[ctx];
 
-            if matches!(
+            let marked_replaced_element = info
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-replaced-element")
+                });
+            if !marked_replaced_element
+                && matches!(
                 info.kind,
                 ComponentKind::Row
                     | ComponentKind::Column

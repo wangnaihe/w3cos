@@ -5317,6 +5317,13 @@ impl Document {
                         {
                             style.height = w3cos_std::style::Dimension::Px(150.0);
                         }
+                        style
+                            .custom_properties
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                "--w3cos-internal-replaced-element".to_string(),
+                                "1".to_string(),
+                            );
                         w3cos_std::Component::boxed(style, vec![])
                     }
                     "svg" | "g" | "defs" => w3cos_std::Component::boxed(style, children),
@@ -9673,6 +9680,9 @@ mod image_component_tests {
         let automatic = &tree.children[0];
         assert_eq!(automatic.style.width, Dimension::Px(300.0));
         assert_eq!(automatic.style.height, Dimension::Px(150.0));
+        assert!(automatic.style.custom_properties.as_ref().is_some_and(
+            |properties| properties.contains_key("--w3cos-internal-replaced-element")
+        ));
         assert!(automatic.children.is_empty());
         let percentage = &tree.children[1].children[0];
         assert_eq!(percentage.style.width, Dimension::Px(300.0));
