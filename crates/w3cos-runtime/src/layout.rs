@@ -1834,6 +1834,7 @@ impl LayoutEngine {
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
+        project_table_cell_inline_vertical_padding(&mut results, flat);
         align_empty_inline_table_baselines(&mut results, flat);
 
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
@@ -1965,6 +1966,7 @@ pub fn compute_with_scroll(
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
+    project_table_cell_inline_vertical_padding(&mut results, &flat);
     align_empty_inline_table_baselines(&mut results, &flat);
 
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
@@ -2093,6 +2095,68 @@ fn project_rtl_fixed_block_alignment(
             viewport_h,
         );
         layouts[position].0.x = parent_content_right - margin_right - layouts[position].0.width;
+    }
+}
+
+fn project_table_cell_inline_vertical_padding(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    fn descendant_of(flat: &[FlatNodeInfo<'_>], mut index: usize, ancestor: usize) -> bool {
+        while let Some(parent) = flat[index].parent {
+            if parent == ancestor {
+                return true;
+            }
+            index = parent;
+        }
+        false
+    }
+
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for (index, node) in flat.iter().enumerate() {
+        let Some(parent_index) = node.parent else {
+            continue;
+        };
+        let padding = node.style.padding_lengths();
+        if node.style.display != WDisplay::Inline
+            || flat[parent_index].style.display != WDisplay::TableCell
+            || (padding.top.abs() <= f32::EPSILON && padding.bottom.abs() <= f32::EPSILON)
+        {
+            continue;
+        }
+        let (Some(position), Some(parent_position)) = (
+            positions.get(&index).copied(),
+            positions.get(&parent_index).copied(),
+        ) else {
+            continue;
+        };
+        let parent = layouts[parent_position].0;
+        let parent_padding = flat[parent_index].style.padding_lengths();
+        let target_content_top = parent.y
+            + flat[parent_index]
+                .style
+                .border_top_width
+                .unwrap_or(flat[parent_index].style.border_width)
+            + parent_padding.top;
+        let current_content_top = layouts[position].0.y
+            + node
+                .style
+                .border_top_width
+                .unwrap_or(node.style.border_width)
+            + padding.top;
+        let delta = target_content_top - current_content_top;
+        if delta.abs() <= f32::EPSILON {
+            continue;
+        }
+        for (rect, candidate) in layouts.iter_mut() {
+            if *candidate == index || descendant_of(flat, *candidate, index) {
+                rect.y += delta;
+            }
+        }
     }
 }
 
@@ -10428,6 +10492,63 @@ mod tests {
         assert_eq!(inline.y, parent.y);
         assert_eq!(text.y, inline.y + 20.0);
         assert_eq!(inline.height, 40.0);
+    }
+
+    #[test]
+    fn table_cell_inline_padding_does_not_move_the_content_line() {
+        let root = Component::row(
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::Inline,
+                    padding: w3cos_std::style::Edges {
+                        top: WSpacing::Px(160.0),
+                        ..w3cos_std::style::Edges::ZERO
+                    },
+                    ..Style::default()
+                },
+                vec![Component::text("control", Style::default())],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        let mut layout = vec![
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 192.0,
+                    width: 200.0,
+                    height: 16.0,
+                },
+                0,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 112.0,
+                    width: 200.0,
+                    height: 176.0,
+                },
+                1,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 272.0,
+                    width: 200.0,
+                    height: 16.0,
+                },
+                2,
+            ),
+        ];
+        project_table_cell_inline_vertical_padding(&mut layout, &flat);
+
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(inline.y, 32.0);
+        assert_eq!(text.y, 192.0);
     }
 
     #[test]
