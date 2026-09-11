@@ -1178,6 +1178,58 @@ fn shrink_to_fit_used_width(component: &Component) -> f32 {
     }
 }
 
+fn component_min_content_width(component: &Component) -> f32 {
+    if !matches!(component.style.width, WDim::Auto | WDim::Percent(_)) {
+        return component_max_content_width(component);
+    }
+    let content_width = if component.children.is_empty() {
+        match &component.kind {
+            ComponentKind::Text { content }
+                if matches!(
+                    component.style.white_space,
+                    WWhiteSpace::Normal | WWhiteSpace::PreLine
+                ) =>
+            {
+                content
+                    .split([' ', '\t', '\n', '\r'])
+                    .filter(|word| !word.is_empty())
+                    .map(|word| text_intrinsic_size(word, &component.style).0)
+                    .fold(0.0_f32, f32::max)
+            }
+            _ => leaf_intrinsic_size(&component.kind, &component.style).0,
+        }
+    } else {
+        component
+            .children
+            .iter()
+            .filter(|child| !matches!(child.style.position, WPos::Absolute | WPos::Fixed))
+            .map(component_min_content_width)
+            .fold(0.0_f32, f32::max)
+    };
+    let padding = component.style.padding_lengths();
+    let margin = component.style.margin_lengths();
+    content_width
+        + padding.left
+        + padding.right
+        + component
+            .style
+            .border_left_width
+            .unwrap_or(component.style.border_width)
+        + component
+            .style
+            .border_right_width
+            .unwrap_or(component.style.border_width)
+        + margin.left
+        + margin.right
+}
+
+fn shrink_to_fit_used_width_with_available(component: &Component, available_width: f32) -> f32 {
+    let preferred_width = shrink_to_fit_used_width(component);
+    component_min_content_width(component)
+        .max(available_width.max(0.0))
+        .min(preferred_width)
+}
+
 fn dim_to_px(dim: WDim) -> Option<f32> {
     match dim {
         WDim::Px(v) => Some(v),
@@ -4030,9 +4082,21 @@ fn align_inline_block_last_line_baselines(
                     && matches!(child.kind, ComponentKind::Text { .. })
             })
             .filter_map(|(child, index)| {
-                positions
-                    .get(index)
-                    .map(|position| layouts[*position].0.y + child.style.font_size * 0.8)
+                let position = positions.get(index)?;
+                let text_rect = layouts[*position].0;
+                let shares_inline_line = children.iter().any(|(candidate, candidate_index)| {
+                    if candidate.style.display != WDisplay::InlineBlock {
+                        return false;
+                    }
+                    let Some(candidate_position) = positions.get(candidate_index) else {
+                        return false;
+                    };
+                    let candidate_rect = layouts[*candidate_position].0;
+                    text_rect.x + text_rect.width <= candidate_rect.x + f32::EPSILON
+                        || text_rect.x >= candidate_rect.x + candidate_rect.width - f32::EPSILON
+                });
+                shares_inline_line
+                    .then_some(text_rect.y + child.style.font_size * 0.8)
             })
             .reduce(f32::max);
         let Some(reference_baseline) = reference_baseline else {
@@ -5739,6 +5803,18 @@ fn build_taffy_tree(
                         child_style.min_size.height = Dimension::length(0.0);
                         tree.set_style(node, child_style)?;
                     }
+                    if comp.style.display == WDisplay::InlineBlock
+                        && matches!(comp.style.width, WDim::Auto)
+                        && c.style.display == WDisplay::Inline
+                        && matches!(c.style.width, WDim::Auto)
+                        && matches!(c.kind, ComponentKind::Text { .. })
+                    {
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.size.width = Dimension::percent(1.0);
+                        child_style.min_size.width = Dimension::length(0.0);
+                        child_style.flex_shrink = 1.0;
+                        tree.set_style(node, child_style)?;
+                    }
                     if mixed_inline_block_flex_fallback
                         && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
                         && matches!(
@@ -5946,7 +6022,10 @@ fn build_taffy_tree(
                         WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
                     )))
         {
-            style.size.width = Dimension::length(shrink_to_fit_used_width(comp));
+            style.size.width = Dimension::length(shrink_to_fit_used_width_with_available(
+                comp,
+                containing_width,
+            ));
             // `shrink_to_fit_used_width` returns the principal border box.
             // Keep padding, borders, and table outer border spacing inside the
             // resolved width instead of adding them a second time.
@@ -8949,6 +9028,7 @@ mod tests {
                 "overflowing text",
                 Style {
                     display: WDisp::Inline,
+                    width: WDim::Percent(100.0),
                     ..Style::default()
                 },
             )],
@@ -12945,6 +13025,83 @@ mod tests {
         );
 
         assert_eq!(shrink_to_fit_used_width(&inline_block), 96.0);
+    }
+
+    #[test]
+    fn auto_width_inline_block_shrink_fits_to_available_width() {
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "several short words that exceed the available width",
+                Style {
+                    display: WDisp::Inline,
+                    ..Style::default()
+                },
+            )],
+        );
+
+        assert_eq!(
+            shrink_to_fit_used_width_with_available(&inline_block, 160.0),
+            160.0
+        );
+    }
+
+    #[test]
+    fn auto_width_inline_block_preserves_an_overwide_min_content_child() {
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(320.0),
+                    ..Style::default()
+                },
+                vec![],
+            )],
+        );
+
+        assert_eq!(
+            shrink_to_fit_used_width_with_available(&inline_block, 160.0),
+            320.0
+        );
+    }
+
+    #[test]
+    fn auto_width_inline_block_wraps_inline_text_to_its_used_width() {
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "several short words that exceed the available width",
+                Style {
+                    display: WDisp::Inline,
+                    ..Style::default()
+                },
+            )],
+        );
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(160.0),
+                ..Style::default()
+            },
+            vec![inline_block],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let inline_block = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(inline_block.width, 160.0);
+        assert_eq!(text.width, inline_block.width);
+        assert!(text.height > 19.2);
     }
 
     #[test]
