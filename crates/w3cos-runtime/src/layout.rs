@@ -5506,8 +5506,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         | WDisplay::TableRow
         | WDisplay::TableRowGroup
         | WDisplay::TableHeaderGroup
-        | WDisplay::TableFooterGroup
-        | WDisplay::TableCell => (
+        | WDisplay::TableFooterGroup => (
             taffy::Display::Flex,
             s.flex_grow,
             s.flex_shrink,
@@ -5519,7 +5518,8 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         WDisplay::TableColumnGroup
         | WDisplay::TableColumn
         | WDisplay::TableCaption
-        | WDisplay::ListItem => (
+        | WDisplay::ListItem
+        | WDisplay::TableCell => (
             taffy::Display::Block,
             s.flex_grow,
             s.flex_shrink,
@@ -10517,6 +10517,40 @@ mod tests {
         );
 
         assert_eq!(component_max_content_width(&cell), 100.0);
+    }
+
+    #[test]
+    fn table_cell_collapses_adjacent_block_margins() {
+        let child = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(50.0),
+                    height: WDim::Px(50.0),
+                    margin: w3cos_std::style::Edges {
+                        top: WSpacing::Px(50.0),
+                        right: WSpacing::Px(0.0),
+                        bottom: WSpacing::Px(50.0),
+                        left: WSpacing::Px(0.0),
+                    },
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        };
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+            vec![child(), child()],
+        );
+
+        let layout = compute(&cell, 800.0, 600.0).unwrap();
+        let cell = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!((cell.height, first.y, second.y), (250.0, 50.0, 150.0));
     }
 
     #[test]
