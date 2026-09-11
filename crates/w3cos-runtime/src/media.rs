@@ -150,8 +150,8 @@ fn parse_media_expression(query: &str) -> Option<MediaCondition> {
         .into_iter()
         .map(str::trim)
         .filter(|part| !part.is_empty())
-        .map(parse_media_alternative)
-        .collect::<Option<Vec<_>>>()?;
+        .map(|part| parse_media_alternative(part).unwrap_or(MediaCondition::Never))
+        .collect::<Vec<_>>();
     match alternatives.as_slice() {
         [] => None,
         [condition] => Some(condition.clone()),
@@ -192,7 +192,7 @@ fn parse_media_term(term: &str) -> Option<MediaCondition> {
     if let Some(clean) = strip_outer_parentheses(term) {
         return parse_single_condition(clean).or_else(|| parse_media_expression(clean));
     }
-    parse_single_condition(term.trim())
+    parse_single_condition(term.trim()).or(Some(MediaCondition::Never))
 }
 
 fn strip_outer_parentheses(query: &str) -> Option<&str> {
@@ -424,6 +424,18 @@ mod tests {
         ));
         assert!(matches_media(
             &parse_media_query("only screen").unwrap(),
+            &desktop()
+        ));
+        assert!(matches_media(
+            &parse_media_query("foo, bar, screen").unwrap(),
+            &desktop()
+        ));
+        assert!(!matches_media(
+            &parse_media_query("foo, bar").unwrap(),
+            &desktop()
+        ));
+        assert!(matches_media(
+            &parse_media_query("not foo").unwrap(),
             &desktop()
         ));
     }
