@@ -922,7 +922,7 @@ fn render_node(
             ..
         } => {
             if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
-                draw_decoded_image(canvas, rect, &raster, style.opacity, true);
+                draw_decoded_image(canvas, rect, &raster, style.opacity, false);
             }
         }
         ComponentKind::Root

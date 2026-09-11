@@ -3165,7 +3165,10 @@ impl Document {
     ) -> w3cos_std::Component {
         let node = self.get_node(id);
         let mut style = self.computed_style(id, ancestors, inherited);
-        let tag = node.tag.as_str();
+        let qualified_tag = node.tag.as_str();
+        let tag = qualified_tag
+            .rsplit_once(':')
+            .map_or_else(|| qualified_tag.clone(), |(_, local_name)| local_name.to_string());
         if style.text_transform != w3cos_std::style::TextTransform::None {
             let mut language_node = Some(id);
             while let Some(language_id) = language_node {
@@ -5536,6 +5539,14 @@ impl Document {
         if !has_namespace {
             source.insert_str("<svg".len(), " xmlns=\"http://www.w3.org/2000/svg\"");
         }
+        if !node
+            .attributes
+            .iter()
+            .any(|(name, _)| name.as_str().eq_ignore_ascii_case("width"))
+        {
+            let (width, _) = self.svg_root_size(id);
+            source.insert_str("<svg".len(), &format!(" width=\"{width}\""));
+        }
         (source, event_targets)
     }
 
@@ -5578,7 +5589,10 @@ impl Document {
                 out.push_str("-->");
             }
             NodeType::Element => {
-                let tag = node.tag.as_str();
+                let qualified_tag = node.tag.as_str();
+                let tag = qualified_tag
+                    .rsplit_once(':')
+                    .map_or_else(|| qualified_tag.clone(), |(_, local_name)| local_name.to_string());
                 let in_defs = in_defs || tag == "defs";
                 let author_id = node
                     .attributes
@@ -5854,10 +5868,24 @@ impl Document {
                 let (width, height) = self.svg_root_size(id);
                 style.position = Position::Relative;
                 if matches!(style.width, Dimension::Auto) {
-                    style.width = Dimension::Px(width);
+                    let attribute_width = self
+                        .svg_attribute(id, "width")
+                        .and_then(|value| parse_html_dimension_attribute(&value));
+                    style.width = attribute_width.unwrap_or(Dimension::Px(width));
+                    if attribute_width.is_none() {
+                        if matches!(style.margin.left, w3cos_std::style::Spacing::Auto) {
+                            style.margin.left = w3cos_std::style::Spacing::Px(0.0);
+                        }
+                        if matches!(style.margin.right, w3cos_std::style::Spacing::Auto) {
+                            style.margin.right = w3cos_std::style::Spacing::Px(0.0);
+                        }
+                    }
                 }
                 if matches!(style.height, Dimension::Auto) {
-                    style.height = Dimension::Px(height);
+                    style.height = self
+                        .svg_attribute(id, "height")
+                        .and_then(|value| parse_html_dimension_attribute(&value))
+                        .unwrap_or(Dimension::Px(height));
                 }
             }
             "g" | "defs" => {
@@ -9429,7 +9457,9 @@ mod generated_counter_format_tests {
 mod image_component_tests {
     use super::*;
     use w3cos_std::component::ComponentKind;
-    use w3cos_std::style::{AlignSelf, Dimension, Display, FlexWrap, Float, Position};
+    use w3cos_std::style::{
+        AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing,
+    };
 
     #[test]
     fn image_width_and_height_attributes_become_layout_hints() {
@@ -9491,6 +9521,32 @@ mod image_component_tests {
         assert!(percentage.children.is_empty());
 
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn prefixed_svg_root_uses_replaced_dimensions_and_local_element_names() {
+        let mut document = Document::new();
+        let svg = document.create_element("svg:svg");
+        svg.set_attribute(&mut document, "height", "50%");
+        let rect = document.create_element("svg:rect");
+        rect.set_attribute(&mut document, "width", "200");
+        rect.set_attribute(&mut document, "height", "100");
+        svg.append_child(&mut document, rect);
+        document.body().append_child(&mut document, svg);
+
+        let tree = document.to_component_tree();
+        let svg = tree.children.first().expect("svg component");
+        let ComponentKind::SvgDocument { source, .. } = &svg.kind else {
+            panic!("prefixed SVG root did not lower as replaced content");
+        };
+        assert_eq!(svg.style.width, Dimension::Px(300.0));
+        assert_eq!(svg.style.height, Dimension::Percent(50.0));
+        assert_eq!(svg.style.margin.left, Spacing::Px(0.0));
+        assert_eq!(svg.style.margin.right, Spacing::Px(0.0));
+        assert!(source.starts_with("<svg "));
+        assert!(source.contains("<rect "));
+        assert!(!source.contains("svg:svg"));
+        assert!(!source.contains("svg:rect"));
     }
 
     #[test]
