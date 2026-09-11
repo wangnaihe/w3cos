@@ -5041,7 +5041,7 @@ fn inline_absolute_static_rect(
     if !has_meaningful_inline_predecessor {
         if matches!(parent_style.display, WDisplay::Block) && !has_in_flow_predecessor {
             rect.x = containing_block.x;
-            rect.y = containing_block.y;
+            rect.y = containing_block.y + style.margin_lengths().top;
             return Some(rect);
         }
         if !matches!(parent_style.display, WDisplay::Block) {
@@ -7045,6 +7045,37 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!(layout[2].0.x - layout[0].0.x - 1.0, expected_x);
         assert_eq!(layout[2].0.y - layout[0].0.y - 1.0, 0.0);
+    }
+
+    #[test]
+    fn auto_inset_absolute_block_keeps_its_own_top_margin() {
+        let absolute = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Absolute,
+                width: WDim::Px(100.0),
+                height: WDim::Px(40.0),
+                margin: w3cos_std::style::Edges {
+                    top: WSpacing::Px(40.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                width: WDim::Px(100.0),
+                height: WDim::Px(80.0),
+                ..Style::default()
+            },
+            vec![absolute],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[1].0.y, 40.0);
     }
 
     #[test]
