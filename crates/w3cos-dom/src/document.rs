@@ -1200,6 +1200,35 @@ impl Document {
             }
         }
         let edge_ex_size = css_ex_size(&style);
+        let inherited_box_dimension = |value, parent: &w3cos_std::style::Style| match value {
+            w3cos_std::style::Dimension::Em(value) => {
+                w3cos_std::style::Dimension::Px(value * parent.font_size)
+            }
+            w3cos_std::style::Dimension::Rem(value) => {
+                w3cos_std::style::Dimension::Px(value * 16.0)
+            }
+            other => other,
+        };
+        if let Some(parent) = inherited {
+            for (property, target, parent_value) in [
+                ("width", &mut style.width, parent.width),
+                ("height", &mut style.height, parent.height),
+                ("min-width", &mut style.min_width, parent.min_width),
+                ("min-height", &mut style.min_height, parent.min_height),
+                ("max-width", &mut style.max_width, parent.max_width),
+                ("max-height", &mut style.max_height, parent.max_height),
+            ] {
+                if let Some(value) = declared_value(&[property]) {
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "inherit" => *target = inherited_box_dimension(parent_value, parent),
+                        "initial" | "unset" | "revert" | "revert-layer" => {
+                            *target = w3cos_std::style::Dimension::Auto;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let ex_dimension = |properties: &[&str]| {
             declared_property_value(properties).and_then(|(_, value)| {
                 value
@@ -12192,6 +12221,27 @@ mod computed_style_cache_tests {
         assert_eq!(style.height, w3cos_std::style::Dimension::Px(96.0));
         assert_eq!(style.min_height, w3cos_std::style::Dimension::Px(16.0));
         assert_eq!(style.max_width, w3cos_std::style::Dimension::Px(48.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn box_dimensions_can_explicitly_inherit_from_the_parent() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("height", "1px")]);
+        crate::stylesheet::register_rule("#child", &[("height", "inherit")]);
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(
+            document.computed_style_for(child.id).height,
+            w3cos_std::style::Dimension::Px(1.0)
+        );
         crate::stylesheet::clear_rules();
     }
 
