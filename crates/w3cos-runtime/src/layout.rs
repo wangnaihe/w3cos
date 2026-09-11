@@ -1831,6 +1831,7 @@ impl LayoutEngine {
         project_inline_after_leading_empty_blocks(&mut results, root);
         project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
         project_simple_float_margin_boxes(&mut results, root);
+        project_positioned_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
@@ -1963,6 +1964,7 @@ pub fn compute_with_scroll(
     project_inline_after_leading_empty_blocks(&mut results, root);
     project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
     project_simple_float_margin_boxes(&mut results, root);
+    project_positioned_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
@@ -3403,6 +3405,84 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
     }
 
     visit(root, 0, layouts, &layout_position);
+}
+
+fn project_positioned_bfc_float_heights(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    flat: &[FlatNodeInfo<'_>],
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn visit(
+        component: &Component,
+        index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>,
+        flat: &[FlatNodeInfo<'_>],
+        viewport_w: f32,
+        viewport_h: f32,
+    ) {
+        if matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+            && matches!(component.style.height, WDim::Auto)
+            && let Some(position) = positions.get(&index).copied()
+        {
+            let container = layouts[position].0;
+            let subtree_end = index + count_nodes(component);
+            let float_bottom = (index + 1..subtree_end)
+                .filter(|candidate| {
+                    positions.contains_key(candidate)
+                        && flat[*candidate].style.float != WFloat::None
+                })
+                .filter_map(|candidate| {
+                    let float = &flat[candidate];
+                    let rect = layouts[*positions.get(&candidate)?].0;
+                    let margin_bottom = resolve_spacing_for_layout(
+                        float.style.margin.bottom,
+                        container.width,
+                        float.style.font_size,
+                        viewport_w,
+                        viewport_h,
+                    );
+                    Some(rect.y + rect.height + margin_bottom)
+                })
+                .reduce(f32::max);
+            if let Some(float_bottom) = float_bottom {
+                let padding = component.style.padding_lengths();
+                let bottom_edge = padding.bottom
+                    + component
+                        .style
+                        .border_bottom_width
+                        .unwrap_or(component.style.border_width);
+                layouts[position].0.height = layouts[position]
+                    .0
+                    .height
+                    .max(float_bottom + bottom_edge - container.y);
+            }
+        }
+
+        let mut child_index = index + 1;
+        for child in &component.children {
+            visit(
+                child,
+                child_index,
+                layouts,
+                positions,
+                flat,
+                viewport_w,
+                viewport_h,
+            );
+            child_index += count_nodes(child);
+        }
+    }
+
+    visit(root, 0, layouts, &positions, flat, viewport_w, viewport_h);
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
@@ -9859,6 +9939,50 @@ mod tests {
         assert_eq!(collapsed.height, 0.0);
         assert_eq!(floating.y, collapsed.y + 100.0);
         assert_eq!(following.y, 200.0);
+    }
+
+    #[test]
+    fn positioned_auto_height_bfc_contains_a_nested_float_margin_box() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    position: WPos::Absolute,
+                    width: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            float: WFloat::Left,
+                            width: WDim::Percent(100.0),
+                            height: WDim::Px(48.0),
+                            margin: w3cos_std::style::Edges {
+                                bottom: WSpacing::Px(48.0),
+                                ..w3cos_std::style::Edges::ZERO
+                            },
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                )],
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let container = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let wrapper = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(container.height, 96.0);
+        assert_eq!(wrapper.height, 0.0);
     }
 
     #[test]
