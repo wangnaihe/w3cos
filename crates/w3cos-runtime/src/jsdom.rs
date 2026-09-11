@@ -6575,6 +6575,16 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
         1,
         body_index,
     );
+    let host_rects = layouts
+        .iter()
+        .filter_map(|(rect, index)| {
+            let entry = flat.get(*index)?;
+            let w3cos_std::EventAction::NativeHost { id, .. } = entry.on_click else {
+                return None;
+            };
+            Some((u32::try_from(*id).ok()?, *rect))
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut hits = layouts
         .into_iter()
@@ -6617,6 +6627,75 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
     let hit_nodes = hits.iter().copied().collect::<HashSet<_>>();
     let mut expanded = Vec::with_capacity(hits.len());
     seen.clear();
+    let pointer_enabled = |node| {
+        dom::with_document(|document| {
+            document
+                .computed_style_for(NodeId::from_u32(node))
+                .pointer_events
+                != w3cos_std::style::PointerEvents::None
+        })
+    };
+    let margin_fragment_host = inclusive_descendant_elements(document_element_id())
+        .into_iter()
+        .rev()
+        .find(|host| {
+            block_in_inline_host(*host)
+                && pointer_enabled(*host)
+                && dom::children(*host).into_iter().any(|child| {
+                    let Some(rect) = host_rects.get(&child) else {
+                        return false;
+                    };
+                    let child_style = dom::with_document(|document| {
+                        document.computed_style_for(NodeId::from_u32(child))
+                    });
+                    if matches!(
+                        child_style.position,
+                        w3cos_std::style::Position::Absolute
+                            | w3cos_std::style::Position::Fixed
+                    ) || !matches!(
+                        child_style.display,
+                        w3cos_std::style::Display::Block
+                            | w3cos_std::style::Display::Flex
+                            | w3cos_std::style::Display::Grid
+                    ) {
+                        return false;
+                    }
+                    let margin = child_style.margin_lengths();
+                    let inside_border = x >= rect.x
+                        && x < rect.x + rect.width
+                        && y >= rect.y
+                        && y < rect.y + rect.height;
+                    !inside_border
+                        && x >= rect.x - margin.left
+                        && x < rect.x + rect.width + margin.right
+                        && y >= rect.y - margin.top
+                        && y < rect.y + rect.height + margin.bottom
+                })
+        });
+    let promoted_negative_fragment_hosts = hits.iter().filter_map(|node| {
+        let style = dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(*node))
+        });
+        if style.position != w3cos_std::style::Position::Relative || style.z_index >= 0 {
+            return None;
+        }
+        let mut ancestor = dom::parent_node(*node);
+        while let Some(candidate) = ancestor {
+            if block_in_inline_host(candidate) && pointer_enabled(candidate) {
+                return Some(candidate);
+            }
+            ancestor = dom::parent_node(candidate);
+        }
+        None
+    });
+    for host in margin_fragment_host
+        .into_iter()
+        .chain(promoted_negative_fragment_hosts)
+    {
+        if seen.insert(host) {
+            expanded.push(host);
+        }
+    }
     for node in hits {
         if seen.insert(node) {
             expanded.push(node);
@@ -6627,12 +6706,7 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
                 break;
             }
             if block_in_inline_host(candidate)
-                && dom::with_document(|document| {
-                    document
-                        .computed_style_for(NodeId::from_u32(candidate))
-                        .pointer_events
-                        != w3cos_std::style::PointerEvents::None
-                })
+                && pointer_enabled(candidate)
                 && seen.insert(candidate)
             {
                 expanded.push(candidate);
