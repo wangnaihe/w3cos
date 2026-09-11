@@ -1272,6 +1272,7 @@ fn draw_text_in_rect(
     _metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
+    let continuation_content = text_continuation_paint_box(rect, style);
     let image_info = canvas.image_info();
     let indent = style.resolved_text_indent(
         content.width,
@@ -1316,7 +1317,7 @@ fn draw_text_in_rect(
     let registry = crate::font_face::FontRegistry::global();
     let layout = text_layout::retained_text_paint_layout_with_run_width_and_first_line(
         text,
-        content.width,
+        continuation_content.width,
         first_line_content.width,
         style.font_size,
         style.white_space,
@@ -1397,7 +1398,7 @@ fn draw_text_in_rect(
         let line_content = if index == 0 {
             first_line_content
         } else {
-            content
+            continuation_content
         };
         let x = aligned_text_x(
             line_content,
@@ -1956,6 +1957,37 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     text_content_box(rect, style)
 }
 
+fn text_continuation_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
+    let content = text_paint_box(rect, style);
+    if style.display != Display::Inline {
+        return content;
+    }
+    let padding = style.padding_lengths();
+    match style.direction {
+        w3cos_std::style::TextDirection::Ltr => {
+            let start = padding.left
+                + style
+                    .border_left_width
+                    .unwrap_or(style.border_width);
+            LayoutRect {
+                x: content.x - start,
+                width: content.width + start,
+                ..content
+            }
+        }
+        w3cos_std::style::TextDirection::Rtl => {
+            let start = padding.right
+                + style
+                    .border_right_width
+                    .unwrap_or(style.border_width);
+            LayoutRect {
+                width: content.width + start,
+                ..content
+            }
+        }
+    }
+}
+
 fn draw_background_image(
     canvas: &Canvas,
     rect: LayoutRect,
@@ -2279,6 +2311,30 @@ mod tests {
         assert_eq!(content.y, 42.0);
         assert_eq!(content.width, 170.0);
         assert_eq!(content.height, 56.0);
+    }
+
+    #[test]
+    fn continued_inline_lines_restore_the_inline_start_edge() {
+        let style = Style {
+            display: Display::Inline,
+            border_left_width: Some(20.0),
+            padding: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(20.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let rect = LayoutRect {
+            x: 8.0,
+            y: 60.0,
+            width: 200.0,
+            height: 200.0,
+        };
+
+        assert_eq!(text_paint_box(rect, &style).x, 48.0);
+        assert_eq!(text_paint_box(rect, &style).width, 160.0);
+        assert_eq!(text_continuation_paint_box(rect, &style).x, 8.0);
+        assert_eq!(text_continuation_paint_box(rect, &style).width, 200.0);
     }
 
     #[test]
