@@ -11524,7 +11524,7 @@ fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str
 }
 
 fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
-    use w3cos_std::style::Spacing;
+    use w3cos_std::style::{Clear, Float, Spacing};
 
     let parent = dom::parent_node(node)?;
     if dom::node_type(parent) != 1 {
@@ -11559,23 +11559,93 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
     }
 
     let rect = forced_bounding_rect(node);
-    let content_width = parent_rect.width
-        - parent_style
-            .border_left_width
-            .unwrap_or(parent_style.border_width)
-        - parent_style
-            .border_right_width
-            .unwrap_or(parent_style.border_width)
-        - resolve(parent_style.padding.left, parent_style.font_size)
-        - resolve(parent_style.padding.right, parent_style.font_size);
+    let border_left = parent_style
+        .border_left_width
+        .unwrap_or(parent_style.border_width);
+    let border_right = parent_style
+        .border_right_width
+        .unwrap_or(parent_style.border_width);
+    let padding_left = resolve(parent_style.padding.left, parent_style.font_size);
+    let padding_right = resolve(parent_style.padding.right, parent_style.font_size);
+    let content_left = parent_rect.x + border_left + padding_left;
+    let content_right = parent_rect.x + parent_rect.width - border_right - padding_right;
+    let content_width = content_right - content_left;
     let left_auto = matches!(style.margin.left, Spacing::Auto);
     let right_auto = matches!(style.margin.right, Spacing::Auto);
     let fixed_left = resolve(style.margin.left, style.font_size);
     let fixed_right = resolve(style.margin.right, style.font_size);
+    let mut left_float_intrusion = 0.0;
+    let mut right_float_intrusion = 0.0;
+    let siblings = dom::children(parent);
+    let node_position = siblings.iter().position(|sibling| *sibling == node)?;
+    for (sibling_position, sibling) in siblings[..node_position].iter().copied().enumerate() {
+        if dom::node_type(sibling) != 1 {
+            continue;
+        }
+        let sibling_style = dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(sibling))
+        });
+        if sibling_style.float == Float::None {
+            continue;
+        }
+        let sibling_rect = forced_bounding_rect(sibling);
+        let clears_float = |clear| {
+            matches!(clear, Clear::Both)
+                || matches!((clear, sibling_style.float), (Clear::Left, Float::Left))
+                || matches!((clear, sibling_style.float), (Clear::Right, Float::Right))
+        };
+        if clears_float(style.clear) {
+            continue;
+        }
+        let mut flow_distance = 0.0;
+        let mut cleared = false;
+        for intervening in siblings[sibling_position + 1..node_position]
+            .iter()
+            .copied()
+            .filter(|intervening| dom::node_type(*intervening) == 1)
+        {
+            let intervening_style = dom::with_document(|document| {
+                document.computed_style_for(NodeId::from_u32(intervening))
+            });
+            if clears_float(intervening_style.clear) {
+                cleared = true;
+                break;
+            }
+            if intervening_style.float == Float::None {
+                let intervening_rect = forced_bounding_rect(intervening);
+                flow_distance += intervening_rect.height
+                    + resolve(intervening_style.margin.top, intervening_style.font_size)
+                    + resolve(intervening_style.margin.bottom, intervening_style.font_size);
+            }
+        }
+        if cleared
+            || flow_distance
+                >= sibling_rect.height
+                    + resolve(sibling_style.margin.bottom, sibling_style.font_size)
+        {
+            continue;
+        }
+        let intrusion = sibling_rect.width
+            + resolve(sibling_style.margin.left, sibling_style.font_size)
+            + resolve(sibling_style.margin.right, sibling_style.font_size);
+        match sibling_style.float {
+            Float::Left => left_float_intrusion += intrusion,
+            Float::Right => right_float_intrusion += intrusion,
+            Float::None => {}
+        }
+    }
     let remaining = content_width - rect.width - fixed_left - fixed_right;
     let used = match (property, left_auto, right_auto) {
-        ("margin-left", true, true) | ("margin-right", true, true) => remaining / 2.0,
-        ("margin-left", true, false) | ("margin-right", false, true) => remaining,
+        ("margin-left", true, true) => {
+            left_float_intrusion
+                + (remaining - left_float_intrusion - right_float_intrusion) / 2.0
+        }
+        ("margin-right", true, true) => {
+            right_float_intrusion
+                + (remaining - left_float_intrusion - right_float_intrusion) / 2.0
+        }
+        ("margin-left", true, false) => remaining - right_float_intrusion,
+        ("margin-right", false, true) => remaining - left_float_intrusion,
         _ => resolve(spacing, style.font_size),
     };
     let used = if used.abs() < 0.000_1 { 0.0 } else { used };
@@ -25961,7 +26031,11 @@ try {
         );
         w3cos_dom::stylesheet::register_rule(
             ".used-margin-child",
-            &[("display", "flow-root"), ("width", "40px")],
+            &[
+                ("display", "flow-root"),
+                ("width", "40px"),
+                ("height", "10px"),
+            ],
         );
         let document = document_value();
         let container = create_in_body("div");
@@ -25990,6 +26064,64 @@ try {
         assert_eq!(both.get_property("marginRight"), Value::string("25px"));
         let left = computed(left);
         assert_eq!(left.get_property("marginLeft"), Value::string("50px"));
+        assert_eq!(left.get_property("marginRight"), Value::string("0px"));
+        let right = computed(right);
+        assert_eq!(right.get_property("marginLeft"), Value::string("0px"));
+        assert_eq!(right.get_property("marginRight"), Value::string("50px"));
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn computed_style_reports_auto_margins_around_a_float() {
+        setup();
+        set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            ".used-margin-container",
+            &[
+                ("display", "flow-root"),
+                ("width", "100px"),
+                ("padding", "5px"),
+                ("box-sizing", "border-box"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".used-margin-child",
+            &[
+                ("display", "flow-root"),
+                ("width", "40px"),
+                ("height", "10px"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".used-margin-float",
+            &[("float", "right"), ("width", "20px"), ("height", "40px")],
+        );
+        let document = document_value();
+        let container = create_in_body("div");
+        container.set_property("className", Value::string("used-margin-container"));
+        let floating = document.call_method("createElement", vec![Value::string("div")]);
+        floating.set_property("className", Value::string("used-margin-float"));
+        container.call_method("appendChild", vec![floating.clone()]);
+        let child = |margin_property: &str| {
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            child.set_property("className", Value::string("used-margin-child"));
+            child
+                .get_property("style")
+                .set_property(margin_property, Value::string("auto"));
+            container.call_method("appendChild", vec![child.clone()]);
+            child
+        };
+        let both = child("margin");
+        let left = child("marginLeft");
+        let right = child("marginRight");
+
+        let computed = |child| window_value().call_method("getComputedStyle", vec![child]);
+        let both = computed(both);
+        assert_eq!(both.get_property("marginLeft"), Value::string("15px"));
+        assert_eq!(both.get_property("marginRight"), Value::string("35px"));
+        let left = computed(left);
+        assert_eq!(left.get_property("marginLeft"), Value::string("30px"));
         assert_eq!(left.get_property("marginRight"), Value::string("0px"));
         let right = computed(right);
         assert_eq!(right.get_property("marginLeft"), Value::string("0px"));
