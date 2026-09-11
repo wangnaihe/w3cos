@@ -4268,7 +4268,30 @@ fn project_simple_float_margin_boxes(
                     (clearance_bottom, layout_position.get(&child_index).copied())
                 {
                     let current_y = layouts[position].0.y;
-                    let target_y = (current_y - leading_margin_group(child)).max(clearance_bottom);
+                    let relative_offset = if child.style.position == WPos::Relative {
+                        let resolve_inset = |dimension: WDim| {
+                            (!matches!(dimension, WDim::Auto | WDim::Percent(_)))
+                                .then(|| {
+                                    dimension.resolve(
+                                        viewport_h,
+                                        ROOT_FONT_SIZE,
+                                        child.style.font_size,
+                                        viewport_w,
+                                        viewport_h,
+                                    )
+                                })
+                                .flatten()
+                        };
+                        resolve_inset(child.style.top)
+                            .or_else(|| resolve_inset(child.style.bottom).map(|value| -value))
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let static_y = current_y - relative_offset;
+                    let target_y = (static_y - leading_margin_group(child))
+                        .max(clearance_bottom)
+                        + relative_offset;
                     if (target_y - current_y).abs() > f32::EPSILON {
                         shift_subtree(
                             layouts,
@@ -11924,6 +11947,47 @@ mod tests {
         let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         let cleared = layout.iter().find(|(_, index)| *index == 5).unwrap().0;
         assert_eq!(cleared.y, floating.y + floating.height);
+    }
+
+    #[test]
+    fn relative_offset_is_preserved_after_float_clearance() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        float: WFloat::Left,
+                        min_height: WDim::Px(200.0),
+                        width: WDim::Px(200.0),
+                        overflow: WOverflow::Auto,
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        position: WPos::Relative,
+                        clear: WClear::Left,
+                        top: WDim::Px(-200.0),
+                        width: WDim::Px(200.0),
+                        height: WDim::Px(200.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let floating = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let cleared = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(cleared.y, floating.y);
     }
 
     #[test]
