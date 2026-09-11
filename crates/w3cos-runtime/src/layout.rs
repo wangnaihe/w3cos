@@ -9124,6 +9124,55 @@ mod tests {
     }
 
     #[test]
+    fn absolute_percentage_height_uses_auto_containing_blocks_final_height() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(
+            "#containing-block",
+            &[
+                ("height", "auto"),
+                ("position", "relative"),
+                ("width", "192px"),
+            ],
+        );
+        stylesheet::register_rule(
+            "#percentage-child",
+            &[
+                ("height", "50%"),
+                ("position", "absolute"),
+                ("width", "96px"),
+            ],
+        );
+        stylesheet::register_rule(
+            "#in-flow-child",
+            &[("height", "192px"), ("width", "192px")],
+        );
+
+        let mut document = Document::new();
+        let containing_block = document.create_element("div");
+        containing_block.set_attribute(&mut document, "id", "containing-block");
+        let percentage_child = document.create_element("div");
+        percentage_child.set_attribute(&mut document, "id", "percentage-child");
+        let in_flow_child = document.create_element("div");
+        in_flow_child.set_attribute(&mut document, "id", "in-flow-child");
+        containing_block.append_child(&mut document, percentage_child);
+        containing_block.append_child(&mut document, in_flow_child);
+        document.body().append_child(&mut document, containing_block);
+
+        let component = document.to_component_tree();
+        assert_eq!(
+            component.children[0].children[0].style.height,
+            WDim::Percent(50.0)
+        );
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(1).height, 192.0);
+        assert_eq!(rect(2).height, 96.0, "layout={layout:#?}");
+        stylesheet::clear_rules();
+    }
+
+    #[test]
     fn anonymous_inline_line_items_preserve_negative_margin_wrapping() {
         use w3cos_dom::{Document, stylesheet};
 

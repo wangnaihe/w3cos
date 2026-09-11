@@ -3291,7 +3291,10 @@ impl Document {
                         "--w3cos-internal-quirks-percentage-height".to_string(),
                         "1".to_string(),
                     );
-            } else if inherited.is_some_and(|parent| {
+            } else if !matches!(
+                style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            ) && inherited.is_some_and(|parent| {
                 matches!(parent.height, w3cos_std::style::Dimension::Auto)
                     && matches!(
                         parent.display,
