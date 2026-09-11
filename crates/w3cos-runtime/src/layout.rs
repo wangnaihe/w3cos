@@ -3941,10 +3941,16 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
-    let passive_inline_text_edges = matches!(comp.kind, ComponentKind::Text { .. })
+    let passive_inline_edges = matches!(
+        comp.kind,
+        ComponentKind::Row
+            | ComponentKind::Column
+            | ComponentKind::Box
+            | ComponentKind::Text { .. }
+    )
         && comp.style.display == WDisplay::Inline
         && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed);
-    if passive_inline_text_edges {
+    if passive_inline_edges {
         // Vertical padding and borders paint on a non-replaced inline box but
         // do not participate in line-box height. Taffy's flex item model
         // otherwise enlarges the line and moves every following line/float.
@@ -5406,6 +5412,7 @@ fn collect_layouts_fast(
         width: layout.size.width,
         height: layout.size.height,
     };
+    let mut passive_inline_top_edge = 0.0;
 
     let mut new_scroll_container = current_scroll_container;
     let mut descendant_containing_block = absolute_containing_block;
@@ -5417,11 +5424,23 @@ fn collect_layouts_fast(
             }
             let info = &flat[ctx];
 
-            if matches!(info.kind, ComponentKind::Text { .. })
+            if matches!(
+                info.kind,
+                ComponentKind::Row
+                    | ComponentKind::Column
+                    | ComponentKind::Box
+                    | ComponentKind::Text { .. }
+            )
                 && info.style.display == WDisplay::Inline
                 && !matches!(info.style.position, WPos::Absolute | WPos::Fixed)
             {
                 let padding = info.style.padding_lengths();
+                passive_inline_top_edge = padding.top
+                    + info
+                        .style
+                        .border_top_width
+                        .unwrap_or(info.style.border_width);
+                rect.y -= passive_inline_top_edge;
                 rect.height += padding.top
                     + padding.bottom
                     + info
@@ -5550,7 +5569,7 @@ fn collect_layouts_fast(
 
     let child_relative_containing_block = LayoutRect {
         x: rect.x + layout.border.left + layout.padding.left,
-        y: rect.y + layout.border.top + layout.padding.top,
+        y: rect.y + passive_inline_top_edge + layout.border.top + layout.padding.top,
         width: layout.content_box_width(),
         height: layout.content_box_height(),
     };
@@ -5575,7 +5594,7 @@ fn collect_layouts_fast(
             tree,
             child,
             rect.x,
-            rect.y,
+            rect.y + passive_inline_top_edge,
             viewport_w,
             viewport_h,
             descendant_containing_block,
@@ -10361,6 +10380,54 @@ mod tests {
 
         let fragment = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(fragment.height, 200.0);
+    }
+
+    #[test]
+    fn inline_container_vertical_border_paints_outside_the_line_box() {
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(200.0),
+                    border_top_width: Some(20.0),
+                    font_size: 20.0,
+                    line_height: 1.0,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::Inline,
+                        border_top_width: Some(20.0),
+                        margin: w3cos_std::style::Edges {
+                            top: WSpacing::Px(50.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        font_size: 20.0,
+                        line_height: 1.0,
+                        ..Style::default()
+                    },
+                    vec![Component::text(
+                        "XXXXXXXXXX",
+                        Style {
+                            display: WDisp::Inline,
+                            font_size: 20.0,
+                            line_height: 1.0,
+                            ..Style::default()
+                        },
+                    )],
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(inline.y, parent.y);
+        assert_eq!(text.y, inline.y + 20.0);
+        assert_eq!(inline.height, 40.0);
     }
 
     #[test]
