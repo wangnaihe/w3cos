@@ -254,6 +254,20 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
 
 fn component_max_content_width(component: &Component) -> f32 {
     let child_width = |child: &Component| component_max_content_width(child);
+    let establishes_block_formatting_context = matches!(
+        component.style.display,
+        WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell
+    ) || (component.style.display == WDisplay::InlineBlock
+        && component.children.iter().any(|child| {
+            matches!(
+                child.style.display,
+                WDisplay::Block
+                    | WDisplay::Flex
+                    | WDisplay::Grid
+                    | WDisplay::Table
+                    | WDisplay::ListItem
+            )
+        }));
     let intrinsic_width = if component.children.is_empty() {
         leaf_intrinsic_size(&component.kind, &component.style).0
     } else {
@@ -283,7 +297,7 @@ fn component_max_content_width(component: &Component) -> f32 {
                 let children = component.children.iter().map(child_width).sum::<f32>();
                 children + component.style.gap * component.children.len().saturating_sub(1) as f32
             }
-            WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell => {
+            _ if establishes_block_formatting_context => {
                 // A block formatting context contributes the widest generated
                 // line/block row. Consecutive inline-level and floating boxes
                 // can share a row; an in-flow block boundary flushes that row.
@@ -12570,6 +12584,29 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((parent.width, parent.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn auto_width_inline_block_uses_the_widest_stacked_block_child() {
+        let child = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                ..Style::default()
+            },
+            vec![child(), child()],
+        );
+
+        assert_eq!(shrink_to_fit_used_width(&inline_block), 96.0);
     }
 
     #[test]
