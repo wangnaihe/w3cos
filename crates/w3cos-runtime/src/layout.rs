@@ -381,11 +381,38 @@ fn component_max_content_width(component: &Component) -> f32 {
         0.0
     };
     let horizontal_inner_edges = padding.left + padding.right + border_width + table_outer_spacing;
-    let border_box_width = match (specified_width, component.style.box_sizing) {
+    let mut border_box_width = match (specified_width, component.style.box_sizing) {
         (Some(width), WBoxSizing::BorderBox) => width,
         (Some(width), WBoxSizing::ContentBox) => width + horizontal_inner_edges,
         (None, _) => intrinsic_width + horizontal_inner_edges,
     };
+    let intrinsic_constraint = |dimension| match dimension {
+        WDim::Px(value) => Some(value),
+        WDim::Em(value) => Some(value * component.style.font_size),
+        WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
+        WDim::Ch(value) => Some(
+            value
+                * layout_font()
+                    .metrics('0', component.style.font_size)
+                    .advance_width,
+        ),
+        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) => None,
+    };
+    let constraint_border_box = |dimension| {
+        intrinsic_constraint(dimension).map(|width| {
+            if component.style.box_sizing == WBoxSizing::ContentBox {
+                width + horizontal_inner_edges
+            } else {
+                width
+            }
+        })
+    };
+    if let Some(max_width) = constraint_border_box(component.style.max_width) {
+        border_box_width = border_box_width.min(max_width);
+    }
+    if let Some(min_width) = constraint_border_box(component.style.min_width) {
+        border_box_width = border_box_width.max(min_width);
+    }
     let margin = component.style.margin_lengths();
     let horizontal_margin = if component.style.display == WDisplay::TableCell {
         0.0
@@ -5198,8 +5225,23 @@ fn build_taffy_tree(
                             ))
                     {
                         let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
-                        if let WDim::Px(mw) = comp.style.min_width {
-                            w = w.max(mw);
+                        if let Some(max_width) = comp.style.max_width.resolve(
+                            containing_width,
+                            ROOT_FONT_SIZE,
+                            comp.style.font_size,
+                            viewport_w,
+                            viewport_h,
+                        ) {
+                            w = w.min(max_width);
+                        }
+                        if let Some(min_width) = comp.style.min_width.resolve(
+                            containing_width,
+                            ROOT_FONT_SIZE,
+                            comp.style.font_size,
+                            viewport_w,
+                            viewport_h,
+                        ) {
+                            w = w.max(min_width);
                         }
                         let dim = Dimension::length(w);
                         if inline_text_in_block && !nowrap {
@@ -12706,6 +12748,43 @@ mod tests {
         let parent_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
         let child_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(child_rect.x, parent_rect.x);
+    }
+
+    #[test]
+    fn inline_block_max_width_constrains_parent_shrink_to_fit_width() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(
+            "div",
+            &[
+                ("display", "inline-block"),
+                ("font", "30px/4 Ahem"),
+                ("width", "auto"),
+            ],
+        );
+        stylesheet::register_rule(
+            "span",
+            &[("display", "inline-block"), ("max-width", "4em")],
+        );
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let constrained_child = document.create_element("span");
+        let text = document.create_text_node("12345678");
+        constrained_child.append_child(&mut document, text);
+        parent.append_child(&mut document, constrained_child);
+        document.body().append_child(&mut document, parent);
+
+        let component = document.to_component_tree();
+        let parent = &component.children[0];
+        assert_eq!(parent.children[0].style.max_width, WDim::Em(4.0));
+        assert_eq!(shrink_to_fit_used_width(parent), 120.0);
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(1).width, 120.0, "layout={layout:#?}");
+        assert_eq!(rect(2).width, 120.0, "layout={layout:#?}");
+        stylesheet::clear_rules();
     }
 
     #[test]
