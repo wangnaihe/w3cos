@@ -1246,7 +1246,9 @@ impl Document {
         .into_iter()
         .enumerate()
         {
-            if let Some(value) = ex_edge_spacing("padding", longhand, side) {
+            if let Some(value) = ex_edge_spacing("padding", longhand, side)
+                && !matches!(value, w3cos_std::style::Spacing::Px(length) if length < 0.0)
+            {
                 padding[side] = value;
             }
         }
@@ -11597,6 +11599,26 @@ mod computed_style_cache_tests {
                 bottom: w3cos_std::style::Spacing::Px(32.0),
                 left: w3cos_std::style::Spacing::Px(16.0),
             }
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn negative_ex_padding_is_invalid_at_computed_value_time() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[("font", "20px/1 Ahem"), ("padding-bottom", "-1ex")],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        assert_eq!(
+            document.computed_style_for(target.id).padding.bottom,
+            w3cos_std::style::Spacing::Px(0.0)
         );
         crate::stylesheet::clear_rules();
     }
