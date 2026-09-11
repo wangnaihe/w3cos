@@ -1360,7 +1360,9 @@ fn draw_text_in_rect(
         } else {
             (ink.top + ink.height - line_height).max(0.0)
         };
-        let top = content.y + text_vertical_offset(style, content.height, line_height)
+        let top = content.y
+            + text_vertical_offset(style, content.height, line_height)
+            + line_box_half_leading(style)
             - ink_bottom_overflow;
         draw_text_line(
             canvas,
@@ -1410,7 +1412,7 @@ fn draw_text_in_rect(
         draw_text_line(
             canvas,
             x,
-            top + index as f32 * line_height,
+            top + index as f32 * line_height + line_box_half_leading(style),
             line,
             style.font_size,
             style.color,
@@ -1435,6 +1437,10 @@ fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) ->
     } else {
         (content_height - text_height).max(0.0) * 0.5
     }
+}
+
+fn line_box_half_leading(style: &Style) -> f32 {
+    (style.font_size * style.line_height - style.font_size) * 0.5
 }
 
 fn draw_centered_text(
@@ -2569,6 +2575,16 @@ mod tests {
             ..Style::default()
         };
         assert!((text_vertical_offset(&centered, 84.0, 19.2) - 32.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn line_box_centers_the_em_box_with_half_leading() {
+        let style = Style {
+            font_size: 30.0,
+            line_height: 4.0,
+            ..Style::default()
+        };
+        assert_eq!(line_box_half_leading(&style), 45.0);
     }
 
     #[test]
