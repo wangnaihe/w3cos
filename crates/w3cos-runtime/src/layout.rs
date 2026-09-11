@@ -1823,6 +1823,7 @@ impl LayoutEngine {
             &mut scroll_ancestor,
         );
 
+        project_empty_painted_inline_boxes(&mut results, flat);
         project_fixed_table_cell_rects(&mut results, root);
         project_forced_break_lines(&mut results, root);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
@@ -1952,6 +1953,7 @@ pub fn compute_with_scroll(
         &mut scroll_ancestor,
     );
 
+    project_empty_painted_inline_boxes(&mut results, &flat);
     project_fixed_table_cell_rects(&mut results, &layout_root);
     project_forced_break_lines(&mut results, root);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
@@ -1967,6 +1969,63 @@ pub fn compute_with_scroll(
 
     results.extend(fixed_results);
     Ok((results, scrollable, clip_only))
+}
+
+fn project_empty_painted_inline_boxes(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for index in 0..flat.len() {
+        let node = &flat[index];
+        if node.style.display != WDisplay::Inline {
+            continue;
+        }
+        let Some(position) = positions.get(&index).copied() else {
+            continue;
+        };
+        if layouts[position].0.height.abs() > f32::EPSILON {
+            continue;
+        }
+        let padding = node.style.padding_lengths();
+        let paints_edge = node.style.border_width > 0.0
+            || node
+                .style
+                .border_top_width
+                .is_some_and(|width| width > 0.0)
+            || node
+                .style
+                .border_right_width
+                .is_some_and(|width| width > 0.0)
+            || node
+                .style
+                .border_bottom_width
+                .is_some_and(|width| width > 0.0)
+            || node
+                .style
+                .border_left_width
+                .is_some_and(|width| width > 0.0)
+            || padding.top > 0.0
+            || padding.right > 0.0
+            || padding.bottom > 0.0
+            || padding.left > 0.0;
+        if !paints_edge {
+            continue;
+        }
+        let Some(parent_position) = node.parent.and_then(|parent| positions.get(&parent).copied())
+        else {
+            continue;
+        };
+        let parent = layouts[parent_position].0;
+        if parent.height > 0.0 {
+            layouts[position].0.y = parent.y;
+            layouts[position].0.height = parent.height;
+        }
+    }
 }
 
 fn align_table_cell_baselines(layouts: &mut [(LayoutRect, usize)], flat: &[FlatNodeInfo<'_>]) {
@@ -10137,6 +10196,53 @@ mod tests {
 
         assert_eq!(layout[0].0.height, 102.0);
         assert_eq!(layout[1].0.y, 84.0);
+    }
+
+    #[test]
+    fn empty_painted_inline_boxes_use_the_surrounding_line_height() {
+        let inline = |border_left, margin_left, children| {
+            Component::row(
+                Style {
+                    display: WDisp::Inline,
+                    border_left_width: Some(border_left),
+                    margin: w3cos_std::style::Edges {
+                        left: WSpacing::Px(margin_left),
+                        ..w3cos_std::style::Edges::ZERO
+                    },
+                    ..Style::default()
+                },
+                children,
+            )
+        };
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Block,
+                    ..Style::default()
+                },
+                vec![
+                    inline(5.0, 0.0, vec![inline(5.0, 50.0, Vec::new())]),
+                    Component::text(
+                        "Filler Text",
+                        Style {
+                            display: WDisp::Inline,
+                            ..Style::default()
+                        },
+                    ),
+                ],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let line = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let outer = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let inner = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(outer.y, line.y);
+        assert_eq!(inner.y, line.y);
+        assert_eq!(outer.height, line.height);
+        assert_eq!(inner.height, line.height);
     }
 
     #[test]
