@@ -65,7 +65,16 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             style.border_color = Color::rgb(118, 118, 118);
             style.border_radius = 2.0;
         }
-        "input" | "select" | "textarea" => {
+        "input" | "textarea" => {
+            style.background = Color::WHITE;
+            style.color = Color::BLACK;
+            style.font_size = 13.333_333;
+            style.padding = Edges::xy(2.0, 1.0);
+            style.border_width = 1.0;
+            style.border_color = Color::rgb(118, 118, 118);
+            style.border_radius = 0.0;
+        }
+        "select" => {
             style.box_sizing = BoxSizing::BorderBox;
             style.background = Color::WHITE;
             style.color = Color::BLACK;
@@ -115,13 +124,16 @@ mod tests {
         let button = html_default_style("button");
 
         assert_eq!(input.background, Color::WHITE);
-        assert_eq!(input.box_sizing, BoxSizing::BorderBox);
+        assert_eq!(input.box_sizing, BoxSizing::ContentBox);
         assert_eq!(input.display, Display::InlineBlock);
         assert_eq!(input.padding, Edges::xy(2.0, 1.0));
         assert_eq!(input.border_color, Color::rgb(118, 118, 118));
+        assert_eq!(input.border_radius, 0.0);
         assert_eq!(button.background, Color::rgb(239, 239, 239));
         assert_eq!(button.box_sizing, BoxSizing::BorderBox);
         assert_eq!(button.padding, Edges::xy(6.0, 1.0));
+        assert_eq!(html_default_style("textarea").box_sizing, BoxSizing::ContentBox);
+        assert_eq!(html_default_style("select").box_sizing, BoxSizing::BorderBox);
 
         assert_eq!(html_default_style("div").display, Display::Block);
         assert_eq!(html_default_style("div").flex_direction, FlexDirection::Row);
