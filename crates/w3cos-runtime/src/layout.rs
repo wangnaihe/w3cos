@@ -1837,6 +1837,7 @@ impl LayoutEngine {
         project_empty_painted_inline_boxes(&mut results, flat);
         project_fixed_table_cell_rects(&mut results, root);
         project_forced_break_lines(&mut results, root);
+        project_collapsible_line_end_whitespace(&mut results, flat);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_inline_after_leading_empty_blocks(&mut results, root);
         project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
@@ -1970,6 +1971,7 @@ pub fn compute_with_scroll(
     project_empty_painted_inline_boxes(&mut results, &flat);
     project_fixed_table_cell_rects(&mut results, &layout_root);
     project_forced_break_lines(&mut results, root);
+    project_collapsible_line_end_whitespace(&mut results, &flat);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_inline_after_leading_empty_blocks(&mut results, root);
     project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
@@ -2108,6 +2110,68 @@ fn project_rtl_fixed_block_alignment(
             viewport_h,
         );
         layouts[position].0.x = parent_content_right - margin_right - layouts[position].0.width;
+    }
+}
+
+fn project_collapsible_line_end_whitespace(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for (index, node) in flat.iter().enumerate() {
+        let ComponentKind::Text { content } = node.kind else {
+            continue;
+        };
+        if content.is_empty()
+            || !content.chars().all(char::is_whitespace)
+            || !matches!(node.style.white_space, WWhiteSpace::Normal | WWhiteSpace::PreLine)
+        {
+            continue;
+        }
+        let Some(parent_index) = node.parent else {
+            continue;
+        };
+        let parent = &flat[parent_index];
+        if parent.style.display != WDisplay::Flex || parent.style.flex_wrap == WWrap::NoWrap {
+            continue;
+        }
+        let Some(position) = positions.get(&index).copied() else {
+            continue;
+        };
+        let whitespace = layouts[position].0;
+        let wraps_before_next = flat[index + 1..]
+            .iter()
+            .enumerate()
+            .find(|(_, sibling)| sibling.parent == Some(parent_index))
+            .and_then(|(offset, _)| positions.get(&(index + 1 + offset)).copied())
+            .is_some_and(|next| layouts[next].0.y > whitespace.y + f32::EPSILON);
+        if !wraps_before_next || whitespace.width <= f32::EPSILON {
+            continue;
+        }
+        let shift = match parent.style.justify_content {
+            WJustify::Center => whitespace.width / 2.0,
+            WJustify::FlexEnd => whitespace.width,
+            _ => 0.0,
+        };
+        layouts[position].0.width = 0.0;
+        if shift <= f32::EPSILON {
+            continue;
+        }
+        for sibling_index in 0..index {
+            if flat[sibling_index].parent != Some(parent_index) {
+                continue;
+            }
+            let Some(sibling_position) = positions.get(&sibling_index).copied() else {
+                continue;
+            };
+            if (layouts[sibling_position].0.y - whitespace.y).abs() <= f32::EPSILON {
+                layouts[sibling_position].0.x += shift;
+            }
+        }
     }
 }
 
@@ -10940,6 +11004,41 @@ mod tests {
         let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
         let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(parent.x + parent.width - 5.0, child.x + child.width);
+    }
+
+    #[test]
+    fn collapsible_line_end_whitespace_is_removed_before_centering() {
+        let inline_text = |content| {
+            Component::text(
+                content,
+                Style {
+                    display: WDisp::Inline,
+                    ..Style::default()
+                },
+            )
+        };
+        let root = Component::row(
+            Style {
+                display: WDisp::Flex,
+                flex_wrap: WWrap::Wrap,
+                justify_content: WJustify::Center,
+                ..Style::default()
+            },
+            vec![inline_text("O"), inline_text(" "), inline_text("B")],
+        );
+        let flat = pre_flatten(&root);
+        let mut layouts = vec![
+            (LayoutRect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 }, 0),
+            (LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }, 1),
+            (LayoutRect { x: 100.0, y: 0.0, width: 100.0, height: 100.0 }, 2),
+            (LayoutRect { x: 50.0, y: 100.0, width: 100.0, height: 100.0 }, 3),
+        ];
+
+        project_collapsible_line_end_whitespace(&mut layouts, &flat);
+
+        assert_eq!(layouts[1].0.x, 50.0);
+        assert_eq!(layouts[2].0.width, 0.0);
+        assert_eq!(layouts[3].0.x, 50.0);
     }
 
     #[test]
