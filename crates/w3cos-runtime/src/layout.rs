@@ -6740,6 +6740,26 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             bottom: LengthPercentageAuto::length(0.0),
             left: to_taffy_margin(s.margin.left, s.font_size, viewport_w, viewport_h),
         }
+    } else if matches!(
+        s.display,
+        WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+    ) {
+        // Auto margins on inline-level non-replaced boxes have a used value
+        // of zero. Do not let the Flex fallback turn them into free-space
+        // distribution and center a shrink-to-fit inline box.
+        let inline_margin = |value| {
+            if matches!(value, WSpacing::Auto) {
+                LengthPercentageAuto::length(0.0)
+            } else {
+                to_taffy_margin(value, s.font_size, viewport_w, viewport_h)
+            }
+        };
+        Rect {
+            top: inline_margin(s.margin.top),
+            right: inline_margin(s.margin.right),
+            bottom: inline_margin(s.margin.bottom),
+            left: inline_margin(s.margin.left),
+        }
     } else {
         Rect {
             top: to_taffy_margin(s.margin.top, s.font_size, viewport_w, viewport_h),
@@ -12656,6 +12676,36 @@ mod tests {
         );
 
         assert_eq!(shrink_to_fit_used_width(&inline_block), 96.0);
+    }
+
+    #[test]
+    fn inline_block_auto_inline_margins_resolve_to_zero() {
+        let child = Component::text(
+            "X",
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Px(100.0),
+                margin: w3cos_std::style::Edges {
+                    left: WSpacing::Auto,
+                    right: WSpacing::Auto,
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            },
+        );
+        let parent = Component::row(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![child],
+        );
+
+        let layout = compute(&parent, 800.0, 600.0).unwrap();
+        let parent_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let child_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(child_rect.x, parent_rect.x);
     }
 
     #[test]
