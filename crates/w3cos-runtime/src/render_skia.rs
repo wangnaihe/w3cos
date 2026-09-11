@@ -1440,7 +1440,11 @@ fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) ->
 }
 
 fn line_box_half_leading(style: &Style) -> f32 {
-    (style.font_size * style.line_height - style.font_size) * 0.5
+    if style.display == Display::Inline {
+        0.0
+    } else {
+        (style.font_size * style.line_height - style.font_size) * 0.5
+    }
 }
 
 fn draw_centered_text(
@@ -2585,6 +2589,12 @@ mod tests {
             ..Style::default()
         };
         assert_eq!(line_box_half_leading(&style), 45.0);
+
+        let inline = Style {
+            display: Display::Inline,
+            ..style
+        };
+        assert_eq!(line_box_half_leading(&inline), 0.0);
     }
 
     #[test]
