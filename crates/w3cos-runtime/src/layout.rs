@@ -897,7 +897,9 @@ fn fixed_table_track_widths(
         return None;
     }
 
-    let border_width = if component.style.box_sizing == WBoxSizing::BorderBox {
+    let border_width = if component.style.box_sizing == WBoxSizing::BorderBox
+        || is_html_table_element(&component.style)
+    {
         component
             .style
             .border_left_width
@@ -6319,6 +6321,39 @@ mod tests {
 
         assert_eq!((rect(3).x, rect(3).width), (172.0, 160.0));
         assert_eq!((rect(8).x, rect(8).width), (172.0, 160.0));
+    }
+
+    #[test]
+    fn fixed_html_table_tracks_exclude_the_outer_border() {
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(256.0),
+                border_width: 3.0,
+                custom_properties: Some(HashMap::from([(
+                    "--w3cos-internal-html-table-element".to_string(),
+                    "1".to_string(),
+                )])),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![cell],
+            )],
+        );
+
+        assert_eq!(fixed_table_track_widths(&table, None), Some(vec![250.0]));
     }
 
     #[test]
