@@ -764,7 +764,20 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
                 WDisplay::TableColumn => tracks.push(
                     specified_border_box_width_with_basis(&child.style, None).unwrap_or(0.0),
                 ),
-                WDisplay::TableColumnGroup => collect_columns(child, tracks),
+                WDisplay::TableColumnGroup => {
+                    if child
+                        .children
+                        .iter()
+                        .any(|column| column.style.display == WDisplay::TableColumn)
+                    {
+                        collect_columns(child, tracks);
+                    } else {
+                        tracks.push(
+                            specified_border_box_width_with_basis(&child.style, None)
+                                .unwrap_or(0.0),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -939,13 +952,7 @@ fn specified_border_box_width_with_basis(
     style: &w3cos_std::style::Style,
     percentage_basis: Option<f32>,
 ) -> Option<f32> {
-    let width = match style.width {
-        WDim::Px(width) => width,
-        WDim::Em(width) => width * style.font_size,
-        WDim::Rem(width) => width * ROOT_FONT_SIZE,
-        WDim::Percent(width) => percentage_basis? * width / 100.0,
-        _ => return None,
-    };
+    let width = constrained_specified_width_with_basis(style, percentage_basis)?;
     if style.box_sizing == WBoxSizing::BorderBox {
         return Some(width.max(0.0));
     }
@@ -960,6 +967,27 @@ fn specified_border_box_width_with_basis(
     )
 }
 
+fn constrained_specified_width_with_basis(
+    style: &w3cos_std::style::Style,
+    percentage_basis: Option<f32>,
+) -> Option<f32> {
+    let resolve = |dimension| match dimension {
+        WDim::Px(width) => Some(width),
+        WDim::Em(width) => Some(width * style.font_size),
+        WDim::Rem(width) => Some(width * ROOT_FONT_SIZE),
+        WDim::Percent(width) => Some(percentage_basis? * width / 100.0),
+        _ => None,
+    };
+    let mut width = resolve(style.width)?.max(0.0);
+    if let Some(max_width) = resolve(style.max_width) {
+        width = width.min(max_width);
+    }
+    if let Some(min_width) = resolve(style.min_width) {
+        width = width.max(min_width);
+    }
+    Some(width.max(0.0))
+}
+
 fn fixed_table_track_widths(
     component: &Component,
     percentage_basis: Option<f32>,
@@ -970,14 +998,8 @@ fn fixed_table_track_widths(
     // CSS table width participates in the table-width algorithm before track
     // distribution. Content-box borders stay outside that width; border-box
     // tables subtract them before deriving the inner grid.
-    let table_width = match component.style.width {
-        WDim::Px(width) => width,
-        WDim::Em(width) => width * component.style.font_size,
-        WDim::Rem(width) => width * ROOT_FONT_SIZE,
-        WDim::Percent(width) => percentage_basis? * width / 100.0,
-        _ => return None,
-    }
-    .max(0.0);
+    let table_width =
+        constrained_specified_width_with_basis(&component.style, percentage_basis)?;
 
     fn collect_columns<'a>(
         component: &'a Component,
@@ -988,7 +1010,17 @@ fn fixed_table_track_widths(
                 WDisplay::TableColumn => {
                     columns.push(Some(&child.style));
                 }
-                WDisplay::TableColumnGroup => collect_columns(child, columns),
+                WDisplay::TableColumnGroup => {
+                    if child
+                        .children
+                        .iter()
+                        .any(|column| column.style.display == WDisplay::TableColumn)
+                    {
+                        collect_columns(child, columns);
+                    } else {
+                        columns.push(Some(&child.style));
+                    }
+                }
                 _ => {}
             }
         }
@@ -6343,16 +6375,10 @@ fn build_taffy_tree(
             let spacing = effective_table_border_spacing(&comp.style).0;
             let minimum_grid = tracks.iter().sum::<f32>() + spacing * (tracks.len() + 1) as f32;
             let minimum_outer = minimum_grid + padding.left + padding.right + borders;
-            let declared_outer = comp
-                .style
-                .width
-                .resolve(
-                    containing_width,
-                    ROOT_FONT_SIZE,
-                    comp.style.font_size,
-                    viewport_w,
-                    viewport_h,
-                )
+            let declared_outer = constrained_specified_width_with_basis(
+                &comp.style,
+                Some(containing_width),
+            )
                 .unwrap_or(0.0)
                 + padding.left
                 + padding.right
@@ -8396,6 +8422,81 @@ mod tests {
         assert_eq!(rect(0).height, 96.0);
         assert_eq!(rect(1).height, 96.0);
         assert_eq!(rect(2).height, 96.0);
+    }
+
+    #[test]
+    fn fixed_table_max_width_caps_its_track() {
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(288.0),
+                max_width: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::TableCell,
+                        height: WDim::Px(96.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                )],
+            )],
+        );
+
+        assert_eq!(fixed_table_track_widths(&table, None), Some(vec![96.0]));
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(0).width, 96.0);
+        assert_eq!(rect(2).width, 96.0);
+    }
+
+    #[test]
+    fn empty_column_group_max_width_supplies_an_intrinsic_track() {
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::TableColumnGroup,
+                        width: WDim::Px(288.0),
+                        max_width: WDim::Px(96.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            height: WDim::Px(96.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                ),
+            ],
+        );
+
+        assert_eq!(table_track_widths(&table), vec![96.0]);
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(0).width, 96.0);
+        assert_eq!(rect(3).width, 96.0);
     }
 
     #[test]
