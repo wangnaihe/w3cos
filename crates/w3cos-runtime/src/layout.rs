@@ -2013,7 +2013,7 @@ impl LayoutEngine {
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_inline_after_leading_empty_blocks(&mut results, root);
         project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
-        project_simple_float_margin_boxes(&mut results, root);
+        project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
         project_positioned_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
@@ -2152,7 +2152,7 @@ pub fn compute_with_scroll(
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_inline_after_leading_empty_blocks(&mut results, root);
     project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
-    project_simple_float_margin_boxes(&mut results, root);
+    project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
     project_positioned_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
@@ -3808,7 +3808,12 @@ fn project_min_height_trailing_margin_containment(
     visit(root, 0, layouts, &layout_position, viewport_w, viewport_h);
 }
 
-fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+fn project_simple_float_margin_boxes(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) {
     let layout_position = layouts
         .iter()
         .enumerate()
@@ -3848,10 +3853,19 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
+        viewport_w: f32,
+        viewport_h: f32,
     ) {
         let mut child_index = component_index + 1;
         for child in &component.children {
-            visit(child, child_index, layouts, layout_position);
+            visit(
+                child,
+                child_index,
+                layouts,
+                layout_position,
+                viewport_w,
+                viewport_h,
+            );
             child_index += count_nodes(child);
         }
 
@@ -3881,10 +3895,94 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                 )
                 && layouts[child_position].0.height.abs() <= f32::EPSILON
             {
-                let margin = child.style.margin_lengths();
-                let collapsed_margin =
-                    margin.top.max(margin.bottom).max(0.0) + margin.top.min(margin.bottom).min(0.0);
-                layouts[parent_position].0.height = collapsed_margin.max(0.0);
+                fn collect_collapsible_margins(
+                    component: &Component,
+                    component_index: usize,
+                    containing_width: f32,
+                    layouts: &[(LayoutRect, usize)],
+                    layout_position: &HashMap<usize, usize>,
+                    viewport_w: f32,
+                    viewport_h: f32,
+                    margins: &mut Vec<f32>,
+                ) -> bool {
+                    let Some(position) = layout_position.get(&component_index).copied() else {
+                        return false;
+                    };
+                    if component.style.display != WDisplay::Block
+                        || !matches!(component.style.height, WDim::Auto | WDim::Px(0.0))
+                        || layouts[position].0.height.abs() > f32::EPSILON
+                        || resolve_spacing_for_layout(
+                            component.style.padding.top,
+                            containing_width,
+                            component.style.font_size,
+                            viewport_w,
+                            viewport_h,
+                        )
+                        .abs()
+                            > f32::EPSILON
+                        || resolve_spacing_for_layout(
+                            component.style.padding.bottom,
+                            containing_width,
+                            component.style.font_size,
+                            viewport_w,
+                            viewport_h,
+                        )
+                        .abs()
+                            > f32::EPSILON
+                        || component
+                            .style
+                            .border_top_width
+                            .unwrap_or(component.style.border_width)
+                            > 0.0
+                        || component
+                            .style
+                            .border_bottom_width
+                            .unwrap_or(component.style.border_width)
+                            > 0.0
+                    {
+                        return false;
+                    }
+                    let own = component.style.margin_lengths();
+                    margins.extend([own.top, own.bottom]);
+                    let child_containing_width = layouts[position].0.width;
+                    let mut child_index = component_index + 1;
+                    for child in &component.children {
+                        let child_count = count_nodes(child);
+                        if !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                            && child.style.display != WDisplay::None
+                            && child.style.float == WFloat::None
+                            && !collect_collapsible_margins(
+                                child,
+                                child_index,
+                                child_containing_width,
+                                layouts,
+                                layout_position,
+                                viewport_w,
+                                viewport_h,
+                                margins,
+                            )
+                        {
+                            return false;
+                        }
+                        child_index += child_count;
+                    }
+                    true
+                }
+
+                let mut margins = Vec::new();
+                if collect_collapsible_margins(
+                    child,
+                    child_index,
+                    layouts[parent_position].0.width,
+                    layouts,
+                    layout_position,
+                    viewport_w,
+                    viewport_h,
+                    &mut margins,
+                ) {
+                    let collapsed_margin = collapse(margins);
+                    layouts[parent_position].0.height = collapsed_margin.max(0.0);
+                }
             }
         }
 
@@ -3978,13 +4076,12 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                 )
             {
                 let previous_margin = previous_child.style.margin_lengths();
-                if previous_margin.bottom < 0.0 {
-                    let child_margin = child.style.margin_lengths();
-                    let target_y = layouts[previous_position].0.y
-                        + layouts[previous_position].0.height
-                        + previous_margin.bottom
-                        + child_margin.top;
-                    let delta_y = target_y - layouts[child_position].0.y;
+                let child_margin = child.style.margin_lengths();
+                let target_y = layouts[previous_position].0.y
+                    + layouts[previous_position].0.height
+                    + collapse([previous_margin.bottom, child_margin.top]);
+                let delta_y = target_y - layouts[child_position].0.y;
+                if delta_y < -f32::EPSILON {
                     shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
                 }
             }
@@ -4146,7 +4243,14 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
         }
     }
 
-    visit(root, 0, layouts, &layout_position);
+    visit(
+        root,
+        0,
+        layouts,
+        &layout_position,
+        viewport_w,
+        viewport_h,
+    );
 }
 
 fn project_positioned_bfc_float_heights(
@@ -11723,6 +11827,79 @@ mod tests {
         assert_eq!(collapsed.height, 0.0);
         assert_eq!(floating.y, collapsed.y + 100.0);
         assert_eq!(following.y, 200.0);
+    }
+
+    #[test]
+    fn zero_resolved_percentage_padding_keeps_collapsed_margin_inside_a_float() {
+        let empty_block = |margin_top, margin_bottom, padding| {
+            Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    margin: w3cos_std::style::Edges {
+                        top: WSpacing::Px(margin_top),
+                        bottom: WSpacing::Px(margin_bottom),
+                        ..w3cos_std::style::Edges::ZERO
+                    },
+                    padding,
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        };
+        let root = Component::column(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(20.0),
+                        margin: w3cos_std::style::Edges {
+                            bottom: WSpacing::Px(16.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        float: WFloat::Left,
+                        width: WDim::Px(100.0),
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            width: WDim::Px(0.0),
+                            ..Style::default()
+                        },
+                        vec![
+                            empty_block(0.0, 100.0, w3cos_std::style::Edges::ZERO),
+                            empty_block(
+                                0.0,
+                                0.0,
+                                w3cos_std::style::Edges {
+                                    top: WSpacing::Percent(100.0),
+                                    bottom: WSpacing::Percent(100.0),
+                                    ..w3cos_std::style::Edges::ZERO
+                                },
+                            ),
+                            empty_block(100.0, 0.0, w3cos_std::style::Edges::ZERO),
+                        ],
+                    )],
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(floating.y, 36.0);
+        assert_eq!(floating.height, 100.0);
     }
 
     #[test]
