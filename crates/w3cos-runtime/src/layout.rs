@@ -255,6 +255,7 @@ fn leaf_intrinsic_size_with_containing(
             let h = dim_to_px(style.height).unwrap_or(20.0);
             (w, h)
         }
+        ComponentKind::Canvas { width, height } => (*width as f32, *height as f32),
         ComponentKind::SvgDocument { width, height, .. } => (*width as f32, *height as f32),
         _ => (0.0, 0.0),
     }
@@ -265,7 +266,65 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
 }
 
 fn component_max_content_width(component: &Component) -> f32 {
-    let child_width = |child: &Component| component_max_content_width(child);
+    let definite_content_height = match component.style.height {
+        WDim::Px(height) => Some(height),
+        WDim::Em(height) => Some(height * component.style.font_size),
+        WDim::Rem(height) => Some(height * ROOT_FONT_SIZE),
+        _ => None,
+    }
+    .map(|height| {
+        if component.style.box_sizing == WBoxSizing::BorderBox {
+            let padding = component.style.padding_lengths();
+            (height
+                - padding.top
+                - padding.bottom
+                - component
+                    .style
+                    .border_top_width
+                    .unwrap_or(component.style.border_width)
+                - component
+                    .style
+                    .border_bottom_width
+                    .unwrap_or(component.style.border_width))
+            .max(0.0)
+        } else {
+            height.max(0.0)
+        }
+    });
+    let child_width = |child: &Component| {
+        let intrinsic_width = component_max_content_width(child);
+        let ratio = match &child.kind {
+            ComponentKind::Image { src } => image_intrinsic_ratio(src),
+            ComponentKind::Canvas { width, height } if *height > 0 => {
+                Some(*width as f32 / *height as f32)
+            }
+            _ => None,
+        };
+        let percentage_replaced_width = match (
+            child.style.width,
+            child.style.height,
+            child.style.min_width,
+            child.style.max_width,
+            definite_content_height,
+            ratio,
+        ) {
+            (
+                WDim::Auto,
+                WDim::Percent(percent),
+                WDim::Auto,
+                WDim::Auto,
+                Some(height),
+                Some(ratio),
+            ) => Some(height * percent / 100.0 * ratio),
+            _ => None,
+        };
+        if let Some(width) = percentage_replaced_width {
+            let intrinsic_content_width = leaf_intrinsic_size(&child.kind, &child.style).0;
+            intrinsic_width + width - intrinsic_content_width
+        } else {
+            intrinsic_width
+        }
+    };
     let establishes_block_formatting_context = matches!(
         component.style.display,
         WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell
@@ -5704,6 +5763,11 @@ fn build_taffy_tree(
     }
 
     if comp.children.is_empty() {
+        if let ComponentKind::Canvas { width, height } = &comp.kind
+            && *height > 0
+        {
+            style.aspect_ratio = Some(*width as f32 / *height as f32);
+        }
         let constrained_replaced_size = if let ComponentKind::Image { src } = &comp.kind
             && let Some(ratio) = image_intrinsic_ratio(src)
         {
@@ -5946,6 +6010,16 @@ fn build_taffy_tree(
         if let Some((width, height)) = constrained_replaced_size {
             leaf_style.size.width = Dimension::length(width);
             leaf_style.size.height = Dimension::length(height);
+        }
+        if matches!(comp.kind, ComponentKind::Canvas { .. })
+            && matches!(parent_display, Some(WDisplay::InlineBlock))
+            && !matches!(comp.style.height, WDim::Auto)
+        {
+            // The column flexbox is only an internal model for anonymous
+            // block generation. A replaced element's percentage height is
+            // not a shrinkable flex main size in the CSS block formatting
+            // context it represents.
+            leaf_style.flex_shrink = 0.0;
         }
         if matches!(comp.kind, ComponentKind::Text { .. })
             && matches!(
@@ -10362,6 +10436,58 @@ mod tests {
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (100.0, 100.0));
         crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn percentage_canvas_height_uses_its_intrinsic_ratio_in_an_anonymous_block() {
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(784.0),
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::InlineBlock,
+                        height: WDim::Px(100.0),
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::canvas(
+                            10,
+                            10,
+                            Style {
+                                display: WDisp::InlineBlock,
+                                height: WDim::Percent(100.0),
+                                position: WPos::Relative,
+                                z_index: -1,
+                                ..Style::default()
+                            },
+                        ),
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                margin: w3cos_std::style::Edges {
+                                    top: WSpacing::Px(16.0),
+                                    bottom: WSpacing::Px(16.0),
+                                    ..w3cos_std::style::Edges::ZERO
+                                },
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                    ],
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let parent = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let canvas = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!((parent.width, parent.height), (100.0, 100.0));
+        assert_eq!((canvas.width, canvas.height), (100.0, 100.0));
     }
 
     #[test]
