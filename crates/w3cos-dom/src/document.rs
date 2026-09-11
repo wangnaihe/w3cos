@@ -1820,6 +1820,45 @@ impl Document {
         if let Some(width) = left_width {
             style.border_left_width = Some(width);
         }
+        let relative_side_color = |properties: &[&str]| {
+            last_border_declaration(properties).and_then(|value| {
+                split_css_tokens(value)
+                    .into_iter()
+                    .find_map(|token| w3cos_std::Color::from_css(&token))
+            })
+        };
+        if let Some(color) = relative_side_color(&[
+            "border",
+            "border-color",
+            "border-top",
+            "border-top-color",
+        ]) {
+            style.border_top_color = Some(color);
+        }
+        if let Some(color) = relative_side_color(&[
+            "border",
+            "border-color",
+            "border-right",
+            "border-right-color",
+        ]) {
+            style.border_right_color = Some(color);
+        }
+        if let Some(color) = relative_side_color(&[
+            "border",
+            "border-color",
+            "border-bottom",
+            "border-bottom-color",
+        ]) {
+            style.border_bottom_color = Some(color);
+        }
+        if let Some(color) = relative_side_color(&[
+            "border",
+            "border-color",
+            "border-left",
+            "border-left-color",
+        ]) {
+            style.border_left_color = Some(color);
+        }
         if declared_value(&["border-color"])
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
         {
@@ -12250,6 +12289,34 @@ mod computed_style_cache_tests {
         let style = document.computed_style_for(target.id);
         assert_eq!(style.border_width, 80.0);
         assert_eq!(style.border_color, w3cos_std::Color::rgb(255, 255, 255));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn relative_side_border_shorthands_keep_their_declared_colors() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[
+                ("font-size", "16px"),
+                ("border-top", "solid green 1em"),
+                ("border-bottom", "solid green 1em"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.border_top_width, Some(16.0));
+        assert_eq!(style.border_bottom_width, Some(16.0));
+        assert_eq!(style.border_top_color, Some(w3cos_std::Color::rgb(0, 128, 0)));
+        assert_eq!(
+            style.border_bottom_color,
+            Some(w3cos_std::Color::rgb(0, 128, 0))
+        );
         crate::stylesheet::clear_rules();
     }
 
