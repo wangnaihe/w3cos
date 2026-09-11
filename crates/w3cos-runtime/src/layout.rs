@@ -4784,7 +4784,9 @@ fn build_taffy_tree(
         style.flex_wrap = FlexWrap::Wrap;
         style.align_items = Some(AlignItems::FlexStart);
         style.align_content = Some(AlignContent::FlexStart);
-        if matches!(comp.style.min_height, WDim::Auto) {
+        if matches!(comp.style.height, WDim::Auto)
+            && matches!(comp.style.min_height, WDim::Auto)
+        {
             let line_height = comp.style.font_size * comp.style.line_height;
             let baseline_replaced_height = comp
                 .children
@@ -8572,6 +8574,32 @@ mod tests {
         let root = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
 
         assert_eq!(root.height, 102.0);
+    }
+
+    #[test]
+    fn definite_zero_height_block_does_not_expand_to_its_line_box() {
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                height: WDim::Px(0.0),
+                ..Style::default()
+            },
+            vec![Component::text(
+                "overflowing text",
+                Style {
+                    display: WDisp::Inline,
+                    ..Style::default()
+                },
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+
+        assert_eq!(root.height, 0.0);
+        assert!(text.height > root.height);
     }
 
     #[test]
