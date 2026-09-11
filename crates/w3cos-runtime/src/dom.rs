@@ -92,6 +92,10 @@ pub(crate) fn set_html_document(html_document: bool) {
     with_document_mut(|document| document.set_html_document(html_document));
 }
 
+pub(crate) fn set_quirks_mode(quirks_mode: bool) {
+    with_document_mut(|document| document.set_quirks_mode(quirks_mode));
+}
+
 pub fn append_child(parent: u32, child: u32) {
     let old_parent = parent_node(child);
     let old_previous = previous_sibling(child);

@@ -137,6 +137,8 @@ pub struct Document {
     // HTML attribute selector matching has a few document-language-specific
     // case-folding rules which do not apply to XML/XHTML documents.
     html_document: bool,
+    // Quirks mode changes percentage-height containing-block traversal.
+    quirks_mode: bool,
 }
 
 impl Document {
@@ -163,6 +165,7 @@ impl Document {
             image_render_sources: HashMap::new(),
             selection: Selection::new(),
             html_document: true,
+            quirks_mode: false,
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -246,6 +249,14 @@ impl Document {
             return;
         }
         self.html_document = html_document;
+        self.mark_dirty(NodeId::ROOT);
+    }
+
+    pub fn set_quirks_mode(&mut self, quirks_mode: bool) {
+        if self.quirks_mode == quirks_mode {
+            return;
+        }
+        self.quirks_mode = quirks_mode;
         self.mark_dirty(NodeId::ROOT);
     }
 
@@ -3165,8 +3176,16 @@ impl Document {
     ) -> w3cos_std::Component {
         let node = self.get_node(id);
         let mut style = self.computed_style(id, ancestors, inherited);
-        if matches!(style.height, w3cos_std::style::Dimension::Percent(_))
-            && inherited.is_some_and(|parent| {
+        if matches!(style.height, w3cos_std::style::Dimension::Percent(_)) {
+            if self.quirks_mode {
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-quirks-percentage-height".to_string(),
+                        "1".to_string(),
+                    );
+            } else if inherited.is_some_and(|parent| {
                 matches!(parent.height, w3cos_std::style::Dimension::Auto)
                     && matches!(
                         parent.display,
@@ -3176,13 +3195,13 @@ impl Document {
                             | w3cos_std::style::Display::TableCell
                             | w3cos_std::style::Display::TableCaption
                     )
-            })
-        {
-            // Percentage heights in an auto-height block formatting context
-            // are indefinite and compute to the auto used height. Letting
-            // Taffy resolve the percentage against the block's eventual
-            // content height creates a cyclic non-zero box.
-            style.height = w3cos_std::style::Dimension::Auto;
+            }) {
+                // Percentage heights in an auto-height block formatting context
+                // are indefinite and compute to the auto used height. Letting
+                // Taffy resolve the percentage against the block's eventual
+                // content height creates a cyclic non-zero box.
+                style.height = w3cos_std::style::Dimension::Auto;
+            }
         }
         let qualified_tag = node.tag.as_str();
         let tag = qualified_tag
@@ -9603,6 +9622,46 @@ mod image_component_tests {
         assert_eq!(
             tree.children[1].children[0].style.height,
             Dimension::Percent(20.0)
+        );
+
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn quirks_mode_keeps_percentage_height_through_an_auto_height_ancestor() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#fixed", &[("height", "100px")]);
+        crate::stylesheet::register_rule(
+            "#percentage",
+            &[("float", "left"), ("height", "100%")],
+        );
+
+        let mut document = Document::new();
+        document.set_quirks_mode(true);
+        let fixed = document.create_element("div");
+        fixed.set_attribute(&mut document, "id", "fixed");
+        let automatic = document.create_element("div");
+        let percentage = document.create_element("div");
+        percentage.set_attribute(&mut document, "id", "percentage");
+        automatic.append_child(&mut document, percentage);
+        fixed.append_child(&mut document, automatic);
+        document.body().append_child(&mut document, fixed);
+
+        let tree = document.to_component_tree();
+        assert_eq!(
+            tree.children[0].children[0].children[0].style.height,
+            Dimension::Percent(100.0)
+        );
+        assert_eq!(
+            tree.children[0].children[0].children[0]
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| {
+                    properties.get("--w3cos-internal-quirks-percentage-height")
+                })
+                .map(String::as_str),
+            Some("1")
         );
 
         crate::stylesheet::clear_rules();

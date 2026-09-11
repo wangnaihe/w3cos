@@ -2734,6 +2734,7 @@ pub(crate) fn sync_global_document_child_relationships() {
 }
 
 pub(crate) fn set_document_compat_mode(quirks: bool) {
+    crate::dom::set_quirks_mode(quirks);
     document_value().set_property(
         "compatMode",
         Value::string(if quirks { "BackCompat" } else { "CSS1Compat" }),

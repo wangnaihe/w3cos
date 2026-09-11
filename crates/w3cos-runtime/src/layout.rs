@@ -1762,6 +1762,7 @@ impl LayoutEngine {
                 viewport_w,
                 viewport_h,
                 viewport_w,
+                Some(viewport_h),
                 None,
                 false,
                 None,
@@ -1903,6 +1904,7 @@ pub fn compute_with_scroll(
         viewport_w,
         viewport_h,
         viewport_w,
+        Some(viewport_h),
         None,
         false,
         None,
@@ -4276,6 +4278,7 @@ fn build_taffy_tree(
     viewport_w: f32,
     viewport_h: f32,
     containing_width: f32,
+    quirks_height_basis: Option<f32>,
     inherited_table_tracks: Option<&[f32]>,
     inherited_fixed_table_layout: bool,
     inherited_collapsed_single_track: Option<CollapsedSingleTrack>,
@@ -4287,6 +4290,29 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    let quirks_percentage_height = comp
+        .style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-quirks-percentage-height")
+        });
+    let own_quirks_height_basis = match comp.style.height {
+        WDim::Px(value) => Some(value),
+        WDim::Em(value) => Some(value * comp.style.font_size),
+        WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
+        WDim::Vh(value) => Some(value * viewport_h / 100.0),
+        WDim::Percent(value) if quirks_percentage_height => {
+            quirks_height_basis.map(|basis| basis * value / 100.0)
+        }
+        _ => None,
+    };
+    if quirks_percentage_height
+        && let Some(height) = own_quirks_height_basis
+    {
+        style.size.height = Dimension::length(height);
+    }
+    let child_quirks_height_basis = own_quirks_height_basis.or(quirks_height_basis);
     let passive_inline_edges = matches!(
         comp.kind,
         ComponentKind::Row
@@ -5349,6 +5375,7 @@ fn build_taffy_tree(
                         viewport_w,
                         viewport_h,
                         child_containing_width,
+                        child_quirks_height_basis,
                         active_table_tracks,
                         active_fixed_table_layout,
                         active_collapsed_single_track,
