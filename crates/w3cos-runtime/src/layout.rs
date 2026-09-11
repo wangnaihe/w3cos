@@ -3207,6 +3207,20 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
         }
     }
 
+    fn shift_subtree_x(
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+        start: usize,
+        count: usize,
+        delta_x: f32,
+    ) {
+        for index in start..start + count {
+            if let Some(position) = layout_position.get(&index).copied() {
+                layouts[position].0.x += delta_x;
+            }
+        }
+    }
+
     fn visit(
         component: &Component,
         component_index: usize,
@@ -3298,7 +3312,7 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
             collapse(margins)
         }
 
-        let mut active_floats = Vec::<(WFloat, f32)>::new();
+        let mut active_floats = Vec::<(WFloat, LayoutRect)>::new();
         let mut previous = None::<(usize, &Component)>;
         let mut previous_in_flow = None::<(usize, &Component)>;
         let mut float_since_in_flow = false;
@@ -3352,6 +3366,54 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                     shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
                 }
             }
+            if child.style.float == WFloat::None
+                && child.style.clear == WClear::None
+                && previous_in_flow.is_none()
+                && !active_floats.is_empty()
+                && let Some(position) = layout_position.get(&child_index).copied()
+            {
+                let current = layouts[position].0;
+                let float_top = active_floats
+                    .iter()
+                    .map(|(_, rect)| rect.y)
+                    .reduce(f32::min)
+                    .unwrap_or(current.y);
+                let float_bottom = active_floats
+                    .iter()
+                    .map(|(_, rect)| rect.y + rect.height)
+                    .reduce(f32::max)
+                    .unwrap_or(current.y);
+                if current.y + f32::EPSILON >= float_bottom {
+                    let delta_y = float_top - current.y;
+                    shift_subtree(
+                        layouts,
+                        layout_position,
+                        child_index,
+                        child_count,
+                        delta_y,
+                    );
+                    normal_flow_correction = normal_flow_correction.min(delta_y);
+                    if child.style.resolved_overflow_x() != WOverflow::Visible
+                        || child.style.resolved_overflow_y() != WOverflow::Visible
+                    {
+                        let left_float_edge = active_floats
+                            .iter()
+                            .filter(|(side, _)| *side == WFloat::Left)
+                            .map(|(_, rect)| rect.x + rect.width)
+                            .reduce(f32::max)
+                            .unwrap_or(current.x);
+                        if left_float_edge > current.x {
+                            shift_subtree_x(
+                                layouts,
+                                layout_position,
+                                child_index,
+                                child_count,
+                                left_float_edge - current.x,
+                            );
+                        }
+                    }
+                }
+            }
             if child.style.clear != WClear::None {
                 let clearance_bottom = active_floats
                     .iter()
@@ -3363,7 +3425,7 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                                 | (WClear::Both, WFloat::Left | WFloat::Right)
                         )
                     })
-                    .map(|(_, bottom)| *bottom)
+                    .map(|(_, rect)| rect.y + rect.height)
                     .reduce(f32::max);
                 if let (Some(clearance_bottom), Some(position)) =
                     (clearance_bottom, layout_position.get(&child_index).copied())
@@ -3387,7 +3449,10 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                 let rect = layouts[position].0;
                 active_floats.push((
                     child.style.float,
-                    rect.y + rect.height + child.style.margin_lengths().bottom,
+                    LayoutRect {
+                        height: rect.height + child.style.margin_lengths().bottom,
+                        ..rect
+                    },
                 ));
                 float_since_in_flow = true;
             } else {
@@ -9901,6 +9966,59 @@ mod tests {
         let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         let cleared = layout.iter().find(|(_, index)| *index == 5).unwrap().0;
         assert_eq!(cleared.y, floating.y + floating.height);
+    }
+
+    #[test]
+    fn leading_block_overlaps_or_avoids_a_float_by_formatting_context() {
+        let layout = |overflow| {
+            compute(
+                &Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(200.0),
+                        height: WDim::Px(200.0),
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                float: WFloat::Left,
+                                width: WDim::Px(50.0),
+                                height: WDim::Px(50.0),
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                overflow,
+                                width: WDim::Px(50.0),
+                                height: WDim::Px(50.0),
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                    ],
+                ),
+                800.0,
+                600.0,
+            )
+            .unwrap()
+        };
+
+        let visible = layout(WOverflow::Visible);
+        let visible_float = visible.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let visible_block = visible.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(visible_block.y, visible_float.y);
+        assert_eq!(visible_block.x, visible_float.x);
+
+        let hidden = layout(WOverflow::Hidden);
+        let hidden_float = hidden.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let hidden_block = hidden.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(hidden_block.y, hidden_float.y);
+        assert_eq!(hidden_block.x, hidden_float.x + hidden_float.width);
     }
 
     #[test]
