@@ -1881,6 +1881,7 @@ impl LayoutEngine {
         project_empty_painted_inline_boxes(&mut results, flat);
         project_fixed_table_cell_rects(&mut results, root, viewport_w, viewport_h);
         project_forced_break_lines(&mut results, root);
+        align_inline_block_last_line_baselines(&mut results, root);
         project_collapsible_line_end_whitespace(&mut results, flat);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_inline_after_leading_empty_blocks(&mut results, root);
@@ -2016,6 +2017,7 @@ pub fn compute_with_scroll(
     project_empty_painted_inline_boxes(&mut results, &flat);
     project_fixed_table_cell_rects(&mut results, &layout_root, viewport_w, viewport_h);
     project_forced_break_lines(&mut results, root);
+    align_inline_block_last_line_baselines(&mut results, root);
     project_collapsible_line_end_whitespace(&mut results, &flat);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_inline_after_leading_empty_blocks(&mut results, root);
@@ -3948,6 +3950,111 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
     }
 
     visit(root, 0, layouts, &layout_position);
+}
+
+fn align_inline_block_last_line_baselines(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn last_text_baseline(
+        component: &Component,
+        component_index: usize,
+        layouts: &[(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>,
+    ) -> Option<f32> {
+        let own = (component.style.visibility == WVisibility::Visible
+            && !matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+            && matches!(component.kind, ComponentKind::Text { .. }))
+        .then(|| {
+            positions
+                .get(&component_index)
+                .map(|position| layouts[*position].0.y + component.style.font_size * 0.8)
+        })
+        .flatten();
+        let mut child_index = component_index + 1;
+        component.children.iter().fold(own, |latest, child| {
+            let child_baseline = last_text_baseline(child, child_index, layouts, positions);
+            child_index += count_nodes(child);
+            match (latest, child_baseline) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            }
+        })
+    }
+
+    fn shift_subtree(
+        layouts: &mut [(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>,
+        component_index: usize,
+        component: &Component,
+        delta_y: f32,
+    ) {
+        for index in component_index..component_index + count_nodes(component) {
+            if let Some(position) = positions.get(&index) {
+                layouts[*position].0.y += delta_y;
+            }
+        }
+    }
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>,
+    ) {
+        let mut child_index = component_index + 1;
+        let children = component
+            .children
+            .iter()
+            .map(|child| {
+                let index = child_index;
+                child_index += count_nodes(child);
+                (child, index)
+            })
+            .collect::<Vec<_>>();
+        for (child, index) in &children {
+            visit(child, *index, layouts, positions);
+        }
+
+        let reference_baseline = children
+            .iter()
+            .filter(|(child, _)| {
+                child.style.display == WDisplay::Inline
+                    && child.style.visibility == WVisibility::Visible
+                    && matches!(child.kind, ComponentKind::Text { .. })
+            })
+            .filter_map(|(child, index)| {
+                positions
+                    .get(index)
+                    .map(|position| layouts[*position].0.y + child.style.font_size * 0.8)
+            })
+            .reduce(f32::max);
+        let Some(reference_baseline) = reference_baseline else {
+            return;
+        };
+        for (child, index) in children {
+            if child.style.display != WDisplay::InlineBlock
+                || !matches!(child.style.overflow, WOverflow::Visible)
+            {
+                continue;
+            }
+            let Some(last_baseline) = last_text_baseline(child, index, layouts, positions) else {
+                continue;
+            };
+            let delta_y = reference_baseline - last_baseline;
+            if delta_y.abs() > f32::EPSILON {
+                shift_subtree(layouts, positions, index, child, delta_y);
+            }
+        }
+    }
+
+    visit(root, 0, layouts, &positions);
 }
 
 fn project_table_column_background_rects(
@@ -12866,6 +12973,46 @@ mod tests {
         assert_eq!(rect(1).width, 120.0, "layout={layout:#?}");
         assert_eq!(rect(2).width, 120.0, "layout={layout:#?}");
         stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inline_block_aligns_its_last_line_to_sibling_text() {
+        let text = |content, display, visibility| {
+            Component::text(
+                content,
+                Style {
+                    display,
+                    visibility,
+                    ..Style::default()
+                },
+            )
+        };
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                ..Style::default()
+            },
+            vec![
+                text("x", WDisp::Block, WVisibility::Hidden),
+                text("bcd", WDisp::Inline, WVisibility::Visible),
+            ],
+        );
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![
+                text("a", WDisp::Inline, WVisibility::Visible),
+                inline_block,
+                text("e", WDisp::Inline, WVisibility::Visible),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(4).y, rect(1).y);
+        assert_eq!(rect(5).y, rect(1).y);
     }
 
     #[test]
