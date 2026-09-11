@@ -3035,7 +3035,7 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                 {
                     let current_y = layouts[position].0.y;
                     let target_y = (current_y - leading_margin_group(child)).max(clearance_bottom);
-                    if target_y < current_y - f32::EPSILON {
+                    if (target_y - current_y).abs() > f32::EPSILON {
                         shift_subtree(
                             layouts,
                             layout_position,
@@ -9252,6 +9252,76 @@ mod tests {
             .0;
         assert_eq!(direct_content.y, 50.0);
         assert_eq!(nested_content.y, 50.0);
+    }
+
+    #[test]
+    fn clear_moves_below_float_after_empty_margin_group_cancels() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(25.0),
+                        margin: w3cos_std::style::Edges {
+                            bottom: WSpacing::Px(25.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Flex,
+                        float: WFloat::Left,
+                        width: WDim::Px(25.0),
+                        height: WDim::Px(25.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(0.0),
+                        margin: w3cos_std::style::Edges {
+                            bottom: WSpacing::Px(25.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            margin: w3cos_std::style::Edges {
+                                bottom: WSpacing::Px(-25.0),
+                                ..w3cos_std::style::Edges::ZERO
+                            },
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        clear: WClear::Both,
+                        height: WDim::Px(25.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let cleared = layout.iter().find(|(_, index)| *index == 5).unwrap().0;
+        assert_eq!(cleared.y, floating.y + floating.height);
     }
 
     #[test]
