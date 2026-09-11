@@ -4638,11 +4638,14 @@ fn build_taffy_tree(
         style.size.height = Dimension::length(height);
     }
     let child_quirks_height_basis = own_quirks_height_basis.or(quirks_height_basis);
-    let marked_replaced_element = comp
-        .style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|properties| properties.contains_key("--w3cos-internal-replaced-element"));
+    let marked_replaced_element = matches!(comp.kind, ComponentKind::SvgDocument { .. })
+        || comp
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-replaced-element")
+            });
     let passive_inline_edges = !marked_replaced_element
         && matches!(
         comp.kind,

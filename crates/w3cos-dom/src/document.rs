@@ -6032,7 +6032,6 @@ impl Document {
         match tag {
             "svg" => {
                 let (width, height) = self.svg_root_size(id);
-                style.position = Position::Relative;
                 if matches!(style.width, Dimension::Auto) {
                     let attribute_width = self
                         .svg_attribute(id, "width")
@@ -9716,6 +9715,22 @@ mod image_component_tests {
         assert!(source.contains("<rect "));
         assert!(!source.contains("svg:svg"));
         assert!(!source.contains("svg:rect"));
+    }
+
+    #[test]
+    fn svg_presentation_attributes_do_not_override_css_position() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("svg", &[("position", "absolute")]);
+
+        let mut document = Document::new();
+        let svg = document.create_element("svg:svg");
+        document.body().append_child(&mut document, svg);
+
+        let tree = document.to_component_tree();
+        let svg = tree.children.first().expect("svg component");
+        assert_eq!(svg.style.position, Position::Absolute);
+
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
