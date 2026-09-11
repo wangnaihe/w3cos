@@ -2012,7 +2012,12 @@ impl LayoutEngine {
         project_collapsible_line_end_whitespace(&mut results, flat);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_inline_after_leading_empty_blocks(&mut results, root);
-        project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
+        project_constrained_height_trailing_margin_containment(
+            &mut results,
+            root,
+            viewport_w,
+            viewport_h,
+        );
         project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
         project_positioned_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
@@ -2151,7 +2156,12 @@ pub fn compute_with_scroll(
     project_collapsible_line_end_whitespace(&mut results, &flat);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_inline_after_leading_empty_blocks(&mut results, root);
-    project_min_height_trailing_margin_containment(&mut results, root, viewport_w, viewport_h);
+    project_constrained_height_trailing_margin_containment(
+        &mut results,
+        root,
+        viewport_w,
+        viewport_h,
+    );
     project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
     project_positioned_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
@@ -3621,7 +3631,7 @@ fn project_inline_after_leading_empty_blocks(
     visit(root, 0, layouts, &layout_position);
 }
 
-fn project_min_height_trailing_margin_containment(
+fn project_constrained_height_trailing_margin_containment(
     layouts: &mut [(LayoutRect, usize)],
     root: &Component,
     viewport_w: f32,
@@ -3687,7 +3697,8 @@ fn project_min_height_trailing_margin_containment(
             let (following_index, following) = pair[1];
             if previous.style.display != WDisplay::Block
                 || !matches!(previous.style.height, WDim::Auto)
-                || matches!(previous.style.min_height, WDim::Auto)
+                || (matches!(previous.style.min_height, WDim::Auto)
+                    && matches!(previous.style.max_height, WDim::Auto))
                 || previous.style.padding_lengths().bottom.abs() > f32::EPSILON
                 || previous
                     .style
@@ -3700,6 +3711,7 @@ fn project_min_height_trailing_margin_containment(
             let previous_position = *layout_position
                 .get(&previous_index)
                 .expect("in-flow child layout");
+            let previous_rect = layouts[previous_position].0;
             let previous_width = layouts[previous_position].0.width;
             let mut previous_children = Vec::new();
             let mut previous_child_index = previous_index + 1;
@@ -3712,8 +3724,14 @@ fn project_min_height_trailing_margin_containment(
                 }
                 previous_child_index += count_nodes(child);
             }
+            let content_overflows_bottom = previous_children.iter().any(|(child_index, _)| {
+                layout_position.get(child_index).is_some_and(|position| {
+                    let child = layouts[*position].0;
+                    child.y + child.height > previous_rect.y + previous_rect.height + 0.01
+                })
+            });
             let mut trailing_margins = Vec::new();
-            for (child_index, child) in previous_children.into_iter().rev() {
+            for &(child_index, child) in previous_children.iter().rev() {
                 trailing_margins.push(resolve_spacing_for_layout(
                     child.style.margin.bottom,
                     previous_width,
@@ -3753,22 +3771,35 @@ fn project_min_height_trailing_margin_containment(
             if trailing_margin <= 0.01 {
                 continue;
             }
-            let Some(min_height) = previous.style.min_height.resolve(
-                containing_height,
-                ROOT_FONT_SIZE,
-                previous.style.font_size,
-                viewport_w,
-                viewport_h,
-            ) else {
+            let constrained_by_min = previous
+                .style
+                .min_height
+                .resolve(
+                    containing_height,
+                    ROOT_FONT_SIZE,
+                    previous.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                )
+                .is_some_and(|min_height| previous_rect.height <= min_height + 0.01);
+            let constrained_by_max = content_overflows_bottom
+                && previous
+                    .style
+                    .max_height
+                    .resolve(
+                        containing_height,
+                        ROOT_FONT_SIZE,
+                        previous.style.font_size,
+                        viewport_w,
+                        viewport_h,
+                    )
+                    .is_some_and(|max_height| previous_rect.height <= max_height + 0.01);
+            if !constrained_by_min && !constrained_by_max {
                 continue;
-            };
+            }
             let Some(following_position) = layout_position.get(&following_index).copied() else {
                 continue;
             };
-            let previous_rect = layouts[previous_position].0;
-            if previous_rect.height > min_height + 0.01 {
-                continue;
-            }
             let previous_margin = previous.style.margin_lengths();
             let following_margin = following.style.margin_lengths();
             let expected_y = previous_rect.y
@@ -11514,6 +11545,52 @@ mod tests {
         assert_eq!(marker.y, parent.y + 130.0);
         assert_eq!(footer.y, parent.y + parent.height);
         assert_eq!(root.height, 251.0);
+    }
+
+    #[test]
+    fn active_max_height_traps_an_overflowing_childs_bottom_margin() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        max_height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            height: WDim::Px(51.0),
+                            margin: w3cos_std::style::Edges {
+                                bottom: WSpacing::Px(10.0),
+                                ..w3cos_std::style::Edges::ZERO
+                            },
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let constrained = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(constrained.height, 50.0);
+        assert_eq!(following.y, constrained.y + constrained.height);
     }
 
     #[test]
