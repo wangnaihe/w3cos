@@ -4705,6 +4705,7 @@ impl Document {
                                 | w3cos_std::style::Display::Grid
                                 | w3cos_std::style::Display::TableCell
                                 | w3cos_std::style::Display::Table
+                                | w3cos_std::style::Display::None
                         )
                     })
                 {
