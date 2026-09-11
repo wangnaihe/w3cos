@@ -8766,12 +8766,33 @@ fn hoist_floats_into_block_formatting_context(
         ) {
             let mut has_prior_in_flow = false;
             let mut retained = Vec::new();
-            for child in std::mem::take(&mut component.children) {
+            let children = std::mem::take(&mut component.children);
+            for (index, child) in children.iter().cloned().enumerate() {
+                let nested_left_float = child.style.float == w3cos_std::style::Float::Left;
+                let has_later_in_flow = children[index + 1..]
+                    .iter()
+                    .any(contributes_in_flow_content);
                 let extract_child =
                     child.style.float != w3cos_std::style::Float::Right || has_prior_in_flow;
                 if let Some(child) = collect(child, extract_child, left, right) {
                     has_prior_in_flow |= contributes_in_flow_content(&child);
                     retained.push(child);
+                } else if nested_left_float && has_prior_in_flow && has_later_in_flow {
+                    // A float between block descendants still leaves the
+                    // containing inline's anonymous line box at that split
+                    // point. Preserve its zero-width font strut after moving
+                    // the float to the outer block formatting context.
+                    let mut strut_style = w3cos_std::style::Style::default();
+                    strut_style.display = w3cos_std::style::Display::Inline;
+                    strut_style.font_size = component.style.font_size;
+                    strut_style.font_weight = component.style.font_weight;
+                    strut_style.font_family = component.style.font_family.clone();
+                    strut_style.font_style = component.style.font_style;
+                    strut_style.line_height = component.style.line_height;
+                    strut_style.letter_spacing = component.style.letter_spacing;
+                    strut_style.word_spacing = component.style.word_spacing;
+                    strut_style.white_space = component.style.white_space;
+                    retained.push(w3cos_std::Component::text(" ", strut_style));
                 }
             }
             component.children = retained;
@@ -9456,6 +9477,32 @@ mod image_component_tests {
         assert!(matches!(fixed[1].kind, ComponentKind::Text { ref content } if content == " "));
         assert_eq!(fixed[2].style.float, Float::Right);
         assert_eq!(fixed[2].style.display, Display::Block);
+
+        let mut positioned_inline_style = w3cos_std::style::Style::default();
+        positioned_inline_style.display = Display::Inline;
+        positioned_inline_style.position = w3cos_std::style::Position::Relative;
+        positioned_inline_style.line_height = 1.5;
+        let block = || {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Block;
+            w3cos_std::Component::text("block", style)
+        };
+        let positioned_inline = w3cos_std::Component::boxed(
+            positioned_inline_style,
+            vec![block(), floating_box(Float::Left), block()],
+        );
+        let fixed = hoist_floats_into_block_formatting_context(
+            &w3cos_std::style::Style::default(),
+            vec![positioned_inline],
+        );
+        assert_eq!(fixed.len(), 2);
+        assert_eq!(fixed[0].style.float, Float::Left);
+        assert_eq!(fixed[1].children.len(), 3);
+        assert!(matches!(
+            fixed[1].children[1].kind,
+            ComponentKind::Text { ref content } if content == " "
+        ));
+        assert_eq!(fixed[1].children[1].style.line_height, 1.5);
 
         let mut line_style = w3cos_std::style::Style::default();
         line_style.display = Display::Inline;

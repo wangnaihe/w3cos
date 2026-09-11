@@ -4723,6 +4723,26 @@ fn build_taffy_tree(
         // the inner block axis here without changing its outer display.
         style.flex_direction = FlexDirection::Column;
     }
+    if comp.style.display == WDisplay::Inline
+        && comp.style.position == WPos::Relative
+        && comp.children.iter().any(|child| {
+            matches!(
+                child.style.display,
+                WDisplay::Block
+                    | WDisplay::Flex
+                    | WDisplay::Grid
+                    | WDisplay::Table
+                    | WDisplay::ListItem
+            )
+        })
+    {
+        // Positioned inline boxes are retained as semantic containing blocks
+        // when in-flow block descendants split their inline formatting
+        // context. The retained host still needs a block axis internally;
+        // otherwise Taffy's inline flex fallback lays the split blocks out on
+        // one row after nested floats have been hoisted.
+        style.flex_direction = FlexDirection::Column;
+    }
     if comp.style.display == WDisplay::InlineTable
         && comp.children.iter().any(|child| {
             matches!(
