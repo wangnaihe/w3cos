@@ -1517,16 +1517,18 @@ fn leaf_taffy_size(
     base: &taffy::Style,
     parent_display: Option<WDisplay>,
     containing_width: f32,
+    viewport_w: f32,
+    viewport_h: f32,
 ) -> taffy::Size<Dimension> {
     // `display:inline` normally forces both axes to auto in `to_taffy_style`,
     // but replaced elements such as `<img>` still honor their CSS width and
     // height. Use the semantic dimensions here before applying leaf sizing.
     let replaced_width = (matches!(kind, ComponentKind::Image { .. })
         && !matches!(style.width, WDim::Auto))
-    .then_some(base.size.width);
+    .then(|| to_taffy_dim(style.width, style.font_size, viewport_w, viewport_h));
     let replaced_height = (matches!(kind, ComponentKind::Image { .. })
         && !matches!(style.height, WDim::Auto))
-    .then_some(base.size.height);
+    .then(|| to_taffy_dim(style.height, style.font_size, viewport_w, viewport_h));
     let width = if let Some(width) = replaced_width {
         width
     } else if matches!(style.width, WDim::Auto) {
@@ -5173,6 +5175,8 @@ fn build_taffy_tree(
             &style,
             parent_display,
             containing_width,
+            viewport_w,
+            viewport_h,
         );
         let inline_control_in_block =
             matches!(
@@ -9772,6 +9776,30 @@ mod tests {
 
         assert_eq!(layout[1].0.width, 40.0);
         assert!(layout[1].0.height > 0.0, "replaced image height collapsed");
+    }
+
+    #[test]
+    fn inline_replaced_leaf_preserves_its_authored_width() {
+        let style = Style {
+            display: WDisp::Inline,
+            width: WDim::Px(96.0),
+            height: WDim::Auto,
+            ..Style::default()
+        };
+        let base = to_taffy_style(&style, 800.0, 600.0);
+        let size = leaf_taffy_size(
+            &ComponentKind::Image {
+                src: "missing-ratio-image.png".to_string(),
+            },
+            &style,
+            &base,
+            Some(WDisp::Block),
+            800.0,
+            800.0,
+            600.0,
+        );
+
+        assert_eq!(size.width, Dimension::length(96.0));
     }
 
     #[test]
