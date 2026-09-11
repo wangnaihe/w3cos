@@ -1450,7 +1450,7 @@ impl Document {
                     _ => {}
                 }
             }
-            let inherited_margin = |value| match value {
+            let inherited_spacing = |value| match value {
                 // CSS inheritance copies the computed value. Relative `em`
                 // lengths therefore keep the parent's resolved font metric
                 // instead of being recomputed against the child's font size.
@@ -1460,10 +1460,10 @@ impl Document {
                 other => other,
             };
             let inherited_margin_edges = [
-                inherited_margin(parent.margin.top),
-                inherited_margin(parent.margin.right),
-                inherited_margin(parent.margin.bottom),
-                inherited_margin(parent.margin.left),
+                inherited_spacing(parent.margin.top),
+                inherited_spacing(parent.margin.right),
+                inherited_spacing(parent.margin.bottom),
+                inherited_spacing(parent.margin.left),
             ];
             let mut margin_edges = [
                 style.margin.top,
@@ -1495,6 +1495,43 @@ impl Document {
                 right: margin_edges[1],
                 bottom: margin_edges[2],
                 left: margin_edges[3],
+            };
+            let inherited_padding_edges = [
+                inherited_spacing(parent.padding.top),
+                inherited_spacing(parent.padding.right),
+                inherited_spacing(parent.padding.bottom),
+                inherited_spacing(parent.padding.left),
+            ];
+            let mut padding_edges = [
+                style.padding.top,
+                style.padding.right,
+                style.padding.bottom,
+                style.padding.left,
+            ];
+            for (side, properties) in [
+                ["padding", "padding-top", "paddingTop"],
+                ["padding", "padding-right", "paddingRight"],
+                ["padding", "padding-bottom", "paddingBottom"],
+                ["padding", "padding-left", "paddingLeft"],
+            ]
+            .iter()
+            .enumerate()
+            {
+                if let Some((_, value)) = declared_property_value(properties) {
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "inherit" => padding_edges[side] = inherited_padding_edges[side],
+                        "initial" | "unset" | "revert" | "revert-layer" => {
+                            padding_edges[side] = w3cos_std::style::Spacing::Px(0.0)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            style.padding = w3cos_std::style::Edges {
+                top: padding_edges[0],
+                right: padding_edges[1],
+                bottom: padding_edges[2],
+                left: padding_edges[3],
             };
             if declared_property_value(&["direction"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
@@ -11473,6 +11510,27 @@ mod computed_style_cache_tests {
         assert_eq!(
             document.computed_style_for(child.id).margin,
             document.computed_style_for(parent.id).margin
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn padding_shorthand_inherit_copies_all_parent_edges() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("padding", "96px 24px 72px 48px")]);
+        crate::stylesheet::register_rule("#child", &[("padding", "inherit")]);
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(
+            document.computed_style_for(child.id).padding,
+            document.computed_style_for(parent.id).padding
         );
         crate::stylesheet::clear_rules();
     }
