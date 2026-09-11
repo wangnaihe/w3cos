@@ -4037,6 +4037,19 @@ fn component_content_width(
     viewport_w: f32,
     viewport_h: f32,
 ) -> f32 {
+    let resolve_edge = |spacing: WSpacing| match spacing {
+        WSpacing::Percent(value) => containing_width * value / 100.0,
+        WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
+        WSpacing::Em(value) => value * style.font_size,
+        WSpacing::Vw(value) => value * viewport_w / 100.0,
+        WSpacing::Vh(value) => value * viewport_h / 100.0,
+        WSpacing::Auto => 0.0,
+        other => other.resolve(&w3cos_std::safe_area::current()),
+    };
+    let horizontal_inner_edges = resolve_edge(style.padding.left)
+        + resolve_edge(style.padding.right)
+        + style.border_left_width.unwrap_or(style.border_width)
+        + style.border_right_width.unwrap_or(style.border_width);
     let specified = style.width.resolve(
         containing_width,
         ROOT_FONT_SIZE,
@@ -4044,21 +4057,14 @@ fn component_content_width(
         viewport_w,
         viewport_h,
     );
-    let mut width = specified.unwrap_or(containing_width);
-    if style.box_sizing == WBoxSizing::BorderBox {
-        let resolve_edge = |spacing: WSpacing| match spacing {
-            WSpacing::Percent(value) => containing_width * value / 100.0,
-            WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
-            WSpacing::Em(value) => value * style.font_size,
-            WSpacing::Vw(value) => value * viewport_w / 100.0,
-            WSpacing::Vh(value) => value * viewport_h / 100.0,
-            WSpacing::Auto => 0.0,
-            other => other.resolve(&w3cos_std::safe_area::current()),
-        };
-        width -= resolve_edge(style.padding.left)
-            + resolve_edge(style.padding.right)
-            + style.border_left_width.unwrap_or(style.border_width)
-            + style.border_right_width.unwrap_or(style.border_width);
+    let mut width = specified.unwrap_or_else(|| {
+        containing_width
+            - resolve_edge(style.margin.left)
+            - resolve_edge(style.margin.right)
+            - horizontal_inner_edges
+    });
+    if specified.is_some() && style.box_sizing == WBoxSizing::BorderBox {
+        width -= horizontal_inner_edges;
     }
     width.max(0.0)
 }
@@ -6827,6 +6833,33 @@ mod tests {
             height: WDim::Px(100.0),
             ..Style::default()
         }
+    }
+
+    #[test]
+    fn component_content_width_subtracts_auto_block_edges() {
+        let auto = Style {
+            margin: w3cos_std::style::Edges {
+                left: WSpacing::Px(8.0),
+                right: WSpacing::Px(8.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            padding: w3cos_std::style::Edges::all(5.0),
+            border_width: 1.0,
+            ..Style::default()
+        };
+        assert_eq!(component_content_width(&auto, 800.0, 800.0, 600.0), 772.0);
+
+        let border_box = Style {
+            width: WDim::Px(100.0),
+            box_sizing: WBoxSizing::BorderBox,
+            padding: w3cos_std::style::Edges::all(5.0),
+            border_width: 1.0,
+            ..Style::default()
+        };
+        assert_eq!(
+            component_content_width(&border_box, 800.0, 800.0, 600.0),
+            88.0
+        );
     }
 
     #[test]
