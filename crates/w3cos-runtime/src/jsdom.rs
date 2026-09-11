@@ -6605,10 +6605,38 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
     hits.sort_by_key(|(z_order, index, _)| (*z_order, *index));
 
     let mut seen = HashSet::new();
-    hits.into_iter()
+    let hits = hits
+        .into_iter()
         .rev()
         .filter_map(|(_, _, node)| seen.insert(node).then_some(node))
-        .collect()
+        .collect::<Vec<_>>();
+    let hit_nodes = hits.iter().copied().collect::<HashSet<_>>();
+    let mut expanded = Vec::with_capacity(hits.len());
+    seen.clear();
+    for node in hits {
+        if seen.insert(node) {
+            expanded.push(node);
+        }
+        let mut ancestor = dom::parent_node(node);
+        while let Some(candidate) = ancestor {
+            if hit_nodes.contains(&candidate) {
+                break;
+            }
+            if block_in_inline_host(candidate)
+                && dom::with_document(|document| {
+                    document
+                        .computed_style_for(NodeId::from_u32(candidate))
+                        .pointer_events
+                        != w3cos_std::style::PointerEvents::None
+                })
+                && seen.insert(candidate)
+            {
+                expanded.push(candidate);
+            }
+            ancestor = dom::parent_node(candidate);
+        }
+    }
+    expanded
 }
 
 fn deepest_node_at_point(x: f32, y: f32) -> Option<u32> {
@@ -7369,12 +7397,33 @@ fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
     );
 }
 
+fn block_in_inline_host(node: u32) -> bool {
+    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    matches!(style.display, w3cos_std::style::Display::Inline)
+        && dom::children(node).iter().copied().any(|child| {
+            dom::node_type(child) == 1
+                && dom::with_document(|document| {
+                    let child_style = document.computed_style_for(NodeId::from_u32(child));
+                    !matches!(
+                        child_style.position,
+                        w3cos_std::style::Position::Absolute
+                            | w3cos_std::style::Position::Fixed
+                    ) && matches!(
+                        child_style.display,
+                        w3cos_std::style::Display::Block
+                            | w3cos_std::style::Display::Flex
+                            | w3cos_std::style::Display::Grid
+                    )
+                })
+        })
+}
+
 fn block_in_inline_fragment_bounds(
     node: u32,
     mut child_rect: impl FnMut(u32) -> Option<w3cos_dom::DOMRect>,
 ) -> Option<w3cos_dom::DOMRect> {
     let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
-    if !matches!(style.display, w3cos_std::style::Display::Inline)
+    if !block_in_inline_host(node)
         || style.padding != w3cos_std::style::Edges::ZERO
         || style.border_width != 0.0
         || style.border_top_width.is_some_and(|value| value != 0.0)
@@ -7384,28 +7433,8 @@ fn block_in_inline_fragment_bounds(
     {
         return None;
     }
-    let children = dom::children(node);
-    let has_in_flow_block = children.iter().copied().any(|child| {
-        dom::node_type(child) == 1
-            && dom::with_document(|document| {
-                let child_style = document.computed_style_for(NodeId::from_u32(child));
-                !matches!(
-                    child_style.position,
-                    w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
-                ) && matches!(
-                    child_style.display,
-                    w3cos_std::style::Display::Block
-                        | w3cos_std::style::Display::Flex
-                        | w3cos_std::style::Display::Grid
-                )
-            })
-    });
-    if !has_in_flow_block {
-        return None;
-    }
-
     let mut bounds: Option<w3cos_dom::DOMRect> = None;
-    for child in children {
+    for child in dom::children(node) {
         if dom::node_type(child) != 1 {
             continue;
         }
