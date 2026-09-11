@@ -1526,13 +1526,31 @@ fn apply_font_shorthand(style: &mut StyleDecl, value: &str) {
 
 fn parse_border_shorthand(style: &mut StyleDecl, value: &str) {
     let parts: Vec<&str> = value.split_whitespace().collect();
+    let mut width = None;
+    let mut color = None;
     for part in &parts {
         if let Some(px) = css_parse_border_width(part) {
-            style.border_width = Some(px);
-        } else if part.starts_with('#') || part.starts_with("rgb") {
-            style.border_color = Some(part.to_string());
+            width = Some(px);
+        } else if w3cos_std::Color::from_css(part).is_some() {
+            color = Some(part.to_string());
+        } else if !matches!(
+            part.to_ascii_lowercase().as_str(),
+            "none"
+                | "hidden"
+                | "dotted"
+                | "dashed"
+                | "solid"
+                | "double"
+                | "groove"
+                | "ridge"
+                | "inset"
+                | "outset"
+        ) {
+            return;
         }
     }
+    style.border_width = width;
+    style.border_color = color;
 }
 
 #[derive(Clone, Copy)]
@@ -1549,11 +1567,22 @@ fn parse_border_side_shorthand(style: &mut StyleDecl, value: &str, side: BorderS
     for part in value.split_whitespace() {
         if let Some(px) = css_parse_border_width(part) {
             width = Some(px);
-        } else if !matches!(
-            part,
-            "none" | "hidden" | "solid" | "dashed" | "dotted" | "double"
-        ) {
+        } else if w3cos_std::Color::from_css(part).is_some() {
             color = Some(part.to_string());
+        } else if !matches!(
+            part.to_ascii_lowercase().as_str(),
+            "none"
+                | "hidden"
+                | "solid"
+                | "dashed"
+                | "dotted"
+                | "double"
+                | "groove"
+                | "ridge"
+                | "inset"
+                | "outset"
+        ) {
+            return;
         }
     }
     match side {
@@ -1899,6 +1928,13 @@ mod tests {
         let sheet = parse_css(css);
         assert_eq!(sheet.rules[0].style.border_width, Some(2.0));
         assert_eq!(sheet.rules[0].style.border_color.as_deref(), Some("#333"));
+    }
+
+    #[test]
+    fn invalid_border_shorthand_is_ignored_atomically() {
+        let sheet = parse_css(".box { border: 6px sold green; }");
+        assert_eq!(sheet.rules[0].style.border_width, None);
+        assert_eq!(sheet.rules[0].style.border_color, None);
     }
 
     #[test]

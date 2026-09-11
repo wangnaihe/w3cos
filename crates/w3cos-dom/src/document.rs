@@ -4669,15 +4669,6 @@ impl Document {
 
                 if block_in_inline
                     && !self.events.has_listeners(id)
-                    && children.first().is_some_and(|child| {
-                        matches!(
-                            child.style.display,
-                            w3cos_std::style::Display::Inline
-                                | w3cos_std::style::Display::InlineBlock
-                                | w3cos_std::style::Display::InlineFlex
-                                | w3cos_std::style::Display::InlineTable
-                        )
-                    })
                     && children.iter().any(|child| {
                         matches!(
                             child.style.display,
@@ -4719,12 +4710,20 @@ impl Document {
                         && style.border_right_width.unwrap_or(0.0) == 0.0
                         && style.border_bottom_width.unwrap_or(0.0) == 0.0
                         && style.border_left_width.unwrap_or(0.0) == 0.0;
+                    if passive_fragment && first_block == 0 {
+                        // A decoration-free inline has no principal box to
+                        // preserve around a leading in-flow block. Its nearest
+                        // painted inline ancestor owns the split fragments.
+                        let mut contents_style = w3cos_std::style::Style::default();
+                        contents_style.display = w3cos_std::style::Display::Contents;
+                        return w3cos_std::Component::boxed(contents_style, children);
+                    }
                     let fragment_style = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
                         fragment.display = if passive_fragment {
                             w3cos_std::style::Display::Flex
                         } else {
-                            w3cos_std::style::Display::InlineFlex
+                            w3cos_std::style::Display::Inline
                         };
                         fragment.flex_direction = w3cos_std::style::FlexDirection::Row;
                         fragment.align_items = w3cos_std::style::AlignItems::Baseline;
@@ -4777,6 +4776,25 @@ impl Document {
                         }
                         fragment
                     };
+                    let fragment_row =
+                        |retain_left: bool,
+                         retain_right: bool,
+                         mut fragment_children: Vec<w3cos_std::Component>| {
+                            let fragment = fragment_style(retain_left, retain_right);
+                            if first_block == 0
+                                && fragment_children.len() == 1
+                                && matches!(
+                                    fragment_children[0].kind,
+                                    w3cos_std::ComponentKind::Text { .. }
+                                )
+                            {
+                                let mut text = fragment_children.remove(0);
+                                text.style = fragment;
+                                text
+                            } else {
+                                w3cos_std::Component::row(fragment, fragment_children)
+                            }
+                        };
                     let inline_start_is_left =
                         style.direction == w3cos_std::style::TextDirection::Ltr;
                     let mut remaining = children;
@@ -4791,16 +4809,18 @@ impl Document {
                             }
                         }
                     }
-                    let mut fragments = vec![w3cos_std::Component::row(
-                        fragment_style(inline_start_is_left, !inline_start_is_left),
+                    let mut fragments = vec![fragment_row(
+                        inline_start_is_left,
+                        !inline_start_is_left,
                         leading,
                     )];
                     let mut middle_inline = Vec::new();
                     for mut child in remaining {
                         if is_block(&child) {
                             if !middle_inline.is_empty() {
-                                fragments.push(w3cos_std::Component::row(
-                                    fragment_style(false, false),
+                                fragments.push(fragment_row(
+                                    false,
+                                    false,
                                     std::mem::take(&mut middle_inline),
                                 ));
                             }
@@ -4820,13 +4840,11 @@ impl Document {
                         }
                     }
                     if !middle_inline.is_empty() {
-                        fragments.push(w3cos_std::Component::row(
-                            fragment_style(false, false),
-                            middle_inline,
-                        ));
+                        fragments.push(fragment_row(false, false, middle_inline));
                     }
-                    fragments.push(w3cos_std::Component::row(
-                        fragment_style(!inline_start_is_left, inline_start_is_left),
+                    fragments.push(fragment_row(
+                        !inline_start_is_left,
+                        inline_start_is_left,
                         trailing,
                     ));
                     let mut contents_style = w3cos_std::style::Style::default();

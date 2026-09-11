@@ -1634,15 +1634,21 @@ fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
 
 fn apply_border_shorthand(style: &mut Style, value: &str) {
     let mut width = None;
+    let mut color = None;
     let mut visible = None;
     for part in split_css_whitespace(value) {
         if let Some(parsed) = parse_border_width(&part) {
             width = Some(parsed);
-        } else if let Some(color) = Color::from_css(&part) {
-            style.border_color = color;
+        } else if let Some(parsed) = Color::from_css(&part) {
+            color = Some(parsed);
         } else if let Some(parsed) = parse_border_style_visibility(&part) {
             visible = Some(parsed);
+        } else {
+            return;
         }
+    }
+    if let Some(color) = color {
+        style.border_color = color;
     }
     if let Some(width) = match visible {
         Some(false) => Some(0.0),
@@ -1676,6 +1682,8 @@ fn apply_border_side_shorthand(style: &mut Style, value: &str, side: BorderSide)
             color = Some(parsed);
         } else if let Some(parsed) = parse_border_style_visibility(&part) {
             visible = Some(parsed);
+        } else {
+            return;
         }
     }
     let width = match visible {
@@ -2493,6 +2501,17 @@ mod tests {
             declaration.inner.border_color,
             Color::rgba(215, 224, 238, 235)
         );
+    }
+
+    #[test]
+    fn invalid_border_shorthand_does_not_partially_mutate_style() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border", "2px solid cyan");
+        let before = declaration.inner.clone();
+
+        declaration.set_property("border", "6px sold green");
+
+        assert_eq!(declaration.inner, before);
     }
 
     #[test]
