@@ -1841,6 +1841,16 @@ impl Document {
                     .map(|(_, value)| value.as_str()),
             )
             .last();
+        if let Some(color) = last_declared_border_color.and_then(|value| {
+            split_css_tokens(value)
+                .into_iter()
+                .find_map(|token| w3cos_std::Color::from_css(&token))
+        }) {
+            // A relative-width border shorthand is finalized here after font
+            // metrics are known. Preserve its color even though the generic
+            // declaration parser could not resolve the width token eagerly.
+            style.border_color = color;
+        }
         let explicitly_transparent_border = last_declared_border_color.is_some_and(|value| {
             split_css_tokens(value)
                 .iter()
@@ -12221,6 +12231,25 @@ mod computed_style_cache_tests {
         assert_eq!(style.height, w3cos_std::style::Dimension::Px(96.0));
         assert_eq!(style.min_height, w3cos_std::style::Dimension::Px(16.0));
         assert_eq!(style.max_width, w3cos_std::style::Dimension::Px(48.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn relative_border_shorthand_keeps_its_declared_color() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[("font-size", "16px"), ("border", "5em white solid")],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.border_width, 80.0);
+        assert_eq!(style.border_color, w3cos_std::Color::rgb(255, 255, 255));
         crate::stylesheet::clear_rules();
     }
 
