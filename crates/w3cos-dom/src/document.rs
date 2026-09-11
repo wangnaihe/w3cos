@@ -5121,6 +5121,42 @@ impl Document {
                 );
 
                 let mut component = match tag.as_str() {
+                    "iframe" => {
+                        // An iframe is a replaced element: its nested browsing
+                        // context never participates in the host document's
+                        // box tree, and an auto axis uses the CSS 300x150
+                        // fallback size. A percentage height only remains
+                        // definite when its containing block has a definite
+                        // height; otherwise CSS resolves it back to auto.
+                        if matches!(style.width, w3cos_std::style::Dimension::Auto) {
+                            style.width = node
+                                .attributes
+                                .iter()
+                                .find(|(key, _)| key.as_str() == "width")
+                                .and_then(|(_, value)| {
+                                    parse_html_dimension_attribute(value.as_str())
+                                })
+                                .unwrap_or(w3cos_std::style::Dimension::Px(300.0));
+                        }
+                        if matches!(style.height, w3cos_std::style::Dimension::Auto) {
+                            style.height = node
+                                .attributes
+                                .iter()
+                                .find(|(key, _)| key.as_str() == "height")
+                                .and_then(|(_, value)| {
+                                    parse_html_dimension_attribute(value.as_str())
+                                })
+                                .unwrap_or(w3cos_std::style::Dimension::Px(150.0));
+                        }
+                        if matches!(style.height, w3cos_std::style::Dimension::Percent(_))
+                            && inherited.is_none_or(|parent| {
+                                matches!(parent.height, w3cos_std::style::Dimension::Auto)
+                            })
+                        {
+                            style.height = w3cos_std::style::Dimension::Px(150.0);
+                        }
+                        w3cos_std::Component::boxed(style, vec![])
+                    }
                     "svg" | "g" | "defs" => w3cos_std::Component::boxed(style, children),
                     "rect" | "circle" | "ellipse" | "line" | "use" => {
                         w3cos_std::Component::boxed(style, children)
@@ -9427,6 +9463,34 @@ mod image_component_tests {
         let image = tree.children.first().expect("image component");
         assert_eq!(image.style.width, Dimension::Percent(100.0));
         assert_eq!(image.style.height, Dimension::Px(50.0));
+    }
+
+    #[test]
+    fn iframe_uses_replaced_fallback_size_and_resolves_definite_percent_height() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#fixed", &[("height", "192px")]);
+
+        let mut document = Document::new();
+        let automatic = document.create_element("iframe");
+        document.body().append_child(&mut document, automatic);
+        let fixed = document.create_element("div");
+        fixed.set_attribute(&mut document, "id", "fixed");
+        let percentage = document.create_element("iframe");
+        percentage.set_attribute(&mut document, "height", "50%");
+        fixed.append_child(&mut document, percentage);
+        document.body().append_child(&mut document, fixed);
+
+        let tree = document.to_component_tree();
+        let automatic = &tree.children[0];
+        assert_eq!(automatic.style.width, Dimension::Px(300.0));
+        assert_eq!(automatic.style.height, Dimension::Px(150.0));
+        assert!(automatic.children.is_empty());
+        let percentage = &tree.children[1].children[0];
+        assert_eq!(percentage.style.width, Dimension::Px(300.0));
+        assert_eq!(percentage.style.height, Dimension::Percent(50.0));
+        assert!(percentage.children.is_empty());
+
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
