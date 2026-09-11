@@ -2953,6 +2953,8 @@ impl Document {
                 && style.word_spacing == parent_style.word_spacing
                 && style.text_decoration == parent_style.text_decoration
                 && style.white_space == parent_style.white_space
+                && style.background == parent_style.background
+                && style.background_image == parent_style.background_image
         };
         fn append_rendered_text(
             output: &mut String,
@@ -2996,7 +2998,9 @@ impl Document {
                 && component.style.letter_spacing == parent_style.letter_spacing
                 && component.style.word_spacing == parent_style.word_spacing
                 && component.style.text_decoration == parent_style.text_decoration
-                && component.style.white_space == parent_style.white_space;
+                && component.style.white_space == parent_style.white_space
+                && component.style.background == parent_style.background
+                && component.style.background_image == parent_style.background_image;
             if let w3cos_std::ComponentKind::Text { content } = &component.kind {
                 if !same_text_style || !component.children.is_empty() {
                     return false;
@@ -3894,6 +3898,16 @@ impl Document {
                     children.push(after);
                 }
                 if !first_line_declarations.is_empty() {
+                    let has_split_inline_fragments = children.iter().any(|component| {
+                        component
+                            .style
+                            .custom_properties
+                            .as_ref()
+                            .is_some_and(|properties| {
+                                properties
+                                    .contains_key("--w3cos-internal-split-inline-fragment")
+                            })
+                    });
                     let available_width = match style.width {
                         w3cos_std::style::Dimension::Px(width) => Some(width),
                         w3cos_std::style::Dimension::Em(width) => Some(width * style.font_size),
@@ -3906,7 +3920,8 @@ impl Document {
                         style.font_size * style.line_height,
                         available_width,
                     );
-                    anonymous_inline_formatting_context |= fragmented;
+                    anonymous_inline_formatting_context |=
+                        fragmented && !has_split_inline_fragments;
                 }
                 if !first_letter_declarations.is_empty()
                     && apply_first_letter_style(&mut children, &first_letter_declarations)
@@ -4727,6 +4742,7 @@ impl Document {
                             w3cos_std::style::Display::Inline
                         };
                         fragment.flex_direction = w3cos_std::style::FlexDirection::Row;
+                        fragment.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
                         fragment.align_items = w3cos_std::style::AlignItems::Baseline;
                         fragment.width = if passive_fragment {
                             w3cos_std::style::Dimension::Percent(100.0)
@@ -4759,6 +4775,13 @@ impl Document {
                         fragment.border_left_width = Some(if retain_left { left } else { 0.0 });
                         fragment.border_right_width = Some(if retain_right { right } else { 0.0 });
                         if passive_fragment {
+                            fragment
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    "--w3cos-internal-split-inline-fragment".to_string(),
+                                    "1".to_string(),
+                                );
                             fragment.justify_content = match (style.text_align, style.direction) {
                                 (w3cos_std::style::TextAlign::Right, _)
                                 | (
@@ -4816,11 +4839,17 @@ impl Document {
                     let mut leading = remaining.drain(..first_block).collect::<Vec<_>>();
                     let mut trailing = remaining.split_off(last_block - first_block + 1);
                     if passive_fragment {
-                        for child in leading.iter_mut().chain(trailing.iter_mut()) {
-                            if matches!(child.kind, w3cos_std::ComponentKind::Text { .. }) {
-                                child.style.width = w3cos_std::style::Dimension::Percent(100.0);
-                                child.style.min_width = w3cos_std::style::Dimension::Px(0.0);
-                                child.style.flex_shrink = 1.0;
+                        for children in [&mut leading, &mut trailing] {
+                            if children.len() != 1 {
+                                continue;
+                            }
+                            for child in children.iter_mut() {
+                                if matches!(child.kind, w3cos_std::ComponentKind::Text { .. }) {
+                                    child.style.width =
+                                        w3cos_std::style::Dimension::Percent(100.0);
+                                    child.style.min_width = w3cos_std::style::Dimension::Px(0.0);
+                                    child.style.flex_shrink = 1.0;
+                                }
                             }
                         }
                     }
@@ -6975,7 +7004,14 @@ fn apply_first_line_style_inner(
                 | w3cos_std::style::Display::InlineBlock
                 | w3cos_std::style::Display::InlineFlex
                 | w3cos_std::style::Display::InlineTable
-        ) {
+        ) || components[index]
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-split-inline-fragment")
+            })
+        {
             let (nested_changed, stopped) = apply_first_line_style_inner(
                 &mut components[index].children,
                 declarations,
