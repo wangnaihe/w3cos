@@ -3834,6 +3834,19 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                         ComponentKind::Text { content } if content == "\u{2028}"
                     )
                 })
+                .skip_while(|(following, _)| {
+                    matches!(
+                        &following.kind,
+                        ComponentKind::Text { content }
+                            if content.chars().all(char::is_whitespace)
+                                && matches!(
+                                    following.style.white_space,
+                                    WWhiteSpace::Normal
+                                        | WWhiteSpace::NoWrap
+                                        | WWhiteSpace::PreLine
+                                )
+                    )
+                })
                 .collect::<Vec<_>>();
             let line_width = following_line
                 .iter()
@@ -8893,6 +8906,46 @@ mod tests {
         let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
         assert_eq!(following.x, 50.0);
         assert_eq!(following.y, 20.0);
+    }
+
+    #[test]
+    fn forced_break_discards_collapsible_whitespace_at_the_next_line_start() {
+        let forced_break = Component::text(
+            "\u{2028}",
+            Style {
+                display: WDisp::Inline,
+                width: WDim::Px(0.0),
+                ..Style::default()
+            },
+        );
+        let whitespace = Component::text(
+            " ",
+            Style {
+                display: WDisp::Inline,
+                ..Style::default()
+            },
+        );
+        let inline_box = Component::boxed(
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Px(15.0),
+                height: WDim::Px(15.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![forced_break, whitespace, inline_box],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let box_rect = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(box_rect.x, root_rect.x);
     }
 
     #[test]
