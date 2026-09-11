@@ -4038,16 +4038,55 @@ fn align_inline_block_last_line_baselines(
         let Some(reference_baseline) = reference_baseline else {
             return;
         };
-        for (child, index) in children {
-            if child.style.display != WDisplay::InlineBlock
-                || !matches!(child.style.overflow, WOverflow::Visible)
-            {
-                continue;
+        let inline_blocks = children
+            .iter()
+            .filter(|(child, _)| {
+                child.style.display == WDisplay::InlineBlock
+                    && matches!(child.style.overflow, WOverflow::Visible)
+            })
+            .filter_map(|(child, index)| {
+                last_text_baseline(child, *index, layouts, positions)
+                    .map(|baseline| (*child, *index, baseline))
+            })
+            .collect::<Vec<_>>();
+        let target_baseline = inline_blocks
+            .iter()
+            .filter(|(child, _, _)| {
+                let margin = child.style.margin_lengths();
+                let padding = child.style.padding_lengths();
+                margin.top.abs() > f32::EPSILON
+                    || margin.bottom.abs() > f32::EPSILON
+                    || padding.top.abs() > f32::EPSILON
+                    || padding.bottom.abs() > f32::EPSILON
+                    || child
+                        .style
+                        .border_top_width
+                        .unwrap_or(child.style.border_width)
+                        .abs()
+                        > f32::EPSILON
+                    || child
+                        .style
+                        .border_bottom_width
+                        .unwrap_or(child.style.border_width)
+                        .abs()
+                        > f32::EPSILON
+            })
+            .map(|(_, _, baseline)| *baseline)
+            .fold(reference_baseline, f32::max);
+
+        let sibling_delta = target_baseline - reference_baseline;
+        if sibling_delta.abs() > f32::EPSILON {
+            for (child, index) in &children {
+                if child.style.display == WDisplay::Inline
+                    && child.style.visibility == WVisibility::Visible
+                    && matches!(child.kind, ComponentKind::Text { .. })
+                {
+                    shift_subtree(layouts, positions, *index, child, sibling_delta);
+                }
             }
-            let Some(last_baseline) = last_text_baseline(child, index, layouts, positions) else {
-                continue;
-            };
-            let delta_y = reference_baseline - last_baseline;
+        }
+        for (child, index, last_baseline) in inline_blocks {
+            let delta_y = target_baseline - last_baseline;
             if delta_y.abs() > f32::EPSILON {
                 shift_subtree(layouts, positions, index, child, delta_y);
             }
@@ -13013,6 +13052,50 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
         assert_eq!(rect(4).y, rect(1).y);
         assert_eq!(rect(5).y, rect(1).y);
+    }
+
+    #[test]
+    fn decorated_inline_block_moves_sibling_text_to_its_last_line() {
+        let text = |content, display, visibility| {
+            Component::text(
+                content,
+                Style {
+                    display,
+                    visibility,
+                    ..Style::default()
+                },
+            )
+        };
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                margin: w3cos_std::style::Edges::xy(0.0, 3.0),
+                padding: w3cos_std::style::Edges::xy(0.0, 9.0),
+                border_top_width: Some(4.0),
+                border_bottom_width: Some(4.0),
+                ..Style::default()
+            },
+            vec![
+                text("x", WDisp::Block, WVisibility::Hidden),
+                text("bcd", WDisp::Inline, WVisibility::Visible),
+            ],
+        );
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![
+                text("a", WDisp::Inline, WVisibility::Visible),
+                inline_block,
+                text("e", WDisp::Inline, WVisibility::Visible),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(1).y, rect(4).y);
+        assert_eq!(rect(5).y, rect(4).y);
     }
 
     #[test]
