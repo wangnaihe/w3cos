@@ -7428,12 +7428,15 @@ fn block_in_inline_fragment_bounds(
 
 fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     let live = dom::bounding_rect(node);
-    if !dom::is_document_dirty()
-        && (live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0)
-    {
-        let rect = block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
-            .unwrap_or(live);
-        return apply_css_motion_to_rect(node, rect);
+    if !dom::is_document_dirty() {
+        if let Some(rect) =
+            block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
+        {
+            return apply_css_motion_to_rect(node, rect);
+        }
+        if live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0 {
+            return apply_css_motion_to_rect(node, live);
+        }
     }
 
     // Geometry APIs synchronously flush pending style and layout in browsers.
@@ -7441,14 +7444,6 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     // inline mutations even before the native render loop's next frame.
     let root = dom::to_component_tree();
     let flat = crate::layout::pre_flatten(&root);
-    let Some(target_index) = flat.iter().position(|info| {
-        matches!(
-            info.on_click,
-            w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node)
-        )
-    }) else {
-        return live;
-    };
     let (viewport_width, viewport_height, _) = viewport();
     let Ok(layouts) = crate::layout::compute(&root, viewport_width as f32, viewport_height as f32)
     else {
@@ -7466,14 +7461,23 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
             .find(|(_, layout_index)| *layout_index == index)
             .map(|(rect, _)| w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height))
     };
-    let rect = block_in_inline_fragment_bounds(node, rect_for_node).unwrap_or_else(|| {
-        layouts
-            .iter()
-            .find(|(_, index)| *index == target_index)
-            .map_or(live, |(rect, _)| {
-                w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height)
-            })
-    });
+    if let Some(rect) = block_in_inline_fragment_bounds(node, rect_for_node) {
+        return apply_css_motion_to_rect(node, rect);
+    }
+    let Some(target_index) = flat.iter().position(|info| {
+        matches!(
+            info.on_click,
+            w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node)
+        )
+    }) else {
+        return live;
+    };
+    let rect = layouts
+        .iter()
+        .find(|(_, index)| *index == target_index)
+        .map_or(live, |(rect, _)| {
+            w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height)
+        });
     apply_css_motion_to_rect(node, rect)
 }
 
