@@ -1335,7 +1335,22 @@ impl StreamingDocumentParser {
         append_parser_child(self.current_parent(), node);
     }
 
+    fn strip_preformatted_initial_line_feed<'a>(&self, text: &'a str) -> &'a str {
+        let parent = self.current_parent();
+        if crate::dom::first_child(parent).is_none()
+            && matches!(
+                crate::dom::tag_name(parent).as_str(),
+                "pre" | "listing" | "textarea"
+            )
+        {
+            text.strip_prefix('\n').unwrap_or(text)
+        } else {
+            text
+        }
+    }
+
     fn append_raw_text(&self, tag: &str, text: &str) {
+        let text = self.strip_preformatted_initial_line_feed(text);
         if matches!(tag, "title" | "textarea") {
             self.append_text_to_current(&crate::jsdom::decode_html_entities(text));
         } else if matches!(tag, "script" | "style") {
@@ -1355,6 +1370,7 @@ impl StreamingDocumentParser {
     }
 
     fn append_text(&mut self, text: &str) {
+        let text = self.strip_preformatted_initial_line_feed(text);
         if text.is_empty() {
             return;
         }
@@ -1479,6 +1495,20 @@ mod tests {
                 .get_property("textContent")
                 .to_js_string(),
             "head"
+        );
+    }
+
+    #[test]
+    fn pre_element_ignores_one_leading_line_feed() {
+        let (document, _) =
+            parse_document("<!doctype html><body><pre id=target>\nfirst\nsecond</pre>");
+
+        assert_eq!(
+            document
+                .call_method("getElementById", vec![Value::string("target")])
+                .get_property("textContent")
+                .to_js_string(),
+            "first\nsecond"
         );
     }
 
