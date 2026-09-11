@@ -1132,11 +1132,11 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
                 style.border_bottom_left_radius = Some(bottom_left);
             }
         }
-        "border-width" => style.border_width = css_parse_px(value),
-        "border-top-width" => style.border_top_width = css_parse_px(value),
-        "border-right-width" => style.border_right_width = css_parse_px(value),
-        "border-bottom-width" => style.border_bottom_width = css_parse_px(value),
-        "border-left-width" => style.border_left_width = css_parse_px(value),
+        "border-width" => style.border_width = css_parse_border_width(value),
+        "border-top-width" => style.border_top_width = css_parse_border_width(value),
+        "border-right-width" => style.border_right_width = css_parse_border_width(value),
+        "border-bottom-width" => style.border_bottom_width = css_parse_border_width(value),
+        "border-left-width" => style.border_left_width = css_parse_border_width(value),
         "border-color" => style.border_color = Some(value.to_string()),
         "border-top-color" => style.border_top_color = Some(value.to_string()),
         "border-right-color" => style.border_right_color = Some(value.to_string()),
@@ -1385,6 +1385,15 @@ fn css_parse_px(value: &str) -> Option<f32> {
     crate::css_values::parse_plain_px(value)
 }
 
+fn css_parse_border_width(value: &str) -> Option<f32> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        _ => css_parse_px(value),
+    }
+}
+
 fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
     match values {
         [all] => Some([*all; 4]),
@@ -1518,7 +1527,7 @@ fn apply_font_shorthand(style: &mut StyleDecl, value: &str) {
 fn parse_border_shorthand(style: &mut StyleDecl, value: &str) {
     let parts: Vec<&str> = value.split_whitespace().collect();
     for part in &parts {
-        if let Some(px) = css_parse_px(part) {
+        if let Some(px) = css_parse_border_width(part) {
             style.border_width = Some(px);
         } else if part.starts_with('#') || part.starts_with("rgb") {
             style.border_color = Some(part.to_string());
@@ -1538,7 +1547,7 @@ fn parse_border_side_shorthand(style: &mut StyleDecl, value: &str, side: BorderS
     let mut width = None;
     let mut color = None;
     for part in value.split_whitespace() {
-        if let Some(px) = css_parse_px(part) {
+        if let Some(px) = css_parse_border_width(part) {
             width = Some(px);
         } else if !matches!(
             part,
@@ -1890,6 +1899,16 @@ mod tests {
         let sheet = parse_css(css);
         assert_eq!(sheet.rules[0].style.border_width, Some(2.0));
         assert_eq!(sheet.rules[0].style.border_color.as_deref(), Some("#333"));
+    }
+
+    #[test]
+    fn parse_border_width_keywords() {
+        let sheet = parse_css(
+            ".thin { border: solid thin; } .medium { border-top-width: medium; } .thick { border-left: thick solid; }",
+        );
+        assert_eq!(sheet.rules[0].style.border_width, Some(1.0));
+        assert_eq!(sheet.rules[1].style.border_top_width, Some(3.0));
+        assert_eq!(sheet.rules[2].style.border_left_width, Some(5.0));
     }
 
     #[test]

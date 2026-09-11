@@ -414,15 +414,17 @@ impl CSSStyleDeclaration {
                     self.inner.border_left_width = Some(left);
                 }
             }
-            "border-top-width" | "borderTopWidth" => self.inner.border_top_width = parse_px(value),
+            "border-top-width" | "borderTopWidth" => {
+                self.inner.border_top_width = parse_border_width(value)
+            }
             "border-right-width" | "borderRightWidth" => {
-                self.inner.border_right_width = parse_px(value)
+                self.inner.border_right_width = parse_border_width(value)
             }
             "border-bottom-width" | "borderBottomWidth" => {
-                self.inner.border_bottom_width = parse_px(value)
+                self.inner.border_bottom_width = parse_border_width(value)
             }
             "border-left-width" | "borderLeftWidth" => {
-                self.inner.border_left_width = parse_px(value)
+                self.inner.border_left_width = parse_border_width(value)
             }
             "border-style" | "borderStyle" => {
                 if let Some(edges) = parse_border_style_edges(value) {
@@ -440,12 +442,12 @@ impl CSSStyleDeclaration {
             }
             "border-inline-width" | "borderInlineWidth" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_px(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_border_width(value)) {
                     self.inner.border_left_width = Some(start);
                     self.inner.border_right_width = Some(
                         values
                             .get(1)
-                            .and_then(|value| parse_px(value))
+                            .and_then(|value| parse_border_width(value))
                             .unwrap_or(start),
                     );
                 }
@@ -959,11 +961,11 @@ impl CSSStyleDeclaration {
                 if matches!(name.as_str(), "border-width" | "borderWidth") {
                     split_css_whitespace(value)
                         .first()
-                        .and_then(|part| parse_px(part))
+                        .and_then(|part| parse_border_width(part))
                 } else if name == "border" {
                     split_css_whitespace(value)
                         .iter()
-                        .find_map(|part| parse_px(part))
+                        .find_map(|part| parse_border_width(part))
                 } else {
                     None
                 }
@@ -1227,6 +1229,15 @@ fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
 
 fn parse_px(value: &str) -> Option<f32> {
     w3cos_std::style::parse_absolute_length_px(value)
+}
+
+fn parse_border_width(value: &str) -> Option<f32> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        _ => parse_px(value),
+    }
 }
 
 fn will_change_to_css(wc: &WillChange) -> String {
@@ -1571,7 +1582,7 @@ fn parse_border_style_edges(value: &str) -> Option<[bool; 4]> {
 fn parse_border_width_edges(value: &str) -> Option<[f32; 4]> {
     let values = split_css_whitespace(value)
         .into_iter()
-        .map(|value| parse_px(&value))
+        .map(|value| parse_border_width(&value))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [all] => Some([*all; 4]),
@@ -1614,7 +1625,7 @@ fn apply_border_shorthand(style: &mut Style, value: &str) {
     let mut width = None;
     let mut visible = None;
     for part in split_css_whitespace(value) {
-        if let Some(parsed) = parse_px(&part) {
+        if let Some(parsed) = parse_border_width(&part) {
             width = Some(parsed);
         } else if let Some(color) = Color::from_css(&part) {
             style.border_color = color;
@@ -1648,7 +1659,7 @@ fn apply_border_side_shorthand(style: &mut Style, value: &str, side: BorderSide)
     let mut color = None;
     let mut visible = None;
     for part in split_css_whitespace(value) {
-        if let Some(parsed) = parse_px(&part) {
+        if let Some(parsed) = parse_border_width(&part) {
             width = Some(parsed);
         } else if let Some(parsed) = Color::from_css(&part) {
             color = Some(parsed);
@@ -2508,6 +2519,19 @@ mod tests {
 
         declaration.set_property("border-style", "none");
         assert_eq!(declaration.inner.border_width, 0.0);
+    }
+
+    #[test]
+    fn border_width_keywords_resolve_in_dynamic_declarations() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border", "solid thin");
+        assert_eq!(declaration.inner.border_width, 1.0);
+
+        declaration.set_property("border-width", "medium thick");
+        assert_eq!(declaration.inner.border_top_width, Some(3.0));
+        assert_eq!(declaration.inner.border_right_width, Some(5.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(3.0));
+        assert_eq!(declaration.inner.border_left_width, Some(5.0));
     }
 
     #[test]
