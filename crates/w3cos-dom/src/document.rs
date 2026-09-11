@@ -3897,6 +3897,35 @@ impl Document {
                 if let Some(after) = after {
                     children.push(after);
                 }
+                if !block_in_inline
+                    && style.display == w3cos_std::style::Display::Inline
+                    && children.iter().any(|child| {
+                        matches!(
+                            child.style.display,
+                            w3cos_std::style::Display::Block
+                                | w3cos_std::style::Display::Flex
+                                | w3cos_std::style::Display::Grid
+                        ) && !matches!(
+                            child.style.position,
+                            w3cos_std::style::Position::Absolute
+                                | w3cos_std::style::Position::Fixed
+                        )
+                    })
+                {
+                    // Generated ::before/::after boxes are appended after the
+                    // source-child lowering pass. Re-evaluate block-in-inline
+                    // splitting so an in-flow block pseudo fragments its
+                    // originating inline exactly like an authored child.
+                    block_in_inline = true;
+                    style.display = w3cos_std::style::Display::Block;
+                    children.retain(|child| {
+                        !matches!(
+                            child.kind,
+                            w3cos_std::ComponentKind::Text { ref content }
+                                if is_only_css_whitespace(content)
+                        )
+                    });
+                }
                 if !first_line_declarations.is_empty() {
                     let has_split_inline_fragments = children.iter().any(|component| {
                         component
