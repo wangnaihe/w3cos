@@ -643,6 +643,18 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
 }
 
 fn table_track_widths(component: &Component) -> Vec<f32> {
+    fn collect_columns(component: &Component, tracks: &mut Vec<f32>) {
+        for child in &component.children {
+            match child.style.display {
+                WDisplay::TableColumn => tracks.push(
+                    specified_border_box_width_with_basis(&child.style, None).unwrap_or(0.0),
+                ),
+                WDisplay::TableColumnGroup => collect_columns(child, tracks),
+                _ => {}
+            }
+        }
+    }
+
     fn collect_rows(component: &Component, tracks: &mut Vec<f32>, collapsed: bool) {
         if component.style.display == WDisplay::TableRow {
             let mut column = 0;
@@ -695,6 +707,7 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
     }
 
     let mut tracks = Vec::new();
+    collect_columns(component, &mut tracks);
     collect_rows(component, &mut tracks, component.style.border_collapse);
     let mut collapsed_columns = Vec::new();
     collect_collapsed_columns(component, &mut collapsed_columns);
@@ -1977,6 +1990,17 @@ fn align_table_cell_baselines(layouts: &mut [(LayoutRect, usize)], flat: &[FlatN
     {
         let alignment = node.style.align_self;
         if !matches!(alignment, WAlignSelf::Center | WAlignSelf::FlexEnd) {
+            continue;
+        }
+        if flat.iter().any(|child| {
+            child.parent == Some(cell)
+                && child.style.display != WDisplay::None
+                && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && {
+                    let margin = child.style.margin_lengths();
+                    margin.top.abs() > f32::EPSILON || margin.bottom.abs() > f32::EPSILON
+                }
+        }) {
             continue;
         }
         let Some(cell_position) = positions.get(&cell).copied() else {
@@ -4543,7 +4567,7 @@ fn build_taffy_tree(
                 + borders;
             style.size.width = Dimension::length(minimum_outer.max(declared_outer));
         }
-        let auto_table_tracks = (owns_table_layout && !comp.style.table_layout_fixed).then(|| {
+        let auto_table_tracks = (owns_table_layout && fixed_table_tracks.is_none()).then(|| {
             let mut tracks = table_track_widths(comp);
             if !tracks.is_empty()
                 && let Some(table_width) = comp.style.width.resolve(
@@ -6391,6 +6415,57 @@ mod tests {
         assert_eq!((rect(5).x, rect(5).width), (0.0, 100.0));
         assert_eq!((rect(6).x, rect(6).width), (100.0, 200.0));
         assert_eq!((rect(7).x, rect(7).width), (300.0, 100.0));
+    }
+
+    #[test]
+    fn fixed_table_with_auto_width_uses_column_intrinsic_tracks() {
+        let column = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableColumn,
+                    width: WDim::Px(40.0),
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        };
+        let cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                ..Style::default()
+            },
+            vec![
+                column(),
+                column(),
+                column(),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell(), cell(), cell()],
+                ),
+            ],
+        );
+
+        assert_eq!(fixed_table_track_widths(&table, None), None);
+        assert_eq!(table_track_widths(&table), vec![40.0, 40.0, 40.0]);
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(0).width, 120.0);
+        assert_eq!((rect(5).x, rect(5).width), (0.0, 40.0));
+        assert_eq!((rect(6).x, rect(6).width), (40.0, 40.0));
+        assert_eq!((rect(7).x, rect(7).width), (80.0, 40.0));
     }
 
     #[test]
