@@ -3035,6 +3035,7 @@ fn project_fixed_table_cell_rects(
         collapsed: bool,
         rtl: bool,
         table_height: f32,
+        row_growth: f32,
         viewport_w: f32,
         viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
@@ -3068,9 +3069,7 @@ fn project_fixed_table_cell_rects(
                         .flatten()
                 })
                 .fold(0.0_f32, f32::max);
-            let row_height = layouts[row_position]
-                .0
-                .height
+            let row_height = (layouts[row_position].0.height + row_growth)
                 .max(cell_height)
                 .max(specified_height.unwrap_or(0.0));
             layouts[row_position].0.height = row_height;
@@ -3176,6 +3175,7 @@ fn project_fixed_table_cell_rects(
                     collapsed,
                     rtl,
                     table_height,
+                    row_growth,
                     viewport_w,
                     viewport_h,
                     layouts,
@@ -3312,7 +3312,7 @@ fn project_fixed_table_cell_rects(
                         WDisplay::TableColumn | WDisplay::TableColumnGroup
                     )
                 });
-                has_declared_columns
+                (component.style.table_layout_fixed || has_declared_columns)
                     .then(|| table_track_widths(component))
                     .filter(|tracks| !tracks.is_empty())
             })
@@ -3321,6 +3321,52 @@ fn project_fixed_table_cell_rects(
             let table_height = layout_position
                 .get(&component_index)
                 .map_or(0.0, |position| layouts[*position].0.height);
+            let mut row_count = 0usize;
+            let mut current_row_height = 0.0_f32;
+            fn collect_row_heights(
+                component: &Component,
+                component_index: usize,
+                layouts: &[(LayoutRect, usize)],
+                layout_position: &HashMap<usize, usize>,
+                row_count: &mut usize,
+                current_row_height: &mut f32,
+            ) {
+                if component.style.display == WDisplay::TableRow {
+                    if let Some(position) = layout_position.get(&component_index) {
+                        *row_count += 1;
+                        *current_row_height += layouts[*position].0.height;
+                    }
+                    return;
+                }
+                let mut child_index = component_index + 1;
+                for child in &component.children {
+                    collect_row_heights(
+                        child,
+                        child_index,
+                        layouts,
+                        layout_position,
+                        row_count,
+                        current_row_height,
+                    );
+                    child_index += count_nodes(child);
+                }
+            }
+            collect_row_heights(
+                component,
+                component_index,
+                layouts,
+                layout_position,
+                &mut row_count,
+                &mut current_row_height,
+            );
+            let row_growth = if matches!(component.style.height, WDim::Auto)
+                && !matches!(component.style.min_height, WDim::Auto)
+                && row_count > 0
+            {
+                (table_height - current_row_height).max(0.0) / row_count as f32
+            } else {
+                0.0
+            };
             project_rows(
                 component,
                 component_index,
@@ -3329,6 +3375,7 @@ fn project_fixed_table_cell_rects(
                 component.style.border_collapse,
                 component.style.direction == w3cos_std::style::TextDirection::Rtl,
                 table_height,
+                row_growth,
                 viewport_w,
                 viewport_h,
                 layouts,
@@ -5412,20 +5459,33 @@ fn build_taffy_tree(
         }
     }
     if owns_table_layout {
-        let specified_height = match comp.style.height {
+        let absolute_height = |dimension| match dimension {
             WDim::Px(height) => Some(height),
             WDim::Em(height) => Some(height * comp.style.font_size),
             WDim::Rem(height) => Some(height * ROOT_FONT_SIZE),
             _ => None,
         };
-        if let Some(height) = specified_height {
+        let specified_height = absolute_height(comp.style.height);
+        let mut used_height = specified_height
+            .or_else(|| absolute_height(comp.style.min_height))
+            .map(|height| height.max(0.0));
+        if let (Some(height), Some(max_height)) =
+            (used_height.as_mut(), absolute_height(comp.style.max_height))
+        {
+            *height = height.min(max_height);
+        }
+        if let (Some(height), Some(min_height)) =
+            (used_height.as_mut(), absolute_height(comp.style.min_height))
+        {
+            *height = height.max(min_height);
+        }
+        if let Some(height) = used_height {
             let caption_height = table_caption_intrinsic_height(comp);
-            if caption_height > 0.0 {
-                // A table's specified height applies to its grid; caption
-                // boxes live outside that height but inside the anonymous
-                // table wrapper represented by this component.
-                style.size.height = Dimension::length(height + caption_height);
-            }
+            // A table's constrained height applies to its grid; caption boxes
+            // live outside that height but inside the anonymous table wrapper.
+            // A minimum also participates in row-height distribution when the
+            // authored height remains auto.
+            style.size.height = Dimension::length(height + caption_height);
         }
     }
     if matches!(parent_display, Some(WDisplay::TableCell))
@@ -6493,7 +6553,8 @@ fn build_taffy_tree(
                                 | WDisplay::TableRowGroup
                                 | WDisplay::TableHeaderGroup
                                 | WDisplay::TableFooterGroup
-                        ) && !matches!(comp.style.height, WDim::Auto),
+                        ) && (!matches!(comp.style.height, WDim::Auto)
+                            || !matches!(comp.style.min_height, WDim::Auto)),
                         active_border_spacing,
                     )?;
                     if float_only_auto_block && c.style.float != WFloat::None {
@@ -8445,6 +8506,40 @@ mod tests {
         assert_eq!(rect(0).height, 96.0);
         assert_eq!(rect(1).height, 96.0);
         assert_eq!(rect(2).height, 96.0);
+    }
+
+    #[test]
+    fn fixed_table_min_height_stretches_its_rows_and_cells() {
+        for display in [WDisp::Table, WDisp::InlineTable] {
+            let table = Component::boxed(
+                Style {
+                    display,
+                    table_layout_fixed: true,
+                    min_height: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            width: WDim::Px(96.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                )],
+            );
+
+            let layout = compute(&table, 800.0, 600.0).unwrap();
+            let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+            assert_eq!(rect(0).height, 96.0);
+            assert_eq!(rect(1).height, 96.0);
+            assert_eq!(rect(2).height, 96.0);
+        }
     }
 
     #[test]
