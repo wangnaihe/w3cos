@@ -1836,7 +1836,7 @@ impl LayoutEngine {
 
         project_rtl_fixed_block_alignment(&mut results, flat, viewport_w, viewport_h);
         project_empty_painted_inline_boxes(&mut results, flat);
-        project_fixed_table_cell_rects(&mut results, root);
+        project_fixed_table_cell_rects(&mut results, root, viewport_w, viewport_h);
         project_forced_break_lines(&mut results, root);
         project_collapsible_line_end_whitespace(&mut results, flat);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
@@ -1971,7 +1971,7 @@ pub fn compute_with_scroll(
 
     project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h);
     project_empty_painted_inline_boxes(&mut results, &flat);
-    project_fixed_table_cell_rects(&mut results, &layout_root);
+    project_fixed_table_cell_rects(&mut results, &layout_root, viewport_w, viewport_h);
     project_forced_break_lines(&mut results, root);
     project_collapsible_line_end_whitespace(&mut results, &flat);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
@@ -2520,7 +2520,12 @@ fn project_collapsed_table_row_rects(
     }
 }
 
-fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+fn project_fixed_table_cell_rects(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) {
     let layout_position = layouts
         .iter()
         .enumerate()
@@ -2548,6 +2553,9 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         gap: f32,
         collapsed: bool,
         rtl: bool,
+        table_height: f32,
+        viewport_w: f32,
+        viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
     ) {
@@ -2556,6 +2564,35 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                 return;
             };
             let row_x = layouts[row_position].0.x;
+            let specified_height = component.style.height.resolve(
+                table_height,
+                ROOT_FONT_SIZE,
+                component.style.font_size,
+                viewport_w,
+                viewport_h,
+            );
+            let mut probe_index = component_index + 1;
+            let cell_height = component
+                .children
+                .iter()
+                .filter_map(|child| {
+                    let index = probe_index;
+                    probe_index += count_nodes(child);
+                    (child.style.display == WDisplay::TableCell)
+                        .then(|| {
+                            layout_position
+                                .get(&index)
+                                .map(|position| layouts[*position].0.height)
+                        })
+                        .flatten()
+                })
+                .fold(0.0_f32, f32::max);
+            let row_height = layouts[row_position]
+                .0
+                .height
+                .max(cell_height)
+                .max(specified_height.unwrap_or(0.0));
+            layouts[row_position].0.height = row_height;
             let mut child_index = component_index + 1;
             let mut column = 0usize;
             let grid_width = tracks.iter().sum::<f32>()
@@ -2622,6 +2659,7 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                             );
                         }
                         layouts[position].0.width = track + left_half + right_half;
+                        layouts[position].0.height = layouts[position].0.height.max(row_height);
                         if collapsed && !matches!(child.style.height, WDim::Auto) {
                             layouts[position].0.height += table_cell_edge_width(child, 0)
                                 + table_cell_edge_width(child, 2);
@@ -2656,6 +2694,9 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                     gap,
                     collapsed,
                     rtl,
+                    table_height,
+                    viewport_w,
+                    viewport_h,
                     layouts,
                     layout_position,
                 );
@@ -2774,6 +2815,8 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         component: &Component,
         component_index: usize,
         containing_width: f32,
+        viewport_w: f32,
+        viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
     ) {
@@ -2794,6 +2837,9 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
             })
         {
             let gap = effective_table_border_spacing(&component.style).0;
+            let table_height = layout_position
+                .get(&component_index)
+                .map_or(0.0, |position| layouts[*position].0.height);
             project_rows(
                 component,
                 component_index,
@@ -2801,6 +2847,9 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                 gap,
                 component.style.border_collapse,
                 component.style.direction == w3cos_std::style::TextDirection::Rtl,
+                table_height,
+                viewport_w,
+                viewport_h,
                 layouts,
                 layout_position,
             );
@@ -2849,6 +2898,8 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                 child,
                 child_index,
                 child_containing_width,
+                viewport_w,
+                viewport_h,
                 layouts,
                 layout_position,
             );
@@ -2860,7 +2911,15 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         .get(&0)
         .copied()
         .map_or(0.0, |position| layouts[position].0.width);
-    visit(root, 0, root_width, layouts, &layout_position);
+    visit(
+        root,
+        0,
+        root_width,
+        viewport_w,
+        viewport_h,
+        layouts,
+        &layout_position,
+    );
 }
 
 fn project_leading_descendant_margin_groups(
@@ -7215,6 +7274,41 @@ mod tests {
         assert_eq!((rect(5).x, rect(5).width), (0.0, 100.0));
         assert_eq!((rect(6).x, rect(6).width), (100.0, 200.0));
         assert_eq!((rect(7).x, rect(7).width), (300.0, 100.0));
+    }
+
+    #[test]
+    fn fixed_table_row_height_stretches_its_cells() {
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+            vec![],
+        );
+        let row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                height: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![cell],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![row],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+
+        assert_eq!(rect(0).height, 96.0);
+        assert_eq!(rect(1).height, 96.0);
+        assert_eq!(rect(2).height, 96.0);
     }
 
     #[test]
