@@ -3990,7 +3990,10 @@ impl ScriptLoader {
         let Ok(base) = Url::parse(document_url) else {
             return;
         };
-        for node in crate::dom::get_elements_by_tag_name("img") {
+        for node in crate::dom::get_elements_by_tag_name("img")
+            .into_iter()
+            .chain(crate::dom::get_elements_by_tag_name("object"))
+        {
             if crate::dom::is_connected(node) {
                 self.prepare_image_node(node, &base);
             }
@@ -8974,7 +8977,7 @@ pub(crate) fn notify_script_mutated(node: u32) {
     if parser_insertion_active() || dom_post_insertion_steps_suppressed() {
         return;
     }
-    if tag.eq_ignore_ascii_case("img") {
+    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object") {
         DYNAMIC_IMAGE_NODES.with(|nodes| {
             nodes.borrow_mut().insert(node);
         });
@@ -9228,7 +9231,10 @@ fn collect_default_style_meta_nodes(node: u32, metas: &mut HashSet<u32>) {
 }
 
 fn collect_image_nodes(node: u32, images: &mut HashSet<u32>) {
-    if crate::dom::tag_name(node).eq_ignore_ascii_case("img") {
+    if matches!(
+        crate::dom::tag_name(node).to_ascii_lowercase().as_str(),
+        "img" | "object"
+    ) {
         images.insert(node);
     }
     for child in crate::dom::children(node) {
@@ -9264,6 +9270,18 @@ enum ImageCandidateDescriptor {
 }
 
 fn select_image_source(node: u32) -> Option<SelectedImageSource> {
+    if crate::dom::tag_name(node).eq_ignore_ascii_case("object") {
+        let media_type = crate::dom::get_attribute(node, "type").unwrap_or_default();
+        if !media_type.trim().to_ascii_lowercase().starts_with("image/") {
+            return None;
+        }
+        return crate::dom::get_attribute(node, "data")
+            .filter(|source| !source.trim().is_empty())
+            .map(|source| SelectedImageSource {
+                source,
+                density: 1.0,
+            });
+    }
     let (viewport_width, viewport_height, device_pixel_ratio) = crate::jsdom::viewport();
     let dpr = device_pixel_ratio.max(0.01);
     if let Some(parent) = crate::dom::parent_node(node)
@@ -11459,6 +11477,23 @@ worker.postMessage(40);
             )
             .map(|selected| selected.source),
             Some("medium.png".to_string())
+        );
+    }
+
+    #[test]
+    fn image_object_selects_its_data_resource() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let object = crate::dom::create_element("object");
+        crate::dom::set_attribute(object, "type", "image/png");
+        crate::dom::set_attribute(object, "data", "box.png");
+
+        assert_eq!(
+            select_image_source(object),
+            Some(SelectedImageSource {
+                source: "box.png".to_string(),
+                density: 1.0,
+            })
         );
     }
 

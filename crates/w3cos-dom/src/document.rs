@@ -4925,7 +4925,25 @@ impl Document {
                             .unwrap_or_default();
                         w3cos_std::Component::button(&label, style)
                     }
-                    "img" => {
+                    "img" | "object"
+                        if tag.as_str() == "img"
+                            || (node.attributes.iter().any(|(key, value)| {
+                                key.as_str() == "type"
+                                    && value
+                                        .as_str()
+                                        .trim()
+                                        .to_ascii_lowercase()
+                                        .starts_with("image/")
+                            }) && (self.image_render_sources.contains_key(&id)
+                                || node.attributes.iter().any(|(key, value)| {
+                                    key.as_str() == "data" && !value.as_str().trim().is_empty()
+                                }))) =>
+                    {
+                        let source_attribute = if tag.as_str() == "object" {
+                            "data"
+                        } else {
+                            "src"
+                        };
                         let src = self
                             .image_render_sources
                             .get(&id)
@@ -4933,7 +4951,7 @@ impl Document {
                             .or_else(|| {
                                 node.attributes
                                     .iter()
-                                    .find(|(k, _)| k.as_str() == "src")
+                                    .find(|(k, _)| k.as_str() == source_attribute)
                                     .map(|(_, v)| v.as_str())
                             })
                             .unwrap_or("");
@@ -9076,6 +9094,22 @@ mod image_component_tests {
             Some("fallback.png"),
             "responsive selection must remain internal rendering state"
         );
+    }
+
+    #[test]
+    fn image_object_lowers_its_data_resource_as_replaced_content() {
+        let mut document = Document::new();
+        let object = document.create_element("object");
+        object.set_attribute(&mut document, "type", "image/png");
+        object.set_attribute(&mut document, "data", "box.png");
+        document.body().append_child(&mut document, object);
+
+        let tree = document.to_component_tree();
+        let component = tree.children.first().expect("object image component");
+        assert!(matches!(
+            component.kind,
+            ComponentKind::Image { ref src } if src == "box.png"
+        ));
     }
 
     #[test]
