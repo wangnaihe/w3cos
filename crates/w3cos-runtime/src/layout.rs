@@ -3476,8 +3476,14 @@ fn project_min_height_trailing_margin_containment(
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
 
-    fn collapse(left: f32, right: f32) -> f32 {
-        left.max(right).max(0.0) + left.min(right).min(0.0)
+    fn collapse(margins: impl IntoIterator<Item = f32>) -> f32 {
+        let mut positive = 0.0_f32;
+        let mut negative = 0.0_f32;
+        for margin in margins {
+            positive = positive.max(margin);
+            negative = negative.min(margin);
+        }
+        positive + negative
     }
 
     fn shift_range(
@@ -3534,23 +3540,59 @@ fn project_min_height_trailing_margin_containment(
             {
                 continue;
             }
-            let Some(last_child) = previous.children.iter().rev().find(|child| {
-                !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
-                    && child.style.display != WDisplay::None
-                    && child.style.float == WFloat::None
-            }) else {
-                continue;
-            };
             let previous_position = *layout_position
                 .get(&previous_index)
                 .expect("in-flow child layout");
-            let trailing_margin = resolve_spacing_for_layout(
-                last_child.style.margin.bottom,
-                layouts[previous_position].0.width,
-                last_child.style.font_size,
-                viewport_w,
-                viewport_h,
-            );
+            let previous_width = layouts[previous_position].0.width;
+            let mut previous_children = Vec::new();
+            let mut previous_child_index = previous_index + 1;
+            for child in &previous.children {
+                if !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                    && child.style.display != WDisplay::None
+                    && child.style.float == WFloat::None
+                {
+                    previous_children.push((previous_child_index, child));
+                }
+                previous_child_index += count_nodes(child);
+            }
+            let mut trailing_margins = Vec::new();
+            for (child_index, child) in previous_children.into_iter().rev() {
+                trailing_margins.push(resolve_spacing_for_layout(
+                    child.style.margin.bottom,
+                    previous_width,
+                    child.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                ));
+                let empty_collapsible = layout_position
+                    .get(&child_index)
+                    .is_some_and(|position| layouts[*position].0.height.abs() <= f32::EPSILON)
+                    && child.style.display == WDisplay::Block
+                    && matches!(child.style.height, WDim::Auto | WDim::Px(0.0))
+                    && child.style.padding_lengths().top.abs() <= f32::EPSILON
+                    && child.style.padding_lengths().bottom.abs() <= f32::EPSILON
+                    && child
+                        .style
+                        .border_top_width
+                        .unwrap_or(child.style.border_width)
+                        <= 0.0
+                    && child
+                        .style
+                        .border_bottom_width
+                        .unwrap_or(child.style.border_width)
+                        <= 0.0;
+                if !empty_collapsible {
+                    break;
+                }
+                trailing_margins.push(resolve_spacing_for_layout(
+                    child.style.margin.top,
+                    previous_width,
+                    child.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                ));
+            }
+            let trailing_margin = collapse(trailing_margins);
             if trailing_margin <= 0.01 {
                 continue;
             }
@@ -3574,16 +3616,21 @@ fn project_min_height_trailing_margin_containment(
             let following_margin = following.style.margin_lengths();
             let expected_y = previous_rect.y
                 + previous_rect.height
-                + collapse(previous_margin.bottom, following_margin.top);
+                + collapse([previous_margin.bottom, following_margin.top]);
             let excess = layouts[following_position].0.y - expected_y;
             if excess > 0.01 {
+                let correction = excess.min(trailing_margin);
                 shift_range(
                     layouts,
                     layout_position,
                     following_index,
                     component_end,
-                    -excess.min(trailing_margin),
+                    -correction,
                 );
+                if matches!(component.style.height, WDim::Auto) {
+                    layouts[component_position].0.height =
+                        (layouts[component_position].0.height - correction).max(0.0);
+                }
             }
         }
 
@@ -10969,6 +11016,64 @@ mod tests {
         let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
         assert_eq!(parent.height, 50.0);
         assert_eq!(following.y, parent.y + parent.height);
+    }
+
+    #[test]
+    fn min_height_traps_a_collapsed_margin_through_an_empty_tail() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                border_top_width: Some(1.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        min_height: WDim::Px(200.0),
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                height: WDim::Px(30.0),
+                                margin: w3cos_std::style::Edges {
+                                    bottom: WSpacing::Px(100.0),
+                                    ..w3cos_std::style::Edges::ZERO
+                                },
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                        Component::boxed(
+                            Style {
+                                display: WDisp::Block,
+                                ..Style::default()
+                            },
+                            Vec::new(),
+                        ),
+                    ],
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let parent = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let marker = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        let footer = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
+        assert_eq!(marker.y, parent.y + 130.0);
+        assert_eq!(footer.y, parent.y + parent.height);
+        assert_eq!(root.height, 251.0);
     }
 
     #[test]
