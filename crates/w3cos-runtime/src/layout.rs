@@ -4299,8 +4299,28 @@ fn build_taffy_tree(
         style.flex_wrap = FlexWrap::Wrap;
         style.align_items = Some(AlignItems::FlexStart);
         if matches!(comp.style.min_height, WDim::Auto) {
-            style.min_size.height =
-                Dimension::length(comp.style.font_size * comp.style.line_height);
+            let line_height = comp.style.font_size * comp.style.line_height;
+            let baseline_replaced_height = comp
+                .children
+                .iter()
+                .filter(|child| {
+                    matches!(child.kind, ComponentKind::Image { .. })
+                        && matches!(child.style.align_self, WAlignSelf::Auto | WAlignSelf::Baseline)
+                })
+                .map(|child| {
+                    let height = leaf_intrinsic_size_with_containing(
+                        &child.kind,
+                        &child.style,
+                        Some(containing_width),
+                    )
+                    .1;
+                    height + line_height * 0.2
+                })
+                .fold(0.0_f32, f32::max);
+            // A baseline-aligned replaced element owns the full area above
+            // the baseline, while the line's font strut still contributes
+            // its descent below it.
+            style.min_size.height = Dimension::length(line_height.max(baseline_replaced_height));
         }
     }
     if mixed_inline_block_flex_fallback {
@@ -10069,6 +10089,40 @@ mod tests {
 
         assert_eq!(layout[0].0.height, 102.0);
         assert_eq!(layout[1].0.y, 84.0);
+    }
+
+    #[test]
+    fn baseline_aligned_tall_image_reserves_the_inline_strut_descent() {
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(100.0),
+                    font_size: 40.0,
+                    line_height: 1.2,
+                    ..Style::default()
+                },
+                vec![Component::image(
+                    "line-box.png",
+                    Style {
+                        display: WDisp::InlineBlock,
+                        width: WDim::Px(100.0),
+                        height: WDim::Px(100.0),
+                        ..Style::default()
+                    },
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        assert!(
+            (layout[0].0.height - 109.6).abs() < 0.01,
+            "baseline line height was {}",
+            layout[0].0.height
+        );
+        assert_eq!(layout[1].0.height, 100.0);
     }
 
     #[test]

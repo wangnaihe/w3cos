@@ -1450,11 +1450,20 @@ impl Document {
                     _ => {}
                 }
             }
+            let inherited_margin = |value| match value {
+                // CSS inheritance copies the computed value. Relative `em`
+                // lengths therefore keep the parent's resolved font metric
+                // instead of being recomputed against the child's font size.
+                w3cos_std::style::Spacing::Em(value) => {
+                    w3cos_std::style::Spacing::Px(value * parent.font_size)
+                }
+                other => other,
+            };
             let inherited_margin_edges = [
-                parent.margin.top,
-                parent.margin.right,
-                parent.margin.bottom,
-                parent.margin.left,
+                inherited_margin(parent.margin.top),
+                inherited_margin(parent.margin.right),
+                inherited_margin(parent.margin.bottom),
+                inherited_margin(parent.margin.left),
             ];
             let mut margin_edges = [
                 style.margin.top,
@@ -11465,6 +11474,34 @@ mod computed_style_cache_tests {
             document.computed_style_for(child.id).margin,
             document.computed_style_for(parent.id).margin
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn margin_inherit_copies_the_parents_computed_em_lengths() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#parent",
+            &[("font-size", "28px"), ("margin", "2em 3em 1em 4em")],
+        );
+        crate::stylesheet::register_rule(
+            "#child",
+            &[("font-size", "40px"), ("margin", "inherit")],
+        );
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        let margin = document.computed_style_for(child.id).margin;
+        assert_eq!(margin.top, w3cos_std::style::Spacing::Px(56.0));
+        assert_eq!(margin.right, w3cos_std::style::Spacing::Px(84.0));
+        assert_eq!(margin.bottom, w3cos_std::style::Spacing::Px(28.0));
+        assert_eq!(margin.left, w3cos_std::style::Spacing::Px(112.0));
         crate::stylesheet::clear_rules();
     }
 
