@@ -1517,12 +1517,12 @@ fn effective_text_align_last(style: &Style) -> Option<TextAlign> {
     })
 }
 
-fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_width: f32) -> f32 {
+fn aligned_text_x(rect: LayoutRect, align: TextAlign, _ink_left: f32, advance_width: f32) -> f32 {
     match align {
-        TextAlign::Right => rect.x + rect.width - advance_width - ink_left,
-        TextAlign::Center => rect.x + (rect.width - advance_width) * 0.5 - ink_left,
+        TextAlign::Right => rect.x + rect.width - advance_width,
+        TextAlign::Center => rect.x + (rect.width - advance_width) * 0.5,
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
-            rect.x - ink_left
+            rect.x
         }
     }
 }
@@ -2595,9 +2595,9 @@ mod tests {
             width: 100.0,
             height: 20.0,
         };
-        assert_eq!(aligned_text_x(rect, TextAlign::Right, 1.0, 40.0), 69.0);
-        assert_eq!(aligned_text_x(rect, TextAlign::Center, 1.0, 40.0), 39.0);
-        assert_eq!(aligned_text_x(rect, TextAlign::Left, 1.0, 40.0), 9.0);
+        assert_eq!(aligned_text_x(rect, TextAlign::Right, 1.0, 40.0), 70.0);
+        assert_eq!(aligned_text_x(rect, TextAlign::Center, 1.0, 40.0), 40.0);
+        assert_eq!(aligned_text_x(rect, TextAlign::Left, 1.0, 40.0), 10.0);
     }
 
     #[test]
@@ -2695,6 +2695,63 @@ mod tests {
         let space = measure_skia_text_advance(" ", &primary, &style);
         let non_breaking_space = measure_skia_text_advance("\u{00a0}", &primary, &style);
         assert!((space - non_breaking_space).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_ascii_text_is_pixel_invariant_across_inline_fragments() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let continuous_style = Style {
+            display: Display::Block,
+            font_family: Some("serif".to_string()),
+            color: w3cos_std::color::Color::BLACK,
+            ..Style::default()
+        };
+        let fragment_style = Style {
+            display: Display::Inline,
+            ..continuous_style.clone()
+        };
+        let mut continuous = Surface::new_raster_n32_premul((96, 32)).unwrap();
+        let mut fragmented = Surface::new_raster_n32_premul((96, 32)).unwrap();
+        continuous.canvas().clear(Color::WHITE);
+        fragmented.canvas().clear(Color::WHITE);
+        draw_text_in_rect(
+            continuous.canvas(),
+            LayoutRect {
+                x: 11.0,
+                y: 4.0,
+                width: 46.179688,
+                height: 19.2,
+            },
+            "abcde",
+            &continuous_style,
+            &typeface,
+            crate::layout::layout_font(),
+        );
+        for (x, width, fragment) in [
+            (11.0, 8.8515625, "a"),
+            (19.851563, 28.117188, "bcd"),
+            (47.96875, 9.2109375, "e"),
+        ] {
+            draw_text_in_rect(
+                fragmented.canvas(),
+                LayoutRect {
+                    x,
+                    y: 4.0,
+                    width,
+                    height: 19.2,
+                },
+                fragment,
+                &fragment_style,
+                &typeface,
+                crate::layout::layout_font(),
+            );
+        }
+        let info = ImageInfo::new((96, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut continuous_pixels = vec![0_u8; 96 * 32 * 4];
+        let mut fragmented_pixels = vec![0_u8; 96 * 32 * 4];
+        assert!(continuous.read_pixels(&info, &mut continuous_pixels, 96 * 4, (0, 0)));
+        assert!(fragmented.read_pixels(&info, &mut fragmented_pixels, 96 * 4, (0, 0)));
+        assert_eq!(continuous_pixels, fragmented_pixels);
     }
 
     #[test]
