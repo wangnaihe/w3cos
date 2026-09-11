@@ -1811,6 +1811,7 @@ impl LayoutEngine {
         project_forced_break_lines(&mut results, root);
         project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
         project_inline_after_leading_empty_blocks(&mut results, root);
+        project_simple_float_margin_boxes(&mut results, root);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
@@ -1938,6 +1939,7 @@ pub fn compute_with_scroll(
     project_forced_break_lines(&mut results, root);
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
     project_inline_after_leading_empty_blocks(&mut results, root);
+    project_simple_float_margin_boxes(&mut results, root);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
@@ -2751,6 +2753,115 @@ fn project_inline_after_leading_empty_blocks(
         for child in &component.children {
             visit(child, child_index, layouts, layout_position);
             child_index += count_nodes(child);
+        }
+    }
+
+    visit(root, 0, layouts, &layout_position);
+}
+
+fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    let layout_position = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn shift_subtree(
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+        start: usize,
+        count: usize,
+        delta_y: f32,
+    ) {
+        for index in start..start + count {
+            if let Some(position) = layout_position.get(&index).copied() {
+                layouts[position].0.y += delta_y;
+            }
+        }
+    }
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+    ) {
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            visit(child, child_index, layouts, layout_position);
+            child_index += count_nodes(child);
+        }
+
+        if component.style.float != WFloat::None
+            && matches!(component.style.height, WDim::Auto)
+            && component.children.len() == 1
+        {
+            let child = &component.children[0];
+            let child_index = component_index + 1;
+            if child.style.display == WDisplay::Block
+                && matches!(child.style.height, WDim::Auto | WDim::Px(0.0))
+                && child.style.padding_lengths().top.abs() <= f32::EPSILON
+                && child.style.padding_lengths().bottom.abs() <= f32::EPSILON
+                && child
+                    .style
+                    .border_top_width
+                    .unwrap_or(child.style.border_width)
+                    <= 0.0
+                && child
+                    .style
+                    .border_bottom_width
+                    .unwrap_or(child.style.border_width)
+                    <= 0.0
+                && let (Some(parent_position), Some(child_position)) = (
+                    layout_position.get(&component_index).copied(),
+                    layout_position.get(&child_index).copied(),
+                )
+                && layouts[child_position].0.height.abs() <= f32::EPSILON
+            {
+                let margin = child.style.margin_lengths();
+                let collapsed_margin = margin.top.max(margin.bottom).max(0.0)
+                    + margin.top.min(margin.bottom).min(0.0);
+                layouts[parent_position].0.height = collapsed_margin.max(0.0);
+            }
+        }
+
+        let mut previous = None::<(usize, &Component)>;
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            let child_count = count_nodes(child);
+            if matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                || child.style.display == WDisplay::None
+            {
+                child_index += child_count;
+                continue;
+            }
+            if child.style.float != WFloat::None
+                && let Some((previous_index, previous_child)) = previous
+                && previous_child.style.float == WFloat::None
+                && let (Some(previous_position), Some(child_position)) = (
+                    layout_position.get(&previous_index).copied(),
+                    layout_position.get(&child_index).copied(),
+                )
+            {
+                let previous_margin = previous_child.style.margin_lengths();
+                if previous_margin.bottom < 0.0 {
+                    let child_margin = child.style.margin_lengths();
+                    let target_y = layouts[previous_position].0.y
+                        + layouts[previous_position].0.height
+                        + previous_margin.bottom
+                        + child_margin.top;
+                    let delta_y = target_y - layouts[child_position].0.y;
+                    shift_subtree(
+                        layouts,
+                        layout_position,
+                        child_index,
+                        child_count,
+                        delta_y,
+                    );
+                }
+            }
+            previous = Some((child_index, child));
+            child_index += child_count;
         }
     }
 
@@ -8629,6 +8740,58 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!(first.y, 16.0);
         assert_eq!(second.y, 122.0);
+    }
+
+    #[test]
+    fn empty_block_margins_form_a_floats_used_box_after_negative_flow_margin() {
+        let empty = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                margin: w3cos_std::style::Edges {
+                    top: WSpacing::Px(100.0),
+                    right: WSpacing::Px(50.0),
+                    bottom: WSpacing::Px(100.0),
+                    left: WSpacing::Px(50.0),
+                },
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(100.0),
+                        height: WDim::Px(100.0),
+                        margin: w3cos_std::style::Edges {
+                            bottom: WSpacing::Px(-100.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        float: WFloat::Left,
+                        ..Style::default()
+                    },
+                    vec![empty],
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let control = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(floating.y, control.y);
+        assert_eq!((floating.width, floating.height), (100.0, 100.0));
     }
 
     #[test]
