@@ -847,6 +847,27 @@ mod tests {
     }
 
     #[test]
+    fn document_node_does_not_override_the_html_default_font() {
+        crate::stylesheet::clear_rules();
+
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        html.append_child(&mut doc, body);
+        doc.body().append_child(&mut doc, html);
+        doc.set_render_body(body.id);
+
+        assert_eq!(
+            doc.computed_style_for(html.id).font_family.as_deref(),
+            Some("serif")
+        );
+        assert_eq!(
+            doc.to_component_tree().style.font_family.as_deref(),
+            Some("serif")
+        );
+    }
+
+    #[test]
     fn body_fast_path_retains_the_browser_default_margin() {
         let doc = Document::new();
         assert_eq!(

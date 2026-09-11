@@ -818,14 +818,17 @@ impl Document {
     // Component tree bridge
     // -----------------------------------------------------------------------
 
-    pub fn to_component_tree(&self) -> w3cos_std::Component {
-        if let Some(document_element) = self.get_node(self.body_id).parent
-            && self
-                .get_node(document_element)
+    fn document_element_id(&self) -> Option<NodeId> {
+        self.get_node(self.body_id).parent.filter(|parent| {
+            self.get_node(*parent)
                 .tag
                 .as_str()
                 .eq_ignore_ascii_case("html")
-        {
+        })
+    }
+
+    pub fn to_component_tree(&self) -> w3cos_std::Component {
+        if let Some(document_element) = self.document_element_id() {
             // Use one stable browser formatting root. Rooting ordinary pages
             // at body makes Taffy ignore the body's own margin, while pages
             // that happen to render html generated content keep that same
@@ -855,9 +858,10 @@ impl Document {
             .into_iter()
             .map(|ancestor| self.selector_context(ancestor))
             .collect();
-        let inherited = self
-            .get_node(id)
-            .parent
+        let inherited = (Some(id) != self.document_element_id())
+            .then(|| self.get_node(id).parent)
+            .flatten()
+            .filter(|parent| self.get_node(*parent).node_type == NodeType::Element)
             .map(|parent| self.computed_style_for(parent));
         let mut component = self.node_to_component(id, &mut ancestors, inherited.as_ref());
         reorder_explicit_bidi_inline_rows(&mut component);
@@ -1775,20 +1779,27 @@ impl Document {
     /// inline declarations for a node.
     pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
         let mut ancestor_ids = Vec::new();
-        let mut current = self.get_node(id).parent;
+        let document_element = self.document_element_id();
+        let mut current = (Some(id) != document_element)
+            .then(|| self.get_node(id).parent)
+            .flatten();
         while let Some(parent) = current {
             ancestor_ids.push(parent);
+            if Some(parent) == document_element {
+                break;
+            }
             current = self.get_node(parent).parent;
         }
         ancestor_ids.reverse();
         let mut ancestors = Vec::new();
         let mut inherited = None;
         for ancestor in ancestor_ids {
+            if self.get_node(ancestor).node_type != NodeType::Element {
+                continue;
+            }
             let style = self.computed_style(ancestor, &ancestors, inherited.as_ref());
             inherited = Some(style);
-            if self.get_node(ancestor).node_type == NodeType::Element {
-                ancestors.push(self.selector_context(ancestor));
-            }
+            ancestors.push(self.selector_context(ancestor));
         }
         self.computed_style(id, &ancestors, inherited.as_ref())
     }

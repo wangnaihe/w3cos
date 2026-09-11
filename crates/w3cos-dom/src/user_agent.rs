@@ -40,6 +40,10 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
     };
 
     match local_name {
+        // HTML's initial canvas text uses the user-agent serif family. Setting
+        // it on the root lets ordinary descendants inherit the same face that
+        // an explicit `font-family: serif` declaration resolves to.
+        "html" => style.font_family = Some("serif".to_string()),
         "body" => style.margin = Edges::all(8.0),
         "table" => {
             style.border_spacing_x = 2.0;
@@ -116,6 +120,10 @@ mod tests {
 
         assert_eq!(html_default_style("div").display, Display::Block);
         assert_eq!(html_default_style("div").flex_direction, FlexDirection::Row);
+        assert_eq!(
+            html_default_style("html").font_family.as_deref(),
+            Some("serif")
+        );
         assert_eq!(html_default_style("body").margin, Edges::all(8.0));
         assert_eq!(html_default_style("p").margin.top, Spacing::Em(1.0));
         assert_eq!(html_default_style("p").margin.bottom, Spacing::Em(1.0));
