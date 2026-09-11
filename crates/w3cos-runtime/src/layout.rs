@@ -3839,6 +3839,12 @@ fn build_taffy_tree(
     if let WSpacing::Percent(value) = comp.style.padding.bottom {
         style.padding.bottom = LengthPercentage::length(containing_width * value / 100.0);
     }
+    if let WSpacing::Percent(value) = comp.style.padding.left {
+        style.padding.left = LengthPercentage::length(containing_width * value / 100.0);
+    }
+    if let WSpacing::Percent(value) = comp.style.padding.right {
+        style.padding.right = LengthPercentage::length(containing_width * value / 100.0);
+    }
     let child_containing_width =
         component_content_width(&comp.style, containing_width, viewport_w, viewport_h);
     if comp.style.float != WFloat::None
@@ -7418,6 +7424,44 @@ mod tests {
         );
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!((layout[1].0.width, layout[1].0.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn horizontal_percentage_padding_uses_a_zero_width_containing_block() {
+        let grandchild = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                height: WDim::Px(20.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let child = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                padding: w3cos_std::style::Edges {
+                    left: WSpacing::Percent(50.0),
+                    right: WSpacing::Percent(50.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            },
+            vec![grandchild],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(0.0),
+                ..Style::default()
+            },
+            vec![child],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[1].0.width, 100.0);
+        assert_eq!(layout[2].0.x, 0.0);
     }
 
     #[test]
