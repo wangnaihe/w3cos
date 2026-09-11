@@ -1960,6 +1960,7 @@ impl LayoutEngine {
         project_auto_table_child_heights(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
         project_table_cell_inline_vertical_padding(&mut results, flat);
+        align_inline_table_first_row_baselines(&mut results, flat);
         align_empty_inline_table_baselines(&mut results, flat);
 
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
@@ -2097,6 +2098,7 @@ pub fn compute_with_scroll(
     project_auto_table_child_heights(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
     project_table_cell_inline_vertical_padding(&mut results, &flat);
+    align_inline_table_first_row_baselines(&mut results, &flat);
     align_empty_inline_table_baselines(&mut results, &flat);
 
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
@@ -2566,6 +2568,120 @@ fn align_empty_inline_table_baselines(
         {
             let parent_rect = &mut layouts[parent_position].0;
             parent_rect.height = (child_bottom - parent_rect.y).max(0.0);
+        }
+    }
+}
+
+fn align_inline_table_first_row_baselines(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    let mut line_top_by_parent = HashMap::<usize, f32>::new();
+    for (table, node) in flat.iter().enumerate() {
+        if node.style.display != WDisplay::InlineTable
+            || !matches!(node.style.align_self, WAlignSelf::Auto | WAlignSelf::Baseline)
+        {
+            continue;
+        }
+        let Some(parent) = node.parent else {
+            continue;
+        };
+        let descendant_of_table = |index: usize| {
+            let mut ancestor = flat[index].parent;
+            while let Some(candidate) = ancestor {
+                if candidate == table {
+                    return true;
+                }
+                ancestor = flat[candidate].parent;
+            }
+            false
+        };
+        let subtree_end = (table + 1..flat.len())
+            .find(|index| !descendant_of_table(*index))
+            .unwrap_or(flat.len());
+        let has_vertical_table_geometry = flat[table..subtree_end].iter().any(|entry| {
+            let padding = entry.style.padding_lengths();
+            let margin = entry.style.margin_lengths();
+            padding.top.abs() > f32::EPSILON
+                || padding.bottom.abs() > f32::EPSILON
+                || margin.top.abs() > f32::EPSILON
+                || margin.bottom.abs() > f32::EPSILON
+                || entry
+                    .style
+                    .border_top_width
+                    .unwrap_or(entry.style.border_width)
+                    .abs()
+                    > f32::EPSILON
+                || entry
+                    .style
+                    .border_bottom_width
+                    .unwrap_or(entry.style.border_width)
+                    .abs()
+                    > f32::EPSILON
+                || entry.style.border_spacing_y.abs() > f32::EPSILON
+        });
+        if !has_vertical_table_geometry {
+            continue;
+        }
+        let first_visible_text = flat[table + 1..subtree_end]
+            .iter()
+            .enumerate()
+            .find(|(_, descendant)| {
+                descendant.style.visibility == WVisibility::Visible
+                    && matches!(
+                        descendant.kind,
+                        ComponentKind::Text { content }
+                            if content.chars().any(|character| !character.is_whitespace())
+                    )
+            })
+            .map(|(offset, text)| (table + 1 + offset, text));
+        let Some((text_index, text)) = first_visible_text else {
+            continue;
+        };
+        let Some(text_position) = positions.get(&text_index).copied() else {
+            continue;
+        };
+        let rect = layouts[text_position].0;
+        let line_top = if text.style.display == WDisplay::Inline {
+            rect.y
+        } else {
+            let padding = text.style.padding_lengths();
+            let border_top = text
+                .style
+                .border_top_width
+                .unwrap_or(text.style.border_width);
+            let half_leading = ((text.style.font_size * text.style.line_height)
+                - text.style.font_size)
+                .max(0.0)
+                * 0.5;
+            rect.y + border_top + padding.top + half_leading
+        };
+        line_top_by_parent
+            .entry(parent)
+            .and_modify(|current| *current = current.max(line_top))
+            .or_insert(line_top);
+    }
+    for (index, node) in flat.iter().enumerate() {
+        if node.style.display != WDisplay::Inline
+            || node.style.visibility != WVisibility::Visible
+            || !matches!(node.kind, ComponentKind::Text { .. })
+        {
+            continue;
+        }
+        let Some(target) = node
+            .parent
+            .and_then(|parent| line_top_by_parent.get(&parent))
+            .copied()
+        else {
+            continue;
+        };
+        if let Some(position) = positions.get(&index).copied() {
+            layouts[position].0.y = target;
         }
     }
 }
@@ -13632,6 +13748,60 @@ mod tests {
         project_auto_table_child_heights(&mut layout, &flat);
 
         assert_eq!(layout[0].0.height, 40.0);
+    }
+
+    #[test]
+    fn inline_table_uses_its_first_cell_text_as_the_sibling_baseline() {
+        let inline = |content| {
+            Component::text(
+                content,
+                Style {
+                    display: WDisp::Inline,
+                    ..Style::default()
+                },
+            )
+        };
+        let table = Component::row(
+            Style {
+                display: WDisp::InlineTable,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "bcd",
+                Style {
+                    display: WDisp::TableCell,
+                    padding: w3cos_std::style::Edges::xy(0.0, 9.0),
+                    border_top_width: Some(4.0),
+                    ..Style::default()
+                },
+            )],
+        );
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![inline("a"), table, inline("e")],
+        );
+        let flat = pre_flatten(&root);
+        let rect = |y, height| LayoutRect {
+            x: 0.0,
+            y,
+            width: 0.0,
+            height,
+        };
+        let mut layout = vec![
+            (rect(0.0, 0.0), 0),
+            (rect(28.6, 0.0), 1),
+            (rect(30.0, 0.0), 2),
+            (rect(48.0, 45.2), 3),
+            (rect(28.6, 0.0), 4),
+        ];
+
+        align_inline_table_first_row_baselines(&mut layout, &flat);
+
+        assert!((layout[1].0.y - 62.6).abs() < 0.01);
+        assert!((layout[4].0.y - 62.6).abs() < 0.01);
     }
 
     #[test]
