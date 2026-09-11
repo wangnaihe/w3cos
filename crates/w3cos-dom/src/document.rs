@@ -3165,6 +3165,25 @@ impl Document {
     ) -> w3cos_std::Component {
         let node = self.get_node(id);
         let mut style = self.computed_style(id, ancestors, inherited);
+        if matches!(style.height, w3cos_std::style::Dimension::Percent(_))
+            && inherited.is_some_and(|parent| {
+                matches!(parent.height, w3cos_std::style::Dimension::Auto)
+                    && matches!(
+                        parent.display,
+                        w3cos_std::style::Display::Block
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::ListItem
+                            | w3cos_std::style::Display::TableCell
+                            | w3cos_std::style::Display::TableCaption
+                    )
+            })
+        {
+            // Percentage heights in an auto-height block formatting context
+            // are indefinite and compute to the auto used height. Letting
+            // Taffy resolve the percentage against the block's eventual
+            // content height creates a cyclic non-zero box.
+            style.height = w3cos_std::style::Dimension::Auto;
+        }
         let qualified_tag = node.tag.as_str();
         let tag = qualified_tag
             .rsplit_once(':')
@@ -9548,6 +9567,35 @@ mod image_component_tests {
         assert!(source.contains("<rect "));
         assert!(!source.contains("svg:svg"));
         assert!(!source.contains("svg:rect"));
+    }
+
+    #[test]
+    fn percentage_height_is_auto_in_an_auto_height_block() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".percentage", &[("height", "20%")]);
+        crate::stylesheet::register_rule("#fixed", &[("height", "100px")]);
+
+        let mut document = Document::new();
+        let automatic = document.create_element("div");
+        let unresolved = document.create_element("div");
+        unresolved.set_attribute(&mut document, "class", "percentage");
+        automatic.append_child(&mut document, unresolved);
+        document.body().append_child(&mut document, automatic);
+        let fixed = document.create_element("div");
+        fixed.set_attribute(&mut document, "id", "fixed");
+        let resolved = document.create_element("div");
+        resolved.set_attribute(&mut document, "class", "percentage");
+        fixed.append_child(&mut document, resolved);
+        document.body().append_child(&mut document, fixed);
+
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].children[0].style.height, Dimension::Auto);
+        assert_eq!(
+            tree.children[1].children[0].style.height,
+            Dimension::Percent(20.0)
+        );
+
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
