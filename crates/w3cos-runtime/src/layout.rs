@@ -2023,9 +2023,14 @@ fn project_empty_painted_inline_boxes(
             continue;
         };
         let parent = layouts[parent_position].0;
-        if parent.height > 0.0 {
+        let painted_height = if parent.height > 0.0 {
+            parent.height
+        } else {
+            node.style.font_size * node.style.line_height
+        };
+        if painted_height > 0.0 {
             layouts[position].0.y = parent.y;
-            layouts[position].0.height = parent.height;
+            layouts[position].0.height = painted_height;
         }
     }
 }
@@ -10306,6 +10311,56 @@ mod tests {
         assert_eq!(inner.y, line.y);
         assert_eq!(outer.height, line.height);
         assert_eq!(inner.height, line.height);
+    }
+
+    #[test]
+    fn empty_painted_inline_fragment_falls_back_to_its_computed_line_height() {
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::Inline,
+                    border_right_width: Some(200.0),
+                    margin: w3cos_std::style::Edges {
+                        right: WSpacing::Px(-200.0),
+                        ..w3cos_std::style::Edges::ZERO
+                    },
+                    font_size: 200.0,
+                    line_height: 1.0,
+                    ..Style::default()
+                },
+                Vec::new(),
+            )],
+        );
+        let flat = pre_flatten(&root);
+        let mut layout = vec![
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 51.2,
+                    width: 200.0,
+                    height: 0.0,
+                },
+                0,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 51.2,
+                    width: 200.0,
+                    height: 0.0,
+                },
+                1,
+            ),
+        ];
+        project_empty_painted_inline_boxes(&mut layout, &flat);
+
+        let fragment = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(fragment.height, 200.0);
     }
 
     #[test]
