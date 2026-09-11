@@ -117,7 +117,22 @@ impl RetainedLayerTree {
 
 pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
     let mut layers = Vec::new();
-    for (chunk_id, chunk) in artifact.chunks.iter().enumerate() {
+    let mut chunk_ids = (0..artifact.chunks.len()).collect::<Vec<_>>();
+    chunk_ids.sort_by(|left, right| {
+        let client_index = |chunk_id: &usize| {
+            artifact
+                .chunks
+                .get(*chunk_id)
+                .and_then(|chunk| artifact.display_items.get(chunk.begin))
+                .map(|item| item.client_index)
+                .unwrap_or(usize::MAX)
+        };
+        artifact
+            .paint_order_key(client_index(left))
+            .cmp(artifact.paint_order_key(client_index(right)))
+    });
+    for chunk_id in chunk_ids {
+        let chunk = &artifact.chunks[chunk_id];
         let sticky = artifact
             .display_items
             .get(chunk.begin)
@@ -458,7 +473,7 @@ pub fn layer_opacity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use w3cos_std::style::{Overflow, Style, Transform2D};
+    use w3cos_std::style::{Float, Overflow, Position, Style, Transform2D};
 
     use crate::paint_artifact::PaintNode;
 
@@ -509,6 +524,58 @@ mod tests {
             LayerPaintAction::Rebuild => tree.note_rebuild(),
             LayerPaintAction::Replay => tree.note_replay(),
         }
+    }
+
+    #[test]
+    fn layers_preserve_css_paint_order_across_scroll_properties() {
+        let mut positioned_style = Style::default();
+        positioned_style.position = Position::Absolute;
+        let mut float_style = Style::default();
+        float_style.float = Float::Left;
+        float_style.overflow = Overflow::Scroll;
+        let artifact = PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style::default(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: positioned_style,
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: float_style,
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Text {
+                        content: "float".into(),
+                    },
+                    style: Style::default(),
+                    parent: Some(2),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+            ],
+            1,
+        );
+
+        let painted_clients = build_layers(&artifact)
+            .into_iter()
+            .flat_map(|layer| layer.client_indices)
+            .collect::<Vec<_>>();
+        assert_eq!(painted_clients, vec![0, 2, 3, 1]);
     }
 
     #[test]
