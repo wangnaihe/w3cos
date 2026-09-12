@@ -453,6 +453,27 @@ mod tests {
     }
 
     #[test]
+    fn out_of_flow_inline_elements_do_not_preserve_collapsible_whitespace() {
+        use w3cos_std::ComponentKind;
+
+        let mut doc = Document::new();
+        for position in ["absolute", "fixed"] {
+            let image = doc.create_element("img");
+            doc.get_style_mut(image.id).set_property("position", position);
+            doc.append_child(doc.body().id, image.id);
+            let whitespace = doc.create_text_node("\n  ");
+            doc.append_child(doc.body().id, whitespace.id);
+        }
+        let block = doc.create_element("div");
+        doc.append_child(doc.body().id, block.id);
+        let tree = doc.to_component_tree();
+        assert_eq!(tree.children.len(), 3);
+        assert!(tree.children.iter().all(|child| !matches!(
+            &child.kind, ComponentKind::Text { content } if content.trim().is_empty()
+        )));
+    }
+
+    #[test]
     fn block_flow_drops_inter_element_whitespace_but_keeps_inline_spacing() {
         use w3cos_std::ComponentKind;
 

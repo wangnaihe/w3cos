@@ -2884,7 +2884,11 @@ impl Document {
                     NodeType::Element => {
                         let child_style =
                             self.computed_style(*child_id, &child_ancestors, Some(parent_style));
-                        if child_style.display == Display::None {
+                        if child_style.display == Display::None
+                            || matches!(child_style.position,
+                                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                            || child_style.float != w3cos_std::style::Float::None
+                        {
                             return None;
                         }
                         let mut participates = matches!(
@@ -2981,10 +2985,13 @@ impl Document {
             match sibling.node_type {
                 NodeType::Text => Some(true),
                 NodeType::Element => {
-                    let display = self
-                        .computed_style(sibling_id, ancestors, Some(parent_style))
-                        .display;
-                    if display == Display::None {
+                    let style = self.computed_style(sibling_id, ancestors, Some(parent_style));
+                    let display = style.display;
+                    if display == Display::None
+                        || matches!(style.position,
+                            w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                        || style.float != w3cos_std::style::Float::None
+                    {
                         return None;
                     }
                     Some(
