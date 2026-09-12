@@ -1230,6 +1230,25 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   tolerances unchanged. Next sequential start 5569; final clean-SHA full
   6548 proof remains unachieved.
 
+### Sequential inline-table baseline checkpoint
+
+- On `2de6611`, starts 5569 and 5577 pass 8/8 each; start 5585 completes
+  7 passed / 1 failed. Receipts:
+  `target/wpt-targeted/batch-<start>-post-outer-spacing-v1/results.json`.
+  Start 5593 was not executed after that failure.
+- Case 5588 `table-vertical-align-baseline-008.xht` differs by 15000 pixels
+  from `ref-filled-green-100px-square.xht` at unchanged zero tolerances.
+  This path passed in the original full report; introducing revision is not
+  qualified yet. It uses definite 50x100 inline-table sizing with zero spacing,
+  unlike the auto-width outer-spacing conversion just repaired.
+- Actual dump `target/wpt-targeted/inline-table-baseline-5588-debug.bin`:
+  the inline-block is at y51.2, 50x100; inline-table at y151.2, 50x100;
+  first row and empty baseline-aligned cell have used height 0 despite the
+  row's declared 100px height. Wrapper height grows to 200 instead of 100.
+  Next scope is row used-height and synthetic empty-cell baseline propagation;
+  do not patch the inline-table position with a fixed 100px offset.
+  Final clean-SHA full 6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
