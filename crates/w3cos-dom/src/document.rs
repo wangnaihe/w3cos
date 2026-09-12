@@ -4812,16 +4812,16 @@ impl Document {
                         }
                     } else {
                         let authored_block = style.display == w3cos_std::style::Display::Block;
-                        style.display = if matches!(
-                            style.display,
+                        // Flex is an internal model for the inline children,
+                        // not a replacement for the authored outer display.
+                        // In particular, inline decoration is not an atomic
+                        // inline-flex box and must not shift its text baseline.
+                        style.display = match style.display {
                             w3cos_std::style::Display::Inline
-                                | w3cos_std::style::Display::InlineBlock
-                                | w3cos_std::style::Display::InlineFlex
-                                | w3cos_std::style::Display::InlineTable
-                        ) {
-                            w3cos_std::style::Display::InlineFlex
-                        } else {
-                            w3cos_std::style::Display::Flex
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex
+                            | w3cos_std::style::Display::InlineTable => style.display,
+                            _ => w3cos_std::style::Display::Flex,
                         };
                         style.flex_direction = w3cos_std::style::FlexDirection::Row;
                         style.align_items = if uses_inline_strut_wrappers {

@@ -12008,6 +12008,21 @@ mod tests {
     }
 
     #[test]
+    fn inline_vertical_decoration_does_not_move_its_text_baseline() {
+        let text = || Component::text("text", Style { display: WDisp::Inline, ..Style::default() });
+        let decorated = Component::row(Style {
+            display: WDisp::Inline, border_width: 1.0,
+            padding: w3cos_std::style::Edges { top: WSpacing::Px(5.0), bottom: WSpacing::Px(5.0),
+                ..w3cos_std::style::Edges::ZERO }, ..Style::default()
+        }, vec![text()]);
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(500.0), ..Style::default()
+        }, vec![text(), decorated]), 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(3).y, get(1).y);
+    }
+
+    #[test]
     fn block_absolute_static_top_ignores_preceding_float_and_clear() {
         let layout = compute(&Component::row(Style {
             display: WDisp::Block, width: WDim::Px(96.0), height: WDim::Px(16.0),

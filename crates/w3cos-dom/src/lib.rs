@@ -517,6 +517,27 @@ mod tests {
     }
 
     #[test]
+    fn decorated_inline_retains_its_outer_display_with_atomic_children() {
+        let mut doc = Document::new();
+        let span = doc.create_element("span");
+        doc.get_style_mut(span.id).set_property("border", "1px solid black");
+        let text = doc.create_text_node("a");
+        doc.append_child(span.id, text.id);
+        let atomic = doc.create_element("div");
+        doc.get_style_mut(atomic.id).set_property("display", "inline-block");
+        doc.get_style_mut(atomic.id).set_property("width", "30px");
+        doc.get_style_mut(atomic.id).set_property("height", "10px");
+        doc.append_child(span.id, atomic.id);
+        doc.append_child(doc.body().id, span.id);
+        fn find(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.border_width == 1.0 { return Some(component); }
+            component.children.iter().find_map(find)
+        }
+        let tree = doc.to_component_tree();
+        assert_eq!(find(&tree).unwrap().style.display, w3cos_std::style::Display::Inline);
+    }
+
+    #[test]
     fn outer_text_does_not_duplicate_a_decorated_inline_trailing_space() {
         let mut doc = Document::new();
         let span = doc.create_element("span");
