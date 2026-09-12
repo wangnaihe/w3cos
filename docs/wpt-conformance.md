@@ -124,6 +124,14 @@ passed 8/8 each. Reports are respectively
 `target/wpt-targeted/batch-4329-4336-current-v1/results.json`. These focused
 results do not establish a green complete 6,548-case run.
 
+The same runtime subsequently passed batches 4337–4344, 4345–4352,
+4353–4360, 4361–4368, 4369–4376 and 4377–4384 (8/8 each). Each receipt is
+`target/wpt-targeted/batch-<start>-<end>-current-v1/results.json` with those
+exact range bounds. Together with the two preceding batches, 4321–4384
+passed 64/64. WPT remained clean at revision
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0` and the suite retained 6,548
+entries; case 4314 remains an open failure outside this passing range.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
