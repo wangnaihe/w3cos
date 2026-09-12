@@ -1067,6 +1067,68 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `box_background_paint_rect` insets before changing collapsed-cell painting.
   Fixed WPT inputs, original suite, viewport and zero tolerances unchanged.
 
+### Centered cell background repair: pending table paint-phase integration
+
+- Local work atop `4da0454`, not committed: corrected collapsed-cell background
+  bounds to retain the inline grid rectangle and background-image origin to
+  use half inline borders. The old helper test incorrectly supplied a full
+  59px border rectangle rather than the observed 57px shared-grid rectangle.
+  Its corrected RED result was x=139/width=55, expected x=138/width=57.
+- Both focused background tests pass, including asymmetric and separated
+  borders. Current unit executable is `w3cos_runtime-11f7b072e926e629`:
+  background-image 16/16, collapsed-layout 16/16, paint-artifact 30/32.
+  The two paint failures are `auto_positioned_subtree_paints_after_later_normal_flow_content`
+  and `inline_fragment_clip_keeps_layout_rect_and_clips_only_paint`; neither
+  uses the modified collapsed-cell bounds path. Do not claim module-wide green.
+  An earlier direct invocation selected an older feature-specific executable;
+  its counts are not current-change qualification.
+- Strict starts `5553,5545,5231,5239,5247,5255,5263,5369`, suffix
+  `centered-cell-background-v1`: 62 passed, 2 failed. Case 5557 now has zero
+  pixel difference, but fixed-table-layout-027 (5370) regressed by 1200 pixels
+  and -029 (5372) by 800. All receipts remain retained; do not advance to 5561.
+- The regression is NOT a fixed-versus-auto rectangle discrepancy. Layout
+  dump 5370 shows shared-grid cell widths 12.5, 75, 12.5. The right red cell
+  background paints after the middle green cell's winning shared border,
+  covering its inner half. Previous unconditional insets masked that ordering.
+  CPU and Skia currently paint background and border together per node.
+- Required next scope: common retained table paint phases, consumed by all
+  raster backends, with table cell backgrounds preceding table borders as
+  required by [CSS2 Appendix E](https://www.w3.org/TR/CSS2/zindex.html#painting-order).
+  Preserve border-conflict ownership, clips, effects and table content order;
+  do not add a fixture, layout-mode or opaque-border clipping special case.
+- Runner build completed in 4m00s including the queued build-lock wait.
+  SHA256 `c6b8e3cc6d634c7b1b0f61eb578aea83a4a99f803d444eef61fbc3ab7c9f10e3`.
+  All jobs are terminal. Fixed upstream revision, original 6548-case suite,
+  800x600 viewport and zero tolerances unchanged. Full closure remains open.
+
+### Shared table replay phases: focused closure of 5557 and fixed-layout regressions
+
+- Added `table_paint` replay shared by window and headless entry points. It
+  emits table/column-group/column/row-group/row/cell backgrounds, then shared
+  borders, then original content; snapshot identity, coordinates and border
+  conflict ownership are retained. Non-table nodes borrow their original data.
+  Positioned, floated and independent-effect parts retain atomic replay.
+- Background/border-only commands suppress outline; the content pass retains
+  it. `filter:none` does not introduce an independent context. This closes the
+  neighbor-background overpaint exposed by the centered bounds repair, rather
+  than restoring an unconditional inset or introducing a layout-mode exception.
+- New stage-order/positioned-cell tests 2/2, background-image 16/16,
+  collapsed-layout 16/16; current paint-artifact scope remains 30/32 with the
+  same two separately recorded failures. New module formatting and diff check
+  passed. This is not a claim that all raster unit tests or native UI journeys pass.
+- Initial draft strict batches 5369 and 5553 passed 16/16, retained under
+  `table-phases-draft-v1`. After outline/filter refinement, rebuilt runner
+  completed in 3m58s including queued lock wait; SHA256:
+  `8285ed7903ecb976837239486331efe5503c551469422e890e281843ddd5d16f`.
+- Latest strict starts `5369,5553,5545,5231,5239,5247,5255,5263`: 64/64
+  passed under `target/wpt-targeted/batch-<start>-table-paint-phases-v1/results.json`.
+  5370/5372 no longer regress, 5557 remains zero pixels, and 211/212 pass.
+  Evidence used the local repair atop `4da0454`, not a final clean-SHA full run.
+- Fixed upstream revision, original 6548-case suite, viewport 800x600 and
+  zero tolerances are unchanged. Next sequential start 5561; final full-suite
+  closure remains open. Actual CPU/GPU/mobile replay acceptance is not implied
+  by compilation of the shared window entry point and headless Skia evidence.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

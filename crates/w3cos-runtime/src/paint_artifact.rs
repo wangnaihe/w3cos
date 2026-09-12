@@ -1043,13 +1043,13 @@ fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
 pub(crate) fn box_background_paint_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
     if style.border_collapse && style.display == Display::TableCell {
         let top = style.border_top_width.unwrap_or(style.border_width) / 2.0;
-        let right = style.border_right_width.unwrap_or(style.border_width) / 2.0;
         let bottom = style.border_bottom_width.unwrap_or(style.border_width) / 2.0;
-        let left = style.border_left_width.unwrap_or(style.border_width) / 2.0;
+        // Inline cell rects already end on shared grid-line centers. Only
+        // block-axis layout still contains the full border-edge extents.
         return LayoutRect {
-            x: rect.x + left,
+            x: rect.x,
             y: rect.y + top,
-            width: (rect.width - left - right).max(0.0),
+            width: rect.width,
             height: (rect.height - top - bottom).max(0.0),
         };
     }
@@ -2063,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_cell_background_uses_shared_border_halves() {
+    fn collapsed_cell_background_retains_centered_inline_grid_bounds() {
         let style = Style {
             display: Display::TableCell,
             border_collapse: true,
@@ -2078,9 +2078,10 @@ mod tests {
             box_background_paint_rect(
                 &style,
                 LayoutRect {
-                    x: 137.0,
+                    // Inline layout already uses shared grid-line centers.
+                    x: 138.0,
                     y: 53.0,
-                    width: 59.0,
+                    width: 57.0,
                     height: 23.0,
                 },
             ),
