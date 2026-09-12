@@ -6307,7 +6307,14 @@ fn build_taffy_tree(
                 comp.style.display,
                 WDisplay::InlineBlock | WDisplay::InlineFlex
             ) && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
-        let (min_w, size_w) = if matches!(comp.style.width, WDim::Auto) {
+        let (min_w, size_w) = if passive_inline_edges
+            && !matches!(comp.kind, ComponentKind::Text { .. })
+        {
+            // Width does not apply to a non-replaced inline box. An empty
+            // inline leaf therefore has zero content advance; its authored
+            // horizontal padding and borders remain on the Taffy style.
+            (Dimension::length(0.0), Dimension::length(0.0))
+        } else if matches!(comp.style.width, WDim::Auto) {
             match &comp.kind {
                 ComponentKind::Text { content } => {
                     let nowrap = matches!(
@@ -11237,6 +11244,30 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert!(inline.width < 200.0, "inline width was {}", inline.width);
+    }
+
+    #[test]
+    fn empty_non_replaced_inline_ignores_width() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Inline,
+                    width: WDim::Px(96.0),
+                    height: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                Vec::new(),
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(inline.width, 0.0);
     }
 
     #[test]
