@@ -422,6 +422,22 @@ in `target/wpt-targeted/batch-5209-5216-bad-string-newline-v1/results.json`
 fixture, membership or tolerance changed. Cases 4314/4947/5110 and final
 6,548-case proof remain open. Next progression: 5217.
 
+After the bad-string fix, 5217–5224 passed 8/8; 5225–5232 initially passed
+7/8, stopping on 5227 (`syntax/uri-018.xht`) at 2,479 pixels. The URL import
+was already successful. Layout dumping exposed text in the default-hidden
+head as a visible anonymous Flex row, adding 19.2px before the body.
+Anonymous/nowrap lowering now preserves `display:none`, including elements
+containing a mixture of hidden elements and text. The strengthened stable
+document-root regression failed two visible children versus one before
+the fix and passed afterward. A text-only head did not reproduce the bug;
+the actual RED required its hidden style child too. Three existing tests,
+including author-visible head content, passed (four DOM unit tests).
+5227 now has zero pixels in
+`target/wpt-targeted/batch-5225-5232-hidden-inline-context-v1/results.json`
+(8/8); 5209–5216 and 5185–5192 also passed 8/8 with that suffix. No WPT
+fixture, suite entry or tolerance changed. Cases 4314/4947/5110 and final
+6,548-case proof remain open. Next progression: 5233.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

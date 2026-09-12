@@ -1100,6 +1100,10 @@ mod tests {
         let mut doc = Document::new();
         let html = doc.create_element("html");
         let head = doc.create_element("head");
+        let style_node = doc.create_element("style");
+        head.append_child(&mut doc, style_node);
+        let head_text = doc.create_text_node("head text must remain hidden");
+        head.append_child(&mut doc, head_text);
         let body = doc.create_element("body");
         let text = doc.create_text_node("body");
         body.append_child(&mut doc, text);

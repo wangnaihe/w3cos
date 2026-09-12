@@ -4675,7 +4675,9 @@ impl Document {
                 // is equivalent to one anonymous horizontal line box, so
                 // lower that visual box as flex-row while retaining the DOM
                 // children and their independently styled paint nodes.
-                if nowrap_inline_formatting_context || anonymous_inline_formatting_context {
+                if style.display != w3cos_std::style::Display::None
+                    && (nowrap_inline_formatting_context || anonymous_inline_formatting_context)
+                {
                     if anonymous_inline_formatting_context {
                         let indent_spacing = match style.text_indent {
                             w3cos_std::style::Dimension::Px(value) => {
