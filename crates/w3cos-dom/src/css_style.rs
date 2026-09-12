@@ -1887,6 +1887,10 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
         }
         after_slash[line_height_end..].trim()
     } else {
+        // The font shorthand resets omitted longhands. In particular, an
+        // inherited or previously declared explicit line-height must not
+        // survive a shorthand that selects the normal line-height.
+        style.line_height = Style::default().line_height;
         value_after_nth_whitespace_token(value, size_index + 1)
     };
 
@@ -2019,6 +2023,16 @@ mod overflow_wrap_tests {
 #[cfg(test)]
 mod font_shorthand_tests {
     use super::*;
+
+    #[test]
+    fn font_shorthand_without_a_slash_resets_an_explicit_line_height() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("line-height", "2");
+        declaration.set_property("font", "20px Ahem");
+        assert_eq!(declaration.to_style().line_height, Style::default().line_height);
+        declaration.set_property("font", "20px/1.5 Ahem");
+        assert_eq!(declaration.to_style().line_height, 1.5);
+    }
 
     #[test]
     fn font_shorthand_preserves_unitless_line_height() {
