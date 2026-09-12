@@ -1495,6 +1495,19 @@ impl Document {
             // the computed `float` value itself becomes `none`.
             style.float = w3cos_std::style::Float::None;
         }
+        if style.float != w3cos_std::style::Float::None {
+            use w3cos_std::style::Display;
+            // Float blockification is a computed display rule, not only a
+            // side effect of extracting floats into a formatting context.
+            style.display = match style.display {
+                Display::None | Display::Contents | Display::Flex | Display::Grid | Display::Table => {
+                    style.display
+                }
+                Display::InlineFlex => Display::Flex,
+                Display::InlineTable => Display::Table,
+                _ => Display::Block,
+            };
+        }
         if declared_value(&["background", "background-color"])
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
         {
@@ -10000,6 +10013,19 @@ mod image_component_tests {
         let line_box = tree.children.first().expect("line box");
         assert_eq!(line_box.style.max_height, Dimension::Px(50.0));
         assert_eq!(line_box.style.min_height, Dimension::Auto);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn floating_inline_principal_box_is_blockified_before_lowering() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("span", &[("float", "left"), ("max-width", "120px")]);
+        let mut document = Document::new();
+        let span = document.create_element("span");
+        document.body().append_child(&mut document, span);
+        let style = document.computed_style_for(span.id);
+        assert_eq!(style.display, Display::Block);
+        assert_eq!(style.max_width, Dimension::Px(120.0));
         crate::stylesheet::clear_rules();
     }
 

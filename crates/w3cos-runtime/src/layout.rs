@@ -6338,6 +6338,7 @@ fn build_taffy_tree(
                     ) && matches!(comp.style.left, WDim::Auto)
                         && matches!(comp.style.right, WDim::Auto);
                     let shrink_to_fit = absolute_auto_shrink_to_fit
+                        || comp.style.float != WFloat::None
                         || inline_text_in_block
                         || matches!(
                             comp.style.display,
@@ -7479,6 +7480,8 @@ fn inline_absolute_static_rect(
     let siblings = tree.children(parent).ok()?;
     let parent_index = tree.get_node_context(parent).copied()?;
     let parent_style = flat.get(parent_index)?.style;
+    let parent_layout = tree.layout(parent).ok()?;
+    let parent_content_top = parent_layout.border.top + parent_layout.padding.top;
     let parent_margin = parent_style.margin_lengths();
     let parent_padding = parent_style.padding_lengths();
     let parent_border_left = parent_style
@@ -7536,8 +7539,9 @@ fn inline_absolute_static_rect(
             WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem
         ) {
             cursor_x = 0.0;
-            cursor_y =
-                layout.location.y + layout.size.height + sibling_info.style.margin_lengths().bottom;
+            cursor_y = layout.location.y + layout.size.height
+                + sibling_info.style.margin_lengths().bottom
+                - parent_content_top;
             line_height = 0.0;
             has_meaningful_inline_predecessor = false;
             crossed_forced_line_break = false;
@@ -7618,7 +7622,12 @@ fn inline_absolute_static_rect(
         // A block-level static-position placeholder splits its inline parent.
         // Its block starts after the preceding line box, at the containing
         // block's inline start rather than after the inline fragment itself.
-        rect.x = containing_block.x + own_margin.left;
+        rect.x = match parent_style.direction {
+            w3cos_std::style::TextDirection::Ltr => containing_block.x + own_margin.left,
+            w3cos_std::style::TextDirection::Rtl => {
+                containing_block.x + containing_block.width - rect.width - own_margin.right
+            }
+        };
         rect.y = containing_block.y + cursor_y + line_height + own_margin.top;
     } else {
         rect.x = containing_block.x - fragmented_inline_start_padding + cursor_x + own_margin.left;
@@ -10241,26 +10250,59 @@ mod tests {
                 border_width: 3.0,
                 ..Style::default()
             },
-            vec![Component::row(
-                Style {
-                    display: WDisp::Flex,
-                    position: WPos::Absolute,
-                    direction: w3cos_std::style::TextDirection::Rtl,
-                    ..Style::default()
-                },
-                vec![Component::boxed(
+            vec![
+                Component::boxed(
                     Style {
-                        display: WDisp::InlineBlock,
-                        width: WDim::Px(100.0),
-                        height: WDim::Px(100.0),
+                        display: WDisp::Block,
+                        height: WDim::Px(40.0),
                         ..Style::default()
                     },
                     Vec::new(),
-                )],
+                ),
+                Component::row(
+                    Style {
+                        display: WDisp::Flex,
+                        position: WPos::Absolute,
+                        direction: w3cos_std::style::TextDirection::Rtl,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::InlineBlock,
+                            width: WDim::Px(100.0),
+                            height: WDim::Px(100.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                ),
+            ],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!((layout[2].0.x, layout[2].0.y), (103.0, 43.0));
+    }
+
+    #[test]
+    fn floated_text_leaf_shrink_fits_before_its_internal_out_of_flow_layout() {
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Absolute,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "WWWWWWWWWW",
+                Style {
+                    display: WDisp::Block,
+                    float: WFloat::Left,
+                    font_size: 30.0,
+                    max_width: WDim::Px(120.0),
+                    ..Style::default()
+                },
             )],
         );
         let layout = compute(&root, 800.0, 600.0).unwrap();
-        assert_eq!(layout[1].0.x, 103.0);
+        assert_eq!(layout[1].0.width, 120.0);
     }
 
     #[test]
