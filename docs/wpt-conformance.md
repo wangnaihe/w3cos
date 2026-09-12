@@ -889,6 +889,14 @@ receipts for starts 5433, 5401, 5425, 5393, 5369 and 1130 pass 48/48.
 081–084 remain at zero pixel difference with zero allowances. This closes
 the candidate's hidden-script prerequisite; next sequential start is 5441.
 
+### Sequential continuation after anonymous row closure (2026-09-13)
+
+On `1415725`, strict `anonymous-row-whitespace-v2` receipts for starts
+5441, 5449, 5457 and 5465 pass 32/32 with the same retained CSS2 userstyle
+profile. All reftests have zero pixel allowances. The next sequential
+start is 5473; these are incremental receipts, not final same-SHA
+6548-case proof. No upstream inputs or tolerance changed.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
