@@ -141,6 +141,22 @@ same range; those 23 initial failures now have focused passing evidence.
 This is a range-level comparison, not a claim that all initial failures or
 the complete suite are closed. Case 4314 is still unresolved.
 
+CSS block text leaves now use the same glyph-advance origin as inline runs,
+without shifting negative left ink bearings into the content box. Cases
+4487/4488 were not selector failures: both had a one-pixel horizontal text
+shift (506 differing pixels), while Chromium 141 placed source and reference
+text at x=8. The new `block_and_inline_text_share_the_same_glyph_origin`
+pixel regression failed with 1,518 differing channels before the change and
+passed with zero after it. Three related inline-origin/half-leading tests
+also passed; this is not a complete runtime-unit gate.
+
+Cases 4487/4488 now have zero pixel differences in
+`target/wpt-targeted/batch-4481-4488-block-glyph-origin-v1/results.json`
+(8/8). Adjacent 4473–4480 and earlier origin regression 4289–4296 also
+passed 8/8; their receipts use the same `block-glyph-origin-v1` suffix.
+No WPT fixture, suite entry or tolerance was changed. Case 4314 remains open
+and the final complete 6,548-case evidence is still pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

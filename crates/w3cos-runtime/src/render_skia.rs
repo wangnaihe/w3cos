@@ -1562,10 +1562,11 @@ fn alignment_ink_left(
     typeface: &Typeface,
     style: &Style,
 ) -> f32 {
-    // Inline origins are glyph-advance positions in their shared line.
-    // Compensating each fragment's negative bearing shifts letters when a
-    // run is split by otherwise geometry-neutral positioned spans.
-    if style.display == Display::Inline || style_uses_generic_monospace(style) {
+    // CSS text starts at its glyph-advance origin, whether represented by an
+    // inline run or a lowered block leaf. Negative ink bearings may overflow
+    // that origin; compensating them changes otherwise identical CSS text.
+    if matches!(style.display, Display::Inline | Display::Block)
+        || style_uses_generic_monospace(style) {
         return 0.0;
     }
     let rendered = text_layout::font_render_text_for_style(text, style);
@@ -2857,6 +2858,33 @@ mod tests {
             "#\u{a0}\u{a0}\u{a0} P\u{a0}\u{a0}\u{a0}",
             "\u{a0}##\u{a0} \u{a0}A\u{a0}\u{a0}", "\u{a0}\u{a0}\u{a0}# \u{a0}\u{a0}SS"]);
         let expected = render(&["FAIL PASS", "####"]);
+        assert_eq!(actual.iter().zip(&expected).filter(|(a, b)| a != b).count(), 0);
+    }
+
+    #[test]
+    fn block_and_inline_text_share_the_same_glyph_origin() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let render = |display| {
+            let style = Style { display, font_family: Some("serif".into()),
+                font_size: 16.0, line_height: 1.2,
+                color: w3cos_std::color::Color::BLACK, ..Style::default() };
+            let mut surface = Surface::new_raster_n32_premul((96, 40)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            let leading = (style.font_size * style.line_height - style.font_size) * 0.5;
+            let rect = if display == Display::Inline {
+                LayoutRect { x: 8.0, y: 8.0 + leading, width: 80.0, height: 16.0 }
+            } else {
+                LayoutRect { x: 8.0, y: 8.0, width: 80.0, height: 19.2 }
+            };
+            draw_text_in_rect(surface.canvas(), rect, "Filler Text", &style,
+                &typeface, crate::layout::layout_font());
+            let info = ImageInfo::new((96, 40), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 96 * 40 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 96 * 4, (0, 0)));
+            pixels
+        };
+        let actual = render(Display::Block);
+        let expected = render(Display::Inline);
         assert_eq!(actual.iter().zip(&expected).filter(|(a, b)| a != b).count(), 0);
     }
 
