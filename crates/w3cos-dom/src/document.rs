@@ -5753,6 +5753,14 @@ impl Document {
             let (width, _) = self.svg_root_size(id);
             source.insert_str("<svg".len(), &format!(" width=\"{width}\""));
         }
+        if !node
+            .attributes
+            .iter()
+            .any(|(name, _)| name.as_str().eq_ignore_ascii_case("height"))
+        {
+            let (_, height) = self.svg_root_size(id);
+            source.insert_str("<svg".len(), &format!(" height=\"{height}\""));
+        }
         (source, event_targets)
     }
 
@@ -9768,6 +9776,24 @@ mod image_component_tests {
         assert!(source.contains("<rect "));
         assert!(!source.contains("svg:svg"));
         assert!(!source.contains("svg:rect"));
+    }
+
+    #[test]
+    fn svg_missing_axes_serialize_the_default_replaced_viewport() {
+        let mut document = Document::new();
+        let svg = document.create_element("svg");
+        let rect = document.create_element("rect");
+        rect.set_attribute(&mut document, "width", "200");
+        rect.set_attribute(&mut document, "height", "100");
+        svg.append_child(&mut document, rect);
+        document.body().append_child(&mut document, svg);
+        let tree = document.to_component_tree();
+        let ComponentKind::SvgDocument { source, width, height, .. } = &tree.children[0].kind else {
+            panic!("expected SVG document");
+        };
+        assert_eq!((*width, *height), (300, 150));
+        assert!(source.contains("width=\"300\""));
+        assert!(source.contains("height=\"150\""));
     }
 
     #[test]
