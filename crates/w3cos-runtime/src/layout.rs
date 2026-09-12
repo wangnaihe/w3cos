@@ -5258,17 +5258,6 @@ fn project_table_column_background_rects(
         for (row, (row_index, cells)) in rows.iter().enumerate() {
             let mut row_bounds = None::<LayoutRect>;
             for (column, (_, cell)) in cells.iter().enumerate() {
-                let left = if column == 0 {
-                    collapsed_layout_edge_width(table_node.style, 3) / 2.0
-                } else {
-                    let previous = cells[column - 1].1;
-                    (previous.x + previous.width - cell.x).max(0.0) / 2.0
-                };
-                let right = if column + 1 == cells.len() {
-                    collapsed_layout_edge_width(table_node.style, 1) / 2.0
-                } else {
-                    (cell.x + cell.width - cells[column + 1].1.x).max(0.0) / 2.0
-                };
                 let top = if row == 0 {
                     collapsed_layout_edge_width(table_node.style, 0) / 2.0
                 } else {
@@ -5284,10 +5273,13 @@ fn project_table_column_background_rects(
                     })
                 };
                 let projected = if table_node.style.border_collapse {
+                    // Inline cell rects already follow the shared grid;
+                    // retain their bounds for every table-part background.
+                    // Vertical rects still carry the legacy painted halves.
                     LayoutRect {
-                        x: cell.x + left,
+                        x: cell.x,
                         y: cell.y + top,
-                        width: (cell.width - left - right).max(0.0),
+                        width: cell.width,
                         height: (cell.height - top - bottom).max(0.0),
                     }
                 } else {
@@ -14380,6 +14372,47 @@ mod tests {
             assert_eq!(rect(index).x, 10.0 + (index - 2) as f32 * 40.0);
             assert_eq!(rect(index).width, 40.0);
         }
+        assert_eq!(rect(1).x, 10.0);
+        assert_eq!(rect(1).width, 160.0);
+    }
+
+    #[test]
+    fn collapsed_parts_keep_canonical_inline_cell_bounds() {
+        let part = |display, children| Component::row(Style {
+            display,
+            border_collapse: true,
+            ..Style::default()
+        }, children);
+        let table = Component::row(Style {
+            display: WDisp::Table,
+            border_collapse: true,
+            border_width: 20.0,
+            ..Style::default()
+        }, vec![
+            part(WDisp::TableColumnGroup, vec![
+                part(WDisp::TableColumn, vec![]), part(WDisp::TableColumn, vec![]),
+            ]),
+            part(WDisp::TableRowGroup, vec![part(WDisp::TableRow, vec![
+                part(WDisp::TableCell, vec![]), part(WDisp::TableCell, vec![]),
+            ])]),
+        ]);
+        let rect = |x, width| LayoutRect { x, y: 0.0, width, height: 60.0 };
+        let mut layouts = vec![
+            (rect(0.0, 100.0), 0), (rect(0.0, 0.0), 1),
+            (rect(0.0, 0.0), 2), (rect(0.0, 0.0), 3),
+            (rect(0.0, 100.0), 4), (rect(0.0, 100.0), 5),
+            (rect(10.0, 40.0), 6), (rect(50.0, 40.0), 7),
+        ];
+        project_table_column_background_rects(&mut layouts, &pre_flatten(&table));
+        let bounds = |index| {
+            let rect = layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+            (rect.x, rect.width)
+        };
+        for index in [1, 4, 5] {
+            assert_eq!(bounds(index), (10.0, 80.0));
+        }
+        assert_eq!(bounds(2), (10.0, 40.0));
+        assert_eq!(bounds(3), (50.0, 40.0));
     }
 
     #[test]

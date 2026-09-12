@@ -694,6 +694,21 @@ No WPT input, suite, viewport or zero tolerance changed. The next focused
 repair is the dependent row/column inline projection, before later
 sequential progression; final 6548-case zero-failure proof remains open.
 
+### Canonical inline table-part backgrounds (2026-09-13)
+
+The dependent background projector no longer subtracts inline border
+halves from canonical cell rectangles. An extended table-origin unit
+first failed with row x=20 rather than Chromium's x=10; after repair
+the row has x=10/w=160. A focused column/column-group/row-group unit
+also checks unchanged shared inline bounds. Related `collapsed_` units
+pass 30/30. Strict `canonical-part-inline-v1` receipts repeat all six
+v3 batches above with 48/48 passes. The 5264 native dump now gives
+the row x=58/w=160 and first cell x=58/w=40, closing the double-inset
+issue recorded above. Vertical half-inset projection remains unchanged;
+the separate colspan/column-ordinal issue remains open. No upstream
+input, suite, viewport or zero tolerance changed. Next sequential
+progression resumes at 5377; final full-suite proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
