@@ -639,6 +639,18 @@ width 202. That uncovered background/column geometry remains open, not
 silently reported fixed. No WPT input, tolerance or suite changed.
 Next progression is 5305; final complete-suite proof remains open.
 
+### Sequential progression to fixed-layout failures (2026-09-13)
+
+On `ba53a3e`, strict `visible-span-v1` progression passes every 8-case
+batch from 5305–5312 through 5361–5368 (eight batches, 64/64).
+Batch 5369–5376 is 6/8: `fixed-table-layout-027.xht` (5370) differs by
+1,200 pixels and `fixed-table-layout-029.xht` (5372) by 800 pixels.
+Both were PASS in the initial full report, so regression diagnosis takes
+priority; the receipt alone does not identify the introducing commit.
+The sequential command exits with failure; no later batch was started.
+These two tests are the next focused repair, not a full-suite verdict.
+Pinned revision, suite entries, viewport and zero tolerances are unchanged.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
