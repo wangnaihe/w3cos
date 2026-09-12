@@ -4215,14 +4215,35 @@ fn project_simple_float_margin_boxes(
         let mut previous_in_flow = None::<(usize, &Component)>;
         let mut float_since_in_flow = false;
         let mut normal_flow_correction = 0.0_f32;
+        let mut skipped_positioned = false;
         let mut child_index = component_index + 1;
         for child in &component.children {
             let child_count = count_nodes(child);
             if matches!(child.style.position, WPos::Absolute | WPos::Fixed)
                 || child.style.display == WDisplay::None
             {
+                skipped_positioned |= matches!(child.style.position, WPos::Absolute | WPos::Fixed);
                 child_index += child_count;
                 continue;
+            }
+            if skipped_positioned && previous.is_none()
+                && child.style.float != WFloat::None && child.style.clear == WClear::None
+                && let (Some(parent_position), Some(child_position)) = (
+                    layout_position.get(&component_index).copied(),
+                    layout_position.get(&child_index).copied(),
+                )
+            {
+                // Out-of-flow preceding siblings cannot advance the static
+                // block position of the first in-flow float.
+                let parent = layouts[parent_position].0;
+                let target_y = parent.y
+                    + component.style.border_top_width.unwrap_or(component.style.border_width)
+                    + resolve_spacing_for_layout(component.style.padding.top, parent.width,
+                        component.style.font_size, viewport_w, viewport_h)
+                    + resolve_spacing_for_layout(child.style.margin.top, parent.width,
+                        child.style.font_size, viewport_w, viewport_h);
+                let delta_y = target_y - layouts[child_position].0.y;
+                shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
             }
             if child.style.float == WFloat::None
                 && child.style.clear == WClear::None
@@ -6337,8 +6358,8 @@ fn build_taffy_tree(
                     let absolute_auto_shrink_to_fit = matches!(
                         comp.style.position,
                         WPos::Absolute | WPos::Fixed
-                    ) && matches!(comp.style.left, WDim::Auto)
-                        && matches!(comp.style.right, WDim::Auto);
+                    ) && (matches!(comp.style.left, WDim::Auto)
+                        || matches!(comp.style.right, WDim::Auto));
                     let shrink_to_fit = absolute_auto_shrink_to_fit
                         || comp.style.float != WFloat::None
                         || inline_text_in_block
@@ -6950,8 +6971,8 @@ fn build_taffy_tree(
         let absolute_auto_shrink_to_fit = matches!(
             comp.style.position,
             WPos::Absolute | WPos::Fixed
-        ) && matches!(comp.style.left, WDim::Auto)
-            && matches!(comp.style.right, WDim::Auto);
+        ) && (matches!(comp.style.left, WDim::Auto)
+            || matches!(comp.style.right, WDim::Auto));
         if matches!(comp.style.width, WDim::Auto)
             && (absolute_auto_shrink_to_fit
                 || ((comp.style.float != WFloat::None
@@ -11777,6 +11798,28 @@ mod tests {
 
         let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(text.height, 0.0);
+    }
+
+    #[test]
+    fn absolute_one_auto_inset_shrink_fits_and_does_not_displace_a_float() {
+        let floating = || Component::row(Style {
+            display: WDisp::Block, float: WFloat::Left,
+            ..Style::default()
+        }, vec![Component::text("X X0", Style {
+            display: WDisp::Inline, ..Style::default()
+        })]);
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, position: WPos::Relative,
+            width: WDim::Px(500.0), border_top_width: Some(10.0),
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::Block, position: WPos::Absolute,
+            left: WDim::Px(0.0), top: WDim::Px(0.0),
+            ..Style::default()
+        }, vec![floating()]), floating()]), 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert!(get(1).width > 0.0);
+        assert_eq!(get(2).y, get(4).y);
     }
 
     #[test]
