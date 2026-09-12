@@ -9606,6 +9606,39 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
     }
 }
 
+fn remove_table_separator_boxes(
+    children: Vec<w3cos_std::Component>,
+    is_table_box: impl Fn(w3cos_std::style::Display) -> bool,
+) -> Vec<w3cos_std::Component> {
+    use w3cos_std::style::Display;
+    let children = children.into_iter()
+        .filter(|child| child.style.display != Display::None)
+        .collect::<Vec<_>>();
+    let whitespace = |child: &w3cos_std::Component| {
+        matches!(&child.kind, w3cos_std::ComponentKind::Text { content }
+            if is_only_css_whitespace(content))
+            && child.children.is_empty()
+            && child.style.display == Display::Inline
+    };
+    let table_boxes = children.iter().map(|child| {
+        (!whitespace(child)).then_some(is_table_box(child.style.display))
+    }).collect::<Vec<_>>();
+    // Ignore complete whitespace runs, but not intervening ordinary boxes.
+    let nearest_table = |previous: &mut bool, current: &Option<bool>| {
+        let result = *previous;
+        if let Some(table) = current {
+            *previous = *table;
+        }
+        Some(result)
+    };
+    let preceding = table_boxes.iter().scan(false, nearest_table).collect::<Vec<_>>();
+    let mut following = table_boxes.iter().rev().scan(false, nearest_table).collect::<Vec<_>>();
+    following.reverse();
+    children.into_iter().enumerate().filter_map(|(index, child)| {
+        (!(whitespace(&child) && preceding[index] && following[index])).then_some(child)
+    }).collect()
+}
+
 fn fixup_css_table_children(
     parent_style: &w3cos_std::style::Style,
     children: Vec<w3cos_std::Component>,
@@ -9614,6 +9647,7 @@ fn fixup_css_table_children(
 
     match parent_style.display {
         Display::TableRow => {
+            let children = remove_table_separator_boxes(children, |display| display == Display::TableCell);
             let mut cells = Vec::new();
             let mut anonymous_children = Vec::new();
             let mut anonymous_run_started = false;
@@ -9677,15 +9711,9 @@ fn fixup_css_table_children(
                         parent_style.white_space,
                         w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap
                     ) {
-                        // An isolated whitespace box adds no preserved text.
-                        // After anonymous text starts a run, however, its
-                        // preserved trailing whitespace remains in that run.
-                        if anonymous_children.last().is_some_and(|previous| {
-                            matches!(previous.kind, w3cos_std::ComponentKind::Text { .. })
-                                && matches!(previous.on_click, w3cos_std::EventAction::None)
-                        }) {
-                            anonymous_children.push(child);
-                        }
+                        // Remaining spaces adjoin improper inline content,
+                        // not a pair of proper cells. Preserve them in pre.
+                        anonymous_children.push(child);
                         continue;
                     }
                     if !anonymous_children.is_empty() {
@@ -9762,9 +9790,6 @@ fn fixup_css_table_children(
         }
         Display::TableColumnGroup => children,
         _ => {
-            let children = children.into_iter()
-                .filter(|child| child.style.display != Display::None)
-                .collect::<Vec<_>>();
             let is_table_internal = |display| {
                 matches!(
                     display,
@@ -9779,6 +9804,7 @@ fn fixup_css_table_children(
                 )
             };
             let mut fixed = Vec::with_capacity(children.len());
+            let children = remove_table_separator_boxes(children, is_table_internal);
             let mut table_run = Vec::new();
             let flush_table_run =
                 |fixed: &mut Vec<w3cos_std::Component>,
@@ -9790,38 +9816,7 @@ fn fixup_css_table_children(
                         ));
                     }
                 };
-            let table_fixup_whitespace = |child: &w3cos_std::Component| {
-                matches!(&child.kind, w3cos_std::ComponentKind::Text { content }
-                    if is_only_css_whitespace(content))
-                    && child.children.is_empty()
-                    && child.style.display == Display::Inline
-            };
-            let table_internal = children
-                .iter()
-                .map(|child| (!table_fixup_whitespace(child))
-                    .then_some(is_table_internal(child.style.display)))
-                .collect::<Vec<_>>();
-            // Nearest substantive siblings, computed in two linear scans:
-            // multiple whitespace boxes do not break cell consecutiveness.
-            let nearest_table = |previous: &mut bool, current: &Option<bool>| {
-                let result = *previous;
-                if let Some(table) = current {
-                    *previous = *table;
-                }
-                Some(result)
-            };
-            let preceding_table = table_internal.iter()
-                .scan(false, nearest_table).collect::<Vec<_>>();
-            let mut following_table = table_internal.iter().rev()
-                .scan(false, nearest_table).collect::<Vec<_>>();
-            following_table.reverse();
-            for (index, child) in children.into_iter().enumerate() {
-                if table_fixup_whitespace(&child)
-                    && preceding_table[index]
-                    && following_table[index]
-                {
-                    continue;
-                }
+            for child in children {
                 if is_table_internal(child.style.display) {
                     table_run.push(child);
                 } else {
@@ -11866,7 +11861,7 @@ mod image_component_tests {
     }
 
     #[test]
-    fn preformatted_anonymous_cell_discards_isolated_spaces_around_inline_element() {
+    fn preformatted_anonymous_cell_preserves_spaces_around_improper_inline_element() {
         let mut document = Document::new();
         let host = document.create_element("div");
         let row = document.create_element("span");
@@ -11904,7 +11899,7 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let mut text = String::new();
         collect(&tree, &mut text);
-        assert_eq!(text, "abcd");
+        assert_eq!(text, "a bc d");
     }
 
     #[test]
@@ -11954,7 +11949,7 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let mut text = String::new();
         collect(&tree, &mut text);
-        assert_eq!(text, "abc d");
+        assert_eq!(text, "a bc d");
     }
 
     #[test]
@@ -11981,6 +11976,14 @@ mod image_component_tests {
         assert_eq!(cells[1].style.white_space, w3cos_std::style::WhiteSpace::Pre);
         assert!(matches!(&cells[1].children[0].kind,
             ComponentKind::Text { content } if content == " bc "));
+        let cell_style = w3cos_std::style::Style { display: Display::TableCell, ..parent.clone() };
+        let text_style = w3cos_std::style::Style { display: Display::Inline, ..parent.clone() };
+        let cells = fixup_css_table_children(&parent, vec![
+            w3cos_std::Component::text("a", cell_style.clone()),
+            w3cos_std::Component::text(" ", text_style),
+            w3cos_std::Component::text("d", cell_style),
+        ]);
+        assert_eq!(cells.len(), 2, "proper cell separators do not create a cell");
     }
 
     #[test]

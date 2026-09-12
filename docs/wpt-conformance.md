@@ -973,6 +973,32 @@ not an internal table box. Preserve the fixed input/reference and inspect
 that distinction before changing the engine or test expectations. Final
 6548-case zero-failure proof remains open.
 
+### CSS2 improper row content keeps preformatted surrounding space (2026-09-13)
+
+CSS2 §17.2.1's irrelevant-whitespace conditions distinguish internal table
+boxes from ordinary inline content. In 199, the improper inline `bc` is
+not a table box, so its surrounding preformatted space remains in the
+generated cell. This supersedes the earlier Chromium-calibrated decision
+to trim these spaces; Chromium's differing output is retained as a
+qualification note, not used to change the fixed WPT reference.
+
+Two corrected TableRow/Pre units first fail `abcd`/`abc d` versus `a bc d`
+(anonymous filter: 23 passed, 2 failed). Separator filtering is now shared
+by default-parent grouping and row fixup, with row filtering accepting
+proper TableCell neighbors. Remaining preformatted improper-child space
+is preserved. The edge-space unit also verifies that a whitespace-only
+separator between two proper cells does not generate an extra cell.
+The linear scan behavior and hidden-box exclusion from 187/188 remain.
+
+Anonymous units pass 25/25, hidden grouping 1/1, cache/inheritance 36/36
+and stylesheet 39/39 (101 distinct focused passes).
+
+The rebuilt runner takes 1m50s. Strict `pre-improper-space-v1` receipts
+for starts 5537, 5529, 5497, 5433, 5401, 5369 and 1130 pass 56/56.
+199 has max difference 0 and differing pixels 0 with both allowances 0.
+No fixed WPT input, font default, suite, viewport or tolerance changed.
+Next sequential start is 5545; final 6548-case proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
