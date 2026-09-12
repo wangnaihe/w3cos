@@ -185,6 +185,15 @@ punctuation cases now have focused passing evidence. WPT remained clean at
 Case 4314 remains unresolved, and the final complete 6,548-case proof is
 still outstanding.
 
+The unchanged runtime at `4aa2924` also passed fifteen eight-case batches
+4689–4808 (120/120). Receipts use
+`target/wpt-targeted/batch-<start>-<end>-first-letter-float-inherit-v1/results.json`
+with starts 4689 through 4801 advancing by eight. The initial complete report
+contained 120 failures and zero passes in this exact range at the pinned WPT
+revision; all now have focused passing evidence. WPT remained clean at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. No test entries or allowances were
+changed. This does not close case 4314 or establish a complete green run.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
