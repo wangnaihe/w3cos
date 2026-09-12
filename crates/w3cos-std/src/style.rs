@@ -190,6 +190,9 @@ pub struct Style {
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
     pub line_height: f32,
+    /// Retained CSS keyword; old wire styles and native numeric builders default to false.
+    #[serde(default)]
+    pub line_height_is_normal: bool,
     #[serde(default = "default_text_indent")]
     pub text_indent: Dimension,
     #[serde(default)]
@@ -333,6 +336,7 @@ impl Default for Style {
             text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             line_height: 1.2,
+            line_height_is_normal: false,
             text_indent: Dimension::Px(0.0),
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
@@ -458,6 +462,7 @@ impl Style {
             text_align,
             white_space,
             line_height,
+            line_height_is_normal,
             text_indent,
             text_transform,
             letter_spacing,
@@ -565,6 +570,7 @@ impl Style {
             text_align: text_align_b,
             white_space: white_space_b,
             line_height: line_height_b,
+            line_height_is_normal: line_height_is_normal_b,
             text_indent: text_indent_b,
             text_transform: text_transform_b,
             letter_spacing: letter_spacing_b,
@@ -670,6 +676,7 @@ impl Style {
             && text_align == text_align_b
             && white_space == white_space_b
             && line_height == line_height_b
+            && line_height_is_normal == line_height_is_normal_b
             && text_indent == text_indent_b
             && text_transform == text_transform_b
             && letter_spacing == letter_spacing_b
@@ -1037,6 +1044,14 @@ impl Style {
 #[cfg(test)]
 mod tests {
     use super::{Edges, Spacing, Style};
+
+    #[test]
+    fn normal_line_height_is_not_compatible_with_the_same_numeric_ratio() {
+        let numeric = Style::default();
+        let normal = Style { line_height_is_normal: true, ..numeric.clone() };
+        assert!(!numeric.eq_except_display(&normal));
+        assert_ne!(numeric, normal);
+    }
 
     #[test]
     fn style_edge_lengths_resolve_em_against_local_font_size() {

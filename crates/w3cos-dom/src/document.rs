@@ -3188,6 +3188,7 @@ impl Document {
                 && style.font_family == parent_style.font_family
                 && style.font_style == parent_style.font_style
                 && style.line_height == parent_style.line_height
+                && style.line_height_is_normal == parent_style.line_height_is_normal
                 && style.text_indent == parent_style.text_indent
                 && style.letter_spacing == parent_style.letter_spacing
                 && style.word_spacing == parent_style.word_spacing
@@ -3234,6 +3235,7 @@ impl Document {
                 && component.style.font_family == parent_style.font_family
                 && component.style.font_style == parent_style.font_style
                 && component.style.line_height == parent_style.line_height
+                && component.style.line_height_is_normal == parent_style.line_height_is_normal
                 && component.style.text_indent == parent_style.text_indent
                 && component.style.letter_spacing == parent_style.letter_spacing
                 && component.style.word_spacing == parent_style.word_spacing
@@ -3348,6 +3350,7 @@ impl Document {
                 || component.style.font_family != parent_style.font_family
                 || component.style.font_style != parent_style.font_style
                 || component.style.line_height != parent_style.line_height
+                || component.style.line_height_is_normal != parent_style.line_height_is_normal
                 || component.style.text_indent != parent_style.text_indent
                 || component.style.text_transform != parent_style.text_transform
                 || component.style.letter_spacing != parent_style.letter_spacing
@@ -3768,6 +3771,7 @@ impl Document {
                                 && component.style.font_family == generated[0].style.font_family
                                 && component.style.font_style == generated[0].style.font_style
                                 && component.style.line_height == generated[0].style.line_height
+                                && component.style.line_height_is_normal == generated[0].style.line_height_is_normal
                                 && component.style.text_indent == generated[0].style.text_indent
                                 && component.style.text_transform
                                     == generated[0].style.text_transform
@@ -3794,6 +3798,7 @@ impl Document {
                         style.font_family = generated_style.font_family.clone();
                         style.font_style = generated_style.font_style;
                         style.line_height = generated_style.line_height;
+                        style.line_height_is_normal = generated_style.line_height_is_normal;
                         style.text_indent = generated_style.text_indent;
                         style.text_transform = generated_style.text_transform;
                         style.letter_spacing = generated_style.letter_spacing;
@@ -4236,6 +4241,7 @@ impl Document {
                         line_style.font_size = style.font_size;
                         line_style.font_family = style.font_family.clone();
                         line_style.line_height = style.line_height;
+                        line_style.line_height_is_normal = style.line_height_is_normal;
                         children = vec![w3cos_std::Component::row(line_style, children)];
                     } else {
                         anonymous_inline_formatting_context |= children
@@ -4728,6 +4734,7 @@ impl Document {
                                 line_item_style.font_size = child.style.font_size;
                                 line_item_style.font_family = child.style.font_family.clone();
                                 line_item_style.line_height = child.style.line_height;
+                                line_item_style.line_height_is_normal = child.style.line_height_is_normal;
                                 line_item_style.width = outer_width;
                                 if !matches!(outer_width, w3cos_std::style::Dimension::Auto) {
                                     line_item_style.min_width = outer_width;
@@ -6926,6 +6933,7 @@ fn inherit_text_style(
     }
     if !declares("line-height") && !declares("font") {
         style.line_height = parent.line_height;
+        style.line_height_is_normal = parent.line_height_is_normal;
     }
     if !declares("text-indent") {
         style.text_indent = parent.text_indent;
@@ -7663,6 +7671,7 @@ fn equivalent_text_paint_style(
         && left.font_style == right.font_style
         && left.white_space == right.white_space
         && left.line_height == right.line_height
+        && left.line_height_is_normal == right.line_height_is_normal
         && left.text_indent == right.text_indent
         && left.text_transform == right.text_transform
         && left.letter_spacing == right.letter_spacing
@@ -9151,6 +9160,7 @@ fn hoist_floats_into_block_formatting_context(
             row_style.font_size = formatting_context_style.font_size;
             row_style.font_family = formatting_context_style.font_family.clone();
             row_style.line_height = formatting_context_style.line_height;
+            row_style.line_height_is_normal = formatting_context_style.line_height_is_normal;
             if force_formatting_context {
                 row_style.float = w3cos_std::style::Float::Left;
                 row_style.clear = left_floats
@@ -9227,6 +9237,7 @@ fn hoist_floats_into_block_formatting_context(
                     strut_style.font_family = component.style.font_family.clone();
                     strut_style.font_style = component.style.font_style;
                     strut_style.line_height = component.style.line_height;
+                    strut_style.line_height_is_normal = component.style.line_height_is_normal;
                     strut_style.letter_spacing = component.style.letter_spacing;
                     strut_style.word_spacing = component.style.word_spacing;
                     strut_style.white_space = component.style.white_space;
@@ -9284,6 +9295,7 @@ fn hoist_floats_into_block_formatting_context(
                     strut_style.font_family = component.style.font_family.clone();
                     strut_style.font_style = component.style.font_style;
                     strut_style.line_height = component.style.line_height;
+                    strut_style.line_height_is_normal = component.style.line_height_is_normal;
                     strut_style.letter_spacing = component.style.letter_spacing;
                     strut_style.word_spacing = component.style.word_spacing;
                     strut_style.white_space = component.style.white_space;

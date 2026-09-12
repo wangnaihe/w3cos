@@ -14,6 +14,19 @@ W3COS has two different kinds of conformance evidence:
 
 Neither result is a claim that the full WPT repository passes.
 
+## Normal line-height representation
+
+`Style.line_height_is_normal` distinguishes the CSS `normal` keyword from an
+explicit numeric `line_height`, including an explicit `1.2`. The optional JSON
+field defaults to `false`, preserving numeric semantics for old serialized
+styles and native component builders. CSS initial styles and omitted
+line-height in the `font` shorthand set it to `true`; explicit line-height
+values clear it, and inheritance carries both fields together. Font-dependent
+used-value resolution must occur before inline lowering so layout struts and
+paint receive the same resolved height. Until a metrics provider is wired,
+`line_height` retains the numeric fallback; representation alone is not proof
+of font-metric or WPT conformance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

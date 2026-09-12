@@ -20,7 +20,7 @@ pub struct CSSStyleDeclaration {
 impl CSSStyleDeclaration {
     pub fn new() -> Self {
         Self {
-            inner: Style::default(),
+            inner: Style { line_height_is_normal: true, ..Style::default() },
             inline_declarations: Vec::new(),
         }
     }
@@ -576,6 +576,7 @@ impl CSSStyleDeclaration {
             "line-height" | "lineHeight" => {
                 if let Some(line_height) = parse_font_line_height(value, self.inner.font_size) {
                     self.inner.line_height = line_height;
+                    self.inner.line_height_is_normal = value.trim().eq_ignore_ascii_case("normal");
                 }
             }
             "text-indent" | "textIndent" => {
@@ -1882,8 +1883,9 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
             .find(char::is_whitespace)
             .unwrap_or(after_slash.len());
         let line_height = &after_slash[..line_height_end];
-        if let Some(line_height) = parse_font_line_height(line_height, style.font_size) {
-            style.line_height = line_height;
+        if let Some(resolved_height) = parse_font_line_height(line_height, style.font_size) {
+            style.line_height = resolved_height;
+            style.line_height_is_normal = line_height.trim().eq_ignore_ascii_case("normal");
         }
         after_slash[line_height_end..].trim()
     } else {
@@ -1891,6 +1893,7 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
         // inherited or previously declared explicit line-height must not
         // survive a shorthand that selects the normal line-height.
         style.line_height = Style::default().line_height;
+        style.line_height_is_normal = true;
         value_after_nth_whitespace_token(value, size_index + 1)
     };
 
@@ -1927,7 +1930,7 @@ fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
 
 fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
     let value = value.trim();
-    if value == "normal" {
+    if value.eq_ignore_ascii_case("normal") {
         return Some(1.2);
     }
     if let Some(number) = value.strip_suffix("rem") {
@@ -2023,6 +2026,21 @@ mod overflow_wrap_tests {
 #[cfg(test)]
 mod font_shorthand_tests {
     use super::*;
+
+    #[test]
+    fn normal_line_height_is_distinct_from_an_explicit_same_ratio() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("line-height", "normal");
+        assert!(declaration.to_style().line_height_is_normal);
+        declaration.set_property("line-height", "1.2");
+        assert!(!declaration.to_style().line_height_is_normal);
+        declaration.set_property("font", "20px Ahem");
+        assert!(declaration.to_style().line_height_is_normal);
+        declaration.set_property("font", "20px/1.2 Ahem");
+        assert!(!declaration.to_style().line_height_is_normal);
+        declaration.set_property("font", "20px/normal Ahem");
+        assert!(declaration.to_style().line_height_is_normal);
+    }
 
     #[test]
     fn font_shorthand_without_a_slash_resets_an_explicit_line_height() {

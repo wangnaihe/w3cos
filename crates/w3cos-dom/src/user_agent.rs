@@ -111,6 +111,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
 /// Return the user-agent style for a standalone HTML element.
 pub fn html_default_style(local_name: &str) -> Style {
     let mut style = Style::default();
+    style.line_height_is_normal = true;
     style.color = Color::BLACK;
     apply_html_default_style(&mut style, local_name);
     style

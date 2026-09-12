@@ -12055,6 +12055,15 @@ mod tests {
     }
 
     #[test]
+    fn legacy_serialized_numeric_line_height_is_not_normal() {
+        let mut serialized = serde_json::to_value(Style::default()).unwrap();
+        serialized.as_object_mut().unwrap().remove("line_height_is_normal");
+        let style: Style = serde_json::from_value(serialized).unwrap();
+        assert_eq!(style.line_height, 1.2);
+        assert!(!style.line_height_is_normal);
+    }
+
+    #[test]
     fn block_absolute_static_top_ignores_preceding_float_and_clear() {
         let layout = compute(&Component::row(Style {
             display: WDisp::Block, width: WDim::Px(96.0), height: WDim::Px(16.0),

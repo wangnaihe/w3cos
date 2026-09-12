@@ -538,6 +538,21 @@ mod tests {
     }
 
     #[test]
+    fn normal_line_height_keyword_survives_font_inheritance() {
+        let mut doc = Document::new();
+        let body = doc.body().id;
+        doc.get_style_mut(body).set_property("line-height", "normal");
+        let span = doc.create_element("span");
+        doc.get_style_mut(span.id).set_property("font-family", "Ahem");
+        doc.get_style_mut(span.id).set_property("font-size", "20px");
+        doc.append_child(body, span.id);
+        assert!(doc.computed_style_for(span.id).line_height_is_normal);
+        doc.get_style_mut(span.id).set_property("line-height", "1.2");
+        doc.mark_inline_style_dirty(span.id);
+        assert!(!doc.computed_style_for(span.id).line_height_is_normal);
+    }
+
+    #[test]
     fn outer_text_does_not_duplicate_a_decorated_inline_trailing_space() {
         let mut doc = Document::new();
         let span = doc.create_element("span");
