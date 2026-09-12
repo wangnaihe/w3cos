@@ -7555,6 +7555,19 @@ fn positioned_descendant_containing_block(
         };
     }
 
+    // Non-replaced inline containing blocks also use padding edges. Their
+    // vertical borders are deliberately absent from Taffy's line layout,
+    // so use the retained authored edges rather than the internal flex box.
+    let left = info.style.border_left_width.unwrap_or(info.style.border_width);
+    let right = info.style.border_right_width.unwrap_or(info.style.border_width);
+    let top = info.style.border_top_width.unwrap_or(info.style.border_width);
+    let bottom = info.style.border_bottom_width.unwrap_or(info.style.border_width);
+    let rect = LayoutRect {
+        x: rect.x + left,
+        y: rect.y + top,
+        width: (rect.width - left - right).max(0.0),
+        height: (rect.height - top - bottom).max(0.0),
+    };
     let Ok(children) = tree.children(node) else {
         return rect;
     };
@@ -12020,6 +12033,25 @@ mod tests {
         }, vec![text(), decorated]), 800.0, 600.0).unwrap();
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(get(3).y, get(1).y);
+    }
+
+    #[test]
+    fn positioned_inline_containing_block_uses_padding_not_border_edges() {
+        let inline = Component::row(Style {
+            display: WDisp::Inline, position: WPos::Relative, border_width: 3.0,
+            padding: w3cos_std::style::Edges { left: WSpacing::Px(10.0),
+                ..w3cos_std::style::Edges::ZERO }, ..Style::default()
+        }, vec![Component::text("text", Style { display: WDisp::Inline, ..Style::default() }),
+            Component::row(Style {
+                position: WPos::Absolute, left: WDim::Px(0.0), right: WDim::Px(0.0),
+                top: WDim::Px(0.0), height: WDim::Px(10.0), ..Style::default()
+            }, vec![])]);
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(500.0), ..Style::default()
+        }, vec![inline]), 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(3).x, get(1).x + 3.0);
+        assert_eq!(get(3).width, get(1).width - 6.0);
     }
 
     #[test]
