@@ -295,6 +295,11 @@ fn component_max_content_width(component: &Component) -> f32 {
         }
     });
     let child_width = |child: &Component| {
+        if matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+            || child.style.display == WDisplay::None
+        {
+            return 0.0;
+        }
         let intrinsic_width = component_max_content_width(child);
         let ratio = match &child.kind {
             ComponentKind::Image { src } => image_intrinsic_ratio(src),
@@ -6827,6 +6832,10 @@ fn build_taffy_tree(
                     }
                     if comp.style.display == WDisplay::InlineBlock
                         && matches!(comp.style.width, WDim::Auto)
+                        && comp.children.iter().filter(|child| {
+                            child.style.display != WDisplay::None
+                                && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                        }).count() == 1
                         && c.style.display == WDisplay::Inline
                         && matches!(c.style.width, WDim::Auto)
                         && matches!(c.kind, ComponentKind::Text { .. })
@@ -11972,6 +11981,30 @@ mod tests {
         let absolute = layout.iter().find(|(_, i)| *i == 3).unwrap().0;
         assert_eq!(absolute.width, 100.0);
         assert_eq!(absolute.y, 0.0);
+    }
+
+    #[test]
+    fn auto_inline_block_keeps_fragment_widths_with_positioned_children() {
+        let text = |content| Component::text(content, Style {
+            display: WDisp::Inline, font_size: 20.0, font_family: Some("Ahem".to_string()),
+            ..Style::default()
+        });
+        let block = || Component::row(Style {
+            display: WDisp::InlineBlock, width: WDim::Px(30.0), height: WDim::Px(10.0),
+            ..Style::default()
+        }, vec![]);
+        let root = Component::row(Style {
+            display: WDisp::InlineBlock, ..Style::default()
+        }, vec![text("tl "), Component::row(Style {
+            display: WDisp::InlineBlock, position: WPos::Absolute,
+            width: WDim::Px(10.0), height: WDim::Px(10.0), ..Style::default()
+        }, vec![]), block(), text(" "), block(), text("\u{a0}")]);
+        assert_eq!(component_max_content_width(&root), 160.0);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(1).width, 60.0);
+        assert_eq!(get(3).width, 30.0);
+        assert_eq!(get(4).width, 20.0);
     }
 
     #[test]
