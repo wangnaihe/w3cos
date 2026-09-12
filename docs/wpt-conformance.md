@@ -69,6 +69,14 @@ text-box fragmentation regression passed after first failing with 234 channel
 differences. The older `default_ascii_text_is_pixel_invariant_across_inline_fragments`
 test still fails both with and without this change; it is not counted as green.
 
+RTL fixed-width block alignment preserves the relative offset selected by the
+containing block's direction and translates descendants with the host. A
+reverse preorder pass computes contiguous subtree ranges for translation.
+Case 4299 moved from 18,432 differing pixels to zero in
+`target/wpt-targeted/batch-4297-4304-rtl-relative-align-v1/results.json`.
+4297–4304 and 4289–4296 each passed 8/8. The next batch, 4305–4312, passed
+4/8 and remains the next repair scope; full-suite acceptance is pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

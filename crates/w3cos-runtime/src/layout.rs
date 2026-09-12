@@ -2452,6 +2452,14 @@ fn project_rtl_fixed_block_alignment(
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
+    // Preorder flattening makes each subtree contiguous. Compute its end in
+    // one reverse pass rather than walking ancestry for every shifted node.
+    let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
+    for index in (0..flat.len()).rev() {
+        if let Some(parent) = flat[index].parent {
+            subtree_ends[parent] = subtree_ends[parent].max(subtree_ends[index]);
+        }
+    }
     for (index, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::Block
             || (matches!(node.style.position, WPos::Absolute | WPos::Fixed)
@@ -2499,7 +2507,25 @@ fn project_rtl_fixed_block_alignment(
             viewport_w,
             viewport_h,
         );
-        layouts[position].0.x = parent_content_right - margin_right - layouts[position].0.width;
+        let relative_x = if node.style.position == WPos::Relative {
+            let resolve = |dimension: WDim| dimension.resolve(
+                containing_width, ROOT_FONT_SIZE, node.style.font_size, viewport_w, viewport_h,
+            );
+            // The containing block is RTL: right wins an over-constrained
+            // pair even if the positioned child itself specifies LTR.
+            resolve(node.style.right).map(|right| -right)
+                .or_else(|| resolve(node.style.left)).unwrap_or(0.0)
+        } else { 0.0 };
+        let target_x = parent_content_right - margin_right - layouts[position].0.width + relative_x;
+        let delta_x = target_x - layouts[position].0.x;
+        layouts[position].0.x = target_x;
+        if delta_x != 0.0 {
+            for descendant in index + 1..subtree_ends[index] {
+                if let Some(position) = positions.get(&descendant) {
+                    layouts[*position].0.x += delta_x;
+                }
+            }
+        }
     }
 }
 
@@ -11097,6 +11123,29 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!(layout[1].0.width, 100.0);
         assert_eq!(layout[2].0.x, 0.0);
+    }
+
+    #[test]
+    fn rtl_block_alignment_preserves_relative_right_precedence_and_descendants() {
+        let child = Component::row(Style {
+            display: WDisp::Block, position: WPos::Relative,
+            direction: w3cos_std::style::TextDirection::Ltr,
+            width: WDim::Px(96.0), height: WDim::Px(96.0),
+            left: WDim::Px(96.0), right: WDim::Px(96.0),
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(10.0), height: WDim::Px(10.0),
+            ..Style::default()
+        }, vec![])]);
+        let root = Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(192.0),
+            direction: w3cos_std::style::TextDirection::Rtl,
+            ..Style::default()
+        }, vec![child]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(1).x, 0.0);
+        assert_eq!(get(2).x, 0.0);
     }
 
     #[test]
