@@ -4737,6 +4737,7 @@ impl Document {
                         if authored_block
                             && matches!(style.height, w3cos_std::style::Dimension::Auto)
                             && matches!(style.min_height, w3cos_std::style::Dimension::Auto)
+                            && matches!(style.max_height, w3cos_std::style::Dimension::Auto)
                         {
                             // Lowering a block inline-formatting context to a
                             // flex row must retain the block's initial line
@@ -9971,6 +9972,33 @@ mod image_component_tests {
         let line_box = tree.children.first().expect("line box");
         assert_eq!(line_box.style.display, Display::Flex);
         assert_eq!(line_box.style.height, Dimension::Px(16.0));
+        assert_eq!(line_box.style.min_height, Dimension::Auto);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn lowered_block_with_max_height_does_not_add_a_line_height_minimum() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#line-box",
+            &[
+                ("position", "absolute"),
+                ("width", "100px"),
+                ("max-height", "50px"),
+                ("font-size", "100px"),
+                ("line-height", "100px"),
+            ],
+        );
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "line-box");
+        let text = document.create_text_node("\u{a0}");
+        container.append_child(&mut document, text);
+        document.body().append_child(&mut document, container);
+
+        let tree = document.to_component_tree();
+        let line_box = tree.children.first().expect("line box");
+        assert_eq!(line_box.style.max_height, Dimension::Px(50.0));
         assert_eq!(line_box.style.min_height, Dimension::Auto);
         crate::stylesheet::clear_rules();
     }
