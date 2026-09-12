@@ -321,6 +321,23 @@ unlike the reference's ordinary block text. This identifies the next
 paint-path investigation, not a completed root-cause fix. No later batch
 was started after this failure.
 
+Case 5062 is now repaired. Read-only pixel comparison proved the fifth
+sentence was shifted exactly one pixel right: comparing actual x against
+reference x-1 reduced all 1,292 differences to zero. The painter compensated
+negative ink bearings for its lowered InlineBlock text, unlike ordinary
+Block/Inline text. CSS atomic inline text now shares the advance origin;
+other display paths retain their existing behavior. The extended
+`block_and_inline_text_share_the_same_glyph_origin` regression failed
+1,518 channels for InlineBlock before the production fix and passed
+Block/InlineBlock/InlineFlex/InlineTable comparisons afterward. Four selected
+half-leading/advance/monospace regressions passed as well (five unit tests).
+Case 5062 now has zero pixel differences in
+`target/wpt-targeted/batch-5057-5064-atomic-inline-origin-v1/results.json`
+(8/8). Batches 4977–4984, 4913–4920 and 4265–4272 also passed 8/8 with
+that suffix: 32 focused reftests, not full acceptance. No fixture, suite
+entry or tolerance changed. Cases 4314/4947 and final 6,548-case proof
+remain open; next progression starts at 5065.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -1563,9 +1563,17 @@ fn alignment_ink_left(
     style: &Style,
 ) -> f32 {
     // CSS text starts at its glyph-advance origin, whether represented by an
-    // inline run or a lowered block leaf. Negative ink bearings may overflow
-    // that origin; compensating them changes otherwise identical CSS text.
-    if matches!(style.display, Display::Inline | Display::Block)
+    // inline run, an atomic inline wrapper or a lowered block leaf. Negative
+    // ink bearings may overflow that origin; compensating them changes
+    // otherwise identical CSS text.
+    if matches!(
+        style.display,
+        Display::Inline
+            | Display::InlineBlock
+            | Display::InlineFlex
+            | Display::InlineTable
+            | Display::Block
+    )
         || style_uses_generic_monospace(style) {
         return 0.0;
     }
@@ -2883,9 +2891,20 @@ mod tests {
             assert!(surface.read_pixels(&info, &mut pixels, 96 * 4, (0, 0)));
             pixels
         };
-        let actual = render(Display::Block);
         let expected = render(Display::Inline);
-        assert_eq!(actual.iter().zip(&expected).filter(|(a, b)| a != b).count(), 0);
+        for display in [
+            Display::Block,
+            Display::InlineBlock,
+            Display::InlineFlex,
+            Display::InlineTable,
+        ] {
+            let actual = render(display);
+            assert_eq!(
+                actual.iter().zip(&expected).filter(|(a, b)| a != b).count(),
+                0,
+                "glyph origin for {display:?}"
+            );
+        }
     }
 
     #[test]
