@@ -814,7 +814,7 @@ fn extract_brace_content(s: &str) -> (&str, usize, bool) {
             continue;
         }
         if let Some(active_quote) = quote {
-            if byte == active_quote {
+            if byte == active_quote || matches!(byte, b'\n' | b'\r' | b'\x0c') {
                 quote = None;
             }
             pos += 1;
@@ -1248,6 +1248,7 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
     let mut delimiters = Vec::new();
     let mut quote = None;
     let mut escaped = false;
+    let mut bad_string = false;
     let bytes = s.as_bytes();
     let mut start = 0usize;
     let mut pos = 0usize;
@@ -1263,6 +1264,9 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
                 escaped = true;
             } else if ch == active_quote {
                 quote = None;
+            } else if matches!(ch, '\n' | '\r' | '\u{000c}') {
+                quote = None;
+                bad_string = true;
             }
             pos += 1;
             continue;
@@ -1283,12 +1287,17 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
             _ => {}
         }
         if ch == sep as char && delimiters.is_empty() {
-            parts.push(s[start..pos].to_string());
+            if !bad_string {
+                parts.push(s[start..pos].to_string());
+            }
+            bad_string = false;
             start = pos + 1;
         }
         pos += 1;
     }
-    parts.push(s[start..].to_string());
+    if !bad_string {
+        parts.push(s[start..].to_string());
+    }
     parts
 }
 
@@ -1706,6 +1715,18 @@ mod tests {
             sheet.rules[0].declarations.last(),
             Some(&("content".into(), "\"Filler Text\"".into()))
         );
+    }
+
+    #[test]
+    fn bad_string_newline_discards_through_the_next_semicolon() {
+        let sheet = parse_css_source(
+            "div { color: green; font-family: 'Courier;\n color: red; } p { color: green; }",
+            "bad-string-newline.css",
+        );
+        assert_eq!(sheet.rules.len(), 2);
+        for rule in &sheet.rules {
+            assert_eq!(rule.declarations, vec![("color".into(), "green".into())]);
+        }
     }
 
     #[test]

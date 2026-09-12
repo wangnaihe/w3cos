@@ -406,6 +406,22 @@ Batch 5209–5216 passed 7/8, stopping on 5209
 the `balanced-at-rule-recovery-v1` suffix. The next focused investigation
 is unterminated string/newline recovery; no later batch was started.
 
+Case 5209 is now repaired. Chromium's read-only computed-style check showed
+green text and Times, with only `color: green` surviving in its CSSOM.
+The compiler kept an unterminated font string open across an unescaped
+newline, both swallowing following rules and applying the malformed font.
+Block extraction now ends that bad string at LF/CR/FF; declaration splitting
+discards the affected segment through its next top-level semicolon.
+Escaped newline handling remains unchanged. The new
+`bad_string_newline_discards_through_the_next_semicolon` regression failed
+one parsed rule versus two before the fix and passed afterward, verifying
+both surviving green-only declarations. Seven selected existing parsing
+tests also passed (eight relevant unit tests). Case 5209 now has zero pixels
+in `target/wpt-targeted/batch-5209-5216-bad-string-newline-v1/results.json`
+(8/8); 5185–5192 and 5113–5120 also passed 8/8 with that suffix. No WPT
+fixture, membership or tolerance changed. Cases 4314/4947/5110 and final
+6,548-case proof remain open. Next progression: 5217.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
