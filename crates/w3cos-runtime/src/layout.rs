@@ -3385,7 +3385,11 @@ fn project_fixed_table_cell_rects(
                         WDisplay::TableColumn | WDisplay::TableColumnGroup
                     )
                 });
-                (component.style.table_layout_fixed || has_declared_columns)
+                // Percentage tracks must be redistributed against the used
+                // containing-block width, not the provisional build-time
+                // width (which can precede an ancestor's shrink-to-fit pass).
+                (component.style.table_layout_fixed || has_declared_columns
+                    || matches!(component.style.width, WDim::Percent(_)))
                     .then(|| auto_table_track_widths(component, Some(containing_width)))
                     .filter(|tracks| !tracks.is_empty())
             })
@@ -12099,6 +12103,33 @@ mod tests {
             assert_eq!(get(1).y, 2.0);
             assert_eq!(get(2).y, get(1).y, "{display:?}");
         }
+    }
+
+    #[test]
+    fn percentage_table_tracks_follow_a_shrink_wrapped_containing_block() {
+        let cell = Component::row(Style {
+            display: WDisp::TableCell, height: WDim::Px(32.0),
+            ..Style::default()
+        }, vec![]);
+        let row = Component::row(Style {
+            display: WDisp::TableRow, ..Style::default()
+        }, vec![cell]);
+        let table = Component::row(Style {
+            display: WDisp::Table, width: WDim::Percent(100.0),
+            border_spacing_x: 2.0, border_spacing_y: 2.0,
+            ..Style::default()
+        }, vec![row]);
+        let absolute = Component::row(Style {
+            display: WDisp::Block, position: WPos::Absolute,
+            ..Style::default()
+        }, vec![table]);
+        let root = Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(800.0),
+            ..Style::default()
+        }, vec![absolute]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(4).width, 0.0);
     }
 
     #[test]

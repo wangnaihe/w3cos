@@ -38,6 +38,13 @@ the text selecting a deferred face. At the pinned revision, the focused
 passed 8/8; case 4106 moved from 10,600 differing pixels to zero. This focused
 receipt does not establish full-suite conformance.
 
+Percentage-width table tracks are redistributed after layout using their
+containing block's used content width, including shrink-wrapped absolute
+ancestors. The focused 4121–4128 receipt at
+`target/wpt-targeted/batch-4121-4128-percent-table-used-basis-v1/results.json`
+passed 8/8; case 4122 moved from 24,960 differing pixels to zero. The adjacent
+4113–4120 regression also passed 8/8. Full-suite acceptance remains pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
