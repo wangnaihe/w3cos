@@ -7620,6 +7620,14 @@ fn inline_absolute_static_rect(
         if matches!(sibling_info.style.position, WPos::Absolute | WPos::Fixed) {
             continue;
         }
+        if sibling_info.style.float != WFloat::None
+            && matches!(style.display,
+                WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem)
+        {
+            // A block static-position placeholder ignores float clearance.
+            // Floats do not advance its normal block-flow cursor.
+            continue;
+        }
         has_in_flow_predecessor = true;
         let layout = tree.layout(sibling).ok()?;
         if matches!(
@@ -11844,6 +11852,24 @@ mod tests {
 
         let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(text.height, 0.0);
+    }
+
+    #[test]
+    fn block_absolute_static_top_ignores_preceding_float_and_clear() {
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(96.0), height: WDim::Px(16.0),
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::Block, float: WFloat::Left,
+            width: WDim::Px(16.0), height: WDim::Px(64.0),
+            ..Style::default()
+        }, vec![]), Component::row(Style {
+            display: WDisp::Block, position: WPos::Absolute, clear: WClear::Both,
+            width: WDim::Px(96.0), height: WDim::Px(16.0),
+            ..Style::default()
+        }, vec![])]), 800.0, 600.0).unwrap();
+        let positioned = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(positioned.y, 0.0);
     }
 
     #[test]
