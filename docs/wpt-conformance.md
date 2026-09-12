@@ -473,6 +473,19 @@ inline-block and must supply the baseline instead. This is the next
 focused repair scope; no later batch was run. WPT inputs and tolerances
 remain unchanged, and the final full-suite proof is still outstanding.
 
+The empty-inline-table bottom-baseline fallback now excludes tables
+containing cells, even when those cells contain no text. A new focused
+unit was RED (second table y=8 became -42 and the parent shrank), then
+GREEN; a new no-cell fallback regression and four existing inline-table
+units also pass (6/6). Source table positions now all have y=8, matching
+Chromium, with correct 130/140/155/180 heights. Strict receipts using
+`populated-inline-table-v1`: 5241–5248 passes 8/8; 5249–5256 remains 7/8.
+5254's difference decreased from 11,920 to 7,820 but is NOT resolved:
+reference table positions remain y=18/16/13/8, unlike Chromium's four
+y=8 positions. The next repair must correct the first-row baseline with
+unequal block-edge borders, rather than treating cell-free and text-free
+tables alike. No later batch, fixture edit or tolerance change was made.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

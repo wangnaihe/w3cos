@@ -2803,7 +2803,8 @@ fn align_empty_inline_table_baselines(
         if flat[table].style.display != WDisplay::InlineTable
             || flat.iter().enumerate().any(|(index, node)| {
                 descendant_of(flat, index, table)
-                    && matches!(node.kind, ComponentKind::Text { content } if content.chars().any(|character| !character.is_whitespace()))
+                    && (node.style.display == WDisplay::TableCell
+                        || matches!(node.kind, ComponentKind::Text { content } if content.chars().any(|character| !character.is_whitespace())))
             })
         {
             continue;
@@ -16110,6 +16111,87 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
         assert_eq!(rect(1).y, rect(4).y);
         assert_eq!(rect(5).y, rect(4).y);
+    }
+
+    #[test]
+    fn text_free_inline_table_with_cells_is_not_bottom_aligned() {
+        let table = || {
+            Component::row(
+                Style {
+                    display: WDisp::InlineTable,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            ..Style::default()
+                        },
+                        vec![Component::boxed(
+                            Style {
+                                display: WDisp::InlineBlock,
+                                ..Style::default()
+                            },
+                            vec![],
+                        )],
+                    )],
+                )],
+            )
+        };
+        let root = Component::row(Style::default(), vec![table(), table()]);
+        let flat = pre_flatten(&root);
+        let rect = |height| LayoutRect {
+            x: 0.0,
+            y: 8.0,
+            width: 50.0,
+            height,
+        };
+        let mut layout = vec![
+            (rect(180.0), 0),
+            (rect(130.0), 1),
+            (rect(20.0), 2),
+            (rect(30.0), 3),
+            (rect(10.0), 4),
+            (rect(180.0), 5),
+            (rect(20.0), 6),
+            (rect(30.0), 7),
+            (rect(10.0), 8),
+        ];
+        let expected = layout.clone();
+        align_empty_inline_table_baselines(&mut layout, &flat);
+        assert_eq!(layout, expected, "cell content supplies a first-row baseline");
+    }
+
+    #[test]
+    fn empty_inline_table_without_cells_keeps_bottom_baseline_fallback() {
+        let table = || {
+            Component::row(
+                Style {
+                    display: WDisp::InlineTable,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let root = Component::row(Style::default(), vec![table(), table()]);
+        let flat = pre_flatten(&root);
+        let rect = |height| LayoutRect {
+            x: 0.0,
+            y: 8.0,
+            width: 50.0,
+            height,
+        };
+        let mut layout = vec![(rect(180.0), 0), (rect(130.0), 1), (rect(180.0), 2)];
+        align_empty_inline_table_baselines(&mut layout, &flat);
+        assert_eq!(layout[2].0.y, -42.0);
+        assert_eq!(
+            layout[1].0.y + layout[1].0.height,
+            layout[2].0.y + layout[2].0.height
+        );
     }
 
     #[test]
