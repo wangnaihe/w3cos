@@ -9089,7 +9089,7 @@ fn hoist_floats_into_block_formatting_context(
 ) -> Vec<w3cos_std::Component> {
     fn contributes_in_flow_content(component: &w3cos_std::Component) -> bool {
         match &component.kind {
-            w3cos_std::ComponentKind::Text { content } => !content.trim().is_empty(),
+            w3cos_std::ComponentKind::Text { content } => !content.trim_matches(is_css_whitespace).is_empty(),
             _ => true,
         }
     }
@@ -9382,10 +9382,15 @@ fn hoist_floats_into_block_formatting_context(
         // extract floats nested inside inline descendants here; direct float
         // ordering is handled after blockification.
         if let Some(mut child) = collect(child, false, &mut left, &mut right) {
-            let has_prior_in_flow = in_flow.iter().any(|component| {
+            let has_prior_in_flow = in_flow.iter().rev().find(|component| {
                 component.style.float == w3cos_std::style::Float::None
+                    && !matches!(component.style.position,
+                        w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                    && component.style.display != w3cos_std::style::Display::None
                     && contributes_in_flow_content(component)
-            });
+            }).is_some_and(|component| matches!(component.style.display,
+                w3cos_std::style::Display::Inline | w3cos_std::style::Display::InlineBlock
+                    | w3cos_std::style::Display::InlineFlex | w3cos_std::style::Display::InlineTable));
             if direct_float == w3cos_std::style::Float::Left && has_prior_in_flow {
                 // A later float is shifted to the inline-start edge of the
                 // current line; earlier inline content flows beside it. Keep
@@ -10275,6 +10280,31 @@ mod image_component_tests {
         assert_eq!(fixed[0].style.position, Position::Relative);
         assert_eq!(fixed[0].children[0].style.float, Float::Left);
         assert_eq!(fixed[0].children[0].children[0].style.position, Position::Absolute);
+    }
+
+    #[test]
+    fn preceding_block_does_not_mark_following_floats_as_after_inline() {
+        use w3cos_std::style::{Style, Float, Dimension};
+        let paragraph = w3cos_std::Component::text("paragraph", Style {
+            display: Display::Block, ..Style::default()
+        });
+        let float = || w3cos_std::Component::boxed(Style {
+            display: Display::Block, float: Float::Left,
+            width: Dimension::Px(48.0), ..Style::default()
+        }, vec![]);
+        let fixed = hoist_floats_into_block_formatting_context(
+            &Style::default(), vec![paragraph, float(), float()],
+        );
+        fn check(component: &w3cos_std::Component) -> usize {
+            let floating = component.style.float == w3cos_std::style::Float::Left;
+            if floating {
+                assert!(component.style.custom_properties.as_ref().is_none_or(|properties| {
+                    !properties.contains_key("--w3cos-internal-left-float-after-inline")
+                }));
+            }
+            usize::from(floating) + component.children.iter().map(check).sum::<usize>()
+        }
+        assert_eq!(fixed.iter().map(check).sum::<usize>(), 2);
     }
 
     #[test]

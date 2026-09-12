@@ -77,6 +77,13 @@ Case 4299 moved from 18,432 differing pixels to zero in
 4297–4304 and 4289–4296 each passed 8/8. The next batch, 4305–4312, passed
 4/8 and remains the next repair scope; full-suite acceptance is pending.
 
+The float-after-inline marker inspects the last relevant in-flow box, skipping
+hidden/out-of-flow boxes and only collapsing CSS whitespace (not NBSP). A
+preceding normal block no longer introduces a synthetic inline-line offset.
+Case 4305 moved from 6,432 differing pixels to zero in
+`target/wpt-targeted/batch-4305-4312-float-after-inline-v1/results.json` (5/8).
+4309–4311 still fail; 4105–4112, 4265–4272 and 4297–4304 regressions passed 8/8.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
