@@ -293,6 +293,23 @@ same receipt suffix: 32 focused reftests total. No WPT fixtures, suite
 membership or tolerances changed. Cases 4314/4947 and final 6,548-case
 acceptance remain open; the next progression batch starts at 4969.
 
+Case 4980 (`syntax/at-charset-012.xht`) is now repaired. XML document byte
+decoding ignored declaration encoding when no transport charset was
+present, so its imported Shift-JIS stylesheet inherited UTF-8 and missed
+the Japanese class selector. Declaration sniffing now reuses the existing
+quick-xml parser, following [XML encoding declarations](https://www.w3.org/TR/xml/#charencoding),
+while preserving BOM/transport priority and the HTML meta/fallback path.
+The new document-to-imported-selector regression failed UTF-8 versus
+Shift_JIS before the production change and passed afterward. Two new
+priority/HTML/streamed-input tests and three existing encoding tests also
+passed: six selected unit tests, not full runtime acceptance.
+Case 4980 changed from 410 differing pixels to zero in
+`target/wpt-targeted/batch-4977-4984-xml-encoding-fallback-v1/results.json`
+(8/8). Batches 4969–4976 and 4961–4968 also passed 8/8 using that receipt
+suffix: 24 focused reftests. No WPT fixture, suite membership or tolerance
+changed. Cases 4314/4947 and final 6,548-case proof remain open; next batch
+starts at 4985.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

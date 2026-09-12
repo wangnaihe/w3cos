@@ -1297,11 +1297,14 @@ impl DocumentByteDecoder {
                 || media_type == "image/svg+xml"
                 || media_type.ends_with("+xml")
         }) {
-            // XML entities default to UTF-8 in the absence of a BOM,
-            // transport charset, or XML declaration. Applying HTML's
-            // windows-1252 fallback here corrupts every non-ASCII character
-            // in XHTML served without an explicit charset.
-            encoding_rs::UTF_8
+            // The XML declaration also determines the fallback encoding
+            // inherited by imported stylesheets. HTML meta sniffing does
+            // not apply to XML entities.
+            if let Some(charset) = sniff_xml_charset(bytes)? {
+                encoding_for_label(&charset)?
+            } else {
+                encoding_rs::UTF_8
+            }
         } else if let Some(charset) = sniff_meta_charset(bytes) {
             html_meta_encoding_for_label(&charset)?
         } else {
@@ -1350,6 +1353,25 @@ fn html_meta_encoding_for_label(label: &str) -> Result<&'static encoding_rs::Enc
     } else {
         Ok(encoding)
     }
+}
+
+fn sniff_xml_charset(bytes: &[u8]) -> Result<Option<String>> {
+    if !bytes.starts_with(b"<?xml")
+        || !matches!(bytes.get(5), Some(b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        return Ok(None);
+    }
+    let Some(end) = bytes.windows(2).position(|window| window == b"?>") else {
+        return Ok(None);
+    };
+    let mut reader = quick_xml::Reader::from_reader(&bytes[..end + 2]);
+    let quick_xml::events::Event::Decl(declaration) = reader.read_event()? else {
+        return Ok(None);
+    };
+    let Some(label) = declaration.encoding().transpose()? else {
+        return Ok(None);
+    };
+    Ok(Some(std::str::from_utf8(&label)?.to_string()))
 }
 
 fn decode_document_bytes_with_encoding(
@@ -17647,6 +17669,66 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         assert_eq!(
             decode_document_bytes("<p>X\u{a0}X</p>".as_bytes(), "application/xhtml+xml").unwrap(),
             "<p>X\u{a0}X</p>"
+        );
+    }
+
+    #[test]
+    fn xml_declared_encoding_is_the_imported_stylesheet_fallback() {
+        let bytes = b"<?xml version='1.0' encoding = 'shift-JIS'?><p>\x95\xbd\x98\x61</p>";
+        let (source, encoding) =
+            decode_document_bytes_with_encoding(bytes, "application/xhtml+xml").unwrap();
+        assert_eq!(encoding, "Shift_JIS");
+        assert!(source.ends_with("<p>平和</p>"));
+        let (stylesheet, stylesheet_encoding) = decode_stylesheet_bytes(
+            b".\x95\xbd\x98\x61 { color: green; }",
+            "text/css",
+            Some(encoding),
+        )
+        .unwrap();
+        assert_eq!(stylesheet_encoding, "Shift_JIS");
+        let parsed = w3cos_compiler::esm_css::parse_css_source(&stylesheet, "imported.css");
+        assert!(parsed.rules.iter().any(|rule| rule.selector == ".平和"));
+    }
+
+    #[test]
+    fn xml_declared_encoding_does_not_override_bom_or_transport() {
+        let source = "<?xml version='1.0' encoding='shift-JIS'?><p>平和</p>";
+        let mut bom_source = vec![0xef, 0xbb, 0xbf];
+        bom_source.extend_from_slice(source.as_bytes());
+        for (bytes, content_type) in [
+            (
+                bom_source.as_slice(),
+                "application/xhtml+xml; charset=windows-1252",
+            ),
+            (source.as_bytes(), "application/xhtml+xml; charset=utf-8"),
+        ] {
+            let (decoded, encoding) =
+                decode_document_bytes_with_encoding(bytes, content_type).unwrap();
+            assert_eq!(encoding, "UTF-8");
+            assert_eq!(decoded, source);
+        }
+    }
+
+    #[test]
+    fn xml_declared_encoding_is_xml_only_and_waits_for_streamed_declaration() {
+        let source = b"<?xml version='1.0' encoding='shift-JIS'?><p>\x95\xbd\x98\x61</p>";
+        let (_, html_encoding) = decode_document_bytes_with_encoding(source, "text/html").unwrap();
+        assert_eq!(html_encoding, "windows-1252");
+        assert!(
+            DocumentByteDecoder::detect(&source[..30], "application/xhtml+xml", false)
+                .unwrap()
+                .is_none()
+        );
+        let (mut decoder, bom_bytes) =
+            DocumentByteDecoder::detect(source, "application/xhtml+xml", true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(bom_bytes, 0);
+        assert_eq!(decoder.encoding_name(), "Shift_JIS");
+        assert!(decoder.decode(source, true).unwrap().ends_with("<p>平和</p>"));
+        assert_eq!(
+            sniff_xml_charset(b"<?xml-stylesheet encoding='shift-JIS'?>").unwrap(),
+            None
         );
     }
 
