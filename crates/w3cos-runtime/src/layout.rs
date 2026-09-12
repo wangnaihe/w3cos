@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use taffy::prelude::*;
+use taffy::util::ResolveOrZero;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
     AlignContent as WAlignContent, AlignItems as WAlign, AlignSelf as WAlignSelf,
@@ -2750,6 +2751,19 @@ fn align_table_cell_baselines(layouts: &mut [(LayoutRect, usize)], flat: &[FlatN
             continue;
         };
         let cell_rect = layouts[cell_position].0;
+        let inline_cell = flat
+            .iter()
+            .filter(|child| {
+                child.parent == Some(cell)
+                    && child.style.display != WDisplay::None
+                    && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                    && child.style.float == WFloat::None
+            })
+            .all(|child| {
+                matches!(child.style.display,
+                    WDisplay::Inline | WDisplay::InlineBlock
+                        | WDisplay::InlineFlex | WDisplay::InlineTable)
+            });
         let content_bounds = flat
             .iter()
             .enumerate()
@@ -2758,7 +2772,18 @@ fn align_table_cell_baselines(layouts: &mut [(LayoutRect, usize)], flat: &[FlatN
                     && !matches!(child.style.position, WPos::Fixed)
                     && child.style.display != WDisplay::None
             })
-            .filter_map(|(index, _)| positions.get(&index).map(|position| layouts[*position].0))
+            .filter_map(|(index, child)| positions.get(&index).map(|position| {
+                let mut rect = layouts[*position].0;
+                if inline_cell && child.parent == Some(cell)
+                    && matches!(child.kind, ComponentKind::Image { .. })
+                    && matches!(child.style.align_self, WAlignSelf::Auto | WAlignSelf::Baseline)
+                {
+                    // Align the baseline line box, including the same font
+                    // descent used by its intrinsic height, not just image ink.
+                    rect.height += node.style.font_size * node.style.line_height * 0.2;
+                }
+                rect
+            }))
             .fold(None::<(f32, f32)>, |bounds, rect| {
                 Some(match bounds {
                     Some((top, bottom)) => (top.min(rect.y), bottom.max(rect.y + rect.height)),
@@ -6112,7 +6137,7 @@ fn build_taffy_tree(
     };
     let establishes_inline_formatting_context = ((matches!(comp.kind, ComponentKind::Row)
         && comp.style.display == WDisplay::Block)
-        || comp.style.display == WDisplay::TableCell)
+        || matches!(comp.style.display, WDisplay::TableCell | WDisplay::TableCaption))
         && normal_flow_children.clone().next().is_some()
         && normal_flow_children.clone().all(|child| {
             matches!(
@@ -6185,7 +6210,7 @@ fn build_taffy_tree(
                         )
                 }));
     if establishes_inline_formatting_context {
-        // A block or table cell whose normal-flow children are all inline-level
+        // A block, cell or caption whose normal-flow children are all inline-level
         // establishes line boxes and exports the content baseline rather than
         // the whole border-box height. Keep the line-height strut when a shorter
         // replaced element is the only child, and let vertical-align map onto
@@ -6229,7 +6254,20 @@ fn build_taffy_tree(
             // A baseline-aligned replaced element owns the full area above
             // the baseline, while the line's font strut still contributes
             // its descent below it.
-            style.min_size.height = Dimension::length(line_height.max(baseline_replaced_height));
+            let resolve_edge = |edge: LengthPercentage| {
+                edge.resolve_or_zero(Some(containing_width), |_, _| {
+                    unreachable!("used padding and border edges contain no calc handles")
+                })
+            };
+            let block_edges = if style.box_sizing == BoxSizing::BorderBox {
+                resolve_edge(style.padding.top) + resolve_edge(style.padding.bottom)
+                    + resolve_edge(style.border.top) + resolve_edge(style.border.bottom)
+            } else {
+                0.0
+            };
+            style.min_size.height = Dimension::length(
+                line_height.max(baseline_replaced_height) + block_edges,
+            );
         }
     }
     if mixed_inline_block_flex_fallback {
@@ -14274,6 +14312,27 @@ mod tests {
             "block text should have one 19.2px line plus 64px padding, got {}",
             text.height
         );
+    }
+
+    #[test]
+    fn middle_aligned_cell_keeps_the_baseline_image_line_box() {
+        let layout = |alignment| {
+            let cell = Component::row(
+                Style { display: WDisp::TableCell, align_self: alignment,
+                    font_size: 16.0, line_height: 1.2, ..Style::default() },
+                vec![Component::image("baseline-line.png", Style {
+                    display: WDisp::InlineBlock, width: WDim::Px(98.0),
+                    height: WDim::Px(99.0), ..Style::default()
+                })],
+            );
+            compute(&Component::row(Style { display: WDisp::Table, ..Style::default() },
+                vec![Component::row(Style { display: WDisp::TableRow, ..Style::default() },
+                    vec![cell])]), 800.0, 600.0).unwrap()
+        };
+        let baseline = layout(WAlignSelf::Baseline);
+        let middle = layout(WAlignSelf::Center);
+        assert!((baseline[2].0.height - 102.84).abs() < 0.0001);
+        assert!((baseline[3].0.y - middle[3].0.y).abs() < 0.0001);
     }
 
     #[test]

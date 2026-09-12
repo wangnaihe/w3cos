@@ -1576,6 +1576,8 @@ fn alignment_ink_left(
             | Display::InlineTable
             | Display::Block
             | Display::ListItem
+            | Display::TableCell
+            | Display::TableCaption
     )
         || style_uses_generic_monospace(style) {
         return 0.0;
@@ -2898,6 +2900,8 @@ mod tests {
         for display in [
             Display::Block,
             Display::ListItem,
+            Display::TableCell,
+            Display::TableCaption,
             Display::InlineBlock,
             Display::InlineFlex,
             Display::InlineTable,

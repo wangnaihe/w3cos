@@ -587,6 +587,27 @@ native dumps differ by 1.92px for the first image; this is the next
 cell-line-box alignment investigation, not a completed fix. No WPT
 input, suite or tolerance was altered; final full-suite proof remains open.
 
+### Caption/cell baseline line boxes and glyph origins (2026-09-13)
+
+Case 5268, `caption-position-001.xht`, is now zero differing pixels
+(previously 2,944). Cell vertical alignment used image bounds without
+the baseline line's font descent, shifting the first reference image
+1.92px. Caption/Cell text leaves also compensated ink bearings. The
+first change removed those differences but left 1,270 pixels on the
+second image: fixed-layout cells use border-box sizing, so their line
+minimum must include used padding/border, and image captions must
+establish the same inline line box. All three paths now agree.
+Chromium had independently loaded both images and matched their source/
+reference y coordinates; WPT fixtures and tolerance remain unchanged.
+The new baseline/middle image unit, expanded glyph-origin pixel unit
+and three related table regressions pass (5/5 selected units). Strict
+`caption-strut-v2` receipts pass 5233–5240, 5249–5256, 5257–5264 and
+5265–5272 (32/32); the intermediate `cell-line-box-v1` receipt remains
+7/8 and is not claimed green. Suite revision remains
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, count 6,548, viewport
+800×600. Next progression is 5273; earlier corpus questions and final
+complete-suite proof remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
