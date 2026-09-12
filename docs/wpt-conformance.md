@@ -345,6 +345,22 @@ pixels. Its fixture tests malformed at-rules inside declaration blocks;
 the next investigation is declaration error recovery. No later batch
 was started, and neither fixture nor tolerance was modified.
 
+Case 5110 is now repaired. Differences were confined to its third sentence
+(y=87–102): declaration recovery reinterpreted `color: red` after a balanced
+block inside the malformed `@media` segment. Declaration segments starting
+with an at-keyword are now discarded through their top-level semicolon;
+top-level at-rule parsing and balanced delimiter scanning are unchanged.
+The new `malformed_at_rule_declaration_recovers_only_after_its_semicolon`
+test failed an extra red declaration before the production change and
+passed afterward, including valid declarations after a semicolon. Five
+selected existing malformed-block/at-rule/string/bad-url tests passed as
+well (six unit tests). Case 5110 changed from 1,067 differing pixels to zero
+in `target/wpt-targeted/batch-5105-5112-declaration-at-rule-v1/results.json`
+(8/8). Batches 5057–5064 and 4977–4984 passed 8/8 with that suffix:
+24 focused reftests, not full acceptance. No WPT fixture, suite entry or
+tolerance changed. Cases 4314/4947 and final 6,548-case proof remain open;
+next progression starts at 5113.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

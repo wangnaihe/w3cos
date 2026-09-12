@@ -961,7 +961,10 @@ fn parse_declarations_raw(block: &str) -> Vec<(String, String)> {
         .collect::<Vec<_>>();
     for segment in segments {
         let segment = segment.trim();
-        if segment.is_empty() {
+        // An at-keyword cannot start a declaration. Its balanced blocks
+        // belong to this malformed segment, not to a new declaration after
+        // a closing brace; resume only at the top-level semicolon.
+        if segment.is_empty() || segment.starts_with('@') {
             continue;
         }
         let mut delimiters = Vec::new();
@@ -1641,6 +1644,30 @@ mod tests {
             .find(|rule| rule.selector == "#f")
             .expect("#f rule survives malformed predecessor");
         assert_eq!(f.declarations[0], ("color".into(), "green".into()));
+    }
+
+    #[test]
+    fn malformed_at_rule_declaration_recovers_only_after_its_semicolon() {
+        let sheet = parse_css_source(
+            "#c { color: green; @media { #c { color: red !important } } color: red; }
+             #d { color: red; @media { #d { color: red !important } }; color: green; }
+             #a { color: green; @import 'red.css' color: red; }",
+            "malformed-declaration.css",
+        );
+        assert_eq!(sheet.rules.len(), 3);
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![("color".into(), "green".into())]
+        );
+        assert_eq!(
+            sheet.rules[1].declarations.last(),
+            Some(&("color".into(), "green".into()))
+        );
+        assert_eq!(
+            sheet.rules[2].declarations,
+            vec![("color".into(), "green".into())]
+        );
+        assert!(sheet.imports.is_empty());
     }
 
     #[test]
