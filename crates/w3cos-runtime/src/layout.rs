@@ -4082,6 +4082,68 @@ fn project_simple_float_margin_boxes(
             child_index += count_nodes(child);
         }
 
+        // A leading right float's synthetic auto margin must not consume
+        // inline line space. Keep a fitting prefix of right floats at the
+        // content end and translate the following inline runs as one group.
+        let right_prefix = component.children.iter().take_while(|child| {
+            child.style.float == WFloat::Right && child.style.position == WPos::Static
+                && child.style.display != WDisplay::None
+        }).count();
+        if component.style.display == WDisplay::Flex
+            && component.style.flex_direction == WDir::Row
+            && component.style.justify_content == WJustify::FlexStart
+            && right_prefix > 0 && right_prefix < component.children.len()
+            && component.children[right_prefix].style.position == WPos::Static
+            && component.children[right_prefix..].iter().all(|child| {
+                child.style.float == WFloat::None
+                    && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                    && matches!(child.style.display, WDisplay::Inline | WDisplay::InlineBlock
+                        | WDisplay::InlineFlex | WDisplay::InlineTable)
+            })
+            && let Some(parent_position) = layout_position.get(&component_index).copied()
+        {
+            let parent = layouts[parent_position].0;
+            let spacing = |value, font_size| resolve_spacing_for_layout(
+                value, parent.width, font_size, viewport_w, viewport_h);
+            let left = parent.x + spacing(component.style.padding.left, component.style.font_size)
+                + component.style.border_left_width.unwrap_or(component.style.border_width);
+            let right = parent.x + parent.width
+                - spacing(component.style.padding.right, component.style.font_size)
+                - component.style.border_right_width.unwrap_or(component.style.border_width);
+            let mut index = component_index + 1;
+            let mut entries = Vec::with_capacity(component.children.len());
+            for child in &component.children {
+                let count = count_nodes(child);
+                if let Some(position) = layout_position.get(&index).copied() {
+                    entries.push((child, index, count, layouts[position].0));
+                }
+                index += count;
+            }
+            let outer_width: f32 = entries.iter().map(|(child, _, _, rect)| rect.width
+                + spacing(child.style.margin.left, child.style.font_size)
+                + spacing(child.style.margin.right, child.style.font_size)).sum();
+            if entries.len() == component.children.len() && outer_width <= right - left + 0.01 {
+                let (first, _, _, first_rect) = entries[right_prefix];
+                let delta = left + spacing(first.style.margin.left, first.style.font_size)
+                    - first_rect.x;
+                for (_, index, count, _) in &entries[right_prefix..] {
+                    shift_subtree_x(layouts, layout_position, *index, *count, delta);
+                }
+                let mut edge = right;
+                for (child, index, count, rect) in &entries[..right_prefix] {
+                    let target_x = edge - spacing(child.style.margin.right, child.style.font_size)
+                        - rect.width;
+                    shift_subtree_x(layouts, layout_position, *index, *count, target_x - rect.x);
+                    let target_y = parent.y
+                        + spacing(component.style.padding.top, component.style.font_size)
+                        + component.style.border_top_width.unwrap_or(component.style.border_width)
+                        + spacing(child.style.margin.top, child.style.font_size);
+                    shift_subtree(layouts, layout_position, *index, *count, target_y - rect.y);
+                    edge = target_x - spacing(child.style.margin.left, child.style.font_size);
+                }
+            }
+        }
+
         if component.style.float != WFloat::None
             && matches!(component.style.height, WDim::Auto)
             && component.children.len() == 1
@@ -4336,8 +4398,12 @@ fn project_simple_float_margin_boxes(
                     .map(|(_, rect)| rect.y + rect.height)
                     .reduce(f32::max)
                     .unwrap_or(current.y);
-                if current.y + f32::EPSILON >= float_bottom {
-                    let delta_y = float_top - current.y;
+                let leading = if child.style.display == WDisplay::Inline
+                    && matches!(child.kind, ComponentKind::Text { .. }) {
+                    (child.style.font_size * child.style.line_height - child.style.font_size) * 0.5
+                } else { 0.0 };
+                if current.y - leading + f32::EPSILON >= float_bottom {
+                    let delta_y = float_top + leading - current.y;
                     shift_subtree(
                         layouts,
                         layout_position,
@@ -16696,6 +16762,42 @@ mod tests {
             flow.y >= floating.y + floating.height - 0.01,
             "an inline replaced box wider than the float-side band must wrap below the float: float={floating:?}, flow={flow:?}"
         );
+    }
+
+    #[test]
+    fn empty_right_float_does_not_shift_following_inline_text() {
+        let root = Component::row(Style { display: WDisp::Flex,
+            width: WDim::Px(400.0), ..Style::default() }, vec![
+            Component::row(Style { display: WDisp::Block, float: WFloat::Right,
+                ..Style::default() }, vec![]),
+            Component::text("This text should be green.", Style {
+                display: WDisp::Inline, ..Style::default() }),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(1).width, 0.0);
+        assert_eq!(get(1).height, 0.0);
+        assert_eq!(get(2).x, get(0).x,
+            "a zero-size float cannot consume the line's free space");
+        assert_eq!(get(1).x, get(0).x + get(0).width);
+        assert_eq!(get(1).y, get(0).y);
+        assert!((get(2).y - get(0).y - 1.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn fitting_leading_right_floats_keep_source_order_at_inline_end() {
+        let floating = |width| Component::row(Style {
+            display: WDisp::Block, float: WFloat::Right, width: WDim::Px(width),
+            height: WDim::Px(0.0), ..Style::default() }, vec![]);
+        let root = Component::row(Style { display: WDisp::Flex,
+            width: WDim::Px(400.0), ..Style::default() }, vec![
+            floating(20.0), floating(30.0), Component::text("Text", Style {
+                display: WDisp::Inline, width: WDim::Px(100.0), ..Style::default() })]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(1).x, 380.0);
+        assert_eq!(get(2).x, 350.0);
+        assert_eq!(get(3).x, 0.0);
     }
 
     #[test]

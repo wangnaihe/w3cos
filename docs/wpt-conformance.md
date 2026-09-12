@@ -212,6 +212,26 @@ Case 4911 now has zero pixel differences in
 (8/8). 4897–4904 and 4265–4272 also passed 8/8 with the same receipt suffix.
 Case 4314 and the final complete 6,548-case proof remain outstanding.
 
+Case 4917 (`first-line-pseudo-007.xht`) differed by 1,943 pixels because
+a leading empty right float's synthetic auto left margin pushed subsequent
+inline text to x=626.26 instead of x=8. Chromium placed the float at x=792,
+y=8 with zero extent and retained the text origin at x=8. Fitting leading
+right-float prefixes in inline rows now align at the content end in source
+order while following inline runs retain the content-start origin. The
+first normal inline after a float also preserves its half-leading.
+
+The empty-float regression first failed with text x=197.87 versus expected
+zero. It now passes text origin, float-end/top and half-leading assertions;
+a second regression passes two nonzero-width right floats in source order.
+The selected right-float unit subset is 2/3, not green: the older
+`right_float_aligns_to_the_containing_block_end` still fails x=0 versus 50.
+Its Block-only input reaches neither new branch; an old-SHA execution
+comparison has not been performed, so its baseline status remains unverified.
+Case 4917 now has zero pixel differences in
+`target/wpt-targeted/batch-4913-4920-leading-right-float-line-v1/results.json`
+(8/8). 4905–4912 and 4265–4272 passed 8/8 using the same receipt suffix.
+Case 4314 and complete 6,548-case acceptance remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
