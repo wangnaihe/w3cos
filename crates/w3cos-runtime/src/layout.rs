@@ -7549,6 +7549,23 @@ fn positioned_descendant_containing_block(
     let Ok(children) = tree.children(node) else {
         return rect;
     };
+    if children.iter().all(|child| {
+        tree.get_node_context(*child).and_then(|index| flat.get(*index)).is_some_and(|child| {
+            child.style.display == WDisplay::None
+                || child.style.float != WFloat::None
+                || matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+        })
+    }) {
+        // An empty anonymous inline line retains its font strut. The em-only
+        // rectangle used to paint an inline is not this line's containing
+        // block geometry; out-of-flow children must use the retained strut.
+        let half_leading = (info.style.font_size * info.style.line_height - info.style.font_size) * 0.5;
+        return LayoutRect {
+            y: rect.y - half_leading,
+            height: rect.height + half_leading * 2.0,
+            ..rect
+        };
+    }
     let mut has_block_split = false;
     let mut current_fragment_width = 0.0_f32;
     let mut widest_fragment = 0.0_f32;
@@ -11931,6 +11948,30 @@ mod tests {
         ]), 800.0, 600.0).unwrap();
         let text = layout.iter().find(|(_, i)| *i == 2).unwrap().0;
         assert!((text.x + text.width - 500.0).abs() < 0.01, "{text:?}");
+    }
+
+    #[test]
+    fn empty_positioned_inline_keeps_its_line_strut_containing_block_top() {
+        let absolute = Component::row(Style {
+            position: WPos::Absolute, top: WDim::Px(0.0), left: WDim::Px(0.0),
+            right: WDim::Px(0.0), height: WDim::Px(100.0), ..Style::default()
+        }, vec![]);
+        let floating = Component::row(Style {
+            display: WDisp::Block, float: WFloat::Left, ..Style::default()
+        }, vec![absolute]);
+        let inline = Component::row(Style {
+            display: WDisp::Inline, position: WPos::Relative,
+            padding: w3cos_std::style::Edges {
+                left: WSpacing::Px(100.0), ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        }, vec![floating]);
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(500.0), ..Style::default()
+        }, vec![inline]), 800.0, 600.0).unwrap();
+        let absolute = layout.iter().find(|(_, i)| *i == 3).unwrap().0;
+        assert_eq!(absolute.width, 100.0);
+        assert_eq!(absolute.y, 0.0);
     }
 
     #[test]

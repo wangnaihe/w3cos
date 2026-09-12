@@ -9156,6 +9156,13 @@ fn hoist_floats_into_block_formatting_context(
             component.style.display = w3cos_std::style::Display::Block;
         }
 
+        if component.style.position != w3cos_std::style::Position::Static {
+            // A positioned inline owns the containing block of descendants,
+            // even when a float sits between it and an absolute box. Moving
+            // that float outside the inline would change ancestor ownership.
+            return Some(component);
+        }
+
         if matches!(
             component.style.display,
             w3cos_std::style::Display::Inline
@@ -10086,6 +10093,25 @@ mod image_component_tests {
     }
 
     #[test]
+    fn float_hoisting_keeps_the_positioned_inline_ancestor() {
+        use w3cos_std::style::{Display, Float, Position, Style};
+        let absolute = w3cos_std::Component::boxed(Style {
+            position: Position::Absolute, ..Style::default()
+        }, vec![]);
+        let floating = w3cos_std::Component::boxed(Style {
+            display: Display::Block, float: Float::Left, ..Style::default()
+        }, vec![absolute]);
+        let inline = w3cos_std::Component::row(Style {
+            display: Display::Inline, position: Position::Relative, ..Style::default()
+        }, vec![floating]);
+        let fixed = hoist_floats_into_block_formatting_context(&Style::default(), vec![inline]);
+        assert_eq!(fixed.len(), 1);
+        assert_eq!(fixed[0].style.position, Position::Relative);
+        assert_eq!(fixed[0].children[0].style.float, Float::Left);
+        assert_eq!(fixed[0].children[0].children[0].style.position, Position::Absolute);
+    }
+
+    #[test]
     fn floating_inline_principal_box_is_blockified_before_lowering() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("span", &[("float", "left"), ("max-width", "120px")]);
@@ -10152,22 +10178,21 @@ mod image_component_tests {
         assert_eq!(fixed[2].style.float, Float::Right);
         assert_eq!(fixed[2].style.display, Display::Block);
 
-        let mut positioned_inline_style = w3cos_std::style::Style::default();
-        positioned_inline_style.display = Display::Inline;
-        positioned_inline_style.position = w3cos_std::style::Position::Relative;
-        positioned_inline_style.line_height = 1.5;
+        let mut split_inline_style = w3cos_std::style::Style::default();
+        split_inline_style.display = Display::Inline;
+        split_inline_style.line_height = 1.5;
         let block = || {
             let mut style = w3cos_std::style::Style::default();
             style.display = Display::Block;
             w3cos_std::Component::text("block", style)
         };
-        let positioned_inline = w3cos_std::Component::boxed(
-            positioned_inline_style,
+        let split_inline = w3cos_std::Component::boxed(
+            split_inline_style,
             vec![block(), floating_box(Float::Left), block()],
         );
         let fixed = hoist_floats_into_block_formatting_context(
             &w3cos_std::style::Style::default(),
-            vec![positioned_inline],
+            vec![split_inline],
         );
         assert_eq!(fixed.len(), 2);
         assert_eq!(fixed[0].style.float, Float::Left);
