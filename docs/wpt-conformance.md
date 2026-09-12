@@ -1571,6 +1571,30 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Underline/overline painting remains a separately identified implementation gap;
   no fixture, viewport or tolerance edits, and no full-suite completion claim.
 
+### Anonymous first-formatted-line indent qualification
+
+- Fresh strict start5689 on1d4b28b is5/8: indent012=2440,
+  indent013=3904, indent014=9600 pixels (maximum255). Other five cases pass.
+- `wrap_inline_runs_between_block_boxes` copied inherited text-indent into
+  every anonymous run, including runs after a preceding formatted block line.
+  Candidate keeps the inherited indent only for the first formatted line;
+  later anonymous inline fragments have no outer-context indent. Principal
+  child blocks and atomic inline containers retain their own inner context.
+  Empty preceding blocks do not consume the first formatted line.
+- New `anonymous_runs_indent_only_the_first_formatted_line` failed before
+  repair (tail indent12 instead of0), then passes. DOM anonymous filter29/29
+  and bidi10/10 pass.
+- Runner SHA256
+  `3114e6efb88c0dc107868755eb4c11f177378d1b01ea89ceecae8a3fc30f4fd9`:
+  start5689 passes6/8. Indent014 moves9600 pixels to0 (maximum0), while
+  indent012=2440 and indent013=3904 remain FAIL (maximum255). Receipt
+  `target/wpt-targeted/batch-5689-anonymous-first-indent-v1/results.json`.
+  Related starts5681,5673,5665,5593,4265,4281,4289,4297 each pass8/8,
+  total64/64 with zero pixel differences. Receipts
+  `target/wpt-targeted/batch-*-anonymous-first-indent-v1/results.json`.
+  No fixture, suite, viewport or tolerance changes; final full6548 proof
+  remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

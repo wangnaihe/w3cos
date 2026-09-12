@@ -7897,7 +7897,33 @@ fn group_unbroken_ascii_inline_words(
 }
 
 fn wrap_inline_runs_between_block_boxes(component: &mut w3cos_std::Component) {
-    use w3cos_std::style::{Display, Float, Position, Style};
+    use w3cos_std::{component::ComponentKind, style::{Dimension, Display, Float, Position, Style}};
+    fn has_formatted_line(component: &w3cos_std::Component) -> bool {
+        if component.style.display == Display::None
+            || component.style.float != Float::None
+            || matches!(component.style.position, Position::Absolute | Position::Fixed)
+        {
+            return false;
+        }
+        if matches!(component.style.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable) {
+            return true;
+        }
+        if let ComponentKind::Text { content } = &component.kind {
+            return content.chars().any(|ch| !matches!(ch, ' ' | '\t' | '\r' | '\n'));
+        }
+        component.children.iter().any(has_formatted_line)
+    }
+    fn clear_anonymous_inline_indent(component: &mut w3cos_std::Component) {
+        let generated_word = component.style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-unbroken-inline-word"));
+        if component.style.display != Display::Inline && !generated_word {
+            return;
+        }
+        component.style.text_indent = Dimension::Px(0.0);
+        for child in &mut component.children {
+            clear_anonymous_inline_indent(child);
+        }
+    }
     for child in &mut component.children {
         wrap_inline_runs_between_block_boxes(child);
     }
@@ -7933,6 +7959,14 @@ fn wrap_inline_runs_between_block_boxes(component: &mut w3cos_std::Component) {
         let mut style = Style::default();
         inherit_text_style(&mut style, &component.style, "", |_| false);
         style.display = Display::Block;
+        if output.iter().any(has_formatted_line) {
+            // Later anonymous runs are not the element's first formatted line.
+            // Atomic inline containers still own their separate inner context.
+            style.text_indent = Dimension::Px(0.0);
+            for child in run.iter_mut() {
+                clear_anonymous_inline_indent(child);
+            }
+        }
         output.push(w3cos_std::Component::row(style, std::mem::take(run)));
     };
     for child in std::mem::take(&mut component.children) {
@@ -11217,6 +11251,28 @@ mod image_component_tests {
         assert!(word.children.iter().all(|child| matches!(child.on_click,
             w3cos_std::EventAction::NativeHost { .. })));
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn anonymous_runs_indent_only_the_first_formatted_line() {
+        use w3cos_std::{Component, style::{Dimension, Style}};
+        let block = Style { display: Display::Block, text_indent: Dimension::Px(12.0), ..Style::default() };
+        let inline = Style { display: Display::Inline, ..block.clone() };
+        let mut root = Component::row(block.clone(), vec![
+            Component::text("lead", inline.clone()),
+            Component::text("block", block.clone()),
+            Component::text("tail", inline.clone()),
+        ]);
+        wrap_inline_runs_between_block_boxes(&mut root);
+        assert_eq!(root.children[0].style.text_indent, Dimension::Px(12.0));
+        assert_eq!(root.children[1].style.text_indent, Dimension::Px(12.0));
+        assert_eq!(root.children[2].style.text_indent, Dimension::Px(0.0));
+        assert_eq!(root.children[2].children[0].style.text_indent, Dimension::Px(0.0));
+        let mut leading_empty = Component::row(block.clone(), vec![
+            Component::row(block, vec![]), Component::text("first", inline),
+        ]);
+        wrap_inline_runs_between_block_boxes(&mut leading_empty);
+        assert_eq!(leading_empty.children[1].style.text_indent, Dimension::Px(12.0));
     }
 
     #[test]
