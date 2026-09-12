@@ -4686,6 +4686,7 @@ impl Document {
                 if style.display != w3cos_std::style::Display::None
                     && (nowrap_inline_formatting_context || anonymous_inline_formatting_context)
                 {
+                    let mut indented_unbroken_text_box = false;
                     if anonymous_inline_formatting_context {
                         if matches!(style.display,
                             w3cos_std::style::Display::Block | w3cos_std::style::Display::InlineBlock)
@@ -4720,31 +4721,45 @@ impl Document {
                         };
                         if indent_spacing != w3cos_std::style::Spacing::Px(0.0) {
                             // `text-indent` moves the first in-flow inline box,
-                            // including an atomic inline-level box. Keep the
-                            // box's inherited value: its own first formatted
+                            // including an atomic inline-level box. Atomic
+                            // boxes keep their inherited value: their first formatted
                             // line is indented again after entering its inner
                             // formatting context.
-                            if let Some(first_atomic_inline) = children.iter_mut().find(|child| {
+                            if let Some(first_inline) = children.iter_mut().find(|child| {
                                 child.style.float == w3cos_std::style::Float::None
                                     && child.style.position == w3cos_std::style::Position::Static
-                                    && !matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                                    && !matches!(&child.kind, w3cos_std::ComponentKind::Text { content }
+                                        if content.chars().all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n')))
                             }) {
+                                let unbroken_text = first_inline.style.display == w3cos_std::style::Display::Inline
+                                    && matches!(&first_inline.kind, w3cos_std::ComponentKind::Text { content }
+                                        if !content.is_empty() && content.chars().all(|ch| ch.is_ascii_alphanumeric()));
+                                let atomic = !matches!(first_inline.kind, w3cos_std::ComponentKind::Text { .. });
                                 let margin = match style.direction {
                                     w3cos_std::style::TextDirection::Ltr => {
-                                        &mut first_atomic_inline.style.margin.left
+                                        &mut first_inline.style.margin.left
                                     }
                                     w3cos_std::style::TextDirection::Rtl => {
-                                        &mut first_atomic_inline.style.margin.right
+                                        &mut first_inline.style.margin.right
                                     }
                                 };
-                                if *margin == w3cos_std::style::Spacing::Px(0.0) {
+                                if (atomic || unbroken_text) && *margin == w3cos_std::style::Spacing::Px(0.0) {
                                     *margin = indent_spacing;
+                                    if unbroken_text {
+                                        // This is one word's inline fragment, not a
+                                        // paragraph-width paint box. Move its background
+                                        // with its glyphs and do not indent again in paint.
+                                        first_inline.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
+                                        first_inline.style.flex_shrink = 0.0;
+                                        indented_unbroken_text_box = true;
+                                    }
                                 }
                             }
                         }
                     }
                     if (anonymous_inline_formatting_context
                         || matches!(style.text_indent, w3cos_std::style::Dimension::Percent(_)))
+                        && !indented_unbroken_text_box
                         && children.len() == 1
                         && matches!(children[0].kind, w3cos_std::ComponentKind::Text { .. })
                         && matches!(
@@ -11273,6 +11288,28 @@ mod image_component_tests {
         ]);
         wrap_inline_runs_between_block_boxes(&mut leading_empty);
         assert_eq!(leading_empty.children[1].style.text_indent, Dimension::Px(12.0));
+    }
+
+    #[test]
+    fn indented_unbroken_inline_text_moves_its_background_box() {
+        use w3cos_std::style::{Dimension, Spacing};
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#host", &[("float", "left"), ("width", "160px"), ("text-indent", "160px")]);
+        crate::stylesheet::register_rule("span", &[("background", "black")]);
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        host.set_attribute(&mut document, "id", "host");
+        let span = document.create_element("span");
+        span.set_text_content(&mut document, "letters");
+        host.append_child(&mut document, span);
+        document.body().append_child(&mut document, host);
+        let tree = document.to_component_tree();
+        let text = &tree.children[0].children[0];
+        assert_eq!(text.style.margin.left, Spacing::Px(160.0));
+        assert_eq!(text.style.width, Dimension::Auto);
+        assert_eq!(text.style.text_indent, Dimension::Px(0.0));
+        assert_ne!(text.style.background.a, 0);
+        crate::stylesheet::clear_rules();
     }
 
     #[test]

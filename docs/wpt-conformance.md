@@ -1595,6 +1595,34 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   No fixture, suite, viewport or tolerance changes; final full6548 proof
   remains unachieved.
 
+### Indented unbroken inline box qualification
+
+- Indent013 source/reference dumps show its black inline fragment atx8/width160
+  versus reference x168/width92.4375. Source paints its glyphs with an indent,
+  but the fixed paragraph-width background remains at the old box location.
+- Candidate moves the first in-flow unbroken ASCII word's whole inline box
+  using the resolved indent margin and removes duplicate paint indentation.
+  The word keeps intrinsic width instead of being forced to100% paragraph
+  width. Multi-word paragraph wrapping remains unchanged; a later atomic inline
+  is no longer incorrectly selected ahead of preceding ordinary text.
+- New `indented_unbroken_inline_text_moves_its_background_box` fails before
+  repair (margin0 instead of160), then passes.
+- Runner SHA256
+  `ec511ffffeac376cf6ae1989144aa8df328873595b88d4a03687b4257ec5c3af`:
+  start5689 now passes7/8. Indent013 moves3904 pixels to0 (maximum0),
+  indent014 remains0; indent012=2440 pixels (maximum255) remains FAIL.
+  Receipt `target/wpt-targeted/batch-5689-indented-word-box-v1/results.json`.
+  Related starts5681,5673,5665,5593,4265,4281,4289,4297 each pass8/8,
+  total64/64 with zero pixel differences. Receipts
+  `target/wpt-targeted/batch-*-indented-word-box-v1/results.json`.
+  Final full6548 proof remains unachieved; no fixture or tolerance edits.
+- DOM indent4/4, anonymous29/29 and bidi10/10 pass. Indent012 pre-candidate
+  source/reference dumps agree on width204 and child positions but disagree
+  on outer height54 versus64: the source lacks the10px descent below the
+  baseline-aligned50px atomic box. Receipts
+  `target/wpt-targeted/indent-5692-*-pre-box-candidate.bin`; this is the next
+  independent repair point, not a qualified fix yet.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
