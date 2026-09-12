@@ -1657,6 +1657,27 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   This is focused qualification, not final full6548 proof; full-suite completion
   remains unachieved.
 
+### Final-font ex text-indent qualification
+
+- After bb0446a, starts5697/5705/5713 each pass8/8; start5721 is7/8:
+  `text-indent-091.xht` differs1024 pixels (maximum255). Receipt
+  `target/wpt-targeted/batch-5721-after-inline-block-strut/results.json`.
+- Parser fallback represented12ex asEm(6), unlike margin-left's final-font
+  x-height recovery. Computed style now resolves authored signed ex text-indent
+  with the final cascaded font, before descendants inherit the computed pixels.
+- `ex_text_indent_uses_final_font_metrics_and_inherits_computed_pixels` first
+  fails (Em6 versusPx153.6), then passes for12ex,+12ex,-2ex with a child whose
+  font size changes. Indent unit filter passes5/5.
+- Runner SHA256
+  `a3cd3bacd8b0ea9e149e39f0bd2223d8accbf5d3607ed9d169e7f2604735678d`:
+  strict start5721 passes8/8, every comparison zero differing pixels and
+  zero maximum channel difference. Indent091 moves1024 pixels to0.
+  Receipt `target/wpt-targeted/batch-5721-final-font-ex-indent-v1/results.json`.
+  Related starts5713,5705,5697,5689,5681,5673,5665,4265 each pass8/8,
+  total64/64 with zero pixel differences. Receipts
+  `target/wpt-targeted/batch-*-final-font-ex-indent-v1/results.json`.
+  No fixture or tolerance changes; final full6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

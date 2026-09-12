@@ -1210,6 +1210,15 @@ impl Document {
             }
         }
         let edge_ex_size = css_ex_size(&style);
+        if let Some(value) = declared_value(&["text-indent", "textIndent"])
+            && let Some(number) = value.trim().strip_suffix("ex")
+            && let Ok(number) = number.trim().parse::<f32>()
+            && number.is_finite()
+        {
+            // ex depends on the final cascaded font, not the parser's fallback
+            // half-em estimate. Descendants inherit this computed length.
+            style.text_indent = w3cos_std::style::Dimension::Px(number * edge_ex_size);
+        }
         if let Some(value) = declared_value(&["letter-spacing", "letterSpacing"]) {
             // Relative spacing resolves after the final font cascade. Children
             // inherit this computed pixel value, not the authored relative unit.
@@ -13360,6 +13369,26 @@ mod computed_style_cache_tests {
                 expected,
                 "inherited {value}"
             );
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn ex_text_indent_uses_final_font_metrics_and_inherits_computed_pixels() {
+        use w3cos_std::style::Dimension;
+        for (value, expected) in [("12ex", 153.6), ("+12ex", 153.6), ("-2ex", -25.6)] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#target", &[("font", "16px/1 Ahem"), ("text-indent", value)]);
+            crate::stylesheet::register_rule("#child", &[("font-size", "10px")]);
+            let mut document = Document::new();
+            let target = document.create_element("div");
+            target.set_attribute(&mut document, "id", "target");
+            let child = document.create_element("div");
+            child.set_attribute(&mut document, "id", "child");
+            target.append_child(&mut document, child);
+            document.body().append_child(&mut document, target);
+            assert_eq!(document.computed_style_for(target.id).text_indent, Dimension::Px(expected));
+            assert_eq!(document.computed_style_for(child.id).text_indent, Dimension::Px(expected));
         }
         crate::stylesheet::clear_rules();
     }
