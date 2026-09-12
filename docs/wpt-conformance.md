@@ -1341,6 +1341,54 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   No fixture, suite, viewport or tolerance changes; final full proof
   remains unachieved.
 
+### Bidi logical paint order (intermediate candidate)
+
+- Regression `bidi_visual_fragments_paint_in_logical_order_without_changing_layout`
+  fails on the old implementation: visual fragment 3 does not paint before
+  fragment 2. RED compiled with the WPT profile in 2m22s.
+- Candidate shared PaintArtifact change assigns contiguous logical traversal
+  ordinals to fully tagged bidi sibling runs while retaining visual node indices
+  and layout rectangles. CSS paint phases and authored z-index are unchanged.
+  DOM normalization records original unit ranks and no longer rewrites z-index
+  for transparent fragments. The new regression passes after the change
+  (WPT-profile compile 2m23s). PaintArtifact scope passes 32/34; the existing
+  `auto_positioned_subtree_paints_after_later_normal_flow_content` z_order
+  assertion and `inline_fragment_clip_keeps_layout_rect_and_clips_only_paint`
+  assertion still fail as previously recorded.
+- Rebuilt runner SHA256:
+  `274e1fcd75dac801268d7c06c8f2e6ca2b4eb26b56cc547d2cb5bea96f833db7`.
+  Strict start 5593 remains 7/8: 001 improves to one differing pixel with
+  max difference 1; 003 stays at zero. Receipt:
+  `target/wpt-targeted/batch-5593-bidi-logical-paint-order-v1/results.json`.
+  The logical-order-only candidate did not qualify at zero tolerance and was
+  not submitted alone. Foreground glyph overlap/compositing required the shared
+  run replay below; starts 5601 onward were not run at this checkpoint.
+  This is not full completion evidence.
+
+### Compatible bidi foreground run qualification
+
+- Logical tree ordering alone left one antialiasing pixel (maximum difference
+  1) in 001. Shared `bidi_paint` replay preserves per-box logical backgrounds
+  and shapes compatible contiguous visual text fragments as one foreground run.
+  Headless and window render paths both consume this replay; original node
+  identity, rectangles and CSS property trees remain unchanged.
+- Eligibility requires static, untransformed text with no float, opacity/filter
+  effect, border, padding, margin, shadow, outline or extra spacing; foreground
+  styles and property-tree handles must match. Different text styles remain
+  borrowed and unmerged. Both new replay regressions pass, as do the logical
+  order regression and two existing table replay regressions.
+- Strict start 5593 now passes 8/8 at zero tolerances, including 001 and 003.
+  Receipt `target/wpt-targeted/batch-5593-bidi-foreground-run-v1/results.json`.
+  Runner SHA256:
+  `17714d115081c326d969518b533d9548b2d1bf0295882a92f52afa3ca5309823`.
+- Related starts 5585, 5577, 5569, 5561, 5553, 5545, 5369, 5231, 5239,
+  5247, 5255 and 5263 pass 8/8 each, receipts
+  `target/wpt-targeted/batch-<start>-bidi-foreground-run-v1/results.json`.
+  Related strict coverage is 96/96, plus the current 8/8. Recompiled DOM bidi
+  scope passes 10/10 and anonymous scope 28/28. Next sequential start is 5601.
+  Parent read-only `pnpm files:size:check` passes with violations=0; new replay
+  module is 240 lines. Final clean-SHA full 6548 proof is still unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

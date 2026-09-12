@@ -8485,6 +8485,10 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             fragment.style.direction = TextDirection::Ltr;
             fragment.style.unicode_bidi = UnicodeBidi::Normal;
             mark_bidi_visual_order(&mut fragment.style);
+            fragment.style.custom_properties.as_mut().unwrap().insert(
+                "--w3cos-internal-bidi-logical-order".to_string(),
+                unit_index.to_string(),
+            );
             let has_left_edge = fragment
                 .style
                 .border_left_width
@@ -8518,20 +8522,6 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             }
         })
         .collect::<Vec<_>>();
-
-    // Inline backgrounds belong below the shaped text of the whole bidi run.
-    // A later background fragment must not erase glyph overhang from its
-    // preceding sibling.
-    if visual_fragments
-        .iter()
-        .any(|fragment| fragment.component.style.background.a > 0)
-    {
-        for fragment in &mut visual_fragments {
-            if fragment.component.style.background.a == 0 {
-                fragment.component.style.z_index = fragment.component.style.z_index.max(1);
-            }
-        }
-    }
 
     let anonymous_space = units
         .iter()

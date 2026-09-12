@@ -181,6 +181,7 @@ pub struct PaintArtifact {
     pub node_properties: Vec<PaintProperties>,
     pub z_order: Vec<i32>,
     pub paint_order: Vec<Vec<PaintOrderLevel>>,
+    logical_paint_ordinals: Vec<usize>,
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
     pub generation: u64,
@@ -200,11 +201,44 @@ impl Default for PaintArtifact {
             node_properties: Vec::new(),
             z_order: Vec::new(),
             paint_order: Vec::new(),
+            logical_paint_ordinals: Vec::new(),
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
             generation: 0,
         }
     }
+}
+
+fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
+    let rank = |index: usize| {
+        nodes[index].style.custom_properties.as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-bidi-logical-order"))
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    let mut ordinals: Vec<_> = (0..nodes.len()).collect();
+    if !(0..nodes.len()).any(|index| rank(index).is_some()) {
+        return ordinals;
+    }
+    // Recover logical tree traversal only for normalized bidi sibling runs.
+    // Subtrees remain contiguous; indices and layout stay in visual order.
+    let mut children = vec![Vec::new(); nodes.len() + 1];
+    for (index, node) in nodes.iter().enumerate() {
+        children[node.parent.filter(|parent| *parent < nodes.len()).unwrap_or(nodes.len())]
+            .push(index);
+    }
+    for siblings in &mut children {
+        if siblings.iter().all(|index| rank(*index).is_some()) {
+            siblings.sort_by_key(|index| rank(*index));
+        }
+    }
+    let mut stack: Vec<_> = children[nodes.len()].iter().rev().copied().collect();
+    let mut ordinal = 0;
+    while let Some(index) = stack.pop() {
+        ordinals[index] = ordinal;
+        ordinal += 1;
+        stack.extend(children[index].iter().rev().copied());
+    }
+    ordinals
 }
 
 fn background_position_uses_relative_basis(position: &str) -> bool {
@@ -1379,6 +1413,7 @@ impl PaintArtifact {
         extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
         annotate_separated_table_background_fragments(&mut nodes, &rect_by_index);
         let mut artifact = Self {
+            logical_paint_ordinals: logical_paint_ordinals(&nodes),
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
             z_order: vec![0; nodes.len()],
@@ -1626,11 +1661,12 @@ impl PaintArtifact {
 
     fn local_paint_order_level(&self, index: usize) -> PaintOrderLevel {
         let node = &self.nodes[index];
+        let ordinal = self.logical_paint_ordinals.get(index).copied().unwrap_or(index);
         if is_positioned(&node.style) {
             return match node.style.z_index.cmp(&0) {
-                std::cmp::Ordering::Less => (0, node.style.z_index, index),
-                std::cmp::Ordering::Equal => (4, 0, index),
-                std::cmp::Ordering::Greater => (5, node.style.z_index, index),
+                std::cmp::Ordering::Less => (0, node.style.z_index, ordinal),
+                std::cmp::Ordering::Equal => (4, 0, ordinal),
+                std::cmp::Ordering::Greater => (5, node.style.z_index, ordinal),
             };
         }
 
@@ -1654,7 +1690,7 @@ impl PaintArtifact {
             // Collapsed table borders paint over cell contents. Transparent
             // table-part backgrounds can therefore use a late display item
             // without disturbing the table background-layer ordering.
-            return (4, 0, index);
+            return (4, 0, ordinal);
         }
 
         let mut cursor = Some(index);
@@ -1669,7 +1705,7 @@ impl PaintArtifact {
                 break;
             }
             if current_node.style.float != w3cos_std::style::Float::None {
-                return (2, 0, index);
+                return (2, 0, ordinal);
             }
             if current != index
                 && matches!(
@@ -1677,7 +1713,7 @@ impl PaintArtifact {
                     Display::InlineBlock | Display::InlineFlex | Display::InlineTable
                 )
             {
-                return (3, 0, index);
+                return (3, 0, ordinal);
             }
             if current != index && establishes_stacking_context(current_node) {
                 break;
@@ -1693,7 +1729,7 @@ impl PaintArtifact {
         } else {
             1
         };
-        (phase, 0, index)
+        (phase, 0, ordinal)
     }
 }
 
@@ -2652,6 +2688,37 @@ mod tests {
 
         assert_eq!(artifact.sticky_owner, vec![None, Some(1), Some(1)]);
         assert_eq!(artifact.z_order, vec![i32::MIN, 3, 3]);
+    }
+
+    #[test]
+    fn bidi_visual_fragments_paint_in_logical_order_without_changing_layout() {
+        let mut nodes = vec![PaintNode {
+            kind: ComponentKind::Row,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        for rank in [2, 1, 0] {
+            let mut style = Style::default();
+            style.display = Display::Inline;
+            style.custom_properties = Some(std::collections::HashMap::from([(
+                "--w3cos-internal-bidi-logical-order".to_string(),
+                rank.to_string(),
+            )]));
+            nodes.push(PaintNode {
+                kind: ComponentKind::Text { content: rank.to_string() },
+                style,
+                parent: Some(0),
+                sticky_counter_signal: None,
+            });
+        }
+        let artifact = PaintArtifact::build(
+            nodes, &[(rect(0.0), 0), (rect(0.0), 1), (rect(20.0), 2), (rect(40.0), 3)], 1,
+        );
+        assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
+        assert!(artifact.paint_order_key(2) < artifact.paint_order_key(1));
+        assert_eq!(artifact.rect_by_index[1], Some(rect(0.0)));
+        assert_eq!(artifact.nodes[1].style.z_index, 0);
     }
 
     #[test]

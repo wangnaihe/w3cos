@@ -3820,6 +3820,10 @@ impl App {
         let render_nodes = table_replay.iter().map(|node|
             (node.index, node.rect, node.kind.as_ref(), node.style.as_ref())
         ).collect::<Vec<_>>();
+        let bidi_replay = crate::bidi_paint::replay(&render_nodes, &self.paint_artifact);
+        let render_nodes = bidi_replay.iter().map(|node|
+            (node.index, node.rect, node.kind.as_ref(), node.style.as_ref())
+        ).collect::<Vec<_>>();
         let scroll_info: Vec<Option<(f32, f32, LayoutRect)>> = scroll_info_raw
             .iter()
             .map(|si| {

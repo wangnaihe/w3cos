@@ -72,6 +72,10 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
     let nodes = table_replay.iter().map(|node|
         (node.index, node.rect, node.kind.as_ref(), node.style.as_ref())
     ).collect::<Vec<_>>();
+    let bidi_replay = crate::bidi_paint::replay(&nodes, &artifact);
+    let nodes = bidi_replay.iter().map(|node|
+        (node.index, node.rect, node.kind.as_ref(), node.style.as_ref())
+    ).collect::<Vec<_>>();
     let mut rasterizer = SkiaRasterizer::new(include_bytes!("../assets/Inter-Regular.ttf"))
         .ok_or_else(|| anyhow::anyhow!("bundled W3COS font is unavailable to Skia"))?;
     let scroll_info = vec![None; flat.len()];
