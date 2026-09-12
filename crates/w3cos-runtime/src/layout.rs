@@ -1401,12 +1401,24 @@ fn component_min_content_width(component: &Component) -> f32 {
             _ => leaf_intrinsic_size(&component.kind, &component.style).0,
         }
     } else {
-        component
+        let widths = component
             .children
             .iter()
             .filter(|child| !matches!(child.style.position, WPos::Absolute | WPos::Fixed))
-            .map(component_min_content_width)
-            .fold(0.0_f32, f32::max)
+            .map(component_min_content_width);
+        if matches!(component.style.display, WDisplay::Flex | WDisplay::InlineFlex)
+            && matches!(component.style.flex_direction, WDir::Row | WDir::RowReverse)
+            && component.style.flex_wrap == WWrap::NoWrap
+        {
+            // An unbroken flex line cannot fit by taking only its largest
+            // child: all children's min-content contributions share the line.
+            let count = widths.clone().count();
+            widths.sum::<f32>()
+                + count.saturating_sub(1) as f32
+                    * component.style.column_gap.unwrap_or(component.style.gap)
+        } else {
+            widths.fold(0.0_f32, f32::max)
+        }
     };
     let padding = component.style.padding_lengths();
     let margin = component.style.margin_lengths();
@@ -7002,6 +7014,47 @@ fn build_taffy_tree(
                         ) - guard)
                             .max(0.0);
                         child_style.margin.top = LengthPercentageAuto::length(margin);
+                        tree.set_style(node, child_style)?;
+                    }
+                    if matches!(comp.style.display, WDisplay::Flex | WDisplay::InlineFlex)
+                        && matches!(comp.style.flex_wrap, WWrap::Wrap | WWrap::WrapReverse)
+                        && matches!(c.style.white_space, WWhiteSpace::Normal | WWhiteSpace::PreLine)
+                        && c.style.position == WPos::Static
+                        && c.style.float == WFloat::None
+                        && c.style.outline_width == 0.0
+                        && c.style.opacity == 1.0
+                        && c.style.transform.is_identity()
+                        && c.style.filter.as_deref().is_none_or(|value| value.trim().eq_ignore_ascii_case("none"))
+                        && c.style.padding == w3cos_std::style::Edges::ZERO
+                        && c.style.margin == w3cos_std::style::Edges::ZERO
+                        && c.style.background.a == 0
+                        && c.style.background_image.is_none()
+                        && c.style.box_shadow.is_none()
+                        && c.style.border_width == 0.0
+                        && [c.style.border_top_width, c.style.border_right_width,
+                            c.style.border_bottom_width, c.style.border_left_width]
+                            .into_iter().all(|width| width.unwrap_or(0.0) == 0.0)
+                        && matches!(&c.kind, ComponentKind::Text { content }
+                            if !content.is_empty()
+                                && content.chars().all(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r'))
+                                && (c.style.white_space != WWhiteSpace::PreLine
+                                    || !content.chars().any(|ch| matches!(ch, '\n' | '\r'))))
+                        && source_index > 0
+                        && child_containing_width > 0.0
+                        && comp.children[source_index - 1].style.custom_properties.as_ref()
+                            .is_some_and(|properties| properties.contains_key("--w3cos-internal-unbroken-inline-word"))
+                        && component_min_content_width(&comp.children[source_index - 1]) >= child_containing_width
+                    {
+                        // A generated word already fills this line. The following
+                        // collapsible separator is discarded at the wrap boundary,
+                        // not a new line with its own font-height strut.
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.display = taffy::Display::None;
+                        child_style.size = Size { width: Dimension::length(0.0), height: Dimension::length(0.0) };
+                        child_style.min_size = child_style.size;
+                        child_style.max_size = child_style.size;
+                        child_style.flex_basis = Dimension::length(0.0);
+                        child_style.align_self = Some(AlignSelf::FlexStart);
                         tree.set_style(node, child_style)?;
                     }
                     if matches!(comp.style.display, WDisplay::Flex | WDisplay::InlineFlex)
@@ -16302,6 +16355,56 @@ mod tests {
             shrink_to_fit_used_width_with_available(&inline_block, 160.0),
             160.0
         );
+    }
+
+    #[test]
+    fn collapsed_separator_after_a_full_generated_word_adds_no_empty_line() {
+        let word = Component::row(
+            Style {
+                display: WDisp::InlineFlex,
+                width: WDim::Px(100.0),
+                height: WDim::Px(20.0),
+                custom_properties: Some(HashMap::from([
+                    ("--w3cos-internal-unbroken-inline-word".to_string(), "1".to_string()),
+                ])),
+                ..Style::default()
+            }, vec![],
+        );
+        for available in [100.0, 50.0] {
+            let mut word = word.clone();
+            word.style.flex_shrink = 0.0;
+            let root = Component::row(
+                Style { display: WDisp::Flex, flex_wrap: WWrap::Wrap,
+                    align_items: WAlign::Baseline,
+                    width: WDim::Px(available), ..Style::default() },
+                vec![word.clone(), Component::text(" ", Style {
+                    display: WDisp::Inline, ..Style::default()
+                }), word],
+            );
+            let layout = compute(&root, 200.0, 200.0).unwrap();
+            assert_eq!(layout.iter().find(|(_, index)| *index == 3).unwrap().0.y, 20.0, "width {available}");
+            assert_eq!(layout.iter().find(|(_, index)| *index == 0).unwrap().0.height, 40.0, "width {available}");
+        }
+    }
+
+    #[test]
+    fn nonwrapping_inline_flex_min_content_sums_its_word_fragments() {
+        let children = vec![
+            Component::text("several", Style::default()),
+            Component::text("letters", Style::default()),
+        ];
+        let expected: f32 = children.iter().map(component_min_content_width).sum();
+        let word = Component::row(
+            Style {
+                display: WDisp::InlineFlex,
+                flex_direction: WDir::Row,
+                flex_wrap: WWrap::NoWrap,
+                ..Style::default()
+            },
+            children,
+        );
+        assert_eq!(component_min_content_width(&word), expected);
+        assert_eq!(shrink_to_fit_used_width_with_available(&word, expected / 2.0), expected);
     }
 
     #[test]

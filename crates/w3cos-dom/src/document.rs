@@ -4687,6 +4687,13 @@ impl Document {
                     && (nowrap_inline_formatting_context || anonymous_inline_formatting_context)
                 {
                     if anonymous_inline_formatting_context {
+                        if matches!(style.display,
+                            w3cos_std::style::Display::Block | w3cos_std::style::Display::InlineBlock)
+                            && matches!(style.white_space,
+                                w3cos_std::style::WhiteSpace::Normal | w3cos_std::style::WhiteSpace::PreLine)
+                        {
+                            children = group_unbroken_ascii_inline_words(children, &style);
+                        }
                         let indent_spacing = match style.text_indent {
                             w3cos_std::style::Dimension::Px(value) => {
                                 w3cos_std::style::Spacing::Px(value)
@@ -7834,6 +7841,59 @@ fn split_css_tokens(value: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn group_unbroken_ascii_inline_words(
+    children: Vec<w3cos_std::Component>,
+    parent: &w3cos_std::style::Style,
+) -> Vec<w3cos_std::Component> {
+    use w3cos_std::{Component, component::ComponentKind, style::*};
+    if parent.unicode_bidi != UnicodeBidi::Normal {
+        return children;
+    }
+    let eligible = |child: &Component| {
+        matches!(&child.kind, ComponentKind::Text { content }
+            if !content.is_empty() && content.chars().all(|ch| ch.is_ascii_alphanumeric()))
+            && child.style.display == Display::Inline
+            && child.style.position == Position::Static
+            && child.style.float == Float::None
+            && child.style.word_break == WordBreak::Normal
+            && child.style.unicode_bidi == UnicodeBidi::Normal
+            && child.style.direction == parent.direction
+            && child.style.margin == Edges::ZERO
+            && child.style.padding == Edges::ZERO
+            && child.style.width == Dimension::Auto
+            && child.style.border_width == 0.0
+            && [child.style.border_top_width, child.style.border_right_width,
+                child.style.border_bottom_width, child.style.border_left_width]
+                .into_iter().all(|width| width.unwrap_or(0.0) == 0.0)
+    };
+    let mut output = Vec::with_capacity(children.len());
+    let mut word = Vec::new();
+    let flush = |word: &mut Vec<Component>, output: &mut Vec<Component>| {
+        if word.len() == 1 {
+            output.push(word.pop().unwrap());
+        } else if !word.is_empty() {
+            let mut style = Style::default();
+            inherit_text_style(&mut style, parent, "", |_| false);
+            style.display = Display::InlineFlex;
+            style.flex_direction = FlexDirection::Row;
+            style.flex_wrap = FlexWrap::NoWrap;
+            style.align_items = AlignItems::Baseline;
+            style.flex_shrink = 0.0;
+            style.white_space = WhiteSpace::NoWrap;
+            style.custom_properties.get_or_insert_with(std::collections::HashMap::new)
+                .insert("--w3cos-internal-unbroken-inline-word".to_string(), "1".to_string());
+            for child in word.iter_mut() { child.style.flex_shrink = 0.0; }
+            output.push(Component::row(style, std::mem::take(word)));
+        }
+    };
+    for child in children {
+        if eligible(&child) { word.push(child); }
+        else { flush(&mut word, &mut output); output.push(child); }
+    }
+    flush(&mut word, &mut output);
+    output
 }
 
 fn wrap_inline_runs_between_block_boxes(component: &mut w3cos_std::Component) {
@@ -11130,6 +11190,32 @@ mod image_component_tests {
             .map(|run| run.0)
             .collect::<String>();
         assert_eq!(rendered, "\"Foo\"<1>0</1>");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn style_boundaries_inside_one_ascii_word_do_not_create_line_break_items() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#container", &[("width", "120px"), ("font", "20px/1 Ahem")]);
+        crate::stylesheet::register_rule(".red", &[("color", "red")]);
+        crate::stylesheet::register_rule(".green", &[("color", "green")]);
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "container");
+        for (class, text) in [("red", "xxxx"), ("green", "x"), ("red", "xxxx")] {
+            let span = document.create_element("span");
+            span.set_attribute(&mut document, "class", class);
+            span.set_text_content(&mut document, text);
+            container.append_child(&mut document, span);
+        }
+        document.body().append_child(&mut document, container);
+        let tree = document.to_component_tree();
+        let word = &tree.children[0].children[0];
+        assert_eq!(word.style.display, Display::InlineFlex);
+        assert_eq!(word.children.len(), 3);
+        assert_ne!(word.children[0].style.color, word.children[1].style.color);
+        assert!(word.children.iter().all(|child| matches!(child.on_click,
+            w3cos_std::EventAction::NativeHost { .. })));
         crate::stylesheet::clear_rules();
     }
 

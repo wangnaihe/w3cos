@@ -1459,6 +1459,67 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   defects, not implemented by replacing them with right alignment.
   Final full 6548 proof remains unachieved.
 
+### Inline word grouping intermediate candidate (not qualified alone)
+
+- New regression `style_boundaries_inside_one_ascii_word_do_not_create_line_break_items`
+  fails on 6941e0e (`Inline` instead of a shared non-breaking word group).
+  Candidate groups undecorated same-direction ASCII alphanumeric inline text
+  in normal/pre-line block formatting contexts, retaining child styles and
+  native event identity. Structural regression passes; bidi filter passes10/10.
+- Rebuilt runner SHA256:
+  `14dd4273e434e0e5da6dbae087d521bd6840c2256d618b6a5a97d43a1173318c`.
+  Strict start5665 remains4/8: 001=6400 pixels, 002=11200, 005=6400,
+  006=11200. This intermediate candidate worsened several open failures and
+  was not submitted alone as a qualified repair. Receipt
+  `target/wpt-targeted/batch-5665-inline-word-group-v1/results.json`.
+- Dump `target/wpt-targeted/text-align-whitespace-5665-word-group-debug.bin`
+  shows the anonymous word's used width120 while its child glyph extent is280.
+  First group is at y51.2, standalone collapsed whitespace at y71.2, and second
+  group at y91.2 instead of the next20px line. Intrinsic min-content recovery
+  and line-end collapsible whitespace handling are required before qualification.
+  Existing 080 conflict and all other failures remain open; no fixture, viewport
+  or tolerance changes. Full6548 completion remains unproven.
+
+### Inline word min-content and wrap separator qualification
+
+- Root cause in `component_min_content_width`: horizontal nonwrapping flex
+  used largest-child minimum rather than the shared line's sum. It now sums
+  child min-content contributions plus horizontal gaps. Regression
+  `nonwrapping_inline_flex_min_content_sums_its_word_fragments` passes.
+- Generated anonymous word groups carry a private marker; only following
+  collapsible whitespace at a filled/overwide line boundary is removed from
+  the virtual Taffy flex line without changing the original CSS style.
+  Authored flex items and preserved pre-line segment breaks are not discarded.
+  Regression `collapsed_separator_after_a_full_generated_word_adds_no_empty_line`
+  passes for available widths100 and50 with baseline alignment (next word
+  y20, outer height40). Zero size alone failed the overwide baseline case
+  (next word y39.2); virtual display-none removes that separator's line strut.
+  Three shrink-to-fit tests also pass.
+- Grouping bypasses explicit parent bidi controls and child directional/control
+  boundaries. The structural word-group regression and bidi10/10 pass.
+- Runner SHA256
+  `d11d83202db1982ecd33639251839b55149d57c8937d4ce9190e4c6c1a1b8215`:
+  strict start5665 is6/8; 001 and005 now have zero differing pixels.
+  002=2400 and006=3600 remain FAIL (maximum channel difference255).
+  Receipt `target/wpt-targeted/batch-5665-word-min-content-hidden-separator-v1/results.json`.
+  The intermediate 4/8 / worsened-pixel receipt above is not completion evidence.
+- Related strict batches start5657,5649,5641,5625,5617,5609,5601,5593,
+  5585,5577,5569,5561,5553,5545,5369,5231,5239,5247,5255,5263
+  each pass8/8 (160/160 total, zero pixel differences). Receipts:
+  `target/wpt-targeted/batch-*-word-min-content-hidden-separator-v1/results.json`.
+  Runtime focused units pass5/5; DOM structural, bidi and anonymous filters
+  pass1/1,10/10 and28/28 respectively. This is focused qualification, not
+  the final same-clean-SHA full6548 gate.
+- Fresh Chrome153 oracle uses the original `.xht` files served as
+  `application/xhtml+xml`, Ahem loaded, viewport800x600. Source/reference
+  comparisons remain nonzero: 002=465 and006=485 pixels (maximum107);
+  080=1804 pixels (maximum255), reconfirming its existing conflict.
+  Earlier text/html-served XHTML screenshots are invalid oracle evidence,
+  superseded by `target/wpt-targeted/chrome-xhtml-*-v2.png`.
+  These Chrome receipts do not qualify the remaining native failures.
+  No pinned fixture, suite, viewport or tolerance edits. Final full proof remains
+  unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
