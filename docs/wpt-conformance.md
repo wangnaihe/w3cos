@@ -553,6 +553,23 @@ collapsed column a nonzero height, unlike Chromium. No WPT input or
 tolerance changed. Next progression: 5265; cases 4314/4947/5110 and the
 final complete 6,548-case proof remain open.
 
+### Hidden-only children do not create a line box (2026-09-13)
+
+Case 5266, `border-spacing-applies-to-016.xht`, regressed from its
+original PASS to 14,896 differing pixels: CSS-styled hidden descendants
+and folded whitespace promoted the empty red parent into a Flex line
+box. Anonymous-line promotion now requires a visible, nonempty-text
+candidate. The minimal CSS-rule reproduction is RED without the guard
+and GREEN with it. Strict `hidden-line-v1` passes 5217–5224 and
+5225–5232 (16/16); 5265–5272 is 6/8, with case 5266 at zero pixels.
+Cases 5268 (2,944 pixels) and 5271 (506 pixels) remain unchanged, so
+progression stays stopped at this batch. The `hidden_` unit selection
+is 3/5 after the guard versus 2/5 without it: the existing anonymous
+table whitespace expectation (`a bc d` versus `abcd`) and counter-test
+index-out-of-bounds failure occur identically in both runs. These are
+not reported as green. No fixture, suite or tolerance was changed;
+the fixed 6,548-case final proof and earlier corpus questions remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -4380,6 +4380,13 @@ impl Document {
                     children = vec![text_run];
                 }
                 if children.len() >= 2
+                    && children.iter().any(|component| {
+                        component.style.display != w3cos_std::style::Display::None
+                            && !matches!(
+                                &component.kind,
+                                w3cos_std::ComponentKind::Text { content } if content.is_empty()
+                            )
+                    })
                     && rendered_child_ids.iter().all(|child_id| {
                         let child = self.get_node(*child_id);
                         child.node_type == NodeType::Text
@@ -10130,6 +10137,36 @@ mod image_component_tests {
             Some("1")
         );
 
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn hidden_children_do_not_create_an_anonymous_line_box() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("background", "red")]);
+        crate::stylesheet::register_rule(
+            "div div",
+            &[
+                ("display", "none"),
+                ("border", "10px solid red"),
+                ("width", "100px"),
+                ("height", "100px"),
+                ("border-spacing", "20px"),
+            ],
+        );
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        for _ in 0..2 {
+            let whitespace = document.create_text_node("\n            ");
+            host.append_child(&mut document, whitespace);
+            let child = document.create_element("div");
+            host.append_child(&mut document, child);
+        }
+        let whitespace = document.create_text_node("\n        ");
+        host.append_child(&mut document, whitespace);
+        document.body().append_child(&mut document, host);
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].style.display, Display::Block);
         crate::stylesheet::clear_rules();
     }
 
