@@ -338,6 +338,13 @@ that suffix: 32 focused reftests, not full acceptance. No fixture, suite
 entry or tolerance changed. Cases 4314/4947 and final 6,548-case proof
 remain open; next progression starts at 5065.
 
+Subsequent eight-case batches 5065–5104 passed 40/40 using the
+`atomic-inline-origin-v1` suffix. Batch 5105–5112 passed 7/8, stopping
+progression on case 5110 (`syntax/declarations-009.xht`) at 1,067 differing
+pixels. Its fixture tests malformed at-rules inside declaration blocks;
+the next investigation is declaration error recovery. No later batch
+was started, and neither fixture nor tolerance was modified.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
