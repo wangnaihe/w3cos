@@ -7240,7 +7240,12 @@ fn collect_layouts_fast(
             new_scroll_container = effective_scroll_container;
 
             if matches!(info.style.position, WPos::Fixed) {
-                rect = compute_fixed_rect(info.style, viewport_w, viewport_h, rect);
+                let replaced = matches!(
+                    info.kind,
+                    ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+                        | ComponentKind::SvgDocument { .. }
+                ) || marked_replaced_element;
+                rect = compute_fixed_rect(info.style, viewport_w, viewport_h, rect, replaced);
                 fixed_out.push((rect, ctx));
             } else {
                 if matches!(info.style.position, WPos::Absolute) {
@@ -7268,6 +7273,11 @@ fn collect_layouts_fast(
                         viewport_w,
                         viewport_h,
                         containing_direction,
+                        matches!(
+                            info.kind,
+                            ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+                                | ComponentKind::SvgDocument { .. }
+                        ) || marked_replaced_element,
                     );
                 } else if matches!(info.style.position, WPos::Relative) {
                     rect = compute_relative_percentage_rect(
@@ -7668,6 +7678,7 @@ fn compute_absolute_rect(
     viewport_w: f32,
     viewport_h: f32,
     containing_direction: w3cos_std::style::TextDirection,
+    replaced: bool,
 ) -> LayoutRect {
     let resolve_spacing = |spacing: WSpacing| match spacing {
         WSpacing::Percent(value) => containing_block.width * value / 100.0,
@@ -7704,6 +7715,7 @@ fn compute_absolute_rect(
         viewport_h,
         fallback.width,
         fallback.height,
+        replaced,
     );
 
     let x = match (resolve_h(style.left), resolve_h(style.right)) {
@@ -7744,7 +7756,7 @@ fn compute_absolute_rect(
     };
     let y = match (resolve_v(style.top), resolve_v(style.bottom)) {
         (Some(top), Some(bottom))
-            if !matches!(style.height, WDim::Auto)
+            if replaced || !matches!(style.height, WDim::Auto)
                 || (height
                     - (containing_block.height
                         - top
@@ -7794,6 +7806,7 @@ fn compute_fixed_rect(
     viewport_w: f32,
     viewport_h: f32,
     fallback: LayoutRect,
+    replaced: bool,
 ) -> LayoutRect {
     let resolve_h = |d: WDim| {
         d.resolve(
@@ -7826,6 +7839,7 @@ fn compute_fixed_rect(
         viewport_h,
         fallback.width,
         fallback.height,
+        replaced,
     );
 
     let x = match (left, right) {
@@ -7856,6 +7870,7 @@ fn positioned_percentage_border_box_size(
     viewport_h: f32,
     fallback_width: f32,
     fallback_height: f32,
+    replaced: bool,
 ) -> (f32, f32) {
     let resolve_spacing = |spacing: WSpacing, percentage_basis: f32| match spacing {
         WSpacing::Percent(value) => percentage_basis * value / 100.0,
@@ -7880,7 +7895,7 @@ fn positioned_percentage_border_box_size(
         viewport_w,
         viewport_h,
     );
-    let width = if matches!(style.width, WDim::Auto)
+    let width = if !replaced && matches!(style.width, WDim::Auto)
         && let (Some(left), Some(right)) = (
             style.left.resolve(
                 containing_width,
@@ -7917,7 +7932,7 @@ fn positioned_percentage_border_box_size(
     } else {
         fallback_width
     };
-    let height = if matches!(style.height, WDim::Auto)
+    let height = if !replaced && matches!(style.height, WDim::Auto)
         && let (Some(top), Some(bottom)) = (
             style.top.resolve(
                 containing_height,
@@ -9912,6 +9927,7 @@ mod tests {
             800.0,
             600.0,
             style.direction,
+            false,
         );
         assert_eq!(absolute, containing_block);
 
@@ -9925,6 +9941,7 @@ mod tests {
                 width: 0.0,
                 height: 0.0,
             },
+            false,
         );
         assert_eq!((fixed.width, fixed.height), (800.0, 600.0));
 
@@ -9944,6 +9961,7 @@ mod tests {
                 width: 0.0,
                 height: 0.0,
             },
+            false,
         );
         assert_eq!((fixed.width, fixed.height), (420.0, 320.0));
 
@@ -9962,6 +9980,7 @@ mod tests {
                 width: 50.0,
                 height: 50.0,
             },
+            false,
         );
         assert_eq!((static_position.x, static_position.y), (58.0, 101.2));
     }
@@ -10028,6 +10047,7 @@ mod tests {
                 800.0,
                 600.0,
                 style.direction,
+                false,
             ),
             LayoutRect {
                 x: 26.0,
@@ -10064,7 +10084,7 @@ mod tests {
             ..Style::default()
         };
         let rect = compute_absolute_rect(
-            &start, containing_block, fallback, 800.0, 600.0, start.direction,
+            &start, containing_block, fallback, 800.0, 600.0, start.direction, false,
         );
         assert_eq!((rect.x, rect.y), (35.0, 38.0));
 
@@ -10080,7 +10100,7 @@ mod tests {
             ..Style::default()
         };
         let rect = compute_absolute_rect(
-            &end, containing_block, fallback, 800.0, 600.0, end.direction,
+            &end, containing_block, fallback, 800.0, 600.0, end.direction, false,
         );
         assert_eq!((rect.x, rect.y), (152.0, 123.0));
     }
@@ -10188,6 +10208,7 @@ mod tests {
                 800.0,
                 600.0,
                 style.direction,
+                false,
             );
             assert_eq!(rect.y, 10.0 + expected_y);
         }
@@ -10214,7 +10235,7 @@ mod tests {
             height: 288.0,
         };
         let rect = compute_absolute_rect(
-            &style, containing, containing, 800.0, 600.0, style.direction,
+            &style, containing, containing, 800.0, 600.0, style.direction, false,
         );
         assert_eq!((rect.y, rect.height), (120.0, 48.0));
     }
@@ -10255,7 +10276,7 @@ mod tests {
                 width: 100.0,
                 ..containing
             };
-            let rect = compute_absolute_rect(&style, containing, fallback, 800.0, 600.0, direction);
+            let rect = compute_absolute_rect(&style, containing, fallback, 800.0, 600.0, direction, false);
             assert_eq!(rect.x, 10.0 + expected_x);
         }
     }
@@ -10287,10 +10308,26 @@ mod tests {
                 height: 600.0,
             };
             let rect = compute_absolute_rect(
-                &style, containing, containing, 800.0, 600.0, style.direction,
+                &style, containing, containing, 800.0, 600.0, style.direction, false,
             );
             assert_eq!((rect.x, rect.width), (expected_x, expected_width));
         }
+    }
+
+    #[test]
+    fn positioned_replaced_auto_axes_keep_their_intrinsic_size_between_insets() {
+        let style = Style {
+            position: WPos::Absolute,
+            left: WDim::Px(100.0),
+            right: WDim::Px(100.0),
+            top: WDim::Px(96.0),
+            bottom: WDim::Px(96.0),
+            ..Style::default()
+        };
+        let size = positioned_percentage_border_box_size(
+            &style, 300.0, 0.0, 800.0, 600.0, 15.0, 15.0, true,
+        );
+        assert_eq!(size, (15.0, 15.0));
     }
 
     #[test]
