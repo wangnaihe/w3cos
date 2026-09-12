@@ -2157,6 +2157,19 @@ impl Document {
         normalize_css_table_internal_used_style(&mut style);
         let (_, content) = selected_content?;
         match content.as_slice() {
+            [GeneratedContentItem::Text(text)]
+                if style.display == w3cos_std::style::Display::Inline
+                    && is_only_css_whitespace(text) =>
+            {
+                // Generated content has a principal pseudo-element box; it
+                // is not an anonymous whitespace inline removed by table fixup.
+                let mut inherited = w3cos_std::style::Style::default();
+                inherit_text_style(&mut inherited, &style, "", |_| false);
+                inherited.display = w3cos_std::style::Display::Inline;
+                Some(w3cos_std::Component::boxed(style, vec![
+                    w3cos_std::Component::text(text.clone(), inherited),
+                ]))
+            }
             [GeneratedContentItem::Text(text)] => {
                 Some(w3cos_std::Component::text(text.clone(), style))
             }
@@ -9602,6 +9615,7 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
 fn remove_table_separator_boxes(
     children: Vec<w3cos_std::Component>,
     is_table_box: impl Fn(w3cos_std::style::Display) -> bool,
+    tabular_container: bool,
 ) -> Vec<w3cos_std::Component> {
     use w3cos_std::style::Display;
     let children = children.into_iter()
@@ -9624,8 +9638,9 @@ fn remove_table_separator_boxes(
         }
         Some(result)
     };
-    let preceding = table_boxes.iter().scan(false, nearest_table).collect::<Vec<_>>();
-    let mut following = table_boxes.iter().rev().scan(false, nearest_table).collect::<Vec<_>>();
+    // CSS2 17.2.1 permits absent siblings only for tabular containers.
+    let preceding = table_boxes.iter().scan(tabular_container, nearest_table).collect::<Vec<_>>();
+    let mut following = table_boxes.iter().rev().scan(tabular_container, nearest_table).collect::<Vec<_>>();
     following.reverse();
     children.into_iter().enumerate().filter_map(|(index, child)| {
         (!(whitespace(&child) && preceding[index] && following[index])).then_some(child)
@@ -9640,7 +9655,7 @@ fn fixup_css_table_children(
 
     match parent_style.display {
         Display::TableRow => {
-            let children = remove_table_separator_boxes(children, |display| display == Display::TableCell);
+            let children = remove_table_separator_boxes(children, |display| display == Display::TableCell, true);
             let mut cells = Vec::new();
             let mut anonymous_children = Vec::new();
             let mut anonymous_run_started = false;
@@ -9702,6 +9717,11 @@ fn fixup_css_table_children(
             cells
         }
         Display::Table | Display::InlineTable => {
+            let children = remove_table_separator_boxes(children, |display| matches!(display,
+                Display::TableCell | Display::TableRow | Display::TableRowGroup
+                    | Display::TableHeaderGroup | Display::TableFooterGroup
+                    | Display::TableColumn | Display::TableColumnGroup | Display::TableCaption
+            ), true);
             let containing_height = specified_table_cell_height(parent_style);
             let mut fixed = Vec::with_capacity(children.len());
             let mut cells = Vec::new();
@@ -9727,6 +9747,9 @@ fn fixup_css_table_children(
             fixed
         }
         Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
+            let children = remove_table_separator_boxes(children, |display| matches!(display,
+                Display::TableRow | Display::TableCell
+            ), true);
             let mut fixed = Vec::with_capacity(children.len());
             let mut improper = Vec::new();
             let flush_improper =
@@ -9767,7 +9790,7 @@ fn fixup_css_table_children(
                 )
             };
             let mut fixed = Vec::with_capacity(children.len());
-            let children = remove_table_separator_boxes(children, is_table_internal);
+            let children = remove_table_separator_boxes(children, is_table_internal, false);
             let mut table_run = Vec::new();
             let flush_table_run =
                 |fixed: &mut Vec<w3cos_std::Component>,
@@ -11913,6 +11936,36 @@ mod image_component_tests {
         let mut text = String::new();
         collect(&tree, &mut text);
         assert_eq!(text, "a bc d");
+    }
+
+    #[test]
+    fn anonymous_table_edge_whitespace_does_not_create_cells() {
+        let parent = w3cos_std::style::Style {
+            display: Display::TableRow,
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            ..Default::default()
+        };
+        let inline = w3cos_std::style::Style { display: Display::Inline, ..parent.clone() };
+        let cell = w3cos_std::style::Style { display: Display::TableCell, ..parent.clone() };
+        let children = fixup_css_table_children(&parent, vec![
+            w3cos_std::Component::text("\n ", inline.clone()),
+            w3cos_std::Component::text("a", cell),
+            w3cos_std::Component::text(" \n", inline),
+        ]);
+        assert_eq!(children.len(), 1);
+        for display in [Display::Table, Display::InlineTable, Display::TableRowGroup,
+            Display::TableHeaderGroup, Display::TableFooterGroup] {
+            let parent = w3cos_std::style::Style { display, ..parent.clone() };
+            let inline = w3cos_std::style::Style { display: Display::Inline, ..parent.clone() };
+            let row = w3cos_std::style::Style { display: Display::TableRow, ..parent.clone() };
+            let children = fixup_css_table_children(&parent, vec![
+                w3cos_std::Component::text("\n ", inline.clone()),
+                w3cos_std::Component::boxed(row, Vec::new()),
+                w3cos_std::Component::text(" \n", inline),
+            ]);
+            assert_eq!(children.len(), 1, "{display:?} edge whitespace");
+            assert_eq!(children[0].style.display, Display::TableRow);
+        }
     }
 
     #[test]
