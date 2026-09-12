@@ -1431,6 +1431,34 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Start 5641 is not executed after the open 080 failure. No change to pinned
   fixtures, references or tolerances; final full 6548 proof remains unachieved.
 
+### Text-align / white-space checkpoint (008 qualified; four open)
+
+- Keeping 080 as an open failure (not skip/pass), independently inspected
+  adjacent batches on 1c48a62. Starts 5641, 5649 and 5657 pass 8/8 each.
+  Receipts `target/wpt-targeted/batch-<start>-post-computed-letter-spacing-v1/results.json`.
+- Start 5665 is 3/8: failures 001=6800 pixels, 002=8400, 005=4000,
+  006=4000 and 008=2400 (all max255). Receipt
+  `target/wpt-targeted/batch-5665-post-computed-letter-spacing-v1/results.json`.
+  Start 5673 remains not run after this new batch failure.
+- 008 dump shows normal RTL spans start x228 while its justified nowrap
+  foreground starts x188. Non-wrapping justified lines need directional-start
+  fallback, rather than unconditional left. DOM regression
+  `rtl_justified_nowrap_line_keeps_its_directional_start_alignment` fails before
+  production changes. Initial row-only fix still failed because a single block
+  can lower directly as Text; both row and direct Text normalization now retain
+  directional-start alignment before bidi consumes direction, and the test passes.
+- Rebuilt runner qualifies 008 at zero differing pixels. Start 5665 now passes
+  4/8: 001=6800 pixels, 002=8400, 005 improves to2400, 006=4000 remain open.
+  Receipt `target/wpt-targeted/batch-5665-nonwrapping-justify-start-v1/results.json`.
+  Runner SHA256:
+  `ad3c90f39fc383e08282f8ac49847b1fb81d9a9f26ef0ecd5340e8862d12ffd5`.
+  Recompiled DOM bidi scope passes10/10. Related starts 5657, 5649, 5641,
+  5625, 5617, 5609, 5601 and 5593 pass8/8 each (64/64), receipts
+  `target/wpt-targeted/batch-<start>-nonwrapping-justify-start-v1/results.json`.
+- Wrapping justification and cross-span soft-wrap boundaries are separate open
+  defects, not implemented by replacing them with right alignment.
+  Final full 6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

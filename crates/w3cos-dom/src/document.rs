@@ -4986,6 +4986,14 @@ impl Document {
                         }
                     }
                     style.justify_content = match (style.text_align, style.direction) {
+                        (w3cos_std::style::TextAlign::Justify, w3cos_std::style::TextDirection::Rtl)
+                            if matches!(style.white_space,
+                                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre) =>
+                        {
+                            // Non-wrapping lines do not distribute justification
+                            // space; their fallback is directional start, not left.
+                            w3cos_std::style::JustifyContent::FlexEnd
+                        }
                         (w3cos_std::style::TextAlign::Right, _)
                         | (
                             w3cos_std::style::TextAlign::Start,
@@ -7880,6 +7888,17 @@ fn wrap_inline_runs_between_block_boxes(component: &mut w3cos_std::Component) {
 }
 
 fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
+    if matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
+        && component.style.text_align == w3cos_std::style::TextAlign::Justify
+        && matches!(component.style.white_space,
+            w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre)
+    {
+        // Resolve the non-justified line start before bidi consumes direction.
+        component.style.text_align = match component.style.direction {
+            w3cos_std::style::TextDirection::Rtl => w3cos_std::style::TextAlign::Right,
+            w3cos_std::style::TextDirection::Ltr => w3cos_std::style::TextAlign::Left,
+        };
+    }
     if matches!(&component.kind, w3cos_std::ComponentKind::Text { content }
         if content == "\u{2028}")
     {
@@ -8665,6 +8684,12 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     }
     component.children = normalized;
     component.style.justify_content = match (component.style.text_align, paragraph_direction) {
+        (w3cos_std::style::TextAlign::Justify, TextDirection::Rtl)
+            if matches!(component.style.white_space,
+                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre) =>
+        {
+            w3cos_std::style::JustifyContent::FlexEnd
+        }
         (w3cos_std::style::TextAlign::Start, TextDirection::Rtl)
         | (w3cos_std::style::TextAlign::End, TextDirection::Ltr) => {
             w3cos_std::style::JustifyContent::FlexEnd
@@ -11105,6 +11130,43 @@ mod image_component_tests {
             .map(|run| run.0)
             .collect::<String>();
         assert_eq!(rendered, "\"Foo\"<1>0</1>");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn rtl_justified_nowrap_line_keeps_its_directional_start_alignment() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#container",
+            &[("direction", "rtl"), ("width", "320px")],
+        );
+        crate::stylesheet::register_rule(
+            "#test",
+            &[
+                ("position", "absolute"),
+                ("width", "320px"),
+                ("white-space", "nowrap"),
+                ("text-align", "justify"),
+            ],
+        );
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "container");
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "test");
+        target.set_text_content(&mut document, "xxxx xxxx xxxx");
+        container.append_child(&mut document, target);
+        document.body().append_child(&mut document, container);
+        let tree = document.to_component_tree();
+        let line = &tree.children[0].children[0];
+        if matches!(line.kind, ComponentKind::Text { .. }) {
+            assert_eq!(line.style.text_align, w3cos_std::style::TextAlign::Right);
+        } else {
+            assert_eq!(
+                line.style.justify_content,
+                w3cos_std::style::JustifyContent::FlexEnd
+            );
+        }
         crate::stylesheet::clear_rules();
     }
 
