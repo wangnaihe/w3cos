@@ -5709,13 +5709,6 @@ impl Document {
                             // wraps it together with adjacent inline content
                             // in an anonymous cell.
                             image_style.display = w3cos_std::style::Display::InlineBlock;
-                            image_style
-                                .custom_properties
-                                .get_or_insert_with(Default::default)
-                                .insert(
-                                    "--w3cos-internal-replaced-table-cell".to_string(),
-                                    "1".to_string(),
-                                );
                         }
                         if matches!(image_style.width, w3cos_std::style::Dimension::Auto)
                             && let Some(width) = node
@@ -9657,42 +9650,12 @@ fn fixup_css_table_children(
                 if child.style.display == Display::None {
                     continue;
                 }
-                let starts_replaced_cell_run = child
-                    .style
-                    .custom_properties
-                    .as_ref()
-                    .and_then(|properties| properties.get("--w3cos-internal-replaced-table-cell"))
-                    .is_some_and(|value| value == "1")
-                    && anonymous_run_started
-                    && !anonymous_children.is_empty()
-                    && anonymous_children
-                        .iter()
-                        .all(collapsible_generated_whitespace);
-                if starts_replaced_cell_run {
-                    cells.push(anonymous_table_cell_from_children(parent_style, Vec::new()));
-                    pending_whitespace = None;
-                }
                 if child.style.display == Display::TableCell {
                     if anonymous_run_started {
-                        let follows_replaced_cell_run =
-                            anonymous_children.iter().any(|component| {
-                                component
-                                    .style
-                                    .custom_properties
-                                    .as_ref()
-                                    .and_then(|properties| {
-                                        properties.get("--w3cos-internal-replaced-table-cell")
-                                    })
-                                    .is_some_and(|value| value == "1")
-                            });
                         cells.push(anonymous_table_cell_from_children(
                             parent_style,
                             std::mem::take(&mut anonymous_children),
                         ));
-                        if follows_replaced_cell_run {
-                            cells
-                                .push(anonymous_table_cell_from_children(parent_style, Vec::new()));
-                        }
                         anonymous_run_started = false;
                         pending_whitespace = None;
                     }

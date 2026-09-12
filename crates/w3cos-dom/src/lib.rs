@@ -1924,6 +1924,37 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_replaced_cell_run_has_no_phantom_columns() {
+        crate::stylesheet::clear_rules();
+        let mut doc = Document::new();
+        let table = doc.create_element("table");
+        let row = doc.create_element("tr");
+        row.style_mut(&mut doc).set_property("white-space", "pre");
+        for content in [" ", "\t ", "   "] {
+            let text = doc.create_text_node(content);
+            row.append_child(&mut doc, text);
+            if content != "   " {
+                let image = doc.create_element("img");
+                image.style_mut(&mut doc).set_property("display", "table-cell");
+                row.append_child(&mut doc, image);
+            }
+        }
+        for _ in 0..2 {
+            let cell = doc.create_element("td");
+            let image = doc.create_element("img");
+            cell.append_child(&mut doc, image);
+            row.append_child(&mut doc, cell);
+        }
+        table.append_child(&mut doc, row);
+        doc.body().append_child(&mut doc, table);
+        let tree = doc.to_component_tree();
+        let row = &tree.children[0].children[0];
+        assert_eq!(row.style.display, w3cos_std::style::Display::TableRow);
+        assert_eq!(row.children.len(), 3);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn generated_row_whitespace_establishes_an_empty_anonymous_cell() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("#row::before", &[("content", "' '")]);

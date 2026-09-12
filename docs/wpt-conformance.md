@@ -1011,6 +1011,18 @@ the reference uses an explicit cell around that same content. Next scope
 is the anonymous cell inline formatting context and replaced-item spacing.
 No WPT input or tolerance changes, and final 6548-case proof remains open.
 
+### Replaced row content: remove phantom cell identity
+
+- Added `anonymous_replaced_cell_run_has_no_phantom_columns` through real DOM
+  images with authored `display: table-cell`. RED: five cells instead of three.
+- Removed both empty-cell insertions and their private custom-property marker;
+  replaced images retain inline-level used display and one consecutive run.
+- Focused DOM regression: anonymous 26/26, computed-style cache 36/36,
+  stylesheet 39/39. `git diff --check` passed.
+- This is an intermediate structural repair, not pixel closure of case 211.
+  Its previous 450-pixel receipt predates this change; row-edge anonymous
+  whitespace still needs qualification and a rebuilt strict runner receipt.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
