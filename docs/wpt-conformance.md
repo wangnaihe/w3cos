@@ -608,6 +608,18 @@ and three related table regressions pass (5/5 selected units). Strict
 800×600. Next progression is 5273; earlier corpus questions and final
 complete-suite proof remain open.
 
+### Sequential progression after caption repair (2026-09-13)
+
+On `26fb6c7`, strict `caption-strut-v2` progression passes 5273–5280,
+5281–5288 and 5289–5296 (24/24). Batch 5297–5304 is 7/8: case 5297,
+`column-visibility-004.xht`, differs by 10,000 pixels (the initial full
+report recorded FAIL at 174 pixels, so its current mismatch is worse).
+The case requires clipping spanned-cell content intersecting a collapsed
+column. The sequential
+command exits with failure here, and no 5305 batch receipt exists.
+This is the next focused repair, not a final-suite pass. Fixtures,
+revision, denominator and zero tolerance are unchanged.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
