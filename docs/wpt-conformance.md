@@ -921,6 +921,18 @@ have max difference 0 and differing pixels 0 with both allowances 0.
 No WPT inputs, font defaults, suite, viewport or tolerances changed.
 Next sequential start is 5505; final 6548-case same-SHA proof remains open.
 
+### Sequential continuation to generated-after whitespace failures (2026-09-13)
+
+On `bb3d9af`, strict `wrappable-table-grid-v1` starts 5505, 5513 and
+5521 pass 24/24. Start 5529 completes all eight with six passes and two
+failures: anonymous objects 187/188 differ by 409/524 pixels against
+`no_red_antialiasing_a_bc_d-ref.xht`. Both are also failures in the original
+report (2375/2325 pixels); they are not newly introduced tests. Sources
+place a hidden script between table-cell `b` and `c`, with a generated
+`::after` supplying `d`, and expect the visible run `a bc d`. Next scope
+is hidden-box table grouping and generated-after whitespace. No 5537
+batch or final full run starts, and no input or tolerance changes.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
