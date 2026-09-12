@@ -4636,6 +4636,15 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                 }
                 continue;
             }
+            if position > 0 && matches!(children[position - 1].0.style.display,
+                WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem | WDisplay::Table)
+            {
+                // The mixed-flow fallback already reserves this empty line.
+                // Subsequent blocks are not fragments of one inline row.
+                line_top = None;
+                line_height = 0.0;
+                continue;
+            }
             if let Some(layout) = layout_position
                 .get(index)
                 .copied()
@@ -6003,6 +6012,13 @@ fn build_taffy_tree(
                 .clone()
                 .zip(normal_flow_children.clone().skip(1))
                 .any(|(left, right)| {
+                    matches!(left.style.display, WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem | WDisplay::Table)
+                        && matches!(&right.kind, ComponentKind::Text { content } if content == "\u{2028}")
+                })
+            || normal_flow_children
+                .clone()
+                .zip(normal_flow_children.clone().skip(1))
+                .any(|(left, right)| {
                     let inline_level = |child: &Component| {
                         matches!(
                             child.style.display,
@@ -6810,6 +6826,24 @@ fn build_taffy_tree(
                         child_style.size.width = Dimension::percent(1.0);
                         child_style.min_size.width = Dimension::length(0.0);
                         child_style.flex_shrink = 1.0;
+                        tree.set_style(node, child_style)?;
+                    }
+                    if mixed_inline_block_flex_fallback
+                        && matches!(&c.kind, ComponentKind::Text { content } if content == "\u{2028}")
+                        && comp.children[..source_index].iter().rev().find(|child| {
+                            child.style.display != WDisplay::None
+                                && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                        }).is_some_and(|child| matches!(child.style.display, WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem | WDisplay::Table))
+                    {
+                        // A break following a block starts an otherwise empty
+                        // anonymous line, so retain its strut as a full row.
+                        let mut child_style = tree.style(node)?.clone();
+                        let line_height = comp.style.font_size * comp.style.line_height;
+                        child_style.flex_basis = Dimension::percent(1.0);
+                        child_style.size.width = Dimension::length(0.0);
+                        child_style.size.height = Dimension::length(line_height);
+                        child_style.min_size.height = Dimension::length(line_height);
+                        child_style.flex_shrink = 0.0;
                         tree.set_style(node, child_style)?;
                     }
                     if mixed_inline_block_flex_fallback
@@ -11852,6 +11886,27 @@ mod tests {
 
         let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(text.height, 0.0);
+    }
+
+    #[test]
+    fn standalone_break_between_blocks_reserves_a_line_before_rtl_blocks() {
+        let block = |direction| Component::row(Style {
+            display: WDisp::Block, direction, ..Style::default()
+        }, vec![Component::text("text", Style {
+            display: WDisp::Inline, direction, ..Style::default()
+        })]);
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(500.0), ..Style::default()
+        }, vec![block(w3cos_std::style::TextDirection::Ltr),
+            Component::text("\u{2028}", Style {
+                display: WDisp::Inline, width: WDim::Px(0.0), height: WDim::Px(19.2),
+                ..Style::default()
+            }), block(w3cos_std::style::TextDirection::Rtl),
+            block(w3cos_std::style::TextDirection::Rtl)]), 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert!((get(4).y - 38.4).abs() < 0.01, "{layout:?}");
+        assert!((get(6).y - 57.6).abs() < 0.01, "{layout:?}");
+        assert_eq!(get(6).x, 0.0);
     }
 
     #[test]
