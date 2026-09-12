@@ -553,6 +553,29 @@ mod tests {
     }
 
     #[test]
+    fn normal_line_height_provider_refreshes_cache_but_preserves_numeric_values() {
+        fn unavailable(_: &w3cos_std::style::Style) -> Option<f32> { None }
+        fn loaded(style: &w3cos_std::style::Style) -> Option<f32> {
+            (style.font_family.as_deref() == Some("MetricFixture")).then_some(1.0)
+        }
+        let mut doc = Document::new();
+        let span = doc.create_element("span");
+        doc.get_style_mut(span.id).set_property("font-family", "MetricFixture");
+        doc.append_child(doc.body().id, span.id);
+        doc.set_normal_line_height_provider(unavailable, 0);
+        assert_eq!(doc.computed_style_for(span.id).line_height, 1.2);
+        doc.set_normal_line_height_provider(loaded, 1);
+        assert_eq!(doc.computed_style_for(span.id).line_height, 1.0);
+        let child = doc.create_element("span");
+        doc.get_style_mut(child.id).set_property("font-family", "UnavailableFixture");
+        doc.append_child(span.id, child.id);
+        assert_eq!(doc.computed_style_for(child.id).line_height, 1.2);
+        doc.get_style_mut(span.id).set_property("line-height", "1.2");
+        doc.mark_inline_style_dirty(span.id);
+        assert_eq!(doc.computed_style_for(span.id).line_height, 1.2);
+    }
+
+    #[test]
     fn outer_text_does_not_duplicate_a_decorated_inline_trailing_space() {
         let mut doc = Document::new();
         let span = doc.create_element("span");

@@ -117,6 +117,7 @@ pub struct Document {
     style_revision_clock: u64,
     style_revisions: Vec<u64>,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    normal_line_height_provider: Option<(fn(&w3cos_std::style::Style) -> Option<f32>, u64)>,
     #[cfg(test)]
     computed_style_cache_hits: Cell<usize>,
     #[cfg(test)]
@@ -142,6 +143,22 @@ pub struct Document {
 }
 
 impl Document {
+    /// Install font metrics before component lowering. The revision represents
+    /// loaded-font changes; changing it invalidates cached fallback metrics.
+    pub fn set_normal_line_height_provider(
+        &mut self,
+        provider: fn(&w3cos_std::style::Style) -> Option<f32>,
+        revision: u64,
+    ) {
+        if self.normal_line_height_provider.is_some_and(|(previous, epoch)| {
+            epoch == revision && std::ptr::fn_addr_eq(previous, provider)
+        }) {
+            return;
+        }
+        self.normal_line_height_provider = Some((provider, revision));
+        self.computed_style_cache.borrow_mut().clear();
+    }
+
     pub fn new() -> Self {
         let mut doc = Self {
             nodes: Vec::new(),
@@ -153,6 +170,7 @@ impl Document {
             style_revision_clock: 0,
             style_revisions: Vec::new(),
             computed_style_cache: RefCell::new(HashMap::new()),
+            normal_line_height_provider: None,
             #[cfg(test)]
             computed_style_cache_hits: Cell::new(0),
             #[cfg(test)]
@@ -1936,6 +1954,17 @@ impl Document {
             // The initial border color is `currentcolor`, not transparent.
             // Resolve it only after text color inheritance has completed.
             style.border_color = style.color;
+        }
+        if style.line_height_is_normal {
+            // The inherited keyword is re-evaluated for this element's font,
+            // not the parent's already resolved metric ratio.
+            style.line_height = w3cos_std::style::Style::default().line_height;
+            if let Some(ratio) = self.normal_line_height_provider
+                .and_then(|(provider, _)| provider(&style))
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            {
+                style.line_height = ratio;
+            }
         }
         self.computed_style_cache.borrow_mut().insert(
             id,
