@@ -51,6 +51,9 @@ thread_local! {
                 .expect("embedded Skia fallback font")
         }
     };
+    static GENERIC_SERIF_TYPEFACE: Option<Typeface> = FontMgr::default()
+        .match_family_style("serif", FontStyle::normal())
+        .or_else(|| FontMgr::default().match_family_style("Times New Roman", FontStyle::normal()));
     static SKIA_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
     static SKIA_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
 }
@@ -133,6 +136,20 @@ fn registered_typeface(style: &Style) -> Option<(crate::font_face::LoadedFont, T
     loaded.parsed()?;
     let typeface = loaded.skia_typeface()?;
     Some((loaded, typeface))
+}
+
+fn generic_serif_typeface(style: &Style) -> Option<Typeface> {
+    let uses_serif = style.font_family.as_deref().is_some_and(|families| {
+        families.split(',').any(|family| {
+            family
+                .trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case("serif")
+        })
+    });
+    uses_serif
+        .then(|| GENERIC_SERIF_TYPEFACE.with(Clone::clone))
+        .flatten()
 }
 
 pub(crate) struct ReplayFrame<'a> {
@@ -1522,12 +1539,12 @@ fn effective_text_align_last(style: &Style) -> Option<TextAlign> {
     })
 }
 
-fn aligned_text_x(rect: LayoutRect, align: TextAlign, _ink_left: f32, advance_width: f32) -> f32 {
+fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_width: f32) -> f32 {
     match align {
         TextAlign::Right => rect.x + rect.width - advance_width,
         TextAlign::Center => rect.x + (rect.width - advance_width) * 0.5,
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
-            rect.x
+            rect.x - ink_left.min(0.0)
         }
     }
 }
@@ -1632,9 +1649,19 @@ fn draw_text_line(
     }
     let mut cursor_x = x;
     let font_text = text_layout::font_render_text_for_style(text, style);
+    let registered = registered_typeface(style);
+    let generic = generic_serif_typeface(style);
+    let baseline_typeface = registered
+        .as_ref()
+        .map(|(_, typeface)| typeface)
+        .or(generic.as_ref())
+        .unwrap_or(typeface);
+    let (_, metrics) = Font::new(baseline_typeface, font_size).metrics();
+    let metric_height = (metrics.descent - metrics.ascent).max(f32::EPSILON);
+    let baseline = top + font_size * (-metrics.ascent / metric_height).clamp(0.0, 1.0);
     for run in css_font_runs(font_text.as_ref(), typeface, style) {
         let font = Font::new(run.typeface, font_size);
-        canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
+        canvas.draw_str(run.text, (cursor_x, baseline), &font, &paint);
         cursor_x += font.measure_str(run.text, Some(&paint)).0;
     }
     cursor_x - x
@@ -1795,10 +1822,12 @@ fn style_uses_generic_monospace(style: &Style) -> bool {
 
 pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
     let registered = registered_typeface(style);
+    let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
         let primary = registered
             .as_ref()
             .map(|(_, typeface)| typeface)
+            .or(generic.as_ref())
             .unwrap_or(intrinsic);
         let lines = text_layout::wrap_text_with_run_width(
             text,
@@ -1828,10 +1857,12 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
 
 pub(crate) fn measure_skia_wrapped_text_height(text: &str, width: f32, style: &Style) -> f32 {
     let registered = registered_typeface(style);
+    let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
         let primary = registered
             .as_ref()
             .map(|(_, typeface)| typeface)
+            .or(generic.as_ref())
             .unwrap_or(intrinsic);
         let padding = style.padding_lengths();
         let inner_width = (width - padding.left - padding.right).max(1.0);
@@ -1855,6 +1886,8 @@ struct FallbackFontRun<'a> {
 }
 
 fn css_font_runs<'a>(text: &'a str, primary: &Typeface, style: &Style) -> Vec<FallbackFontRun<'a>> {
+    let generic = generic_serif_typeface(style);
+    let primary = generic.as_ref().unwrap_or(primary);
     let mut runs = Vec::new();
     for resolved in crate::font_face::FontRegistry::global().resolve_style_runs(style, text) {
         let run_text = &text[resolved.byte_range];
@@ -2664,6 +2697,7 @@ mod tests {
         assert_eq!(aligned_text_x(rect, TextAlign::Right, 1.0, 40.0), 70.0);
         assert_eq!(aligned_text_x(rect, TextAlign::Center, 1.0, 40.0), 40.0);
         assert_eq!(aligned_text_x(rect, TextAlign::Left, 1.0, 40.0), 10.0);
+        assert_eq!(aligned_text_x(rect, TextAlign::Left, -0.25, 40.0), 10.25);
     }
 
     #[test]
@@ -2752,6 +2786,16 @@ mod tests {
         drop(typeface);
         crate::font_face::FontRegistry::global().clear_owner(OWNER);
         assert!(registered_typeface(&style).is_none());
+    }
+
+    #[test]
+    fn generic_serif_selects_a_system_serif_typeface() {
+        let style = Style {
+            font_family: Some("serif".to_string()),
+            ..Style::default()
+        };
+        let serif = generic_serif_typeface(&style).expect("system serif typeface");
+        assert_ne!(serif.family_name(), "Inter");
     }
 
     #[test]
