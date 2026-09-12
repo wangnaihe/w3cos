@@ -4304,7 +4304,7 @@ impl Document {
                         fragmented && !has_split_inline_fragments;
                 }
                 if !first_letter_declarations.is_empty()
-                    && apply_first_letter_style(&mut children, &first_letter_declarations)
+                    && apply_first_letter_style(&mut children, &first_letter_declarations, &style)
                 {
                     if style.float != w3cos_std::style::Float::None {
                         let mut line_style = w3cos_std::style::Style::default();
@@ -7323,15 +7323,17 @@ fn first_letter_fragment_range(
 fn apply_first_letter_style(
     components: &mut Vec<w3cos_std::Component>,
     declarations: &[(String, String, u32)],
+    origin_style: &w3cos_std::style::Style,
 ) -> bool {
     let mut letter_seen = false;
-    apply_first_letter_style_inner(components, declarations, &mut letter_seen).0
+    apply_first_letter_style_inner(components, declarations, &mut letter_seen, origin_style).0
 }
 
 fn apply_first_letter_style_inner(
     components: &mut Vec<w3cos_std::Component>,
     declarations: &[(String, String, u32)],
     letter_seen: &mut bool,
+    origin_style: &w3cos_std::style::Style,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut index = 0;
@@ -7376,7 +7378,16 @@ fn apply_first_letter_style_inner(
             };
             let source = components[index].clone();
             let base_style = source.style.clone();
-            let pseudo_style = text_pseudo_style(&base_style, declarations);
+            let mut pseudo_style = text_pseudo_style(&base_style, declarations);
+            // `float` is not inherited by the anonymous text run. Explicit
+            // inheritance on ::first-letter reads its originating block,
+            // not the already-lowered inline fragment's initial float value.
+            if declarations.iter().rev()
+                .find(|(property, _, _)| css_property_eq(property, "float"))
+                .is_some_and(|(_, value, _)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                pseudo_style.float = origin_style.float;
+            }
             let mut fragments = Vec::with_capacity(3);
             let collapses_leading_whitespace = !letter_was_seen
                 && content[..range.start].chars().all(char::is_whitespace)
@@ -7419,6 +7430,7 @@ fn apply_first_letter_style_inner(
                 &mut components[index].children,
                 declarations,
                 letter_seen,
+                origin_style,
             );
             changed |= nested_changed;
             if done {
@@ -10692,6 +10704,35 @@ mod image_component_tests {
         let mut runs = Vec::new();
         collect(component, &mut runs);
         runs
+    }
+
+    #[test]
+    fn first_letter_float_inherit_uses_the_originating_block() {
+        use w3cos_std::style::Float;
+        for (value, expected) in [("left", Float::Left), ("right", Float::Right),
+            ("none", Float::None)] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("div", &[("float", value),
+                ("font-size", "50px"), ("width", "3em"),
+                ("overflow", "scroll"), ("line-height", "10px")]);
+            crate::stylesheet::register_rule("div::first-letter", &[("float", "inherit")]);
+            crate::stylesheet::register_rule("span", &[("font-size", "10px")]);
+            let mut document = Document::new();
+            let block = document.create_element("div");
+            let span = document.create_element("span");
+            let first = document.create_text_node("T");
+            block.append_child(&mut document, first);
+            let text = document.create_text_node("his is text");
+            span.append_child(&mut document, text);
+            block.append_child(&mut document, span);
+            document.body().append_child(&mut document, block);
+            let tree = document.to_component_tree();
+            let runs = descendant_text_runs(&tree);
+            assert_eq!(runs[0].0, "T");
+            assert_eq!(runs[0].1.float, expected, "origin float: {value}");
+            assert_eq!(runs[1].1.float, Float::None);
+        }
+        crate::stylesheet::clear_rules();
     }
 
     #[test]

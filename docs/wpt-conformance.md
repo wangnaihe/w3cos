@@ -157,6 +157,23 @@ passed 8/8; their receipts use the same `block-glyph-origin-v1` suffix.
 No WPT fixture, suite entry or tolerance was changed. Case 4314 remains open
 and the final complete 6,548-case evidence is still pending.
 
+At runtime commit `b8c6d1a`, six eight-case batches 4497–4544 passed 48/48.
+Receipts use `target/wpt-targeted/batch-<start>-<end>-block-glyph-origin-v1/results.json`
+with starts 4497 through 4537 advancing by eight. The following batch
+4545–4552 passed 7/8: case 4546 (`first-letter-inherit-001.xht`) differed by
+449 pixels. Its source uses `float: inherit` on ::first-letter while its
+reference uses `float: left`; Chromium 141 computed `left` on both.
+
+Explicit ::first-letter float inheritance now reads the originating block's
+computed style instead of the lowered text fragment's initial `none` value.
+The new `first_letter_float_inherit_uses_the_originating_block` regression
+first reproduced `None` versus expected `Left`, then passed for left/right/none
+origins. All five selected first-letter tests passed. Case 4546 now has zero
+pixel differences in
+`target/wpt-targeted/batch-4545-4552-first-letter-float-inherit-v1/results.json`
+(8/8). 4537–4544 and 4481–4488 also passed 8/8 using the same receipt suffix.
+These focused results do not close case 4314 or the complete 6,548-case run.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
