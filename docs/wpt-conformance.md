@@ -99,6 +99,16 @@ zero in `target/wpt-targeted/batch-4313-4320-forced-break-line-top-v1/results.js
 8/8. Forced-break unit tests passed 5/7; the two remaining failures were
 verified to produce identical results with the production change removed.
 
+A left float encountered after inline content may share the current line when
+the prior inline extent plus its margin box fits the used content width. The
+float uses the line top and preceding inline subtrees move by its outer width;
+insufficient room retains the next-line fallback. Case 4319 moved from 2,085
+differing pixels to zero in
+`target/wpt-targeted/batch-4313-4320-fitting-after-inline-float-v1/results.json`
+(7/8). Case 4314 remains unresolved. 4265–4272 and 4105–4112 passed 8/8.
+The new fitting-float unit passed; the older zero-width after-inline-float unit
+also fails with the new fitting branch disabled and is not counted as green.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

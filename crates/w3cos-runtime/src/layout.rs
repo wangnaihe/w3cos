@@ -7476,9 +7476,56 @@ fn collect_layouts_fast(
                             viewport_w,
                             viewport_h,
                         );
-                        rect.y = rect.y.max(
-                            relative_containing_block.y + line_height.max(0.0) + margin_top,
-                        );
+                        let prior_inline = out.iter().filter(|(_, index)| {
+                            let prior = &flat[*index];
+                            prior.parent == info.parent && prior.style.float == WFloat::None
+                                && !matches!(prior.style.position, WPos::Absolute | WPos::Fixed)
+                                && matches!(prior.style.display, WDisplay::Inline | WDisplay::InlineBlock
+                                    | WDisplay::InlineFlex | WDisplay::InlineTable)
+                        }).map(|(rect, index)| (*rect, *index)).collect::<Vec<_>>();
+                        let prior_right = prior_inline.iter().map(|(rect, _)| rect.x + rect.width)
+                            .fold(relative_containing_block.x, f32::max);
+                        let margin = info.style.margin_lengths();
+                        let outer_width = rect.width + margin.left + margin.right;
+                        let (line_start, available_width) = out.iter()
+                            .find(|(_, index)| Some(*index) == info.parent)
+                            .map(|(parent, _)| {
+                                let padding = parent_style.style.padding_lengths();
+                                let left = padding.left + parent_style.style.border_left_width
+                                    .unwrap_or(parent_style.style.border_width);
+                                let right = padding.right + parent_style.style.border_right_width
+                                    .unwrap_or(parent_style.style.border_width);
+                                let available = if matches!(parent_style.style.width, WDim::Auto) {
+                                    (parent.width - left - right).max(0.0)
+                                } else {
+                                    component_content_width(parent_style.style, parent.width,
+                                        viewport_w, viewport_h)
+                                };
+                                (parent.x + left, available)
+                            }).unwrap_or((relative_containing_block.x, relative_containing_block.width));
+                        if !prior_inline.is_empty()
+                            && prior_right + outer_width <= line_start + available_width + 0.01
+                        {
+                            rect.x = line_start + margin.left;
+                            rect.y = prior_inline.iter().map(|(rect, index)| {
+                                let style = flat[*index].style;
+                                let leading = if style.display == WDisplay::Inline
+                                    && matches!(flat[*index].kind, ComponentKind::Text { .. }) {
+                                    (style.font_size * style.line_height - style.font_size) * 0.5
+                                } else { 0.0 };
+                                rect.y - leading
+                            }).fold(f32::INFINITY, f32::min) + margin_top;
+                            let mut shifted = vec![false; flat.len()];
+                            for (_, index) in &prior_inline { shifted[*index] = true; }
+                            for (prior_rect, index) in out.iter_mut() {
+                                shifted[*index] |= flat[*index].parent.is_some_and(|parent| shifted[parent]);
+                                if shifted[*index] { prior_rect.x += outer_width; }
+                            }
+                        } else {
+                            rect.y = rect.y.max(
+                                relative_containing_block.y + line_height.max(0.0) + margin_top,
+                            );
+                        }
                     }
                 }
                 out.push((rect, ctx));
@@ -16649,6 +16696,25 @@ mod tests {
             flow.y >= floating.y + floating.height - 0.01,
             "an inline replaced box wider than the float-side band must wrap below the float: float={floating:?}, flow={flow:?}"
         );
+    }
+
+    #[test]
+    fn fitting_left_float_after_inline_shares_the_current_line() {
+        let text_style = Style { display: WDisp::Inline, font_size: 48.0,
+            line_height: 1.2, ..Style::default() };
+        let mut float_style = Style { display: WDisp::Block, float: WFloat::Left,
+            width: WDim::Px(85.0), height: WDim::Px(57.6), font_size: 48.0,
+            line_height: 1.2, ..Style::default() };
+        float_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-left-float-after-inline".into(), "1".into());
+        let root = Component::row(Style { display: WDisp::Flex, width: WDim::Px(400.0),
+            font_size: 48.0, line_height: 1.2, ..Style::default() }, vec![
+            Component::text("S ", text_style.clone()),
+            Component::row(float_style, vec![]), Component::text("S", text_style)]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(2).y, get(0).y);
+        assert_eq!(get(1).x, get(0).x + 85.0);
     }
 
     #[test]
