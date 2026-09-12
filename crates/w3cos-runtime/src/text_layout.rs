@@ -31,6 +31,39 @@ pub struct TextPaintLayout {
     pub ink_bounds: Vec<InkBounds>,
 }
 
+/// The logical-start edge belongs to the first inline fragment only. Restore
+/// the containing line's start for continuation lines, including the margin
+/// already consumed by the first fragment's layout position.
+pub(crate) fn inline_text_continuation_box(
+    content: crate::layout::LayoutRect,
+    style: &Style,
+) -> crate::layout::LayoutRect {
+    if style.display != Display::Inline {
+        return content;
+    }
+    let padding = style.padding_lengths();
+    let margin = style.margin_lengths();
+    match style.direction {
+        w3cos_std::style::TextDirection::Ltr => {
+            let start = padding.left + margin.left
+                + style.border_left_width.unwrap_or(style.border_width);
+            crate::layout::LayoutRect {
+                x: content.x - start,
+                width: content.width + start,
+                ..content
+            }
+        }
+        w3cos_std::style::TextDirection::Rtl => {
+            let start = padding.right + margin.right
+                + style.border_right_width.unwrap_or(style.border_width);
+            crate::layout::LayoutRect {
+                width: content.width + start,
+                ..content
+            }
+        }
+    }
+}
+
 /// Positions shaped words without changing their glyph advances. Only the
 /// collapsible inter-word spaces receive the positive justification remainder.
 pub fn justified_word_positions<'a>(
@@ -1117,6 +1150,32 @@ pub fn clear_paint_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_continuation_restores_first_fragment_margin_and_edges_only() {
+        use w3cos_std::style::{Spacing, TextDirection};
+        for direction in [TextDirection::Ltr, TextDirection::Rtl] {
+            let mut style = Style { display: Display::Inline, direction, ..Style::default() };
+            if direction == TextDirection::Ltr {
+                style.margin.left = Spacing::Px(100.0);
+                style.padding.left = Spacing::Px(6.0);
+                style.border_left_width = Some(4.0);
+            } else {
+                style.margin.right = Spacing::Px(100.0);
+                style.padding.right = Spacing::Px(6.0);
+                style.border_right_width = Some(4.0);
+            }
+            let content = crate::layout::LayoutRect {
+                x: if direction == TextDirection::Ltr { 118.0 } else { 8.0 },
+                y: 0.0, width: 674.0, height: 16.0,
+            };
+            let continuation = inline_text_continuation_box(content, &style);
+            assert_eq!((continuation.x, continuation.width), (8.0, 784.0));
+            style.display = Display::Block;
+            let block = inline_text_continuation_box(content, &style);
+            assert_eq!((block.x, block.width), (content.x, content.width));
+        }
+    }
 
     #[test]
     fn justified_words_expand_spaces_but_not_glyph_advances() {

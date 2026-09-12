@@ -1259,6 +1259,7 @@ fn draw_text_in_rect(
     dpi: Affine,
 ) {
     let content = text_paint_box(rect, style);
+    let continuation_content = crate::text_layout::inline_text_continuation_box(content, style);
     let indent = style.resolved_text_indent(content.width, content.width, content.height);
     let first_line_content = match style.direction {
         w3cos_std::style::TextDirection::Ltr => LayoutRect {
@@ -1295,7 +1296,7 @@ fn draw_text_in_rect(
     let registry = crate::font_face::FontRegistry::global();
     let layout = crate::text_layout::retained_text_paint_layout_with_first_line(
         text,
-        content.width,
+        continuation_content.width,
         first_line_content.width,
         style.font_size,
         style.white_space,
@@ -1328,7 +1329,7 @@ fn draw_text_in_rect(
         let line_content = if index == 0 {
             first_line_content
         } else {
-            content
+            continuation_content
         };
         let align = single_line_h_align(style, line_content.width, ink.width);
         let x = match align {

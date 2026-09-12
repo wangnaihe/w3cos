@@ -1807,6 +1807,35 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Next focused entry: start5773 limit4 retains the three failing wrap cases and
   their passing mismatch control, before requalifying the enclosing8-case batch.
 
+### Inline continuation margin qualification (float wrapping remains open)
+
+- Base903b59b retains three wrap failures at5773/5775/5776. Inline-margin and
+  block-margin references incorrectly paint identically; the first inline edge
+  must not contract every continuation line.
+- Shared inline continuation geometry now restores logical-start margin along
+  with padding/border, while keeping the first fragment and block boxes intact.
+  Skia, CPU and GPU use the same box for continuation width and position.
+  Text-layout26/26 tests pass, including LTR/RTL leading-edge and block controls.
+  The dynamic-js + Skia + GPU + CPU-render library check passes (existing
+  warnings remain); CPU/GPU pixels have not been accepted.
+- Runner SHA256 is
+  `2afe425891e749862fbd16165052025bda4ccca26ab5b913a0b4c1fdcef32989`.
+  `batch-5773-inline-continuation-margin-v1/results.json` passes two of four:
+  the block-margin mismatch now correctly differs by34667 pixels; the other
+  expected mismatch remains34728. Inline-margin versus float still fails34733,
+  while the primary indent versus inline-margin difference falls36267 to1600.
+  The enclosing5769 eight-case receipt improves5/8 to6/8. All pixel tolerances
+  remain zero, upstream inputs and viewport800x600 are unchanged.
+- Related starts5761/5753/5745/5737/5729/5721/5689/5681/5665/5545/5553/5593
+  each rerun eight cases under `batch-<start>-inline-continuation-margin-v1`:
+  96/96 pass, with94 exact zero-pixel matches and two expected mismatches.
+  The existing Skia continuation-edge unit also passes. This is focused
+  qualification, not a full6548-suite or browser/native journey acceptance.
+- Float-reference diagnostics still show4539.125px unwrapped long InlineText
+  below a100px by4.8px float, instead of a first-line exclusion followed by
+  normal-width lines. Multi-line inline background fragments and layout height
+  are also open. The margin correction alone is not full closure of these cases.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

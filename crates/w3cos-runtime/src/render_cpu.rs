@@ -1373,6 +1373,7 @@ fn draw_text_in_rect(
     clip_mask: Option<&Mask>,
 ) {
     let content = text_paint_box(rect, style);
+    let continuation_content = text_layout::inline_text_continuation_box(content, style);
     let indent =
         style.resolved_text_indent(content.width, pixmap.width() as f32, pixmap.height() as f32);
     let first_line_content = match style.direction {
@@ -1410,7 +1411,7 @@ fn draw_text_in_rect(
     let registry = crate::font_face::FontRegistry::global();
     let layout = text_layout::retained_text_paint_layout_with_first_line(
         text,
-        content.width,
+        continuation_content.width,
         first_line_content.width,
         style.font_size,
         style.white_space,
@@ -1455,7 +1456,7 @@ fn draw_text_in_rect(
         } else {
             ink.left
         };
-        let line_content = if i == 0 { first_line_content } else { content };
+        let line_content = if i == 0 { first_line_content } else { continuation_content };
         let align = if i + 1 == lines.len() {
             text_align_last(style)
                 .unwrap_or_else(|| single_line_h_align(style, line_content.width, ink.width))

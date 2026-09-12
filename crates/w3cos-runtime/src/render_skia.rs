@@ -2037,34 +2037,7 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 }
 
 fn text_continuation_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
-    let content = text_paint_box(rect, style);
-    if style.display != Display::Inline {
-        return content;
-    }
-    let padding = style.padding_lengths();
-    match style.direction {
-        w3cos_std::style::TextDirection::Ltr => {
-            let start = padding.left
-                + style
-                    .border_left_width
-                    .unwrap_or(style.border_width);
-            LayoutRect {
-                x: content.x - start,
-                width: content.width + start,
-                ..content
-            }
-        }
-        w3cos_std::style::TextDirection::Rtl => {
-            let start = padding.right
-                + style
-                    .border_right_width
-                    .unwrap_or(style.border_width);
-            LayoutRect {
-                width: content.width + start,
-                ..content
-            }
-        }
-    }
+    text_layout::inline_text_continuation_box(text_paint_box(rect, style), style)
 }
 
 fn draw_background_image(
