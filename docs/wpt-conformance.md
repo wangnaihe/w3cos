@@ -486,6 +486,20 @@ y=8 positions. The next repair must correct the first-row baseline with
 unequal block-edge borders, rather than treating cell-free and text-free
 tables alike. No later batch, fixture edit or tolerance change was made.
 
+5254 is now resolved with zero differing pixels. Taffy's Block layout
+does not export a baseline, so a TableCell containing inline content
+previously fell back to its full border-box height. Increasing only the
+bottom border from 10 to 20 moved the other table down 10 pixels in a
+new RED unit. TableCell now shares the existing inline-formatting-context
+path when all its normal-flow children are inline-level, preserving
+block-content cells while exporting the content baseline. That unit and
+six existing inline-table units pass, as do four related table geometry
+units (11/11). Strict receipts with suffix `table-cell-inline-baseline-v1`
+pass 5233–5240, 5241–5248 and 5249–5256 (24/24); 5254's 7,820-pixel
+difference is zero. No fixture, suite or pixel tolerance changed.
+Next progression: 5257. Cases 4314/4947/5110 and the final complete
+6,548-case proof remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

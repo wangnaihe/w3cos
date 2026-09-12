@@ -6064,8 +6064,9 @@ fn build_taffy_tree(
             || padding.bottom > 0.0
             || padding.left > 0.0
     };
-    let establishes_inline_formatting_context = matches!(comp.kind, ComponentKind::Row)
-        && comp.style.display == WDisplay::Block
+    let establishes_inline_formatting_context = ((matches!(comp.kind, ComponentKind::Row)
+        && comp.style.display == WDisplay::Block)
+        || comp.style.display == WDisplay::TableCell)
         && normal_flow_children.clone().next().is_some()
         && normal_flow_children.clone().all(|child| {
             matches!(
@@ -6138,8 +6139,9 @@ fn build_taffy_tree(
                         )
                 }));
     if establishes_inline_formatting_context {
-        // A block whose normal-flow children are all inline-level establishes
-        // line boxes. Keep the inherited line-height strut even when a shorter
+        // A block or table cell whose normal-flow children are all inline-level
+        // establishes line boxes and exports the content baseline rather than
+        // the whole border-box height. Keep the line-height strut when a shorter
         // replaced element is the only child, and let vertical-align map onto
         // the row cross axis.
         style.display = taffy::Display::Flex;
@@ -16111,6 +16113,63 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
         assert_eq!(rect(1).y, rect(4).y);
         assert_eq!(rect(5).y, rect(4).y);
+    }
+
+    #[test]
+    fn inline_table_first_row_baseline_excludes_cell_bottom_border() {
+        let table = |bottom| {
+            Component::row(
+                Style {
+                    display: WDisp::InlineTable,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        border_collapse: true,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            border_collapse: true,
+                            border_width: 10.0,
+                            border_bottom_width: Some(bottom),
+                            align_self: WAlignSelf::Center,
+                            line_height: 0.0,
+                            line_height_is_normal: false,
+                            ..Style::default()
+                        },
+                        vec![Component::boxed(
+                            Style {
+                                display: WDisp::InlineBlock,
+                                width: WDim::Px(10.0),
+                                height: WDim::Px(10.0),
+                                ..Style::default()
+                            },
+                            vec![],
+                        )],
+                    )],
+                )],
+            )
+        };
+        let root = Component::row(
+            Style {
+                display: WDisp::Flex,
+                align_items: WAlign::Baseline,
+                ..Style::default()
+            },
+            vec![table(10.0), table(20.0)],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(
+            rect(1).y,
+            rect(5).y,
+            "bottom border cannot move the first row baseline"
+        );
+        assert_eq!(rect(4).y + rect(4).height, rect(8).y + rect(8).height);
     }
 
     #[test]
