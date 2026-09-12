@@ -538,6 +538,26 @@ mod tests {
     }
 
     #[test]
+    fn absolute_table_parts_are_blockified_before_table_lowering() {
+        for display in ["table-column-group", "table-column", "table-row", "table-cell",
+            "table-row-group", "table-header-group", "table-footer-group", "table-caption"] {
+            for position in ["absolute", "fixed"] {
+            let mut doc = Document::new();
+            let element = doc.create_element("div");
+            doc.get_style_mut(element.id).set_property("display", display);
+            doc.get_style_mut(element.id).set_property("position", position);
+            doc.append_child(doc.body().id, element.id);
+            assert_eq!(doc.computed_style_for(element.id).display,
+                w3cos_std::style::Display::Block, "{display}/{position}");
+            doc.get_style_mut(element.id).set_property("position", "static");
+            doc.mark_inline_style_dirty(element.id);
+            assert_ne!(doc.computed_style_for(element.id).display,
+                w3cos_std::style::Display::Block, "static {display}");
+            }
+        }
+    }
+
+    #[test]
     fn normal_line_height_keyword_survives_font_inheritance() {
         let mut doc = Document::new();
         let body = doc.body().id;

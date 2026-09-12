@@ -45,6 +45,14 @@ ancestors. The focused 4121–4128 receipt at
 passed 8/8; case 4122 moved from 24,960 differing pixels to zero. The adjacent
 4113–4120 regression also passed 8/8. Full-suite acceptance remains pending.
 
+Absolute/fixed internal table parts are blockified before DOM table lowering,
+so track/background projections cannot overwrite their positioned geometry.
+Static table parts retain their internal role. At the pinned revision, case
+4184 moved from 10,000 differing pixels to zero in
+`target/wpt-targeted/batch-4177-4184-abs-table-part-blockify-v1/results.json`.
+The current 4177–4184, adjacent 4169–4176/4185–4192, and earlier
+4105–4112/4121–4128 regression batches each passed 8/8.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

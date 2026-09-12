@@ -1512,6 +1512,17 @@ impl Document {
             // CSS2 blockifies the principal box for absolute positioning, but
             // the computed `float` value itself becomes `none`.
             style.float = w3cos_std::style::Float::None;
+            use w3cos_std::style::Display;
+            // Out-of-flow table parts cease to be internal table boxes.
+            // Keeping their authored role lets later track/background
+            // projections overwrite the absolute box's used geometry.
+            if matches!(style.display,
+                Display::TableColumnGroup | Display::TableColumn | Display::TableRow
+                    | Display::TableCell | Display::TableRowGroup | Display::TableHeaderGroup
+                    | Display::TableFooterGroup | Display::TableCaption)
+            {
+                style.display = Display::Block;
+            }
         }
         if style.float != w3cos_std::style::Float::None {
             use w3cos_std::style::Display;
