@@ -497,6 +497,47 @@ mod tests {
     }
 
     #[test]
+    fn decorated_inline_keeps_a_trailing_space_before_outer_text() {
+        let mut doc = Document::new();
+        let span = doc.create_element("span");
+        doc.get_style_mut(span.id).set_property("border", "1px solid black");
+        let inside = doc.create_text_node("a ");
+        doc.append_child(span.id, inside.id);
+        doc.append_child(doc.body().id, span.id);
+        let outside = doc.create_text_node("b");
+        doc.append_child(doc.body().id, outside.id);
+        let tree = doc.to_component_tree();
+        fn find(component: &w3cos_std::Component) -> Option<&str> {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                if content.starts_with('a') { return Some(content); }
+            }
+            component.children.iter().find_map(find)
+        }
+        assert_eq!(find(&tree), Some("a "));
+    }
+
+    #[test]
+    fn outer_text_does_not_duplicate_a_decorated_inline_trailing_space() {
+        let mut doc = Document::new();
+        let span = doc.create_element("span");
+        doc.get_style_mut(span.id).set_property("border", "1px solid black");
+        let inside = doc.create_text_node("a ");
+        doc.append_child(span.id, inside.id);
+        doc.append_child(doc.body().id, span.id);
+        let outside = doc.create_text_node(" b");
+        doc.append_child(doc.body().id, outside.id);
+        fn text(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children { text(child, output); }
+        }
+        let mut output = String::new();
+        text(&doc.to_component_tree(), &mut output);
+        assert_eq!(output, "a b");
+    }
+
+    #[test]
     fn block_flow_drops_inter_element_whitespace_but_keeps_inline_spacing() {
         use w3cos_std::ComponentKind;
 

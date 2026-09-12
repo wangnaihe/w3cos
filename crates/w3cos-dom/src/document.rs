@@ -2824,6 +2824,90 @@ impl Document {
         None
     }
 
+    fn inline_ends_with_collapsible_space(&self, id: NodeId) -> bool {
+        let node = self.get_node(id);
+        if node.node_type == NodeType::Text {
+            let raw = node.text_content.as_deref().unwrap_or_default();
+            if !raw.chars().next_back().is_some_and(is_css_whitespace) {
+                return false;
+            }
+            if !is_only_css_whitespace(raw) { return true; }
+            let mut previous = node.prev_sibling;
+            while let Some(id) = previous {
+                let node = self.get_node(id);
+                previous = node.prev_sibling;
+                if node.node_type == NodeType::Text {
+                    if !node.text_content.as_deref().is_none_or(is_only_css_whitespace) {
+                        return true;
+                    }
+                } else if node.node_type == NodeType::Element {
+                    let style = self.computed_style_for(id);
+                    if style.display == w3cos_std::style::Display::None
+                        || style.float != w3cos_std::style::Float::None
+                        || matches!(style.position, w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                    { continue; }
+                    return matches!(style.display, w3cos_std::style::Display::Inline
+                        | w3cos_std::style::Display::InlineBlock | w3cos_std::style::Display::InlineFlex
+                        | w3cos_std::style::Display::InlineTable);
+                }
+            }
+            return false;
+        }
+        if node.node_type != NodeType::Element
+            || self.computed_style_for(id).display != w3cos_std::style::Display::Inline
+        {
+            return false;
+        }
+        let mut child = node.last_child;
+        while let Some(id) = child {
+            let node = self.get_node(id);
+            child = node.prev_sibling;
+            if node.node_type == NodeType::Element {
+                let style = self.computed_style_for(id);
+                if style.display == w3cos_std::style::Display::None
+                    || style.float != w3cos_std::style::Float::None
+                    || matches!(style.position, w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                {
+                    continue;
+                }
+            } else if node.node_type != NodeType::Text {
+                continue;
+            }
+            return self.inline_ends_with_collapsible_space(id);
+        }
+        false
+    }
+
+    fn inline_flow_continues_after(&self, mut inline_id: NodeId) -> bool {
+        use w3cos_std::style::{Display, Float, Position};
+        loop {
+            if self.computed_style_for(inline_id).display != Display::Inline {
+                return false;
+            }
+            let mut sibling = self.get_node(inline_id).next_sibling;
+            while let Some(id) = sibling {
+                let node = self.get_node(id);
+                sibling = node.next_sibling;
+                if node.node_type == NodeType::Text {
+                    if !node.text_content.as_deref().is_none_or(is_only_css_whitespace) {
+                        return true;
+                    }
+                } else if node.node_type == NodeType::Element {
+                    let style = self.computed_style_for(id);
+                    if style.display == Display::None || style.float != Float::None
+                        || matches!(style.position, Position::Absolute | Position::Fixed)
+                    {
+                        continue;
+                    }
+                    return matches!(style.display,
+                        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable);
+                }
+            }
+            let Some(parent) = self.get_node(inline_id).parent else { return false; };
+            inline_id = parent;
+        }
+    }
+
     fn render_child_ids(
         &self,
         parent_id: NodeId,
@@ -2956,7 +3040,7 @@ impl Document {
                 let inline_after = participates_in_inline_flow[index + 1..]
                     .iter()
                     .find_map(|participates| *participates)
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| self.inline_flow_continues_after(parent_id));
                 (inline_before && inline_after).then_some(child_id)
             })
             .collect()
@@ -3023,11 +3107,7 @@ impl Document {
             .rev()
             .find_map(|sibling| {
                 sibling_inline_state(*sibling).map(|inline| {
-                    let previous = self.get_node(*sibling);
-                    let already_has_space = previous.node_type == NodeType::Text
-                        && previous.text_content.as_deref().is_some_and(|text| {
-                            text.chars().next_back().is_some_and(is_css_whitespace)
-                        });
+                    let already_has_space = self.inline_ends_with_collapsible_space(*sibling);
                     inline && !already_has_space
                 })
             })
@@ -3035,7 +3115,7 @@ impl Document {
         let inline_after = child_ids[index + 1..]
             .iter()
             .find_map(|sibling| sibling_inline_state(*sibling))
-            .unwrap_or(false);
+            .unwrap_or_else(|| child.parent.is_some_and(|parent| self.inline_flow_continues_after(parent)));
         collapse_css_whitespace(raw, inline_before, inline_after)
     }
 
