@@ -194,6 +194,24 @@ revision; all now have focused passing evidence. WPT remained clean at
 `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. No test entries or allowances were
 changed. This does not close case 4314 or establish a complete green run.
 
+At runtime `4aa2924`, eleven eight-case batches 4817–4904 passed 88/88;
+the initial complete report had 86 failures and two passes in that range.
+Receipts use the `first-letter-float-inherit-v1` suffix with starts 4817
+through 4897 advancing by eight. The next batch 4905–4912 passed 7/8,
+with case 4911 (`first-line-floats-002.xht`) differing by 812 pixels.
+Source and reference geometry matched, but source glyphs were red instead
+of green: a floated descendant was incorrectly classified as an in-flow
+block, splitting its inline ancestor before ::first-line inheritance.
+
+All three source/lowered/generated block-in-inline checks now exclude
+floats. The new real Text-node regression asserts an actual left float and
+reproduced red versus expected green before the fix; it now passes. Eight
+selected first-line/float/first-letter unit tests passed, not a full unit gate.
+Case 4911 now has zero pixel differences in
+`target/wpt-targeted/batch-4905-4912-nested-inline-float-first-line-v1/results.json`
+(8/8). 4897–4904 and 4265–4272 also passed 8/8 with the same receipt suffix.
+Case 4314 and the final complete 6,548-case proof remain outstanding.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

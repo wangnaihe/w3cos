@@ -3977,7 +3977,8 @@ impl Document {
                             w3cos_std::style::Display::Block
                                 | w3cos_std::style::Display::Flex
                                 | w3cos_std::style::Display::Grid
-                        ) && !matches!(
+                        ) && child_style.float == w3cos_std::style::Float::None
+                            && !matches!(
                             child_style.position,
                             w3cos_std::style::Position::Absolute
                                 | w3cos_std::style::Position::Fixed
@@ -4034,7 +4035,8 @@ impl Document {
                             w3cos_std::style::Display::Block
                                 | w3cos_std::style::Display::Flex
                                 | w3cos_std::style::Display::Grid
-                        ) && !matches!(
+                        ) && child.style.float == w3cos_std::style::Float::None
+                            && !matches!(
                             child.style.position,
                             w3cos_std::style::Position::Absolute
                                 | w3cos_std::style::Position::Fixed
@@ -4256,7 +4258,8 @@ impl Document {
                             w3cos_std::style::Display::Block
                                 | w3cos_std::style::Display::Flex
                                 | w3cos_std::style::Display::Grid
-                        ) && !matches!(
+                        ) && child.style.float == w3cos_std::style::Float::None
+                            && !matches!(
                             child.style.position,
                             w3cos_std::style::Position::Absolute
                                 | w3cos_std::style::Position::Fixed
@@ -10864,6 +10867,29 @@ mod image_component_tests {
             runs[0].1.background,
             w3cos_std::Color::from_named("green").unwrap()
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_inherited_color_reaches_a_nested_float_text_node() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("color", "red")]);
+        crate::stylesheet::register_rule("div:first-line", &[("color", "green")]);
+        crate::stylesheet::register_rule(".floated", &[("float", "left")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let inline = document.create_element("span");
+        let floated = document.create_element("span");
+        floated.set_attribute(&mut document, "class", "floated");
+        let text = document.create_text_node("This should be green");
+        floated.append_child(&mut document, text);
+        inline.append_child(&mut document, floated);
+        block.append_child(&mut document, inline);
+        document.body().append_child(&mut document, block);
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree);
+        assert_eq!(runs[0].1.float, w3cos_std::style::Float::Left);
+        assert_eq!(runs[0].1.color, w3cos_std::Color::from_named("green").unwrap());
         crate::stylesheet::clear_rules();
     }
 
