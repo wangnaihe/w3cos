@@ -6253,8 +6253,10 @@ fn build_taffy_tree(
         let constrained_replaced_size = if let ComponentKind::Image { src } = &comp.kind
             && let Some(ratio) = image_intrinsic_ratio(src)
         {
-            if !matches!(comp.style.width, WDim::Auto)
-                || !matches!(comp.style.height, WDim::Auto)
+            // The intrinsic ratio derives an automatic axis; it must not
+            // override two authored dimensions in Taffy's block algorithm.
+            if matches!(comp.style.width, WDim::Auto)
+                != matches!(comp.style.height, WDim::Auto)
             {
                 style.aspect_ratio = Some(ratio);
             }
@@ -11766,6 +11768,22 @@ mod tests {
 
         let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(text.height, 0.0);
+    }
+
+    #[test]
+    fn block_image_explicit_axes_override_intrinsic_ratio() {
+        let src = "browser-layout-block-explicit-axes.svg";
+        crate::image_loader::decode_and_install(src,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"/>"#).unwrap();
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(288.0), height: WDim::Px(288.0),
+            ..Style::default()
+        }, vec![Component::image(src, Style {
+            display: WDisp::Block, width: WDim::Px(200.0), height: WDim::Px(50.0),
+            ..Style::default()
+        })]), 800.0, 600.0).unwrap();
+        let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!((image.width, image.height), (200.0, 50.0));
     }
 
     #[test]
