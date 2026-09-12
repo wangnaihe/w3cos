@@ -6054,6 +6054,15 @@ fn build_taffy_tree(
         style.flex_wrap = FlexWrap::Wrap;
         style.align_items = Some(AlignItems::FlexStart);
         style.align_content = Some(AlignContent::FlexStart);
+        style.justify_content = Some(match (comp.style.text_align, comp.style.direction) {
+            (w3cos_std::style::TextAlign::Right, _)
+            | (w3cos_std::style::TextAlign::Start, w3cos_std::style::TextDirection::Rtl)
+            | (w3cos_std::style::TextAlign::End, w3cos_std::style::TextDirection::Ltr) => {
+                taffy::JustifyContent::FlexEnd
+            }
+            (w3cos_std::style::TextAlign::Center, _) => taffy::JustifyContent::Center,
+            _ => taffy::JustifyContent::FlexStart,
+        });
         if matches!(comp.style.height, WDim::Auto)
             && matches!(comp.style.min_height, WDim::Auto)
             && matches!(comp.style.max_height, WDim::Auto)
@@ -11907,6 +11916,21 @@ mod tests {
         assert!((get(4).y - 38.4).abs() < 0.01, "{layout:?}");
         assert!((get(6).y - 57.6).abs() < 0.01, "{layout:?}");
         assert_eq!(get(6).x, 0.0);
+    }
+
+    #[test]
+    fn rtl_inline_line_aligns_start_with_an_absolute_sibling() {
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, direction: w3cos_std::style::TextDirection::Rtl,
+            width: WDim::Px(500.0), ..Style::default()
+        }, vec![
+            Component::text("positioned", Style {
+                display: WDisp::Inline, position: WPos::Absolute, ..Style::default()
+            }),
+            Component::text("text", Style { display: WDisp::Inline, ..Style::default() }),
+        ]), 800.0, 600.0).unwrap();
+        let text = layout.iter().find(|(_, i)| *i == 2).unwrap().0;
+        assert!((text.x + text.width - 500.0).abs() < 0.01, "{text:?}");
     }
 
     #[test]

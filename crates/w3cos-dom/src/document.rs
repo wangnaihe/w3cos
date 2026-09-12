@@ -7605,6 +7605,12 @@ fn split_css_tokens(value: &str) -> Vec<String> {
 }
 
 fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
+    if matches!(&component.kind, w3cos_std::ComponentKind::Text { content }
+        if content == "\u{2028}")
+    {
+        // A standalone BR is a layout marker, not a bidi text paragraph.
+        return;
+    }
     if let w3cos_std::ComponentKind::Text { content } = &mut component.kind
         && content.contains('\u{2028}')
         && component.style.unicode_bidi == w3cos_std::style::UnicodeBidi::Normal
@@ -7787,6 +7793,18 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     use w3cos_std::style::{
         BoxSizing, Dimension, Display, FlexWrap, Spacing, TextDirection, UnicodeBidi, WhiteSpace,
     };
+
+    // Out-of-flow principal boxes are not text units of this paragraph.
+    // Flattening their contents changes the logical static-position anchor,
+    // and can move an absolute box across a forced line break. Keep these
+    // boxes intact; recursion still shapes their own independent text runs.
+    if component.children.iter().any(|child| {
+        matches!(child.style.position,
+            w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+            || child.style.float != w3cos_std::style::Float::None
+    }) {
+        return false;
+    }
 
     let bidi_control_for =
         |style: &w3cos_std::style::Style| match (style.direction, style.unicode_bidi) {
@@ -12032,6 +12050,26 @@ mod image_component_tests {
             tree.children[0].children
         );
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn bidi_paragraph_keeps_absolute_text_before_its_line_break() {
+        use w3cos_std::style::{Display, Position, Style, TextDirection};
+        let mut component = w3cos_std::Component::row(
+            Style { display: Display::Block, direction: TextDirection::Rtl, ..Style::default() },
+            vec![
+                w3cos_std::Component::text("positioned", Style {
+                    display: Display::Inline, position: Position::Absolute,
+                    direction: TextDirection::Rtl, ..Style::default()
+                }),
+                w3cos_std::Component::text("\u{2028}", Style {
+                    display: Display::Inline, direction: TextDirection::Rtl, ..Style::default()
+                }),
+            ],
+        );
+        reorder_explicit_bidi_inline_rows(&mut component);
+        assert_eq!(component.children[0].style.position, Position::Absolute);
+        assert!(matches!(&component.children[1].kind, ComponentKind::Text { content } if content == "\u{2028}"));
     }
 }
 
