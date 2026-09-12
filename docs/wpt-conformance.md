@@ -1542,6 +1542,35 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   No fixture, revision, viewport or tolerance modifications. This is focused
   proof, not the final same-clean-SHA full6548 gate; other failures remain open.
 
+### Short inline baseline qualification
+
+- Fresh start5681 on40bb123 is7/8. `text-decoration-va-length-002.xht`
+  differs by39 pixels (maximum254). Actual/reference images show the differing
+  pixels in the preceding instruction paragraph, not a rendered underline.
+  Both images lack the expected black decoration; equality alone would not
+  prove that decoration capability is implemented.
+- Source/reference layout dumps have identical instruction-fragment boxes.
+  Short single-line paint nevertheless subtracts string-specific ink-bottom
+  overflow from glyph top. Different white inline fragments can consequently
+  erase different instruction pixels above their own line.
+- Candidate disables that ink-dependent baseline compensation for ordinary
+  inline text while preserving existing block/control compensation. Pixel unit
+  compares short-line fragments with direct font-baseline paint, using three
+  strings with different ink bounds; the new pixel unit passes1/1.
+  Skia unit filter is37 PASS /1 FAIL: the older
+  `default_ascii_text_is_pixel_invariant_across_inline_fragments` remains failed,
+  as previously documented above, and is not counted green.
+- Runner SHA256
+  `f0e5f53e716e5ecd5304722166b01c0fcf74944ceab603951e56c36b8ceec360`:
+  strict start5681 passes8/8 with zero differing pixels and zero maximum
+  channel difference. The39 instruction-pixel differences are eliminated.
+  Receipt `target/wpt-targeted/batch-5681-inline-baseline-v1/results.json`.
+  Related starts4281,4289,4297,4265,5673,5665,5657,5593 each pass8/8,
+  total64/64 with zero pixel differences. Receipts
+  `target/wpt-targeted/batch-*-inline-baseline-v1/results.json`.
+  Underline/overline painting remains a separately identified implementation gap;
+  no fixture, viewport or tolerance edits, and no full-suite completion claim.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

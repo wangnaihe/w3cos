@@ -1377,7 +1377,12 @@ fn draw_text_in_rect(
         );
         // The monospace path paints on a fixed em baseline. Fallback ink
         // bounds must not move that baseline according to the string's glyphs.
-        let ink_bottom_overflow = if line_height <= 0.0 || style_uses_generic_monospace(style) {
+        // Ordinary inline fragments likewise share the font baseline: short
+        // line-height permits ink overflow, not per-string upward relocation.
+        let ink_bottom_overflow = if line_height <= 0.0
+            || style.display == Display::Inline
+            || style_uses_generic_monospace(style)
+        {
             0.0
         } else {
             (ink.top + ink.height - line_height).max(0.0)
@@ -2354,6 +2359,40 @@ mod tests {
                 "right".to_string(),
             );
         assert_eq!(effective_text_align_last(&style), Some(TextAlign::Right));
+    }
+
+    #[test]
+    fn short_inline_line_height_keeps_the_font_baseline_independent_of_ink() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("serif".to_string()),
+            font_size: 24.0,
+            line_height: 0.4,
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            color: w3cos_std::color::Color::BLACK,
+            ..Style::default()
+        };
+        let rect = LayoutRect { x: 10.0, y: 40.0, width: 180.0, height: 9.6 };
+        for text in ["abcde", "fghij", "abcdefghijklmno"] {
+            let mut actual = Surface::new_raster_n32_premul((200, 100)).unwrap();
+            let mut expected = Surface::new_raster_n32_premul((200, 100)).unwrap();
+            actual.canvas().clear(Color::WHITE);
+            expected.canvas().clear(Color::WHITE);
+            draw_text_in_rect(actual.canvas(), rect, text, &style, &typeface, crate::layout::layout_font());
+            let ink = measure_skia_text_ink_bounds(text, 24.0, &typeface, style.font_weight, Some(&style));
+            let x = aligned_text_x(rect, TextAlign::Left,
+                alignment_ink_left(text, ink.left, 24.0, &typeface, &style),
+                measure_skia_text_advance(text, &typeface, &style));
+            draw_text_line(expected.canvas(), x, rect.y, text, 24.0, style.color,
+                style.opacity, &typeface, &style);
+            let info = ImageInfo::new((200, 100), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut actual_pixels = vec![0; 200 * 100 * 4];
+            let mut expected_pixels = actual_pixels.clone();
+            assert!(actual.read_pixels(&info, &mut actual_pixels, 800, (0, 0)));
+            assert!(expected.read_pixels(&info, &mut expected_pixels, 800, (0, 0)));
+            assert_eq!(actual_pixels, expected_pixels, "{text}");
+        }
     }
 
     #[test]
