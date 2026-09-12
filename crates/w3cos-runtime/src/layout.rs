@@ -1964,6 +1964,7 @@ impl LayoutEngine {
                 viewport_h,
                 viewport_w,
                 Some(viewport_h),
+                Some(viewport_h),
                 None,
                 false,
                 None,
@@ -2114,6 +2115,7 @@ pub fn compute_with_scroll(
         viewport_w,
         viewport_h,
         viewport_w,
+        Some(viewport_h),
         Some(viewport_h),
         None,
         false,
@@ -5285,6 +5287,7 @@ fn build_taffy_tree(
     viewport_h: f32,
     containing_width: f32,
     quirks_height_basis: Option<f32>,
+    definite_height_basis: Option<f32>,
     inherited_table_tracks: Option<&[f32]>,
     inherited_fixed_table_layout: bool,
     inherited_collapsed_single_track: Option<CollapsedSingleTrack>,
@@ -5319,6 +5322,24 @@ fn build_taffy_tree(
         style.size.height = Dimension::length(height);
     }
     let child_quirks_height_basis = own_quirks_height_basis.or(quirks_height_basis);
+    let own_definite_height_basis = match comp.style.height {
+        WDim::Px(value) => Some(value),
+        WDim::Em(value) => Some(value * comp.style.font_size),
+        WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
+        WDim::Vh(value) => Some(value * viewport_h / 100.0),
+        WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
+        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) => None,
+    };
+    if let (WDim::Percent(value), Some(basis)) =
+        (comp.style.min_height, definite_height_basis)
+    {
+        style.min_size.height = Dimension::length(basis * value / 100.0);
+    }
+    if let (WDim::Percent(value), Some(basis)) =
+        (comp.style.max_height, definite_height_basis)
+    {
+        style.max_size.height = Dimension::length(basis * value / 100.0);
+    }
     let marked_replaced_element = matches!(comp.kind, ComponentKind::SvgDocument { .. })
         || comp
             .style
@@ -6542,6 +6563,7 @@ fn build_taffy_tree(
                         viewport_h,
                         child_containing_width,
                         child_quirks_height_basis,
+                        own_definite_height_basis,
                         active_table_tracks,
                         active_fixed_table_layout,
                         active_collapsed_single_track,
@@ -10931,6 +10953,44 @@ mod tests {
             .0;
         assert_eq!((constrained.width, constrained.height), (100.0, 50.0));
         crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn nested_percentage_min_height_uses_the_viewport_basis() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                height: WDim::Percent(100.0),
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    height: WDim::Percent(100.0),
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::Flex,
+                        min_height: WDim::Percent(100.0),
+                        ..Style::default()
+                    },
+                    vec![Component::text(
+                        "viewport",
+                        Style {
+                            display: WDisp::Inline,
+                            ..Style::default()
+                        },
+                    )],
+                )],
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(0).height, 600.0);
+        assert_eq!(rect(1).height, 600.0);
+        assert_eq!(rect(2).height, 600.0);
     }
 
     #[test]
