@@ -689,6 +689,86 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             .collect::<Vec<_>>()
     }
 
+    fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
+        let mut parent = nodes[index].parent;
+        while let Some(parent_index) = parent {
+            if matches!(
+                nodes[parent_index].style.display,
+                Display::Table | Display::InlineTable
+            ) {
+                return Some(parent_index);
+            }
+            parent = nodes[parent_index].parent;
+        }
+        None
+    }
+    let parts = nodes
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, node)| {
+            node.style.border_collapse && matches!(
+                node.style.display,
+                Display::TableRow | Display::TableRowGroup
+                    | Display::TableHeaderGroup | Display::TableFooterGroup
+            )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for part in parts {
+        let part_rows = if nodes[part].style.display == Display::TableRow {
+            vec![part]
+        } else {
+            rows.iter().copied()
+                .filter(|row| {
+                    if nearest_table(nodes, *row) != nearest_table(nodes, part) {
+                        return false;
+                    }
+                    let mut parent = nodes[*row].parent;
+                    while let Some(index) = parent {
+                        if index == part {
+                            return true;
+                        }
+                        parent = nodes[index].parent;
+                    }
+                    false
+                })
+                .collect()
+        };
+        let populated_rows = part_rows.iter().copied()
+            .filter(|row| !row_cells(nodes, *row).is_empty())
+            .collect::<Vec<_>>();
+        let Some(first) = populated_rows.first().copied() else {
+            continue;
+        };
+        let last = populated_rows.last().copied().unwrap_or(first);
+        let mut boundary_cells = [
+            row_cells(nodes, first), Vec::new(), row_cells(nodes, last), Vec::new(),
+        ];
+        for row in populated_rows {
+            let cells = row_cells(nodes, row);
+            if let Some(first) = cells.first() {
+                boundary_cells[3].push(*first);
+            }
+            if let Some(last) = cells.last() {
+                boundary_cells[1].push(*last);
+            }
+        }
+        for side in 0..4 {
+            let part_edge = edge(&nodes[part].style, side);
+            for cell in &boundary_cells[side] {
+                if part_edge.0 > edge(&nodes[*cell].style, side).0 {
+                    set_edge(&mut nodes[*cell].style, side, part_edge.0, part_edge.1);
+                }
+            }
+            if !boundary_cells[side].is_empty() {
+                // Cells now own the winning edge. Keep the part's background
+                // on its grid box without painting a second border ring.
+                set_edge(&mut nodes[part].style, side, 0.0, Color::TRANSPARENT);
+            }
+        }
+    }
+
     for row in &rows {
         let cells = row_cells(nodes, *row);
         for pair in cells.windows(2) {
@@ -717,19 +797,6 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         }
     }
 
-    fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
-        let mut parent = nodes[index].parent;
-        while let Some(parent_index) = parent {
-            if matches!(
-                nodes[parent_index].style.display,
-                Display::Table | Display::InlineTable
-            ) {
-                return Some(parent_index);
-            }
-            parent = nodes[parent_index].parent;
-        }
-        None
-    }
     let tables = nodes
         .iter()
         .enumerate()
@@ -1811,6 +1878,45 @@ mod tests {
         suppress_hidden_empty_cell_paint(&mut nodes);
         assert_eq!(nodes[0].style.background, Color::TRANSPARENT);
         assert_eq!(nodes[0].style.border_width, 0.0);
+    }
+
+    #[test]
+    fn collapsed_part_edges_preserve_owner_priority_and_nested_table_boundary() {
+        let green = Color::rgb(0, 128, 0);
+        let red = Color::rgb(255, 0, 0);
+        let blue = Color::rgb(0, 0, 255);
+        let node = |display, border_width, border_color, parent| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display,
+                border_collapse: true,
+                border_width,
+                border_color,
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
+        };
+        let mut nodes = vec![
+            node(Display::Table, 0.0, green, None),
+            node(Display::TableRowGroup, 20.0, green, Some(0)),
+            node(Display::TableRow, 20.0, red, Some(1)),
+            node(Display::TableCell, 10.0, blue, Some(2)),
+            node(Display::Table, 0.0, green, Some(1)),
+            node(Display::TableRow, 0.0, green, Some(4)),
+            node(Display::TableCell, 10.0, blue, Some(5)),
+        ];
+        nodes[3].style.border_top_width = Some(20.0);
+        nodes[3].style.border_top_color = Some(blue);
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+        assert_eq!(nodes[3].style.border_top_color, Some(blue));
+        assert_eq!(nodes[3].style.border_bottom_color, Some(red));
+        assert_eq!(nodes[3].style.border_left_color, Some(red));
+        assert_eq!(nodes[3].style.border_left_width, Some(20.0));
+        assert_eq!(nodes[1].style.border_left_width, Some(0.0));
+        assert_eq!(nodes[2].style.border_bottom_width, Some(0.0));
+        assert_eq!(nodes[6].style.border_left_width, Some(10.0));
+        assert_eq!(nodes[6].style.border_left_color, Some(blue));
     }
 
     #[test]

@@ -534,6 +534,25 @@ It is NOT resolved. The next scope is row/shared-border layout and paint
 projection, without scaling the whole table or modifying WPT/tolerances.
 No later batch was run; full-suite proof remains outstanding.
 
+5259 now passes with zero differing pixels. Row/row-group borders join
+the shared cell-grid conflict set in the layout clone; their own layout
+border is cleared only after cells can carry it. Paint transfers winning
+part edges to cells (cell > row > row-group on equal widths), excluding
+nested tables, then disables the duplicate part border. Part backgrounds
+stay on grid boxes and collapsed rows no longer distort those unions.
+The new RED found the first visible row height 100 versus the expected
+shared-half track 50; it is now GREEN, including regular/cached-layout
+parity. Styled-part projection in the cached path uses normalized widths
+too. A new paint-priority/nested-table test and seven related regressions
+pass (9/9). Strict `shared-part-grid-v1` receipts pass 5233–5240,
+5241–5248, 5249–5256 and 5257–5264 (32/32). Native table dimensions are
+100×100; visible row heights are approximately 50 each. This closes the
+reftest, not general CSSOM conformance: the dump still anchors the
+zero-height collapsed row at the table top and gives the zero-width
+collapsed column a nonzero height, unlike Chromium. No WPT input or
+tolerance changed. Next progression: 5265; cases 4314/4947/5110 and the
+final complete 6,548-case proof remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

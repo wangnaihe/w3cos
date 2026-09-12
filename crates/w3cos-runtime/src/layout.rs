@@ -671,34 +671,75 @@ fn set_collapsed_layout_edge_width(style: &mut w3cos_std::style::Style, side: us
 fn resolve_collapsed_table_layout_borders(root: &mut Component) {
     fn collect_rows(component: &Component, rows: &mut Vec<Vec<[f32; 4]>>) {
         if component.style.display == WDisplay::TableRow {
-            rows.push(
-                component
+            let mut edges: Vec<[f32; 4]> = component
                     .children
                     .iter()
                     .filter(|child| child.style.display == WDisplay::TableCell)
                     .map(|cell| {
                         [
-                            collapsed_layout_edge_width(&cell.style, 0),
+                            collapsed_layout_edge_width(&cell.style, 0)
+                                .max(collapsed_layout_edge_width(&component.style, 0)),
                             collapsed_layout_edge_width(&cell.style, 1),
-                            collapsed_layout_edge_width(&cell.style, 2),
+                            collapsed_layout_edge_width(&cell.style, 2)
+                                .max(collapsed_layout_edge_width(&component.style, 2)),
                             collapsed_layout_edge_width(&cell.style, 3),
                         ]
                     })
-                    .collect(),
-            );
+                    .collect();
+            if let Some(first) = edges.first_mut() {
+                first[3] = first[3].max(collapsed_layout_edge_width(&component.style, 3));
+            }
+            if let Some(last) = edges.last_mut() {
+                last[1] = last[1].max(collapsed_layout_edge_width(&component.style, 1));
+            }
+            rows.push(edges);
             return;
         }
+        let start = rows.len();
         for child in &component.children {
             if matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable) {
                 continue;
             }
             collect_rows(child, rows);
         }
+        if matches!(
+            component.style.display,
+            WDisplay::TableRowGroup | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
+        )
+        {
+            let group_rows = &mut rows[start..];
+            if let Some(first) = group_rows.iter_mut().find(|row| !row.is_empty()) {
+                for cell in first {
+                    cell[0] = cell[0].max(collapsed_layout_edge_width(&component.style, 0));
+                }
+            }
+            if let Some(last) = group_rows.iter_mut().rev().find(|row| !row.is_empty()) {
+                for cell in last {
+                    cell[2] = cell[2].max(collapsed_layout_edge_width(&component.style, 2));
+                }
+            }
+            for row in group_rows {
+                if let Some(first) = row.first_mut() {
+                    first[3] = first[3].max(collapsed_layout_edge_width(&component.style, 3));
+                }
+                if let Some(last) = row.last_mut() {
+                    last[1] = last[1].max(collapsed_layout_edge_width(&component.style, 1));
+                }
+            }
+        }
     }
 
-    fn apply_rows(component: &mut Component, rows: &mut impl Iterator<Item = Vec<[f32; 4]>>) {
+    fn clear_part_border(component: &mut Component) {
+        component.style.border_width = 0.0;
+        for side in 0..4 {
+            set_collapsed_layout_edge_width(&mut component.style, side, 0.0);
+        }
+    }
+
+    fn apply_rows(component: &mut Component, rows: &mut impl Iterator<Item = Vec<[f32; 4]>>) -> bool {
         if component.style.display == WDisplay::TableRow {
             if let Some(edges) = rows.next() {
+                let has_cells = !edges.is_empty();
                 for (cell, widths) in component
                     .children
                     .iter_mut()
@@ -709,15 +750,28 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
                         set_collapsed_layout_edge_width(&mut cell.style, side, width);
                     }
                 }
+                if has_cells {
+                    clear_part_border(component);
+                }
+                return has_cells;
             }
-            return;
+            return false;
         }
+        let mut has_cells = false;
         for child in &mut component.children {
             if matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable) {
                 continue;
             }
-            apply_rows(child, rows);
+            has_cells |= apply_rows(child, rows);
         }
+        if has_cells && matches!(
+            component.style.display,
+            WDisplay::TableRowGroup | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
+        )
+        {
+            clear_part_border(component);
+        }
+        has_cells
     }
 
     if matches!(root.style.display, WDisplay::Table | WDisplay::InlineTable)
@@ -2092,7 +2146,28 @@ impl LayoutEngine {
         project_rtl_fixed_block_alignment(&mut results, flat, viewport_w, viewport_h);
         project_empty_painted_inline_boxes(&mut results, flat);
         project_mixed_inline_block_definite_widths(&mut results, flat, viewport_w, viewport_h);
-        project_fixed_table_cell_rects(&mut results, root, viewport_w, viewport_h);
+        let projection_root = flat
+            .iter()
+            .any(|node| {
+                node.style.border_collapse
+                    && matches!(
+                        node.style.display,
+                        WDisplay::TableRow | WDisplay::TableRowGroup
+                            | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
+                    )
+                    && (0..4).any(|side| collapsed_layout_edge_width(node.style, side) > 0.0)
+            })
+            .then(|| {
+                let mut resolved = root.clone();
+                resolve_collapsed_table_layout_borders(&mut resolved);
+                resolved
+            });
+        project_fixed_table_cell_rects(
+            &mut results,
+            projection_root.as_ref().unwrap_or(root),
+            viewport_w,
+            viewport_h,
+        );
         project_forced_break_lines(&mut results, root);
         align_inline_block_last_line_baselines(&mut results, root);
         project_collapsible_line_end_whitespace(&mut results, flat);
@@ -5123,6 +5198,7 @@ fn project_table_column_background_rects(
             .enumerate()
             .filter(|(index, node)| {
                 node.style.display == WDisplay::TableRow
+                    && node.style.visibility != WVisibility::Collapse
                     && nearest_table(*index) == Some(table)
                     && layout_rects.contains_key(index)
             })
@@ -5285,38 +5361,9 @@ fn project_table_column_background_rects(
     }
     for (rect, index) in layouts.iter_mut() {
         if let Some(projected) = projected.get(index) {
-            let mut projected = *projected;
-            let node = &flat[*index];
-            let collapsed_table = nearest_table(*index)
-                .and_then(|table| flat.get(table))
-                .is_some_and(|table| table.style.border_collapse);
-            if collapsed_table {
-                let top = collapsed_layout_edge_width(node.style, 0);
-                let right = collapsed_layout_edge_width(node.style, 1);
-                let bottom = collapsed_layout_edge_width(node.style, 2);
-                let left = collapsed_layout_edge_width(node.style, 3);
-                match node.style.display {
-                    WDisplay::TableRowGroup
-                    | WDisplay::TableHeaderGroup
-                    | WDisplay::TableFooterGroup => {
-                        projected.x -= left;
-                        projected.y -= top;
-                        projected.width += left;
-                        projected.height += top + bottom;
-                    }
-                    WDisplay::TableRow => {
-                        projected.x -= left;
-                        projected.y -= top;
-                        projected.width += right;
-                        projected.height += top + bottom;
-                    }
-                    // Column backgrounds and used boxes stay on their grid
-                    // tracks. Shared border halves are handled by painting.
-                    WDisplay::TableColumnGroup | WDisplay::TableColumn => {}
-                    _ => {}
-                }
-            }
-            *rect = projected;
+            // Table parts describe grid/background boxes. Winning borders
+            // are resolved on cells (or centered column edges) during paint.
+            *rect = *projected;
         }
     }
 }
@@ -9780,6 +9827,58 @@ mod tests {
             (rect(0).width, rect(2).width, rect(4).x),
             (180.0, 60.0, 40.0)
         );
+    }
+
+    #[test]
+    fn collapsed_row_part_border_crosses_collapsed_track_once() {
+        let row = |top, bottom, visibility| Component::row(
+            Style {
+                display: WDisp::TableRow,
+                border_collapse: true,
+                border_top_width: Some(top),
+                border_bottom_width: Some(bottom),
+                border_color: w3cos_std::Color::rgb(0, 128, 0),
+                visibility,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    border_collapse: true,
+                    visibility,
+                    ..Style::default()
+                },
+                vec![],
+            )],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                min_width: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::TableRowGroup,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![
+                    row(0.0, 100.0, WVisibility::Visible),
+                    row(0.0, 0.0, WVisibility::Collapse),
+                    row(100.0, 0.0, WVisibility::Visible),
+                ],
+            )],
+        );
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(0).height, 100.0, "one shared 100px grid border");
+        assert_eq!((rect(2).y, rect(2).height), (0.0, 50.0));
+        assert_eq!((rect(6).y, rect(6).height), (50.0, 50.0));
+        let flat = pre_flatten(&table);
+        let cached = LayoutEngine::new().compute(&table, &flat, 800.0, 600.0).unwrap();
+        assert_eq!(layout, cached.layout_cache);
     }
 
     #[test]
