@@ -1061,9 +1061,6 @@ impl Document {
             target.push((property.clone(), value.to_string(), u32::MAX));
         }
         author_declarations.extend(important);
-        user_normal.extend(author_declarations);
-        user_normal.extend(user_important);
-        let author_declarations = user_normal;
         let mut merged =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
         // The legacy HTML `text` presentational hint participates before
@@ -1081,7 +1078,18 @@ impl Document {
             None
         };
         if let Some(value) = body_text_hint {
-            merged.set_property("color", value);
+            user_normal.push(("color".to_string(), value.to_string(), 0));
+        }
+        let font_color_hint = (node.node_type == NodeType::Element
+            && node.tag.as_str().eq_ignore_ascii_case("font")
+            && node.is_html_element)
+            .then(|| node.attributes.iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("color"))
+                .map(|(_, value)| value.as_str()))
+            .flatten()
+            .filter(|value| w3cos_std::Color::from_css(value).is_some());
+        if let Some(value) = font_color_hint {
+            user_normal.push(("color".to_string(), value.to_string(), 0));
         }
         let body_background_hint = if node.node_type == NodeType::Element
             && node.tag.as_str().eq_ignore_ascii_case("body")
@@ -1094,7 +1102,7 @@ impl Document {
             None
         };
         if let Some(value) = body_background_hint {
-            merged.set_property("background-color", value);
+            user_normal.push(("background-color".to_string(), value.to_string(), 0));
         }
         let direction_hint = (node.node_type == NodeType::Element)
             .then(|| {
@@ -1106,8 +1114,13 @@ impl Document {
             .flatten()
             .filter(|value| matches!(value.as_str(), "ltr" | "rtl"));
         if let Some(value) = &direction_hint {
-            merged.set_property("direction", value);
+            user_normal.push(("direction".to_string(), value.to_string(), 0));
         }
+        // Presentational hints are author-origin declarations before author
+        // stylesheets, not UA defaults that normal user rules can override.
+        user_normal.extend(author_declarations);
+        user_normal.extend(user_important);
+        let author_declarations = user_normal;
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
@@ -1151,9 +1164,7 @@ impl Document {
                     })
                     .map(|(_, value, _)| value.as_str())
                     .last();
-                (css_property_eq(property, "color") && body_text_hint.is_some())
-                    || (css_property_eq(property, "direction") && direction_hint.is_some())
-                    || winning_author_value.is_some_and(|value| {
+                winning_author_value.is_some_and(|value| {
                         !matches!(
                             value.trim().to_ascii_lowercase().as_str(),
                             "inherit" | "unset"
@@ -12482,6 +12493,32 @@ mod computed_style_cache_tests {
         let mut document = Document::new();
         let target = document.create_element("span");
         target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+        assert_eq!(document.computed_style_for(target.id).color, w3cos_std::Color::rgb(0, 128, 0));
+    }
+
+    #[test]
+    fn user_origin_respects_body_presentational_hint_boundary() {
+        for important in [false, true] {
+            stylesheet::clear_rules();
+            stylesheet::register_user_rule("#target", &[("color", if important { "red !important" } else { "red" })]);
+            let mut document = Document::new();
+            let body = document.body();
+            body.set_attribute(&mut document, "id", "target");
+            body.set_attribute(&mut document, "text", "green");
+            let expected = if important { w3cos_std::Color::rgb(255, 0, 0) } else { w3cos_std::Color::rgb(0, 128, 0) };
+            assert_eq!(document.computed_style_for(body.id).color, expected);
+        }
+    }
+
+    #[test]
+    fn user_origin_normal_loses_to_font_color_hint() {
+        stylesheet::clear_rules();
+        stylesheet::register_user_rule("#target", &[("color", "red")]);
+        let mut document = Document::new();
+        let target = document.create_element("font");
+        target.set_attribute(&mut document, "id", "target");
+        target.set_attribute(&mut document, "color", "green");
         document.body().append_child(&mut document, target);
         assert_eq!(document.computed_style_for(target.id).color, w3cos_std::Color::rgb(0, 128, 0));
     }

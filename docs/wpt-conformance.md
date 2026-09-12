@@ -781,6 +781,23 @@ are the next focused changes before testing 1132 with its prescribed
 profile. No WPT input, suite entry or tolerance changed; sequential
 progression and final 6548-case proof remain open.
 
+### Presentational hint origin boundary (2026-09-13)
+
+Normal user rules now precede HTML body text/background and direction
+hints; author declarations follow those hints and important user rules
+remain last. HTML font color hints join the same ordered declaration
+stream rather than being treated as UA defaults. The inheritance winner
+lookup uses that stream too. This does not implement every legacy font
+attribute or legacy HTML color parsing rule.
+
+Body and font color precedence tests first failed, then passed; the body
+test also checks that important user color still wins. Cache/inheritance
+tests pass 36/36 and stylesheet tests 39/39 (75 distinct passes).
+The runner builds in 1m50s; strict `presentational-origin-v1` receipts
+for starts 5401, 5393, 1122, 5257 and 5369 pass 40/40.
+The prescribed user stylesheet runner profile for 1132 is still open;
+these unit results are not its pixel acceptance or final-suite proof.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
