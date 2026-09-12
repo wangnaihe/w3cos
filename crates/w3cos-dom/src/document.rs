@@ -3131,6 +3131,11 @@ impl Document {
                     {
                         return None;
                     }
+                    // A BR terminates the inline line. Collapsible spaces on
+                    // either side belong to line edges, not between words.
+                    if sibling.tag.as_str().eq_ignore_ascii_case("br") {
+                        return Some(false);
+                    }
                     Some(
                         matches!(
                             display,

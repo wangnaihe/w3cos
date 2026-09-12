@@ -1044,6 +1044,29 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
 - Evidence was generated from the local repair atop `f8ede08`; this is focused
   closure, not a final clean-SHA 6548-case run. Next sequential start is 5553.
 
+### Sequential 5553 and forced-break whitespace: case 212 closure
+
+- On `8d7c873`, strict batch 5553 completed 8 cases: 6 passed, 2 failed.
+  Receipt: `target/wpt-targeted/batch-5553-tabular-edge-whitespace-v1/results.json`.
+  Case 212 differed by 347 pixels; `table-backgrounds-bc-cell-001.xht`
+  (index 5557) differed by 2166. Later starts 5561 through 5585 were not run.
+- Headless source/reference dumps for 212 show the reference coalescing
+  `above` + BR + indentation into `above\u{2028} below`. The extra space
+  indents its second line by 4px; the source block-table flow is correct.
+- Strengthened the existing forced-break DOM test with whitespace on both
+  sides of BR (RED), then treated an in-flow BR as a line edge in collapsed
+  text sibling analysis (GREEN). Preformatted modes retain their early return.
+  Normative basis: [CSS2 whitespace processing](https://www.w3.org/TR/CSS2/text.html#white-space-model).
+- Anonymous DOM 27/27, cache 36/36, stylesheet 39/39 and diff check passed.
+  Runner rebuilt in 1m50s. Case 5553 strictly passed, followed by 64/64 at
+  starts `5545,5537,5529,5497,5433,5401,5369,1130`. Receipts use suffix
+  `br-edge-whitespace-v1`, with the single case under `case-5553-...`.
+  Runner SHA256 `66fb2576c5a57edf5a225d2f6c8223db8a5f754b958123c6b323ea8d0caacba2`.
+- Evidence used the local repair atop `8d7c873`; no final full-suite claim.
+  Next failure is index 5557: inspect shared inline border allocation versus
+  `box_background_paint_rect` insets before changing collapsed-cell painting.
+  Fixed WPT inputs, original suite, viewport and zero tolerances unchanged.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

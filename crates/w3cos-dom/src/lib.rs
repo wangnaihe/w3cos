@@ -2317,9 +2317,9 @@ mod tests {
         crate::stylesheet::clear_rules();
         let mut doc = Document::new();
         let line = doc.create_element("div");
-        let first = doc.create_text_node("first");
+        let first = doc.create_text_node("first \n ");
         let break_element = doc.create_element("br");
-        let second = doc.create_text_node("second");
+        let second = doc.create_text_node(" \n second");
         line.append_child(&mut doc, first);
         line.append_child(&mut doc, break_element);
         line.append_child(&mut doc, second);
