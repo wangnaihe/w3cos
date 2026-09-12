@@ -400,6 +400,12 @@ retaining 5110 at 1,067 pixels (strict runner exit 1, not counted as passed).
 Cases 4314, 4947 and 5110 remain visible in the unchanged 6,548-case suite;
 no fixture or tolerance was changed. Next progression starts at 5193.
 
+Using the corrected parser, batches 5193–5200 and 5201–5208 passed 8/8.
+Batch 5209–5216 passed 7/8, stopping on 5209
+(`syntax/unterminated-string-001.xht`) at 610 differing pixels. Receipts use
+the `balanced-at-rule-recovery-v1` suffix. The next focused investigation
+is unterminated string/newline recovery; no later batch was started.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
