@@ -4962,6 +4962,10 @@ impl Document {
                         }
                     } else {
                         let authored_block = style.display == w3cos_std::style::Display::Block;
+                        if authored_block && anonymous_inline_formatting_context {
+                            style.custom_properties.get_or_insert_with(Default::default)
+                                .insert("--w3cos-internal-inline-formatting-context".to_string(), "1".to_string());
+                        }
                         // Flex is an internal model for the inline children,
                         // not a replacement for the authored outer display.
                         // In particular, inline decoration is not an atomic

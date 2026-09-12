@@ -6286,6 +6286,52 @@ fn build_taffy_tree(
             );
         }
     }
+    if comp.style.custom_properties.as_ref().is_some_and(|properties|
+        properties.contains_key("--w3cos-internal-inline-formatting-context"))
+        && matches!(comp.style.height, WDim::Auto)
+        && matches!(comp.style.max_height, WDim::Auto)
+    {
+        let descent = comp.style.font_size * comp.style.line_height * 0.2;
+        let minimum = comp.children.iter().filter(|child| {
+            child.style.display == WDisplay::InlineBlock
+                && child.style.float == WFloat::None
+                && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && matches!(child.style.align_self, WAlignSelf::Auto | WAlignSelf::Baseline)
+                && child.children.iter().all(|descendant|
+                    descendant.style.display == WDisplay::None
+                        || matches!(descendant.style.position, WPos::Absolute | WPos::Fixed)
+                        || descendant.style.float != WFloat::None)
+        }).filter_map(|child| {
+            if matches!(child.style.height, WDim::Percent(_)) && definite_height_basis.is_none() {
+                return None;
+            }
+            let height = child.style.height.resolve(definite_height_basis.unwrap_or(0.0),
+                ROOT_FONT_SIZE, child.style.font_size, viewport_w, viewport_h).unwrap_or(0.0);
+            let padding = child.style.padding_lengths();
+            let edges = padding.top + padding.bottom
+                + child.style.border_top_width.unwrap_or(child.style.border_width)
+                + child.style.border_bottom_width.unwrap_or(child.style.border_width);
+            let border_height = if child.style.box_sizing == WBoxSizing::BorderBox {
+                height.max(edges)
+            } else { height + edges };
+            let margin = child.style.margin_lengths();
+            Some(border_height + margin.top + margin.bottom + descent)
+        }).fold(0.0_f32, f32::max);
+        if minimum > 0.0 {
+            // DOM-lowered line rows still have a font strut. A child with no
+            // internal line boxes exports its bottom margin edge as baseline.
+            let edges = if style.box_sizing == BoxSizing::BorderBox {
+                let resolve = |edge: LengthPercentage| edge.resolve_or_zero(Some(containing_width), |_, _| unreachable!());
+                resolve(style.padding.top) + resolve(style.padding.bottom)
+                    + resolve(style.border.top) + resolve(style.border.bottom)
+            } else { 0.0 };
+            style.min_size.height = Dimension::length(
+                (minimum.max(comp.style.font_size * comp.style.line_height) + edges)
+                    .max(comp.style.min_height.resolve(definite_height_basis.unwrap_or(0.0),
+                        ROOT_FONT_SIZE, comp.style.font_size, viewport_w, viewport_h).unwrap_or(0.0)),
+            );
+        }
+    }
     if mixed_inline_block_flex_fallback {
         // Inline runs on either side of an in-flow block generate anonymous
         // block boxes. Wrapped flex lines model those runs without inserting
@@ -14923,6 +14969,26 @@ mod tests {
             layout[0].0.height
         );
         assert_eq!(layout[1].0.height, 100.0);
+    }
+
+    #[test]
+    fn lowered_inline_row_reserves_empty_inline_block_descent_but_authored_flex_does_not() {
+        let mut root = Component::row(Style {
+            display: WDisp::Flex, align_items: WAlign::Baseline,
+            width: WDim::Px(200.0), font_size: 50.0, line_height: 1.0,
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::InlineBlock, width: WDim::Px(50.0), height: WDim::Px(50.0),
+            ..Style::default()
+        }, vec![])]);
+        assert_eq!(compute(&root, 800.0, 600.0).unwrap()[0].0.height, 50.0);
+        root.style.custom_properties = Some(HashMap::from([(
+            "--w3cos-internal-inline-formatting-context".to_string(), "1".to_string(),
+        )]));
+        root.style.min_height = WDim::Px(50.0);
+        assert_eq!(compute(&root, 800.0, 600.0).unwrap()[0].0.height, 60.0);
+        root.children[0].style.height = WDim::Px(10.0);
+        assert_eq!(compute(&root, 800.0, 600.0).unwrap()[0].0.height, 50.0);
     }
 
     #[test]

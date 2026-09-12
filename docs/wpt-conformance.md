@@ -1623,6 +1623,40 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `target/wpt-targeted/indent-5692-*-pre-box-candidate.bin`; this is the next
   independent repair point, not a qualified fix yet.
 
+### Lowered inline row descent qualification
+
+- Indent012 still differs2440 pixels on9b86b71. Source outer height54 versus
+  reference64 omits the font strut's10px below the empty50px inline-block's
+  bottom-margin baseline; widths and child positions already agree.
+- DOM now tags authored block containers lowered into anonymous inline rows,
+  so layout can reserve the strut without changing ordinary authored Flex.
+  Candidate adds auto-height minimums for bottom-baseline empty inline-blocks,
+  including child border/padding/margin contributions and parent box edges,
+  never below the complete containing font strut. Percentage height without
+  a definite basis and nonempty internal line-box baselines are not guessed.
+- New focused unit contrasts an authored Flex (height50) with a tagged
+  inline row (height60), including its existing strut min-height50; a short
+  atomic box still retains the containing50px font strut. Latest source unit
+  passes1/1, related runtime units5/5. Fresh DOM indent4/4, anonymous29/29,
+  bidi10/10 pass. Original fixtures and zero tolerances remain unchanged.
+- First runner qualification remains7/8: indent012 still2440 pixels and
+  height54. The actual DOM already supplies an initial font-strut min-height50,
+  so the candidate's min-height-auto guard incorrectly excluded that row.
+  Candidate now composes the baseline requirement with the existing minimum;
+  the unit includes that DOM-like min-height and the short-box font-strut case.
+  Receipt `target/wpt-targeted/batch-5689-inline-block-strut-v1/results.json`.
+  This failed intermediate is not a qualified repair.
+- Runner SHA256
+  `f47066b3603532d79b8c071aff628401480538d34998d2943ee1098f0f663f27`:
+  strict start5689 passes8/8 with zero differing pixels and zero maximum
+  channel difference. Indent012 moves2440 pixels to0;013/014 remain0.
+  Receipt `target/wpt-targeted/batch-5689-inline-block-strut-v2/results.json`.
+  Related starts5681,5673,5665,5593,4265,4281,4289,4297,5369,5545,5553,
+  5561 each pass8/8, total96/96 with zero pixel differences. Receipts
+  `target/wpt-targeted/batch-*-inline-block-strut-v2/results.json`.
+  This is focused qualification, not final full6548 proof; full-suite completion
+  remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
