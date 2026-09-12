@@ -31,6 +31,50 @@ pub struct TextPaintLayout {
     pub ink_bounds: Vec<InkBounds>,
 }
 
+/// Positions shaped words without changing their glyph advances. Only the
+/// collapsible inter-word spaces receive the positive justification remainder.
+pub fn justified_word_positions<'a>(
+    line: &'a str,
+    available: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> Option<Vec<(&'a str, f32)>> {
+    let words: Vec<_> = line.split(' ').filter(|word| !word.is_empty()).collect();
+    if words.len() < 2 || line.starts_with(' ') || line.ends_with(' ') {
+        return None;
+    }
+    let advance = measure(line);
+    if !available.is_finite() || available <= advance {
+        return None;
+    }
+    let extra = (available - advance) / (words.len() - 1) as f32;
+    let mut offset = 0.0;
+    let mut output = Vec::with_capacity(words.len());
+    for word in words {
+        output.push((word, offset));
+        offset += measure(word) + measure(" ") + extra;
+    }
+    Some(output)
+}
+
+/// Recover preserved paragraph boundaries from the normalized source rather
+/// than treating every non-final painted line as an automatic wrap.
+pub fn paragraph_terminal_lines(text: &str, white_space: WhiteSpace, lines: &[String]) -> Vec<bool> {
+    let normalized = prepare_text_for_white_space(text, white_space);
+    let mut remaining = normalized.as_str();
+    lines.iter().enumerate().map(|(index, line)| {
+        remaining = remaining.trim_start_matches(' ');
+        if let Some(rest) = remaining.strip_prefix(line.as_str()) {
+            remaining = rest.trim_start_matches(' ');
+        }
+        let terminal = remaining.starts_with(['\n', FORCED_LINE_BREAK])
+            || index + 1 == lines.len();
+        if remaining.starts_with(['\n', FORCED_LINE_BREAK]) {
+            remaining = &remaining[remaining.chars().next().unwrap().len_utf8()..];
+        }
+        terminal
+    }).collect()
+}
+
 pub struct TextPrepaintRequest {
     pub text: String,
     pub width: f32,
@@ -1073,6 +1117,22 @@ pub fn clear_paint_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn justified_words_expand_spaces_but_not_glyph_advances() {
+        let positions = justified_word_positions("abc def", 180.0, |text| text.len() as f32 * 20.0).unwrap();
+        assert_eq!(positions, vec![("abc", 0.0), ("def", 120.0)]);
+        assert!(justified_word_positions("abcdef", 180.0, |_| 120.0).is_none());
+        assert!(justified_word_positions("abc def", 100.0, |_| 140.0).is_none());
+    }
+
+    #[test]
+    fn justified_paragraph_endings_distinguish_forced_and_automatic_breaks() {
+        let text = "abc def ghi\njkl mno pqr";
+        let lines = wrap_text_with_run_width(text, 7.0, WhiteSpace::PreLine, |text| text.len() as f32);
+        assert_eq!(lines, vec!["abc def", "ghi", "jkl mno", "pqr"]);
+        assert_eq!(paragraph_terminal_lines(text, WhiteSpace::PreLine, &lines), vec![false, true, false, true]);
+    }
 
     #[test]
     fn retained_paint_layout_reuses_shaping_for_same_interest_item() {

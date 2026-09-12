@@ -1520,6 +1520,28 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   No pinned fixture, suite, viewport or tolerance edits. Final full proof remains
   unachieved.
 
+### Justified paragraph paint qualification
+
+- Native start5665 still has002=2400 and006=3600 differing pixels after
+  c79dd63. Skia's `aligned_text_x` treats justify as left alignment; multiline
+  paint did not distribute the positive remainder to inter-word spaces.
+- Candidate adds shared shaped-word positions and normalized-source paragraph
+  terminal recovery; Skia uses expansion only on automatic normal/pre-line
+  wraps. Preserved breaks and RTL paragraph terminals use end-of-paragraph
+  alignment rather than justification. Glyph advances are not stretched.
+- New word-position and forced-versus-automatic terminal tests pass2/2;
+  the complete text-layout unit filter passes25/25.
+- Runner SHA256
+  `3536621e4c4a2c99bd97b1dd6c6a2c0d12a2992967310575da93687543a8a974`:
+  strict start5665 now passes8/8, every comparison zero differing pixels and
+  zero maximum channel difference. Both002 and006 are repaired.
+  Receipt `target/wpt-targeted/batch-5665-justified-paragraph-v1/results.json`.
+  Related starts5641,5649,5657,5593,5601,5609,5617,5625 each pass8/8:
+  64/64 comparisons with zero pixel differences, receipts
+  `target/wpt-targeted/batch-*-justified-paragraph-v1/results.json`.
+  No fixture, revision, viewport or tolerance modifications. This is focused
+  proof, not the final same-clean-SHA full6548 gate; other failures remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

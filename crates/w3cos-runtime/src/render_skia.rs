@@ -1405,6 +1405,7 @@ fn draw_text_in_rect(
     let line_height = style.font_size * style.line_height;
     let text_height = layout.lines.len() as f32 * line_height;
     let top = content.y + text_vertical_offset(style, content.height, text_height);
+    let paragraph_ends = text_layout::paragraph_terminal_lines(text, style.white_space, &layout.lines);
     for (index, line) in layout.lines.iter().enumerate() {
         let ink = measure_skia_text_ink_bounds(
             line,
@@ -1421,13 +1422,31 @@ fn draw_text_in_rect(
         } else {
             continuation_content
         };
+        let align = effective_text_align(style);
+        if align == TextAlign::Justify && !paragraph_ends[index]
+            && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal | w3cos_std::style::WhiteSpace::PreLine)
+        {
+            if let Some(words) = text_layout::justified_word_positions(line, line_content.width,
+                |word| measure_skia_text_advance(word, typeface, style))
+            {
+                for (word, offset) in words {
+                    draw_text_line(canvas, line_content.x + offset,
+                        top + index as f32 * line_height + line_box_half_leading(style),
+                        word, style.font_size, style.color, style.opacity, typeface, style);
+                }
+                continue;
+            }
+        }
+        let line_align = if paragraph_ends[index] {
+            effective_text_align_last(style).unwrap_or_else(|| {
+                if align == TextAlign::Justify && style.direction == w3cos_std::style::TextDirection::Rtl {
+                    TextAlign::Right
+                } else { align }
+            })
+        } else { align };
         let x = aligned_text_x(
             line_content,
-            if index + 1 == layout.lines.len() {
-                effective_text_align_last(style).unwrap_or_else(|| effective_text_align(style))
-            } else {
-                effective_text_align(style)
-            },
+            line_align,
             alignment_ink_left,
             advance,
         );
