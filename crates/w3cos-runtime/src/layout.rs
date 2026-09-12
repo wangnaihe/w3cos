@@ -414,11 +414,15 @@ fn component_max_content_width(component: &Component) -> f32 {
             },
         }
     };
-    let specified_width = match component.style.width {
-        WDim::Px(width) => Some(width),
-        WDim::Em(width) => Some(width * component.style.font_size),
-        WDim::Rem(width) => Some(width * ROOT_FONT_SIZE),
-        _ => None,
+    let specified_width = if component.style.display == WDisplay::Inline {
+        None
+    } else {
+        match component.style.width {
+            WDim::Px(width) => Some(width),
+            WDim::Em(width) => Some(width * component.style.font_size),
+            WDim::Rem(width) => Some(width * ROOT_FONT_SIZE),
+            _ => None,
+        }
     };
     let mut padding = component.style.padding_lengths();
     if component.style.border_collapse
@@ -481,11 +485,13 @@ fn component_max_content_width(component: &Component) -> f32 {
             }
         })
     };
-    if let Some(max_width) = constraint_border_box(component.style.max_width) {
-        border_box_width = border_box_width.min(max_width);
-    }
-    if let Some(min_width) = constraint_border_box(component.style.min_width) {
-        border_box_width = border_box_width.max(min_width);
+    if component.style.display != WDisplay::Inline {
+        if let Some(max_width) = constraint_border_box(component.style.max_width) {
+            border_box_width = border_box_width.min(max_width);
+        }
+        if let Some(min_width) = constraint_border_box(component.style.min_width) {
+            border_box_width = border_box_width.max(min_width);
+        }
     }
     let margin = component.style.margin_lengths();
     let horizontal_margin = if component.style.display == WDisplay::TableCell {
@@ -1128,6 +1134,37 @@ fn fixed_table_track_widths(
             .map(|width| width.unwrap_or(automatic_width))
             .collect(),
     )
+}
+
+fn auto_table_track_widths(component: &Component, percentage_basis: Option<f32>) -> Vec<f32> {
+    let mut tracks = table_track_widths(component);
+    let Some(table_width) =
+        constrained_specified_width_with_basis(&component.style, percentage_basis).or_else(|| {
+            resolve_width_dimension(
+                component.style.min_width,
+                &component.style,
+                percentage_basis,
+            )
+        })
+    else {
+        return tracks;
+    };
+    let spacing = effective_table_border_spacing(&component.style).0;
+    let grid_width = (table_width - spacing * (tracks.len() + 1) as f32).max(0.0);
+    let intrinsic_width = tracks.iter().map(|width| width.max(0.0)).sum::<f32>();
+    let visible_tracks = tracks
+        .iter()
+        .filter(|track| !track.is_sign_negative())
+        .count();
+    if grid_width > intrinsic_width && visible_tracks > 0 {
+        let extra = (grid_width - intrinsic_width) / visible_tracks as f32;
+        for track in &mut tracks {
+            if !track.is_sign_negative() {
+                *track += extra;
+            }
+        }
+    }
+    tracks
 }
 
 fn is_html_table_element(style: &w3cos_std::style::Style) -> bool {
@@ -3328,7 +3365,7 @@ fn project_fixed_table_cell_rects(
                     )
                 });
                 (component.style.table_layout_fixed || has_declared_columns)
-                    .then(|| table_track_widths(component))
+                    .then(|| auto_table_track_widths(component, Some(containing_width)))
                     .filter(|tracks| !tracks.is_empty())
             })
         {
@@ -5381,6 +5418,8 @@ fn build_taffy_tree(
         style.padding.bottom = LengthPercentage::length(0.0);
         style.border.top = LengthPercentage::length(0.0);
         style.border.bottom = LengthPercentage::length(0.0);
+        style.min_size.width = Dimension::auto();
+        style.max_size.width = Dimension::auto();
     }
     let owns_table_layout = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable);
     if matches!(
@@ -6300,23 +6339,25 @@ fn build_taffy_tree(
                             ))
                     {
                         let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
-                        if let Some(max_width) = comp.style.max_width.resolve(
-                            containing_width,
-                            ROOT_FONT_SIZE,
-                            comp.style.font_size,
-                            viewport_w,
-                            viewport_h,
-                        ) {
-                            w = w.min(max_width);
-                        }
-                        if let Some(min_width) = comp.style.min_width.resolve(
-                            containing_width,
-                            ROOT_FONT_SIZE,
-                            comp.style.font_size,
-                            viewport_w,
-                            viewport_h,
-                        ) {
-                            w = w.max(min_width);
+                        if comp.style.display != WDisplay::Inline {
+                            if let Some(max_width) = comp.style.max_width.resolve(
+                                containing_width,
+                                ROOT_FONT_SIZE,
+                                comp.style.font_size,
+                                viewport_w,
+                                viewport_h,
+                            ) {
+                                w = w.min(max_width);
+                            }
+                            if let Some(min_width) = comp.style.min_width.resolve(
+                                containing_width,
+                                ROOT_FONT_SIZE,
+                                comp.style.font_size,
+                                viewport_w,
+                                viewport_h,
+                            ) {
+                                w = w.max(min_width);
+                            }
                         }
                         let dim = Dimension::length(w);
                         if inline_text_in_block && !nowrap {
@@ -6402,7 +6443,9 @@ fn build_taffy_tree(
         } else {
             (Dimension::auto(), size.width)
         };
-        let min_w = if matches!(comp.style.min_width, WDim::Auto) {
+        let min_w = if comp.style.display == WDisplay::Inline
+            || matches!(comp.style.min_width, WDim::Auto)
+        {
             min_w
         } else {
             to_taffy_dim(
@@ -6512,35 +6555,8 @@ fn build_taffy_tree(
                 + borders;
             style.size.width = Dimension::length(minimum_outer.max(declared_outer));
         }
-        let auto_table_tracks = (owns_table_layout && fixed_table_tracks.is_none()).then(|| {
-            let mut tracks = table_track_widths(comp);
-            if !tracks.is_empty()
-                && let Some(table_width) = comp.style.width.resolve(
-                    containing_width,
-                    ROOT_FONT_SIZE,
-                    comp.style.font_size,
-                    viewport_w,
-                    viewport_h,
-                )
-            {
-                let spacing = effective_table_border_spacing(&comp.style).0;
-                let grid_width = (table_width - spacing * (tracks.len() + 1) as f32).max(0.0);
-                let intrinsic_width = tracks.iter().map(|width| width.max(0.0)).sum::<f32>();
-                let visible_tracks = tracks
-                    .iter()
-                    .filter(|track| !track.is_sign_negative())
-                    .count();
-                if grid_width > intrinsic_width && visible_tracks > 0 {
-                    let extra = (grid_width - intrinsic_width) / visible_tracks as f32;
-                    for track in &mut tracks {
-                        if !track.is_sign_negative() {
-                            *track += extra;
-                        }
-                    }
-                }
-            }
-            tracks
-        });
+        let auto_table_tracks = (owns_table_layout && fixed_table_tracks.is_none())
+            .then(|| auto_table_track_widths(comp, Some(containing_width)));
         let owned_table_tracks = fixed_table_tracks.or(auto_table_tracks);
         let owned_collapsed_single_track =
             (matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
@@ -8584,6 +8600,39 @@ mod tests {
             assert_eq!(rect(0).height, 96.0);
             assert_eq!(rect(1).height, 96.0);
             assert_eq!(rect(2).height, 96.0);
+        }
+    }
+
+    #[test]
+    fn fixed_auto_table_min_width_stretches_its_track() {
+        for display in [WDisp::Table, WDisp::InlineTable] {
+            let table = Component::boxed(
+                Style {
+                    display,
+                    table_layout_fixed: true,
+                    min_width: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            height: WDim::Px(96.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                )],
+            );
+
+            let layout = compute(&table, 800.0, 600.0).unwrap();
+            let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+            assert_eq!(rect(0).width, 96.0);
+            assert_eq!(rect(2).width, 96.0);
         }
     }
 
@@ -11080,6 +11129,37 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let constrained = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((constrained.width, constrained.height), (96.0, 96.0));
+    }
+
+    #[test]
+    fn inline_text_ignores_min_width() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Inline,
+                    font_size: 16.0,
+                    min_width: WDim::Px(200.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "A",
+                    Style {
+                        display: WDisp::Inline,
+                        font_size: 16.0,
+                        ..Style::default()
+                    },
+                )],
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert!(inline.width < 200.0, "inline width was {}", inline.width);
     }
 
     #[test]
