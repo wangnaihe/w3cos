@@ -2612,7 +2612,14 @@ fn project_rtl_fixed_block_alignment(
         }
     }
     for (index, node) in flat.iter().enumerate() {
-        if node.style.display != WDisplay::Block
+        // Flex/grid and generated IFC rows still have block-level outer
+        // boxes in normal block flow. Their inner layout mode must not erase
+        // the containing block's RTL inline-start margin resolution.
+        let block_level = matches!(node.style.display,
+            WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::Table | WDisplay::ListItem);
+        let floated = node.style.float != WFloat::None
+            && !matches!(node.style.position, WPos::Absolute | WPos::Fixed);
+        if !block_level || floated
             || (matches!(node.style.position, WPos::Absolute | WPos::Fixed)
                 && (!matches!(node.style.left, WDim::Auto)
                     || !matches!(node.style.right, WDim::Auto)))
@@ -14981,6 +14988,44 @@ mod tests {
         let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
         let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(parent.x + parent.width - 5.0, child.x + child.width);
+    }
+
+    #[test]
+    fn rtl_block_level_flex_alignment_preserves_outer_margins_and_float_authority() {
+        for (generated, float, margin_right, expected_x) in
+            [(true, WFloat::None, 0.0, 96.0), (true, WFloat::None, -16.0, 112.0),
+             (false, WFloat::None, 0.0, 96.0), (true, WFloat::Left, 0.0, 0.0)]
+        {
+            let mut style = Style {
+                display: WDisp::Flex,
+                width: WDim::Px(96.0),
+                height: WDim::Px(16.0),
+                float,
+                margin: w3cos_std::style::Edges {
+                    right: WSpacing::Px(margin_right),
+                    ..w3cos_std::style::Edges::default()
+                },
+                ..Style::default()
+            };
+            if generated {
+                style.custom_properties = Some(HashMap::from([
+                    ("--w3cos-internal-inline-formatting-context".to_string(), "1".to_string()),
+                ]));
+            }
+            let child = Component::row(style, vec![Component::row(Style {
+                display: WDisp::InlineBlock, width: WDim::Px(10.0),
+                height: WDim::Px(10.0), ..Style::default()
+            }, vec![])]);
+            let root = Component::row(Style {
+                display: WDisp::Block, width: WDim::Px(192.0),
+                direction: w3cos_std::style::TextDirection::Rtl,
+                ..Style::default()
+            }, vec![child]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            assert_eq!(get(1).x, expected_x);
+            assert_eq!(get(2).x, expected_x);
+        }
     }
 
     #[test]

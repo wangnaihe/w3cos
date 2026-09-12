@@ -1769,6 +1769,44 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `target/wpt-targeted/batch-{start}-intrinsic-segments-v3/results.json`.
   No fixture or tolerance changes; final full6548 clean-SHA proof remains open.
 
+### RTL block-level alignment qualification (wrap remains open)
+
+- Fresh start5769 on8c15d01 passes4/8. RTL002 differs2560 pixels;
+  wrap notref-block-margin incorrectly equals its mismatch reference, inline
+  margin differs34728 pixels from the float reference, and wrap001 differs36267.
+  Receipt `target/wpt-targeted/batch-5769-after-intrinsic-segments/results.json`.
+- RTL002's30em principal block is internally Flex under a40em RTL block.
+  Existing projection only recognizes DisplayBlock, leaving its x8 instead of
+  x168 (reference negative-right-margin block needs x248). Its text already has
+  the correct first-line displacement; the missing outer alignment is separate.
+- RTL fixed-width projection now recognizes block-level Flex/Grid/Table/ListItem
+  outer boxes as well as Block. In-flow floats keep their float-placement
+  authority, and inline-level boxes remain outside this block projection.
+  Latest margin/descendant/generated-and-authored-flex/float controls pass;
+  rtl_block3/3 and rtl_fixed_block1/1 filters pass.
+- Runner SHA256
+  `473c7a275a077ae503e5c4dadce2e2a49b0ce37b6525311f96cf40c7d5e0175e`
+  passes5/8 at start5769. RTL002 moves2560 pixels to0, maximum difference0;
+  the other four passing cases stay passing. The three wrap failures retain
+  their pre-candidate pixel differences/relations, not hidden or counted green.
+  Receipt `target/wpt-targeted/batch-5769-rtl-block-level-v1/results.json`.
+  Related starts5761/5753/5745/5737/5729/5721/5689/5681/5665/5545/5553/5593
+  pass96/96:94 match comparisons have zero differences;2 expected mismatch
+  comparisons pass. Receipts use
+  `target/wpt-targeted/batch-{start}-rtl-block-level-v1/results.json`.
+  No fixture/tolerance changes; final full6548 zero-failure proof is unachieved.
+- Right-float raw-IR alignment unit fails0 versus50px on both latest414fd857
+  and preserved pre-candidate11f7b072 executables. Its parent is LTR and never
+  enters this RTL projection. The older executable has a different feature set;
+  this is baseline evidence, not a same-feature clean-SHA gate or a green test.
+- Separate wrap diagnostics on the pre-candidate runner show784px original
+  available width but684px throughout the inline-margin reference, producing an
+  extra line. Its long InlineText layout rect is16px tall despite its paragraph's
+  multi-line height. These remaining three reference failures are still open;
+  neither uniform padding nor a tolerance change is an appropriate closure.
+  Next focused entry: start5773 limit4 retains the three failing wrap cases and
+  their passing mismatch control, before requalifying the enclosing8-case batch.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
