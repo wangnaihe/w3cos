@@ -7954,6 +7954,28 @@ fn positioned_percentage_border_box_size(
     } else {
         fallback_height
     };
+    let horizontal_inner_edges = if style.box_sizing == WBoxSizing::ContentBox {
+        resolve_spacing(style.padding.left, containing_width)
+            + resolve_spacing(style.padding.right, containing_width)
+            + style.border_left_width.unwrap_or(style.border_width)
+            + style.border_right_width.unwrap_or(style.border_width)
+    } else {
+        0.0
+    };
+    let resolve_width_limit = |dimension: WDim| {
+        dimension
+            .resolve(
+                containing_width,
+                ROOT_FONT_SIZE,
+                style.font_size,
+                viewport_w,
+                viewport_h,
+            )
+            .map(|value| value.max(0.0) + horizontal_inner_edges)
+    };
+    let width = width
+        .min(resolve_width_limit(style.max_width).unwrap_or(f32::INFINITY))
+        .max(resolve_width_limit(style.min_width).unwrap_or(0.0));
     let vertical_inner_edges = if style.box_sizing == WBoxSizing::ContentBox {
         resolve_spacing(style.padding.top, containing_width)
             + resolve_spacing(style.padding.bottom, containing_width)
@@ -10235,6 +10257,39 @@ mod tests {
             };
             let rect = compute_absolute_rect(&style, containing, fallback, 800.0, 600.0, direction);
             assert_eq!(rect.x, 10.0 + expected_x);
+        }
+    }
+
+    #[test]
+    fn absolute_auto_width_reenters_margin_equation_after_max_width() {
+        for (right_margin, min_width, expected_x, expected_width) in [
+            (WSpacing::Auto, WDim::Auto, 350.0, 100.0),
+            (WSpacing::Px(0.0), WDim::Auto, 692.0, 100.0),
+            (WSpacing::Auto, WDim::Px(120.0), 340.0, 120.0),
+        ] {
+            let style = Style {
+                position: WPos::Absolute,
+                left: WDim::Px(8.0),
+                right: WDim::Px(8.0),
+                max_width: WDim::Px(100.0),
+                min_width,
+                margin: w3cos_std::style::Edges {
+                    left: WSpacing::Auto,
+                    right: right_margin,
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            };
+            let containing = LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            };
+            let rect = compute_absolute_rect(
+                &style, containing, containing, 800.0, 600.0, style.direction,
+            );
+            assert_eq!((rect.x, rect.width), (expected_x, expected_width));
         }
     }
 
