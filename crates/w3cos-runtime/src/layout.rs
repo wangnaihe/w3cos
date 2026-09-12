@@ -5322,6 +5322,7 @@ fn project_table_column_background_rects(
                         projected.height += top + bottom;
                     }
                     WDisplay::TableRow => {
+                        projected.x -= left;
                         projected.y -= top;
                         projected.width += right;
                         projected.height += top + bottom;
@@ -15424,6 +15425,38 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(row_table, group_table);
+        for (row_cell, group_cell) in [3, 5, 7, 10, 12, 14, 17, 19, 21]
+            .into_iter()
+            .zip([3, 5, 7, 11, 13, 15, 19, 21, 23])
+        {
+            let row_rect = row_border
+                .iter()
+                .find(|(_, index)| *index == row_cell)
+                .unwrap()
+                .0;
+            let group_rect = group_border
+                .iter()
+                .find(|(_, index)| *index == group_cell)
+                .unwrap()
+                .0;
+            for (actual, expected) in [
+                (row_rect.x, group_rect.x),
+                (row_rect.y, group_rect.y),
+                (row_rect.width, group_rect.width),
+                (row_rect.height, group_rect.height),
+            ] {
+                assert!(
+                    (actual - expected).abs() < 0.0001,
+                    "cell {row_cell}/{group_cell}: {actual} versus {expected}"
+                );
+            }
+        }
+        let row_frame = row_border.iter().find(|(_, index)| *index == 9).unwrap().0;
+        let group_frame = group_border.iter().find(|(_, index)| *index == 9).unwrap().0;
+        assert_eq!(
+            row_frame, group_frame,
+            "equivalent bordered row and row group"
+        );
     }
 
     #[test]

@@ -445,6 +445,18 @@ cases 5245/5246/5247 (`tables/border-collapse-dynamic-row-001/002/003.xht`):
 `hidden-inline-context-v1`. No later batch was started; these three cases
 are the next focused repair scope.
 
+The focused repair now projects a collapsed row border from its left
+border edge, matching the equivalent row-group frame. The strengthened
+geometry unit reproduced x=20 versus x=0 before the fix and passes now;
+nine cell rectangles remain equivalent (1e-4 floating-point geometry
+epsilon only, not a pixel tolerance). Four related table units also pass.
+5241–5248 now passes 8/8, including zero pixel differences for
+5245/5246/5247; 5225–5232 and 5209–5216 pass 8/8 as regressions. Receipts:
+`target/wpt-targeted/batch-5241-5248-collapsed-row-frame-v1/results.json`
+and the corresponding 5225–5232 / 5209–5216 batch directories. No WPT
+fixture, suite entry or pixel tolerance changed. Cases 4314/4947/5110
+and the final 6,548-case proof remain open. Next progression: 5249.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
