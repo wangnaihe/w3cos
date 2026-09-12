@@ -1452,12 +1452,24 @@ impl PaintArtifact {
             return vec![(0, 0, index)];
         }
 
-        let mut key = node
-            .parent
+        // Auto positioned boxes group their normal contents, but positioned
+        // descendants participate in the nearest real stacking context.
+        let mut parent = node.parent;
+        if is_positioned(&node.style) {
+            while let Some(current) = parent {
+                if self.nodes[current].parent.is_none()
+                    || establishes_stacking_context(&self.nodes[current])
+                {
+                    break;
+                }
+                parent = self.nodes[current].parent;
+            }
+        }
+        let mut key = parent
             .and_then(|parent| self.paint_context_prefix(parent))
             .unwrap_or_default();
         key.push(self.local_paint_order_level(index));
-        if establishes_stacking_context(node) {
+        if establishes_stacking_context(node) || is_positioned(&node.style) {
             // A context's own background is the first item inside that
             // context. Descendant keys extend the prefix before adding their
             // local CSS2 paint phase.
@@ -1468,9 +1480,9 @@ impl PaintArtifact {
 
     fn paint_context_prefix(&self, index: usize) -> Option<Vec<PaintOrderLevel>> {
         let node = self.nodes.get(index)?;
-        if node.parent.is_none() || establishes_stacking_context(node) {
+        if node.parent.is_none() || establishes_stacking_context(node) || is_positioned(&node.style) {
             let mut key = self.paint_order.get(index)?.clone();
-            if establishes_stacking_context(node) {
+            if establishes_stacking_context(node) || is_positioned(&node.style) {
                 key.pop();
             }
             return Some(key);
@@ -1512,24 +1524,6 @@ impl PaintArtifact {
             return (4, 0, index);
         }
 
-        // A z-index:auto positioned subtree is one atomic participant in its
-        // containing stacking context. Descendant floats must not escape into
-        // the earlier float phase of that outer context.
-        let mut positioned_ancestor = node.parent;
-        while let Some(current) = positioned_ancestor {
-            let ancestor = &self.nodes[current];
-            if is_positioned(&ancestor.style) {
-                if !establishes_stacking_context(ancestor) {
-                    return (4, 0, index);
-                }
-                break;
-            }
-            if establishes_stacking_context(ancestor) {
-                break;
-            }
-            positioned_ancestor = ancestor.parent;
-        }
-
         let mut cursor = Some(index);
         while let Some(current) = cursor {
             let current_node = &self.nodes[current];
@@ -1537,11 +1531,9 @@ impl PaintArtifact {
                 && is_positioned(&current_node.style)
                 && !establishes_stacking_context(current_node)
             {
-                // A positioned z-index:auto subtree participates atomically
-                // at stack level zero even though it does not establish a new
-                // stacking context. Its normal descendants must paint after
-                // the positioned box's own background.
-                return (4, 0, index);
+                // The hierarchical prefix keeps this normal subtree in the
+                // positioned participant; retain its local CSS paint phases.
+                break;
             }
             if current_node.style.float != w3cos_std::style::Float::None {
                 return (2, 0, index);
@@ -2476,6 +2468,25 @@ mod tests {
         );
 
         assert_eq!(artifact.z_order, vec![i32::MIN, i32::MIN + 1, i32::MIN]);
+    }
+
+    #[test]
+    fn auto_positioned_container_paints_normal_blocks_before_positioned_children() {
+        let nodes = [
+            (None, Position::Static),
+            (Some(0), Position::Relative),
+            (Some(1), Position::Absolute),
+            (Some(1), Position::Static),
+        ].map(|(parent, position)| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { position, ..Style::default() },
+            parent,
+            sticky_counter_signal: None,
+        });
+        let artifact = PaintArtifact::build(nodes,
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2), (rect(0.0), 3)], 1);
+        assert!(artifact.paint_order_key(1) < artifact.paint_order_key(3));
+        assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
     }
 
     #[test]
