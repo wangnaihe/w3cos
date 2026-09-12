@@ -1210,6 +1210,21 @@ impl Document {
             }
         }
         let edge_ex_size = css_ex_size(&style);
+        if let Some(value) = declared_value(&["letter-spacing", "letterSpacing"]) {
+            // Relative spacing resolves after the final font cascade. Children
+            // inherit this computed pixel value, not the authored relative unit.
+            let value = value.trim();
+            let relative = value
+                .strip_suffix("ex")
+                .map(|number| (number, edge_ex_size))
+                .or_else(|| value.strip_suffix("em").map(|number| (number, style.font_size)));
+            if let Some((number, basis)) = relative
+                && let Ok(number) = number.trim().parse::<f32>()
+                && number.is_finite()
+            {
+                style.letter_spacing = number * basis;
+            }
+        }
         let inherited_box_dimension = |value, parent: &w3cos_std::style::Style| match value {
             w3cos_std::style::Dimension::Em(value) => {
                 w3cos_std::style::Dimension::Px(value * parent.font_size)
@@ -13071,6 +13086,36 @@ mod computed_style_cache_tests {
         assert_eq!(margin.right, w3cos_std::style::Spacing::Px(84.0));
         assert_eq!(margin.bottom, w3cos_std::style::Spacing::Px(28.0));
         assert_eq!(margin.left, w3cos_std::style::Spacing::Px(112.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn relative_letter_spacing_uses_final_font_metrics_and_inherits_computed_pixels() {
+        for (value, expected) in [("12ex", 192.0), ("+12ex", 192.0), ("6em", 120.0)] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(
+                "#target",
+                &[("font", "20px/1 Ahem"), ("letter-spacing", value)],
+            );
+            crate::stylesheet::register_rule("#child", &[("font-size", "10px")]);
+            let mut document = Document::new();
+            let target = document.create_element("div");
+            target.set_attribute(&mut document, "id", "target");
+            let child = document.create_element("span");
+            child.set_attribute(&mut document, "id", "child");
+            target.append_child(&mut document, child);
+            document.body().append_child(&mut document, target);
+            assert_eq!(
+                document.computed_style_for(target.id).letter_spacing,
+                expected,
+                "{value}"
+            );
+            assert_eq!(
+                document.computed_style_for(child.id).letter_spacing,
+                expected,
+                "inherited {value}"
+            );
+        }
         crate::stylesheet::clear_rules();
     }
 

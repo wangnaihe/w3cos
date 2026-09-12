@@ -1400,6 +1400,37 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Start 5641 was not executed. These failures remain open; final full proof
   remains unachieved.
 
+### Letter-spacing computed metric checkpoint (091/092 qualified; 080 open)
+
+- Strict failures at indices 5639/5640 use `12ex`/`+12ex`. Dumps show span
+  margin uses Ahem x-height (192px, glyph x220), but text letter spacing uses
+  the fallback half-em value (120px, second glyph x148).
+  Diagnostics: `target/wpt-targeted/letter-spacing-5639-{source,reference}-debug.bin`.
+- DOM regression
+  `relative_letter_spacing_uses_final_font_metrics_and_inherits_computed_pixels`
+  fails before the fix (120 instead of 192) and passes after resolving authored
+  `ex`/`em` spacing against final computed font metrics. Signed ex, em and
+  inheritance to a differently sized child are covered. `ex_` filter passes
+  13/13 (includes unrelated name matches, not 13 font-metric-only tests).
+- Index 5635 (`080`) is a separate pinned-reference inconsistency: source has
+  20px Ahem and 6em=120px, while its specified `007-ref` has hardcoded 96px.
+  Isolated Chrome 153.0.8010.36, 800x600, scale1, with original pinned resources
+  fulfilled read-only at a virtual HTTP origin and confirmed loaded Ahem,
+  reproduces source span x148 vs reference x124 and 1804 differing pixels,
+  max difference255. Screenshots:
+  `target/wpt-targeted/chrome-letter-spacing-080.xht-v1.png` and
+  `target/wpt-targeted/chrome-letter-spacing-007-ref.xht-v1.png`.
+  No fixture/reference, suite or tolerance change is authorized; 080 stays open.
+- Rebuilt runner qualifies 091/092 at zero differing pixels. Strict start 5633
+  is now 7/8; 080 remains unchanged at 1600 differing pixels, max255.
+  Receipt `target/wpt-targeted/batch-5633-computed-letter-spacing-v1/results.json`.
+  Runner SHA256:
+  `aaaa555e14a407a303b9523b9824849fcad4178c254e56017c5e77149d268440`.
+- Related starts 5625, 5617, 5609, 5601 and 5593 pass 8/8 each (40/40),
+  receipts `target/wpt-targeted/batch-<start>-computed-letter-spacing-v1/results.json`.
+  Start 5641 is not executed after the open 080 failure. No change to pinned
+  fixtures, references or tolerances; final full 6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
