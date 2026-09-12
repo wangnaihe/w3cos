@@ -7692,6 +7692,24 @@ fn compute_absolute_rect(
         (None, None) => fallback.x,
     };
     let y = match (resolve_v(style.top), resolve_v(style.bottom)) {
+        (Some(top), Some(bottom)) if !matches!(style.height, WDim::Auto) => {
+            let top_auto = matches!(style.margin.top, WSpacing::Auto);
+            let bottom_auto = matches!(style.margin.bottom, WSpacing::Auto);
+            let remaining = containing_block.height
+                - top
+                - bottom
+                - height
+                - resolve_spacing(style.margin.top)
+                - resolve_spacing(style.margin.bottom);
+            let margin_top = if top_auto {
+                // CSS2 absolute block-axis constraints divide even negative
+                // remaining space equally when both margins are automatic.
+                remaining / if bottom_auto { 2.0 } else { 1.0 }
+            } else {
+                resolve_spacing(style.margin.top)
+            };
+            containing_block.y + top + margin_top
+        }
         (Some(top), _) => containing_block.y + top + resolve_spacing(style.margin.top),
         (None, Some(bottom)) => {
             containing_block.y + containing_block.height
@@ -10018,6 +10036,47 @@ mod tests {
 
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!(layout[1].0.y, 40.0);
+    }
+
+    #[test]
+    fn absolute_vertical_auto_margins_solve_the_remaining_space() {
+        for (top_margin, bottom_margin, containing_height, expected_y) in [
+            (WSpacing::Auto, WSpacing::Auto, 288.0, 96.0),
+            (WSpacing::Auto, WSpacing::Px(48.0), 288.0, 96.0),
+            (WSpacing::Px(48.0), WSpacing::Auto, 288.0, 96.0),
+            (WSpacing::Auto, WSpacing::Auto, 144.0, 24.0),
+        ] {
+            let style = Style {
+                position: WPos::Absolute,
+                top: WDim::Px(48.0),
+                bottom: WDim::Px(48.0),
+                height: WDim::Px(96.0),
+                margin: w3cos_std::style::Edges {
+                    top: top_margin,
+                    bottom: bottom_margin,
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            };
+            let rect = compute_absolute_rect(
+                &style,
+                LayoutRect {
+                    x: 0.0,
+                    y: 10.0,
+                    width: 288.0,
+                    height: containing_height,
+                },
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 288.0,
+                    height: 96.0,
+                },
+                800.0,
+                600.0,
+            );
+            assert_eq!(rect.y, 10.0 + expected_y);
+        }
     }
 
     #[test]
