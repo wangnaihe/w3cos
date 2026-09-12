@@ -361,6 +361,24 @@ in `target/wpt-targeted/batch-5105-5112-declaration-at-rule-v1/results.json`
 tolerance changed. Cases 4314/4947 and final 6,548-case proof remain open;
 next progression starts at 5113.
 
+The next batch 5113–5120 initially passed 7/8, stopping on case 5113
+(`syntax/eof-003.xht`) at 410 differing pixels. It is now repaired:
+declaration whitespace trimming exposed a trailing string backslash, which
+escaped the synthetic EOF closing quote. A pending string escape is now
+discarded before closing the quote, as specified by
+[string token consumption](https://www.w3.org/TR/css-syntax-3/#consume-string-token).
+The new `eof_string_discards_a_trailing_escape_before_closing_the_quote`
+regression failed the content spelling before the production fix and passed
+afterward, including preservation of paired backslashes. Five relevant
+existing EOF/malformed-at-rule/quoted-semicolon/bad-url tests passed as well
+(six relevant tests; the broad `eof_` filter also matched three unrelated
+compiler tests, which are not counted as CSS coverage).
+Case 5113 now has zero pixel differences in
+`target/wpt-targeted/batch-5113-5120-eof-string-escape-v1/results.json`
+(8/8). Batches 5105–5112 and 5057–5064 also passed 8/8 with that suffix:
+24 focused reftests. No WPT fixture, suite entry or tolerance changed;
+cases 4314/4947 and final 6,548-case proof remain open. Next batch: 5121.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

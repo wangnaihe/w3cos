@@ -1184,6 +1184,11 @@ fn close_css_value_at_eof(value: &str) -> String {
     }
     let mut closed = value.to_string();
     if let Some(active_quote) = quote {
+        // A string's reverse solidus followed by EOF contributes no code
+        // point. Do not let it escape the synthetic closing quote.
+        if escaped {
+            closed.pop();
+        }
         closed.push(active_quote);
     }
     closed.extend(delimiters.into_iter().rev());
@@ -1668,6 +1673,23 @@ mod tests {
             vec![("color".into(), "green".into())]
         );
         assert!(sheet.imports.is_empty());
+    }
+
+    #[test]
+    fn eof_string_discards_a_trailing_escape_before_closing_the_quote() {
+        assert_eq!(
+            close_css_value_at_eof("\"Filler Text\\\\"),
+            "\"Filler Text\\\\\""
+        );
+        let sheet = parse_css_source(
+            "div::before { color: green; content: \"Filler Text\\\n",
+            "eof-string.css",
+        );
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(
+            sheet.rules[0].declarations.last(),
+            Some(&("content".into(), "\"Filler Text\"".into()))
+        );
     }
 
     #[test]
