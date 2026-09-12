@@ -1449,7 +1449,7 @@ impl PaintArtifact {
     fn hierarchical_paint_order(&self, index: usize) -> Vec<PaintOrderLevel> {
         let node = &self.nodes[index];
         if node.parent.is_none() {
-            return vec![(0, 0, index)];
+            return vec![(0, i32::MIN, index)];
         }
 
         // Auto positioned boxes group their normal contents, but positioned
@@ -2243,6 +2243,11 @@ mod tests {
             1,
         );
         assert_eq!(artifact.z_order, [i32::MIN, -1, 0]);
+        assert!(
+            artifact.paint_order_key(0) < artifact.paint_order_key(1),
+            "the root background and border paint below negative descendants"
+        );
+        assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2));
     }
 
     #[test]

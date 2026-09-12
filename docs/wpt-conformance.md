@@ -277,6 +277,22 @@ passed 8/8 with that suffix. The following 4961–4968 batch passed 7/8,
 with root stacking-context case 4967 awaiting repair at 10,000 pixels.
 Case 4314 and full 6,548-case proof remain outstanding as well.
 
+Case 4967 (`stacking-context/root-element-creates-stacking-context.html`)
+is now repaired. The numeric root z-order was already the minimum, but
+the hierarchical paint key placed the root border after its negative-z
+descendant. The root key now uses the same minimum phase sentinel; child
+stacking-context prefixes and descendant ordering remain unchanged.
+The strengthened `root_sentinel_does_not_raise_negative_descendants_above_normal_flow`
+regression failed the root-before-negative assertion before the production
+change and passed afterward. Three selected nested/fixed/auto-positioned
+stacking regressions also passed (four unit tests, not a full module gate).
+The repaired case changed from 10,000 differing pixels to zero in
+`target/wpt-targeted/batch-4961-4968-root-background-order-v1/results.json`
+(8/8). Batches 4921–4928, 4913–4920 and 4265–4272 passed 8/8 using the
+same receipt suffix: 32 focused reftests total. No WPT fixtures, suite
+membership or tolerances changed. Cases 4314/4947 and final 6,548-case
+acceptance remain open; the next progression batch starts at 4969.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
