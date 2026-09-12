@@ -28,7 +28,9 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "a" | "abbr" | "b" | "br" | "code" | "em" | "i" | "label" | "small" | "span" | "strong" => {
             Display::Inline
         }
-        "button" | "canvas" | "img" | "input" | "select" | "textarea" => Display::InlineBlock,
+        "button" | "canvas" | "img" | "input" | "select" | "textarea" | "video" => {
+            Display::InlineBlock
+        }
         "table" => Display::Table,
         "caption" => Display::TableCaption,
         "colgroup" => Display::TableColumnGroup,
@@ -148,6 +150,7 @@ mod tests {
         assert_eq!(html_default_style("br").display, Display::Inline);
         assert_eq!(html_default_style("img").display, Display::InlineBlock);
         assert_eq!(html_default_style("canvas").display, Display::InlineBlock);
+        assert_eq!(html_default_style("video").display, Display::InlineBlock);
         assert_eq!(html_default_style("table").display, Display::Table);
         assert_eq!(
             html_default_style("thead").display,
