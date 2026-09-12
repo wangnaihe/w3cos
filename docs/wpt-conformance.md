@@ -709,6 +709,25 @@ the separate colspan/column-ordinal issue remains open. No upstream
 input, suite, viewport or zero tolerance changed. Next sequential
 progression resumes at 5377; final full-suite proof remains open.
 
+### Sequential progression to inline-priority failure (2026-09-13)
+
+On `6a9d793`, strict `canonical-part-inline-v1` progression passes
+5377–5384, 5385–5392 and 5393–5400 (24/24). Batch 5401–5408 is 7/8:
+`table-anonymous-objects-017.xht` (5408) differs by 498 pixels. It already
+failed by 1,040 pixels in the initial report, so this is an unresolved
+initial failure, not evidence of a newly introduced regression.
+No batch after 5408 was started.
+
+The source has `span { display: table-cell ! important }` over inline
+`display:block`. Chromium computes both spans as table cells. The native
+dump instead contains two block text nodes, leaving the second red line
+uncovered. The stylesheet importance helper accepts the spaced marker,
+but computed-style merging unconditionally reapplies inline declarations
+after all matched rules, losing author-important precedence at that
+boundary. This is the next focused cascade repair; anonymous-table
+layout has not yet been independently ruled out as an additional issue.
+Pinned upstream inputs and zero tolerances remain unchanged.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
