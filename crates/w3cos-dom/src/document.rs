@@ -1009,9 +1009,9 @@ impl Document {
             .with_html_element(self.html_document && node.is_html_element)
     }
 
-    /// Computed style for a node: stylesheet-matched declarations first
-    /// (ascending specificity, then registration order), inline style on top.
-    /// Falls back to the raw inline style when no stylesheet rules apply.
+    /// Author declarations share one cascade: normal rules, normal inline,
+    /// important rules, important inline. Every value/winner consumer below
+    /// uses this order, including inheritance and relative shorthand fixups.
     fn computed_style(
         &self,
         id: NodeId,
@@ -1037,10 +1037,23 @@ impl Document {
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            stylesheet::matching_declarations_for_node(self, id)
+            stylesheet::matching_cascade_declarations_for_node(self, id)
         } else {
             Vec::new()
         };
+        let mut author_declarations = Vec::with_capacity(matched.len() + inline.inline_declarations.len());
+        let mut important = Vec::new();
+        for declaration in matched {
+            let target = if declaration.important { &mut important } else { &mut author_declarations };
+            target.push((declaration.property, declaration.value, declaration.specificity));
+        }
+        for (property, raw_value) in &inline.inline_declarations {
+            let (value, is_important) = stylesheet::declaration_value_and_importance(raw_value);
+            let value = if is_important { value } else { raw_value.as_str() };
+            let target = if is_important { &mut important } else { &mut author_declarations };
+            target.push((property.clone(), value.to_string(), u32::MAX));
+        }
+        author_declarations.extend(important);
         let mut merged =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
         // The legacy HTML `text` presentational hint participates before
@@ -1096,23 +1109,12 @@ impl Document {
         // Custom properties participate in the cascade independently of
         // declaration order. Collect them first, then resolve ordinary
         // declarations using the winning inherited/scoped/inline values.
-        for (prop, value, _specificity) in &matched {
+        for (prop, value, _specificity) in &author_declarations {
             if prop.starts_with("--") {
                 custom_properties.insert(prop.clone(), value.clone());
             }
         }
-        for (prop, value) in &inline.inline_declarations {
-            if prop.starts_with("--") {
-                custom_properties.insert(prop.clone(), value.clone());
-            }
-        }
-        for (prop, value, _specificity) in &matched {
-            if !prop.starts_with("--") {
-                merged.set_property(prop, &resolve_css_variables(value, &custom_properties));
-            }
-        }
-        // Inline wins: re-apply the node's own declarations on top.
-        for (prop, value) in &inline.inline_declarations {
+        for (prop, value, _specificity) in &author_declarations {
             if !prop.starts_with("--") {
                 merged.set_property(prop, &resolve_css_variables(value, &custom_properties));
             }
@@ -1131,23 +1133,13 @@ impl Document {
 
         if let Some(parent) = inherited {
             let declares = |property: &str| {
-                let winning_author_value = matched
+                let winning_author_value = author_declarations
                     .iter()
                     .filter(|(name, value, _)| {
                         css_property_eq(name, property)
                             && declaration_value_is_valid(property, value)
                     })
                     .map(|(_, value, _)| value.as_str())
-                    .chain(
-                        inline
-                            .inline_declarations
-                            .iter()
-                            .filter(|(name, value)| {
-                                css_property_eq(name, property)
-                                    && declaration_value_is_valid(property, value)
-                            })
-                            .map(|(_, value)| value.as_str()),
-                    )
                     .last();
                 (css_property_eq(property, "color") && body_text_hint.is_some())
                     || (css_property_eq(property, "direction") && direction_hint.is_some())
@@ -1161,7 +1153,7 @@ impl Document {
             inherit_text_style(&mut style, parent, &node.tag.as_str(), declares);
         }
         let declared_value = |properties: &[&str]| {
-            matched
+            author_declarations
                 .iter()
                 .filter(|(name, _, _)| {
                     properties
@@ -1169,21 +1161,10 @@ impl Document {
                         .any(|property| css_property_eq(name, property))
                 })
                 .map(|(_, value, _)| value.as_str())
-                .chain(
-                    inline
-                        .inline_declarations
-                        .iter()
-                        .filter(|(name, _)| {
-                            properties
-                                .iter()
-                                .any(|property| css_property_eq(name, property))
-                        })
-                        .map(|(_, value)| value.as_str()),
-                )
                 .last()
         };
         let declared_property_value = |properties: &[&str]| {
-            matched
+            author_declarations
                 .iter()
                 .filter(|(name, _, _)| {
                     properties
@@ -1191,17 +1172,6 @@ impl Document {
                         .any(|property| css_property_eq(name, property))
                 })
                 .map(|(name, value, _)| (name.as_str(), value.as_str()))
-                .chain(
-                    inline
-                        .inline_declarations
-                        .iter()
-                        .filter(|(name, _)| {
-                            properties
-                                .iter()
-                                .any(|property| css_property_eq(name, property))
-                        })
-                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                )
                 .last()
         };
         if let Some((property, value)) = declared_property_value(&["font-size", "fontSize", "font"])
@@ -1818,7 +1788,7 @@ impl Document {
             }
         }
         let last_border_declaration = |properties: &[&str]| {
-            matched
+            author_declarations
                 .iter()
                 .filter(|(name, _, _)| {
                     properties
@@ -1826,17 +1796,6 @@ impl Document {
                         .any(|property| css_property_eq(name, property))
                 })
                 .map(|(_, value, _)| value.as_str())
-                .chain(
-                    inline
-                        .inline_declarations
-                        .iter()
-                        .filter(|(name, _)| {
-                            properties
-                                .iter()
-                                .any(|property| css_property_eq(name, property))
-                        })
-                        .map(|(_, value)| value.as_str()),
-                )
                 .last()
         };
         if let Some(width) = last_border_declaration(&["border", "border-width"])
@@ -1916,21 +1875,12 @@ impl Document {
         {
             style.border_color = style.color;
         }
-        let last_declared_border_color = matched
+        let last_declared_border_color = author_declarations
             .iter()
             .filter(|(name, _, _)| {
                 matches!(name.as_str(), "border" | "border-color" | "borderColor")
             })
             .map(|(_, value, _)| value.as_str())
-            .chain(
-                inline
-                    .inline_declarations
-                    .iter()
-                    .filter(|(name, _)| {
-                        matches!(name.as_str(), "border" | "border-color" | "borderColor")
-                    })
-                    .map(|(_, value)| value.as_str()),
-            )
             .last();
         if let Some(color) = last_declared_border_color.and_then(|value| {
             split_css_tokens(value)
@@ -12513,6 +12463,68 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn author_important_beats_inline_normal_in_one_cascade() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("span", &[
+            ("display", "table-cell ! important"),
+            ("--chosen", "green !important"),
+            ("color", "green !important"),
+            ("padding", "8px !important"),
+        ]);
+        let mut document = Document::new();
+        let target = document.create_element("span");
+        for (name, value) in [("display", "block"), ("--chosen", "red"),
+            ("color", "blue"), ("padding-left", "2px")] {
+            target.style_mut(&mut document).set_property(name, value);
+        }
+        document.body().append_child(&mut document, target);
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.display, w3cos_std::style::Display::TableCell);
+        assert_eq!(style.color, w3cos_std::Color::rgb(0, 128, 0));
+        assert_eq!(style.padding_lengths().left, 8.0);
+        assert_eq!(style.custom_properties.as_ref().unwrap().get("--chosen"), Some(&"green".to_string()));
+    }
+
+    #[test]
+    fn inline_important_keeps_keyword_and_shorthand_winner_order() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("span", &[
+            ("font-size", "40px !important"), ("color", "red !important"),
+            ("border", "10px solid red !important"),
+        ]);
+        let mut document = Document::new();
+        let body = document.body();
+        body.style_mut(&mut document).set_property("color", "blue");
+        body.style_mut(&mut document).set_property("font-size", "24px");
+        let target = document.create_element("span");
+        for (name, value) in [("font-size", "inherit ! IMPORTANT"),
+            ("color", "inherit !important"), ("border-left", "5px solid blue !important"),
+            ("border-color", "green")] {
+            target.style_mut(&mut document).set_property(name, value);
+        }
+        body.append_child(&mut document, target);
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.font_size, 24.0);
+        assert_eq!(style.color, w3cos_std::Color::rgb(0, 0, 255));
+        assert_eq!(style.border_color, w3cos_std::Color::rgb(255, 0, 0));
+        assert_eq!(style.border_left_width, Some(5.0));
+        assert_eq!(style.border_left_color, Some(w3cos_std::Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn important_cascade_keeps_normal_custom_property_whitespace() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let target = document.create_element("span");
+        target.style_mut(&mut document).set_property("--text", "  ordinary value  ");
+        document.body().append_child(&mut document, target);
+        assert_eq!(document.get_style(target.id).inner.custom_properties.as_ref()
+            .unwrap().get("--text"), Some(&"  ordinary value  ".to_string()));
+        assert_eq!(document.computed_style_for(target.id).custom_properties.as_ref()
+            .unwrap().get("--text"), Some(&"  ordinary value  ".to_string()));
+    }
 
     #[test]
     fn cache_reuses_styles_and_observes_dom_and_stylesheet_version_fences() {

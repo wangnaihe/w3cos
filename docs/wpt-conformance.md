@@ -728,6 +728,35 @@ boundary. This is the next focused cascade repair; anonymous-table
 layout has not yet been independently ruled out as an additional issue.
 Pinned upstream inputs and zero tolerances remain unchanged.
 
+### Unified author importance across inline merging (2026-09-13)
+
+Node matching now retains typed importance metadata while the legacy
+three-field matching API remains compatible. Computed styles use one
+ordered author stream: normal rules, normal inline, important rules,
+important inline. Custom properties, inheritance/relative-value winner
+queries and border shorthand finalization consume that same stream,
+rather than reapplying inline values after the important declarations.
+Priority markers are removed for value parsing but retained in the raw
+declaration records. Ordinary inline/custom-property whitespace is kept.
+
+Two focused priority tests first failed (block instead of table-cell;
+40px instead of inherited 24px). The repaired cache/inheritance module
+passes 32/32, plus three anonymous-table shaping units and the existing
+stylesheet importance unit (36 distinct targeted passes). Strict
+`author-important-restored-v1` receipts pass 5401–5408, 5393–5400,
+1122–1129, 5257–5264 and 5369–5376 (40/40). 5408 is now pixel-identical.
+
+The independently executed 1130–1137 batch remains 7/8: 1132 requires
+the user stylesheet prescribed by its `userstyle` flag. A temporarily
+restored, clean pre-repair `8449f00` build reproduces exactly the same
+14,958-pixel failure (`author-important-clean-baseline-v1`), proving no
+new regression in that batch. Chromium without that user stylesheet
+also leaves the instructions visible, the last line black and `b` bold.
+All three repair files were restored exactly before the latest build
+and 40-case regression. No fixture, suite entry or tolerance changed.
+User-origin stylesheet/profile support is the next prerequisite repair,
+not silently skipped or counted green. Full 6548-case closure is open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

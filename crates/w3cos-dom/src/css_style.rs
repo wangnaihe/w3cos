@@ -12,8 +12,8 @@ use w3cos_std::style::{
 pub struct CSSStyleDeclaration {
     pub inner: Style,
     /// Raw `(property, value)` pairs applied through `set_property`, in order.
-    /// `Document::to_component_tree` re-applies these above stylesheet-matched
-    /// rules so that inline style wins the cascade.
+    /// Document merges these with stylesheet rules using importance and
+    /// inline precedence; raw values retain their priority markers.
     pub inline_declarations: Vec<(String, String)>,
 }
 
@@ -35,6 +35,8 @@ impl CSSStyleDeclaration {
     pub fn set_property(&mut self, name: &str, value: &str) {
         self.inline_declarations
             .push((name.to_string(), value.to_string()));
+        let (parsed_value, important) = crate::stylesheet::declaration_value_and_importance(value);
+        let value = if important { parsed_value } else { value };
         if name.starts_with("--") {
             self.inner
                 .custom_properties

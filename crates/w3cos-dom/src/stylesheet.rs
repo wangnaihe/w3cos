@@ -773,6 +773,23 @@ pub fn matching_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<(String, String, u32)> {
+    matching_cascade_declarations_for_node(document, node)
+        .into_iter()
+        .map(|declaration| (declaration.property, declaration.value, declaration.specificity))
+        .collect()
+}
+
+pub(crate) struct CascadeDeclaration {
+    pub property: String,
+    pub value: String,
+    pub specificity: u32,
+    pub important: bool,
+}
+
+pub(crate) fn matching_cascade_declarations_for_node(
+    document: &Document,
+    node: NodeId,
+) -> Vec<CascadeDeclaration> {
     let ancestor_bloom = AncestorBloom::for_node(document, node);
     RULES.with(|rules| {
         let rules = rules.borrow();
@@ -808,7 +825,10 @@ pub fn matching_declarations_for_node(
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
                     let (value, is_important) = declaration_value_and_importance(value);
-                    let declaration = (prop.clone(), value.to_string(), rule.specificity);
+                    let declaration = CascadeDeclaration {
+                        property: prop.clone(), value: value.to_string(),
+                        specificity: rule.specificity, important: is_important,
+                    };
                     if is_important {
                         important.push(declaration);
                     } else {
@@ -876,7 +896,7 @@ pub fn matching_pseudo_declarations_for_node(
     })
 }
 
-fn declaration_value_and_importance(value: &str) -> (&str, bool) {
+pub(crate) fn declaration_value_and_importance(value: &str) -> (&str, bool) {
     let value = value.trim();
     let Some(marker) = value.rfind('!') else {
         return (value, false);
