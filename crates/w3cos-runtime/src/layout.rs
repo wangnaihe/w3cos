@@ -1731,6 +1731,17 @@ fn leaf_taffy_size(
     viewport_w: f32,
     viewport_h: f32,
 ) -> taffy::Size<Dimension> {
+    let replaced_containing_width = if matches!(kind, ComponentKind::Image { .. })
+        && style.display == WDisplay::Block
+        && matches!(style.width, WDim::Auto)
+    {
+        let padding = style.padding_lengths();
+        let borders = style.border_left_width.unwrap_or(style.border_width)
+            + style.border_right_width.unwrap_or(style.border_width);
+        (containing_width - padding.left - padding.right - borders).max(0.0)
+    } else {
+        containing_width
+    };
     // `display:inline` normally forces both axes to auto in `to_taffy_style`,
     // but replaced elements such as `<img>` still honor their CSS width and
     // height. Use the semantic dimensions here before applying leaf sizing.
@@ -1770,7 +1781,9 @@ fn leaf_taffy_size(
                     height: Dimension::auto(),
                 };
             }
-            _ => leaf_intrinsic_size_with_containing(kind, style, Some(containing_width)).1,
+            _ => {
+                leaf_intrinsic_size_with_containing(kind, style, Some(replaced_containing_width)).1
+            }
         };
         Dimension::length(h)
     } else {
@@ -6240,7 +6253,11 @@ fn build_taffy_tree(
         let constrained_replaced_size = if let ComponentKind::Image { src } = &comp.kind
             && let Some(ratio) = image_intrinsic_ratio(src)
         {
-            style.aspect_ratio = Some(ratio);
+            if !matches!(comp.style.width, WDim::Auto)
+                || !matches!(comp.style.height, WDim::Auto)
+            {
+                style.aspect_ratio = Some(ratio);
+            }
             if !matches!(comp.style.width, WDim::Auto | WDim::Percent(_))
                 && matches!(comp.style.height, WDim::Auto)
                 && let Some(mut used_width) = comp.style.width.resolve(
@@ -6423,10 +6440,24 @@ fn build_taffy_tree(
                     (Dimension::length(w), Dimension::length(w))
                 }
                 ComponentKind::Image { src } => {
+                    let intrinsic_containing_width = if comp.style.display == WDisplay::Block {
+                        let padding = comp.style.padding_lengths();
+                        let borders = comp
+                            .style
+                            .border_left_width
+                            .unwrap_or(comp.style.border_width)
+                            + comp
+                                .style
+                                .border_right_width
+                                .unwrap_or(comp.style.border_width);
+                        (containing_width - padding.left - padding.right - borders).max(0.0)
+                    } else {
+                        containing_width
+                    };
                     let w = leaf_intrinsic_size_with_containing(
                         &comp.kind,
                         &comp.style,
-                        Some(containing_width),
+                        Some(intrinsic_containing_width),
                     )
                     .0;
                     let size = if !matches!(comp.style.height, WDim::Auto)
@@ -11415,6 +11446,39 @@ mod tests {
         crate::image_loader::invalidate(explicit_axes);
         crate::image_loader::invalidate(height_only);
         crate::image_loader::invalidate(no_intrinsic_size);
+    }
+
+    #[test]
+    fn block_replaced_auto_width_uses_parent_width_before_intrinsic_ratio() {
+        let source = "browser-layout-block-auto-ratio.svg";
+        crate::image_loader::decode_and_install(
+            source,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 2"/>"#,
+        )
+        .unwrap();
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![Component::image(
+                source,
+                Style {
+                    display: WDisp::Block,
+                    padding: w3cos_std::style::Edges {
+                        right: WSpacing::Px(100.0),
+                        ..w3cos_std::style::Edges::ZERO
+                    },
+                    ..Style::default()
+                },
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!((image.width, image.height), (200.0, 200.0));
+        crate::image_loader::invalidate(source);
     }
 
     #[test]
