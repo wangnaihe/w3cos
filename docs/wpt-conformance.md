@@ -500,6 +500,23 @@ difference is zero. No fixture, suite or pixel tolerance changed.
 Next progression: 5257. Cases 4314/4947/5110 and the final complete
 6,548-case proof remain open.
 
+5257–5264 initially passed 3/8. 5259 (collapsed row/column tracks) had
+20,000 differing pixels; 5260–5263 (`border-conflict-element-001a/b/c/d`)
+had 6,000/6,000/10,000/16,800. Original full-suite receipts had passed
+5260–5262, so those are regressions, not newly discovered baseline failures.
+Their cause was the side-color finalizer added in `b28fbeeb`: it selected
+the first token of a multi-value border-color for every physical edge,
+overwriting the already expanded colors. The new DOM RED expected a green
+right edge but obtained red. The finalizer now uses the existing 1–4-color
+expansion parser for border-color while preserving last-declaration
+selection and relative side-shorthand handling. That unit and three color
+regressions pass (4/4). Strict `physical-border-colors-v1` receipts pass
+5260–5263 with zero pixels and 5241–5248 / 5249–5256 with 8/8 each.
+5257–5264 is now 7/8: 5259 remains at 20,000 pixels, with native height
+200 and a projected column reaching width 150 instead of the 100×100
+reference square. Progression is stopped there; no later batch, WPT input
+or tolerance change. Cases 4314/4947/5110 and full-suite proof remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -1609,7 +1609,7 @@ fn parse_border_width_edges(value: &str) -> Option<[f32; 4]> {
     }
 }
 
-fn parse_border_color_edges(value: &str) -> Option<[Color; 4]> {
+pub(crate) fn parse_border_color_edges(value: &str) -> Option<[Color; 4]> {
     let values = split_css_whitespace(value)
         .into_iter()
         .map(|value| Color::from_css(&value))
