@@ -1373,7 +1373,9 @@ fn draw_text_in_rect(
             alignment_ink_left,
             advance,
         );
-        let ink_bottom_overflow = if line_height <= 0.0 {
+        // The monospace path paints on a fixed em baseline. Fallback ink
+        // bounds must not move that baseline according to the string's glyphs.
+        let ink_bottom_overflow = if line_height <= 0.0 || style_uses_generic_monospace(style) {
             0.0
         } else {
             (ink.top + ink.height - line_height).max(0.0)
@@ -2805,6 +2807,34 @@ mod tests {
         let space = measure_skia_text_advance(" ", &primary, &style);
         let non_breaking_space = measure_skia_text_advance("\u{00a0}", &primary, &style);
         assert!((space - non_breaking_space).abs() < 0.01);
+    }
+
+    #[test]
+    fn monospace_overlays_keep_a_shared_baseline_independent_of_glyphs() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style {
+            display: Display::Inline, font_family: Some("monospace".to_string()),
+            font_size: 32.0, font_weight: 700, line_height: 1.0,
+            color: w3cos_std::color::Color::BLACK, ..Style::default()
+        };
+        let render = |lines: &[&str]| {
+            let mut surface = Surface::new_raster_n32_premul((240, 96)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            for line in lines {
+                draw_text_in_rect(surface.canvas(), LayoutRect {
+                    x: 8.0, y: 40.0, width: 220.0, height: 32.0,
+                }, line, &style, &typeface, crate::layout::layout_font());
+            }
+            let info = ImageInfo::new((240, 96), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 240 * 96 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 240 * 4, (0, 0)));
+            pixels
+        };
+        let actual = render(&["FAIL \u{a0}\u{a0}\u{a0}\u{a0}",
+            "#\u{a0}\u{a0}\u{a0} P\u{a0}\u{a0}\u{a0}",
+            "\u{a0}##\u{a0} \u{a0}A\u{a0}\u{a0}", "\u{a0}\u{a0}\u{a0}# \u{a0}\u{a0}SS"]);
+        let expected = render(&["FAIL PASS", "####"]);
+        assert_eq!(actual.iter().zip(&expected).filter(|(a, b)| a != b).count(), 0);
     }
 
     #[test]
