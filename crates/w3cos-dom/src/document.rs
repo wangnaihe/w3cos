@@ -8607,6 +8607,13 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     true
 }
 
+fn text_has_internal_soft_wrap_space(component: &w3cos_std::Component) -> bool {
+    !matches!(component.style.white_space,
+        w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre)
+        && matches!(&component.kind, w3cos_std::ComponentKind::Text { content }
+            if content.trim_matches(is_css_whitespace).chars().any(is_css_whitespace))
+}
+
 fn plain_anonymous_inline_table_text(
     component: &w3cos_std::Component,
 ) -> Option<w3cos_std::Component> {
@@ -8662,6 +8669,9 @@ fn plain_anonymous_inline_table_text(
             }
             if text.is_empty() {
                 return true;
+            }
+            if text_has_internal_soft_wrap_space(component) {
+                return false;
             }
             if let Some(style) = text_style.as_ref()
                 && !equivalent_text_paint_style(style, &component.style)
@@ -9539,6 +9549,12 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
             .skip(1)
             .any(|cell| direct_text(cell) != direct_text(&cells[0]))
     {
+        return;
+    }
+
+    if cells.iter().any(|cell| text_has_internal_soft_wrap_space(
+        if direct_text(cell) { cell } else { &cell.children[0] }
+    )) {
         return;
     }
 
@@ -11634,6 +11650,20 @@ mod image_component_tests {
         assert_eq!(text.style.display, Display::Block);
         assert_eq!(text.style.white_space, w3cos_std::style::WhiteSpace::NoWrap);
         assert!(matches!(text.kind, ComponentKind::Text { content } if content == "Row 1Row 2"));
+    }
+
+    #[test]
+    fn wrappable_anonymous_cells_keep_their_grid_identity() {
+        let parent = w3cos_std::style::Style { display: Display::Block, ..Default::default() };
+        let cell_style = w3cos_std::style::Style { display: Display::TableCell, ..parent.clone() };
+        let table = anonymous_table_wrapper(&parent, vec![
+            w3cos_std::Component::text("a b", cell_style.clone()),
+            w3cos_std::Component::text("c d", cell_style),
+        ]);
+        let cells = &table.children[0].children;
+        assert!(matches!(&cells[0].kind, ComponentKind::Text { content } if content == "a b"));
+        assert!(matches!(&cells[1].kind, ComponentKind::Text { content } if content == "c d"));
+        assert!(plain_anonymous_inline_table_text(&table).is_none());
     }
 
     #[test]

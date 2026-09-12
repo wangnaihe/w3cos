@@ -897,6 +897,30 @@ profile. All reftests have zero pixel allowances. The next sequential
 start is 5473; these are incremental receipts, not final same-SHA
 6548-case proof. No upstream inputs or tolerance changed.
 
+### Wrappable anonymous cell identity repair (2026-09-13)
+
+On `4f6c7d2`, strict `anonymous-row-whitespace-v2` starts 5473, 5481 and
+5489 pass 24/24. Start 5497 completes all eight with six passes and two
+failures: anonymous objects 155/156 (indices 5500/5501), each differing
+by 785 pixels. No 5505 batch starts. Both fixtures replace an inter-cell
+whitespace text node with a middle row on load; the old lowering flattens
+the last anonymous row and wraps its final `Col 3` below the overlay.
+The original report classifies both as XML-script parse errors, not new
+tests introduced in this run.
+
+A unit first fails because two `normal` cells containing `a b` and `c d`
+lose their separate contents. Text with internal soft-wrap whitespace
+now bypasses both anonymous-cell concatenation and plain-table text
+lowering, retaining the table grid instead of forcing nowrap or altering
+font defaults. Anonymous units pass 25/25; cache/inheritance 36/36 and
+stylesheet 39/39 pass (100 distinct scoped units).
+
+The rebuilt runner takes 1m50s. Strict `wrappable-table-grid-v1` receipts
+for starts 5497, 5489, 5433, 5401, 5369 and 1130 pass 48/48. Both 155/156
+have max difference 0 and differing pixels 0 with both allowances 0.
+No WPT inputs, font defaults, suite, viewport or tolerances changed.
+Next sequential start is 5505; final 6548-case same-SHA proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
