@@ -5310,10 +5310,9 @@ fn project_table_column_background_rects(
                         projected.width += right;
                         projected.height += top + bottom;
                     }
-                    WDisplay::TableColumnGroup | WDisplay::TableColumn => {
-                        projected.width += right;
-                        projected.height += top + bottom;
-                    }
+                    // Column backgrounds and used boxes stay on their grid
+                    // tracks. Shared border halves are handled by painting.
+                    WDisplay::TableColumnGroup | WDisplay::TableColumn => {}
                     _ => {}
                 }
             }
@@ -15099,6 +15098,81 @@ mod tests {
         let caption = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
 
         assert_eq!((caption.x, caption.y), (table.x, table.y));
+    }
+
+    #[test]
+    fn collapsed_columns_keep_grid_boxes_while_borders_cross_edges() {
+        let column = |left, right| {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableColumn,
+                    border_collapse: true,
+                    border_left_width: Some(left),
+                    border_right_width: Some(right),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                ..Style::default()
+            },
+            vec![
+                column(0.0, 100.0),
+                column(100.0, 0.0),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell(), cell()],
+                ),
+            ],
+        );
+        let flat = pre_flatten(&table);
+        let rect = |x, width| LayoutRect {
+            x,
+            y: 0.0,
+            width,
+            height: 100.0,
+        };
+        let mut layout = vec![
+            (rect(0.0, 100.0), 0),
+            (rect(0.0, 0.0), 1),
+            (rect(0.0, 0.0), 2),
+            (rect(0.0, 100.0), 3),
+            (rect(0.0, 50.0), 4),
+            (rect(50.0, 50.0), 5),
+        ];
+        project_table_column_background_rects(&mut layout, &flat);
+        assert_eq!(layout[1].0, rect(0.0, 50.0));
+        assert_eq!(layout[2].0, rect(50.0, 50.0));
+        assert_eq!(layout[4].0, rect(0.0, 50.0));
+        assert_eq!(layout[5].0, rect(50.0, 50.0));
+        let right = crate::paint_artifact::border_edge_paint_rects(
+            flat[1].style,
+            layout[1].0,
+            [0.0, 100.0, 0.0, 0.0],
+        )[1];
+        let left = crate::paint_artifact::border_edge_paint_rects(
+            flat[2].style,
+            layout[2].0,
+            [0.0, 0.0, 0.0, 100.0],
+        )[3];
+        assert_eq!(right, rect(0.0, 100.0));
+        assert_eq!(left, right);
     }
 
     #[test]

@@ -517,6 +517,23 @@ regressions pass (4/4). Strict `physical-border-colors-v1` receipts pass
 reference square. Progression is stopped there; no later batch, WPT input
 or tolerance change. Cases 4314/4947/5110 and full-suite proof remain open.
 
+5259's column projection is partially repaired: used column/background
+boxes now remain on their grid tracks; the Skia edge-border path paints
+collapsed column borders centered on grid lines, including uniform-width
+column borders. Chromium gives column widths 50/0/50 and table height 100.
+Native widths were 150/0/50 and now are 50/0/50. The initial diagnostic
+unit exposed width 150 versus an assumed 100-pixel paint frame; that
+assumption was corrected using Chromium's 50-pixel used column box.
+The final strengthened unit checks both 50-pixel grid boxes and the
+separate 100-pixel shared border rectangles, leaving cell geometry intact.
+It and five related geometry/paint regressions pass (6/6).
+Strict receipts with suffix `column-grid-border-paint-v1`: 5241–5248 and
+5249–5256 pass 8/8 each; 5257–5264 stays 7/8. 5259's differing pixels
+decreased from 20,000 to 10,000, but its native table height is still 200.
+It is NOT resolved. The next scope is row/shared-border layout and paint
+projection, without scaling the whole table or modifying WPT/tolerances.
+No later batch was run; full-suite proof remains outstanding.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

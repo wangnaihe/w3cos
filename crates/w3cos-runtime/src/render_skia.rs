@@ -811,7 +811,9 @@ fn render_node(
         || style.border_top_color.is_some()
         || style.border_right_color.is_some()
         || style.border_bottom_color.is_some()
-        || style.border_left_color.is_some();
+        || style.border_left_color.is_some()
+        || (style.border_collapse
+            && matches!(style.display, Display::TableColumn | Display::TableColumnGroup));
     if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         let mut border = color_paint(style.border_color, style.opacity);
         border.set_style(paint::Style::Stroke);

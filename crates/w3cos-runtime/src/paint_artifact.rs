@@ -882,6 +882,38 @@ pub(crate) fn border_edge_paint_rects(
     rect: LayoutRect,
     widths: [f32; 4],
 ) -> [LayoutRect; 4] {
+    if style.border_collapse
+        && matches!(style.display, Display::TableColumn | Display::TableColumnGroup)
+    {
+        // Column boxes describe grid tracks, not inset border boxes. A
+        // collapsed border is centered on the corresponding grid line.
+        return [
+            LayoutRect {
+                x: rect.x,
+                y: rect.y - widths[0] / 2.0,
+                width: rect.width,
+                height: widths[0],
+            },
+            LayoutRect {
+                x: rect.x + rect.width - widths[1] / 2.0,
+                y: rect.y,
+                width: widths[1],
+                height: rect.height,
+            },
+            LayoutRect {
+                x: rect.x,
+                y: rect.y + rect.height - widths[2] / 2.0,
+                width: rect.width,
+                height: widths[2],
+            },
+            LayoutRect {
+                x: rect.x - widths[3] / 2.0,
+                y: rect.y,
+                width: widths[3],
+                height: rect.height,
+            },
+        ];
+    }
     let suppressed = |name: &str| collapsed_border_suppressed(style, name);
     let top = if suppressed("top") { widths[0] } else { 0.0 };
     let right = if suppressed("right") { widths[1] } else { 0.0 };
