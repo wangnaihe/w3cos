@@ -999,6 +999,18 @@ for starts 5537, 5529, 5497, 5433, 5401, 5369 and 1130 pass 56/56.
 No fixed WPT input, font default, suite, viewport or tolerance changed.
 Next sequential start is 5545; final 6548-case proof remains open.
 
+### Sequential stop at replaced-cell preformatted content (2026-09-13)
+
+On `b438ac2`, strict `pre-improper-space-v1` start 5545 completes all
+eight with seven passes and one failure: anonymous objects 211 differs
+by 450 pixels against its dedicated 211 reference (original report also
+fails, 82400 pixels). No 5553 batch starts. The source requires images
+authored as table-cell to participate as inline replaced content inside
+one generated cell, including leading space, tabs and trailing spaces;
+the reference uses an explicit cell around that same content. Next scope
+is the anonymous cell inline formatting context and replaced-item spacing.
+No WPT input or tolerance changes, and final 6548-case proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
