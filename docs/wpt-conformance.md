@@ -838,6 +838,57 @@ which overlay is absolutely positioned. The next scope is anonymous
 table splitting and absolute overlay geometry, not further suite runs.
 No WPT input, suite, viewport or tolerance changed.
 
+### Anonymous block-table text flow candidate (2026-09-13, local)
+
+The 081 layout dump exposed block anonymous tables lowered to inline text,
+with nowrap forcibly normalized to normal. A new invariant unit first
+failed Inline-versus-Block, then passed with block flow and nowrap retained.
+The lowering no longer inserts U+2028 separators to emulate block edges;
+the existing sibling-boundary unit now checks two actual text fragments
+with the lower one block-level rather than requiring that encoding.
+Chromium confirms the authored block spans retain nowrap and separate
+vertical rows (its font metrics are not substituted for native pixels).
+
+The rebuilt runner takes 1m50s. Strict `anonymous-block-flow-v1` starts
+5433, 5401 and 5425 pass 24/24, including all four previous failures at
+zero pixel difference and zero allowances. Anonymous-filter unit results
+are 22 passed, 1 failed: hidden-script table text now collects `a bc d`
+where the existing unit expects `abcd`. This whitespace discrepancy is
+not yet resolved; the candidate remains local and is not declared fully
+validated. No 5441 batch or final full run has started.
+
+### Preformatted row whitespace prerequisite closed (2026-09-13)
+
+The remaining hidden-script unit did not actually create its intended
+TableRow/Pre case: the Rust primitive attribute setter stores `style`
+without invoking the runtime's style parser. Both affected units now use
+the typed style entry and assert computed TableRow/Pre before proceeding.
+This does not alter the browser JS attribute/parser path or WPT inputs.
+
+Chromium DOM-created fixtures establish that isolated leading row space
+is absent, preserved trailing bare-text space survives hidden scripts,
+and spaces within one significant `" bc "` text node remain. The row
+fixup excludes display:none boxes and retains preformatted trailing space
+only in an existing anonymous text run. The inline-element fixture checks
+`abcd`; the bare-text/hidden-script fixture checks `abc d`, rather than
+incorrectly dropping the legal trailing space. These are corrections to
+invalid Rust test prerequisites, not changes to the upstream reference.
+See [CSS2 anonymous table objects](https://www.w3.org/TR/CSS2/tables.html#anonymous-boxes)
+for irrelevant-box and missing-wrapper processing.
+
+With the corrected prerequisites, temporarily restoring the old row
+branch reproduces both failures (21 passed, 2 failed). Restoring the
+fix passes 23/23; an additional significant-text edge-space invariant
+passes too, yielding anonymous units 24/24. Cache/inheritance 36/36 and
+stylesheet 39/39 also pass (99 distinct scoped passes, not the full DOM
+suite). The earlier CSSStyle ch-versus-em assertion remains separately
+open; final 6548-case proof is not yet available.
+
+The rebuilt runner takes 1m50s. Strict `anonymous-row-whitespace-v2`
+receipts for starts 5433, 5401, 5425, 5393, 5369 and 1130 pass 48/48.
+081–084 remain at zero pixel difference with zero allowances. This closes
+the candidate's hidden-script prerequisite; next sequential start is 5441.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

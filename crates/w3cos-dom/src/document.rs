@@ -8744,8 +8744,11 @@ fn plain_anonymous_inline_table_text(
     if collapse_css_whitespace(&content, true, true) != content {
         return None;
     }
-    style.display = Display::Inline;
-    style.white_space = w3cos_std::style::WhiteSpace::Normal;
+    style.display = if component.style.display == Display::Table {
+        Display::Block
+    } else {
+        Display::Inline
+    };
     Some(w3cos_std::Component::text(content, style))
 }
 
@@ -8769,51 +8772,15 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
         )
     };
     let children = std::mem::take(&mut component.children);
-    let child_displays = children
-        .iter()
-        .map(|child| child.style.display)
-        .collect::<Vec<_>>();
     let mut coalesced: Vec<w3cos_std::Component> = Vec::with_capacity(children.len());
-    for (index, mut fragment) in children.into_iter().enumerate() {
+    for mut fragment in children {
         if fragment.style.display == w3cos_std::style::Display::None {
             continue;
         }
         if empty_inline_box_has_no_area(&fragment) {
             continue;
         }
-        let anonymous_block_table = fragment.style.display == w3cos_std::style::Display::Table;
-        if let Some(mut text) = plain_anonymous_inline_table_text(&fragment) {
-            if anonymous_block_table {
-                let has_previous_inline = coalesced.last().is_some_and(|previous| {
-                    matches!(
-                        previous.style.display,
-                        w3cos_std::style::Display::Inline
-                            | w3cos_std::style::Display::InlineBlock
-                            | w3cos_std::style::Display::InlineFlex
-                            | w3cos_std::style::Display::InlineTable
-                    )
-                });
-                let has_following_inline = child_displays[index + 1..]
-                    .iter()
-                    .find(|display| **display != w3cos_std::style::Display::None)
-                    .is_some_and(|display| {
-                        matches!(
-                            display,
-                            w3cos_std::style::Display::Inline
-                                | w3cos_std::style::Display::InlineBlock
-                                | w3cos_std::style::Display::InlineFlex
-                                | w3cos_std::style::Display::InlineTable
-                        )
-                    });
-                if let ComponentKind::Text { content } = &mut text.kind {
-                    if has_previous_inline {
-                        content.insert_str(0, "\u{2028} ");
-                    }
-                    if has_following_inline {
-                        content.push('\u{2028}');
-                    }
-                }
-            }
+        if let Some(text) = plain_anonymous_inline_table_text(&fragment) {
             fragment = text;
         }
         loop {
@@ -9608,7 +9575,6 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
         .collect::<String>();
     if direct_text(&cells[0]) {
         cells[0].kind = w3cos_std::ComponentKind::Text { content };
-        cells[0].style.white_space = WhiteSpace::Normal;
         for cell in &mut cells[1..] {
             cell.kind = w3cos_std::ComponentKind::Text {
                 content: String::new(),
@@ -9616,7 +9582,6 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
         }
     } else {
         cells[0].children[0].kind = w3cos_std::ComponentKind::Text { content };
-        cells[0].children[0].style.white_space = WhiteSpace::Normal;
         for cell in &mut cells[1..] {
             cell.children[0].kind = w3cos_std::ComponentKind::Text {
                 content: String::new(),
@@ -9639,6 +9604,9 @@ fn fixup_css_table_children(
             let mut pending_whitespace = None;
 
             for child in children {
+                if child.style.display == Display::None {
+                    continue;
+                }
                 let starts_replaced_cell_run = child
                     .style
                     .custom_properties
@@ -9693,7 +9661,15 @@ fn fixup_css_table_children(
                         parent_style.white_space,
                         w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap
                     ) {
-                        anonymous_children.push(child);
+                        // An isolated whitespace box adds no preserved text.
+                        // After anonymous text starts a run, however, its
+                        // preserved trailing whitespace remains in that run.
+                        if anonymous_children.last().is_some_and(|previous| {
+                            matches!(previous.kind, w3cos_std::ComponentKind::Text { .. })
+                                && matches!(previous.on_click, w3cos_std::EventAction::None)
+                        }) {
+                            anonymous_children.push(child);
+                        }
                         continue;
                     }
                     if !anonymous_children.is_empty() {
@@ -11642,6 +11618,25 @@ mod image_component_tests {
     }
 
     #[test]
+    fn anonymous_block_table_text_keeps_block_flow_and_nowrap() {
+        let parent = w3cos_std::style::Style {
+            display: Display::Block,
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            ..Default::default()
+        };
+        let cells = ["Row 1", "Row 2"].into_iter().map(|content| {
+            let mut style = parent.clone();
+            style.display = Display::TableCell;
+            w3cos_std::Component::text(content, style)
+        }).collect();
+        let table = anonymous_table_wrapper(&parent, cells);
+        let text = plain_anonymous_inline_table_text(&table).expect("plain table text");
+        assert_eq!(text.style.display, Display::Block);
+        assert_eq!(text.style.white_space, w3cos_std::style::WhiteSpace::NoWrap);
+        assert!(matches!(text.kind, ComponentKind::Text { content } if content == "Row 1Row 2"));
+    }
+
+    #[test]
     fn optimized_text_table_cells_share_one_text_shaping_run() {
         let cell = |content: &str, white_space| {
             let mut style = w3cos_std::style::Style {
@@ -11803,15 +11798,14 @@ mod image_component_tests {
     }
 
     #[test]
-    fn preformatted_anonymous_cell_preserves_spaces_around_inline_content() {
+    fn preformatted_anonymous_cell_discards_isolated_spaces_around_inline_element() {
         let mut document = Document::new();
         let host = document.create_element("div");
         let row = document.create_element("span");
-        row.set_attribute(
-            &mut document,
-            "style",
-            "display: table-row; white-space: pre",
-        );
+        row.style_mut(&mut document).set_property("display", "table-row");
+        row.style_mut(&mut document).set_property("white-space", "pre");
+        assert_eq!(document.computed_style_for(row.id).display, Display::TableRow);
+        assert_eq!(document.computed_style_for(row.id).white_space, w3cos_std::style::WhiteSpace::Pre);
         let append =
             |document: &mut Document, row: Element, content: &str, display: Option<&str>| {
                 let child = document.create_element("span");
@@ -11842,7 +11836,7 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let mut text = String::new();
         collect(&tree, &mut text);
-        assert_eq!(text, "a bc d");
+        assert_eq!(text, "abcd");
     }
 
     #[test]
@@ -11850,11 +11844,10 @@ mod image_component_tests {
         let mut document = Document::new();
         let host = document.create_element("div");
         let row = document.create_element("span");
-        row.set_attribute(
-            &mut document,
-            "style",
-            "display: table-row; white-space: pre",
-        );
+        row.style_mut(&mut document).set_property("display", "table-row");
+        row.style_mut(&mut document).set_property("white-space", "pre");
+        assert_eq!(document.computed_style_for(row.id).display, Display::TableRow);
+        assert_eq!(document.computed_style_for(row.id).white_space, w3cos_std::style::WhiteSpace::Pre);
         let append_cell = |document: &mut Document, row: Element, content: &str| {
             let cell = document.create_element("span");
             cell.style_mut(document)
@@ -11893,7 +11886,33 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let mut text = String::new();
         collect(&tree, &mut text);
-        assert_eq!(text, "abcd");
+        assert_eq!(text, "abc d");
+    }
+
+    #[test]
+    fn preformatted_anonymous_cell_keeps_significant_text_edge_spaces() {
+        let parent = w3cos_std::style::Style {
+            display: Display::TableRow,
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            ..Default::default()
+        };
+        let text_style = w3cos_std::style::Style {
+            display: Display::Inline,
+            ..parent.clone()
+        };
+        let cell_style = w3cos_std::style::Style {
+            display: Display::TableCell,
+            ..parent.clone()
+        };
+        let cells = fixup_css_table_children(&parent, vec![
+            w3cos_std::Component::text("a", cell_style.clone()),
+            w3cos_std::Component::text(" bc ", text_style),
+            w3cos_std::Component::text("d", cell_style),
+        ]);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1].style.white_space, w3cos_std::style::WhiteSpace::Pre);
+        assert!(matches!(&cells[1].children[0].kind,
+            ComponentKind::Text { content } if content == " bc "));
     }
 
     #[test]
@@ -11966,17 +11985,19 @@ mod image_component_tests {
         cell.set_text_content(&mut document, "below");
         document.body().append_child(&mut document, cell);
 
-        fn collect(component: &w3cos_std::Component, text: &mut String) {
+        fn collect(component: &w3cos_std::Component, text: &mut Vec<(Display, String)>) {
             if let ComponentKind::Text { content } = &component.kind {
-                text.push_str(content);
+                text.push((component.style.display, content.clone()));
             }
             for child in &component.children {
                 collect(child, text);
             }
         }
-        let mut text = String::new();
+        let mut text = Vec::new();
         collect(&document.to_component_tree(), &mut text);
-        assert_eq!(text, "above\u{2028} below");
+        assert_eq!(text.len(), 2);
+        assert_eq!(text[0].1, "above");
+        assert_eq!(text[1], (Display::Block, "below".to_string()));
     }
 
     #[test]
