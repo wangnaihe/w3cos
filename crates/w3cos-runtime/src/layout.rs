@@ -6389,6 +6389,16 @@ fn build_taffy_tree(
         } else {
             (Dimension::auto(), size.width)
         };
+        let min_w = if matches!(comp.style.min_width, WDim::Auto) {
+            min_w
+        } else {
+            to_taffy_dim(
+                comp.style.min_width,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            )
+        };
         let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto)
             && matches!(comp.style.max_height, WDim::Auto)
         {
@@ -10991,6 +11001,31 @@ mod tests {
         assert_eq!(rect(0).height, 600.0);
         assert_eq!(rect(1).height, 600.0);
         assert_eq!(rect(2).height, 600.0);
+    }
+
+    #[test]
+    fn block_min_width_overrides_zero_width() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(0.0),
+                    min_width: WDim::Px(96.0),
+                    height: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                Vec::new(),
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let constrained = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!((constrained.width, constrained.height), (96.0, 96.0));
     }
 
     #[test]
