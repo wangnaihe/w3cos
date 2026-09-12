@@ -23,9 +23,12 @@ styles and native component builders. CSS initial styles and omitted
 line-height in the `font` shorthand set it to `true`; explicit line-height
 values clear it, and inheritance carries both fields together. Font-dependent
 used-value resolution must occur before inline lowering so layout struts and
-paint receive the same resolved height. Until a metrics provider is wired,
-`line_height` retains the numeric fallback; representation alone is not proof
-of font-metric or WPT conformance.
+paint receive the same resolved height. The runtime DOM tree entry point now
+installs a revisioned provider using the registered face's shared fontdue line
+metrics. Font registration/removal invalidates cached used values on the next
+tree build. Unregistered fonts retain the numeric fallback; shadow/frame tree
+entry points and mixed fallback-font line metrics still need separate proof.
+Representation or provider wiring alone is not proof of WPT conformance.
 
 ## Prepare the pinned upstream checkout
 

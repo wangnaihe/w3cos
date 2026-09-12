@@ -34,6 +34,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Convert a browser font container into the sfnt bytes consumed by layout and
 /// every renderer. Keeping this at the registry boundary prevents the browser
@@ -377,6 +378,7 @@ pub(crate) struct ResolvedFontRun {
 ///
 /// Access via `FontRegistry::global()`. Thread-safe.
 pub struct FontRegistry {
+    revision: AtomicU64,
     fonts: Mutex<HashMap<FontKey, Vec<(u64, LoadedFont)>>>,
     /// Ordered list of registered families (for CSS `font-family` stack resolution).
     families: Mutex<Vec<(u64, String)>>,
@@ -444,6 +446,7 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
 impl FontRegistry {
     fn new() -> Self {
         Self {
+            revision: AtomicU64::new(0),
             fonts: Mutex::new(HashMap::new()),
             families: Mutex::new(Vec::new()),
         }
@@ -452,6 +455,27 @@ impl FontRegistry {
     /// Access the global font registry (lazily initialized).
     pub fn global() -> &'static FontRegistry {
         GLOBAL_REGISTRY.get_or_init(FontRegistry::new)
+    }
+
+    /// Revision for invalidating styles resolved before font loading completed.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Resolve the font's own line metrics using the shared parsed face.
+    pub fn normal_line_height(&self, style: &w3cos_std::style::Style) -> Option<f32> {
+        use w3cos_std::style::FontStyle;
+        let font_style = match style.font_style {
+            FontStyle::Normal => FontFaceStyle::Normal,
+            FontStyle::Italic => FontFaceStyle::Italic,
+            FontStyle::Oblique => FontFaceStyle::Oblique,
+        };
+        let font = self.resolve_stack(
+            style.font_family.as_deref()?, FontWeight(style.font_weight), font_style,
+        )?;
+        let metrics = font.parsed()?.horizontal_line_metrics(style.font_size)?;
+        let ratio = metrics.new_line_size / style.font_size;
+        (ratio.is_finite() && ratio > 0.0).then_some(ratio)
     }
 
     /// Register a `@font-face` rule. Loads font data immediately.
@@ -535,6 +559,7 @@ impl FontRegistry {
         {
             families.push((owner, face.family));
         }
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -565,6 +590,7 @@ impl FontRegistry {
         });
         let mut families = self.families.lock().unwrap();
         families.retain(|(existing_owner, _)| *existing_owner != owner);
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
     /// Resolve a font by family name, weight, and style.
@@ -1048,6 +1074,31 @@ mod tests {
         assert_ne!(host.font.lookup_glyph_index('A'), 0);
         #[cfg(target_os = "macos")]
         assert_ne!(host.font.lookup_glyph_index('输'), 0);
+    }
+
+    #[test]
+    fn normal_line_height_uses_loaded_metrics_and_tracks_font_revision() {
+        let registry = FontRegistry::new();
+        let style = w3cos_std::style::Style {
+            font_family: Some("MetricFixture".into()),
+            font_size: 20.0,
+            ..Default::default()
+        };
+        assert!(registry.normal_line_height(&style).is_none());
+        let before = registry.revision();
+        registry.register_for_owner(42, FontFace {
+            family: "MetricFixture".into(),
+            src: FontSource::Bytes(include_bytes!("../assets/Inter-Regular.ttf").to_vec()),
+            ..Default::default()
+        }).unwrap();
+        assert!(registry.revision() > before);
+        let font = registry.resolve("MetricFixture", FontWeight::NORMAL, FontFaceStyle::Normal).unwrap();
+        let expected = font.parsed().unwrap().horizontal_line_metrics(20.0).unwrap().new_line_size / 20.0;
+        assert_eq!(registry.normal_line_height(&style), Some(expected));
+        let loaded = registry.revision();
+        registry.clear_owner(42);
+        assert!(registry.revision() > loaded);
+        assert!(registry.normal_line_height(&style).is_none());
     }
 
     #[test]
