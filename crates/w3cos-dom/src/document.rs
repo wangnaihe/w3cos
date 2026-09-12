@@ -2918,6 +2918,39 @@ impl Document {
         false
     }
 
+    fn inline_flow_needs_leading_space(&self, mut inline_id: NodeId) -> bool {
+        use w3cos_std::style::{Display, Float, Position};
+        let mut preceding_space = false;
+        loop {
+            if self.computed_style_for(inline_id).display != Display::Inline {
+                return false;
+            }
+            let mut sibling = self.get_node(inline_id).prev_sibling;
+            while let Some(id) = sibling {
+                let node = self.get_node(id);
+                sibling = node.prev_sibling;
+                if node.node_type == NodeType::Text {
+                    let raw = node.text_content.as_deref().unwrap_or_default();
+                    if is_only_css_whitespace(raw) {
+                        preceding_space |= !raw.is_empty();
+                        continue;
+                    }
+                    return !preceding_space && !self.inline_ends_with_collapsible_space(id);
+                } else if node.node_type == NodeType::Element {
+                    let style = self.computed_style_for(id);
+                    if style.display == Display::None || style.float != Float::None
+                        || matches!(style.position, Position::Absolute | Position::Fixed)
+                    { continue; }
+                    return matches!(style.display,
+                        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+                        && !preceding_space && !self.inline_ends_with_collapsible_space(id);
+                }
+            }
+            let Some(parent) = self.get_node(inline_id).parent else { return false; };
+            inline_id = parent;
+        }
+    }
+
     fn inline_flow_continues_after(&self, mut inline_id: NodeId) -> bool {
         use w3cos_std::style::{Display, Float, Position};
         loop {
@@ -3076,7 +3109,7 @@ impl Document {
                     .iter()
                     .rev()
                     .find_map(|participates| *participates)
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| self.inline_flow_needs_leading_space(parent_id));
                 let inline_after = participates_in_inline_flow[index + 1..]
                     .iter()
                     .find_map(|participates| *participates)
@@ -3151,7 +3184,7 @@ impl Document {
                     inline && !already_has_space
                 })
             })
-            .unwrap_or(false);
+            .unwrap_or_else(|| child.parent.is_some_and(|parent| self.inline_flow_needs_leading_space(parent)));
         let inline_after = child_ids[index + 1..]
             .iter()
             .find_map(|sibling| sibling_inline_state(*sibling))

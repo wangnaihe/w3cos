@@ -583,6 +583,33 @@ mod tests {
     }
 
     #[test]
+    fn inline_leading_space_observes_the_outer_previous_fragment() {
+        for trailing in [false, true] {
+            let mut doc = Document::new();
+            let parent = doc.create_element("div");
+            let first = doc.create_element("span");
+            doc.get_style_mut(first.id).set_property("position", "relative");
+            let text = doc.create_text_node(if trailing { "Filler Text " } else { "Filler Text" });
+            doc.append_child(first.id, text.id);
+            doc.append_child(parent.id, first.id);
+            let second = doc.create_element("span");
+            let text = doc.create_text_node(" Filler Text");
+            doc.append_child(second.id, text.id);
+            doc.append_child(parent.id, second.id);
+            doc.append_child(doc.body().id, parent.id);
+            fn collect(component: &w3cos_std::Component, output: &mut String) {
+                if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                    output.push_str(content);
+                }
+                for child in &component.children { collect(child, output); }
+            }
+            let mut output = String::new();
+            collect(&doc.to_component_tree(), &mut output);
+            assert_eq!(output, "Filler Text Filler Text", "trailing={trailing}");
+        }
+    }
+
+    #[test]
     fn normal_line_height_keyword_survives_font_inheritance() {
         let mut doc = Document::new();
         let body = doc.body().id;

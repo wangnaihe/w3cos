@@ -84,6 +84,13 @@ Case 4305 moved from 6,432 differing pixels to zero in
 `target/wpt-targeted/batch-4305-4312-float-after-inline-v1/results.json` (5/8).
 4309–4311 still fail; 4105–4112, 4265–4272 and 4297–4304 regressions passed 8/8.
 
+Leading collapsible space inside an inline observes previous outer fragments
+across inline ancestors, retaining one separator without duplicating an already
+owned trailing space. Cases 4309–4311 moved from 567/560/1,120 differing pixels
+to zero in `target/wpt-targeted/batch-4305-4312-outer-leading-space-v1/results.json`
+(8/8). 4297–4304 and 4105–4112 regressions also passed 8/8. The next batch
+4313–4320 passed 5/8, with cases 4314, 4318 and 4319 awaiting repair.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
