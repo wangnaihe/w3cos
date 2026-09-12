@@ -1389,6 +1389,17 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Parent read-only `pnpm files:size:check` passes with violations=0; new replay
   module is 240 lines. Final clean-SHA full 6548 proof is still unachieved.
 
+### Post-bidi sequential checkpoint on 7532b9b
+
+- Starts 5601, 5609, 5617 and 5625 pass 8/8 each, receipts
+  `target/wpt-targeted/batch-<start>-post-bidi-foreground-run-v1/results.json`.
+- Start 5633 stops sequential advancement with 5 passed / 3 failed:
+  `letter-spacing-080.xht` = 1600 differing pixels; `letter-spacing-091.xht`
+  and `letter-spacing-092.xht` = 800 each; all max difference 255.
+  Receipt `target/wpt-targeted/batch-5633-post-bidi-foreground-run-v1/results.json`.
+  Start 5641 was not executed. These failures remain open; final full proof
+  remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
