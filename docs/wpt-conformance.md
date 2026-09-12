@@ -438,6 +438,13 @@ including author-visible head content, passed (four DOM unit tests).
 fixture, suite entry or tolerance changed. Cases 4314/4947/5110 and final
 6,548-case proof remain open. Next progression: 5233.
 
+Following the hidden-display fix, 5233–5240 passed 8/8. Batch 5241–5248
+passed 5/8, stopping on the three related dynamic collapsed-row-border
+cases 5245/5246/5247 (`tables/border-collapse-dynamic-row-001/002/003.xht`):
+2,288/3,660/1,320 differing pixels respectively. Receipts use
+`hidden-inline-context-v1`. No later batch was started; these three cases
+are the next focused repair scope.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
