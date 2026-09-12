@@ -438,6 +438,8 @@ fn annotate_separated_table_background_fragments(
         if !matches!(
             nodes[source].style.display,
             Display::TableColumnGroup | Display::TableColumn
+                | Display::TableRow | Display::TableRowGroup
+                | Display::TableHeaderGroup | Display::TableFooterGroup
         ) || (nodes[source].style.background.a == 0
             && nodes[source].style.background_image.is_none())
         {
@@ -474,7 +476,10 @@ fn annotate_separated_table_background_fragments(
             })
             .map(|(column, _)| column)
             .collect::<std::collections::HashSet<_>>();
-        if covered.is_empty() {
+        let row_source = matches!(nodes[source].style.display,
+            Display::TableRow | Display::TableRowGroup
+                | Display::TableHeaderGroup | Display::TableFooterGroup);
+        if covered.is_empty() && !row_source {
             continue;
         }
         let rows = (0..original_len)
@@ -485,6 +490,9 @@ fn annotate_separated_table_background_fragments(
             .collect::<Vec<_>>();
         let mut fragments = Vec::new();
         for row in rows {
+            if row_source && row != source && !descendant_of(nodes, row, source) {
+                continue;
+            }
             let cells = (0..original_len)
                 .filter(|index| {
                     nodes[*index].parent == Some(row)
@@ -494,7 +502,7 @@ fn annotate_separated_table_background_fragments(
             let mut column = 0usize;
             for cell in cells {
                 let span = column_span(&nodes[cell].style);
-                if (column..column.saturating_add(span)).any(|index| covered.contains(&index))
+                if (row_source || (column..column.saturating_add(span)).any(|index| covered.contains(&index)))
                     && let Some(rect) = rect_by_index.get(cell).copied().flatten()
                 {
                     fragments.push(format!(
@@ -2253,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn separated_row_group_background_is_not_clipped_to_cell_fragments() {
+    fn separated_row_group_background_excludes_cell_spacing() {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
@@ -2324,11 +2332,11 @@ mod tests {
                 .style
                 .custom_properties
                 .as_ref()
-                .is_none_or(|properties| !properties.contains_key(TABLE_BACKGROUND_FRAGMENTS))
+                .is_some_and(|properties| properties.contains_key(TABLE_BACKGROUND_FRAGMENTS))
         );
         assert_eq!(
             box_background_paint_rects(&nodes[1].style, row_group),
-            vec![row_group]
+            vec![LayoutRect { width: 90.0, ..row_group }]
         );
     }
 

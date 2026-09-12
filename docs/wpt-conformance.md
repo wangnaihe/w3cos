@@ -1176,6 +1176,35 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   The other three separated-background failures from batch 5561 still require
   targeted qualification. Final clean-SHA full 6548 proof remains unachieved.
 
+### Separated-background targeted checkpoint
+
+- On `cf4cc5a`, strict batch 5561 completed 5 passed / 3 failed. Receipt:
+  `target/wpt-targeted/batch-5561-collapsed-table-bounds-v1/results.json`.
+  Remaining differences: row 5566 = 504 pixels; rowgroup 5567 = 6966;
+  table 5568 = 48823. No later sequential batch was advanced.
+- CSS2 section 17.6.1 requires row, column and group backgrounds to be
+  invisible in separated-border spacing. The existing rowgroup test asserted
+  the opposite. After replacing that expectation with cell-fragment clipping,
+  the test failed before changing production code (missing fragment metadata).
+  The shared column-background fragment mechanism now includes rows and row
+  groups, retaining full source-box image positioning. The replacement test
+  passes after the production fix; focused `separated` tests pass 2/2 and
+  `background_image` tests pass 17/17.
+- Strict batch 5561 after fragment repair passes 7/8. Row 5566 and rowgroup
+  5567 now have zero pixel differences; table 5568 remains at 48823.
+  Receipt: `target/wpt-targeted/batch-5561-separated-row-clips-v1/results.json`.
+  Runner SHA256:
+  `b4b3f9af680245e6a364ca918b6221aecf21b7e25aa0274eaf5270b680dbf96f`.
+- Starts 5369, 5553, 5545, 5231, 5239, 5247, 5255 and 5263 pass 8/8 each
+  under `target/wpt-targeted/batch-<start>-separated-row-clips-v1/results.json`:
+  64/64 strict related regressions. The fixed revision, 800x600 viewport and
+  zero tolerances remain unchanged; this is not full-suite closure.
+- Independent layout dumps for 5566 and 5568 show tables at x19, y15/162/309,
+  width 329, height 145; upstream reference geometry specifies width 325.
+  Source row boxes are correctly 303x21. The 4px table-width discrepancy is a
+  separate pending repair, not evidence that background clipping alone closes
+  all three failures. Qualification and final full-suite proof remain pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
