@@ -1575,6 +1575,7 @@ fn alignment_ink_left(
             | Display::InlineFlex
             | Display::InlineTable
             | Display::Block
+            | Display::ListItem
     )
         || style_uses_generic_monospace(style) {
         return 0.0;
@@ -2896,6 +2897,7 @@ mod tests {
         let expected = render(Display::Inline);
         for display in [
             Display::Block,
+            Display::ListItem,
             Display::InlineBlock,
             Display::InlineFlex,
             Display::InlineTable,

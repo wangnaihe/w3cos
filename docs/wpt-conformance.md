@@ -570,6 +570,23 @@ index-out-of-bounds failure occur identically in both runs. These are
 not reported as green. No fixture, suite or tolerance was changed;
 the fixed 6,548-case final proof and earlier corpus questions remain open.
 
+### List-item text uses the same glyph origin (2026-09-13)
+
+Case 5271, `caption-side-applies-to-003.xht`, is now zero differing
+pixels (previously 506). Its lowered ListItem text leaf still compensated
+ink bearings, unlike the reference's retained Inline text. ListItem now
+uses the same advance origin as Block and Inline; no list indentation,
+marker or line-height rule changed. Extending the existing pixel test
+produced RED (1,518 differing channel values) and then GREEN. Three
+alignment/half-leading regressions also pass (4/4 selected unit tests).
+Strict `list-origin-v1` receipts pass 5049–5056 and 5057–5064 (16/16).
+The current 5265–5272 batch is 7/8: case 5268 remains at 2,944 pixels,
+so no later batch was started. Chromium loads both cat images and gives
+the source/reference identical image y positions (119 and 310), while
+native dumps differ by 1.92px for the first image; this is the next
+cell-line-box alignment investigation, not a completed fix. No WPT
+input, suite or tolerance was altered; final full-suite proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
