@@ -61,6 +61,14 @@ float-only blocks and mixed normal block flow are excluded. The focused
 passed 8/8, including case 4269's 40px indent assertion (previously 0px).
 4257–4264 and 4105–4112 regression batches each passed 8/8.
 
+Inline text fragments retain glyph-advance origins rather than individually
+compensating negative ink bearings. Case 4292 moved from 78 differing pixels
+to zero in `target/wpt-targeted/batch-4289-4296-inline-bearing-v1/results.json`;
+4281–4288 and 4265–4272 regression batches also passed 8/8. The new serif
+text-box fragmentation regression passed after first failing with 234 channel
+differences. The older `default_ascii_text_is_pixel_invariant_across_inline_fragments`
+test still fails both with and without this change; it is not counted as green.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

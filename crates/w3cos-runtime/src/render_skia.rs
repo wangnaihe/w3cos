@@ -1562,7 +1562,10 @@ fn alignment_ink_left(
     typeface: &Typeface,
     style: &Style,
 ) -> f32 {
-    if style_uses_generic_monospace(style) {
+    // Inline origins are glyph-advance positions in their shared line.
+    // Compensating each fragment's negative bearing shifts letters when a
+    // run is split by otherwise geometry-neutral positioned spans.
+    if style.display == Display::Inline || style_uses_generic_monospace(style) {
         return 0.0;
     }
     let rendered = text_layout::font_render_text_for_style(text, style);
@@ -2854,6 +2857,33 @@ mod tests {
             "#\u{a0}\u{a0}\u{a0} P\u{a0}\u{a0}\u{a0}",
             "\u{a0}##\u{a0} \u{a0}A\u{a0}\u{a0}", "\u{a0}\u{a0}\u{a0}# \u{a0}\u{a0}SS"]);
         let expected = render(&["FAIL PASS", "####"]);
+        assert_eq!(actual.iter().zip(&expected).filter(|(a, b)| a != b).count(), 0);
+    }
+
+    #[test]
+    fn serif_glyph_advances_are_invariant_across_inline_runs() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("serif".into()), color: w3cos_std::color::Color::BLACK,
+            ..Style::default()
+        };
+        let render = |fragments: &[(f32, &str)]| {
+            let mut surface = Surface::new_raster_n32_premul((96, 32)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            for (x, text) in fragments {
+                let width = measure_skia_text_advance(text, &typeface, &style);
+                draw_text_in_rect(surface.canvas(), LayoutRect {
+                    x: *x, y: 4.0, width, height: 16.0,
+                }, text, &style, &typeface, crate::layout::layout_font());
+            }
+            let info = ImageInfo::new((96, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 96 * 32 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 96 * 4, (0, 0)));
+            pixels
+        };
+        let actual = render(&[(8.0, "a"), (15.1015625, " b "), (31.1015625, "c"), (38.203125, " d")]);
+        let expected = render(&[(8.0, "a b c d")]);
         assert_eq!(actual.iter().zip(&expected).filter(|(a, b)| a != b).count(), 0);
     }
 
