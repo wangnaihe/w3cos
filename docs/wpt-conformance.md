@@ -798,6 +798,32 @@ for starts 5401, 5393, 1122, 5257 and 5369 pass 40/40.
 The prescribed user stylesheet runner profile for 1132 is still open;
 these unit results are not its pixel acceptance or final-suite proof.
 
+### Explicit CSS2 userstyle profile and font-weight keywords (2026-09-13)
+
+`--user-stylesheet tests/wpt/profiles/css2-userstyle.css` now forwards the
+same explicit user-origin profile to isolated actual/reference workers.
+Registration runs after navigation reset and before parser/script polling.
+The artifact directory retains an exact copy as `user-stylesheet.css`.
+Profiles currently require unconditional, self-contained rules; media,
+imports, font-face metadata and parser warnings fail explicitly. This is
+not complete dynamic user-stylesheet support. The profile contains the
+upstream 1132 instructions' selectors, without changing upstream inputs.
+
+The first configured 1130 batch passed 7/8: 1132 decreased from 14958 to
+1592 differing pixels, exposing ignored `font-weight: normal` on `<b>`.
+A longhand unit reproduced numeric 700 surviving `normal`; `normal` and
+`bold` now map to 400 and 700 and that unit passes. Cache/inheritance
+36/36 and stylesheet 39/39 pass. CSSStyle tests are 39 passed, 1 failed:
+`negative_margin_and_character_relative_lengths_remain_valid` expects
+`Em(4)` but gets `Ch(4)` on an unchanged length path. That failure remains
+open; the module is not claimed green.
+
+The rebuilt runner completes in 1m51s. Strict `userstyle-profile-v2`
+receipts for starts 1130, 5401, 5393, 1122, 5257 and 5369 pass 48/48.
+1132 has max difference 0 and differing pixels 0 with both allowances 0;
+its retained profile matches the input byte-for-byte. Sequential next
+start remains 5409 and final 6548-case zero-failure proof is still open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

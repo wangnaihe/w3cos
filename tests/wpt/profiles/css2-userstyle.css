@@ -1,0 +1,6 @@
+/* User stylesheet prescribed by CSS2 cascade/html-precedence-004.xht.
+ * Selectors are scoped by the upstream test itself, not renderer exceptions. */
+#hixie-cascade-tests .instructions { display: none; }
+#hixie-cascade-tests .red { color: red; }
+#hixie-cascade-tests .green { color: green; }
+#hixie-cascade-tests .normal { font-weight: normal; }

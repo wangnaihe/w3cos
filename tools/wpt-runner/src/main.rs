@@ -43,6 +43,9 @@ struct Cli {
     /// Per-navigation and testharness completion timeout.
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+    /// Explicit user-origin stylesheet profile, applied to test and reference.
+    #[arg(long)]
+    user_stylesheet: Option<PathBuf>,
     /// Produce evidence without making current conformance failures fatal.
     #[arg(long)]
     report_only: bool,
@@ -256,11 +259,15 @@ fn run_worker(cli: &Cli, manifest: SuiteManifest, mode: InternalMode) -> Result<
         .internal_output
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("internal worker requires an output path"))?;
-    let runner = SuiteRunner::new(
+    let mut runner = SuiteRunner::new(
         cli.wpt_root.clone(),
         manifest,
         Duration::from_millis(cli.timeout_ms),
     );
+    if let Some(path) = &cli.user_stylesheet {
+        runner.set_user_stylesheet(std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read user stylesheet {}", path.display()))?);
+    }
     match mode {
         InternalMode::Testharness => {
             let report = runner.run_testharness_case(index)?;
@@ -281,6 +288,10 @@ fn run_isolated_suite(cli: &Cli, manifest: &SuiteManifest) -> Result<SuiteReport
             cli.artifacts.display()
         )
     })?;
+    if let Some(path) = &cli.user_stylesheet {
+        std::fs::copy(path, cli.artifacts.join("user-stylesheet.css"))
+            .with_context(|| format!("failed to retain user stylesheet profile {}", path.display()))?;
+    }
     let start = cli.case_start.min(manifest.tests.len());
     let end = cli
         .case_limit
@@ -438,6 +449,9 @@ fn spawn_worker(
         .arg(output);
     if reference {
         command.arg("--internal-reference");
+    }
+    if let Some(path) = &cli.user_stylesheet {
+        command.arg("--user-stylesheet").arg(path);
     }
     let mut child = command
         .stdout(Stdio::piped())

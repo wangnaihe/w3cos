@@ -392,8 +392,14 @@ impl CSSStyleDeclaration {
             }
             "font" => apply_font_shorthand(&mut self.inner, value),
             "font-weight" | "fontWeight" => {
-                if let Ok(v) = value.parse() {
-                    self.inner.font_weight = v
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "normal" => self.inner.font_weight = 400,
+                    "bold" => self.inner.font_weight = 700,
+                    _ => {
+                        if let Ok(v) = value.parse() {
+                            self.inner.font_weight = v
+                        }
+                    }
                 }
             }
             "border-radius" | "borderRadius" => {
@@ -2433,6 +2439,15 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn font_weight_keywords_override_existing_numeric_weight() {
+        let mut declaration = super::CSSStyleDeclaration::default();
+        declaration.set_property("font-weight", "700");
+        declaration.set_property("font-weight", "normal");
+        assert_eq!(declaration.inner.font_weight, 400);
+        declaration.set_property("font-weight", "bold");
+        assert_eq!(declaration.inner.font_weight, 700);
+    }
     use super::*;
 
     #[test]

@@ -131,6 +131,7 @@ pub struct SuiteRunner {
     root: PathBuf,
     manifest: SuiteManifest,
     timeout: Duration,
+    user_stylesheet: Option<String>,
 }
 
 impl SuiteRunner {
@@ -139,7 +140,12 @@ impl SuiteRunner {
             root,
             manifest,
             timeout,
+            user_stylesheet: None,
         }
+    }
+
+    pub fn set_user_stylesheet(&mut self, source: String) {
+        self.user_stylesheet = Some(source);
     }
 
     pub fn run_testharness_case(&self, index: usize) -> Result<TestReport> {
@@ -177,6 +183,7 @@ impl SuiteRunner {
             effective_document_timeout(&self.root, path, self.timeout),
             self.manifest.viewport.width,
             self.manifest.viewport.height,
+            self.user_stylesheet.as_deref(),
         )
     }
 
@@ -187,6 +194,7 @@ impl SuiteRunner {
             timeout,
             self.manifest.viewport.width,
             self.manifest.viewport.height,
+            self.user_stylesheet.as_deref(),
         )?;
         let payload = wait_for_harness_payload(timeout)?;
         let minimum = test.expected_subtests_min.unwrap_or(1);
@@ -349,10 +357,10 @@ fn write_reftest_artifacts(
     Ok(())
 }
 
-fn load_and_render(url: &str, timeout: Duration, width: u32, height: u32) -> Result<HeadlessFrame> {
+fn load_and_render(url: &str, timeout: Duration, width: u32, height: u32, user_stylesheet: Option<&str>) -> Result<HeadlessFrame> {
     // Keep the navigation loader alive until the frame has been captured. Its
     // owned stylesheet/font/resource state is intentionally released on Drop.
-    let _document = load_document(url, timeout, width, height)?;
+    let _document = load_document(url, timeout, width, height, user_stylesheet)?;
     wait_for_reftest_ready(timeout)?;
     wait_for_document_fonts(timeout)?;
     w3cos_runtime::headless::render_document_rgba(width, height)
@@ -412,7 +420,7 @@ fn wait_for_reftest_ready(timeout: Duration) -> Result<()> {
     }
 }
 
-fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Result<DocumentLoader> {
+fn load_document(url: &str, timeout: Duration, width: u32, height: u32, user_stylesheet: Option<&str>) -> Result<DocumentLoader> {
     let mut script_policy = ScriptPolicy::default();
     // The runner's explicit per-case timeout is the authoritative budget.
     // Keeping the production VM's five-second / one-million-instruction
@@ -440,6 +448,23 @@ fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Resul
     );
     loader.navigate(url)?;
     w3cos_runtime::jsdom::set_viewport(f64::from(width), f64::from(height));
+    // Navigation resets the document; install before polling can parse markup
+    // or execute scripts. Keep the profile out of author CSSOM/stylesheet owners.
+    if let Some(source) = user_stylesheet {
+        let parsed = w3cos_compiler::esm_css::parse_css_source(source, "WPT user stylesheet profile");
+        if !parsed.imports.is_empty() || !parsed.font_faces.is_empty() || !parsed.warnings.is_empty() {
+            bail!("WPT user stylesheet profiles require self-contained rules without parser warnings");
+        }
+        for rule in parsed.rules {
+            if rule.media.is_some() {
+                bail!("WPT user stylesheet profiles currently require unconditional rules");
+            }
+            let declarations = rule.declarations.iter()
+                .map(|(property, value)| (property.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            w3cos_dom::stylesheet::register_user_rule(&rule.selector, &declarations);
+        }
+    }
     let deadline = Instant::now() + timeout;
     loop {
         match loader.poll() {
