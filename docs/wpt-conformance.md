@@ -955,6 +955,24 @@ receipts for starts 5529, 5521, 5497, 5433, 5401, 5369 and 1130 pass 56/56.
 0. No WPT input, font default, suite, viewport or tolerance changed.
 Next sequential start is 5537; final 6548-case proof remains open.
 
+### Sequential stop at CSS2 preformatted improper-row space (2026-09-13)
+
+On `762725e`, strict `hidden-table-consecutiveness-v1` start 5537 completes
+all eight with seven passes and one failure: anonymous objects 199 differs
+by 637 pixels against `no_red_antialiasing_a_bc_d-ref.xht` (original report
+also fails, 1040 pixels). No 5545 batch starts. Its TableRow/Pre contains
+proper cell `a`, an improper inline span `bc` with isolated spaces around
+it, and proper cell `d`; the fixed WPT reference requires `a bc d`.
+
+Chromium loading the actual file as application/xhtml+xml instead renders
+`a\tbcd` in innerText and assigns no client rect to either space. This
+contradicts the reference, not evidence that the reference was changed.
+The earlier browser-calibrated pre-row whitespace decision must be
+rechecked against CSS2 irrelevant-box classification: the middle span is
+not an internal table box. Preserve the fixed input/reference and inspect
+that distinction before changing the engine or test expectations. Final
+6548-case zero-failure proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
