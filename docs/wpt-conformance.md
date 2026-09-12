@@ -232,6 +232,24 @@ Case 4917 now has zero pixel differences in
 (8/8). 4905–4912 and 4265–4272 passed 8/8 using the same receipt suffix.
 Case 4314 and complete 6,548-case acceptance remain open.
 
+Case 4928 (`first-line-selector-004.xht`) differed by 820 pixels despite
+correct green text: applying ::first-line to a lowered block text descendant
+incorrectly enabled anonymous inline flow on its parent. The resulting Flex
+parent prevented paragraph-margin collapse, moving text from y=51.2 to 67.2.
+First-line lowering now enables that inline context only when its remaining
+in-flow children are inline-level. The new block-context regression failed
+Flex versus expected Block before the change; seven selected first-line
+unit tests now pass. Case 4928 has zero pixel differences in
+`target/wpt-targeted/batch-4921-4928-first-line-block-context-v1/results.json`
+(6/8); 4913–4920 and 4905–4912 passed 8/8 using the same receipt suffix.
+
+4922/4923 remain open at 2,800 pixels each: pixel inspection found only an
+extra 140x20 red inline-background rectangle at y=51–70. Their green stripes
+already match the reference, but the bottom-aligned inline wrapper's paint
+box remains at the tall line's top. Inline paint-box vertical alignment is
+the next focused repair, without moving already-correct descendants.
+Case 4314 and final complete 6,548-case proof remain outstanding.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

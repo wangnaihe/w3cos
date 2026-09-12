@@ -4303,8 +4303,18 @@ impl Document {
                         style.font_size * style.line_height,
                         available_width,
                     );
+                    // Styling a first line inside a block descendant does
+                    // not turn that descendant into an inline-level child.
+                    let inline_flow = children.iter().filter(|child| {
+                        child.style.float == w3cos_std::style::Float::None
+                            && child.style.display != w3cos_std::style::Display::None
+                            && !matches!(child.style.position,
+                                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                    }).all(|child| matches!(child.style.display,
+                        w3cos_std::style::Display::Inline | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex | w3cos_std::style::Display::InlineTable));
                     anonymous_inline_formatting_context |=
-                        fragmented && !has_split_inline_fragments;
+                        fragmented && !has_split_inline_fragments && inline_flow;
                 }
                 if !first_letter_declarations.is_empty()
                     && apply_first_letter_style(&mut children, &first_letter_declarations, &style)
@@ -10867,6 +10877,25 @@ mod image_component_tests {
             runs[0].1.background,
             w3cos_std::Color::from_named("green").unwrap()
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_on_block_descendant_preserves_block_formatting_context() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div:first-line", &[("color", "green")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let paragraph = document.create_element("p");
+        let text = document.create_text_node("Filler Text");
+        paragraph.append_child(&mut document, text);
+        block.append_child(&mut document, paragraph);
+        document.body().append_child(&mut document, block);
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].style.display, w3cos_std::style::Display::Block,
+            "first-line typography cannot turn a block child into inline flow");
+        let runs = descendant_text_runs(&tree);
+        assert_eq!(runs[0].1.color, w3cos_std::Color::from_named("green").unwrap());
         crate::stylesheet::clear_rules();
     }
 
