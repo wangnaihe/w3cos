@@ -7692,7 +7692,17 @@ fn compute_absolute_rect(
         (None, None) => fallback.x,
     };
     let y = match (resolve_v(style.top), resolve_v(style.bottom)) {
-        (Some(top), Some(bottom)) if !matches!(style.height, WDim::Auto) => {
+        (Some(top), Some(bottom))
+            if !matches!(style.height, WDim::Auto)
+                || (height
+                    - (containing_block.height
+                        - top
+                        - bottom
+                        - resolve_spacing(style.margin.top)
+                        - resolve_spacing(style.margin.bottom))
+                    .max(0.0))
+                .abs() > f32::EPSILON =>
+        {
             let top_auto = matches!(style.margin.top, WSpacing::Auto);
             let bottom_auto = matches!(style.margin.bottom, WSpacing::Auto);
             let remaining = containing_block.height
@@ -7893,6 +7903,30 @@ fn positioned_percentage_border_box_size(
     } else {
         fallback_height
     };
+    let vertical_inner_edges = if style.box_sizing == WBoxSizing::ContentBox {
+        resolve_spacing(style.padding.top, containing_width)
+            + resolve_spacing(style.padding.bottom, containing_width)
+            + style.border_top_width.unwrap_or(style.border_width)
+            + style.border_bottom_width.unwrap_or(style.border_width)
+    } else {
+        0.0
+    };
+    let resolve_height_limit = |dimension: WDim| {
+        dimension
+            .resolve(
+                containing_height,
+                ROOT_FONT_SIZE,
+                style.font_size,
+                viewport_w,
+                viewport_h,
+            )
+            .map(|value| value.max(0.0) + vertical_inner_edges)
+    };
+    // Insets may have resolved an auto height after Taffy applied min/max.
+    // Reapply the constraints to this border-box result, with min winning.
+    let height = height
+        .min(resolve_height_limit(style.max_height).unwrap_or(f32::INFINITY))
+        .max(resolve_height_limit(style.min_height).unwrap_or(0.0));
     (width, height)
 }
 
@@ -10077,6 +10111,30 @@ mod tests {
             );
             assert_eq!(rect.y, 10.0 + expected_y);
         }
+    }
+
+    #[test]
+    fn absolute_auto_height_reenters_margin_equation_after_max_height() {
+        let style = Style {
+            position: WPos::Absolute,
+            top: WDim::Px(96.0),
+            bottom: WDim::Px(96.0),
+            max_height: WDim::Px(48.0),
+            margin: w3cos_std::style::Edges {
+                top: WSpacing::Auto,
+                bottom: WSpacing::Auto,
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let containing = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 288.0,
+            height: 288.0,
+        };
+        let rect = compute_absolute_rect(&style, containing, containing, 800.0, 600.0);
+        assert_eq!((rect.y, rect.height), (120.0, 48.0));
     }
 
     #[test]
