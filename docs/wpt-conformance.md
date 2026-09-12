@@ -263,6 +263,20 @@ Cases 4922/4923 now have zero pixel differences in
 No WPT fixtures, suite entries or tolerances changed. Case 4314 and complete
 6,548-case acceptance remain open.
 
+Case 4947 (`selectors/pseudo-007.xht`) remains a failure, not skipped or
+adjusted. Its source tests mixed-case `:first-child` with green filler text,
+but the linked `universal-selector-002-ref.xht` paints blue 10px borders on
+html/div, black filler text and a different instruction. Chromium
+141.0.7390.37 at 800x600 confirmed source color rgb(0,128,0)/0px borders
+versus reference color rgb(0,0,0)/10px borders. This is a source/reference
+content mismatch at the fixed revision; no fixture, membership or allowance
+was changed. Native report:
+`target/wpt-targeted/batch-4945-4952-inline-bottom-paint-box-v1/results.json`
+(7/8, 37,763 differing pixels on 4947). Batches 4937–4944 and 4953–4960
+passed 8/8 with that suffix. The following 4961–4968 batch passed 7/8,
+with root stacking-context case 4967 awaiting repair at 10,000 pixels.
+Case 4314 and full 6,548-case proof remain outstanding as well.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
