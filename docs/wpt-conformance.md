@@ -651,6 +651,19 @@ The sequential command exits with failure; no later batch was started.
 These two tests are the next focused repair, not a full-suite verdict.
 Pinned revision, suite entries, viewport and zero tolerances are unchanged.
 
+### Implicit column-group parser repair (2026-09-13)
+
+The HTML parser now exits an implicit `colgroup` before a row or cell
+token, allowing the existing implicit `tbody` insertion to put rows
+under the table rather than inside the column group. Fragment roots
+are protected from the added stack pop. The new parser regression and
+the existing template/table-wrapper regression both pass (2/2).
+This isolated parser commit does not claim pixel closure: concurrent
+uncommitted cell-grid changes pass 5369–5376 but still fail 5257, 5263
+and 5264 in strict `cell-inline-grid-v2` receipts. Those layout/paint
+changes remain outside this commit; sequential progression is stopped.
+No upstream WPT input, suite entry or tolerance changed.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

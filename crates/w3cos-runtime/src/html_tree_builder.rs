@@ -747,6 +747,14 @@ impl StreamingDocumentParser {
     }
 
     fn prepare_table_context(&mut self, incoming: &str) {
+        if matches!(incoming, "tr" | "td" | "th")
+            && self.stack.len() > 1
+            && self.stack.last().is_some_and(|node| crate::dom::tag_name(*node) == "colgroup")
+        {
+            // Row/cell tokens leave the column-group insertion context.
+            // The implicit tbody must be a sibling, not a child of colgroup.
+            self.stack.pop();
+        }
         if matches!(incoming, "td" | "th") {
             self.pop_current_table_cell();
         }
@@ -1556,6 +1564,25 @@ mod tests {
                 .and_then(crate::dom::parent_node),
             crate::jsdom::node_id_of(&outer)
         );
+    }
+
+    #[test]
+    fn feature_neutral_parser_closes_implicit_colgroup_before_rows() {
+        for end_tag in ["", "</col>"] {
+            let (document, _) = parse_document(&format!(
+                "<!doctype html><table id=t><col id=c>{end_tag}<tr id=r><td>C</td></tr></table>"
+            ));
+            let find = |selector: &str| crate::jsdom::node_id_of(
+                &document.call_method("querySelector", vec![Value::string(selector)])
+            ).unwrap();
+            let table = find("#t");
+            let group = crate::dom::parent_node(find("#c")).unwrap();
+            let section = crate::dom::parent_node(find("#r")).unwrap();
+            assert_eq!(crate::dom::tag_name(group), "colgroup");
+            assert_eq!(crate::dom::tag_name(section), "tbody");
+            assert_eq!(crate::dom::parent_node(group), Some(table));
+            assert_eq!(crate::dom::parent_node(section), Some(table));
+        }
     }
 
     #[test]
