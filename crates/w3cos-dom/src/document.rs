@@ -5315,9 +5315,9 @@ impl Document {
                         // An iframe is a replaced element: its nested browsing
                         // context never participates in the host document's
                         // box tree, and an auto axis uses the CSS 300x150
-                        // fallback size. A percentage height only remains
-                        // definite when its containing block has a definite
-                        // height; otherwise CSS resolves it back to auto.
+                        // fallback size. In-flow percentage heights need a
+                        // definite containing height; absolute/fixed frames
+                        // resolve against their independently sized container.
                         if matches!(style.width, w3cos_std::style::Dimension::Auto) {
                             style.width = node
                                 .attributes
@@ -5339,6 +5339,11 @@ impl Document {
                                 .unwrap_or(w3cos_std::style::Dimension::Px(150.0));
                         }
                         if matches!(style.height, w3cos_std::style::Dimension::Percent(_))
+                            && !matches!(
+                                style.position,
+                                w3cos_std::style::Position::Absolute
+                                    | w3cos_std::style::Position::Fixed
+                            )
                             && inherited.is_none_or(|parent| {
                                 matches!(parent.height, w3cos_std::style::Dimension::Auto)
                             })
@@ -9716,6 +9721,19 @@ mod image_component_tests {
         assert_eq!(percentage.style.height, Dimension::Percent(50.0));
         assert!(percentage.children.is_empty());
 
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn absolute_iframe_keeps_percentage_height_in_an_auto_height_container() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("iframe", &[("position", "absolute")]);
+        let mut document = Document::new();
+        let frame = document.create_element("iframe");
+        frame.set_attribute(&mut document, "height", "50%");
+        document.body().append_child(&mut document, frame);
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].style.height, Dimension::Percent(50.0));
         crate::stylesheet::clear_rules();
     }
 
