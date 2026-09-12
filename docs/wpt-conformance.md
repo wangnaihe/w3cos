@@ -1152,6 +1152,30 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   fixed-layout and dynamic-border batches in focused regressions. Full 6548-case
   proof remains unachieved.
 
+### Collapsed table root bounds repair
+
+- Auto-height projection had reintroduced table padding and a full bottom
+  border into the collapsed grid. It now ignores padding and adds only the
+  remaining border half; separated borders retain their original calculation.
+- Border conflict resolution retains resolved outer widths with transparent
+  table ink, so background positioning uses the winning border geometry while
+  boundary cells remain responsible for painting the shared edge.
+- The new auto-height regression failed at 115 instead of 103 before the fix
+  and passes afterward; it also checks separated-border height remains 115.
+  A paint regression checks stronger cell borders determine table image origin.
+- Case 5562 passes with zero differing pixels (previously 34629), receipt
+  `target/wpt-targeted/case-5562-collapsed-table-bounds-v1/results.json`.
+  Starts 5369, 5553, 5545, 5231, 5239, 5247, 5255 and 5263 each pass 8/8,
+  receipts `batch-<start>-collapsed-table-bounds-v1/results.json` in the same
+  directory. Total focused pixel coverage: 65/65, unchanged pinned suite,
+  viewport and zero tolerances. Runner SHA256:
+  `78f928f1c9a1e15efd2e1f551495e804331c0082cf7a96f0230fee14cac7bbd5`.
+- Focused runtime tests: collapsed layout 17/17, background image 16/16,
+  table replay 2/2, paint artifact 31/33. The two remaining paint-test failures
+  concern positioned ordering and inline clipping, not repaired in this scope.
+  The other three separated-background failures from batch 5561 still require
+  targeted qualification. Final clean-SHA full 6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -861,7 +861,16 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             // Boundary cells paint the resolved collapsed edge on the grid.
             // Leaving the table wrapper border active would inset and paint a
             // second ring around that same edge.
-            suppress_edge(&mut nodes[table].style, side, table_edge.0);
+            // Keep the resolved table padding-box geometry while cells own
+            // its ink. CSS2 takes inline outer edges from the first row;
+            // block outer edges use the maximum across the boundary row.
+            let used_width = if matches!(side, 1 | 3) {
+                boundary_cells[side].first().map(|cell| edge(&nodes[*cell].style, side).0)
+            } else {
+                boundary_cells[side].iter().map(|cell| edge(&nodes[*cell].style, side).0)
+                    .reduce(f32::max)
+            }.unwrap_or(table_edge.0);
+            suppress_edge(&mut nodes[table].style, side, used_width);
         }
     }
     for pair in rows.windows(2) {
@@ -2060,6 +2069,25 @@ mod tests {
         assert_eq!(artifact.display_items[0].visual_rect,
             LayoutRect { x: 0.0, width: 100.0, ..rect });
         assert_eq!(artifact.rect_by_index[0], Some(rect));
+    }
+
+    #[test]
+    fn collapsed_table_background_origin_uses_resolved_outer_edges() {
+        let node = |display, border_width, parent| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true, border_width,
+                border_color: Color::rgb(0, 128, 0), ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        let mut nodes = vec![node(Display::Table, 2.0, None),
+            node(Display::TableRow, 0.0, Some(0)),
+            node(Display::TableCell, 6.0, Some(1))];
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        assert_eq!(box_background_positioning_rect(&nodes[0].style, rect),
+            Some(LayoutRect { x: 3.0, y: 3.0, width: 94.0, height: 94.0 }));
+        assert_eq!(nodes[0].style.border_left_color, Some(Color::TRANSPARENT));
+        assert_eq!(nodes[2].style.border_left_color, Some(Color::rgb(0, 128, 0)));
     }
 
     #[test]

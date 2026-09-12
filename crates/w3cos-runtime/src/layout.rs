@@ -3172,11 +3172,14 @@ fn project_auto_table_child_heights(
             continue;
         };
         let padding = node.style.padding_lengths();
-        let bottom_edge = padding.bottom
-            + node
-                .style
-                .border_bottom_width
-                .unwrap_or(node.style.border_width);
+        let border_bottom = node.style.border_bottom_width.unwrap_or(node.style.border_width);
+        let bottom_edge = if node.style.border_collapse {
+            // Collapsed tables have no padding. The row grid ends on the
+            // border center, so its outer box adds only the remaining half.
+            border_bottom / 2.0
+        } else {
+            padding.bottom + border_bottom
+        };
         layouts[table_position].0.height = layouts[table_position]
             .0
             .height
@@ -16648,6 +16651,30 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((table.width, table.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn collapsed_auto_table_child_height_ignores_padding_and_uses_border_half() {
+        let table = Component::row(Style {
+            display: WDisp::Table,
+            border_collapse: true,
+            padding: w3cos_std::style::Edges::all(8.0),
+            border_bottom_width: Some(8.0),
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::TableRowGroup, ..Style::default()
+        }, Vec::new())]);
+        let flat = pre_flatten(&table);
+        let mut layout = vec![
+            (LayoutRect { x: 19.0, y: 15.0, width: 291.0, height: 103.0 }, 0),
+            (LayoutRect { x: 22.0, y: 17.0, width: 287.0, height: 97.0 }, 1),
+        ];
+        project_auto_table_child_heights(&mut layout, &flat);
+        assert_eq!(layout[0].0.height, 103.0);
+        let mut separated = table.clone();
+        separated.style.border_collapse = false;
+        project_auto_table_child_heights(&mut layout, &pre_flatten(&separated));
+        assert_eq!(layout[0].0.height, 115.0, "separate borders retain padding and full edge");
     }
 
     #[test]
