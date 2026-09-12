@@ -4844,6 +4844,52 @@ fn align_inline_block_last_line_baselines(
             visit(child, *index, layouts, positions);
         }
 
+        let normal_children = children.iter().filter(|(child, _)| {
+            child.style.display != WDisplay::None
+                && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && child.style.float == WFloat::None
+        }).collect::<Vec<_>>();
+        if (component.style.display == WDisplay::Block
+            || (component.style.display == WDisplay::Flex
+                && component.style.align_items == WAlign::Baseline))
+            && !normal_children.is_empty()
+            && normal_children.iter().all(|(child, _)| {
+                child.style.display == WDisplay::Inline
+                    && child.style.position == WPos::Static
+                    && matches!(child.kind, ComponentKind::Text { .. })
+                    && child.style.font_size == component.style.font_size
+                    && matches!(child.style.align_self, WAlignSelf::Auto | WAlignSelf::Baseline)
+                    && child.style.custom_properties.as_ref().is_none_or(|properties| {
+                        !properties.contains_key("--w3cos-internal-vertical-align-length")
+                    })
+                    && child.style.padding.top == WSpacing::Px(0.0)
+                    && child.style.padding.bottom == WSpacing::Px(0.0)
+                    && child.style.border_top_width.unwrap_or(child.style.border_width) == 0.0
+                    && child.style.border_bottom_width.unwrap_or(child.style.border_width) == 0.0
+            })
+            && let Some(parent_position) = positions.get(&component_index)
+        {
+            // Equal-sized glyphs share a baseline even when their inline
+            // line-heights differ. Taffy's leaf-bottom baseline and the block
+            // fallback's top alignment disagree on these anonymous line rows.
+            let line_height = normal_children.iter()
+                .map(|(child, _)| child.style.font_size * child.style.line_height)
+                .fold(component.style.font_size * component.style.line_height, f32::max);
+            if line_height > 0.0 {
+                let content_top = layouts[*parent_position].0.y
+                    + component.style.padding_lengths().top
+                    + component.style.border_top_width.unwrap_or(component.style.border_width);
+                for (child, index) in normal_children {
+                    if let Some(position) = positions.get(index) {
+                        let rect = &mut layouts[*position].0;
+                        let row = ((rect.y - content_top) / line_height).floor().max(0.0);
+                        rect.y = content_top + row * line_height
+                            + (line_height - child.style.font_size) * 0.5;
+                    }
+                }
+            }
+        }
+
         let reference_baseline = children
             .iter()
             .filter(|(child, _)| {
@@ -11798,6 +11844,26 @@ mod tests {
 
         let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(text.height, 0.0);
+    }
+
+    #[test]
+    fn equal_font_inline_runs_share_a_baseline_across_different_line_heights() {
+        for display in [WDisp::Block, WDisp::Flex] {
+            let layout = compute(&Component::row(Style {
+                display, align_items: WAlign::Baseline, font_size: 16.0,
+                line_height: 1.25, width: WDim::Px(500.0),
+                ..Style::default()
+            }, vec![Component::text("normal", Style {
+                display: WDisp::Inline, font_size: 16.0, line_height: 1.25,
+                ..Style::default()
+            }), Component::text("short", Style {
+                display: WDisp::Inline, font_size: 16.0, line_height: 1.0,
+                ..Style::default()
+            })]), 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            assert_eq!(get(1).y, 2.0);
+            assert_eq!(get(2).y, get(1).y, "{display:?}");
+        }
     }
 
     #[test]
