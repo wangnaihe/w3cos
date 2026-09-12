@@ -7243,6 +7243,15 @@ fn collect_layouts_fast(
                 fixed_out.push((rect, ctx));
             } else {
                 if matches!(info.style.position, WPos::Absolute) {
+                    let mut ancestor = info.parent;
+                    let mut containing_direction = info.style.direction;
+                    while let Some(index) = ancestor {
+                        containing_direction = flat[index].style.direction;
+                        if flat[index].style.position != WPos::Static {
+                            break;
+                        }
+                        ancestor = flat[index].parent;
+                    }
                     let fallback = inline_absolute_static_rect(
                         flat,
                         tree,
@@ -7257,6 +7266,7 @@ fn collect_layouts_fast(
                         fallback,
                         viewport_w,
                         viewport_h,
+                        containing_direction,
                     );
                 } else if matches!(info.style.position, WPos::Relative) {
                     rect = compute_relative_percentage_rect(
@@ -7581,7 +7591,12 @@ fn inline_absolute_static_rect(
     }
     if !has_meaningful_inline_predecessor {
         if matches!(parent_style.display, WDisplay::Block) && !has_in_flow_predecessor {
-            rect.x = containing_block.x + own_margin.left;
+            rect.x = match parent_style.direction {
+                w3cos_std::style::TextDirection::Ltr => containing_block.x + own_margin.left,
+                w3cos_std::style::TextDirection::Rtl => {
+                    containing_block.x + containing_block.width - rect.width - own_margin.right
+                }
+            };
             rect.y = containing_block.y + own_margin.top;
             return Some(rect);
         }
@@ -7643,6 +7658,7 @@ fn compute_absolute_rect(
     fallback: LayoutRect,
     viewport_w: f32,
     viewport_h: f32,
+    containing_direction: w3cos_std::style::TextDirection,
 ) -> LayoutRect {
     let resolve_spacing = |spacing: WSpacing| match spacing {
         WSpacing::Percent(value) => containing_block.width * value / 100.0,
@@ -7682,6 +7698,32 @@ fn compute_absolute_rect(
     );
 
     let x = match (resolve_h(style.left), resolve_h(style.right)) {
+        (Some(left), Some(right)) => {
+            let left_auto = matches!(style.margin.left, WSpacing::Auto);
+            let right_auto = matches!(style.margin.right, WSpacing::Auto);
+            let remaining = containing_block.width
+                - left
+                - right
+                - width
+                - resolve_spacing(style.margin.left)
+                - resolve_spacing(style.margin.right);
+            let margin_left = match (left_auto, right_auto) {
+                (true, true) if remaining >= 0.0 => remaining / 2.0,
+                (true, true) if containing_direction == w3cos_std::style::TextDirection::Ltr => 0.0,
+                (true, _) => remaining,
+                _ => resolve_spacing(style.margin.left),
+            };
+            if !left_auto
+                && !right_auto
+                && containing_direction == w3cos_std::style::TextDirection::Rtl
+            {
+                // An over-constrained RTL box ignores left, not right.
+                containing_block.x + containing_block.width - right - width
+                    - resolve_spacing(style.margin.right)
+            } else {
+                containing_block.x + left + margin_left
+            }
+        }
         (Some(left), _) => containing_block.x + left + resolve_spacing(style.margin.left),
         (None, Some(right)) => {
             containing_block.x + containing_block.width
@@ -9838,6 +9880,7 @@ mod tests {
             },
             800.0,
             600.0,
+            style.direction,
         );
         assert_eq!(absolute, containing_block);
 
@@ -9953,6 +9996,7 @@ mod tests {
                 },
                 800.0,
                 600.0,
+                style.direction,
             ),
             LayoutRect {
                 x: 26.0,
@@ -9988,7 +10032,9 @@ mod tests {
             },
             ..Style::default()
         };
-        let rect = compute_absolute_rect(&start, containing_block, fallback, 800.0, 600.0);
+        let rect = compute_absolute_rect(
+            &start, containing_block, fallback, 800.0, 600.0, start.direction,
+        );
         assert_eq!((rect.x, rect.y), (35.0, 38.0));
 
         let end = Style {
@@ -10002,7 +10048,9 @@ mod tests {
             },
             ..Style::default()
         };
-        let rect = compute_absolute_rect(&end, containing_block, fallback, 800.0, 600.0);
+        let rect = compute_absolute_rect(
+            &end, containing_block, fallback, 800.0, 600.0, end.direction,
+        );
         assert_eq!((rect.x, rect.y), (152.0, 123.0));
     }
 
@@ -10108,6 +10156,7 @@ mod tests {
                 },
                 800.0,
                 600.0,
+                style.direction,
             );
             assert_eq!(rect.y, 10.0 + expected_y);
         }
@@ -10133,8 +10182,85 @@ mod tests {
             width: 288.0,
             height: 288.0,
         };
-        let rect = compute_absolute_rect(&style, containing, containing, 800.0, 600.0);
+        let rect = compute_absolute_rect(
+            &style, containing, containing, 800.0, 600.0, style.direction,
+        );
         assert_eq!((rect.y, rect.height), (120.0, 48.0));
+    }
+
+    #[test]
+    fn absolute_horizontal_auto_margins_follow_direction_for_negative_space() {
+        use w3cos_std::style::TextDirection;
+        for (direction, containing_width, right, expected_x) in [
+            (TextDirection::Ltr, 400.0, -200.0, 300.0),
+            (TextDirection::Ltr, 200.0, 100.0, 100.0),
+            (TextDirection::Rtl, 200.0, 100.0, 0.0),
+        ] {
+            let style = Style {
+                // The containing block, not the positioned child's own
+                // overridden direction, governs this constraint equation.
+                direction: match direction {
+                    TextDirection::Ltr => TextDirection::Rtl,
+                    TextDirection::Rtl => TextDirection::Ltr,
+                },
+                position: WPos::Absolute,
+                left: WDim::Px(100.0),
+                right: WDim::Px(right),
+                width: WDim::Px(100.0),
+                margin: w3cos_std::style::Edges {
+                    left: WSpacing::Auto,
+                    right: WSpacing::Auto,
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            };
+            let containing = LayoutRect {
+                x: 10.0,
+                y: 0.0,
+                width: containing_width,
+                height: 200.0,
+            };
+            let fallback = LayoutRect {
+                width: 100.0,
+                ..containing
+            };
+            let rect = compute_absolute_rect(&style, containing, fallback, 800.0, 600.0, direction);
+            assert_eq!(rect.x, 10.0 + expected_x);
+        }
+    }
+
+    #[test]
+    fn rtl_absolute_auto_insets_use_the_right_static_edge() {
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                direction: w3cos_std::style::TextDirection::Rtl,
+                width: WDim::Px(200.0),
+                height: WDim::Px(200.0),
+                border_width: 3.0,
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::Flex,
+                    position: WPos::Absolute,
+                    direction: w3cos_std::style::TextDirection::Rtl,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::InlineBlock,
+                        width: WDim::Px(100.0),
+                        height: WDim::Px(100.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                )],
+            )],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[1].0.x, 103.0);
     }
 
     #[test]
