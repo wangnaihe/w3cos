@@ -4921,6 +4921,10 @@ impl Document {
                         // This is the same IR shape used for mixed generated
                         // content with the corresponding `display` value.
                         let mut line_style = w3cos_std::style::Style::default();
+                        inherit_text_style(&mut line_style, &style, "", |_| false);
+                        // The first-line displacement has already been
+                        // projected into the inline children, not this row.
+                        line_style.text_indent = w3cos_std::style::Dimension::Px(0.0);
                         line_style.display = w3cos_std::style::Display::Flex;
                         line_style.flex_direction = w3cos_std::style::FlexDirection::Row;
                         line_style.width = w3cos_std::style::Dimension::Percent(100.0);
@@ -11322,6 +11326,47 @@ mod image_component_tests {
         assert_eq!(text.style.width, Dimension::Auto);
         assert_eq!(text.style.text_indent, Dimension::Px(0.0));
         assert_ne!(text.style.background.a, 0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn anonymous_table_cell_inline_row_inherits_typography_without_repeating_indent() {
+        use w3cos_std::{Component, style::Dimension};
+        fn find_cell(component: &Component) -> Option<&Component> {
+            if component.style.display == Display::TableCell {
+                return Some(component);
+            }
+            component.children.iter().find_map(find_cell)
+        }
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#cell",
+            &[
+                ("display", "table-cell"),
+                ("font", "20px/1 Ahem"),
+                ("text-indent", "12px"),
+            ],
+        );
+        crate::stylesheet::register_rule("#table", &[("display", "table")]);
+        crate::stylesheet::register_rule("#row", &[("display", "table-row")]);
+        let mut document = Document::new();
+        let table = document.create_element("div");
+        table.set_attribute(&mut document, "id", "table");
+        let row = document.create_element("div");
+        row.set_attribute(&mut document, "id", "row");
+        let cell = document.create_element("div");
+        cell.set_attribute(&mut document, "id", "cell");
+        let text = document.create_text_node("word");
+        cell.append_child(&mut document, text);
+        row.append_child(&mut document, cell);
+        table.append_child(&mut document, row);
+        document.body().append_child(&mut document, table);
+        let tree = document.to_component_tree();
+        let line = &find_cell(&tree).unwrap().children[0];
+        assert_eq!(line.style.font_family.as_deref(), Some("Ahem"));
+        assert_eq!(line.style.font_size, 20.0);
+        assert_eq!(line.style.line_height, 1.0);
+        assert_eq!(line.style.text_indent, Dimension::Px(0.0));
         crate::stylesheet::clear_rules();
     }
 

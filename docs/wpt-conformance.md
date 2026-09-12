@@ -1678,6 +1678,32 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `target/wpt-targeted/batch-*-final-font-ex-indent-v1/results.json`.
   No fixture or tolerance changes; final full6548 proof remains unachieved.
 
+### Table inline-row typography qualification
+
+- Fresh start5745 on2636cc0 is5/8: text-indent-applies-to006/007/008 each
+  differ320 pixels (maximum255). Source006's word already has the correctx168;
+  its anonymous row has font_familyNone/line_height1.2, shifting glyph y to
+  52.8 instead of reference51.2 despite the cell's Ahem/line_height1.
+  Receipt `target/wpt-targeted/batch-5745-after-final-font-ex-indent/results.json`.
+- Table-part anonymous inline rows now inherit text typography, retaining their
+  transparent principal-box defaults. Outer indent already projected into child
+  layout/paint is not repeated on the row.
+- New regression uses an explicit Text child in a valid table/row/cell tree;
+  direct element text and malformed-cell setups did not exercise this path and
+  are not counted as root-cause RED. Real-path RED is font_familyNone versusAhem,
+  then GREEN verifies family,20px size,line_height1 and zero row indent.
+  Anonymous30/30, indent6/6 and bidi10/10 filters pass.
+- Runner SHA256
+  `7d1176f047a16b1fd7d36cb46fab41c6dd0edad4e03d5fae25454c7a331f251e`:
+  strict start5745 passes8/8 with zero differing pixels and zero maximum
+  channel difference. Applies-to006/007/008 each move320 pixels to0.
+  Receipt `target/wpt-targeted/batch-5745-table-inline-typography-v1/results.json`.
+  Related starts5737/5729/5721/5689/5681/5673/5665/5369/5545/5553/5561/5593
+  pass96/96:94 match comparisons have zero pixel differences;2 expected
+  mismatch comparisons pass. Receipts use
+  `target/wpt-targeted/batch-{start}-table-inline-typography-v1/results.json`.
+  No fixture or tolerance edits; final full6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
