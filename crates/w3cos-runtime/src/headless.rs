@@ -29,8 +29,10 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         for (rect, index) in &layout_cache {
             if let Some(node) = flat.get(*index) {
                 eprintln!(
-                    "W3COS_HEADLESS_LAYOUT index={index} parent={:?} display={:?} kind={:?} width={:?} height={:?} rect={rect:?}",
+                    "W3COS_HEADLESS_LAYOUT index={index} parent={:?} display={:?} kind={:?} width={:?} height={:?} rect={rect:?} font_family={:?} line_height={} normal={} font_metric={:?}",
                     node.parent, node.style.display, node.kind, node.style.width, node.style.height,
+                    node.style.font_family, node.style.line_height, node.style.line_height_is_normal,
+                    crate::font_face::FontRegistry::global().normal_line_height(&node.style),
                 );
             }
         }

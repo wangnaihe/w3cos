@@ -354,7 +354,30 @@ fn load_and_render(url: &str, timeout: Duration, width: u32, height: u32) -> Res
     // owned stylesheet/font/resource state is intentionally released on Drop.
     let _document = load_document(url, timeout, width, height)?;
     wait_for_reftest_ready(timeout)?;
+    wait_for_document_fonts(timeout)?;
     w3cos_runtime::headless::render_document_rgba(width, height)
+}
+
+fn wait_for_document_fonts(timeout: Duration) -> Result<()> {
+    use w3cos_core::promise::{PromiseStatus, status};
+    let ready = w3cos_runtime::jsdom::document_value()
+        .get_property("fonts")
+        .get_property("ready");
+    let deadline = Instant::now() + timeout;
+    loop {
+        w3cos_runtime::dynamic_script::poll_script_fetches();
+        w3cos_runtime::jsdom::drain_microtasks();
+        match status(&ready) {
+            Some(PromiseStatus::Fulfilled(_)) => return Ok(()),
+            Some(PromiseStatus::Rejected(_)) => bail!("document.fonts.ready rejected before capture"),
+            Some(PromiseStatus::Pending) => {}
+            None => bail!("document.fonts.ready did not return a promise"),
+        }
+        if Instant::now() >= deadline {
+            bail!("reftest timed out waiting for document.fonts.ready");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn reftest_is_waiting() -> bool {

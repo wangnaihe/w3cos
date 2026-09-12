@@ -30,6 +30,14 @@ tree build. Unregistered fonts retain the numeric fallback; shadow/frame tree
 entry points and mixed fallback-font line metrics still need separate proof.
 Representation or provider wiring alone is not proof of WPT conformance.
 
+Reftest capture waits for `document.fonts.ready` after the `reftest-wait`
+condition clears, polling font fetches and microtasks within the case timeout.
+This matters when a stylesheet finishes before the streaming parser appends
+the text selecting a deferred face. At the pinned revision, the focused
+4105–4112 run in `target/wpt-targeted/batch-4105-4112-font-ready-v1/results.json`
+passed 8/8; case 4106 moved from 10,600 differing pixels to zero. This focused
+receipt does not establish full-suite conformance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
