@@ -269,6 +269,70 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
     leaf_intrinsic_size_with_containing(kind, style, None)
 }
 
+// The DOM's generated IFC rows are not authored flexboxes. Atomic inline
+// advances share a line, while explicit break opportunities delimit intrinsic
+// segments. Margins already contain any first-line indent displacement.
+fn atomic_inline_intrinsic_width(component: &Component, minimum: bool) -> Option<f32> {
+    if !component.style.custom_properties.as_ref().is_some_and(|properties| {
+        properties.contains_key("--w3cos-internal-inline-formatting-context")
+    }) || !matches!(component.style.flex_direction, WDir::Row | WDir::RowReverse)
+        || component.style.gap != 0.0
+        || component.style.column_gap.is_some_and(|gap| gap != 0.0)
+    {
+        return None;
+    }
+    let mut widest = 0.0_f32;
+    let mut advance = 0.0_f32;
+    for child in &component.children {
+        if child.style.display == WDisplay::None
+            || matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+        {
+            continue;
+        }
+        if child.style.float != WFloat::None {
+            return None;
+        }
+        let semantic = if child.children.len() == 1
+            && child.style.custom_properties.as_ref().is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-inline-line-item")
+            })
+        {
+            &child.children[0]
+        } else {
+            child
+        };
+        if let ComponentKind::Text { content } = &semantic.kind {
+            let forced = content == "\u{2028}"
+                || (matches!(component.style.white_space,
+                    WWhiteSpace::Pre | WWhiteSpace::PreWrap | WWhiteSpace::PreLine)
+                    && matches!(content.as_str(), "\n" | "\r\n" | "\r"));
+            let soft = minimum && content == "\u{200b}"
+                && !matches!(component.style.white_space, WWhiteSpace::Pre | WWhiteSpace::NoWrap);
+            if forced || soft {
+                widest = widest.max(advance);
+                advance = 0.0;
+            } else if !content.is_empty() && content != "\u{200b}" {
+                return None;
+            }
+        } else if matches!(child.style.display,
+            WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable)
+        {
+            let width = if minimum {
+                component_min_content_width(child)
+            } else {
+                component_max_content_width(child)
+            };
+            // A negative initial advance cannot erase a later atomic box's
+            // own minimum contribution, but still reduces the whole line.
+            widest = widest.max(width);
+            advance += width;
+        } else {
+            return None;
+        }
+    }
+    Some(widest.max(advance).max(0.0))
+}
+
 fn component_max_content_width(component: &Component) -> f32 {
     let definite_content_height = match component.style.height {
         WDim::Px(height) => Some(height),
@@ -351,7 +415,9 @@ fn component_max_content_width(component: &Component) -> f32 {
                     | WDisplay::ListItem
             )
         }));
-    let intrinsic_width = if component.children.is_empty() {
+    let intrinsic_width = if let Some(width) = atomic_inline_intrinsic_width(component, false) {
+        width
+    } else if component.children.is_empty() {
         leaf_intrinsic_size(&component.kind, &component.style).0
     } else {
         match component.style.display {
@@ -1384,7 +1450,9 @@ fn component_min_content_width(component: &Component) -> f32 {
     if !matches!(component.style.width, WDim::Auto | WDim::Percent(_)) {
         return component_max_content_width(component);
     }
-    let content_width = if component.children.is_empty() {
+    let content_width = if let Some(width) = atomic_inline_intrinsic_width(component, true) {
+        width
+    } else if component.children.is_empty() {
         match &component.kind {
             ComponentKind::Text { content }
                 if matches!(
@@ -1439,7 +1507,19 @@ fn component_min_content_width(component: &Component) -> f32 {
 
 fn shrink_to_fit_used_width_with_available(component: &Component, available_width: f32) -> f32 {
     let preferred_width = shrink_to_fit_used_width(component);
-    component_min_content_width(component)
+    // Both intrinsic bounds must describe the assigned border box. Taffy
+    // applies inline/float margins separately; only removing them from the
+    // preferred bound inflates a constrained minimum by the outer margins.
+    let margin = component.style.margin_lengths();
+    let outer_margin = if component.style.float != WFloat::None
+        || matches!(component.style.display, WDisplay::Inline | WDisplay::InlineBlock
+            | WDisplay::InlineFlex | WDisplay::InlineTable | WDisplay::Table)
+    {
+        margin.left + margin.right
+    } else {
+        0.0
+    };
+    (component_min_content_width(component) - outer_margin).max(0.0)
         .max(available_width.max(0.0))
         .min(preferred_width)
 }
@@ -7379,12 +7459,13 @@ fn build_taffy_tree(
                     ))
                     && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
                         || (matches!(parent_display, Some(WDisplay::Flex))
-                            && matches!(
+                            && (matches!(
                                 comp.style.display,
                                 WDisplay::InlineBlock
                                     | WDisplay::InlineFlex
                                     | WDisplay::InlineTable
-                            )))))
+                            ) || (comp.style.float != WFloat::None
+                                && atomic_inline_intrinsic_width(comp, true).is_some()))))))
         {
             let border_box_width = shrink_to_fit_used_width_with_available(
                 comp,
@@ -16399,6 +16480,56 @@ mod tests {
         );
 
         assert_eq!(shrink_to_fit_used_width(&inline_block), 96.0);
+    }
+
+    #[test]
+    fn generated_inline_intrinsic_width_flushes_breaks_and_clamps_negative_indent() {
+        let atom = |width, indent| Component::row(Style {
+            display: WDisp::InlineBlock,
+            width: WDim::Px(width),
+            margin: w3cos_std::style::Edges {
+                left: WSpacing::Px(indent),
+                ..w3cos_std::style::Edges::default()
+            },
+            ..Style::default()
+        }, vec![]);
+        let line = |children| Component::row(Style {
+            display: WDisp::Flex,
+            custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".to_string(), "1".to_string()),
+            ])),
+            ..Style::default()
+        }, children);
+        let separator = |text| Component::text(text, Style {
+            display: WDisp::Inline, ..Style::default()
+        });
+        let forced = line(vec![atom(12.0, 36.0), separator("\u{2028}"), atom(24.0, 0.0)]);
+        assert_eq!(component_max_content_width(&forced), 48.0);
+        let soft = line(vec![atom(12.0, 36.0), separator("\u{200b}"), atom(24.0, 0.0)]);
+        assert_eq!(component_min_content_width(&soft), 48.0);
+        assert_eq!(component_max_content_width(&soft), 72.0);
+        let mut floated = soft.clone();
+        floated.style.float = WFloat::Left;
+        floated.style.margin = w3cos_std::style::Edges::all(1.0);
+        floated.style.border_width = 3.0;
+        assert_eq!(shrink_to_fit_used_width_with_available(&floated, 1.0), 54.0);
+        let mut nowrap = soft.clone();
+        nowrap.style.white_space = WWhiteSpace::Pre;
+        assert_eq!(component_min_content_width(&nowrap), 72.0);
+        let negative = line(vec![atom(12.0, -36.0), separator("\u{200b}"), atom(12.0, 0.0)]);
+        assert_eq!(component_min_content_width(&negative), 12.0);
+        assert_eq!(component_max_content_width(&negative), 12.0);
+        let wrapped_separator = Component::boxed(Style {
+            display: WDisp::InlineFlex,
+            custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-line-item".to_string(), "1".to_string()),
+            ])),
+            ..Style::default()
+        }, vec![separator("\u{200b}")]);
+        let wrapped = line(vec![atom(12.0, -36.0), wrapped_separator.clone(),
+            atom(36.0, 0.0), wrapped_separator, atom(36.0, 0.0)]);
+        assert_eq!(component_min_content_width(&wrapped), 36.0);
+        assert_eq!(component_max_content_width(&wrapped), 48.0);
     }
 
     #[test]

@@ -102,6 +102,11 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             vertical_margin(style, 1.0);
         }
         "p" => vertical_margin(style, 1.0),
+        "pre" => {
+            style.white_space = w3cos_std::style::WhiteSpace::Pre;
+            style.font_family = Some("monospace".to_string());
+            vertical_margin(style, 1.0);
+        }
         "b" | "strong" => style.font_weight = 700,
         "em" | "i" => style.font_style = FontStyle::Italic,
         _ => {}
@@ -177,5 +182,54 @@ mod tests {
         let table = html_default_style("table");
         assert_eq!(table.border_spacing_x, 2.0);
         assert_eq!(table.border_spacing_y, 2.0);
+    }
+
+    #[test]
+    fn pre_preserves_whitespace_at_user_agent_origin() {
+        let pre = html_default_style("pre");
+        assert_eq!(pre.white_space, w3cos_std::style::WhiteSpace::Pre);
+        assert_eq!(pre.font_family.as_deref(), Some("monospace"));
+        assert_eq!(pre.margin.top, Spacing::Em(1.0));
+        assert_eq!(pre.margin.bottom, Spacing::Em(1.0));
+    }
+
+    #[test]
+    fn pre_computed_style_keeps_defaults_and_accepts_author_inheritance() {
+        let mut document = crate::document::Document::new();
+        let pre = document.create_element("pre");
+        document.body().append_child(&mut document, pre);
+        let style = document.computed_style_for(pre.id);
+        assert_eq!(style.white_space, w3cos_std::style::WhiteSpace::Pre);
+        assert_eq!(style.font_family.as_deref(), Some("monospace"));
+        pre.style_mut(&mut document).set_property("white-space", "inherit");
+        pre.style_mut(&mut document).set_property("font-family", "inherit");
+        let inherited = document.computed_style_for(pre.id);
+        let parent = document.computed_style_for(document.body().id);
+        assert_eq!(inherited.white_space, parent.white_space);
+        assert_eq!(inherited.font_family, parent.font_family);
+    }
+
+    #[test]
+    fn negative_indent_pre_line_items_keep_the_preserved_newline() {
+        fn has_newline(component: &w3cos_std::Component) -> bool {
+            matches!(&component.kind, w3cos_std::ComponentKind::Text { content }
+                if content.contains('\n')) || component.children.iter().any(has_newline)
+        }
+        let mut document = crate::document::Document::new();
+        let pre = document.create_element("pre");
+        pre.style_mut(&mut document).set_property("text-indent", "-36px");
+        for (i, width) in [60, 12].into_iter().enumerate() {
+            if i == 1 {
+                let newline = document.create_text_node("\n");
+                pre.append_child(&mut document, newline);
+            }
+            let span = document.create_element("span");
+            span.style_mut(&mut document).set_property("display", "inline-block");
+            span.style_mut(&mut document).set_property("width", &format!("{width}px"));
+            span.style_mut(&mut document).set_property("height", "12px");
+            pre.append_child(&mut document, span);
+        }
+        document.body().append_child(&mut document, pre);
+        assert!(has_newline(&document.to_component_tree()));
     }
 }

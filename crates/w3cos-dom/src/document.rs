@@ -1165,6 +1165,15 @@ impl Document {
                     })
                     .map(|(_, value, _)| value.as_str())
                     .last();
+                // A UA declaration wins over inherited values when no author
+                // declaration exists. Explicit author inherit/unset still
+                // requests inheritance rather than keeping the UA default.
+                if winning_author_value.is_none()
+                    && node.tag.as_str() == "pre"
+                    && matches!(property, "white-space" | "font-family")
+                {
+                    return true;
+                }
                 winning_author_value.is_some_and(|value| {
                         !matches!(
                             value.trim().to_ascii_lowercase().as_str(),
@@ -4878,6 +4887,9 @@ impl Document {
                                     _ => child.style.width,
                                 };
                                 let mut line_item_style = w3cos_std::style::Style::default();
+                                line_item_style.custom_properties = Some(std::collections::HashMap::from([
+                                    ("--w3cos-internal-inline-line-item".to_string(), "1".to_string()),
+                                ]));
                                 line_item_style.display = w3cos_std::style::Display::InlineFlex;
                                 line_item_style.flex_direction =
                                     w3cos_std::style::FlexDirection::Row;
@@ -4887,6 +4899,7 @@ impl Document {
                                 line_item_style.font_family = child.style.font_family.clone();
                                 line_item_style.line_height = child.style.line_height;
                                 line_item_style.line_height_is_normal = child.style.line_height_is_normal;
+                                line_item_style.white_space = child.style.white_space;
                                 line_item_style.width = outer_width;
                                 if !matches!(outer_width, w3cos_std::style::Dimension::Auto) {
                                     line_item_style.min_width = outer_width;
@@ -8178,7 +8191,16 @@ fn empty_inline_box_has_no_area(component: &w3cos_std::Component) -> bool {
             return false;
         }
         match &component.kind {
-            ComponentKind::Text { content } => content.chars().all(is_css_whitespace),
+            ComponentKind::Text { content } => {
+                // Preserved whitespace is line content, not an empty box.
+                // In particular, pruning a newline's transparent line item
+                // erases a mandatory line boundary before intrinsic sizing.
+                content.is_empty() || (content.chars().all(is_css_whitespace)
+                    && !matches!(component.style.white_space,
+                        w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap)
+                    && !(component.style.white_space == w3cos_std::style::WhiteSpace::PreLine
+                        && content.contains(['\n', '\r'])))
+            }
             ComponentKind::Row | ComponentKind::Box => {
                 component.children.iter().all(subtree_is_empty)
             }

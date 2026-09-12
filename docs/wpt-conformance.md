@@ -1704,6 +1704,71 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `target/wpt-targeted/batch-{start}-table-inline-typography-v1/results.json`.
   No fixture or tolerance edits; final full6548 proof remains unachieved.
 
+### Intrinsic text-indent batch qualification
+
+- Fresh start5761 on a9f3bdd passes4/8. Intrinsic001/002/003/004 differ
+  2196/1476/1008/720 pixels respectively (maximum255).
+  Receipt `target/wpt-targeted/batch-5761-after-table-inline-typography/results.json`.
+- Source001's final two pre elements lower their authored newline to a space;
+  HTML pre UA whitespace/family/margins were missing, and inheritance would
+  overwrite inherited-property UA defaults. Pre now supplies pre/monospace/1em
+  vertical margins. The cascade retains these when no author declaration exists,
+  while explicit author inherit/unset still requests inheritance.
+- Two focused tests reproduce Normal versus Pre before the fix and pass after it,
+  including actual computed style and explicit author inheritance. UA4/4,
+  anonymous30/30 and bidi10/10 filters pass.
+- Runner SHA2560cb42404f0c2c07ebb39d7783855754aafa451b9e2a690790c5cea0d1cdf3079
+  reruns this batch4/8: pixels2160/1440/1008/720. The first two improve36 pixels
+  each, but all four remain open. Receipt
+  `target/wpt-targeted/batch-5761-pre-ua-v1/results.json`.
+  Preserved newlines now remain Text newline children; intrinsic aggregation
+  still sums across them and the rendered line has not yet split.
+  This is not completion of the four intrinsic failures or the full6548 suite.
+- Pre-UA related starts5753/5745/5737/5729/5665/5593 pass48/48. Receipts use
+  `target/wpt-targeted/batch-{start}-pre-ua-v1/results.json`.
+- Intrinsic atomic-IFC test reproduces forced-break max-content72 versus48
+  before the algorithm change, then passes after it. The latest test also checks
+  positive/negative soft-break contributions and pre's no-soft-wrap behavior.
+  Atomic inline min-content uses child min-content rather than preferred width.
+  Segment aggregation and generated float shrink-fitting qualify below.
+- Related runtime tests pass3 shrink-fit width checks,1 nonwrapping fragment
+  check and1 collapsed-separator check. The wrapped-text-height check fails
+  (`text.height > 19.2`), also on preserved pre-candidate executable11f7b072;
+  it constructs direct components without the new IFC marker, so the new path
+  is not entered. The older executable uses a different feature set; this is
+  baseline evidence, not a same-feature clean-SHA comparison or all-green gate.
+- Runner db0b97e4566bd82e0696ab35730336947e9c9d611b72a08ca7167e73801ae983
+  passes5/8 at start5761: intrinsic002 moves1440 to0, while001/003/004
+  retain216/864/432 pixels. Receipt
+  `target/wpt-targeted/batch-5761-intrinsic-segments-v1/results.json`.
+- Source001 constrained soft-break floats are56/80px instead of54/78px because
+  min-content still includes outer margins. Both shrink-fit bounds now remove
+  separately applied margins; the new1px-margin/3px-border assertion passes.
+- Negative-indent line-height wrappers hide break Text children. DOM now marks
+  transparent internal line items, and the intrinsic pass reads their break
+  semantics without removing or changing the principal paint/event box.
+  Wrapped-separator assertion passes. V2 runner
+  336a10920ef27e52e5192e1c1a805cddb4092e6973896fc1f98796908878c3d5
+  passes6/8:001/002 are0 pixels and003/004 each retain216.
+  Receipt `target/wpt-targeted/batch-5761-intrinsic-segments-v2/results.json`.
+- Remaining differences are the final pre box42px versus reference30px.
+  A real DOM regression reproduces a missing preserved newline. Carrying
+  white-space alone is insufficient: bidi's empty-inline pruning also classified
+  nonempty preserved whitespace as empty. That predicate now retains pre/pre-wrap
+  whitespace and pre-line newline content. The same DOM test becomes GREEN;
+  UA5/5, anonymous30/30 and bidi10/10 filters pass.
+- Latest runner SHA256
+  `566d8f0e777e27d6bf15fca99609819a270737b41d8d3dd52999cf2d52cce81d`
+  passes strict start5761 at8/8, with zero maximum difference and zero differing
+  pixels for every comparison. Intrinsic001/002/003/004 move2196/1476/1008/720
+  pixels from the clean pre-candidate baseline to0.
+  Receipt `target/wpt-targeted/batch-5761-intrinsic-segments-v3/results.json`.
+  Related starts5753/5745/5737/5729/5721/5689/5681/5673/5665/5545/5553/5593
+  pass96/96:94 match comparisons have zero differing pixels/maximum difference;
+  2 expected mismatch comparisons pass. Receipts use
+  `target/wpt-targeted/batch-{start}-intrinsic-segments-v3/results.json`.
+  No fixture or tolerance changes; final full6548 clean-SHA proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
