@@ -310,6 +310,17 @@ suffix: 24 focused reftests. No WPT fixture, suite membership or tolerance
 changed. Cases 4314/4947 and final 6,548-case proof remain open; next batch
 starts at 4985.
 
+Subsequent eight-case batches 4985–5056 passed 72/72 with the
+`xml-encoding-fallback-v1` receipt suffix. Batch 5057–5064 passed 7/8;
+case 5062 (`syntax/case-sensitive-003.xht`) remains open at 1,292 differing
+pixels. Read-only actual/reference image comparison localized every
+difference to y=157–172, the fifth (`::first-line`) sentence. All sentence
+colors are green; the mixed-case pseudo names are recognized. Source
+layout represents that sentence as a generated InlineBlock text node,
+unlike the reference's ordinary block text. This identifies the next
+paint-path investigation, not a completed root-cause fix. No later batch
+was started after this failure.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
