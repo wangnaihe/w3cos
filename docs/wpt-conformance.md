@@ -457,6 +457,22 @@ and the corresponding 5225–5232 / 5209–5216 batch directories. No WPT
 fixture, suite entry or pixel tolerance changed. Cases 4314/4947/5110
 and the final 6,548-case proof remain open. Next progression: 5249.
 
+5249–5256 passed 7/8, stopping at 5254
+(`tables/border-collapse-empty-row.html`, 9,200 differing pixels).
+Chromium gives both source and reference table heights 130/140/155/180;
+native source initially gave 130 for all four. Empty rows now retain
+their used height instead of consuming it as a collapsed-border overlap.
+The strengthened unit was RED (second populated row y=20 versus 22),
+then GREEN; four related table geometry units also passed. Native table
+heights now match Chromium. Strict receipts with suffix
+`empty-row-height-v1`: 5241–5248 passes 8/8 and 5249–5256 remains 7/8.
+5254 is NOT fixed: its difference increased to 11,920 because the
+text-free inline-table baseline correction still aligns table bottoms,
+moving the taller tables above the line. Its first row contains an
+inline-block and must supply the baseline instead. This is the next
+focused repair scope; no later batch was run. WPT inputs and tolerances
+remain unchanged, and the final full-suite proof is still outstanding.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
