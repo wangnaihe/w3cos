@@ -109,6 +109,21 @@ differing pixels to zero in
 The new fitting-float unit passed; the older zero-width after-inline-float unit
 also fails with the new fitting branch disabled and is not counted as green.
 
+Case 4314 (`position-relative-035.xht`) remains unresolved, not skipped.
+On 2026-09-12, Chromium 141.0.7390.37 at 800x600 with its computed
+`16px / 20px Times` font also produced a 20px source orange box (y=110)
+versus a 24px reference orange box (y=126). Both black boxes were y=66,
+height=60. This is evidence of a reference mismatch in this browser/font
+environment, not proof that the test is invalid on every platform. No fixture,
+suite membership or pixel allowance was changed. Further font/reference
+qualification is required before closing this failure.
+
+At runtime commit `141d51b`, subsequent batches 4321–4328 and 4329–4336
+passed 8/8 each. Reports are respectively
+`target/wpt-targeted/batch-4321-4328-current-v1/results.json` and
+`target/wpt-targeted/batch-4329-4336-current-v1/results.json`. These focused
+results do not establish a green complete 6,548-case run.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
