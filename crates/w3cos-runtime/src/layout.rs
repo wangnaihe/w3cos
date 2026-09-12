@@ -161,7 +161,10 @@ fn image_intrinsic_size(
                 let width = containing_width.unwrap_or(300.0).min(300.0).max(0.0);
                 (width, width / ratio)
             }
-            (None, None, _) => (300.0, 150.0),
+            (None, None, _) => (
+                containing_width.unwrap_or(300.0).clamp(0.0, 300.0),
+                150.0,
+            ),
         }
     } else {
         decoded
@@ -7465,6 +7468,7 @@ fn inline_absolute_static_rect(
     let mut has_meaningful_inline_predecessor = inline_start_is_meaningful;
     let mut has_in_flow_predecessor = false;
     let mut crossed_forced_line_break = false;
+    let own_margin = style.margin_lengths();
     for sibling in siblings {
         if sibling == node {
             break;
@@ -7539,8 +7543,8 @@ fn inline_absolute_static_rect(
     }
     if !has_meaningful_inline_predecessor {
         if matches!(parent_style.display, WDisplay::Block) && !has_in_flow_predecessor {
-            rect.x = containing_block.x;
-            rect.y = containing_block.y + style.margin_lengths().top;
+            rect.x = containing_block.x + own_margin.left;
+            rect.y = containing_block.y + own_margin.top;
             return Some(rect);
         }
         if !matches!(parent_style.display, WDisplay::Block) {
@@ -7561,11 +7565,11 @@ fn inline_absolute_static_rect(
         // A block-level static-position placeholder splits its inline parent.
         // Its block starts after the preceding line box, at the containing
         // block's inline start rather than after the inline fragment itself.
-        rect.x = containing_block.x;
-        rect.y = containing_block.y + cursor_y + line_height;
+        rect.x = containing_block.x + own_margin.left;
+        rect.y = containing_block.y + cursor_y + line_height + own_margin.top;
     } else {
-        rect.x = containing_block.x - fragmented_inline_start_padding + cursor_x;
-        rect.y = containing_block.y + cursor_y;
+        rect.x = containing_block.x - fragmented_inline_start_padding + cursor_x + own_margin.left;
+        rect.y = containing_block.y + cursor_y + own_margin.top;
     }
     Some(rect)
 }
@@ -9979,6 +9983,48 @@ mod tests {
     }
 
     #[test]
+    fn auto_inset_absolute_block_applies_negative_margin_after_flow_content() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                width: WDim::Px(150.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        position: WPos::Absolute,
+                        width: WDim::Px(150.0),
+                        height: WDim::Px(150.0),
+                        margin: w3cos_std::style::Edges {
+                            top: WSpacing::Px(-2.0),
+                            right: WSpacing::Px(-2.0),
+                            bottom: WSpacing::Px(-2.0),
+                            left: WSpacing::Px(-2.0),
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let absolute = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!((absolute.x, absolute.y), (-2.0, 18.0));
+    }
+
+    #[test]
     fn non_breaking_space_contributes_to_absolute_static_line_height() {
         let line_style = Style {
             display: WDisp::Inline,
@@ -11351,9 +11397,24 @@ mod tests {
         };
         assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (300.0, 25.0));
 
+        let no_intrinsic_size = "browser-layout-no-intrinsic-size.svg";
+        crate::image_loader::decode_and_install(
+            no_intrinsic_size,
+            br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
+        )
+        .unwrap();
+        let kind = ComponentKind::Image {
+            src: no_intrinsic_size.to_string(),
+        };
+        assert_eq!(
+            leaf_intrinsic_size_with_containing(&kind, &Style::default(), Some(150.0)),
+            (150.0, 150.0)
+        );
+
         crate::image_loader::invalidate(ratio_only);
         crate::image_loader::invalidate(explicit_axes);
         crate::image_loader::invalidate(height_only);
+        crate::image_loader::invalidate(no_intrinsic_size);
     }
 
     #[test]
