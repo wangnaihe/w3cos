@@ -6972,14 +6972,23 @@ fn build_taffy_tree(
                                     | WDisplay::InlineTable
                             )))))
         {
-            style.size.width = Dimension::length(shrink_to_fit_used_width_with_available(
+            let border_box_width = shrink_to_fit_used_width_with_available(
                 comp,
                 containing_width,
-            ));
-            // `shrink_to_fit_used_width` returns the principal border box.
-            // Keep padding, borders, and table outer border spacing inside the
-            // resolved width instead of adding them a second time.
-            style.box_sizing = BoxSizing::BorderBox;
+            );
+            // Convert just the shrink-fit width to the existing box sizing.
+            // Changing box-sizing here would also reinterpret authored heights.
+            let inner_width = if style.box_sizing == BoxSizing::ContentBox {
+                resolve_spacing_for_layout(comp.style.padding.left, containing_width,
+                    comp.style.font_size, viewport_w, viewport_h)
+                    + resolve_spacing_for_layout(comp.style.padding.right, containing_width,
+                        comp.style.font_size, viewport_w, viewport_h)
+                    + comp.style.border_left_width.unwrap_or(comp.style.border_width)
+                    + comp.style.border_right_width.unwrap_or(comp.style.border_width)
+            } else {
+                0.0
+            };
+            style.size.width = Dimension::length((border_box_width - inner_width).max(0.0));
             if comp.style.display == WDisplay::Table {
                 // CSS auto table layout shrink-wraps up to the available
                 // containing-block width. An unconstrained max-content width
@@ -11768,6 +11777,25 @@ mod tests {
 
         let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(text.height, 0.0);
+    }
+
+    #[test]
+    fn absolute_shrink_fit_width_keeps_content_box_height() {
+        let layout = compute(&Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(800.0),
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::Block, position: WPos::Absolute,
+            height: WDim::Px(296.0), border_width: 3.0,
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::Block, width: WDim::Px(200.0), height: WDim::Px(50.0),
+            margin: w3cos_std::style::Edges { left: WSpacing::Px(96.0),
+                ..w3cos_std::style::Edges::ZERO },
+            ..Style::default()
+        }, vec![])])]), 800.0, 600.0).unwrap();
+        let container = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!((container.width, container.height), (302.0, 302.0));
     }
 
     #[test]
