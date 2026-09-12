@@ -132,6 +132,15 @@ passed 64/64. WPT remained clean at revision
 `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0` and the suite retained 6,548
 entries; case 4314 remains an open failure outside this passing range.
 
+The next ten eight-case batches, 4393–4472, passed 80/80 using the unchanged
+runtime at `141d51b`. Receipts use
+`target/wpt-targeted/batch-<start>-<end>-current-v1/results.json`, starting
+at 4393 and advancing by eight through 4465. Comparison with the pinned
+initial `target/wpt-all/results.json` found 23 failures and 57 passes in this
+same range; those 23 initial failures now have focused passing evidence.
+This is a range-level comparison, not a claim that all initial failures or
+the complete suite are closed. Case 4314 is still unresolved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
