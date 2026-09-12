@@ -174,6 +174,17 @@ pixel differences in
 (8/8). 4537–4544 and 4481–4488 also passed 8/8 using the same receipt suffix.
 These focused results do not close case 4314 or the complete 6,548-case run.
 
+At runtime commit `4aa2924`, fifteen successive eight-case batches
+4561–4680 passed 120/120. Receipts are
+`target/wpt-targeted/batch-<start>-<end>-first-letter-float-inherit-v1/results.json`
+with starts 4561 through 4673 advancing by eight. The same range in the
+initial complete `target/wpt-all/results.json` contained 120 failures and
+zero passes, all at the unchanged pinned WPT revision. These first-letter
+punctuation cases now have focused passing evidence. WPT remained clean at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`; no fixtures or tolerances changed.
+Case 4314 remains unresolved, and the final complete 6,548-case proof is
+still outstanding.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
