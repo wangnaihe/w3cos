@@ -1009,8 +1009,8 @@ impl Document {
             .with_html_element(self.html_document && node.is_html_element)
     }
 
-    /// Author declarations share one cascade: normal rules, normal inline,
-    /// important rules, important inline. Every value/winner consumer below
+    /// User and author declarations share one origin/importance cascade.
+    /// Inline precedence applies only within the author origin. Consumers below
     /// uses this order, including inheritance and relative shorthand fixups.
     fn computed_style(
         &self,
@@ -1043,8 +1043,15 @@ impl Document {
         };
         let mut author_declarations = Vec::with_capacity(matched.len() + inline.inline_declarations.len());
         let mut important = Vec::new();
+        let mut user_normal = Vec::new();
+        let mut user_important = Vec::new();
         for declaration in matched {
-            let target = if declaration.important { &mut important } else { &mut author_declarations };
+            let target = match (declaration.origin, declaration.important) {
+                (stylesheet::StylesheetOrigin::User, false) => &mut user_normal,
+                (stylesheet::StylesheetOrigin::User, true) => &mut user_important,
+                (stylesheet::StylesheetOrigin::Author, false) => &mut author_declarations,
+                (stylesheet::StylesheetOrigin::Author, true) => &mut important,
+            };
             target.push((declaration.property, declaration.value, declaration.specificity));
         }
         for (property, raw_value) in &inline.inline_declarations {
@@ -1054,6 +1061,9 @@ impl Document {
             target.push((property.clone(), value.to_string(), u32::MAX));
         }
         author_declarations.extend(important);
+        user_normal.extend(author_declarations);
+        user_normal.extend(user_important);
+        let author_declarations = user_normal;
         let mut merged =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
         // The legacy HTML `text` presentational hint participates before
@@ -12463,6 +12473,29 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn user_origin_normal_loses_to_author_regardless_of_specificity() {
+        stylesheet::clear_rules();
+        stylesheet::register_rule("span", &[("color", "green")]);
+        stylesheet::register_user_rule("#target", &[("color", "red")]);
+        let mut document = Document::new();
+        let target = document.create_element("span");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+        assert_eq!(document.computed_style_for(target.id).color, w3cos_std::Color::rgb(0, 128, 0));
+    }
+
+    #[test]
+    fn user_origin_important_beats_important_inline() {
+        stylesheet::clear_rules();
+        stylesheet::register_user_rule("span", &[("color", "green !important")]);
+        let mut document = Document::new();
+        let target = document.create_element("span");
+        target.style_mut(&mut document).set_property("color", "red !important");
+        document.body().append_child(&mut document, target);
+        assert_eq!(document.computed_style_for(target.id).color, w3cos_std::Color::rgb(0, 128, 0));
+    }
 
     #[test]
     fn author_important_beats_inline_normal_in_one_cascade() {

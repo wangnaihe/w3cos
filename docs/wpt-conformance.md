@@ -757,6 +757,30 @@ and 40-case regression. No fixture, suite entry or tolerance changed.
 User-origin stylesheet/profile support is the next prerequisite repair,
 not silently skipped or counted green. Full 6548-case closure is open.
 
+### User stylesheet origin matching foundation (2026-09-13)
+
+Rules now carry an explicit author/user origin. Host code can register
+user rules without disguising them as author rules or changing selector
+specificity. Context, live-node and pseudo-element matching use four
+stable buckets ordered by origin and importance, preserving specificity
+and declaration order within each bucket. The shared property lookup
+also uses that origin rank. Computed merging places normal user rules
+below author rules and important user rules above important inline values,
+following [CSS2.1 cascading order](https://www.w3.org/TR/CSS2/cascade.html#cascading-order).
+
+Both origin-precedence units first failed red-versus-green, then passed.
+A cross-path unit checks both precedence directions in context, node and
+pseudo matching. Cache/inheritance units pass 34/34 and stylesheet units
+39/39 (73 distinct passes). Strict `user-origin-foundation-v1` receipts
+repeat the five restored-author batches above with 40/40 passes.
+
+This is a prerequisite foundation, not 1132 acceptance. The runner has
+not yet supplied a user stylesheet, and normal user rules still need to
+be placed below HTML presentational hints in computed merging. These
+are the next focused changes before testing 1132 with its prescribed
+profile. No WPT input, suite entry or tolerance changed; sequential
+progression and final 6548-case proof remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

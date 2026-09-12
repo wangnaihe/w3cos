@@ -349,6 +349,7 @@ fn attribute_value_contains(actual: &str, expected: &str, insensitive: bool) -> 
 /// A registered rule: a selector chain (rightmost = subject) + declarations.
 #[derive(Debug, Clone)]
 struct Rule {
+    origin: StylesheetOrigin,
     /// Compounds left-to-right; `combinators[i]` links `chain[i]` to `chain[i+1]`.
     chain: Vec<CompoundSelector>,
     combinators: Vec<Combinator>,
@@ -400,22 +401,42 @@ fn rule_has_container_query(rule: &Rule) -> bool {
 /// independent rules. One syntactically invalid selector invalidates the
 /// complete selector list, as required by CSS 2.1.
 pub fn register_rule(selector: &str, declarations: &[(&str, &str)]) {
-    register_rule_with_owner(None, selector, declarations);
+    register_rule_with_owner(None, StylesheetOrigin::Author, selector, declarations);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StylesheetOrigin {
+    User,
+    Author,
+}
+
+fn cascade_rank(origin: StylesheetOrigin, important: bool) -> usize {
+    match (origin, important) {
+        (StylesheetOrigin::User, false) => 0,
+        (StylesheetOrigin::Author, false) => 1,
+        (StylesheetOrigin::Author, true) => 2,
+        (StylesheetOrigin::User, true) => 3,
+    }
+}
+
+/// Register a user-origin rule without changing its selector specificity.
+pub fn register_user_rule(selector: &str, declarations: &[(&str, &str)]) {
+    register_rule_with_owner(None, StylesheetOrigin::User, selector, declarations);
 }
 
 /// Register one page-owned Browser rule.
 pub fn register_rule_for_owner(owner: u64, selector: &str, declarations: &[(&str, &str)]) {
-    register_rule_with_owner(Some(owner), selector, declarations);
+    register_rule_with_owner(Some(owner), StylesheetOrigin::Author, selector, declarations);
 }
 
-fn register_rule_with_owner(owner: Option<u64>, selector: &str, declarations: &[(&str, &str)]) {
+fn register_rule_with_owner(owner: Option<u64>, origin: StylesheetOrigin, selector: &str, declarations: &[(&str, &str)]) {
     if declarations.is_empty() {
         return;
     }
     let Some(parsed) = parse_selector_list(selector) else {
         return;
     };
-    register_parsed_rules(owner, parsed, declarations);
+    register_parsed_rules(owner, origin, parsed, declarations);
 }
 
 fn parse_selector_list(
@@ -468,6 +489,7 @@ pub fn register_compiled_rule(bytecode: &[u8], declarations: &[(&str, &str)]) {
     };
     register_parsed_rules(
         None,
+        StylesheetOrigin::Author,
         vec![(chain, combinators, pseudo_element)],
         declarations,
     );
@@ -475,6 +497,7 @@ pub fn register_compiled_rule(bytecode: &[u8], declarations: &[(&str, &str)]) {
 
 fn register_parsed_rules(
     owner: Option<u64>,
+    origin: StylesheetOrigin,
     parsed: Vec<(Vec<CompoundSelector>, Vec<Combinator>, Option<String>)>,
     declarations: &[(&str, &str)],
 ) {
@@ -486,6 +509,7 @@ fn register_parsed_rules(
             let ancestor_filter = AncestorBloom::for_rule(&chain, &combinators);
             let order = rules.rules.len() as u32;
             rules.push(Rule {
+                origin,
                 chain,
                 combinators,
                 declarations: declarations
@@ -608,23 +632,17 @@ pub fn matching_declarations_for_context(
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        let mut normal = Vec::new();
-        let mut important = Vec::new();
+        let mut buckets: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
         for rule in matched {
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
                     let (value, is_important) = declaration_value_and_importance(value);
                     let declaration = (prop.clone(), value.to_string(), rule.specificity);
-                    if is_important {
-                        important.push(declaration);
-                    } else {
-                        normal.push(declaration);
-                    }
+                    buckets[cascade_rank(rule.origin, is_important)].push(declaration);
                 }
             }
         }
-        normal.extend(important);
-        normal
+        buckets.into_iter().flatten().collect()
     })
 }
 
@@ -678,12 +696,12 @@ fn matched_property_value(
                 .find(|(name, _)| name.eq_ignore_ascii_case(property))
                 .map(|(_, value)| {
                     let (value, important) = declaration_value_and_importance(value);
-                    (important, rule.specificity, rule.order, value.to_string())
+                    (cascade_rank(rule.origin, important), rule.specificity, rule.order, value.to_string())
                 })
         })
         .collect::<Vec<_>>();
     declarations
-        .sort_by_key(|(important, specificity, order, _)| (*important, *specificity, *order));
+        .sort_by_key(|(priority, specificity, order, _)| (*priority, *specificity, *order));
     declarations.pop().map(|(_, _, _, value)| value)
 }
 
@@ -780,6 +798,7 @@ pub fn matching_declarations_for_node(
 }
 
 pub(crate) struct CascadeDeclaration {
+    pub origin: StylesheetOrigin,
     pub property: String,
     pub value: String,
     pub specificity: u32,
@@ -819,26 +838,21 @@ pub(crate) fn matching_cascade_declarations_for_node(
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        let mut normal = Vec::new();
-        let mut important = Vec::new();
+        let mut buckets: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
         for rule in matched {
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
                     let (value, is_important) = declaration_value_and_importance(value);
                     let declaration = CascadeDeclaration {
+                        origin: rule.origin,
                         property: prop.clone(), value: value.to_string(),
                         specificity: rule.specificity, important: is_important,
                     };
-                    if is_important {
-                        important.push(declaration);
-                    } else {
-                        normal.push(declaration);
-                    }
+                    buckets[cascade_rank(rule.origin, is_important)].push(declaration);
                 }
             }
         }
-        normal.extend(important);
-        normal
+        buckets.into_iter().flatten().collect()
     })
 }
 
@@ -876,23 +890,17 @@ pub fn matching_pseudo_declarations_for_node(
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        let mut normal = Vec::new();
-        let mut important = Vec::new();
+        let mut buckets: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
         for rule in matched {
             for (property, value) in &rule.declarations {
                 if property != CONTAINER_QUERY_MARKER {
                     let (value, is_important) = declaration_value_and_importance(value);
                     let declaration = (property.clone(), value.to_string(), rule.specificity);
-                    if is_important {
-                        important.push(declaration);
-                    } else {
-                        normal.push(declaration);
-                    }
+                    buckets[cascade_rank(rule.origin, is_important)].push(declaration);
                 }
             }
         }
-        normal.extend(important);
-        normal
+        buckets.into_iter().flatten().collect()
     })
 }
 
@@ -2637,6 +2645,34 @@ mod tests {
             matching_declarations_for_node(&document, target.id).len(),
             1
         );
+    }
+
+    #[test]
+    fn user_origin_order_is_shared_by_context_node_and_pseudo() {
+        for important in [false, true] {
+            clear_rules();
+            let (author_selector, user_selector, author_value, user_value, expected) = if important {
+                ("#target", "span", "green !important", "red !important", "red")
+            } else {
+                ("span", "#target", "green", "red", "green")
+            };
+            register_rule(author_selector, &[("color", author_value)]);
+            register_user_rule(user_selector, &[("color", user_value)]);
+            register_rule(&format!("{author_selector}::before"), &[("color", author_value)]);
+            register_user_rule(&format!("{user_selector}::before"), &[("color", user_value)]);
+            let context = SelectorContext::new("span", Some("target"), &[]);
+            let mut document = Document::new();
+            let target = document.create_element("span");
+            target.set_attribute(&mut document, "id", "target");
+            document.body().append_child(&mut document, target);
+            for declarations in [
+                matching_declarations_for_context(&context, &[]),
+                matching_declarations_for_node(&document, target.id),
+                matching_pseudo_declarations_for_node(&document, target.id, "::before"),
+            ] {
+                assert_eq!(declarations.last().unwrap().1, expected);
+            }
+        }
     }
 
     #[test]
