@@ -824,6 +824,20 @@ receipts for starts 1130, 5401, 5393, 1122, 5257 and 5369 pass 48/48.
 its retained profile matches the input byte-for-byte. Sequential next
 start remains 5409 and final 6548-case zero-failure proof is still open.
 
+### Sequential resume through anonymous-table split failures (2026-09-13)
+
+Strict `userstyle-profile-v2` starts 5409, 5417 and 5425 pass 24/24.
+Start 5433 completes all eight with four passes and four failures:
+`table-anonymous-objects-081`/082/083/084 have 9743/12804/8982/12043
+differing pixels against `no_red_3x3_monospace_multi_table-ref.xht`.
+All four are also failures in the original report (8500/12452/11191/12452);
+they are not newly added tests. Progression stops here without starting
+5441. Sources 081/082 compare three independently sized anonymous table
+rows separated by block spans against three explicit tables, swapping
+which overlay is absolutely positioned. The next scope is anonymous
+table splitting and absolute overlay geometry, not further suite runs.
+No WPT input, suite, viewport or tolerance changed.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
