@@ -620,6 +620,25 @@ command exits with failure here, and no 5305 batch receipt exists.
 This is the next focused repair, not a final-suite pass. Fixtures,
 revision, denominator and zero tolerance are unchanged.
 
+### Collapsed-column spans retain their visible grid width (2026-09-13)
+
+Case 5297, `column-visibility-004.xht`, is now zero differing pixels
+(RED receipt: 10,000). Final cell projection wrote signed collapsed
+track markers as negative widths and advanced every cell by one column,
+discarding colspan. Projection now measures only visible tracks,
+advances by the full span, and includes spacing only for visible tracks.
+The spanning cell is 100px wide at x=112, with its following cell at
+x=214; the removed track's original width remains available to the
+existing content-offset/clip path. A new geometry unit and five related
+collapsed-column/shared-border units pass (6/6). Strict `visible-span-v1`
+receipts pass 5249–5256, 5257–5264, 5265–5272 and 5297–5304 (32/32).
+This proves the reftest, not complete CSSOM conformance: the later column
+background projector still derives column bounds by cell ordinal, so
+the native dump gives the collapsed column width 100 and the next column
+width 202. That uncovered background/column geometry remains open, not
+silently reported fixed. No WPT input, tolerance or suite changed.
+Next progression is 5305; final complete-suite proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

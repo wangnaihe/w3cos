@@ -3189,6 +3189,17 @@ fn project_fixed_table_cell_rects(
     viewport_w: f32,
     viewport_h: f32,
 ) {
+    fn visible_grid_width(tracks: &[f32], gap: f32) -> f32 {
+        let visible = tracks.iter().filter(|track| !track.is_sign_negative());
+        visible.clone().copied().sum::<f32>()
+            + gap * visible.count().saturating_sub(1) as f32
+    }
+
+    fn visible_track_offset(tracks: &[f32], gap: f32) -> f32 {
+        let visible = tracks.iter().filter(|track| !track.is_sign_negative());
+        visible.clone().copied().sum::<f32>() + gap * visible.count() as f32
+    }
+
     let layout_position = layouts
         .iter()
         .enumerate()
@@ -3257,8 +3268,7 @@ fn project_fixed_table_cell_rects(
             layouts[row_position].0.height = row_height;
             let mut child_index = component_index + 1;
             let mut column = 0usize;
-            let grid_width = tracks.iter().sum::<f32>()
-                + gap * tracks.len().saturating_sub(1) as f32;
+            let grid_width = visible_grid_width(tracks, gap);
             let first_cell = component
                 .children
                 .iter()
@@ -3278,9 +3288,18 @@ fn project_fixed_table_cell_rects(
             for child in &component.children {
                 let child_count = count_nodes(child);
                 if child.style.display == WDisplay::TableCell {
-                    if let Some(track) = tracks.get(column).copied()
+                    let span = table_cell_column_span(&child.style);
+                    let end_column = column.saturating_add(span).min(tracks.len());
+                    let covered = &tracks[column.min(tracks.len())..end_column];
+                    if !covered.is_empty()
                         && let Some(position) = layout_position.get(&child_index).copied()
                     {
+                        let track = visible_grid_width(covered, gap);
+                        let following_gap = if covered.iter().any(|track| !track.is_sign_negative()) {
+                            gap
+                        } else {
+                            0.0
+                        };
                         if rtl {
                             target_x -= track;
                         }
@@ -3327,12 +3346,12 @@ fn project_fixed_table_cell_rects(
                                 + table_cell_edge_width(child, 2);
                         }
                         if rtl {
-                            target_x -= gap;
+                            target_x -= following_gap;
                         } else {
-                            target_x += track + gap;
+                            target_x += track + following_gap;
                         }
                     }
-                    column += 1;
+                    column = end_column;
                 }
                 child_index += child_count;
             }
@@ -3371,8 +3390,7 @@ fn project_fixed_table_cell_rects(
             WDisplay::TableRowGroup | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
         ) && let Some(position) = layout_position.get(&component_index).copied()
         {
-            layouts[position].0.width =
-                tracks.iter().sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32;
+            layouts[position].0.width = visible_grid_width(tracks, gap);
         }
     }
 
@@ -3430,9 +3448,8 @@ fn project_fixed_table_cell_rects(
                         && let Some(position) = layout_position.get(&child_index).copied()
                     {
                         layouts[position].0.x = grid_start_x
-                            + tracks[..*column].iter().sum::<f32>()
-                            + gap * *column as f32;
-                        layouts[position].0.width = track;
+                            + visible_track_offset(&tracks[..*column], gap);
+                        layouts[position].0.width = if track.is_sign_negative() { 0.0 } else { track };
                         if let Some(grid) = grid_rect {
                             layouts[position].0.y = grid.y;
                             layouts[position].0.height = grid.height;
@@ -3463,10 +3480,8 @@ fn project_fixed_table_cell_rects(
             && let Some(position) = layout_position.get(&component_index).copied()
         {
             layouts[position].0.x = grid_start_x
-                + tracks[..start_column].iter().sum::<f32>()
-                + gap * start_column as f32;
-            layouts[position].0.width = tracks[start_column..*column].iter().sum::<f32>()
-                + gap * (*column).saturating_sub(start_column + 1) as f32;
+                + visible_track_offset(&tracks[..start_column], gap);
+            layouts[position].0.width = visible_grid_width(&tracks[start_column..*column], gap);
             if let Some(grid) = grid_rect {
                 layouts[position].0.y = grid.y;
                 layouts[position].0.height = grid.height;
@@ -14312,6 +14327,41 @@ mod tests {
             "block text should have one 19.2px line plus 64px padding, got {}",
             text.height
         );
+    }
+
+    #[test]
+    fn collapsed_column_projection_keeps_partial_colspans_visible() {
+        let cell = |span: usize| Component::boxed(Style {
+            display: WDisp::TableCell,
+            width: WDim::Px(100.0),
+            height: WDim::Px(100.0),
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-table-column-span".into(), span.to_string(),
+            )])),
+            ..Style::default()
+        }, vec![]);
+        let mut children = (0..4).map(|column| Component::boxed(Style {
+            display: WDisp::TableColumn,
+            width: WDim::Px(100.0),
+            visibility: if column == 1 { WVisibility::Collapse } else { WVisibility::Visible },
+            ..Style::default()
+        }, vec![])).collect::<Vec<_>>();
+        children.push(Component::row(Style { display: WDisp::TableRow, ..Style::default() },
+            vec![cell(1), cell(2), cell(1)]));
+        children.push(Component::row(Style { display: WDisp::TableRow, ..Style::default() },
+            vec![cell(1), cell(1), cell(1), cell(1)]));
+        let root = Component::row(Style {
+            display: WDisp::Table, border_spacing_x: 2.0, ..Style::default()
+        }, children);
+        let flat = pre_flatten(&root);
+        let layouts = compute(&root, 800.0, 600.0).unwrap();
+        let cells = layouts.iter().filter(|(_, index)| flat[*index].style.display == WDisp::TableCell)
+            .map(|(rect, _)| *rect).collect::<Vec<_>>();
+        assert!(layouts.iter().all(|(rect, _)| rect.width >= 0.0));
+        assert_eq!(cells[1].width, 100.0);
+        assert_eq!(cells[2].x - cells[1].x, 102.0);
+        assert_eq!(cells[4].width, 0.0);
+        assert_eq!(cells[5].x, cells[4].x);
     }
 
     #[test]
