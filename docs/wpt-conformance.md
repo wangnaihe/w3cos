@@ -1292,6 +1292,55 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   800x600 and zero tolerances. Next sequential start 5593. Final full clean-SHA
   6548 proof remains unachieved.
 
+### Bidi-span targeted checkpoint (anonymous line qualified; 001 open)
+
+- On `5a90c89`, strict start 5593 completes 6 passed / 2 failed:
+  case 5598 `bidi-span-001.html` = 2 pixels, max difference 7; case 5600
+  `bidi-span-003.html` = 3945 pixels, max difference 255. Receipt:
+  `target/wpt-targeted/batch-5593-post-empty-cell-auto-height-v1/results.json`.
+  Starts 5601, 5609 and 5617 were not executed after this failure.
+- Both paths failed in the original full report (1286 and 1410 pixels), so
+  they are original failure paths, not newly discovered suite additions.
+- Chrome 153.0.8010.36, 800x600, device scale 1 rendered the same pinned
+  source/reference files: both 001 and 003 compare at zero differing pixels.
+  Screenshots retained as `target/wpt-targeted/chrome-bidi-<001|003>[-ref]-v1.png`.
+  The missing `>` in 003 reference HTML does not make its reftest inherently
+  inconsistent: browser recovery leaves its third span in the container,
+  where inherited `text-align:right` still aligns it correctly.
+- W3COS 003 reference dump has its final inline principal box at x8; source
+  has it at x216.25 with identical y63 and width91.75. The reference's mixed
+  block/inline container is missing an anonymous inherited-alignment line box.
+  DOM regression `inline_run_after_blocks_has_an_anonymous_inherited_alignment_box`
+  failed before production changes (`Inline` instead of `Block`) and passes
+  after wrapping normal-flow inline runs among block boxes. Original principal
+  decoration and event identity remain on children, not the anonymous box.
+- The first anonymous wrapper used generic `Box`: structural checks passed,
+  but start 5593 still had both failures unchanged, receipt
+  `target/wpt-targeted/batch-5593-anonymous-inline-lines-v1/results.json`.
+  Dump showed a 300px wrapper but its inline child still at x8. Runtime inline
+  formatting uses the canonical `Row` component for authored/anonymous block
+  lines; the wrapper now uses that existing representation and the regression
+  asserts its kind. The rebuilt runner qualifies 003 at zero differing pixels;
+  strict start 5593 now passes 7/8, with only 001 still failing by 2 pixels
+  (max difference 7). Receipt:
+  `target/wpt-targeted/batch-5593-anonymous-inline-row-lines-v1/results.json`.
+  Runner SHA256:
+  `f7280b508021e695ad9781832099636638ea9a0fa037ca7b511b985b92addc40`.
+- Related starts 5585, 5577, 5569, 5561, 5553, 5545, 5369, 5231, 5239,
+  5247, 5255 and 5263 pass 8/8 each (96/96), receipts
+  `target/wpt-targeted/batch-<start>-anonymous-inline-row-lines-v1/results.json`.
+  Anonymous, bidi and mixed DOM scopes also pass on the canonical Row build.
+  Sequential start 5601 remains not run because 5598 is still failing.
+- Focused DOM scopes passed after initial wrapping: anonymous 28/28, bidi
+  10/10, mixed 5/5 (overlapping filters, not 43 distinct assertions).
+- 001 dump isolates its two remaining pixels to the decorated fourth row:
+  source uses three visual glyph fragments; reference paints a single run at
+  identical line top and summed advances. Font/run raster qualification remains
+  pending. Both pixels lie at x13, y78/y79 beside the decorated glyph edge;
+  logical background/text paint ordering requires separate qualification.
+  No fixture, suite, viewport or tolerance changes; final full proof
+  remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

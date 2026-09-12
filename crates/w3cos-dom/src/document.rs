@@ -893,6 +893,7 @@ impl Document {
             .filter(|parent| self.get_node(*parent).node_type == NodeType::Element)
             .map(|parent| self.computed_style_for(parent));
         let mut component = self.node_to_component(id, &mut ancestors, inherited.as_ref());
+        wrap_inline_runs_between_block_boxes(&mut component);
         reorder_explicit_bidi_inline_rows(&mut component);
         component
     }
@@ -7812,6 +7813,57 @@ fn split_css_tokens(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn wrap_inline_runs_between_block_boxes(component: &mut w3cos_std::Component) {
+    use w3cos_std::style::{Display, Float, Position, Style};
+    for child in &mut component.children {
+        wrap_inline_runs_between_block_boxes(child);
+    }
+    let inline = |child: &w3cos_std::Component| {
+        matches!(
+            child.style.display,
+            Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+        )
+    };
+    if component.style.display != Display::Block
+        || component.children.iter().any(|child| {
+            child.style.float != Float::None
+                || matches!(child.style.position, Position::Absolute | Position::Fixed)
+        })
+        || !component.children.iter().any(inline)
+        || !component.children.iter().any(|child| {
+            matches!(
+                child.style.display,
+                Display::Block | Display::Flex | Display::Grid | Display::Table | Display::ListItem
+            )
+        })
+    {
+        return;
+    }
+    let mut output = Vec::new();
+    let mut run = Vec::new();
+    let flush = |run: &mut Vec<w3cos_std::Component>, output: &mut Vec<w3cos_std::Component>| {
+        if run.is_empty() {
+            return;
+        }
+        // CSS anonymous block boxes inherit text layout, but never their
+        // parent's principal border, padding, background or event identity.
+        let mut style = Style::default();
+        inherit_text_style(&mut style, &component.style, "", |_| false);
+        style.display = Display::Block;
+        output.push(w3cos_std::Component::row(style, std::mem::take(run)));
+    };
+    for child in std::mem::take(&mut component.children) {
+        if inline(&child) {
+            run.push(child);
+        } else {
+            flush(&mut run, &mut output);
+            output.push(child);
+        }
+    }
+    flush(&mut run, &mut output);
+    component.children = output;
+}
+
 fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
     if matches!(&component.kind, w3cos_std::ComponentKind::Text { content }
         if content == "\u{2028}")
@@ -11068,6 +11120,34 @@ mod image_component_tests {
             tree.children[0].style.flex_direction,
             w3cos_std::style::FlexDirection::Row
         );
+    }
+
+    #[test]
+    fn inline_run_after_blocks_has_an_anonymous_inherited_alignment_box() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#container", &[("width", "300px"), ("text-align", "right")]);
+        crate::stylesheet::register_rule("span", &[("border", "5px solid purple")]);
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "container");
+        for _ in 0..2 {
+            let block = document.create_element("div");
+            block.set_text_content(&mut document, "before");
+            container.append_child(&mut document, block);
+        }
+        let span = document.create_element("span");
+        span.set_text_content(&mut document, "after");
+        container.append_child(&mut document, span);
+        document.body().append_child(&mut document, container);
+        let tree = document.to_component_tree();
+        let line = tree.children[0].children.last().unwrap();
+        assert_eq!(line.style.display, Display::Block);
+        assert!(matches!(line.kind, w3cos_std::ComponentKind::Row));
+        assert_eq!(line.style.text_align, w3cos_std::style::TextAlign::Right);
+        assert_eq!(line.style.border_width, 0.0, "anonymous box must not copy principal decoration");
+        assert_eq!(line.children[0].style.display, Display::Inline);
+        assert_eq!(line.children[0].style.border_width, 5.0);
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
