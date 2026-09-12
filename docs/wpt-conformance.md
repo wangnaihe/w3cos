@@ -933,6 +933,28 @@ place a hidden script between table-cell `b` and `c`, with a generated
 is hidden-box table grouping and generated-after whitespace. No 5537
 batch or final full run starts, and no input or tolerance changes.
 
+### Hidden-box anonymous table consecutiveness (2026-09-13)
+
+The 187 layout dump contains `a b  c d` rather than reference `a bc d`:
+display:none script placeholders break the sibling table run and preserve
+the inter-cell whitespace on both sides. Default-parent table fixup now
+excludes non-generating hidden boxes before grouping and compares the
+nearest substantive siblings across a whole whitespace run. Two linear
+scans compute those neighbors; no quadratic per-node search is added.
+Whitespace at the table-to-generated-`d` edge remains present.
+
+The new unit first fails with seven fragments where three are expected;
+after the repair it verifies one InlineTable containing `bc`, a preserved
+edge space and `d`, with no hidden script text. It passes 1/1; anonymous
+units 25/25, cache/inheritance 36/36 and stylesheet 39/39 also pass
+(101 distinct focused units, not the full DOM suite).
+
+The rebuilt runner takes 1m50s. Strict `hidden-table-consecutiveness-v1`
+receipts for starts 5529, 5521, 5497, 5433, 5401, 5369 and 1130 pass 56/56.
+187/188 have max difference 0 and differing pixels 0 with both allowances
+0. No WPT input, font default, suite, viewport or tolerance changed.
+Next sequential start is 5537; final 6548-case proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

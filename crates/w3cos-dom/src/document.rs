@@ -9762,6 +9762,9 @@ fn fixup_css_table_children(
         }
         Display::TableColumnGroup => children,
         _ => {
+            let children = children.into_iter()
+                .filter(|child| child.style.display != Display::None)
+                .collect::<Vec<_>>();
             let is_table_internal = |display| {
                 matches!(
                     display,
@@ -9787,22 +9790,35 @@ fn fixup_css_table_children(
                         ));
                     }
                 };
+            let table_fixup_whitespace = |child: &w3cos_std::Component| {
+                matches!(&child.kind, w3cos_std::ComponentKind::Text { content }
+                    if is_only_css_whitespace(content))
+                    && child.children.is_empty()
+                    && child.style.display == Display::Inline
+            };
             let table_internal = children
                 .iter()
-                .map(|child| is_table_internal(child.style.display))
+                .map(|child| (!table_fixup_whitespace(child))
+                    .then_some(is_table_internal(child.style.display)))
                 .collect::<Vec<_>>();
+            // Nearest substantive siblings, computed in two linear scans:
+            // multiple whitespace boxes do not break cell consecutiveness.
+            let nearest_table = |previous: &mut bool, current: &Option<bool>| {
+                let result = *previous;
+                if let Some(table) = current {
+                    *previous = *table;
+                }
+                Some(result)
+            };
+            let preceding_table = table_internal.iter()
+                .scan(false, nearest_table).collect::<Vec<_>>();
+            let mut following_table = table_internal.iter().rev()
+                .scan(false, nearest_table).collect::<Vec<_>>();
+            following_table.reverse();
             for (index, child) in children.into_iter().enumerate() {
-                let table_fixup_whitespace = matches!(
-                    &child.kind,
-                    w3cos_std::ComponentKind::Text { content }
-                        if is_only_css_whitespace(content)
-                ) && child.children.is_empty()
-                    && child.style.display == Display::Inline;
-                if table_fixup_whitespace
-                    && index > 0
-                    && index + 1 < table_internal.len()
-                    && table_internal[index - 1]
-                    && table_internal[index + 1]
+                if table_fixup_whitespace(&child)
+                    && preceding_table[index]
+                    && following_table[index]
                 {
                     continue;
                 }
@@ -11664,6 +11680,28 @@ mod image_component_tests {
         assert!(matches!(&cells[0].kind, ComponentKind::Text { content } if content == "a b"));
         assert!(matches!(&cells[1].kind, ComponentKind::Text { content } if content == "c d"));
         assert!(plain_anonymous_inline_table_text(&table).is_none());
+    }
+
+    #[test]
+    fn hidden_boxes_do_not_split_table_runs_or_hide_edge_whitespace() {
+        let parent = w3cos_std::style::Style { display: Display::Inline, ..Default::default() };
+        let cell = w3cos_std::style::Style { display: Display::TableCell, ..parent.clone() };
+        let hidden = w3cos_std::style::Style { display: Display::None, ..parent.clone() };
+        let fixed = fixup_css_table_children(&parent, vec![
+            w3cos_std::Component::text("b", cell.clone()),
+            w3cos_std::Component::text(" ", parent.clone()),
+            w3cos_std::Component::text("script text", hidden),
+            w3cos_std::Component::text(" ", parent.clone()),
+            w3cos_std::Component::text("c", cell),
+            w3cos_std::Component::text(" ", parent.clone()),
+            w3cos_std::Component::text("d", parent.clone()),
+        ]);
+        assert_eq!(fixed.len(), 3);
+        assert_eq!(fixed[0].style.display, Display::InlineTable);
+        let text = plain_anonymous_inline_table_text(&fixed[0]).expect("plain inline table");
+        assert!(matches!(text.kind, ComponentKind::Text { content } if content == "bc"));
+        assert!(matches!(&fixed[1].kind, ComponentKind::Text { content } if content == " "));
+        assert!(matches!(&fixed[2].kind, ComponentKind::Text { content } if content == "d"));
     }
 
     #[test]
