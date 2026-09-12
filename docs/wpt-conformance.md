@@ -1129,6 +1129,29 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   closure remains open. Actual CPU/GPU/mobile replay acceptance is not implied
   by compilation of the shared window entry point and headless Skia evidence.
 
+### Sequential 5561 checkpoint after shared replay integration
+
+- On `aa94977`, batch 5561 (`table-paint-phases-v1`) completed 8 cases:
+  4 passed, 4 failed. Starts 5569 through 5593 were not executed.
+- Failures: 5562 `table-backgrounds-bc-table-001.xht` 34629 pixels;
+  5566 `table-backgrounds-bs-row-001.xht` 504; 5567
+  `table-backgrounds-bs-rowgroup-001.xht` 6966; 5568
+  `table-backgrounds-bs-table-001.xht` 48823. Zero tolerances retained.
+- All four paths passed in the original `vendor/w3cos/target/wpt-all/results.json`
+  snapshot. The exact introducing version is not yet qualified; do not label
+  these as ordinary original failures or assume this replay commit introduced
+  them. Separated-border nodes are borrowed unchanged by the new replay.
+- Source/reference dumps for 5562 are retained under
+  `target/wpt-targeted/table-background-5562-{actual,reference}-debug.bin`.
+  Source tables are 291x115; reference blocks are 291x103, with identical
+  x/y positions (19/15, 19/120, 19/225). The root used-height/background bounds
+  disagree by 12px even though successive table placement agrees.
+- Next scope: qualify root grid height versus cell/row border allocation and
+  background positioning. Repair authoritative layout/paint bounds rather than
+  applying a 12px clipping constant. Keep the already passing cell-background,
+  fixed-layout and dynamic-border batches in focused regressions. Full 6548-case
+  proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
