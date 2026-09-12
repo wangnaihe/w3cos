@@ -558,6 +558,31 @@ mod tests {
     }
 
     #[test]
+    fn leading_float_does_not_consume_atomic_inline_text_indent() {
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.get_style_mut(parent.id).set_property("width", "100px");
+        doc.get_style_mut(parent.id).set_property("text-indent", "40px");
+        let floating = doc.create_element("div");
+        doc.get_style_mut(floating.id).set_property("float", "left");
+        doc.get_style_mut(floating.id).set_property("width", "60px");
+        doc.append_child(parent.id, floating.id);
+        let inline = doc.create_element("div");
+        doc.get_style_mut(inline.id).set_property("display", "inline-block");
+        doc.get_style_mut(inline.id).set_property("width", "60px");
+        doc.append_child(parent.id, inline.id);
+        doc.append_child(doc.body().id, parent.id);
+        fn find(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.display == w3cos_std::style::Display::InlineBlock {
+                return Some(component);
+            }
+            component.children.iter().find_map(find)
+        }
+        assert_eq!(find(&doc.to_component_tree()).unwrap().style.margin.left,
+            w3cos_std::style::Spacing::Px(40.0));
+    }
+
+    #[test]
     fn normal_line_height_keyword_survives_font_inheritance() {
         let mut doc = Document::new();
         let body = doc.body().id;

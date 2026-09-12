@@ -53,6 +53,14 @@ Static table parts retain their internal role. At the pinned revision, case
 The current 4177–4184, adjacent 4169–4176/4185–4192, and earlier
 4105–4112/4121–4128 regression batches each passed 8/8.
 
+A leading float does not consume a block's first inline line or text-indent.
+Blocks with floats and otherwise inline flow establish the anonymous line box;
+float-only blocks and mixed normal block flow are excluded. The focused
+4265–4272 run at
+`target/wpt-targeted/batch-4265-4272-leading-float-indent-v1/results.json`
+passed 8/8, including case 4269's 40px indent assertion (previously 0px).
+4257–4264 and 4105–4112 regression batches each passed 8/8.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

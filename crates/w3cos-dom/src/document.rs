@@ -4389,6 +4389,31 @@ impl Document {
                         anonymous_inline_formatting_context = true;
                     }
                 }
+                // Floats do not consume the first formatted line. A block
+                // whose remaining children are inline still needs its line
+                // box (including text-indent) even after float blockification.
+                if matches!(style.display,
+                    w3cos_std::style::Display::Block | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::TableCell | w3cos_std::style::Display::TableCaption)
+                    && children.iter().any(|child| child.style.float != w3cos_std::style::Float::None)
+                    && children.iter().any(|child| {
+                        child.style.float == w3cos_std::style::Float::None
+                            && child.style.position == w3cos_std::style::Position::Static
+                            && matches!(child.style.display,
+                                w3cos_std::style::Display::Inline | w3cos_std::style::Display::InlineBlock
+                                    | w3cos_std::style::Display::InlineFlex | w3cos_std::style::Display::InlineTable)
+                    })
+                    && children.iter().filter(|child| {
+                        child.style.float == w3cos_std::style::Float::None
+                            && !matches!(child.style.position,
+                                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+                            && child.style.display != w3cos_std::style::Display::None
+                    }).all(|child| matches!(child.style.display,
+                        w3cos_std::style::Display::Inline | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex | w3cos_std::style::Display::InlineTable))
+                {
+                    anonymous_inline_formatting_context = true;
+                }
                 if matches!(
                     style.display,
                     w3cos_std::style::Display::Block
