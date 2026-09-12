@@ -961,10 +961,7 @@ fn parse_declarations_raw(block: &str) -> Vec<(String, String)> {
         .collect::<Vec<_>>();
     for segment in segments {
         let segment = segment.trim();
-        // An at-keyword cannot start a declaration. Its balanced blocks
-        // belong to this malformed segment, not to a new declaration after
-        // a closing brace; resume only at the top-level semicolon.
-        if segment.is_empty() || segment.starts_with('@') {
+        if segment.is_empty() {
             continue;
         }
         let mut delimiters = Vec::new();
@@ -1652,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_at_rule_declaration_recovers_only_after_its_semicolon() {
+    fn malformed_at_rule_declaration_recovers_after_a_balanced_block() {
         let sheet = parse_css_source(
             "#c { color: green; @media { #c { color: red !important } } color: red; }
              #d { color: red; @media { #d { color: red !important } }; color: green; }
@@ -1662,7 +1659,10 @@ mod tests {
         assert_eq!(sheet.rules.len(), 3);
         assert_eq!(
             sheet.rules[0].declarations,
-            vec![("color".into(), "green".into())]
+            vec![
+                ("color".into(), "green".into()),
+                ("color".into(), "red".into()),
+            ]
         );
         assert_eq!(
             sheet.rules[1].declarations.last(),
@@ -1673,6 +1673,22 @@ mod tests {
             vec![("color".into(), "green".into())]
         );
         assert!(sheet.imports.is_empty());
+    }
+
+    #[test]
+    fn unknown_at_rule_block_preserves_a_following_declaration_without_semicolon() {
+        let sheet = parse_css_source(
+            "#p3 { @foo { color: red } color: green }
+             #p6 { color: orange; 12 @page { color: red } color: green }",
+            "malformed-block-recovery.css",
+        );
+        assert_eq!(sheet.rules.len(), 2);
+        for rule in &sheet.rules {
+            assert_eq!(
+                rule.declarations.last(),
+                Some(&("color".into(), "green".into()))
+            );
+        }
     }
 
     #[test]

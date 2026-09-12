@@ -345,10 +345,11 @@ pixels. Its fixture tests malformed at-rules inside declaration blocks;
 the next investigation is declaration error recovery. No later batch
 was started, and neither fixture nor tolerance was modified.
 
-Case 5110 is now repaired. Differences were confined to its third sentence
+Superseded trial (see compatibility correction below): case 5110 temporarily
+passed. Differences were confined to its third sentence
 (y=87–102): declaration recovery reinterpreted `color: red` after a balanced
 block inside the malformed `@media` segment. Declaration segments starting
-with an at-keyword are now discarded through their top-level semicolon;
+with an at-keyword were discarded through their top-level semicolon;
 top-level at-rule parsing and balanced delimiter scanning are unchanged.
 The new `malformed_at_rule_declaration_recovers_only_after_its_semicolon`
 test failed an extra red declaration before the production change and
@@ -378,6 +379,26 @@ Case 5113 now has zero pixel differences in
 (8/8). Batches 5105–5112 and 5057–5064 also passed 8/8 with that suffix:
 24 focused reftests. No WPT fixture, suite entry or tolerance changed;
 cases 4314/4947 and final 6,548-case proof remain open. Next batch: 5121.
+
+Compatibility correction: the blanket declaration at-keyword rejection
+from `cf249e2` is withdrawn. With that trial rule, batches 5121–5184 passed
+64/64 (`eof-string-escape-v1` receipts), but batch 5185–5192 passed 7/8,
+failing 5191 (`syntax/malformed-decl-block-001.xht`) at 878 pixels.
+That fixture requires recovery after a balanced unknown at-rule block
+without a semicolon. Read-only Chromium 141.0.7390.37 at 800x600 showed all
+seven of its paragraphs green, while 5110's paragraph `c` is red
+rgb(255,0,0) and its other five paragraphs green. Thus the trial's 5110
+green result was not modern-browser parity; its old reference requires an
+incompatible recovery behavior. The final parser retains balanced-block
+recovery and the independent EOF escape fix, without at-rule-name hacks.
+The new unknown-block regression failed loss of the first rule under the
+trial and passed after withdrawing it; seven relevant parsing regressions
+passed. Case 5191 is now zero pixels in
+`target/wpt-targeted/batch-5185-5192-balanced-at-rule-recovery-v1/results.json`
+(8/8); 5113–5120 also passed 8/8 with that suffix. 5105–5112 passed 7/8,
+retaining 5110 at 1,067 pixels (strict runner exit 1, not counted as passed).
+Cases 4314, 4947 and 5110 remain visible in the unchanged 6,548-case suite;
+no fixture or tolerance was changed. Next progression starts at 5193.
 
 ## Prepare the pinned upstream checkout
 
