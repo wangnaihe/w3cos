@@ -3021,7 +3021,16 @@ impl Document {
         let inline_before = child_ids[..index]
             .iter()
             .rev()
-            .find_map(|sibling| sibling_inline_state(*sibling))
+            .find_map(|sibling| {
+                sibling_inline_state(*sibling).map(|inline| {
+                    let previous = self.get_node(*sibling);
+                    let already_has_space = previous.node_type == NodeType::Text
+                        && previous.text_content.as_deref().is_some_and(|text| {
+                            text.chars().next_back().is_some_and(is_css_whitespace)
+                        });
+                    inline && !already_has_space
+                })
+            })
             .unwrap_or(false);
         let inline_after = child_ids[index + 1..]
             .iter()

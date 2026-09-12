@@ -474,6 +474,29 @@ mod tests {
     }
 
     #[test]
+    fn text_nodes_collapse_one_space_across_positioned_elements() {
+        fn text(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children { text(child, output); }
+        }
+        for position in ["absolute", "fixed"] {
+            let mut doc = Document::new();
+            let before = doc.create_text_node("x ");
+            doc.append_child(doc.body().id, before.id);
+            let positioned = doc.create_element("span");
+            doc.get_style_mut(positioned.id).set_property("position", position);
+            doc.append_child(doc.body().id, positioned.id);
+            let after = doc.create_text_node(" y");
+            doc.append_child(doc.body().id, after.id);
+            let mut output = String::new();
+            text(&doc.to_component_tree(), &mut output);
+            assert_eq!(output, "x y");
+        }
+    }
+
+    #[test]
     fn block_flow_drops_inter_element_whitespace_but_keeps_inline_spacing() {
         use w3cos_std::ComponentKind;
 
