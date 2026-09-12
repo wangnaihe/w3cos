@@ -1205,6 +1205,31 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   separate pending repair, not evidence that background clipping alone closes
   all three failures. Qualification and final full-suite proof remain pending.
 
+### Separated auto-table width conversion
+
+- New regression `separated_auto_table_shrink_fit_counts_outer_spacing_once`
+  confirms intrinsic border-box width 325, but actual layout failed at 329.
+  Shrink-fit conversion had subtracted authored padding and border only,
+  leaving outer spacing already present in intrinsic width to be added again
+  through Taffy's table padding. The content-box conversion now subtracts
+  the table's two effective horizontal outer-spacing edges as well.
+- The failing test was established before production changes and passes after
+  the fix. Focused tests: `separated` 3/3, `shrink_to_fit` 3/3 and collapsed
+  layout 17/17. Strict batch 5561 passes 8/8, including zero differing pixels
+  for case 5568 (previously 48823). Receipt:
+  `target/wpt-targeted/batch-5561-separated-outer-spacing-v1/results.json`.
+  Runner SHA256:
+  `522fd664885d8080114c6ec92776d38313811de48eeee0359b66862ba7630995`.
+- Post-fix layout dump for 5568 shows all three tables at x19, y15/162/309,
+  width 325 and height 145. Receipt:
+  `target/wpt-targeted/separate-table-5568-outer-spacing-debug.bin`.
+  This qualifies actual layout width, not a clipping-only workaround.
+- Related starts 5369, 5553, 5545, 5231, 5239, 5247, 5255 and 5263 each pass
+  8/8 under `target/wpt-targeted/batch-<start>-separated-outer-spacing-v1/results.json`.
+  Total strict coverage: 72/72. Fixed upstream revision, viewport and zero
+  tolerances unchanged. Next sequential start 5569; final clean-SHA full
+  6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

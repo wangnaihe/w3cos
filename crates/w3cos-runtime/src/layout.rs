@@ -7282,6 +7282,12 @@ fn build_taffy_tree(
                         comp.style.font_size, viewport_w, viewport_h)
                     + comp.style.border_left_width.unwrap_or(comp.style.border_width)
                     + comp.style.border_right_width.unwrap_or(comp.style.border_width)
+                    // Table outer spacing is part of shrink-fit border-box
+                    // width and of Taffy's padding. Remove it in this
+                    // conversion so layout adds it back exactly once.
+                    + if matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable) {
+                        effective_table_border_spacing(&comp.style).0 * 2.0
+                    } else { 0.0 }
             } else {
                 0.0
             };
@@ -16651,6 +16657,37 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((table.width, table.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn separated_auto_table_shrink_fit_counts_outer_spacing_once() {
+        use w3cos_std::style::Spacing::Px;
+        let cell = || Component::boxed(Style {
+            display: WDisp::TableCell,
+            padding: w3cos_std::style::Edges { top: Px(1.0), right: Px(2.0), bottom: Px(4.0), left: Px(3.0) },
+            border_top_width: Some(2.0), border_right_width: Some(1.0),
+            border_bottom_width: Some(4.0), border_left_width: Some(3.0),
+            ..Style::default()
+        }, vec![Component::boxed(Style {
+            display: WDisp::Block, width: WDim::Px(50.0), height: WDim::Px(10.0),
+            ..Style::default()
+        }, vec![])]);
+        let table = Component::boxed(Style {
+            display: WDisp::Table, border_collapse: false,
+            border_spacing_x: 2.0, border_spacing_y: 3.0,
+            padding: w3cos_std::style::Edges { top: Px(3.0), right: Px(7.0), bottom: Px(8.0), left: Px(6.0) },
+            border_top_width: Some(4.0), border_right_width: Some(2.0),
+            border_bottom_width: Some(7.0), border_left_width: Some(3.0),
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::TableRow, ..Style::default()
+        }, (0..5).map(|_| cell()).collect())]);
+        assert_eq!(component_max_content_width(&table), 325.0);
+        let root = Component::boxed(Style {
+            display: WDisp::Block, ..Style::default()
+        }, vec![table]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout.iter().find(|(_, index)| *index == 1).unwrap().0.width, 325.0);
     }
 
     #[test]
