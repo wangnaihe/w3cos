@@ -1249,6 +1249,49 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   do not patch the inline-table position with a fixed 100px offset.
   Final clean-SHA full 6548 proof remains unachieved.
 
+### Empty baseline-aligned cell height repair
+
+- Added DOM-backed regression
+  `empty_inline_table_first_row_fills_definite_grid_before_baseline_alignment`:
+  intended to reproduce the zero-font floated wrapper with two 50x100 boxes.
+  The initial unit failed at row height 2 instead of 100, but raw diagnostics
+  later showed its style attributes had not applied: it was a block table with
+  UA spacing/padding, not the intended inline-table. The test now registers
+  these declarations through the stylesheet API and asserts zero spacing and
+  padding plus inline-table display. WPT case 5588 remains the authoritative
+  pre-fix failure; do not treat that older fixture as exact WPT reproduction.
+- The Taffy fallback now stretches a table cell's outer box to its row height.
+  CSS vertical alignment remains on the component style and is handled by
+  existing content-alignment projection. Previously baseline flex-item
+  alignment retained the empty cell's intrinsic height, and table-part
+  background projection then replaced the row box with that cell union.
+- The initial cell-stretch-only candidate was insufficient: the focused unit
+  failed at row height 2 versus 100. Strict case 5588 also failed, receipt
+  `target/wpt-targeted/case-5588-cell-stretch-v1/results.json`. It is not a
+  qualified repair and must not be submitted as completion.
+- Raw diagnostics showed the row had height 96 before projection, while its
+  empty cell had height 2 and a fixed zero preferred content height despite
+  CSS `height:auto`; subsequent cell-union projection reduced the row to 2.
+  Leaf conversion now preserves auto height for empty non-replaced table
+  cells, allowing row stretch to assign used height. Temporary debug printing
+  is removed. The corrected unit passes; focused baseline tests pass 10/10,
+  separated tests 3/3 and collapsed layout tests 17/17. No position constant or
+  WPT fixture/tolerance change is introduced.
+- Strict current batch 5585 passes 8/8, including zero differing pixels for
+  5588. Receipt:
+  `target/wpt-targeted/batch-5585-empty-cell-auto-height-v1/results.json`.
+  Runner SHA256:
+  `0076eb13e6d324779a1e222463cc0e336c3e4ddfc01d290fd7221edf43b76540`.
+- Post-fix dump `target/wpt-targeted/inline-table-baseline-5588-auto-height-debug.bin`
+  shows inline-block and inline-table both at y51.2, 50x100; first row and empty
+  cell also have used height 100.
+- Related starts 5577, 5569, 5561, 5553, 5545, 5369, 5231, 5239, 5247, 5255
+  and 5263 pass 8/8 each, receipts
+  `target/wpt-targeted/batch-<start>-empty-cell-auto-height-v1/results.json`.
+  Together with current batch 5585, strict coverage is 96/96 at fixed revision,
+  800x600 and zero tolerances. Next sequential start 5593. Final full clean-SHA
+  6548 proof remains unachieved.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

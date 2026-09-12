@@ -6363,6 +6363,14 @@ fn build_taffy_tree(
     }
     if comp.style.display == WDisplay::TableCell
         && matches!(parent_display, Some(WDisplay::TableRow))
+    {
+        // A cell's outer box fills the row height. CSS vertical-align moves
+        // its contents, not that box; baseline-aligning the flex item leaves
+        // empty cells at intrinsic zero height and exports the wrong baseline.
+        style.align_self = Some(AlignSelf::Stretch);
+    }
+    if comp.style.display == WDisplay::TableCell
+        && matches!(parent_display, Some(WDisplay::TableRow))
         && matches!(comp.style.width, WDim::Auto)
         && table_column
             .and_then(|column| inherited_table_tracks?.get(column))
@@ -6814,6 +6822,16 @@ fn build_taffy_tree(
             },
             ..style
         };
+        if comp.style.display == WDisplay::TableCell
+            && matches!(parent_display, Some(WDisplay::TableRow))
+            && matches!(comp.style.height, WDim::Auto)
+            && matches!(comp.kind, ComponentKind::Row | ComponentKind::Column | ComponentKind::Box)
+        {
+            // Empty non-replaced cells have zero intrinsic content height,
+            // not a specified zero height. Keep auto so row stretch can
+            // assign the used cell box and synthesize its content baseline.
+            leaf_style.size.height = Dimension::auto();
+        }
         if let Some((width, height)) = constrained_replaced_size {
             leaf_style.size.width = Dimension::length(width);
             leaf_style.size.height = Dimension::length(height);
@@ -16657,6 +16675,47 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((table.width, table.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn empty_inline_table_first_row_fills_definite_grid_before_baseline_alignment() {
+        use w3cos_dom::{Document, stylesheet};
+        stylesheet::clear_rules();
+        stylesheet::register_rule(".wrapper", &[("float", "left"), ("font-size", "0")]);
+        stylesheet::register_rule(".wrapper > *", &[("width", "50px"), ("height", "100px")]);
+        stylesheet::register_rule(".wrapper > div", &[("display", "inline-block")]);
+        stylesheet::register_rule(".wrapper > table", &[("display", "inline-table"), ("border-spacing", "0")]);
+        stylesheet::register_rule("td", &[("vertical-align", "baseline"), ("padding", "0")]);
+        let mut document = Document::new();
+        let wrapper = document.create_element("div");
+        wrapper.set_attribute(&mut document, "class", "wrapper");
+        let sibling = document.create_element("div");
+        wrapper.append_child(&mut document, sibling);
+        let table = document.create_element("table");
+        let cell = document.create_element("td");
+        table.append_child(&mut document, cell);
+        wrapper.append_child(&mut document, table);
+        document.body().append_child(&mut document, wrapper);
+        let component = document.to_component_tree();
+        let flat = pre_flatten(&component);
+        let table_style = flat.iter().find(|node| node.style.display == WDisp::InlineTable).unwrap().style;
+        assert_eq!(table_style.height, WDim::Px(100.0));
+        assert_eq!(table_style.border_spacing_y, 0.0);
+        let cell_style = flat.iter().find(|node| node.style.display == WDisp::TableCell).unwrap().style;
+        assert_eq!(cell_style.padding_lengths().top, 0.0);
+        assert_eq!(cell_style.padding_lengths().bottom, 0.0);
+        let mut engine = LayoutEngine::new();
+        let layout = engine.compute(&component, &flat, 800.0, 600.0).unwrap().layout_cache;
+        let rect = |display| {
+            let index = flat.iter().position(|node| node.style.display == display).unwrap();
+            layout.iter().find(|(_, item)| *item == index).unwrap().0
+        };
+        let row = rect(WDisp::TableRow);
+        let cell = rect(WDisp::TableCell);
+        assert_eq!(row.height, 100.0, "first row must fill the definite table grid");
+        assert_eq!(cell.height, 100.0, "empty cell must export its bottom content baseline");
+        assert_eq!(rect(WDisp::InlineTable).y, rect(WDisp::InlineBlock).y);
+        stylesheet::clear_rules();
     }
 
     #[test]
