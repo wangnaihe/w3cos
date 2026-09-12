@@ -250,6 +250,19 @@ box remains at the tall line's top. Inline paint-box vertical alignment is
 the next focused repair, without moving already-correct descendants.
 Case 4314 and final complete 6,548-case proof remain outstanding.
 
+Bottom-aligned nonfloating inline containers now locate their own em paint
+box at the bottom of the tall content line, while retaining the original
+layout origin for descendants and their relative containing block. The new
+`bottom_aligned_inline_box_uses_its_em_box_without_shifting_children`
+regression failed wrapper y=0 versus expected 80 before the fix; it now
+passes the wrapper and all three child-position assertions. Three selected
+half-leading/right-float regressions also passed (four tests, not a full gate).
+Cases 4922/4923 now have zero pixel differences in
+`target/wpt-targeted/batch-4921-4928-inline-bottom-paint-box-v1/results.json`
+(8/8). 4913–4920 and 4265–4272 passed 8/8 using the same receipt suffix.
+No WPT fixtures, suite entries or tolerances changed. Case 4314 and complete
+6,548-case acceptance remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

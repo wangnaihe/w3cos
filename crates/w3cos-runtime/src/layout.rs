@@ -7387,6 +7387,7 @@ fn collect_layouts_fast(
     };
     let mut passive_inline_top_edge = 0.0;
     let mut passive_inline_half_leading = 0.0;
+    let mut passive_inline_alignment_offset = 0.0;
 
     let mut new_scroll_container = current_scroll_container;
     let mut descendant_containing_block = absolute_containing_block;
@@ -7420,12 +7421,22 @@ fn collect_layouts_fast(
                 let line_height = info.style.font_size * info.style.line_height;
                 let half_leading = (line_height - info.style.font_size) * 0.5;
                 passive_inline_half_leading = half_leading;
+                if info.style.float == WFloat::None
+                    && !matches!(info.kind, ComponentKind::Text { .. })
+                    && info.style.align_self == WAlignSelf::FlexEnd
+                {
+                    // The layout container accommodates tall descendants,
+                    // but the inline paint box is its own bottom-aligned em
+                    // box. Descendants retain the original layout origin.
+                    passive_inline_alignment_offset =
+                        (layout.content_box_height() - line_height).max(0.0);
+                }
                 passive_inline_top_edge = padding.top
                     + info
                         .style
                         .border_top_width
                         .unwrap_or(info.style.border_width);
-                rect.y += half_leading - passive_inline_top_edge;
+                rect.y += half_leading - passive_inline_top_edge + passive_inline_alignment_offset;
                 rect.height = info.style.font_size
                     + padding.top
                     + padding.bottom
@@ -7636,7 +7647,8 @@ fn collect_layouts_fast(
 
     let child_relative_containing_block = LayoutRect {
         x: rect.x + layout.border.left + layout.padding.left,
-        y: rect.y + passive_inline_top_edge + layout.border.top + layout.padding.top,
+        y: rect.y + passive_inline_top_edge - passive_inline_alignment_offset
+            + layout.border.top + layout.padding.top,
         width: layout.content_box_width(),
         height: layout.content_box_height(),
     };
@@ -7666,7 +7678,8 @@ fn collect_layouts_fast(
             tree,
             child,
             rect.x,
-            rect.y + passive_inline_top_edge - passive_inline_half_leading,
+            rect.y + passive_inline_top_edge - passive_inline_half_leading
+                - passive_inline_alignment_offset,
             viewport_w,
             viewport_h,
             descendant_containing_block,
@@ -16762,6 +16775,27 @@ mod tests {
             flow.y >= floating.y + floating.height - 0.01,
             "an inline replaced box wider than the float-side band must wrap below the float: float={floating:?}, flow={flow:?}"
         );
+    }
+
+    #[test]
+    fn bottom_aligned_inline_box_uses_its_em_box_without_shifting_children() {
+        let text = |value, size| Component::text(value, Style {
+            display: WDisp::Inline, font_size: size, line_height: 1.0,
+            align_self: WAlignSelf::FlexEnd, ..Style::default() });
+        let inline = Component::row(Style {
+            display: WDisp::Inline, font_size: 20.0, line_height: 1.0,
+            align_self: WAlignSelf::FlexEnd, align_items: WAlign::FlexEnd,
+            ..Style::default() }, vec![text("X", 20.0), text("p", 100.0), text("X", 20.0)]);
+        let root = Component::row(Style { display: WDisp::Flex,
+            width: WDim::Px(200.0), align_items: WAlign::FlexEnd,
+            font_size: 20.0, line_height: 1.0, ..Style::default() }, vec![inline]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(1).height, 20.0);
+        assert_eq!(get(1).y, 80.0, "the inline paint box follows bottom alignment");
+        assert_eq!(get(2).y, 80.0);
+        assert_eq!(get(3).y, 0.0, "the tall descendant keeps its original layout origin");
+        assert_eq!(get(4).y, 80.0);
     }
 
     #[test]
