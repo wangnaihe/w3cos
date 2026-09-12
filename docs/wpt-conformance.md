@@ -664,6 +664,36 @@ and 5264 in strict `cell-inline-grid-v2` receipts. Those layout/paint
 changes remain outside this commit; sequential progression is stopped.
 No upstream WPT input, suite entry or tolerance changed.
 
+### Canonical collapsed-cell inline grid (2026-09-13)
+
+Cells now retain shared-grid inline rectangles instead of adding their
+painted border halves to the used width again. Inline border painting,
+text content insets and retained visual bounds account for the centered
+halves separately. Auto tables and the single-column path use the same
+inline convention as fixed tables; rows use the table-wide boundary
+winner, without subtracting the table border already zeroed for Taffy.
+The old extra authored-height border addition is also removed.
+
+The percentage-cell regression was reproduced before repair. An added
+table-border origin test also failed at x=0 versus Chromium's x=10
+before its fix. Old paint-expanded geometry expectations were replaced
+only after independent Chromium rectangle checks (including the two
+unequal-border rows); the related `collapsed_` subset passes 29/29.
+The draft's four `cell-inline-grid-v1` regressions reduced to three in
+v2, then cleared in v3. Strict v3 receipts pass 5257–5264, 5369–5376,
+5241–5248, 5265–5272, 5249–5256 and 5297–5304 (48/48).
+The runtime library also passes `cargo check --profile wpt` with
+`dynamic-js,skia,cpu-render,gpu`; non-Skia pixel acceptance is not claimed.
+
+Remaining geometry is explicit: on 5264 the first cell is correctly
+x=58/w=40, but the row/background projector still applies the old
+inline half-insets, giving x=68/w=140 instead of Chromium's x=58/w=160.
+Its span/column-ordinal issue noted above also remains open. Vertical
+CSSOM rectangles have not been canonicalized by this inline repair.
+No WPT input, suite, viewport or zero tolerance changed. The next focused
+repair is the dependent row/column inline projection, before later
+sequential progression; final 6548-case zero-failure proof remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

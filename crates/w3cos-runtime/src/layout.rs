@@ -557,12 +557,8 @@ impl CollapsedSingleTrack {
         self.outer_left_half + self.grid_width + self.outer_right_half
     }
 
-    fn cell_geometry(self, style: &w3cos_std::style::Style) -> (f32, f32) {
-        let left = style.border_left_width.unwrap_or(style.border_width);
-        let right = style.border_right_width.unwrap_or(style.border_width);
-        let offset = self.outer_left_half - left / 2.0;
-        let border_box_width = self.grid_width + left / 2.0 + right / 2.0;
-        (offset, border_box_width)
+    fn cell_geometry(self) -> (f32, f32) {
+        (self.outer_left_half, self.grid_width)
     }
 }
 
@@ -927,7 +923,7 @@ fn table_cell_column_span(style: &w3cos_std::style::Style) -> usize {
         .min(1000)
 }
 
-fn collapsed_table_outer_inline_halves(component: &Component) -> f32 {
+fn collapsed_table_outer_inline_edges(component: &Component) -> (f32, f32) {
     fn collect(component: &Component, left: &mut f32, right: &mut f32) {
         if component.style.display == WDisplay::TableRow {
             let cells = component
@@ -959,6 +955,11 @@ fn collapsed_table_outer_inline_halves(component: &Component) -> f32 {
     let mut left = table_cell_edge_width(component, 3) / 2.0;
     let mut right = table_cell_edge_width(component, 1) / 2.0;
     collect(component, &mut left, &mut right);
+    (left, right)
+}
+
+fn collapsed_table_outer_inline_halves(component: &Component) -> f32 {
+    let (left, right) = collapsed_table_outer_inline_edges(component);
     left + right
 }
 
@@ -3226,6 +3227,7 @@ fn project_fixed_table_cell_rects(
         tracks: &[f32],
         gap: f32,
         collapsed: bool,
+        outer_half: f32,
         rtl: bool,
         table_height: f32,
         row_growth: f32,
@@ -3269,17 +3271,6 @@ fn project_fixed_table_cell_rects(
             let mut child_index = component_index + 1;
             let mut column = 0usize;
             let grid_width = visible_grid_width(tracks, gap);
-            let first_cell = component
-                .children
-                .iter()
-                .find(|child| child.style.display == WDisplay::TableCell);
-            let outer_half = if collapsed {
-                first_cell.map_or(0.0, |cell| {
-                    table_cell_edge_width(cell, if rtl { 1 } else { 3 }) / 2.0
-                })
-            } else {
-                0.0
-            };
             let mut target_x = if rtl {
                 row_x + grid_width - outer_half
             } else {
@@ -3303,21 +3294,11 @@ fn project_fixed_table_cell_rects(
                         if rtl {
                             target_x -= track;
                         }
-                        let left_half = if collapsed {
-                            table_cell_edge_width(child, 3) / 2.0
-                        } else {
-                            0.0
-                        };
-                        let right_half = if collapsed {
-                            table_cell_edge_width(child, 1) / 2.0
-                        } else {
-                            0.0
-                        };
-                        let paint_x = target_x - left_half;
+                        let paint_x = target_x;
                         if collapsed {
-                            // The border box extends by the shared half-border,
-                            // while the content subtree moves with the grid
-                            // track and stays after the full painted border.
+                            // Cell rects describe shared grid border boxes.
+                            // Painting centers the authored border on the grid
+                            // edge; do not add its halves to the used width again.
                             let content_delta = target_x - layouts[position].0.x;
                             if child_count > 1 {
                                 shift_subtree_x(
@@ -3339,12 +3320,8 @@ fn project_fixed_table_cell_rects(
                                 delta,
                             );
                         }
-                        layouts[position].0.width = track + left_half + right_half;
+                        layouts[position].0.width = track;
                         layouts[position].0.height = layouts[position].0.height.max(row_height);
-                        if collapsed && !matches!(child.style.height, WDim::Auto) {
-                            layouts[position].0.height += table_cell_edge_width(child, 0)
-                                + table_cell_edge_width(child, 2);
-                        }
                         if rtl {
                             target_x -= following_gap;
                         } else {
@@ -3374,6 +3351,7 @@ fn project_fixed_table_cell_rects(
                     tracks,
                     gap,
                     collapsed,
+                    outer_half,
                     rtl,
                     table_height,
                     row_growth,
@@ -3512,7 +3490,7 @@ fn project_fixed_table_cell_rects(
                 // Percentage tracks must be redistributed against the used
                 // containing-block width, not the provisional build-time
                 // width (which can precede an ancestor's shrink-to-fit pass).
-                (component.style.table_layout_fixed || has_declared_columns
+                (component.style.table_layout_fixed || component.style.border_collapse || has_declared_columns
                     || matches!(component.style.width, WDim::Percent(_)))
                     .then(|| auto_table_track_widths(component, Some(containing_width)))
                     .filter(|tracks| !tracks.is_empty())
@@ -3568,13 +3546,23 @@ fn project_fixed_table_cell_rects(
             } else {
                 0.0
             };
+            let rtl = component.style.direction == w3cos_std::style::TextDirection::Rtl;
+            let outer_half = if component.style.border_collapse {
+                let (left, right) = collapsed_table_outer_inline_edges(component);
+                // Taffy's table border is zero in the collapsed model;
+                // include the shared boundary once, regardless of its owner.
+                if rtl { right } else { left }
+            } else {
+                0.0
+            };
             project_rows(
                 component,
                 component_index,
                 &tracks,
                 gap,
                 component.style.border_collapse,
-                component.style.direction == w3cos_std::style::TextDirection::Rtl,
+                outer_half,
+                rtl,
                 table_height,
                 row_growth,
                 viewport_w,
@@ -5975,11 +5963,17 @@ fn build_taffy_tree(
             }),
         };
     }
+    if comp.style.display == WDisplay::TableCell && comp.style.border_collapse {
+        // All collapsed cells, including auto/single-column tables, expose
+        // the same shared half-border content insets to Taffy and painting.
+        style.border.left = LengthPercentage::length(table_cell_edge_width(comp, 3) / 2.0);
+        style.border.right = LengthPercentage::length(table_cell_edge_width(comp, 1) / 2.0);
+    }
     if comp.style.display == WDisplay::TableCell
         && table_column == Some(0)
         && let Some(track) = inherited_collapsed_single_track
     {
-        let (offset, border_box_width) = track.cell_geometry(&comp.style);
+        let (offset, border_box_width) = track.cell_geometry();
         let left = comp
             .style
             .border_left_width
@@ -5993,7 +5987,7 @@ fn build_taffy_tree(
         } else {
             table_cell_padding.left + table_cell_padding.right
         };
-        let content_width = (border_box_width - left - right - padding_width).max(0.0);
+        let content_width = (border_box_width - (left + right) / 2.0 - padding_width).max(0.0);
         style.size.width = Dimension::length(content_width);
         style.flex_basis = Dimension::length(content_width);
         style.flex_grow = 0.0;
@@ -9717,7 +9711,7 @@ mod tests {
         let layout = compute(&table, 800.0, 600.0).unwrap();
         let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
 
-        assert_eq!((rect(6).x, rect(6).width), (82.0, 200.0));
+        assert_eq!((rect(6).x, rect(6).width), (118.0, 164.0));
     }
 
     #[test]
@@ -9793,7 +9787,7 @@ mod tests {
 
         assert_eq!(
             (rect(6).x, rect(6).width, rect(6).height),
-            (100.0, 200.0, 24.0)
+            (130.0, 140.0, 24.0)
         );
         assert_eq!((rect(7).x, rect(7).height), (160.0, 24.0));
     }
@@ -9878,7 +9872,7 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(
             (rect(0).width, rect(2).width, rect(4).x),
-            (180.0, 60.0, 40.0)
+            (180.0, 40.0, 50.0)
         );
     }
 
@@ -14330,6 +14324,65 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_percentage_cells_use_shared_grid_border_boxes() {
+        let cell = |width, left, right| Component::boxed(Style {
+            display: WDisp::TableCell,
+            border_collapse: true,
+            width,
+            border_left_width: Some(left),
+            border_right_width: Some(right),
+            padding: w3cos_std::style::Edges {
+                top: WSpacing::Px(50.0), bottom: WSpacing::Px(50.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        }, vec![]);
+        let root = Component::row(Style {
+            display: WDisp::Table, width: WDim::Px(100.0),
+            border_collapse: true, table_layout_fixed: true,
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::TableRow, border_collapse: true, ..Style::default()
+        }, vec![cell(WDim::Auto, 0.0, 24.0),
+            cell(WDim::Percent(50.0), 25.0, 25.0), cell(WDim::Auto, 25.0, 0.0)])]);
+        let layouts = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(2).width, 12.5);
+        assert_eq!(rect(3).x, 12.5);
+        assert_eq!(rect(3).width, 75.0);
+        assert_eq!(rect(4).x, 87.5);
+        assert_eq!(rect(4).width, 12.5);
+    }
+
+    #[test]
+    fn collapsed_table_border_does_not_remove_the_shared_cell_origin() {
+        let cell = || Component::boxed(Style {
+            display: WDisp::TableCell,
+            border_collapse: true,
+            border_width: 20.0,
+            padding: w3cos_std::style::Edges::all(10.0),
+            ..Style::default()
+        }, vec![]);
+        let root = Component::row(Style {
+            display: WDisp::Table,
+            border_collapse: true,
+            border_width: 20.0,
+            ..Style::default()
+        }, vec![Component::row(Style {
+            display: WDisp::TableRow,
+            border_collapse: true,
+            ..Style::default()
+        }, vec![cell(), cell(), cell(), cell()])]);
+        let layouts = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!(rect(0).width, 180.0);
+        for index in 2..6 {
+            assert_eq!(rect(index).x, 10.0 + (index - 2) as f32 * 40.0);
+            assert_eq!(rect(index).width, 40.0);
+        }
+    }
+
+    #[test]
     fn collapsed_column_projection_keeps_partial_colspans_visible() {
         let cell = |span: usize| Component::boxed(Style {
             display: WDisp::TableCell,
@@ -15761,8 +15814,8 @@ mod tests {
         let table_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
         let row_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
 
-        assert_eq!(table_rect.x, row_rect.x);
-        assert_eq!(table_rect.width, row_rect.width);
+        assert_eq!(row_rect.x - table_rect.x, 25.0);
+        assert_eq!(table_rect.width - row_rect.width, 50.0);
     }
 
     #[test]
@@ -15915,9 +15968,9 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(
             (rect(1).width, rect(4).x, rect(4).width),
-            (200.0, 0.0, 150.0)
+            (200.0, 75.0, 75.0)
         );
-        assert_eq!((rect(7).x, rect(7).width), (75.0, 125.0));
+        assert_eq!((rect(7).x, rect(7).width), (75.0, 75.0));
         assert_eq!((rect(8).x, rect(8).width), (75.0, 25.0));
     }
 

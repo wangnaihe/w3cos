@@ -981,11 +981,16 @@ pub(crate) fn border_edge_paint_rects(
             },
         ];
     }
+    let cell_inline_half = if style.border_collapse && style.display == Display::TableCell {
+        0.5
+    } else {
+        0.0
+    };
     let suppressed = |name: &str| collapsed_border_suppressed(style, name);
     let top = if suppressed("top") { widths[0] } else { 0.0 };
-    let right = if suppressed("right") { widths[1] } else { 0.0 };
+    let right = if suppressed("right") { widths[1] * (1.0 - cell_inline_half) } else { 0.0 };
     let bottom = if suppressed("bottom") { widths[2] } else { 0.0 };
-    let left = if suppressed("left") { widths[3] } else { 0.0 };
+    let left = if suppressed("left") { widths[3] * (1.0 - cell_inline_half) } else { 0.0 };
     let bottom_extension = style
         .custom_properties
         .as_ref()
@@ -1001,7 +1006,7 @@ pub(crate) fn border_edge_paint_rects(
             height: widths[0],
         },
         LayoutRect {
-            x: rect.x + rect.width - widths[1],
+            x: rect.x + rect.width - widths[1] * (1.0 - cell_inline_half),
             y: rect.y + top,
             width: widths[1],
             height: (rect.height - top - bottom).max(0.0),
@@ -1013,12 +1018,18 @@ pub(crate) fn border_edge_paint_rects(
             height: widths[2] + bottom_extension,
         },
         LayoutRect {
-            x: rect.x,
+            x: rect.x - widths[3] * cell_inline_half,
             y: rect.y + top,
             width: widths[3],
             height: (rect.height - top - bottom).max(0.0),
         },
     ]
+}
+
+pub(crate) fn paint_inline_border_widths(style: &Style) -> (f32, f32) {
+    let scale = if style.border_collapse && style.display == Display::TableCell { 0.5 } else { 1.0 };
+    (style.border_left_width.unwrap_or(style.border_width) * scale,
+        style.border_right_width.unwrap_or(style.border_width) * scale)
 }
 
 fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
@@ -1529,6 +1540,12 @@ impl PaintArtifact {
         let Some(bounds) = self.rect_by_index[index] else {
             return;
         };
+        let bounds = if node.style.border_collapse && node.style.display == Display::TableCell {
+            let (left, right) = paint_inline_border_widths(&node.style);
+            LayoutRect { x: bounds.x - left, width: bounds.width + left + right, ..bounds }
+        } else {
+            bounds
+        };
         let item_index = self.display_items.len();
         let chunk_id = self.chunks.len();
         self.display_items.push(DisplayItem {
@@ -2025,6 +2042,24 @@ mod tests {
 
         assert_eq!(nodes[1].style.border_right_color, Some(Color::TRANSPARENT));
         assert_eq!(nodes[2].style.border_left_color, Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn collapsed_cell_visual_bounds_include_centered_inline_borders() {
+        let node = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display: Display::TableCell, border_collapse: true,
+                border_left_width: Some(25.0), border_right_width: Some(25.0),
+                ..Style::default()
+            },
+            parent: None, sticky_counter_signal: None,
+        };
+        let rect = LayoutRect { x: 12.5, y: 0.0, width: 75.0, height: 100.0 };
+        let artifact = PaintArtifact::build(vec![node], &[(rect, 0)], 1);
+        assert_eq!(artifact.display_items[0].visual_rect,
+            LayoutRect { x: 0.0, width: 100.0, ..rect });
+        assert_eq!(artifact.rect_by_index[0], Some(rect));
     }
 
     #[test]

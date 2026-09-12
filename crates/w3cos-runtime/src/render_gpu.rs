@@ -1207,11 +1207,12 @@ fn draw_text_run(
 
 fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     let border = style.border_width;
+    let (left, right) = crate::paint_artifact::paint_inline_border_widths(style);
     let pad = style.padding_lengths();
     LayoutRect {
-        x: rect.x + pad.left + border,
+        x: rect.x + pad.left + left,
         y: rect.y + pad.top + border,
-        width: (rect.width - pad.left - pad.right - border * 2.0).max(1.0),
+        width: (rect.width - pad.left - pad.right - left - right).max(1.0),
         height: (rect.height - pad.top - pad.bottom - border * 2.0).max(0.0),
     }
 }

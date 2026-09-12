@@ -813,7 +813,7 @@ fn render_node(
         || style.border_bottom_color.is_some()
         || style.border_left_color.is_some()
         || (style.border_collapse
-            && matches!(style.display, Display::TableColumn | Display::TableColumnGroup));
+            && matches!(style.display, Display::TableColumn | Display::TableColumnGroup | Display::TableCell));
     if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         let mut border = color_paint(style.border_color, style.opacity);
         border.set_style(paint::Style::Stroke);
@@ -1997,9 +1997,8 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
 
 fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     let border_top = style.border_top_width.unwrap_or(style.border_width);
-    let border_right = style.border_right_width.unwrap_or(style.border_width);
+    let (border_left, border_right) = crate::paint_artifact::paint_inline_border_widths(style);
     let border_bottom = style.border_bottom_width.unwrap_or(style.border_width);
-    let border_left = style.border_left_width.unwrap_or(style.border_width);
     let padding = style.padding_lengths();
     LayoutRect {
         x: rect.x + padding.left + border_left,
