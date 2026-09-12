@@ -91,6 +91,14 @@ to zero in `target/wpt-targeted/batch-4305-4312-outer-leading-space-v1/results.j
 (8/8). 4297–4304 and 4105–4112 regressions also passed 8/8. The next batch
 4313–4320 passed 5/8, with cases 4314, 4318 and 4319 awaiting repair.
 
+Forced-break projection derives the line top from an inline text em box by
+removing its half-leading; following text restores its own half-leading while
+replaced boxes use the line top. Case 4318 moved from 768 differing pixels to
+zero in `target/wpt-targeted/batch-4313-4320-forced-break-line-top-v1/results.json`
+(6/8). 4314/4319 remain failures; 4305–4312 and 4097–4104 regressions passed
+8/8. Forced-break unit tests passed 5/7; the two remaining failures were
+verified to produce identical results with the production change removed.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

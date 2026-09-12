@@ -4589,6 +4589,13 @@ fn project_positioned_bfc_float_heights(
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    fn text_half_leading(component: &Component) -> f32 {
+        if component.style.display == WDisplay::Inline
+            && matches!(&component.kind, ComponentKind::Text { content } if content != "\u{2028}")
+        {
+            (component.style.font_size * component.style.line_height - component.style.font_size) * 0.5
+        } else { 0.0 }
+    }
     let layout_position = layouts
         .iter()
         .enumerate()
@@ -4666,7 +4673,8 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                     .copied()
                     .map(|position| layouts[position].0)
                 {
-                    line_top.get_or_insert(layout.y);
+                    // Text rects describe their em box, not the line strut.
+                    line_top.get_or_insert(layout.y - text_half_leading(child));
                     line_height = line_height.max(layout.height);
                 }
                 continue;
@@ -4790,7 +4798,7 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                     *following_index,
                     count_nodes(following),
                     target_x - following_rect.x,
-                    target_y - following_rect.y,
+                    target_y + text_half_leading(following) - following_rect.y,
                 );
                 cursor_x = target_x + following_rect.width + margin_right;
             }
@@ -10822,6 +10830,25 @@ mod tests {
 
         assert_eq!(root.height, 0.0);
         assert!(text.height > root.height);
+    }
+
+    #[test]
+    fn forced_break_uses_line_top_instead_of_text_em_top() {
+        let text_style = Style { display: WDisp::Inline, font_size: 16.0,
+            line_height: 1.25, ..Style::default() };
+        let root = Component::row(Style {
+            display: WDisp::Flex, font_size: 16.0, line_height: 1.25,
+            height: WDim::Px(192.0), ..Style::default()
+        }, vec![Component::text("Filler Text", text_style.clone()),
+            Component::text("\u{2028}", text_style),
+            Component::image("image.png", Style { display: WDisp::InlineBlock,
+                width: WDim::Px(192.0), height: WDim::Px(172.0), ..Style::default() })]);
+        let rect = |y, width, height| LayoutRect { x: 0.0, y, width, height };
+        let mut layouts = vec![(rect(0.0, 192.0, 192.0), 0),
+            (rect(2.0, 68.0, 16.0), 1), (rect(22.0, 0.0, 16.0), 2),
+            (rect(22.0, 192.0, 172.0), 3)];
+        project_forced_break_lines(&mut layouts, &root);
+        assert_eq!(layouts[3].0.y, 20.0);
     }
 
     #[test]
