@@ -784,7 +784,14 @@ fn render_node(
     }
 
     let bg = style.background;
-    for background_rect in crate::paint_artifact::box_background_paint_rects(style, rect) {
+    let background_rects = if style.display == Display::Inline
+        && matches!(kind, ComponentKind::Text { .. })
+    {
+        Vec::new() // Inline decorations follow shaped fragments below.
+    } else {
+        crate::paint_artifact::box_background_paint_rects(style, rect)
+    };
+    for background_rect in background_rects {
         if bg.a > 0 {
             draw_rounded_rect(
                 canvas,
@@ -1352,6 +1359,41 @@ fn draw_text_in_rect(
             )
         },
     );
+    if style.display == Display::Inline
+        && (style.background.a > 0 || style.background_image.is_some())
+    {
+        let line_height = style.font_size * style.line_height;
+        let top = content.y + text_vertical_offset(
+            style, content.height, layout.lines.len() as f32 * line_height);
+        let paragraph_ends = text_layout::paragraph_terminal_lines(text, style.white_space, &layout.lines);
+        for (index, line) in layout.lines.iter().enumerate() {
+            let line_content = if index == 0 { first_line_content } else { continuation_content };
+            let align = effective_text_align(style);
+            let justify = align == TextAlign::Justify && !paragraph_ends[index]
+                && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal
+                    | w3cos_std::style::WhiteSpace::PreLine);
+            let advance = if justify { line_content.width }
+                else { measure_skia_text_advance(line, typeface, style) };
+            let line_align = if paragraph_ends[index] {
+                effective_text_align_last(style).unwrap_or_else(|| {
+                    if align == TextAlign::Justify
+                        && style.direction == w3cos_std::style::TextDirection::Rtl
+                    { TextAlign::Right } else { align }
+                })
+            } else { align };
+            let x = aligned_text_x(line_content, line_align, 0.0, advance);
+            let fragment = text_layout::inline_fragment_background_box(
+                LayoutRect { x, y: top + index as f32 * line_height,
+                    ..line_content }, advance, style, index == 0, index + 1 == layout.lines.len());
+            if style.background.a > 0 {
+                draw_rounded_rect(canvas, fragment, style.border_corner_radii(),
+                    &color_paint(style.background, style.opacity));
+            }
+            if style.background_image.is_some() {
+                draw_background_image(canvas, fragment, rect, style.border_radius, style, style.opacity);
+            }
+        }
+    }
     if layout.lines.len() == 1 {
         let ink = measure_skia_text_ink_bounds(
             &layout.lines[0],
@@ -2332,6 +2374,34 @@ mod tests {
                 "right".to_string(),
             );
         assert_eq!(effective_text_align_last(&style), Some(TextAlign::Right));
+    }
+
+    #[test]
+    fn inline_background_uses_first_and_continuation_fragments() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("serif".into()),
+            font_size: 16.0,
+            line_height: 1.25,
+            text_indent: w3cos_std::style::Dimension::Px(16.0),
+            background: w3cos_std::color::Color::rgb(255, 255, 0),
+            color: w3cos_std::color::Color::rgba(0, 0, 0, 0),
+            ..Style::default()
+        };
+        let mut surface = Surface::new_raster_n32_premul((80, 120)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        let kind = ComponentKind::Text { content: "a a a a a a a a a a a a".into() };
+        render_node(surface.canvas(), 0,
+            LayoutRect { x: 8.0, y: 8.0, width: 40.0, height: 16.0 },
+            &kind, &style, &typeface, crate::layout::layout_font(), None, false, false);
+        let info = ImageInfo::new((80, 120), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 80 * 120 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 80 * 4, (0, 0)));
+        let pixel = |x: usize, y: usize| &pixels[(y * 80 + x) * 4..(y * 80 + x) * 4 + 4];
+        assert_eq!(pixel(8, 8), &[255, 255, 255, 255], "indent is not background");
+        assert_eq!(pixel(25, 8), &[255, 255, 0, 255], "first fragment");
+        assert_eq!(pixel(8, 28), &[255, 255, 0, 255], "continuation fragment");
     }
 
     #[test]

@@ -64,6 +64,33 @@ pub(crate) fn inline_text_continuation_box(
     }
 }
 
+/// Slice an inline decoration around a shaped line's advance box. Horizontal
+/// edges occur only at the logical first/last fragment; margins never paint.
+pub(crate) fn inline_fragment_background_box(
+    line: crate::layout::LayoutRect,
+    advance: f32,
+    style: &Style,
+    first: bool,
+    last: bool,
+) -> crate::layout::LayoutRect {
+    let padding = style.padding_lengths();
+    let rtl = style.direction == w3cos_std::style::TextDirection::Rtl;
+    let left = if (first && !rtl) || (last && rtl) {
+        padding.left + style.border_left_width.unwrap_or(style.border_width)
+    } else { 0.0 };
+    let right = if (last && !rtl) || (first && rtl) {
+        padding.right + style.border_right_width.unwrap_or(style.border_width)
+    } else { 0.0 };
+    let top = padding.top + style.border_top_width.unwrap_or(style.border_width);
+    let bottom = padding.bottom + style.border_bottom_width.unwrap_or(style.border_width);
+    crate::layout::LayoutRect {
+        x: line.x - left,
+        y: line.y - top,
+        width: advance.max(0.0) + left + right,
+        height: style.font_size + top + bottom,
+    }
+}
+
 /// Positions shaped words without changing their glyph advances. Only the
 /// collapsible inter-word spaces receive the positive justification remainder.
 pub fn justified_word_positions<'a>(

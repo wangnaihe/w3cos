@@ -1836,6 +1836,40 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   normal-width lines. Multi-line inline background fragments and layout height
   are also open. The margin correction alone is not full closure of these cases.
 
+### Skia shaped inline background qualification (float wrapping remains open)
+
+- Continuing from698cefa, the primary wrap's remaining1600 pixels form the
+  100px first-line indentation multiplied by the16px inline background height.
+  Glyph rows agree, but both implementations still lack proper multi-line
+  background fragments; removing only the indentation paint is not closure.
+- A non-fixture-specific Skia pixel test,
+  `inline_background_uses_first_and_continuation_fragments`, is confirmed RED:
+  the indent probe is yellow instead of white. Its first/continuation probes
+  additionally require actual fragment backgrounds (transparent glyph paint).
+  The initial test-only compile used an incorrect type name; after correcting
+  it toDimension, compilation succeeds and the pixel assertion genuinely fails.
+- Candidate shared fragment geometry excludes margins, paints vertical edges
+  on every line, and includes logical-start/end edges only on first/last lines.
+  Skia uses retained shaped lines and advances for background slices instead
+  of the leaf's single layout rectangle. The post-fix pixel unit is GREEN;
+  background-filter35/35 and text-layout26/26 unit tests pass. CPU/GPU
+  integration and full-suite acceptance remain pending.
+- Runner SHA256 is
+  `724f505119b64ebc8083a8193eb9eefdd2095513024a94e4c90266ab6de1b8f3`.
+  `batch-5773-shaped-inline-background-v1/results.json` passes3/4: the primary
+  indent versus inline-margin match becomes exact zero pixels (previous1600).
+  The two expected mismatches pass46485 and73839 pixels. Inline-margin versus
+  float remains FAIL73806 pixels (previous34733); painting actual multi-line
+  backgrounds exposes the underlying float layout difference, not closure.
+  Inline border/radius/image fragmentation and float exclusions are not claimed
+  closed by this scoped Skia qualification.
+- The enclosing5769 batch improves6/8 to7/8. Related eight-case starts
+  5761/5753/5745/5737/5729/5721/5689/5681/5665/5545/5553/5593 under
+  `batch-<start>-shaped-inline-background-v1` pass96/96:94 zero-pixel matches
+  and two expected mismatches. This is not final6548 acceptance. The next
+  focused failure remains5775, requiring breakable float-side line layout
+  rather than an unwrapped atomic text box below the float.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
