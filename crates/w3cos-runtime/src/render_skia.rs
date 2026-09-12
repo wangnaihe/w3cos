@@ -1460,7 +1460,11 @@ fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) ->
 }
 
 fn line_box_half_leading(style: &Style) -> f32 {
-    if style.display == Display::Inline {
+    if style.display == Display::Inline
+        && !matches!(style.position,
+            w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+        && style.float == w3cos_std::style::Float::None
+    {
         0.0
     } else {
         (style.font_size * style.line_height - style.font_size) * 0.5
@@ -2686,6 +2690,22 @@ mod tests {
             ..style
         };
         assert_eq!(line_box_half_leading(&inline), 0.0);
+    }
+
+    #[test]
+    fn blockified_inline_text_retains_its_line_box_half_leading() {
+        for position in [w3cos_std::style::Position::Absolute, w3cos_std::style::Position::Fixed] {
+            let style = Style {
+                display: Display::Inline, position, font_size: 30.0, line_height: 4.0,
+                ..Style::default()
+            };
+            assert_eq!(line_box_half_leading(&style), 45.0);
+        }
+        let floated = Style {
+            display: Display::Inline, float: w3cos_std::style::Float::Left,
+            font_size: 30.0, line_height: 4.0, ..Style::default()
+        };
+        assert_eq!(line_box_half_leading(&floated), 45.0);
     }
 
     #[test]
