@@ -8909,6 +8909,12 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         previous_line = Some(fragment.line_index);
     }
     component.children = normalized;
+    if style_bidi_control.is_some() {
+        // The children are now visual-order runs. Keep the principal box's
+        // direction for alignment, but do not expose its already-consumed
+        // embedding/override to a surrounding paragraph on a later pass.
+        component.style.unicode_bidi = UnicodeBidi::Normal;
+    }
     component.style.justify_content = match (component.style.text_align, paragraph_direction) {
         (w3cos_std::style::TextAlign::Justify, TextDirection::Rtl)
             if matches!(component.style.white_space,
@@ -9124,6 +9130,11 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
                 )
                 || fragment.children.len() != 1
                 || !passive_host(&fragment.on_click)
+                // This wrapper owns a bidi embedding/isolation/override.
+                // Its text child does not inherit unicode-bidi; removing the
+                // wrapper here would erase the paragraph's control boundary
+                // before visual-order lowering can consume it.
+                || fragment.style.unicode_bidi != w3cos_std::style::UnicodeBidi::Normal
                 || !(principal_box_can_merge_generated_inline_text(&fragment.style)
                     || painted_wrapper_matches_text)
                 || !matches!(&fragment.children[0].kind, ComponentKind::Text { .. })
@@ -13102,6 +13113,39 @@ mod image_component_tests {
             } else { None }
         }).unwrap_or_else(|| panic!("missing decorated pXpX fragment: {runs:?}"));
         assert_eq!(fragment, "pXpX");
+    }
+
+    #[test]
+    fn inline_override_survives_anonymous_block_lowering() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[
+            ("display", "inline"),
+            ("direction", "rtl"),
+            ("unicode-bidi", "bidi-override"),
+        ]);
+        let mut document = Document::new();
+        document.set_html_document(false);
+        let paragraph = document.create_element("p");
+        paragraph.set_text_content(&mut document, "instruction");
+        document.body().append_child(&mut document, paragraph);
+        let before = document.create_text_node("\n        ");
+        document.body().append_child(&mut document, before);
+        let inline = document.create_element("div");
+        inline.set_attribute(&mut document, "class", "override");
+        let content = document.create_text_node("SSAP SSAP");
+        inline.append_child(&mut document, content);
+        document.body().append_child(&mut document, inline);
+        let after = document.create_text_node("\n    ");
+        document.body().append_child(&mut document, after);
+        let tree = document.to_component_tree();
+        fn text(component: &w3cos_std::Component) -> String {
+            match &component.kind {
+                w3cos_std::ComponentKind::Text { content } => content.clone(),
+                _ => component.children.iter().map(text).collect(),
+            }
+        }
+        assert_eq!(text(&tree).trim(), "instructionPASS PASS");
+        crate::stylesheet::clear_rules();
     }
 
     #[test]

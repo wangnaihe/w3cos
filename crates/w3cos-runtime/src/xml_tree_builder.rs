@@ -494,6 +494,47 @@ mod tests {
 
     #[cfg(feature = "dynamic-js")]
     #[test]
+    fn xhtml_inline_override_keeps_visual_order_after_parsing() {
+        w3cos_dom::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        ));
+        let url = "https://example.test/override.xhtml";
+        loader.begin_document_parse(url).unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(loader, url);
+        parser.write("<html xmlns='http://www.w3.org/1999/xhtml'><head></head><body>\n<p>instruction</p>\n<div>SSAP SSAP</div>\n</body></html>").unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+            "div { direction: rtl; display: inline; unicode-bidi: bidi-override; }",
+            "inline <style>",
+        );
+        assert!(stylesheet.rules.iter().any(|rule| rule.declarations.iter()
+            .any(|(property, value)| property == "unicode-bidi" && value == "bidi-override")));
+        for rule in stylesheet.rules {
+            let declarations = rule.declarations.iter()
+                .map(|(property, value)| (property.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
+        }
+        fn text(component: &w3cos_std::Component) -> String {
+            match &component.kind {
+                w3cos_std::ComponentKind::Text { content } => content.clone(),
+                _ => component.children.iter().map(text).collect(),
+            }
+        }
+        let direct = crate::dom::with_document(|document| document.to_component_tree());
+        assert_eq!(text(&direct).trim(), "instructionPASS PASS", "parsed DOM before runtime font provider");
+        let tree = crate::dom::to_component_tree();
+        assert_eq!(text(&tree).trim(), "instructionPASS PASS");
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
     fn xhtml_generated_and_authored_inline_text_share_one_principal_text_box() {
         w3cos_dom::stylesheet::clear_rules();
         crate::dom::reset_document();

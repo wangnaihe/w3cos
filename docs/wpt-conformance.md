@@ -3734,6 +3734,40 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `1e5892f6023244f5cc178b06e434409f84b603c3c0879c884cd92186aae4614c`.
   This focused receipt is not full-6548 acceptance or a global remaining count.
 
+### Inline override text-node boundary (after 51ca233)
+
+- Discovery batches 408/416/424/432/440 are each 8/8. Batch 448 is 6/8:
+  direction-applies-to-008 differs by 716 pixels; direction-applies-to-012
+  by 100. Actual/reference dumps and raw frames are retained in
+  `target/wpt-targeted/direction-{452,454}-{actual,ref}*`.
+- Direct `Element::set_text_content` fixtures passed but were not RED:
+  this method stores text on the element, unlike parsed XML's separate
+  Text child. The corrected Text-child DOM fixture fails with SSAP SSAP
+  instead of PASS PASS. The XML-parser/CSS-compiler fixture also fails
+  before the runtime font-provider stage; compiled CSS retains override.
+- Candidate v1 preserves non-normal bidi wrapper boundaries before visual
+  lowering. DOM and XML new units pass, but the 19-case sample regresses
+  `nested_bidi_overrides_shape_as_one_passive_inline_run` (17/19).
+  Its receipt is retained; this candidate is not qualified for publication.
+- Candidate v2 also clears successfully consumed principal bidi controls,
+  retaining direction for alignment. New DOM unit passes; the existing
+  sample returns to 18/19 with no prior PASS lost, including nested override.
+  The existing RTL inline-block unit failure remains. Receipts:
+  `inline-override-dom-neighbors-after.json` and
+  `inline-override-dom-neighbors-v2-after.json` under `target/wpt-targeted/`.
+  Current production build completes in **2m04s**. Batch 448 becomes 7/8:
+  direction-applies-to-008 is **716 differing pixels -> 0**, with unchanged
+  reference and zero tolerance; direction-applies-to-012 remains 100 pixels.
+  Final focused qualification: **520 executions, 510 PASS / 10 existing
+  FAIL**, with no prior PASS lost. Only direction-applies-to-008 changes;
+  other 519 complete result objects are unchanged. Receipt:
+  `target/wpt-targeted/inline-override-v2-comparison.json`.
+  Production binary SHA256:
+  `eeb33719f83a48f7508caee52a045dcb5038460d60f17f95e262319c4ac45768`.
+  This is not full-6548 acceptance or a global remaining-failure count.
+  The RTL inline-block pixel difference is a 1px horizontal shift, not a
+  missing glyph; it remains an independently tracked open failure.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
