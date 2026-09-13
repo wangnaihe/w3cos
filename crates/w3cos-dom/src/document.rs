@@ -9571,6 +9571,8 @@ fn hoist_floats_into_block_formatting_context(
                     // Extra whitespace would advance that line and shift the
                     // extracted float compared with a directly authored float.
                     if !nowrap_line {
+                        strut_style.custom_properties.get_or_insert_with(Default::default).insert(
+                            "--w3cos-internal-float-strut".into(), "1".into());
                         right.push(w3cos_std::Component::text(" ", strut_style));
                     }
                     component.style.display = w3cos_std::style::Display::Block;
@@ -10819,6 +10821,12 @@ mod image_component_tests {
             let has_strut = fixed.iter().any(|child| matches!(&child.kind,
                 ComponentKind::Text { content } if content == " "));
             assert_eq!(has_strut, needs_strut, "line={line_space:?}, float={float_space:?}");
+            for child in &fixed {
+                if matches!(&child.kind, ComponentKind::Text { content } if content == " ") {
+                    assert!(child.style.custom_properties.as_ref().is_some_and(|properties|
+                        properties.get("--w3cos-internal-float-strut").is_some_and(|value| value == "1")));
+                }
+            }
         }
     }
 

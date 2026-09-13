@@ -147,7 +147,9 @@ pub(crate) fn resolve_float_text_layouts(
             .map(|index| (*index, &nodes[*index])).collect();
         // Floats retain their source-order placement, but text exclusion is
         // independent of whether the float precedes or follows the text leaf.
-        let mut normal = children.iter().filter(|(_, (_, style, _))| style.float == WFloat::None);
+        let mut normal = children.iter().filter(|(_, (_, style, _))| style.float == WFloat::None
+            && !style.custom_properties.as_ref().is_some_and(|properties|
+                properties.get("--w3cos-internal-float-strut").is_some_and(|value| value == "1")));
         let Some(&(text_index, (kind, style, _))) = normal.next() else { continue; };
         if normal.next().is_some() { continue; }
         let ComponentKind::Text { content: text } = kind else { continue; };
@@ -18638,6 +18640,38 @@ mod tests {
         assert!((get(2).y - get(0).y).abs() < 0.01, "float={:?}", get(2));
         assert!((get(3).y - get(1).y).abs() < 0.01);
         assert!((get(0).height - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn float_text_exclusion_ignores_only_the_synthetic_extraction_strut() {
+        for synthetic in [false, true] {
+            let mut parent = Style { display: WDisp::Flex, width: WDim::Px(400.0),
+                ..Style::default() };
+            parent.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into());
+            let text = ComponentKind::Text { content: "HelloKitty".into() };
+            let space = ComponentKind::Text { content: " ".into() };
+            let mut strut = Style { display: WDisp::Inline, ..Style::default() };
+            if synthetic {
+                strut.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-float-strut".into(), "1".into());
+            }
+            let inline = Style { display: WDisp::Inline, ..Style::default() };
+            let floating = Style { float: WFloat::Right, ..Style::default() };
+            let nodes = vec![(&ComponentKind::Row, &parent, None),
+                (&text, &inline, Some(0)), (&space, &strut, Some(0)),
+                (&ComponentKind::Row, &floating, Some(0))];
+            let rects = vec![Some(LayoutRect { x: 8.0, y: 16.0, width: 400.0, height: 50.0 }),
+                Some(LayoutRect { x: 8.0, y: 17.6, width: 68.0, height: 16.0 }),
+                Some(LayoutRect { x: 76.0, y: 17.6, width: 4.0, height: 16.0 }),
+                Some(LayoutRect { x: 358.0, y: 16.0, width: 50.0, height: 50.0 })];
+            let flows = resolve_float_text_layouts(&nodes, &rects, 800.0, 600.0);
+            assert_eq!(flows.len(), usize::from(synthetic));
+            if synthetic {
+                assert_eq!(flows[0].text_index, 1);
+                assert_eq!(flows[0].bands[0].width, 350.0);
+            }
+        }
     }
 
     #[test]

@@ -1592,6 +1592,8 @@ fn effective_text_align(style: &Style) -> TextAlign {
     // anonymous line row perform the authored alignment.
     if style.display == Display::Inline
         && style.width != w3cos_std::style::Dimension::Percent(100.0)
+        && !style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-float-line-bands"))
     {
         return TextAlign::Left;
     }
@@ -2375,6 +2377,22 @@ mod tests {
         style.display = Display::Inline;
         style.text_align = TextAlign::Right;
         assert_eq!(effective_text_align(&style), TextAlign::Left);
+    }
+
+    #[test]
+    fn float_exclusion_line_uses_the_containing_blocks_text_alignment() {
+        for (align, direction, expected) in [
+            (TextAlign::Right, w3cos_std::style::TextDirection::Ltr, TextAlign::Right),
+            (TextAlign::Start, w3cos_std::style::TextDirection::Rtl, TextAlign::Right),
+            (TextAlign::Center, w3cos_std::style::TextDirection::Ltr, TextAlign::Center),
+        ] {
+            let mut style = Style { display: Display::Inline, text_align: align,
+                direction, ..Style::default() };
+            assert_eq!(effective_text_align(&style), TextAlign::Left);
+            style.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-float-line-bands".into(), "50 0 350".into());
+            assert_eq!(effective_text_align(&style), expected);
+        }
     }
 
     #[test]

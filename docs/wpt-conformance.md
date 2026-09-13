@@ -2434,6 +2434,44 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   changes. Multi-run/nested-inline ownership, full margin/relative-float
   packing and final same-SHA6548 acceptance remain open.
 
+### Float-band text alignment and extraction struts
+
+- At clean baselinea21d597,1386 (`001a`) is RED at1910px. Raw frame comparison
+  isolates955 pixels each to the RTL/right-aligned left-float paragraphs.
+  The shared full-line text painter incorrectly forced these Inline leaves
+  to left alignment, despite their exclusion-band geometry representing a
+  complete line rather than a fragment. Ordinary inline fragments still
+  retain their no-double-alignment rule; marked float-band lines now honor
+  the containing block's alignment.
+- Fresh Chromium800x600 Range geometry of the unmodified upstream reference
+  gives text origins58/8/339.5625/289.5625/339.5625/289.5625 and advance68.4375.
+  Baseline native reference ink was at59/9/59/9/59/9, confirming its painting was
+  also wrong. This is not merely a source/reference agreement repair.
+- Paint-only intermediate build3m24s passes its alignment counter, but WPT
+  neighbor starts1358/1366/1385 give8/8,8/8,3/8:1386 reaches0 while1387
+  regresses0->1910px. Receipt suffix`float-line-alignment-after-v1` records
+  that unqualified candidate. A synthetic extracted-right-float strut was
+  being counted as a second real text leaf, preventing the shared text flow.
+- DOM now marks only that internal strut; layout excludes the marked strut
+  from real-text cardinality while preserving its line-height/static anchor.
+  Authored whitespace is not excluded. New paired counter checks both paths,
+  and the DOM extraction-context counter checks marker provenance.
+  Final library3m38s: new counter PASS, float43PASS/1FAIL (unchanged24-vs80
+  margin expectation), text-align4/4, text-layout28/28, BFC3/3. DOM build
+  17.83s passes its strut counter and all13 float tests.
+- Final runner2m12s SHA256
+  `497870f652d2c27bce19a7d23358c753e7e329bbacd50e88dbfe34a86a7ae5f2`:
+  neighbor starts1358/1366/1385 now8/8,8/8,4/8.1386/1387 both PASS0;
+  1388 improves13558->13110px but remains FAIL;1385/1390/1391 remain
+  10000/20000/20000px,1389/1392 stayPASS0. Receipts use suffix
+  `float-line-alignment-strut-after-v1`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 exact-zero matches, four expected
+  mismatches), with ordered paths/statuses/full pixel-diff objects identical
+  to a21d597. Receipts use`float-line-alignment-strut-final-v1`. No allowances,
+  suite or upstream files changed. Nested inline float ownership, broader
+  multi-run line layout and final same-clean-SHA6548 proof remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
