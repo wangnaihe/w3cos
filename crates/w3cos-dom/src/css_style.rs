@@ -1038,6 +1038,43 @@ impl CSSStyleDeclaration {
                 }
             }
         }
+        for (edge, physical, alias, shorthand, shorthand_alias) in [
+            (0, "border-top-color", "borderTopColor", "border-top", "borderTop"),
+            (1, "border-right-color", "borderRightColor", "border-right", "borderRight"),
+            (2, "border-bottom-color", "borderBottomColor", "border-bottom", "borderBottom"),
+            (3, "border-left-color", "borderLeftColor", "border-left", "borderLeft")] {
+            let color = self.inline_declarations.iter().rev().find_map(|(name, value)| {
+                let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+                if name == physical || name == alias {
+                    if value.eq_ignore_ascii_case("currentcolor") { Some(style.color) }
+                    else { Color::from_css(value) }
+                } else if matches!(name.as_str(), "border-color" | "borderColor") {
+                    if value.eq_ignore_ascii_case("currentcolor") { Some(style.color) }
+                    else { parse_border_color_edges(value).map(|edges| edges[edge]) }
+                } else if name == "border" || name == shorthand || name == shorthand_alias {
+                    border_shorthand_color(value, style.color, parse_border_width)
+                } else { None }
+            });
+            if let Some(color) = color {
+                match edge {
+                    0 => style.border_top_color = Some(color),
+                    1 => style.border_right_color = Some(color),
+                    2 => style.border_bottom_color = Some(color),
+                    _ => style.border_left_color = Some(color),
+                }
+            }
+        }
+        if let Some(color) = self.inline_declarations.iter().rev().find_map(|(name, value)| {
+            let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+            if name == "border" {
+                border_shorthand_color(value, style.color, parse_border_width)
+            } else if matches!(name.as_str(), "border-color" | "borderColor") {
+                if value.eq_ignore_ascii_case("currentcolor") { Some(style.color) }
+                else { parse_border_color_edges(value).map(|edges| edges[0]) }
+            } else { None }
+        }) {
+            style.border_color = color;
+        }
         style
     }
 
@@ -1756,6 +1793,30 @@ fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
         }
         _ => None,
     }
+}
+
+pub(crate) fn border_shorthand_color(
+    value: &str, current_color: Color, width: impl Fn(&str) -> Option<f32>,
+) -> Option<Color> {
+    let parts = split_css_whitespace(value);
+    if parts.is_empty() { return None; }
+    let mut counts = [0; 3];
+    let mut color = None;
+    for part in parts {
+        if width(&part).is_some_and(|width| width.is_finite() && width >= 0.0) {
+            counts[0] += 1;
+        } else if let Some(parsed) = Color::from_css(&part) {
+            counts[1] += 1;
+            color = Some(parsed);
+        } else if part.eq_ignore_ascii_case("currentcolor") {
+            counts[1] += 1;
+            color = Some(current_color);
+        } else if parse_border_line_style(&part).is_some() {
+            counts[2] += 1;
+        } else { return None; }
+        if counts.into_iter().any(|count| count > 1) { return None; }
+    }
+    Some(color.unwrap_or(current_color))
 }
 
 fn apply_border_shorthand(style: &mut Style, value: &str) {
@@ -2715,6 +2776,31 @@ mod tests {
         declaration.set_property("border-left", "blue");
         assert_eq!(declaration.to_style().border_left_width, Some(0.0));
         assert_eq!(declaration.to_style().border_top_width, None);
+    }
+
+    #[test]
+    fn border_shorthand_omitted_color_resets_to_final_current_color() {
+        for property in ["border", "border-top", "border-right", "border-bottom", "border-left"] {
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("color", "blue");
+            declaration.set_property("border-color", "red");
+            declaration.set_property(property, "solid 16px");
+            declaration.set_property("color", "green");
+            let style = declaration.to_style();
+            let colors = [style.border_top_color, style.border_right_color,
+                style.border_bottom_color, style.border_left_color]
+                .map(|color| color.unwrap_or(style.border_color));
+            let target_edge = match property {
+                "border-top" => Some(0), "border-right" => Some(1),
+                "border-bottom" => Some(2), "border-left" => Some(3), _ => None,
+            };
+            for (edge, color) in colors.into_iter().enumerate() {
+                let expected = if target_edge.is_none_or(|target| target == edge) {
+                    Color::rgb(0, 128, 0)
+                } else { Color::rgb(255, 0, 0) };
+                assert_eq!(color, expected, "{property}, edge={edge}");
+            }
+        }
     }
 
     #[test]

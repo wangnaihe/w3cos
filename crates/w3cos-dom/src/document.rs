@@ -1921,7 +1921,15 @@ impl Document {
         let relative_side_color = |properties: &[&str], side: usize| {
             declared_property_value(properties).and_then(|(property, value)| {
                 if css_property_eq(property, "border-color") {
-                    crate::css_style::parse_border_color_edges(value).map(|edges| edges[side])
+                    if value.trim().eq_ignore_ascii_case("currentcolor") { Some(style.color) }
+                    else { crate::css_style::parse_border_color_edges(value).map(|edges| edges[side]) }
+                } else if css_property_eq(property, "border")
+                    || css_property_eq(property, ["border-top", "border-right", "border-bottom", "border-left"][side])
+                {
+                    crate::css_style::border_shorthand_color(value, style.color,
+                        |token| relative_border_width_px(token, &style))
+                } else if value.trim().eq_ignore_ascii_case("currentcolor") {
+                    Some(style.color)
                 } else {
                     split_css_tokens(value)
                         .into_iter()
@@ -1929,28 +1937,22 @@ impl Document {
                 }
             })
         };
-        if let Some(color) = relative_side_color(
-            &["border", "border-color", "border-top", "border-top-color"],
-            0,
-        ) {
+        let side_colors = [
+            relative_side_color(&["border", "border-color", "border-top", "border-top-color"], 0),
+            relative_side_color(&["border", "border-color", "border-right", "border-right-color"], 1),
+            relative_side_color(&["border", "border-color", "border-bottom", "border-bottom-color"], 2),
+            relative_side_color(&["border", "border-color", "border-left", "border-left-color"], 3),
+        ];
+        if let Some(color) = side_colors[0] {
             style.border_top_color = Some(color);
         }
-        if let Some(color) = relative_side_color(
-            &["border", "border-color", "border-right", "border-right-color"],
-            1,
-        ) {
+        if let Some(color) = side_colors[1] {
             style.border_right_color = Some(color);
         }
-        if let Some(color) = relative_side_color(
-            &["border", "border-color", "border-bottom", "border-bottom-color"],
-            2,
-        ) {
+        if let Some(color) = side_colors[2] {
             style.border_bottom_color = Some(color);
         }
-        if let Some(color) = relative_side_color(
-            &["border", "border-color", "border-left", "border-left-color"],
-            3,
-        ) {
+        if let Some(color) = side_colors[3] {
             style.border_left_color = Some(color);
         }
         if declared_value(&["border-color"])
@@ -1963,19 +1965,24 @@ impl Document {
             .filter(|(name, _, _)| {
                 matches!(name.as_str(), "border" | "border-color" | "borderColor")
             })
-            .map(|(_, value, _)| value.as_str())
+            .map(|(name, value, _)| (name.as_str(), value.as_str()))
             .last();
-        if let Some(color) = last_declared_border_color.and_then(|value| {
-            split_css_tokens(value)
-                .into_iter()
-                .find_map(|token| w3cos_std::Color::from_css(&token))
+        if let Some(color) = last_declared_border_color.and_then(|(property, value)| {
+            if css_property_eq(property, "border") {
+                crate::css_style::border_shorthand_color(value, style.color,
+                    |token| relative_border_width_px(token, &style))
+            } else if value.trim().eq_ignore_ascii_case("currentcolor") {
+                Some(style.color)
+            } else {
+                crate::css_style::parse_border_color_edges(value).map(|edges| edges[0])
+            }
         }) {
             // A relative-width border shorthand is finalized here after font
             // metrics are known. Preserve its color even though the generic
             // declaration parser could not resolve the width token eagerly.
             style.border_color = color;
         }
-        let explicitly_transparent_border = last_declared_border_color.is_some_and(|value| {
+        let explicitly_transparent_border = last_declared_border_color.is_some_and(|(_, value)| {
             split_css_tokens(value)
                 .iter()
                 .any(|token| token.eq_ignore_ascii_case("transparent"))
@@ -1995,6 +2002,50 @@ impl Document {
             // Resolve it only after text color inheritance has completed.
             style.border_color = style.color;
         }
+        // Keep the computed keyword separate from its used color. Inherited
+        // currentColor must resolve against this element, even when the parent
+        // has already produced a concrete color for painting.
+        let color_properties = [
+            ["border", "border-color", "border-top", "border-top-color"],
+            ["border", "border-color", "border-right", "border-right-color"],
+            ["border", "border-color", "border-bottom", "border-bottom-color"],
+            ["border", "border-color", "border-left", "border-left-color"],
+        ];
+        let parent_keywords = inherited.and_then(|parent| parent.border_current_color)
+            .unwrap_or([false; 4]);
+        let mut keywords = [true; 4];
+        for (side, properties) in color_properties.iter().enumerate() {
+            if let Some((property, value)) = declared_property_value(properties) {
+                let value = value.trim();
+                keywords[side] = if value.eq_ignore_ascii_case("inherit") {
+                    parent_keywords[side]
+                } else if matches!(value.to_ascii_lowercase().as_str(),
+                    "initial" | "unset" | "revert" | "revert-layer" | "currentcolor") {
+                    true
+                } else if css_property_eq(property, "border")
+                    || css_property_eq(property, properties[2]) {
+                    crate::css_style::border_shorthand_color(value, style.color,
+                        |token| relative_border_width_px(token, &style)).is_some()
+                        && !split_css_tokens(value).iter()
+                            .any(|token| w3cos_std::Color::from_css(token).is_some())
+                } else {
+                    false
+                };
+            }
+        }
+        for (side, (keyword, color)) in keywords.iter().zip([
+            &mut style.border_top_color, &mut style.border_right_color,
+            &mut style.border_bottom_color, &mut style.border_left_color,
+        ]).enumerate() {
+            if *keyword && declared_property_value(&color_properties[side]).is_some() {
+                *color = Some(style.color);
+            }
+        }
+        if keywords.iter().all(|keyword| *keyword)
+            && (has_used_border_width || declared_property_value(&["border", "border-color"]).is_some()) {
+            style.border_color = style.color;
+        }
+        style.border_current_color = Some(keywords);
         if style.line_height_is_normal {
             // The inherited keyword is re-evaluated for this element's font,
             // not the parent's already resolved metric ratio.
@@ -14207,6 +14258,88 @@ mod computed_style_cache_tests {
         assert_eq!(style.bottom, w3cos_std::style::Dimension::Px(16.0));
         assert_eq!(style.left, w3cos_std::style::Dimension::Px(-32.0));
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inherited_omitted_border_color_resolves_on_receiving_element() {
+        for child_tag in ["div", "span"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#parent", &[("color", "red"), ("border", "none")]);
+            crate::stylesheet::register_rule("#child", &[("border-color", "inherit"),
+                ("border-style", "solid"), ("color", "green")]);
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            parent.set_attribute(&mut document, "id", "parent");
+            let child = document.create_element(child_tag);
+            child.set_attribute(&mut document, "id", "child");
+            parent.append_child(&mut document, child);
+            document.body().append_child(&mut document, parent);
+            let style = document.computed_style_for(child.id);
+            for color in [style.border_top_color, style.border_right_color,
+                style.border_bottom_color, style.border_left_color] {
+                assert_eq!(color.unwrap_or(style.border_color), w3cos_std::Color::rgb(0, 128, 0),
+                    "{child_tag}: inherited currentColor must resolve on child");
+            }
+            crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn inherited_border_color_keeps_per_edge_keyword_across_generations() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("color", "red"),
+            ("border", "solid 3px blue"), ("border-top", "none")]);
+        crate::stylesheet::register_rule("#child", &[("color", "green"),
+            ("border-color", "inherit"), ("border-style", "solid")]);
+        crate::stylesheet::register_rule("#grandchild", &[("color", "purple"),
+            ("border", "inherit")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        let grandchild = document.create_element("div");
+        grandchild.set_attribute(&mut document, "id", "grandchild");
+        child.append_child(&mut document, grandchild);
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+        for (element, current) in [(child, w3cos_std::Color::rgb(0, 128, 0)),
+            (grandchild, w3cos_std::Color::rgb(128, 0, 128))] {
+            let style = document.computed_style_for(element.id);
+            assert_eq!(style.border_current_color, Some([true, false, false, false]));
+            assert_eq!(style.border_top_color, Some(current));
+            for color in [style.border_right_color, style.border_bottom_color, style.border_left_color] {
+                assert_eq!(color, Some(w3cos_std::Color::rgb(0, 0, 255)));
+            }
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn omitted_border_shorthand_colors_follow_inherited_text_color() {
+        for property in ["border", "border-top"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("div", &[("border-color", "red")]);
+            crate::stylesheet::register_rule("body", &[("color", "green"), ("font-size", "16px")]);
+            crate::stylesheet::register_rule("#target", &[(property, "solid 1em")]);
+            let mut document = Document::new();
+            let body = document.body();
+            let target = document.create_element("div");
+            target.set_attribute(&mut document, "id", "target");
+            body.append_child(&mut document, target);
+            let style = document.computed_style_for(target.id);
+            let green = w3cos_std::Color::rgb(0, 128, 0);
+            let red = w3cos_std::Color::rgb(255, 0, 0);
+            assert_eq!(style.color, green, "inherited color");
+            assert_eq!(style.border_top_width, Some(16.0), "{property}");
+            assert_eq!(style.border_top_color, Some(green), "{property}");
+            assert_eq!(style.border_color, if property == "border" { green } else { red },
+                "uniform fallback, {property}");
+            for color in [style.border_right_color, style.border_bottom_color, style.border_left_color] {
+                assert_eq!(color, Some(if property == "border" { green } else { red }), "{property}");
+            }
+            crate::stylesheet::clear_rules();
+        }
     }
 
     #[test]

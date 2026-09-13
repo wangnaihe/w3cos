@@ -4546,6 +4546,141 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   the6548 remaining count. Scoped commit authorized by small-step request;
   clean-SHA focused replay remains required before normal main push.
 
+- After published0a09e37, added CSSStyleDeclaration regression for omitted
+  shorthand color: initial textblue and borderred, apply border or any
+  physical-side shorthand, then change textgreen. Affected edges mustgreen;
+  unaffected edges must remainred. This tests final currentColor rather
+  than a snapshot at shorthand application. Exact RED compilation started;
+  no parser/compute patch or candidate publication yet.
+
+- Omitted-color CSSStyleDeclaration test is terminal RED: border top red
+  instead of finalgreen (`border-shorthand-current-color-real-red.log`,
+  18.62s). Candidate resolves winning physical color declarations and valid
+  shorthand omitted/currentColor against final text color, with a shared
+  shorthand color classifier; Document repeats resolution after inherited
+  font/color facts are known, supporting relative widths. First GREEN
+  attempt fails compilation E0506 (no tests executed); corrected by
+  computing all four colors before mutating Style. GREENv2 compilation
+  started; no production pixel qualification or candidate publication yet.
+
+- GREENv2 finishes17.77s, exactly1 test PASS: global and all four physical
+  shorthand cases resolve affected borders to finalgreen, unaffected edges
+  remainred. Receipt: `border-shorthand-current-color-green-v2.log`.
+  Stylesheet/inherited-color/invalid-value neighbors and production840/841
+  zero pixels are still required; no broad success or publication claimed.
+
+- Added stylesheet/inherited-green/relative1em regression with uniform
+  fallback and physical-side scope assertions. Initial attempt fails at
+  inheritedgreen before border assertions: raw body style-attribute setup
+  did not populate computed declarations in this direct Document test.
+  Corrected to register a body stylesheet rule, matching neighboring
+  direct Document tests; all expected colors/widths remain unchanged.
+  Corrected validation started; no inherited-color root failure claimed.
+
+- Corrected stylesheet test fails at uniform fallback red instead ofgreen
+  after inherited text and physical topcolor assertions pass; receipt:
+  `border-shorthand-inherited-color-v2.log`. Candidate now resolves uniform
+  fallback from the last winning global color/shorthand as well, retaining
+  single-side scope. GREENv3 completes17.90s, exactly1 inherited/relative
+  stylesheet test PASS (`border-shorthand-inherited-color-green-v3.log`).
+  Existing omitted-color CSSStyle and invalid-shorthand no-partial-mutation
+  tests each independently PASS on the same executable. Broader directed
+  neighbors and production840/841 strict pixels remain unverified.
+
+- Omitted-color directed DOM neighbors finish30/30PASS: all28 prior
+  initial-border-none neighbor names still PASS plus the2 new regressions,
+  invalid-shorthand test included, no lost PASS. Receipt:
+  `border-shorthand-current-color-v1-unit-neighbors.json`. Production runner
+  build started; all production sources frozen until focused840..847
+  strict pixel verification. No candidate commit/push yet.
+
+- Current-color production840..847 is terminal8PASS/0FAIL. Target840
+  different_pixels25088→0, target84112544→0, bothmax0 at zero tolerances;
+  other6 complete objects unchanged, no lost PASS. Receipt:
+  `border-shorthand-current-color-v1-pixel-comparison.json`. Sealed912
+  directed qualification starts with840, covering prior896 plus832/840
+  discovery against exact baselines. Sources frozen, no candidate
+  commit/push until terminal qualification and clean-SHA replay.
+
+- Current-color qualification stops at batch600 after672 executions
+  (659PASS/13FAIL): border-color-011.xht and border-color-012.xht lost
+  their prior PASS, different_pixels4932 and4620 respectively. This is
+  a partial failed qualification, not a completed912 receipt. Both fixtures
+  inherit an omitted border color from `border: none` and expect currentColor
+  to resolve on the receiving green element. Candidate eager resolution to
+  parent red is the suspected regression; preserving inherited keyword
+  provenance requires a minimal regression test before changing code.
+  No candidate commit/push. Separate sealed848..911 discovery64/64PASS
+  does not override this regression. Receipt:
+  `border-shorthand-current-color-v1-comparison.json`.
+
+- Inherited-currentColor minimal unit is real RED: a green block child
+  incorrectly receives red from parent `border: none`; receipt
+  `inherited-border-current-color-real-red.log`. Candidate preserves a
+  per-edge computed keyword mask independently of used RGBA in Style,
+  with serde default None for native styles lacking CSS provenance and
+  equality including the mask. Document derives each winning edge's
+  keyword and resolves inherited currentColor on the receiving element.
+  Undeclared initial edges are not made authored physical color owners.
+  GREENv1 passes block/inline child variants. Additional GREENv2 test
+  passes mixed currentColor/explicit-blue edges through two generations,
+  including global shorthand inheritance (18.66s). All32 isolated DOM
+  neighbors PASS, prior28 PASS retained, no lost PASS; receipt
+  `border-shorthand-current-color-v2-unit-neighbors.json`. Productionv2
+  build started. Production600/840 strict pixels and qualification remain
+  unverified; no candidate commit/push.
+
+- CurrentColorv2 production build completes2m05s. Strict batch600..607
+  is8PASS/0FAIL, all8 complete result objects identical to published
+  leading-float-margin-v1, restoring both lost inheritance PASS with zero
+  pixels/max0. Strict840..847 is8PASS/0FAIL: target84025088→0 and
+  target84112544→0 retained, other6 objects unchanged, no lost PASS.
+  Receipts: `inherited-border-current-color-v2-pixel-comparison.json`,
+  `border-shorthand-current-color-v2-pixel-comparison.json`. Production
+  sources frozen for fresh912 qualificationv2, with600/840 run first.
+  No candidate commit/push before terminal qualification and clean-SHA
+  replay. No full6548 zero-failure evidence yet.
+
+- CurrentColorv2 additional848..911 replay is64PASS/0FAIL; all64 complete
+  objects identical to v1 discovery, no lost PASS. Separate durable
+  comparison: `border-current-color-v2-extra64-comparison.json`.
+  Subsequent912..975 bounded discovery executes64,61PASS/3FAIL, stopping
+  at968: border-width-011/012 each102504 pixels, border-width-applies-to-012
+  one pixel. Seal: `discovery-912-border-shorthand-current-color-v2-sealed.json`.
+  This is newly discovered coverage, not proof of candidate regressions.
+  Read-only original-file Chromium141 oracle sees body none/hidden used0,
+  child inherited width0, while fixed reference has32px; thus this browser
+  itself does not match these updated inheritance reftests. Current editor
+  draft border-width has absolute-length computed values and only used
+  width0 for none/hidden (https://drafts.csswg.org/css-backgrounds-3/#border-width).
+  Native969 dump shows body179.2 high and childx40/y56, consistent with
+  hidden initial body borders leaking into geometry after relative width
+  finalization. This remains a hypothesis pending minimal RED after the
+  current frozen qualification/publication boundary. Oracle:
+  `border-width-inherit-969-970-chromium-oracle.json`; dump:
+  `border-width-969-layout.log`. No production source changed during912
+  qualificationv2, no candidate commit/push yet.
+
+- Width969 read-only reference dump confirms body/p x8/y16 andp784x83.2,
+  while actual bodyx8/y8,p x40/y56,720x83.2. ActualPNG inspected: unrequested
+  black32px bodyframe around greenpframe. CSSStyleDeclaration::to_style
+  masks nonvisible physical widths to0, but Document relative-width
+  finalization subsequently overwrites those physical widths with32;
+  runtime layout consumes numeric physical widths directly. This closes
+  the source/geometry chain for the bodyframe leak, but remains untested
+  as a fix; production source stays frozen for current-color qualification.
+  Reference dump: `border-width-969-ref-layout.log`.
+
+- CurrentColorv2 qualification is terminal912 executions899PASS/13FAIL.
+  Exactly840/841 FAIL→PASS; other910 full ordered result objects unchanged,
+  no lost PASS. Additional sealed64 remain64PASS/full objects unchanged.
+  These are976 directed executions, not6548 remaining-failure statistics.
+  Receipt: `border-shorthand-current-color-v2-comparison.json`.
+  Qualified binarySHA256:
+  `d0f069378566e4f34ad9870d83648efcd22fc98a9c10ec850dd5c7b23bf3fb9e`.
+  Preparing scoped4-file commit under user's small-step commit/push
+  authorization; clean-SHA48 replay and actual push still pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

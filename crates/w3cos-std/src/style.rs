@@ -191,6 +191,11 @@ pub struct Style {
     pub border_bottom_left_radius: Option<f32>,
     pub border_width: f32,
     pub border_color: Color,
+    /// Computed keyword provenance, top/right/bottom/left. CSS currentColor
+    /// is inherited as a keyword, not as the parent's resolved RGBA value.
+    /// None leaves native numeric styles without CSS provenance unchanged.
+    #[serde(default)]
+    pub border_current_color: Option<[bool; 4]>,
     /// Physical edges in top/right/bottom/left order. None preserves older
     /// native numeric styles without inventing an authored CSS declaration.
     #[serde(default)]
@@ -351,6 +356,7 @@ impl Default for Style {
             border_bottom_left_radius: None,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            border_current_color: None,
             border_styles: [None; 4],
             border_top_width: None,
             border_right_width: None,
@@ -478,6 +484,7 @@ impl Style {
             border_bottom_left_radius,
             border_width,
             border_color,
+            border_current_color,
             border_styles,
             border_top_width,
             border_right_width,
@@ -587,6 +594,7 @@ impl Style {
             border_bottom_left_radius: border_bottom_left_radius_b,
             border_width: border_width_b,
             border_color: border_color_b,
+            border_current_color: border_current_color_b,
             border_styles: border_styles_b,
             border_top_width: border_top_width_b,
             border_right_width: border_right_width_b,
@@ -694,6 +702,7 @@ impl Style {
             && border_bottom_left_radius == border_bottom_left_radius_b
             && border_width == border_width_b
             && border_color == border_color_b
+            && border_current_color == border_current_color_b
             && border_styles == border_styles_b
             && border_top_width == border_top_width_b
             && border_right_width == border_right_width_b
