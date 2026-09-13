@@ -1864,24 +1864,30 @@ impl Document {
                 }
             }
         }
-        let last_border_declaration = |properties: &[&str]| {
+        let last_border_declaration = |properties: &[&str], computed: &w3cos_std::style::Style| {
             author_declarations
                 .iter()
+                .rev()
                 .filter(|(name, _, _)| {
                     properties
                         .iter()
                         .any(|property| css_property_eq(name, property))
                 })
+                .filter(|(_, value, _)| split_css_tokens(value).into_iter().all(|token| {
+                    relative_border_length_px(&token, computed)
+                        .or_else(|| w3cos_std::style::parse_absolute_length_px(&token))
+                        .is_none_or(|width| width.is_finite() && width >= 0.0)
+                }))
                 .map(|(_, value, _)| value.as_str())
-                .last()
+                .next()
         };
-        if let Some(width) = last_border_declaration(&["border", "border-width"])
+        if let Some(width) = last_border_declaration(&["border", "border-width"], &style)
             .and_then(|value| relative_border_width_px(value, &style))
         {
             style.border_width = width;
         }
         let relative_side_width = |properties: &[&str]| {
-            last_border_declaration(properties)
+            last_border_declaration(properties, &style)
                 .and_then(|value| relative_border_width_px(value, &style))
         };
         let top_width =
@@ -9196,6 +9202,10 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
 }
 
 fn relative_border_width_px(value: &str, style: &w3cos_std::style::Style) -> Option<f32> {
+    relative_border_length_px(value, style).filter(|width| width.is_finite() && *width >= 0.0)
+}
+
+fn relative_border_length_px(value: &str, style: &w3cos_std::style::Style) -> Option<f32> {
     split_css_tokens(value).into_iter().find_map(|token| {
         let token = token.to_ascii_lowercase();
         if let Some(number) = token.strip_suffix("rem") {
@@ -13840,6 +13850,27 @@ mod computed_style_cache_tests {
             document.computed_style_for(target.id).direction,
             w3cos_std::style::TextDirection::Ltr
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn invalid_relative_border_width_preserves_the_valid_computed_width() {
+        for prior in [None, Some("1em")] {
+            for invalid in ["-1em", "-1rem", "-1ex"] {
+                crate::stylesheet::clear_rules();
+                let mut declarations = vec![("font-size", "20px"), ("border-bottom-style", "solid")];
+                if let Some(value) = prior { declarations.push(("border-bottom-width", value)); }
+                declarations.push(("border-bottom-width", invalid));
+                crate::stylesheet::register_rule("#target", &declarations);
+                let mut document = Document::new();
+                let target = document.create_element("span");
+                target.set_attribute(&mut document, "id", "target");
+                document.body().append_child(&mut document, target);
+                assert_eq!(document.computed_style_for(target.id).border_bottom_width,
+                    Some(if prior.is_some() { 20.0 } else { 3.0 }),
+                    "prior {prior:?}, invalid {invalid}");
+            }
+        }
         crate::stylesheet::clear_rules();
     }
 

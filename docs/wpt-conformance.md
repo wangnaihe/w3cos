@@ -3978,6 +3978,41 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   This qualifies the focused repair, not full6548 acceptance. Clean-SHA
   replay is pending; the known text-ink FAILs remain open.
 
+### Invalid relative border width finalization (after c1b53c8)
+
+- Discovery batches 544/552/560 each pass 8/8. Batch 568 is 7/8; index
+  571, border-bottom-width-067, differs by 636 pixels. Its negative -1em
+  declaration must leave the solid edge's initial medium width unchanged.
+  Native actual first inline text has height 0 versus reference 19px.
+- Document relative-length finalization reintroduced -20px after the
+  CSSStyleDeclaration validity check. Real-DOM test
+  `computed_style_cache_tests::invalid_relative_border_width_preserves_the_valid_computed_width`
+  reproduces -20px versus 3px. The initial cargo invocation selected the
+  wrong test module and ran zero tests; `invalid-relative-border-width-red.log`
+  is excluded as RED evidence. `invalid-relative-border-width-real-red.log`
+  runs one exact test and fails correctly. Later em/rem/ex and prior-valid
+  iterations were not reached after its first assertion.
+- Candidate selects the last valid border length declaration before
+  relative-unit conversion, rejects negative/nonfinite converted widths,
+  and retains earlier valid lengths. Exact GREEN passed, executing all six
+  em/rem/ex and prior-valid combinations. The isolated DOM/CSS border
+  neighbor sample is 23/23; receipt:
+  `invalid-relative-border-width-v1-unit-neighbors.json`.
+  References, tolerances and the open font-ink failures are unchanged.
+
+- Production build passed in 2m11s. Strict batch 568 is now 8/8; target
+  571 improves 636 different pixels to zero and maximum difference zero.
+  The 640-execution comparison against the published 600-execution records
+  plus discovery batches 536/544/552/560/568 passed qualification: 629 PASS,
+  11 existing FAIL, one FAIL-to-PASS change and no lost PASS. The other 639
+  complete ordered result objects are unchanged. Receipt:
+  `relative-border-width-v1-comparison.json`; document blob
+  `0c326798f2f5f7cfec135c5f0a78e7d1b261b161`, production binary SHA256
+  `76f500ef40d9b9967be2c9f11594c696a07f7a22816f6f9615c05737bb4bf5e6`.
+  This is a targeted execution sample, not 640 unique cases or full6548
+  acceptance. Scoped commit/push is authorized; remote main still matches
+  c1b53c8 after fetch. Clean-SHA replay remains required before push.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
