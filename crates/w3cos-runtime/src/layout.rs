@@ -200,10 +200,18 @@ pub(crate) fn resolve_float_text_layouts(
         let lines = text_layout::wrap_text_with_run_width_and_line_widths(
             text, content.width, &widths, style.white_space,
             |run| text_intrinsic_size(run, style).0);
-        flows.push(FloatTextLayout { text_index, parent_index, content: text_rect, bands,
-            used_height: top + lines.len() as f32 * line_height
-                + spacing(parent_style.padding.bottom, parent_style.font_size)
-                + parent_style.border_bottom_width.unwrap_or(parent_style.border_width) });
+        let bottom_edge = spacing(parent_style.padding.bottom, parent_style.font_size)
+            + parent_style.border_bottom_width.unwrap_or(parent_style.border_width);
+        let mut used_height = top + lines.len() as f32 * line_height + bottom_edge;
+        let contains_floats = parent_style.resolved_overflow_x() != WOverflow::Visible
+            || parent_style.resolved_overflow_y() != WOverflow::Visible
+            || parent_style.float != WFloat::None
+            || matches!(parent_style.position, WPos::Absolute | WPos::Fixed)
+            || nodes[parent_index].2.is_none();
+        if contains_floats {
+            used_height = used_height.max(bottom + bottom_edge - parent_rect.y);
+        }
+        flows.push(FloatTextLayout { text_index, parent_index, content: text_rect, bands, used_height });
     }
     flows
 }
@@ -2467,7 +2475,7 @@ impl LayoutEngine {
         );
         project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
         project_float_text_layouts(&mut results, flat, viewport_w, viewport_h);
-        project_positioned_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
+        project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         project_auto_table_child_heights(&mut results, flat);
@@ -2613,7 +2621,7 @@ pub fn compute_with_scroll(
     );
     project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
     project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h);
-    project_positioned_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
+    project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     project_auto_table_child_heights(&mut results, &flat);
@@ -5167,7 +5175,7 @@ fn project_simple_float_margin_boxes(
     );
 }
 
-fn project_positioned_bfc_float_heights(
+fn project_auto_height_bfc_float_heights(
     layouts: &mut [(LayoutRect, usize)],
     root: &Component,
     flat: &[FlatNodeInfo<'_>],
@@ -5180,6 +5188,41 @@ fn project_positioned_bfc_float_heights(
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
 
+    fn establishes_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
+        let anonymous = style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                || properties.contains_key("--w3cos-internal-anonymous-float-group"));
+        root || style.float != WFloat::None
+            || matches!(style.position, WPos::Absolute | WPos::Fixed)
+            || style.resolved_overflow_x() != WOverflow::Visible
+            || style.resolved_overflow_y() != WOverflow::Visible
+            || matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineTable | WDisplay::TableCell)
+            || (!anonymous && matches!(style.display,
+                WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid))
+    }
+
+    fn capped_height(index: usize, height: f32, layouts: &[(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>, flat: &[FlatNodeInfo<'_>], vw: f32, vh: f32) -> f32 {
+        let style = flat[index].style;
+        let parent_height = flat[index].parent.and_then(|parent| positions.get(&parent))
+            .map_or(vh, |position| layouts[*position].0.height);
+        let indefinite_percentage = matches!(style.max_height, WDim::Percent(_))
+            && flat[index].parent.is_some_and(|parent| matches!(flat[parent].style.height, WDim::Auto));
+        let maximum = (!indefinite_percentage).then(||
+            style.max_height.resolve(parent_height, ROOT_FONT_SIZE, style.font_size, vw, vh)).flatten();
+        let Some(maximum) = maximum else { return height; };
+        let width = positions.get(&index).map_or(0.0, |position| layouts[*position].0.width);
+        let edge = if style.box_sizing == w3cos_std::style::BoxSizing::BorderBox { 0.0 } else {
+            resolve_spacing_for_layout(style.padding.top, width, style.font_size, vw, vh)
+                + resolve_spacing_for_layout(style.padding.bottom, width, style.font_size, vw, vh)
+                + style.border_top_width.unwrap_or(style.border_width)
+                + style.border_bottom_width.unwrap_or(style.border_width)
+        };
+        // The initial used box already incorporates min-height, which wins
+        // over max-height when the two constraints conflict.
+        height.min((maximum + edge).max(layouts[*positions.get(&index).unwrap()].0.height))
+    }
+
     fn visit(
         component: &Component,
         index: usize,
@@ -5189,7 +5232,13 @@ fn project_positioned_bfc_float_heights(
         viewport_w: f32,
         viewport_h: f32,
     ) {
-        if matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+        // Children settle first; ownership never crosses another BFC.
+        let mut child_index = index + 1;
+        for child in &component.children {
+            visit(child, child_index, layouts, positions, flat, viewport_w, viewport_h);
+            child_index += count_nodes(child);
+        }
+        if establishes_bfc(&component.style, flat[index].parent.is_none())
             && matches!(component.style.height, WDim::Auto)
             && let Some(position) = positions.get(&index).copied()
         {
@@ -5199,6 +5248,20 @@ fn project_positioned_bfc_float_heights(
                 .filter(|candidate| {
                     positions.contains_key(candidate)
                         && flat[*candidate].style.float != WFloat::None
+                        && flat[*candidate].style.display != WDisplay::None
+                        && !matches!(flat[*candidate].style.position, WPos::Absolute | WPos::Fixed)
+                        && {
+                            let mut ancestor = flat[*candidate].parent;
+                            let mut owned = true;
+                            while let Some(parent) = ancestor {
+                                if parent == index { break; }
+                                if establishes_bfc(flat[parent].style, false) {
+                                    owned = false; break;
+                                }
+                                ancestor = flat[parent].parent;
+                            }
+                            owned
+                        }
                 })
                 .filter_map(|candidate| {
                     let float = &flat[candidate];
@@ -5214,32 +5277,56 @@ fn project_positioned_bfc_float_heights(
                 })
                 .reduce(f32::max);
             if let Some(float_bottom) = float_bottom {
-                let padding = component.style.padding_lengths();
-                let bottom_edge = padding.bottom
+                let bottom_edge = resolve_spacing_for_layout(component.style.padding.bottom,
+                    container.width, component.style.font_size, viewport_w, viewport_h)
                     + component
                         .style
                         .border_bottom_width
                         .unwrap_or(component.style.border_width);
-                layouts[position].0.height = layouts[position]
-                    .0
-                    .height
-                    .max(float_bottom + bottom_edge - container.y);
+                let height = capped_height(index, container.height.max(float_bottom + bottom_edge - container.y),
+                    layouts, positions, flat, viewport_w, viewport_h);
+                let mut owner = index;
+                let mut delta = height - container.height;
+                layouts[position].0.height = height;
+                if component.style.float != WFloat::None
+                    || matches!(component.style.position, WPos::Absolute | WPos::Fixed) { return; }
+                while delta > f32::EPSILON {
+                    let Some(parent) = flat[owner].parent else { break; };
+                    let Some(parent_position) = positions.get(&parent).copied() else { break; };
+                    let old_owner = layouts[*positions.get(&owner).unwrap()].0;
+                    let old_bottom = old_owner.y + old_owner.height - delta;
+                    let vertical_flow = matches!(flat[parent].style.display, WDisplay::Block | WDisplay::ListItem);
+                    if vertical_flow {
+                        let current: HashMap<_, _> = layouts.iter().map(|(rect, i)| (*i, *rect)).collect();
+                        for (rect, i) in layouts.iter_mut() {
+                            let mut ancestor = *i;
+                            while let Some(candidate_parent) = flat[ancestor].parent {
+                                if candidate_parent == parent {
+                                    if ancestor > owner && flat[ancestor].style.float == WFloat::None
+                                        && !matches!(flat[ancestor].style.position, WPos::Absolute | WPos::Fixed)
+                                        && current.get(&ancestor).is_some_and(|sibling| sibling.y >= old_bottom - 0.01)
+                                    { rect.y += delta; }
+                                    break;
+                                }
+                                ancestor = candidate_parent;
+                            }
+                        }
+                    }
+                    if !matches!(flat[parent].style.height, WDim::Auto) { break; }
+                    let old_parent = layouts[parent_position].0;
+                    let required = if vertical_flow { old_parent.height + delta } else {
+                        old_parent.height.max(old_owner.y + old_owner.height - old_parent.y)
+                    };
+                    let height = capped_height(parent, required, layouts, positions, flat, viewport_w, viewport_h);
+                    layouts[parent_position].0.height = height;
+                    delta = height - old_parent.height;
+                    owner = parent;
+                    if flat[parent].style.float != WFloat::None
+                        || matches!(flat[parent].style.position, WPos::Absolute | WPos::Fixed) { break; }
+                }
             }
         }
 
-        let mut child_index = index + 1;
-        for child in &component.children {
-            visit(
-                child,
-                child_index,
-                layouts,
-                positions,
-                flat,
-                viewport_w,
-                viewport_h,
-            );
-            child_index += count_nodes(child);
-        }
     }
 
     visit(root, 0, layouts, &positions, flat, viewport_w, viewport_h);
@@ -7509,6 +7596,16 @@ fn build_taffy_tree(
                             || !matches!(comp.style.min_height, WDim::Auto)),
                         active_border_spacing,
                     )?;
+                    if c.style.float != WFloat::None
+                        && comp.style.custom_properties.as_ref().is_some_and(|properties|
+                            properties.contains_key("--w3cos-internal-inline-formatting-context"))
+                    {
+                        // Floats are not baseline participants in a CSS line.
+                        // Flex is only the internal anonymous-line model here.
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.align_self = Some(AlignSelf::FlexStart);
+                        tree.set_style(node, child_style)?;
+                    }
                     if float_only_auto_block && c.style.float != WFloat::None {
                         // Floats do not contribute to their ordinary block
                         // parent's auto height. Treat the Taffy fallback as
@@ -14517,6 +14614,58 @@ mod tests {
     }
 
     #[test]
+    fn overflow_auto_height_bfc_contains_float_and_advances_its_next_sibling() {
+        for overflow in [WOverflow::Visible, WOverflow::Auto, WOverflow::Hidden, WOverflow::Scroll] {
+            let root = Component::boxed(Style { display: WDisp::Block,
+                ..Style::default() }, vec![
+                Component::boxed(Style { display: WDisp::Block, overflow,
+                    width: WDim::Px(96.0), ..Style::default() }, vec![
+                    Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                        width: WDim::Px(48.0), height: WDim::Px(48.0),
+                        margin: w3cos_std::style::Edges { bottom: WSpacing::Px(8.0),
+                            ..w3cos_std::style::Edges::ZERO }, ..Style::default() }, vec![]),
+                ]),
+                Component::boxed(Style { display: WDisp::Block, height: WDim::Px(10.0),
+                    ..Style::default() }, vec![]),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            let expected = if overflow == WOverflow::Visible { 0.0 } else { 56.0 };
+            assert_eq!(get(1).height, expected, "overflow={overflow:?}");
+            assert_eq!(get(3).y, get(1).y + expected, "overflow={overflow:?}");
+        }
+    }
+
+    #[test]
+    fn float_text_reflow_preserves_overflow_bfc_height_and_sibling_position() {
+        for overflow in [WOverflow::Visible, WOverflow::Auto, WOverflow::Hidden, WOverflow::Scroll] {
+            let mut line_style = Style { display: WDisp::Flex, overflow,
+                width: WDim::Px(96.0), ..Style::default() };
+            line_style.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into());
+            let root = Component::boxed(Style { display: WDisp::Block,
+                ..Style::default() }, vec![
+                Component::row(line_style, vec![
+                    Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                        width: WDim::Px(48.0), height: WDim::Px(48.0),
+                        margin: w3cos_std::style::Edges { bottom: WSpacing::Px(8.0),
+                            ..w3cos_std::style::Edges::ZERO }, ..Style::default() }, vec![]),
+                    Component::text("text", Style { display: WDisp::Inline,
+                        ..Style::default() }),
+                ]),
+                Component::boxed(Style { display: WDisp::Block, height: WDim::Px(10.0),
+                    ..Style::default() }, vec![]),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            let expected = if overflow == WOverflow::Visible { 19.2 } else { 56.0 };
+            assert!((get(1).height - expected).abs() < 0.01, "overflow={overflow:?}, height={}", get(1).height);
+            assert!((get(4).y - get(1).y - expected).abs() < 0.01,
+                "overflow={overflow:?}, sibling_y={}", get(4).y);
+        }
+    }
+
+    #[test]
     fn float_does_not_advance_following_normal_flow_block() {
         let root = Component::boxed(
             Style {
@@ -18441,6 +18590,51 @@ mod tests {
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(get(2).y, get(0).y);
         assert_eq!(get(1).x, get(0).x + 85.0);
+    }
+
+    #[test]
+    fn tall_float_after_inline_keeps_the_text_strut_and_float_line_top() {
+        let text_style = Style { display: WDisp::Inline, font_size: 16.0,
+            line_height: 1.2, ..Style::default() };
+        let mut float_style = Style { display: WDisp::Block, float: WFloat::Left,
+            width: WDim::Px(50.0), height: WDim::Px(50.0), font_size: 16.0,
+            line_height: 1.2, ..Style::default() };
+        float_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-left-float-after-inline".into(), "1".into());
+        let mut line_style = Style { display: WDisp::Flex, width: WDim::Px(400.0),
+            flex_wrap: WWrap::Wrap, align_items: w3cos_std::style::AlignItems::Baseline,
+            overflow: WOverflow::Auto, font_size: 16.0, line_height: 1.2,
+            ..Style::default() };
+        line_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-inline-formatting-context".into(), "1".into());
+        let root = Component::row(line_style, vec![
+            Component::text("Hello", text_style.clone()),
+            Component::row(float_style, vec![]), Component::text("Kitty", text_style)]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert!((get(1).y - get(0).y - 1.6).abs() < 0.01, "text={:?}", get(1));
+        assert!((get(2).y - get(0).y).abs() < 0.01, "float={:?}", get(2));
+        assert!((get(3).y - get(1).y).abs() < 0.01);
+        assert!((get(0).height - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn genuine_flex_baseline_is_not_float_line_strut_alignment() {
+        let text_style = Style { display: WDisp::Inline, font_size: 16.0,
+            line_height: 1.2, ..Style::default() };
+        let root = Component::row(Style { display: WDisp::Flex,
+            width: WDim::Px(400.0), align_items: w3cos_std::style::AlignItems::Baseline,
+            font_size: 16.0, line_height: 1.2, ..Style::default() }, vec![
+            Component::text("Hello", text_style.clone()),
+            Component::row(Style { display: WDisp::Block,
+                width: WDim::Px(50.0), height: WDim::Px(50.0),
+                ..Style::default() }, vec![]),
+            Component::text("Kitty", text_style),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert!(get(1).y > get(0).y + 20.0, "text={:?}", get(1));
+        assert!((get(2).y - get(0).y).abs() < 0.01);
     }
 
     #[test]

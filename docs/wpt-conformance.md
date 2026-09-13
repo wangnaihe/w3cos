@@ -2306,6 +2306,105 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   suffix. This is one qualified historical failure repair, not all CSS float
   placement/nowrap semantics, CPU/GPU/device parity or final6548 closure.
 
+### Overflow BFC float-height chain
+
+- Immediate production4b37aa8 leaves1386 `floats-placement-vertical-001a.xht`
+  at21033px. Raw reference paragraphs have overflow:auto yet height19.2px
+  despite their50px floats; subsequent paragraph y51.2 versus source y82.
+  Raw source paragraphs also center text at y36.800003 rather than reference
+  y17.6, and marked left floats start at y46.800003 rather than y16. These
+  are separate sizing/line-metric/float-placement discontinuities, not just
+  a border/radius or paint tolerance issue.
+- Add `overflow_auto_height_bfc_contains_float_and_advances_its_next_sibling`
+  covering visible (non-BFC) versus auto/hidden/scroll, a48px float with8px
+  bottom margin, and a following normal-flow sibling. First verify whether
+  the primitive Block path reproduces the failure; if it passes, narrow the
+  discontinuity to the anonymous Flex inline-lowering path shown in the raw
+  WPT layout rather than changing an already-correct primitive.
+  Library RED qualification is pending; production behavior is unchanged.
+  Raw frames below `target/wpt-targeted`: `vertical001a-actual-4b37aa8.frame`
+  and `vertical001a-ref-4b37aa8.frame`. No final6548 closure is claimed.
+- Code evidence narrows the reference discontinuity to
+  `resolve_float_text_layouts`: its used-height was only text-line count plus
+  edges, and `project_float_text_layouts` propagates that reduction to siblings
+  and ancestors. Preserve the maximum float margin-box bottom plus bottom
+  edges when the marked authored-block flow establishes a BFC (overflow,
+  floated/positioned, or root); visible non-root flow still ignores floats
+  for normal-flow auto height. Add a separate anonymous-flow reflow counter
+  with a following sibling. The still-running primitive-test build predates
+  this source/test extension; fresh combined qualification is required.
+- Immediate baseline runner reproduces1386 FAIL at zero allowance in
+  `case-1386-bfc-flow-height-before-v1/results.json`; preserve binary at
+  `target/wpt-targeted/w3cos-wpt-bfc-flow-height-baseline-4b37aa8`.
+  No new production renderer has been built or accepted yet.
+- Primitive baseline library build4m33s is RED: visible/non-BFC control
+  passes, overflowAuto container height0 versus expected56 fails before
+  hidden/scroll variants execute. Preserve executable at
+  `target/wpt-targeted/w3cos-runtime-bfc-height-red-4b37aa8`. This confirms a
+  second general BFC-height discontinuity outside the marked text reflow:
+  the resolver change alone cannot close the added primitive test. Complete
+  BFC float ownership, auto-height and following-flow propagation together
+  before qualifying the next candidate; neither primitive nor WPT is closed.
+- Generalize positioned-only float-height containment to postorder auto-height
+  BFC containment on both compute paths. Owned float scans stop at nested BFCs
+  and ignore hidden/out-of-flow principal boxes. Resolve float bottom margins
+  and padding before height growth; retain max-height/min-height used-box
+  constraints. Translate following ordinary-flow sibling subtrees when an
+  in-flow BFC grows and propagate its parent's auto-height delta; positioned
+  and floated owners do not consume outer normal-flow height.
+  Non-vertical parent extent growth is not a full Flex/Grid track re-solve;
+  do not infer that broader capability from these focused tests.
+  The combined BFC library selector is being compiled; no combined GREEN
+  or new WPT renderer proof exists yet.
+- Combined optimized library3m57s: BFC selector3/3PASS, including primitive
+  overflow and anonymous text-reflow/sibling counters plus existing positioned
+  nested-float containment. Broad float selector38PASS/1FAIL: the unchanged
+  leading-float/normal-flow margin expectation24 versus80. Text-layout28/28.
+  Fresh native runner build is in progress; pixel qualification remains open.
+- Fresh runner2m10s SHA256
+  `49c11fa625d22707f0db58a02270a3fa7e5fd68efbbbc1b7165d258fcecc65cc`:
+  starts1358/1366/1385 remain8/8,8/8,2/8.1387 improves15030->12856px and
+  1388 improves15444->13454px, while1386 worsens21033->30518px. Source
+  first paragraph now height80.8 because its50px float still starts30.8px
+  below the paragraph's line top; that incorrect placement is now reflected
+  in its correct containment rather than hidden by a too-small used box.
+  Receipts `batch-<start>-bfc-height-after-v1/results.json`. No commit is
+  qualified by this intermediate worsening.
+- Add `tall_float_after_inline_keeps_the_text_strut_and_float_line_top`,
+  a50px float between16px inline runs in the marked baseline-aligned line.
+  Require text at trailing-half-leading1.6px and float at line-top, with BFC
+  height50px. Its RED build is pending; close line metrics/placement before
+  final combined regression and commit qualification.
+- Tall-float counter is RED in3m25s: text y20.800001 versus expected1.6,
+  matching the source WPT's incorrect line offset. Preserve executable at
+  `target/wpt-targeted/w3cos-runtime-tall-float-red-bfc-candidate`.
+  In the marked anonymous-line model only, set floating child layout nodes
+  to cross-start rather than baseline participation; ordinary Flex keeps its
+  authored alignment. Add a genuine-Flex tall ordinary-item counter requiring
+  its baseline offset to remain. New optimized qualification is pending.
+- Optimized combined library3m24s: tall-float counter passes; the genuine-Flex
+  baseline counter passes in the broad float selector40PASS/1FAIL (unchanged
+  leading-float/normal-flow margin expectation24 versus80). BFC3/3 and
+  text-layout28/28 remain green. Fresh runner pixels are pending; ordinary
+  Flex is not converted into CSS float-line alignment by this repair.
+- Fresh runner2m11s SHA256
+  `8d947e0d784a2a492cf064cac33e2682cf767acd411e07cae0c8737767bde68f`:
+  neighbor starts1358/1366/1385 remain8/8,8/8,2/8. Relative to immediate
+  production baseline,1386 improves21033->20000px,1387 15030->10000px,
+  1388 15444->13454px,1390/1391 each20016->20000px.1385 stays10000px;
+  all five improved cases still FAIL at zero allowances, with no new PASS
+  implied. Source first paragraph now height50/text y17.6/float y16/next
+  paragraph y82, matching the corresponding reference geometry. Its remaining
+  horizontal float/band discontinuities remain open. Receipts
+  `batch-<start>-bfc-line-metrics-after-v1/results.json`; raw source frame
+  `vertical001a-metrics-actual.frame` below `target/wpt-targeted`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 exact-zero matches, four expected
+  mismatches). Receipts `batch-<start>-bfc-line-metrics-final-v1/results.json`.
+  Ordered paths, statuses and full pixel-diff objects match the baseline.
+  This qualifies a partial BFC/line-metric repair, not closure of the five
+  remaining pixel failures, full float semantics, or final6548 acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
