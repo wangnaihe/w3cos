@@ -3799,6 +3799,53 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `c9140d5fdfba5805dd487b16cde8f5bb0bd8ca4d90ff422d49990ec18c72f39c`.
   This focused receipt is not full-6548 acceptance or a global remaining count.
 
+### Collapsed cell content-height minimum (after dd97e01)
+
+- Discovery batches 464/472 are 8/8; batch 480 is 4/8. Four
+  border-applies-to-001..004 cases each differ by 832 pixels. Index 484
+  actual/reference layouts and frames are retained as `border-484-*` under
+  `target/wpt-targeted/`. Actual table height is 96px, reference 104px;
+  both declared 48px cell rows become 46px in the actual layout.
+- New real-DOM unit
+  `collapsed_group_border_preserves_declared_cell_content_heights`
+  gives valid RED, 96px versus expected 104px, with actual Text children.
+- The collapsed-cell stretch minimum subtracted padding/half-border insets
+  from ContentBox height. Candidate instead adds these insets when converting
+  to Taffy's border-box minimum; the explicit BorderBox branch is unchanged.
+  GREEN compilation passed (one exact test). The isolated table/collapsed
+  unit sample is 77/83: five failures match previously recorded baseline
+  names, but `anonymous_table_wrapper_collapses_section_boundaries` now
+  reports 116px instead of 68px. This candidate is not qualified.
+- The first isolated Chromium anonymous-wrapper diagnostic omitted DOCTYPE:
+  its 68px result is quirks-mode evidence, not standards-mode evidence.
+  Repeating with `<!doctype html>` verifies CSS1Compat, wrapper 92px and
+  28px group heights at y=12/40/68px (including 8px body margin).
+  The original direct-IR content-box unit's 68px expectation was therefore
+  not a standards-mode oracle; it now explicitly expects 92px/28px groups.
+- Root cause: fixed table tracks switch the actual Taffy cell to border-box,
+  whereas anonymous/auto tracks retain content-box. Candidate v2 converts
+  the declared minimum between authored and actual sizing only when they
+  differ, avoiding double-counted insets on content-box tracks.
+  Exact anonymous-wrapper GREEN passed after a 2m31s compilation. Replaying
+  the same 83 isolated table/collapsed units gives 78 PASS and the five
+  previously recorded baseline failures, with no new failed names.
+  Receipts: `collapsed-cell-sizing-v2-anonymous.log`,
+  `collapsed-cell-sizing-v2-unit-neighbors.json` and
+  `collapsed-cell-browser-sizing-modes.json` in `target/wpt-targeted/`.
+  This includes the new real-DOM height unit; it is not full-module green.
+  Production build passed in 2m06s. Batch 480 is now 8/8: all four
+  border-applies-to-001..004 targets have zero different pixels and zero
+  maximum difference, using unchanged references and zero tolerances.
+  The 552-execution comparison against the published 520-execution receipt
+  plus discovery batches 456/464/472/480 completed: 543 PASS, nine existing
+  failures. Only the four targets change FAIL to PASS; the other 548
+  complete result objects are unchanged and no old PASS is lost.
+  Receipt: `collapsed-cell-sizing-v2-comparison.json`, layout blob
+  `4203fb75ebed34794954eb00515a0544330da48f`, production SHA256
+  `3e5be3c05e08d86186d92930364a7c59a582f441b27f3fa355f341e5be63bfd2`.
+  This qualifies the focused repair, not full6548 acceptance. References
+  and zero tolerances remain unchanged; clean-SHA replay is still pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -8313,8 +8313,10 @@ fn build_taffy_tree(
                         && let Some(height) = c.style.height.resolve(viewport_h, ROOT_FONT_SIZE,
                             c.style.font_size, viewport_w, viewport_h)
                     {
-                        // Cell height is a minimum grid-box height, not a
-                        // content height plus another round of border halves.
+                        // Fixed table tracks switch Taffy cells to border-box
+                        // sizing. Convert the authored minimum only when the
+                        // actual Taffy sizing differs; auto/anonymous tracks
+                        // retain content-box sizing and add their own insets.
                         let edges = (c.style.border_top_width.unwrap_or(c.style.border_width)
                             + c.style.border_bottom_width.unwrap_or(c.style.border_width)) / 2.0
                             + [c.style.padding.top, c.style.padding.bottom].into_iter()
@@ -8322,9 +8324,11 @@ fn build_taffy_tree(
                                     c.style.font_size, viewport_w, viewport_h)).sum::<f32>();
                         let mut child_style = tree.style(node)?.clone();
                         child_style.size.height = Dimension::auto();
-                        let cell_floor = if c.style.box_sizing == WBoxSizing::BorderBox {
-                            height
-                        } else { (height - edges).max(0.0) };
+                        let cell_floor = match (c.style.box_sizing, child_style.box_sizing) {
+                            (WBoxSizing::ContentBox, BoxSizing::BorderBox) => height + edges,
+                            (WBoxSizing::BorderBox, BoxSizing::ContentBox) => (height - edges).max(0.0),
+                            _ => height,
+                        };
                         let declared_minimum = if matches!(c.style.min_height, WDim::Percent(_))
                             && own_definite_height_basis.is_none() { None } else {
                             c.style.min_height.resolve(own_definite_height_basis.unwrap_or(viewport_h),
@@ -18346,6 +18350,43 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_group_border_preserves_declared_cell_content_heights() {
+        w3cos_dom::stylesheet::clear_rules();
+        for (selector, declarations) in [
+            (".table", vec![("display", "table"), ("border-collapse", "collapse"),
+                ("table-layout", "fixed"), ("width", "100px")]),
+            (".group", vec![("display", "table-row-group"), ("border", "4px solid green")]),
+            (".row", vec![("display", "table-row")]),
+            (".cell", vec![("display", "table-cell"), ("height", "48px")]),
+        ] {
+            w3cos_dom::stylesheet::register_rule(selector, &declarations);
+        }
+        let mut document = w3cos_dom::Document::new();
+        let table = document.create_element("div");
+        table.set_attribute(&mut document, "class", "table");
+        let group = document.create_element("div");
+        group.set_attribute(&mut document, "class", "group");
+        for _ in 0..2 {
+            let row = document.create_element("div");
+            row.set_attribute(&mut document, "class", "row");
+            for _ in 0..2 {
+                let cell = document.create_element("div");
+                cell.set_attribute(&mut document, "class", "cell");
+                let text = document.create_text_node("a");
+                cell.append_child(&mut document, text);
+                row.append_child(&mut document, cell);
+            }
+            group.append_child(&mut document, row);
+        }
+        table.append_child(&mut document, group);
+        document.body().append_child(&mut document, table);
+        let tree = document.to_component_tree();
+        let layout = compute(&tree.children[0], 800.0, 600.0).unwrap();
+        assert_eq!(layout.iter().find(|(_, index)| *index == 0).unwrap().0.height, 104.0);
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn anonymous_table_wrapper_collapses_section_boundaries() {
         let group = || {
             Component::boxed(
@@ -18392,9 +18433,11 @@ mod tests {
                 .0
         });
 
-        assert_eq!(wrapper_rect.height, 68.0);
+        // Standards-mode content-box cells contribute 20px content plus
+        // two shared 4px border halves; the wrapper adds outer halves.
+        assert_eq!(wrapper_rect.height, 92.0);
         assert_eq!(group_rects.map(|rect| (rect.y, rect.height)),
-            [(4.0, 20.0), (24.0, 20.0), (44.0, 20.0)]);
+            [(4.0, 28.0), (32.0, 28.0), (60.0, 28.0)]);
     }
 
     #[test]
