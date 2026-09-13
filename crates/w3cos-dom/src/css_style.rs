@@ -20,12 +20,25 @@ pub struct CSSStyleDeclaration {
 impl CSSStyleDeclaration {
     pub fn new() -> Self {
         Self {
-            inner: Style { line_height_is_normal: true, ..Style::default() },
+            inner: Style {
+                line_height_is_normal: true,
+                border_styles: [Some(w3cos_std::style::BorderLineStyle::None); 4],
+                ..Style::default()
+            },
             inline_declarations: Vec::new(),
         }
     }
 
-    pub fn from_style(style: Style) -> Self {
+    pub fn from_style(mut style: Style) -> Self {
+        // Empty HTML defaults use CSS's initial none line style. Preserve
+        // legacy native builders that explicitly supplied numeric borders.
+        if style.border_styles == [None; 4] && style.border_width == 0.0
+            && [style.border_top_width, style.border_right_width,
+                style.border_bottom_width, style.border_left_width]
+                .into_iter().all(|width| width.is_none_or(|width| width == 0.0))
+        {
+            style.border_styles = [Some(w3cos_std::style::BorderLineStyle::None); 4];
+        }
         Self {
             inner: style,
             inline_declarations: Vec::new(),
@@ -1009,9 +1022,10 @@ impl CSSStyleDeclaration {
                     if parts.iter().all(|part| parse_border_width(part).is_some()
                         || Color::from_css(part).is_some() || parse_border_style_visibility(part).is_some()) {
                         parts.iter().find_map(|part| parse_border_line_style(part))
+                            .or(Some(w3cos_std::style::BorderLineStyle::None))
                     } else { None }
                 } else { None }
-            });
+            }).or(style.border_styles[edge]);
             if let Some(line_style) = line_style {
                 style.border_styles[edge] = Some(line_style);
             }
@@ -2692,6 +2706,31 @@ mod tests {
     }
 
     #[test]
+    fn numeric_native_borders_survive_css_declaration_wrapping() {
+        let mut declaration = CSSStyleDeclaration::from_style(Style {
+            border_width: 6.0, border_color: Color::rgb(255, 0, 0), ..Style::default()
+        });
+        assert_eq!(declaration.to_style().border_width, 6.0);
+        assert_eq!(declaration.to_style().border_top_width, None);
+        declaration.set_property("border-left", "blue");
+        assert_eq!(declaration.to_style().border_left_width, Some(0.0));
+        assert_eq!(declaration.to_style().border_top_width, None);
+    }
+
+    #[test]
+    fn border_width_does_not_activate_unspecified_side_styles() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-left", "blue");
+        declaration.set_property("border-left-style", "solid");
+        declaration.set_property("border-width", "5px");
+        let style = declaration.to_style();
+        assert_eq!([style.border_top_width, style.border_right_width,
+            style.border_bottom_width, style.border_left_width],
+            [Some(0.0), Some(0.0), Some(0.0), Some(5.0)]);
+        assert_eq!(style.border_left_color, Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
     fn hidden_border_style_retains_distinct_conflict_identity() {
         for property in ["border-style", "border-top-style", "border-right-style",
             "border-bottom-style", "border-left-style", "border", "border-top"] {
@@ -2756,6 +2795,9 @@ mod tests {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("border-bottom-width", "5px");
         declaration.set_property("border-bottom-width", "-1px");
+        assert_eq!(declaration.inner.border_bottom_width, Some(5.0));
+        assert_eq!(declaration.to_style().border_bottom_width, Some(0.0));
+        declaration.set_property("border-bottom-style", "solid");
         assert_eq!(declaration.to_style().border_bottom_width, Some(5.0));
     }
 

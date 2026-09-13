@@ -4148,6 +4148,77 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   and clean-SHA replay before push; unverified inherit/pseudo/wire boundaries
   and the 13 strict failures are not converted into completion claims.
 
+### CSS initial border line styles (candidate after 4e817e0)
+
+- Published main `4e817e0c7ba2b8fd3dda2fc4152be1ed37b6cac0` is verified.
+  Clean-SHA batches616/488/5593 replay 8/8, 6/8, 8/8 with complete ordered
+  objects unchanged; `hidden-border-4e817e0-clean-replay.json`. Normal main
+  push completed. Original vendor checkout and parent/submodule pin remain
+  untouched.
+- Discovery batch624 is 6/8. Index626 border-conflict-style-107 fails by
+  52740 pixels (equal-width color owner precedence across table parts), and
+  index630 border-left-003 fails by 8320 pixels. The latter declares a blue
+  left shorthand, left solid style and global width5px; other edge styles
+  remain initial none. Production actual frame/layout retained:
+  `border-left-630-4e817e0.frame` and layout log.
+- Exact CSS RED runs one test, producing [5,5,5,5] versus [0,0,0,5]:
+  `initial-border-none-real-red.log`. Candidate initializes empty CSS styles
+  with none identity, retains positive numeric native borders and resets
+  omitted shorthand line styles to none. Target unit GREEN is terminal PASS:
+  `initial-border-none-green-v1.log`. Numeric-native wrapping guard passes.
+- Initial isolated border neighbors are 27/28:
+  `initial-border-none-v1-unit-neighbors.json`. The old negative-width unit
+  expected computed5px without a line style; this is an incorrect oracle,
+  not claimed an unchanged prior PASS. Isolated standards Chromium141 proves
+  declared5px remains after invalid -1px, computed0px with initial none, and
+  computed5px after solid. Receipt: `initial-border-none-chromium-oracle.json`.
+  The unit now preserves the declaration5px assertion and separately checks
+  none0px and solid5px. Its rebuilt exact test is live; no completed revised
+  neighbor or pixel qualification is claimed yet. No commit/push of candidate.
+
+- Corrected-oracle exact test is now terminal PASS, and the revised isolated
+  border neighbors pass 28/28: `initial-border-none-v2-unit-neighbors.json`.
+  This includes the explicitly corrected fixture and is not described as
+  28 unchanged baseline tests. Production runner build is live; index630
+  zero-pixel acceptance and ordered pixel regression remain pending. Equal
+  color-owner precedence failure626 remains open. Source frozen during build.
+
+- Production build is terminal PASS in 2m09s. Target batch624 now passes
+  7/8; border-left-003 improves 8320 differing pixels to zero with maximum
+  difference zero and both allowances still zero. Equal-color owner
+  precedence failure626 remains strict FAIL. Receipt:
+  `batch-624-initial-border-none-v1/results.json`.
+- The same frozen-source candidate is now in a 696-execution qualification
+  against the published688 records plus batch624 discovery. Required target
+  is left-003; hidden-conflict and earlier border/bidi batches are retained.
+  Complete comparison, clean-SHA replay and full6548 closure remain pending.
+  No candidate commit/push has occurred.
+
+- While that qualification remains live, index626 diagnostic evidence shows
+  multiple independent gaps, not only color-owner precedence. Actual frame
+  and layout receipt `border-color-owner-626-initial-none-v1-layout.log`
+  retain the current production binary's geometry. Native first floating
+  table starts at (8,59.2), and subsequent BR/clear float groups do not form
+  four rows of four. Isolated standards Chromium141 at800x600 places all16
+  tables at x8/58/108/158, y50/100/150/200, each50x50:
+  `border-color-owner-626-chromium-layout.json`. This is an authoritative
+  diagnostic comparison, not native acceptance or a completed fix. Next
+  repair must independently close color ownership and floating-table/BR
+  clearance geometry. Current candidate source remains frozen.
+
+- Initial-border-none qualification is terminal PASS: 696 executions,
+  682 PASS, 14 retained FAIL. Only border-left-003 changes FAIL to PASS;
+  the other 695 complete ordered result objects are unchanged, no lost PASS.
+  Receipt: `initial-border-none-v1-comparison.json`; CSS source blob
+  `fcf0bde508037e4bafbdedd276b5745022c6112b`, binary SHA256
+  `d1dc5942bb1d0947331fde59d6af4e71ed1e61bae644e2c413022c805025c047`.
+  The explicitly corrected unit oracle is disclosed separately above and
+  not substituted for unchanged production WPT results. Executions overlap;
+  this is not 696 unique cases or full6548 acceptance.
+- User authorizes small scoped commit/normal main push. Fetch confirms
+  remote main still equals4e817e0. Clean-SHA replay is required before push;
+  failure626 and existing font/ink failures remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
