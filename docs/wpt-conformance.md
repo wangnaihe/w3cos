@@ -2675,6 +2675,36 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   to`auto-bfc-track-guard-v3`. Overall18 batches pass138/144, not144/144.
 - This focused repair does not prove final same-clean-SHA6548 acceptance.
 
+### Mixed-side float top-band qualification
+
+- Base`f88fc77`; ordinary Block/ListItem/TableCell sibling floats now try
+  the highest available shared band before advancing below exclusions.
+  Both physical sides use static margin boxes, source-order flow floors and
+  clearance; relative visual offsets do not alter occupied float space.
+  The complete floated subtree moves, not just its wrapper. Genuine flex/
+  grid tracks and previously imported synthetic float groups keep their
+  separate existing paths.
+- New opposite-side unit is RED(100,100) versus(100,0) in3m23s, then GREEN
+  in2m51s. It covers mirrored sides, insufficient space, clear and a relative
+  predecessor. Float units54/55 retain only the known leading-margin failure;
+  auto-table10/10, BFC8/8 and text-layout28/28 pass.
+- Default optimized runner4m52s includes the unit artifact-lock wait,
+  SHA256`c717e47ccbfb9f0f6d013957223823fe0c1000f17e4ac9a9b5734e520883a31e`.
+  Receipts use`mixed-float-top-band-v1`. Start1400 improves2/8 to4/8:
+  cases1402/1403 become exact0, while1400/1401 remain exact0. Cases1404–
+  1407 retain35200/35200/36000/36000 pixels; right wrapping differences
+  increase after correcting native reference float placement, not to PASS.
+- Saved previous runner`w3cos-wpt-before-mixed-f88fc77` has SHA256
+  `0b30c19dc45fe567270c7e6ce837b7d3b3989c031939eb664b5eab523905c514`.
+  Fresh neighboring baselines1408/1416 are3/8 and1/8. Candidate results
+  are4/8 and1/8; case1410 becomes exact0. The anonymous block BFC used by
+  wrapping002 is internally Flex and remains304px wide, so it does not
+  enter the current Block-only width reflow. Seventeen related/neighbor
+  batches pass136/136 with ordered paths/statuses/full pixel-diff objects
+  identical to`table-cell-intrinsic-v1`; neither new neighboring batch loses
+  a previously passing case. Overall20 batches pass145/160 (15 FAIL), not
+ 160/160. This does not prove final same-clean-SHA6548 acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

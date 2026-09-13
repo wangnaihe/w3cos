@@ -4806,6 +4806,8 @@ fn project_simple_float_margin_boxes(
         let mut normal_flow_correction = 0.0_f32;
         let mut imported_float_group = false;
         let mut skipped_positioned = false;
+        let ordinary_float_context = matches!(component.style.display,
+            WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell);
         let mut child_index = component_index + 1;
         let content_box = layout_position.get(&component_index).map(|position| {
             let parent = layouts[*position].0;
@@ -5237,6 +5239,61 @@ fn project_simple_float_margin_boxes(
             if child.style.float != WFloat::None
                 && let Some(position) = layout_position.get(&child_index).copied()
             {
+                if ordinary_float_context && !imported_float_group
+                    && !active_floats.is_empty()
+                    && let Some(containing) = content_box
+                {
+                    // Native block stacking may place the next float below
+                    // its predecessor even when the shared top band fits.
+                    // Source-order floors and clearance apply to static
+                    // margin boxes, not their relative visual displacement.
+                    let minimum_flow_y = previous_in_flow
+                        .and_then(|(index, previous_child)| {
+                            layout_position.get(&index).map(|position| {
+                                let rect = layouts[*position].0;
+                                let leading = if previous_child.style.display == WDisplay::Inline
+                                    && matches!(previous_child.kind, ComponentKind::Text { .. }) {
+                                    (previous_child.style.font_size * previous_child.style.line_height
+                                        - previous_child.style.font_size) * 0.5
+                                } else { 0.0 };
+                                rect.y - relative_shift(&previous_child.style).1 + rect.height + leading
+                                    + resolve_spacing_for_layout(previous_child.style.margin.bottom,
+                                        containing.width, previous_child.style.font_size, viewport_w, viewport_h)
+                            })
+                        }).unwrap_or(containing.y);
+                    let mut y = active_floats.iter().map(|(_, rect)| rect.y)
+                        .fold(minimum_flow_y, f32::max);
+                    for (side, rect) in &active_floats {
+                        if matches!((child.style.clear, *side),
+                            (WClear::Both, _) | (WClear::Left, WFloat::Left)
+                                | (WClear::Right, WFloat::Right)) {
+                            y = y.max(rect.y + rect.height);
+                        }
+                    }
+                    let current = layouts[position].0;
+                    let margin_box = float_margin_box(current, &child.style);
+                    let exclusions = active_floats.iter().map(|(side, margin_box)|
+                        FloatExclusion { side: *side, margin_box: *margin_box }).collect::<Vec<_>>();
+                    let band = loop {
+                        let band = float_line_band(containing, y, margin_box.height, &exclusions);
+                        if margin_box.width <= band.width + 0.01 { break band; }
+                        let next = active_floats.iter().map(|(_, rect)| rect.y + rect.height)
+                            .filter(|bottom| *bottom > y + 0.01).min_by(f32::total_cmp);
+                        let Some(next) = next else { break band; };
+                        y = next;
+                    };
+                    let margin_left = resolve_spacing_for_layout(child.style.margin.left,
+                        containing.width, child.style.font_size, viewport_w, viewport_h);
+                    let margin_top = resolve_spacing_for_layout(child.style.margin.top,
+                        containing.width, child.style.font_size, viewport_w, viewport_h);
+                    let relative = relative_shift(&child.style);
+                    let x = if child.style.float == WFloat::Left { band.x }
+                        else { band.x + band.width - margin_box.width };
+                    shift_subtree(layouts, layout_position, child_index, child_count,
+                        y + margin_top + relative.1 - current.y);
+                    shift_subtree_x(layouts, layout_position, child_index, child_count,
+                        x + margin_left + relative.0 - current.x);
+                }
                 // Anonymous CSS lines use Flex internally, but CSS floats
                 // belong to physical edges, not the line's justification.
                 // Genuine flex items deliberately do not enter this path.
@@ -5377,7 +5434,7 @@ fn project_simple_float_margin_boxes(
                     shift_subtree_x(layouts, layout_position, child_index, child_count, delta_x);
                 }
                 let rect = layouts[position].0;
-                let exclusion = if imported_float_group { float_margin_box(rect, &child.style) }
+                let exclusion = if imported_float_group || ordinary_float_context { float_margin_box(rect, &child.style) }
                     else { LayoutRect { height: rect.height + child.style.margin_lengths().bottom, ..rect } };
                 active_floats.push((child.style.float, exclusion));
                 float_since_in_flow = true;
@@ -14822,6 +14879,43 @@ mod tests {
             assert_eq!(get(2).width, 200.0);
             assert_eq!(get(3).width, 80.0);
             assert!((get(4).width - 83.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn opposite_floats_try_the_top_band_before_advancing_below() {
+        for first_side in [WFloat::Left, WFloat::Right] {
+            for (width, clear, relative_top) in [(200.0, WClear::None, 0.0),
+                (250.0, WClear::None, 0.0), (200.0, WClear::Both, 0.0),
+                (200.0, WClear::None, 20.0)] {
+                let second_side = if first_side == WFloat::Left { WFloat::Right }
+                    else { WFloat::Left };
+                let root = Component::boxed(Style { display: WDisp::Block,
+                    width: WDim::Px(300.0), ..Style::default() }, vec![
+                    Component::boxed(Style { display: WDisp::Block, float: first_side,
+                        position: WPos::Relative, top: WDim::Px(relative_top),
+                        width: WDim::Px(100.0), height: WDim::Px(100.0),
+                        ..Style::default() }, vec![]),
+                    Component::boxed(Style { display: WDisp::Block, float: second_side,
+                        clear, width: WDim::Px(width), height: WDim::Px(50.0),
+                        ..Style::default() }, vec![Component::boxed(Style {
+                        display: WDisp::Block, width: WDim::Px(150.0),
+                        height: WDim::Px(50.0), ..Style::default() }, vec![])]),
+                ]);
+                let mut layout = vec![
+                    (LayoutRect { x: 0.0, y: 0.0, width: 300.0, height: 150.0 }, 0),
+                    (LayoutRect { x: if first_side == WFloat::Left { 0.0 } else { 200.0 },
+                        y: relative_top, width: 100.0, height: 100.0 }, 1),
+                    (LayoutRect { x: 0.0, y: 100.0, width, height: 50.0 }, 2),
+                    (LayoutRect { x: 0.0, y: 100.0, width: 150.0, height: 50.0 }, 3),
+                ];
+                project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
+                let y = if width > 200.0 || clear != WClear::None { 100.0 } else { 0.0 };
+                let x = if second_side == WFloat::Left { 0.0 } else { 300.0 - width };
+                assert_eq!((layout[2].0.x, layout[2].0.y), (x, y),
+                    "first={first_side:?} width={width} clear={clear:?} relative={relative_top}");
+                assert_eq!((layout[3].0.x, layout[3].0.y), (x, y));
+            }
         }
     }
 
