@@ -9650,6 +9650,21 @@ fn hoist_floats_into_block_formatting_context(
     let mut right: Vec<w3cos_std::Component> = Vec::new();
     let mut moved_direct_right = false;
     for child in children {
+        let float_boundary = child.style.display != w3cos_std::style::Display::None
+            && !matches!(child.style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed)
+            && ((child.style.float != w3cos_std::style::Float::None
+                && child.style.clear != w3cos_std::style::Clear::None)
+                || (child.style.float == w3cos_std::style::Float::None
+                    && matches!(child.style.display,
+                        w3cos_std::style::Display::Block | w3cos_std::style::Display::ListItem
+                            | w3cos_std::style::Display::Flex | w3cos_std::style::Display::Grid
+                            | w3cos_std::style::Display::Table)));
+        if float_boundary {
+            // Trailing placement may join inline runs, but must not reorder
+            // an earlier float behind a later block or clearance constraint.
+            in_flow.append(&mut right);
+        }
         let direct_float = child.style.float;
         // A direct child is already owned by this formatting context. Only
         // extract floats nested inside inline descendants here; direct float
@@ -10802,6 +10817,31 @@ mod image_component_tests {
                         ComponentKind::Text { content } if content == " ")));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn queued_right_float_does_not_cross_clear_or_normal_block_boundaries() {
+        for clear in [false, true] {
+            let before = w3cos_std::Component::boxed(w3cos_std::style::Style {
+                display: Display::InlineBlock, width: Dimension::Px(50.0),
+                height: Dimension::Px(50.0), ..Default::default()
+            }, vec![]);
+            let right = w3cos_std::Component::boxed(w3cos_std::style::Style {
+                display: Display::Block, float: Float::Right,
+                width: Dimension::Px(50.0), height: Dimension::Px(100.0),
+                ..Default::default()
+            }, vec![]);
+            let boundary = w3cos_std::Component::boxed(w3cos_std::style::Style {
+                display: Display::Block, float: if clear { Float::Left } else { Float::None },
+                clear: if clear { w3cos_std::style::Clear::Both } else { w3cos_std::style::Clear::None },
+                width: Dimension::Px(30.0), height: Dimension::Px(50.0),
+                ..Default::default()
+            }, vec![]);
+            let fixed = hoist_floats_into_block_formatting_context(
+                &w3cos_std::style::Style::default(), vec![before, right, boundary]);
+            assert_eq!(fixed[1].style.float, Float::Right, "clear={clear}");
+            assert_ne!(fixed[2].style.float, Float::Right);
         }
     }
 

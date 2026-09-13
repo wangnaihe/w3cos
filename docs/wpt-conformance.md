@@ -2547,6 +2547,34 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Chromium reports6/114. Stale auto-height after float relocation, broader
   packing/relative-offset closure and final same-clean-SHA6548 proof stay open.
 
+### Right-float queues cannot cross later flow boundaries
+
+- Baseline9c17d3d case1385 (`floats-placement-008`) is RED10000px: the direct
+  right float after an InlineBlock is queued behind a later clear:both left
+  float, incorrectly placing the right green box100px below the container.
+  New paired DOM clear/normal-block boundary test is RED in20.78s (index1
+  FloatNone versus requiredRight), preserving the source-order failure.
+- Flush previously queued right floats before a subsequent cleared float or
+  normal block/list/table/flex/grid box. Hidden and absolute/fixed boxes do
+  not act as flow barriers. Inline-run coalescing remains within a segment,
+  not across a later clearance/source-position constraint.
+- Optimized DOM19.28s passes16/16 float tests. Fresh runner3m04s SHA256
+  `24ffd2673ce3c4d293bb782b1213851139221056c59d72b444643cb4f27d32d7`:
+  neighbor starts1358/1366/1385 all8/8;1385 improves10000->0px and the
+  1386–1392 exact matches remain0. Receipts use`float-queue-boundary-after-v1`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 exact-zero matches, four expected
+  mismatches), with ordered paths/statuses/full pixel-diff objects identical
+  to9c17d3d. Receipts use`float-queue-boundary-final-v1`. No WPT fixture,
+  suite or tolerance changes; runtime unit binaries were not rebuilt for this
+  DOM-only change, so runtime evidence is the freshly built focused runner.
+- Browser source geometry places the right float at the container top and
+  the cleared left float100px lower. Absolute browser y50 versus native51.2
+  still differs through default normal-font line metrics; stale auto-height
+  after relocation also remains open. This closes the focused historical
+  float queue failure, not complete browser geometry, all historic failures,
+  or final same-clean-SHA6548 acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
