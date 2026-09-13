@@ -2764,6 +2764,37 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   remains unqualified and it is not declared repaired. Final same-clean-SHA
  6548 acceptance is not established by this focused contraction repair.
 
+### Auto table float-band reflow and real DOM wrapping qualification
+
+- Base`aab1afa`; auto nested tables may reflow into the current float band
+  only when their minimum border-box content fits. The minimum includes
+  column tracks, effective spacing, outer borders/padding and captions.
+  Forced HTML-table widths retain border-box treatment; unbreakable content
+  continues below the float rather than being compressed or clipped.
+- The new layout unit is RED300x50 versus200x100, then GREEN, covering
+  spacing0/2 and rigid300 content. A runtime-only runner still fails both
+  real002 table cases: DOM-generated table-cell inline rows were NoWrap
+  and lacked the inline-formatting-context marker. The new real DOM unit
+  reproduces NoWrap versus Wrap, then passes for normal/nowrap/pre after
+  preserving inherited whitespace wrapping and adding that internal marker.
+  This integration failure was not published as a successful repair.
+- DOM table tests40/42 retain the two recorded failures. Integrated runtime
+  table tests77/83 retain the same six failures; float56/57 retains the
+  leading-margin failure. BFC9/9 and text-layout28/28 pass. Runtime table
+  test compilation takes3m05s; the default optimized runner build takes
+  5m00s including artifact-lock waiting, SHA256
+  `2d9578ac5eeb2493355a4f8cb8cdcb5584de18912473ea718c27c18fe38eda28`.
+- Receipts use`auto-table-band-dom-wrap-v2`, with the unchanged frozen WPT
+  revision/suite and800x600 viewport. Start1400 improves6/8 to8/8:
+  cases1405/1407 become exact0 from35200 pixels each. All20 selected
+  eight-case batches finish149/160 PASS,11 FAIL, with no prior PASS lost.
+  The other19 complete ordered path/status/pixel-diff reports are identical
+  to`auto-track-contraction-v1`; the17 related/neighbor batches remain
+  136/136 PASS. These are executions with overlapping batches, not160
+  unique cases or a current global remaining count. Caption case1414
+  remains52944 pixels; the remaining float/margin failures are not repaired.
+  Final same-clean-SHA6548 acceptance remains unestablished.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

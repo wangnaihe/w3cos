@@ -1534,6 +1534,34 @@ fn is_html_table_element(style: &w3cos_std::style::Style) -> bool {
         .is_some_and(|value| value == "1")
 }
 
+fn visible_grid_width(tracks: &[f32], gap: f32) -> f32 {
+    let visible = tracks.iter().filter(|track| !track.is_sign_negative());
+    visible.clone().copied().sum::<f32>()
+        + gap * visible.count().saturating_sub(1) as f32
+}
+
+fn table_min_content_border_box_width(
+    component: &Component, containing_width: f32, viewport_w: f32, viewport_h: f32,
+) -> f32 {
+    let tracks = table_intrinsic_track_widths(component, true);
+    let spacing = effective_table_border_spacing(&component.style).0;
+    let edges = if component.style.border_collapse {
+        collapsed_table_outer_inline_halves(component)
+    } else {
+        [component.style.padding.left, component.style.padding.right].into_iter()
+            .map(|value| resolve_spacing_for_layout(value, containing_width,
+                component.style.font_size, viewport_w, viewport_h)).sum::<f32>()
+            + component.style.border_left_width.unwrap_or(component.style.border_width)
+            + component.style.border_right_width.unwrap_or(component.style.border_width)
+    };
+    let grid = visible_grid_width(&tracks, spacing) + 2.0 * spacing + edges;
+    let caption = component.children.iter().filter(|child|
+        child.style.display == WDisplay::TableCaption
+            && !matches!(child.style.position, WPos::Absolute | WPos::Fixed))
+        .map(component_min_content_width).reduce(f32::max).unwrap_or(0.0);
+    grid.max(caption)
+}
+
 fn table_caption_intrinsic_height(component: &Component) -> f32 {
     fn outer_height(component: &Component) -> f32 {
         let specified = match component.style.height {
@@ -3620,12 +3648,6 @@ fn project_fixed_table_cell_rects(
     viewport_w: f32,
     viewport_h: f32,
 ) {
-    fn visible_grid_width(tracks: &[f32], gap: f32) -> f32 {
-        let visible = tracks.iter().filter(|track| !track.is_sign_negative());
-        visible.clone().copied().sum::<f32>()
-            + gap * visible.count().saturating_sub(1) as f32
-    }
-
     fn visible_track_offset(tracks: &[f32], gap: f32) -> f32 {
         let visible = tracks.iter().filter(|track| !track.is_sign_negative());
         visible.clone().copied().sum::<f32>() + gap * visible.count() as f32
@@ -5009,6 +5031,7 @@ fn project_simple_float_margin_boxes(
                 } else { 0.0 };
                 if avoids_floats
                     && (child.style.display == WDisplay::Block
+                        || matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable)
                         || (child.style.display == WDisplay::Flex
                             && child.style.custom_properties.as_ref().is_some_and(|properties|
                                 properties.contains_key("--w3cos-internal-inline-formatting-context"))))
@@ -5031,7 +5054,11 @@ fn project_simple_float_margin_boxes(
                             containing.width, child.style.font_size, viewport_w, viewport_h))
                         .sum::<f32>();
                     let available = (band.width - horizontal_margin).max(0.0);
-                    if available > 0.01 && available < current.width - 0.01 {
+                    let table = matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable);
+                    if available > 0.01 && available < current.width - 0.01
+                        && (!table || table_min_content_border_box_width(child,
+                            containing.width, viewport_w, viewport_h) <= available + 0.01)
+                    {
                         // A new BFC can narrow beside floats. Re-layout the
                         // complete subtree so wrapping and percent descendants
                         // use the new containing width, not just a smaller clip.
@@ -5047,7 +5074,9 @@ fn project_simple_float_margin_boxes(
                             + spacing(child.style.padding.right)
                             + child.style.border_left_width.unwrap_or(child.style.border_width)
                             + child.style.border_right_width.unwrap_or(child.style.border_width);
-                        constrained.style.width = WDim::Px(if child.style.box_sizing == WBoxSizing::BorderBox {
+                        let forced_border_box = child.style.box_sizing == WBoxSizing::BorderBox
+                            || (table && is_html_table_element(&child.style));
+                        constrained.style.width = WDim::Px(if forced_border_box {
                             available
                         } else { (available - horizontal_inner).max(0.0) });
                         for dimension in [&mut constrained.style.min_width, &mut constrained.style.max_width] {
@@ -5061,7 +5090,7 @@ fn project_simple_float_margin_boxes(
                                 + spacing(child.style.padding.bottom)
                                 + child.style.border_top_width.unwrap_or(child.style.border_width)
                                 + child.style.border_bottom_width.unwrap_or(child.style.border_width);
-                            constrained.style.height = WDim::Px(if child.style.box_sizing == WBoxSizing::BorderBox {
+                            constrained.style.height = WDim::Px(if forced_border_box {
                                 current.height
                             } else { (current.height - vertical_inner).max(0.0) });
                         }
@@ -14936,6 +14965,52 @@ mod tests {
             assert_eq!(get(2).width, 200.0);
             assert_eq!(get(3).width, 80.0);
             assert!((get(4).width - 83.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn auto_nested_html_table_reflows_its_tracks_into_the_float_band() {
+        let html_table_style = |width, spacing| {
+            let mut style = Style { display: WDisp::Table, width,
+                border_spacing_x: spacing, border_spacing_y: spacing,
+                ..Style::default() };
+            style.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-html-table-element".into(), "1".into());
+            style
+        };
+        let grid = |children| vec![Component::boxed(Style {
+            display: WDisp::TableRowGroup, ..Style::default()
+        }, vec![Component::row(Style { display: WDisp::TableRow,
+            ..Style::default() }, vec![Component::boxed(Style {
+            display: WDisp::TableCell, ..Style::default() }, children)])])];
+        let span = |width| Component::boxed(Style { display: WDisp::InlineBlock,
+            width: WDim::Px(width), height: WDim::Px(50.0),
+            align_self: WAlignSelf::FlexEnd, ..Style::default() }, vec![]);
+        for (spacing, span_width) in [(0.0, 150.0), (2.0, 150.0), (0.0, 300.0)] {
+            let mut line_style = Style { display: WDisp::Flex,
+                width: WDim::Percent(100.0), flex_wrap: WWrap::Wrap,
+                ..Style::default() };
+            line_style.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into());
+            let nested = Component::boxed(html_table_style(WDim::Auto, spacing),
+                grid(vec![Component::row(line_style, vec![span(span_width), Component::text(" ",
+                    Style { display: WDisp::Inline, ..Style::default() }), span(span_width)])]));
+            let root = Component::boxed(html_table_style(WDim::Px(300.0), 0.0),
+                grid(vec![Component::boxed(Style { display: WDisp::Block,
+                    float: WFloat::Left, width: WDim::Px(100.0),
+                    height: WDim::Px(100.0), ..Style::default() }, vec![]), nested]));
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            if span_width > 200.0 {
+                assert!(get(5).width >= 300.0);
+                assert!(get(5).y >= get(4).y + get(4).height);
+                continue;
+            }
+            assert_eq!((get(5).width, get(5).height), (200.0, 100.0 + 2.0 * spacing));
+            assert_eq!((get(5).x, get(5).y), (get(4).x + get(4).width, get(4).y));
+            assert_eq!(get(8).width, 200.0 - 2.0 * spacing);
+            assert_eq!((get(10).x, get(10).y), (get(5).x + spacing, get(5).y + spacing));
+            assert_eq!((get(12).x, get(12).y), (get(10).x, get(10).y + 50.0));
         }
     }
 

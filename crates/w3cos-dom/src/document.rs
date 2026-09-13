@@ -4958,6 +4958,12 @@ impl Document {
                         line_style.text_indent = w3cos_std::style::Dimension::Px(0.0);
                         line_style.display = w3cos_std::style::Display::Flex;
                         line_style.flex_direction = w3cos_std::style::FlexDirection::Row;
+                        line_style.flex_wrap = if matches!(style.white_space,
+                            w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre) {
+                            w3cos_std::style::FlexWrap::NoWrap
+                        } else { w3cos_std::style::FlexWrap::Wrap };
+                        line_style.custom_properties.get_or_insert_with(Default::default)
+                            .insert("--w3cos-internal-inline-formatting-context".to_string(), "1".to_string());
                         line_style.width = w3cos_std::style::Dimension::Percent(100.0);
                         line_style.direction = style.direction;
                         line_style.unicode_bidi = style.unicode_bidi;
@@ -11536,6 +11542,43 @@ mod image_component_tests {
         assert_eq!(text.style.text_indent, Dimension::Px(0.0));
         assert_ne!(text.style.background.a, 0);
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn table_cell_anonymous_inline_row_preserves_soft_wrapping() {
+        fn find_cell(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.display == Display::TableCell { return Some(component); }
+            component.children.iter().find_map(find_cell)
+        }
+        for (white_space, wraps) in [("normal", true), ("nowrap", false), ("pre", false)] {
+            let mut document = Document::new();
+            let table = document.create_element("table");
+            let row = document.create_element("tr");
+            let cell = document.create_element("td");
+            document.get_style_mut(cell.id).set_property("white-space", white_space);
+            for index in 0..2 {
+                if index > 0 {
+                    let space = document.create_text_node(" ");
+                    cell.append_child(&mut document, space);
+                }
+                let span = document.create_element("span");
+                let style = document.get_style_mut(span.id);
+                style.set_property("display", "inline-block");
+                style.set_property("width", "150px");
+                style.set_property("height", "50px");
+                cell.append_child(&mut document, span);
+            }
+            row.append_child(&mut document, cell);
+            table.append_child(&mut document, row);
+            document.body().append_child(&mut document, table);
+            let tree = document.to_component_tree();
+            let line = &find_cell(&tree).unwrap().children[0];
+            let expected = if wraps { w3cos_std::style::FlexWrap::Wrap }
+                else { w3cos_std::style::FlexWrap::NoWrap };
+            assert_eq!(line.style.flex_wrap, expected, "white-space={white_space}");
+            assert!(line.style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-inline-formatting-context")));
+        }
     }
 
     #[test]
