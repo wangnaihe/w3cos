@@ -44,7 +44,7 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
                 if *id == u64::from(crate::dom::body_id())
         )
     });
-    let artifact = PaintArtifact::build_with_body_background(
+    let artifact = PaintArtifact::build_with_body_background_and_viewport(
         flat.iter().map(|node| PaintNode {
             kind: node.kind.clone(),
             style: node.style.clone(),
@@ -54,6 +54,7 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         &layout_cache,
         1,
         body_index,
+        Some((width as f32, height as f32)),
     );
     let mut nodes = layout_cache
         .iter()

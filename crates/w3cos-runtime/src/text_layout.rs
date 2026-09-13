@@ -16,7 +16,7 @@ const PARAGRAPH_SEPARATOR: char = '\u{2029}';
 struct TextPaintKey {
     text: String,
     max_width: u32,
-    first_line_width: u32,
+    line_widths: Vec<u32>,
     font: u64,
     font_size: u32,
     white_space: u8,
@@ -401,7 +401,7 @@ fn wrap_greedy_with_run_width<F>(
     text: &str,
     max_width: f32,
     first_line_width: f32,
-    mut run_width: F,
+    run_width: F,
 ) -> Vec<String>
 where
     F: FnMut(&str) -> f32,
@@ -409,6 +409,16 @@ where
     if max_width <= 1.0 {
         return vec![text.to_string()];
     }
+    wrap_greedy_with_line_width(text, |index| {
+        if index == 0 { first_line_width } else { max_width }
+    }, run_width)
+}
+
+fn wrap_greedy_with_line_width(
+    text: &str,
+    mut line_width: impl FnMut(usize) -> f32,
+    mut run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
 
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -425,11 +435,7 @@ where
         }
 
         current.push(ch);
-        let available_width = if lines.is_empty() {
-            first_line_width
-        } else {
-            max_width
-        };
+        let available_width = line_width(lines.len()).max(1.0);
         if current.chars().count() > 1 && run_width(&current) > available_width {
             if let Some(space_index) = current.rfind(' ') {
                 let remainder = current[space_index + 1..]
@@ -977,6 +983,24 @@ pub fn wrap_text_with_run_width_and_first_line(
     wrap_greedy_with_run_width(&text, max_width, first_line_width.max(1.0), run_width)
 }
 
+/// Wrap against resolved per-line exclusion bands. Missing bands use the full
+/// containing width; forced breaks consume a band just like automatic wraps.
+/// Band geometry must be resolved by layout, not inferred from text contents.
+pub fn wrap_text_with_run_width_and_line_widths(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    white_space: WhiteSpace,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    let text = prepare_text_for_white_space(text, white_space);
+    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) || max_width <= 1.0 {
+        return text.split(['\n', FORCED_LINE_BREAK]).map(str::to_string).collect();
+    }
+    wrap_greedy_with_line_width(&text,
+        |index| line_widths.get(index).copied().unwrap_or(max_width), run_width)
+}
+
 pub fn retained_text_paint_layout(
     text: &str,
     max_width: f32,
@@ -1009,7 +1033,7 @@ pub fn retained_text_paint_layout_with(
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
-        first_line_width: max_width.to_bits(),
+        line_widths: vec![max_width.to_bits()],
         font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
@@ -1044,7 +1068,7 @@ pub fn retained_text_paint_layout_with_first_line(
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
-        first_line_width: first_line_width.to_bits(),
+        line_widths: vec![first_line_width.to_bits()],
         font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
@@ -1084,7 +1108,7 @@ pub fn retained_text_paint_layout_with_run_width(
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
-        first_line_width: max_width.to_bits(),
+        line_widths: vec![max_width.to_bits()],
         font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
@@ -1114,12 +1138,29 @@ pub fn retained_text_paint_layout_with_run_width_and_first_line(
     white_space: WhiteSpace,
     font_identity: u64,
     run_width: impl FnMut(&str) -> f32,
+    measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
+    retained_text_paint_layout_with_run_width_and_line_widths(
+        text, max_width, &[first_line_width], font_size, white_space,
+        font_identity, run_width, measure_ink)
+}
+
+/// Retain shaped lines using every resolved exclusion-band width in the key.
+/// Origins belong to paint geometry and do not affect the shaped-line cache.
+pub fn retained_text_paint_layout_with_run_width_and_line_widths(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    font_size: f32,
+    white_space: WhiteSpace,
+    font_identity: u64,
+    run_width: impl FnMut(&str) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
-        first_line_width: first_line_width.to_bits(),
+        line_widths: line_widths.iter().map(|width| width.to_bits()).collect(),
         font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
@@ -1128,10 +1169,10 @@ pub fn retained_text_paint_layout_with_run_width_and_first_line(
         return cached;
     }
 
-    let lines = wrap_text_with_run_width_and_first_line(
+    let lines = wrap_text_with_run_width_and_line_widths(
         text,
         max_width,
-        first_line_width,
+        line_widths,
         white_space,
         run_width,
     );
@@ -1177,6 +1218,43 @@ pub fn clear_paint_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_line_bands_wrap_each_line_and_preserve_white_space_controls() {
+        let measure = |run: &str| run.chars().count() as f32 * 10.0;
+        let text = "a b c d e f";
+        let bands = [30.0, 20.0, 30.0];
+        assert_eq!(wrap_text_with_run_width_and_line_widths(
+            text, 60.0, &bands, WhiteSpace::Normal, measure), ["a b", "c", "d e", "f"]);
+        assert_eq!(wrap_text_with_run_width_and_line_widths(
+            "a\u{2028}b c d", 60.0, &bands, WhiteSpace::Normal, measure), ["a", "b", "c d"]);
+        for white_space in [WhiteSpace::NoWrap, WhiteSpace::Pre] {
+            assert_eq!(wrap_text_with_run_width_and_line_widths(
+                text, 60.0, &bands, white_space, measure), [text]);
+        }
+        assert_eq!(wrap_text_with_run_width_and_line_widths(
+            text, 60.0, &[30.0], WhiteSpace::Normal, measure),
+            wrap_text_with_run_width_and_first_line(text, 60.0, 30.0, WhiteSpace::Normal, measure));
+    }
+
+    #[test]
+    fn retained_line_bands_reuse_identical_widths_but_not_changed_continuations() {
+        clear_paint_cache();
+        let measure = |run: &str| run.chars().count() as f32 * 10.0;
+        let ink = |run: &str| InkBounds {
+            left: 0.0, top: 0.0, width: measure(run), height: 10.0,
+        };
+        let retain = |widths: &[f32]| retained_text_paint_layout_with_run_width_and_line_widths(
+            "a b c d e f", 60.0, widths, 10.0, WhiteSpace::Normal, 0x4241_4e44,
+            measure, ink);
+        let narrow = retain(&[30.0, 20.0, 30.0]);
+        let repeated = retain(&[30.0, 20.0, 30.0]);
+        let wide = retain(&[30.0, 60.0, 30.0]);
+        assert!(Rc::ptr_eq(&narrow, &repeated));
+        assert!(!Rc::ptr_eq(&narrow, &wide));
+        assert_eq!(narrow.lines, ["a b", "c", "d e", "f"]);
+        assert_eq!(wide.lines, ["a b", "c d e", "f"]);
+    }
 
     #[test]
     fn inline_continuation_restores_first_fragment_margin_and_edges_only() {

@@ -1303,6 +1303,16 @@ impl PaintArtifact {
         generation: u64,
         body_index: Option<usize>,
     ) -> Self {
+        Self::build_with_body_background_and_viewport(nodes, layout_cache, generation, body_index, None)
+    }
+
+    pub(crate) fn build_with_body_background_and_viewport(
+        nodes: impl IntoIterator<Item = PaintNode>,
+        layout_cache: &[(LayoutRect, usize)],
+        generation: u64,
+        body_index: Option<usize>,
+        viewport: Option<(f32, f32)>,
+    ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
@@ -1403,6 +1413,23 @@ impl PaintArtifact {
         for &(rect, index) in layout_cache {
             if let Some(slot) = rect_by_index.get_mut(index) {
                 *slot = Some(rect);
+            }
+        }
+        for node in &mut nodes {
+            if let Some(properties) = node.style.custom_properties.as_mut() {
+                properties.remove("--w3cos-internal-float-line-bands");
+            }
+        }
+        if let Some((width, height)) = viewport {
+            let refs: Vec<_> = nodes.iter().map(|node|
+                (&node.kind, &node.style, node.parent)).collect();
+            let flows = crate::layout::resolve_float_text_layouts(&refs, &rect_by_index, width, height);
+            for flow in flows {
+                let encoded = flow.bands.iter().map(|band| format!("{} {} {}",
+                    band.x - flow.content.x, band.y - flow.content.y, band.width))
+                    .collect::<Vec<_>>().join(";");
+                nodes[flow.text_index].style.custom_properties.get_or_insert_with(Default::default)
+                    .insert("--w3cos-internal-float-line-bands".into(), encoded);
             }
         }
         trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rect_by_index);

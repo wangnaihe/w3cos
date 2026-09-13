@@ -1305,7 +1305,7 @@ fn draw_text_in_rect(
         image_info.width() as f32,
         image_info.height() as f32,
     );
-    let first_line_content = match style.direction {
+    let mut first_line_content = match style.direction {
         w3cos_std::style::TextDirection::Ltr => LayoutRect {
             x: content.x + indent,
             width: (content.width - indent).max(1.0),
@@ -1319,6 +1319,19 @@ fn draw_text_in_rect(
             ..content
         },
     };
+    let float_bands: Vec<LayoutRect> = style.custom_properties.as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-float-line-bands"))
+        .map(|value| value.split(';').filter_map(|band| {
+            let values: Vec<f32> = band.split_ascii_whitespace()
+                .filter_map(|value| value.parse().ok()).collect();
+            (values.len() == 3 && values.iter().all(|value| value.is_finite())
+                && values[2] > 0.0).then(|| LayoutRect {
+                x: content.x + values[0], y: content.y + values[1],
+                width: values[2], ..content })
+        }).collect()).unwrap_or_default();
+    if let Some(first) = float_bands.first() { first_line_content = *first; }
+    let line_widths: Vec<_> = if float_bands.is_empty() { vec![first_line_content.width] }
+        else { float_bands.iter().map(|band| band.width).collect() };
     // An overflow clip belongs to the element itself as well as its
     // descendants. The retained prepaint clip chain only carries ancestor
     // clips, so a leaf text node must clip its own glyph paint explicitly.
@@ -1341,10 +1354,10 @@ fn draw_text_in_rect(
         save
     });
     let registry = crate::font_face::FontRegistry::global();
-    let layout = text_layout::retained_text_paint_layout_with_run_width_and_first_line(
+    let layout = text_layout::retained_text_paint_layout_with_run_width_and_line_widths(
         text,
         continuation_content.width,
-        first_line_content.width,
+        &line_widths,
         style.font_size,
         style.white_space,
         registry.cascade_cache_key(style, text) ^ 0x534b_4941_5445_5801,
@@ -1367,7 +1380,8 @@ fn draw_text_in_rect(
             style, content.height, layout.lines.len() as f32 * line_height);
         let paragraph_ends = text_layout::paragraph_terminal_lines(text, style.white_space, &layout.lines);
         for (index, line) in layout.lines.iter().enumerate() {
-            let line_content = if index == 0 { first_line_content } else { continuation_content };
+            let line_content = float_bands.get(index).copied().unwrap_or_else(||
+                if index == 0 { first_line_content } else { continuation_content });
             let align = effective_text_align(style);
             let justify = align == TextAlign::Justify && !paragraph_ends[index]
                 && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal
@@ -1464,11 +1478,11 @@ fn draw_text_in_rect(
         let advance = measure_skia_text_advance(line, typeface, style);
         let alignment_ink_left =
             alignment_ink_left(line, ink.left, style.font_size, typeface, style);
-        let line_content = if index == 0 {
+        let line_content = float_bands.get(index).copied().unwrap_or_else(|| if index == 0 {
             first_line_content
         } else {
             continuation_content
-        };
+        });
         let align = effective_text_align(style);
         if align == TextAlign::Justify && !paragraph_ends[index]
             && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal | w3cos_std::style::WhiteSpace::PreLine)

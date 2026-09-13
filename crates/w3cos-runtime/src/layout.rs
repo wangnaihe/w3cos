@@ -75,6 +75,198 @@ pub struct LayoutRect {
     pub height: f32,
 }
 
+/// A resolved float margin box, independent of authored width units or paint.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FloatExclusion {
+    pub margin_box: LayoutRect,
+    pub side: WFloat,
+}
+
+/// Intersect a line's vertical extent with all active float margin boxes.
+/// Callers advance to a float bottom if a band cannot fit an unbreakable item;
+/// they must not turn a zero-width band into a full-width text line.
+pub(crate) fn float_line_band(
+    containing: LayoutRect,
+    y: f32,
+    line_height: f32,
+    exclusions: &[FloatExclusion],
+) -> LayoutRect {
+    let mut left = containing.x;
+    let mut right = containing.x + containing.width;
+    for exclusion in exclusions {
+        let rect = exclusion.margin_box;
+        if rect.width <= 0.0 || rect.height <= 0.0
+            || y >= rect.y + rect.height || y + line_height <= rect.y
+        { continue; }
+        match exclusion.side {
+            WFloat::Left => left = left.max(rect.x + rect.width),
+            WFloat::Right => right = right.min(rect.x),
+            WFloat::None => {}
+        }
+    }
+    left = left.clamp(containing.x, containing.x + containing.width);
+    right = right.clamp(containing.x, containing.x + containing.width);
+    LayoutRect { x: left, y, width: (right - left).max(0.0), height: line_height }
+}
+
+#[derive(Debug)]
+pub(crate) struct FloatTextLayout {
+    pub text_index: usize,
+    pub parent_index: usize,
+    pub content: LayoutRect,
+    pub bands: Vec<LayoutRect>,
+    pub used_height: f32,
+}
+
+/// Resolve a leading float group followed by one breakable inline text run.
+/// Both layout projection and retained paint consume this resolved geometry.
+pub(crate) fn resolve_float_text_layouts(
+    nodes: &[(&ComponentKind, &w3cos_std::style::Style, Option<usize>)],
+    rects: &[Option<LayoutRect>],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Vec<FloatTextLayout> {
+    if !nodes.iter().any(|(_, style, _)| style.float != WFloat::None) { return Vec::new(); }
+    let mut children_by_parent = vec![Vec::new(); nodes.len()];
+    let mut float_parents = vec![false; nodes.len()];
+    for (index, (_, style, parent)) in nodes.iter().enumerate() {
+        if let Some(parent) = *parent {
+            if style.display != WDisplay::None && !matches!(style.position, WPos::Absolute | WPos::Fixed) {
+                children_by_parent[parent].push(index);
+                float_parents[parent] |= style.float != WFloat::None;
+            }
+        }
+    }
+    let mut flows = Vec::new();
+    for (parent_index, (_, parent_style, _)) in nodes.iter().enumerate() {
+        if !float_parents[parent_index] || !parent_style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-inline-formatting-context"))
+        { continue; }
+        let Some(parent_rect) = rects.get(parent_index).copied().flatten() else { continue; };
+        let children: Vec<_> = children_by_parent[parent_index].iter()
+            .map(|index| (*index, &nodes[*index])).collect();
+        let prefix = children.iter().take_while(|(_, (_, style, _))| style.float != WFloat::None).count();
+        if prefix == 0 || children.len() != prefix + 1 { continue; }
+        let (text_index, (kind, style, _)) = children[prefix];
+        let ComponentKind::Text { content: text } = kind else { continue; };
+        if style.display != WDisplay::Inline || style.float != WFloat::None
+            || matches!(style.white_space, WWhiteSpace::Pre | WWhiteSpace::NoWrap)
+        { continue; }
+        let spacing = |value, font_size| resolve_spacing_for_layout(
+            value, parent_rect.width, font_size, viewport_w, viewport_h);
+        let left = spacing(parent_style.padding.left, parent_style.font_size)
+            + parent_style.border_left_width.unwrap_or(parent_style.border_width);
+        let right = spacing(parent_style.padding.right, parent_style.font_size)
+            + parent_style.border_right_width.unwrap_or(parent_style.border_width);
+        let top = spacing(parent_style.padding.top, parent_style.font_size)
+            + parent_style.border_top_width.unwrap_or(parent_style.border_width);
+        let line_height = style.font_size * style.line_height;
+        if line_height <= 0.0 { continue; }
+        let content = LayoutRect { x: parent_rect.x + left,
+            y: parent_rect.y + top + (line_height - style.font_size) * 0.5,
+            width: (parent_rect.width - left - right).max(0.0), height: style.font_size };
+        let exclusions: Vec<_> = children[..prefix].iter().filter_map(|(index, (_, style, _))| {
+            let rect = rects.get(*index).copied().flatten()?;
+            let ml = spacing(style.margin.left, style.font_size);
+            let mr = spacing(style.margin.right, style.font_size);
+            let mt = spacing(style.margin.top, style.font_size);
+            let mb = spacing(style.margin.bottom, style.font_size);
+            Some(FloatExclusion { side: style.float, margin_box: LayoutRect {
+                x: rect.x - ml, y: rect.y - mt, width: rect.width + ml + mr,
+                height: rect.height + mt + mb } })
+        }).collect();
+        let bottom = exclusions.iter().map(|exclusion|
+            exclusion.margin_box.y + exclusion.margin_box.height).fold(content.y, f32::max);
+        let count = (((bottom - content.y) / line_height).ceil().max(1.0) as usize)
+            .min(text.chars().count() + 1);
+        let mut bands: Vec<_> = (0..count).map(|index| float_line_band(
+            content, content.y + index as f32 * line_height, line_height, &exclusions)).collect();
+        let rtl = style.direction == w3cos_std::style::TextDirection::Rtl;
+        let margin = spacing(if rtl { style.margin.right } else { style.margin.left }, style.font_size);
+        let indent = style.resolved_text_indent(content.width, viewport_w, viewport_h);
+        if let Some(first) = bands.first_mut() {
+            first.width -= margin + indent;
+            if !rtl { first.x += margin + indent; }
+        }
+        let text_rect = LayoutRect {
+            x: content.x + if rtl { 0.0 } else { margin },
+            width: content.width - margin,
+            ..content
+        };
+        // Closed bands require vertical advancement before wrapping; leave
+        // that case to the existing below-float path until it is integrated.
+        if bands.iter().any(|band| band.width <= 0.0) { continue; }
+        let widths: Vec<_> = bands.iter().map(|band| band.width).collect();
+        let lines = text_layout::wrap_text_with_run_width_and_line_widths(
+            text, content.width, &widths, style.white_space,
+            |run| text_intrinsic_size(run, style).0);
+        flows.push(FloatTextLayout { text_index, parent_index, content: text_rect, bands,
+            used_height: top + lines.len() as f32 * line_height
+                + spacing(parent_style.padding.bottom, parent_style.font_size)
+                + parent_style.border_bottom_width.unwrap_or(parent_style.border_width) });
+    }
+    flows
+}
+
+fn project_float_text_layouts(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let mut positions = vec![None; flat.len()];
+    let mut rects = vec![None; flat.len()];
+    for (position, &(rect, index)) in layouts.iter().enumerate() {
+        positions[index] = Some(position);
+        rects[index] = Some(rect);
+    }
+    let nodes: Vec<_> = flat.iter().map(|node| (node.kind, node.style, node.parent)).collect();
+    for flow in resolve_float_text_layouts(&nodes, &rects, viewport_w, viewport_h) {
+        let Some(parent_position) = positions[flow.parent_index] else { continue; };
+        let old_parent = rects[flow.parent_index].unwrap();
+        let dy = layouts[parent_position].0.y - old_parent.y;
+        if let Some(position) = positions[flow.text_index] {
+            layouts[position].0 = LayoutRect { y: flow.content.y + dy, ..flow.content };
+        }
+        let mut owner = flow.parent_index;
+        let mut height = flow.used_height;
+        loop {
+            let style = flat[owner].style;
+            if !matches!(style.height, WDim::Auto)
+                || !matches!(style.min_height, WDim::Auto | WDim::Px(_))
+                || !matches!(style.max_height, WDim::Auto | WDim::Px(_))
+            { break; }
+            if let WDim::Px(maximum) = style.max_height { height = height.min(maximum); }
+            if let WDim::Px(minimum) = style.min_height { height = height.max(minimum); }
+            let Some(position) = positions[owner] else { break; };
+            let old = layouts[position].0;
+            let delta = height - old.height;
+            layouts[position].0.height = height.max(0.0);
+            let Some(parent) = flat[owner].parent else { break; };
+            let current_rects: HashMap<_, _> = layouts.iter()
+                .map(|(rect, index)| (*index, *rect)).collect();
+            // Translate later in-flow siblings and their complete subtrees.
+            for (rect, index) in layouts.iter_mut() {
+                let mut ancestor = *index;
+                while let Some(candidate_parent) = flat[ancestor].parent {
+                    if candidate_parent == parent {
+                        if ancestor != owner && ancestor > owner
+                            && !matches!(flat[ancestor].style.position, WPos::Absolute | WPos::Fixed)
+                            && current_rects.get(&ancestor).is_some_and(|sibling|
+                                sibling.y >= old.y + old.height - 0.01)
+                        { rect.y += delta; }
+                        break;
+                    }
+                    ancestor = candidate_parent;
+                }
+            }
+            let Some(parent_position) = positions[parent] else { break; };
+            height = layouts[parent_position].0.height + delta;
+            owner = parent;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollExtent {
     pub max_x: f32,
@@ -2274,6 +2466,7 @@ impl LayoutEngine {
             viewport_h,
         );
         project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
+        project_float_text_layouts(&mut results, flat, viewport_w, viewport_h);
         project_positioned_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
@@ -2419,6 +2612,7 @@ pub fn compute_with_scroll(
         viewport_h,
     );
     project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
+    project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h);
     project_positioned_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
@@ -17718,6 +17912,97 @@ mod tests {
         let float_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
 
         assert_eq!(float_rect.width, 200.0);
+    }
+
+    #[test]
+    fn float_line_bands_release_each_side_at_its_actual_bottom() {
+        let containing = LayoutRect { x: 8.0, y: 16.0, width: 240.0, height: 100.0 };
+        let exclusions = [
+            FloatExclusion { side: WFloat::Left,
+                margin_box: LayoutRect { x: 8.0, y: 16.0, width: 60.0, height: 6.0 } },
+            FloatExclusion { side: WFloat::Right,
+                margin_box: LayoutRect { x: 208.0, y: 16.0, width: 40.0, height: 44.0 } },
+        ];
+        let first = float_line_band(containing, 18.0, 20.0, &exclusions);
+        let second = float_line_band(containing, 38.0, 20.0, &exclusions);
+        let third = float_line_band(containing, 58.0, 20.0, &exclusions);
+        let fourth = float_line_band(containing, 78.0, 20.0, &exclusions);
+        assert_eq!((first.x, first.width), (68.0, 140.0));
+        assert_eq!((second.x, second.width), (8.0, 200.0));
+        assert_eq!((third.x, third.width), (8.0, 200.0));
+        assert_eq!((fourth.x, fourth.width), (8.0, 240.0));
+        let closed = float_line_band(containing, 18.0, 20.0, &[
+            FloatExclusion { side: WFloat::Left,
+                margin_box: LayoutRect { width: 240.0, ..containing } },
+        ]);
+        assert_eq!(closed.width, 0.0, "a fully excluded band is not a full-width line");
+    }
+
+    #[test]
+    fn consecutive_float_text_rows_keep_the_following_flow_below_both_rows() {
+        let row = || Component::row(Style {
+            display: WDisp::Flex,
+            width: WDim::Percent(100.0),
+            min_height: WDim::Px(20.0),
+            flex_wrap: WWrap::Wrap,
+            custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
+            ])),
+            ..Style::default()
+        }, vec![
+            Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(60.0), height: WDim::Px(6.0), ..Style::default() }, vec![]),
+            Component::text("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda", Style {
+                display: WDisp::Inline, font_size: 16.0, line_height: 1.25, ..Style::default()
+            }),
+        ]);
+        let root = Component::boxed(Style { display: WDisp::Block,
+            width: WDim::Px(240.0), ..Style::default() }, vec![row(), row(),
+            Component::boxed(Style { display: WDisp::Block, height: WDim::Px(10.0),
+                ..Style::default() }, vec![])]);
+        let layouts = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layouts.iter().find(|(_, candidate)| *candidate == index).unwrap().0;
+        let first = rect(1);
+        let second = rect(4);
+        let following = rect(7);
+        assert!(first.height >= 40.0 && second.height >= 40.0);
+        assert!(second.y >= first.y + first.height - 0.01);
+        assert!(following.y >= second.y + second.height - 0.01,
+            "later flow must use coordinates after the first correction: first={first:?}, second={second:?}, following={following:?}");
+    }
+
+    #[test]
+    fn breakable_inline_text_starts_in_the_leading_float_side_band() {
+        let root = Component::row(Style {
+            custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
+            ])),
+            display: WDisp::Flex,
+            width: WDim::Px(240.0),
+            flex_wrap: WWrap::Wrap,
+            ..Style::default()
+        }, vec![
+            Component::boxed(Style {
+                display: WDisp::Block,
+                float: WFloat::Left,
+                width: WDim::Px(60.0),
+                height: WDim::Px(6.0),
+                ..Style::default()
+            }, vec![]),
+            Component::text("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda", Style {
+                display: WDisp::Inline,
+                font_size: 16.0,
+                line_height: 1.25,
+                ..Style::default()
+            }),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let floating = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let text = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert!(text.width <= 240.0, "text must not retain its unwrapped intrinsic width: {text:?}");
+        assert!(text.y < floating.y + floating.height,
+            "a breakable text line must begin beside the float, not below it: float={floating:?}, text={text:?}");
+        assert!(layout[0].0.height >= 40.0, "wrapped lines contribute parent height");
     }
 
     #[test]

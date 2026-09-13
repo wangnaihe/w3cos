@@ -2876,11 +2876,12 @@ impl App {
                     }),
             )
         };
-        self.paint_artifact = PaintArtifact::build_with_body_background(
+        self.paint_artifact = PaintArtifact::build_with_body_background_and_viewport(
             paint_nodes,
             &self.layout_cache,
             self.layout_generation + 1,
             canvas_body_index,
+            Some((w, layout_h)),
         );
         for (scroll_index, correction) in virtual_anchor_corrections {
             self.queue_scroll_damage(scroll_index, correction);

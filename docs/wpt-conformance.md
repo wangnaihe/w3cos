@@ -1870,6 +1870,131 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   focused failure remains5775, requiring breakable float-side line layout
   rather than an unwrapped atomic text box below the float.
 
+### Float-text integration and focused qualification history
+
+- Following3ea871c,5775 remains FAIL73806 pixels. Existing layout evidence
+  shows the float reference's long InlineText as an atomic4539.125px box below
+  a100px by4.8px float. A decoration-only or first-line-only patch does not
+  establish general float-side line layout.
+- Shared run-width wrapping now accepts resolved per-line widths, falling back
+  to the full containing width after supplied exclusion bands. Existing
+  first-line APIs delegate to the same greedy algorithm. Forced breaks consume
+  a band; no-wrap/pre retain their authored break behavior. A unit covers
+  different widths on three successive lines, forced breaks, white-space
+  controls and equivalence with the existing one-band API.
+- Text-layout27/27 unit tests pass, including the new multi-band test and
+  existing first-line, whitespace, shaped-width and punctuation controls.
+  This primitive is not yet connected to float
+  geometry, retained-cache band identity, layout height or paint positions;
+ 5775 is not claimed repaired. Current PaintArtifact receives both indexed
+  layout rectangles and parent-linked immutable paint-node styles; geometry
+  must originate from actual layout, not fixture text or authored API metadata.
+  No preparation commit or push is claimed.
+- Retained shaped-text keys now contain all band widths, not merely the first
+  width. The existing Skia first-line retained API delegates to the multi-band
+  API; origins remain paint geometry and do not invalidate identical shaping.
+  A cache unit verifies same-band pointer reuse and changed second-band line
+  results. Text-layout28/28 tests pass after this cache extension; layout/paint
+  float-band producers still need integration before5775 can be re-evaluated.
+- A runtime Component-row layout reproducer,
+  `breakable_inline_text_starts_in_the_leading_float_side_band`, is confirmed
+  RED: in a240px row beside a60px by6px float, the text is x0/y6/width507.7422/
+  height16. It retains unwrapped intrinsic width and starts below the float.
+  The existing oversized-inline-replaced-box float control passes, and must
+  remain distinct from breakable text. The DOM-generated inline-formatting
+  marker must govern CSS integration: authored CSS Flex must not accidentally
+  acquire float semantics from this runtime Component-row reproducer.
+- Shared layout now has typed resolved float margin boxes and a line-band
+  intersection function. It handles simultaneous left/right floats, distinct
+  float bottoms, partial vertical overlap and completely excluded zero-width
+  bands. A geometry unit exercises multiple affected lines and release back
+  to full width. Its qualification is pending; this geometry primitive is not
+  yet wired into the layout/paint flow producer. A zero-width band must advance
+  past an exclusion before the wrapping API is called, not be clamped into a
+  fictitious one-pixel/full-width line.5775 remains open.
+- A shared float-text resolver now reads parent-linked node styles and actual
+  indexed layout rectangles. It resolves parent padding/borders and float
+  margin boxes using the containing width/viewport, builds multiple affected
+  line bands, and measures used height through the existing font-aware run
+  measurement. Admission requires the DOM inline-formatting marker and a
+  leading float group followed by one inline text run; other shapes remain
+  open. Completely closed bands stay on the existing below-float path pending
+  vertical-advancement integration. Skia + dynamic-js library type checking
+  passes (existing warnings remain). The preceding line-band geometry unit
+  passes; the new resolver's runtime tests and consumer integration remain
+  pending. This is not5775 pixel acceptance or full float conformance.
+- Layout projection now consumes the resolver after float placement, replacing
+  the unwrapped leaf geometry and propagating multi-line used height through
+  unconstrained auto-height ancestors and subsequent in-flow sibling subtrees.
+  The layout postcondition now explicitly supplies the generated-IFC marker;
+  the earlier raw Component-row RED is diagnostic evidence, not a claim that
+  authored CSS Flex should support floats. Post-fix qualification is pending.
+- Window/headless retained paint supplies the actual layout viewport. Artifacts
+  clear stale private band annotations and regenerate them from the shared
+  resolver; Skia uses these widths and origins for wrapping, backgrounds and
+  glyph placement. Cache, producer and consumer thus share resolved line bands.
+  Source has not yet passed focused pixels; CPU/GPU consumers remain open.
+  Parent adjacency is built once, float-free documents exit early, and only
+  float-owning formatting contexts are examined (no per-parent full-tree scan).
+- The marked-IFC layout postcondition passes after projection integration.
+  The integration library check also passes; subsequent height propagation
+  admits auto/Px minimum/maximum constraints (including DOM line struts), with
+  minimum height winning conflicting maximum height. Other height constraint
+  forms remain open. Latest source still requires runner build and focused
+  pixels before any commit/closure claim. CPU/GPU band consumption is not yet
+  implemented and must not be represented as multi-backend acceptance.
+- The integration runner (before the subsequent flowing-sibling coordinate
+  correction) SHA256 is
+  `d7524e2c79dd0aa1dbe65458764ed5214ba138bafd7808bcd5d731b7738e50c5`.
+  `batch-5773-float-text-integration-before-following-flow-v1/results.json`
+  passes4/4, including the previously failing float reference exact match.
+  This is diagnostic integration evidence, not latest-source qualification.
+- Static review found that a second float-text paragraph compared later siblings
+  against original coordinates after the first paragraph had translated them.
+  Projection now snapshots current sibling coordinates at each propagation
+  level. A consecutive-two-row/following-flow regression is compiling; the
+  latest-source runner is queued behind it. Final focused rerun and related
+  regression remain required before any scoped commit/push or closure claim.
+- Latest-source consecutive-two-row regression passes. The marked float-side
+  layout postcondition and oversized-replaced-item control also pass; shared
+  text-layout28/28 pass after all integration/coordinate changes. The latest
+  runner remains in build; focused pixels and related regression are pending.
+- Latest candidate runner SHA256
+  `a2899d9b5b9154c95c176b37164304507121e142e16e623f28e8de5cc5494380`
+  passes enclosing5769 batch8/8. Related96 regression is95/96, with a genuine
+ 263px regression in5689's text-indent-013 (previous exact zero). The float-side
+  first band discarded the inline leading margin/indent already projected by
+  DOM. Candidate resolution now preserves that first-fragment displacement
+  while continuation boxes restore the containing line; qualification pending.
+- Extra single-case starts1358/1359/1361/1363/1371/1372/1374/1389 pass5/8.
+  Float-root1371 fails179px, float-table-align-left-quirk1372 fails105px,
+  floats-placement-vertical-0031389 fails2640px. These were historically PASS
+  but require a direct3ea871c baseline comparison before assigning cause.
+  A separate clean baseline worktree shares the current copied Cargo.lock;
+  `--locked --offline` build is running. Its initial unlocked build was stopped
+  and is not valid comparison evidence. Candidate binary is retained under
+  `target/wpt-targeted/w3cos-wpt-float-text-flow-candidate-v1`. No commit/push.
+- Direct clean3ea871c baseline (copied identical lockfile, locked/offline build)
+  runner SHA256
+  `2f2e69ad67517275556a147bd631e638730bdb849435a3ecbc6dd5796f4af2c6`
+  also fails1371/1372/1389 at identical179/105/2640 pixels. They are pre-existing at the
+  immediate commit baseline, not newly introduced by this float-text change.
+  The exact013 index is5693 (the initial extra5691 baseline is a different
+  passing control, not evidence for013).5693 baseline passes exact zero,
+  confirming the candidate013 regression. The corrected candidate build is
+  running. Full6548 zero-failure evidence is still absent.
+- Corrected runner SHA256
+  `c37d3b1757a1e9abf7ce30bda631be6bc6bdce50adcd1385d47576fba390c9e1`:
+  `case-5693-float-text-first-margin-v1` restores013 from263 to exact zero;
+  enclosing `batch-5769-float-text-first-margin-v1` remains8/8 PASS. Related
+  eight-case starts5761/5753/5745/5737/5729/5721/5689/5681/5665/5545/5553/5593
+  under `batch-<start>-float-text-first-margin-v1` pass96/96 (94 zero-pixel
+  matches and two expected mismatches). Revision/800x600/zero tolerances remain
+  unchanged. Extra eight float controls still pass5/8, with the identical
+  pre-existing179/105/2640px failures proved by the direct baseline. No new
+  failure remains in these observed ranges. This is scoped Skia qualification,
+  not full float conformance, CPU/GPU acceptance or final6548 zero-failure proof.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
