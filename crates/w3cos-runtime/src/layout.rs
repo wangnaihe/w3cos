@@ -6075,6 +6075,10 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                 .copied()
                 .map(|position| layouts[position].0)
             {
+                // A first break terminates its reserved line box. Its raw
+                // layout origin excludes the passive inline parent's em-box
+                // half-leading, unlike the parent's paint rectangle.
+                line_top.get_or_insert(layout.y);
                 line_height = line_height.max(layout.height);
             }
             let Some((_, next_index)) = children.get(position + 1) else {
@@ -8858,6 +8862,10 @@ fn collect_layouts_fast(
                     | ComponentKind::Text { .. }
             )
                 && info.style.display == WDisplay::Inline
+                // A forced break carries the reserved line strut, not a
+                // painted glyph/em box. Keep its measured layout height.
+                && !matches!(info.kind,
+                    ComponentKind::Text { content } if content == "\u{2028}")
                 && !matches!(info.style.position, WPos::Absolute | WPos::Fixed)
             {
                 let padding = info.style.padding_lengths();
@@ -12442,6 +12450,34 @@ mod tests {
             .expect("absolute inline layout");
         assert_eq!(absolute.x, text_intrinsic_size(" ", &inline_style).0);
         assert_eq!(absolute.y, 19.2);
+    }
+
+    #[test]
+    fn first_forced_break_projects_float_from_its_reserved_line_origin() {
+        let root = Component::boxed(Style {
+            display: WDisp::Inline, line_height: 12.5, ..Style::default()
+        }, vec![
+            Component::text("\u{2028}", Style {
+                display: WDisp::Inline, height: WDim::Px(200.0),
+                line_height: 12.5, ..Style::default()
+            }),
+            Component::boxed(Style {
+                display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(200.0), height: WDim::Px(200.0),
+                ..Style::default()
+            }, vec![Component::boxed(Style {
+                position: WPos::Absolute, width: WDim::Px(200.0),
+                height: WDim::Px(200.0), ..Style::default()
+            }, vec![])]),
+        ]);
+        let rect = |y, height, width| LayoutRect { x: 0.0, y, width, height };
+        let mut layout = vec![
+            (rect(92.0, 16.0, 200.0), 0), (rect(0.0, 200.0, 0.0), 1),
+            (rect(0.0, 200.0, 200.0), 2), (rect(0.0, 200.0, 200.0), 3),
+        ];
+        project_forced_break_lines(&mut layout, &root);
+        assert_eq!(layout[2].0.y, 200.0);
+        assert_eq!(layout[3].0.y, 200.0);
     }
 
     #[test]

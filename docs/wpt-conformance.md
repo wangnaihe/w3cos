@@ -3281,6 +3281,62 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `git diff --check` passes. The remaining three focused failures and
   full6548 acceptance are not closed by this repair.
 
+### Preserve forced-break struts and float source anchors
+
+- Based on published `7b7f16dcc3a08d5ac67c611b34043a7131ffcbac`, the existing
+  `standalone_forced_break_establishes_its_line_height_strut` test is RED:
+  reserved height 200 becomes a 16px paint/em box. Forced-break text nodes
+  now retain their measured layout strut rather than undergoing glyph-box
+  projection. This exact regression is GREEN in 2m52s; the same positioning
+  and break checks improve from 33/34 to 34/34, with no old PASS lost.
+  Receipt `forced-break-runtime-unit-after.json`.
+- The new DOM source-anchor test first runs zero cases under an incorrect
+  module filter; that invocation is not a passing regression. The exact
+  `document::image_component_tests::float_after_forced_break_keeps_its_inline_source_anchor`
+  invocation reproduces RED: extraction moves the float outside its prior
+  inline break. Receipt `float-forced-break-source-anchor-red-exact.log`.
+  After an in-flow forced break, float extraction now retains the owning
+  inline source anchor. Nested passive inline breaks count; hidden,
+  out-of-flow and atomic inline contents do not create this outer anchor.
+- The exact DOM test (both float sides) is GREEN in 2m27s including its
+  runtime-build lock wait. Related DOM float checks improve from 15/17 to
+  16/17, with only this status changed; the earlier static-line/block-order
+  failure remains. Receipts `forced-break-dom-unit-before/after.json`.
+- WPT `static-inside-float-inside-inline.html` remains RED in the published
+  baseline (50200 pixels). Chromium 141 confirms float and nested abspos
+  offsets of 200px from the wrapper. The published native lowered tree puts
+  the float before the break; this prototype's optimized-runner pixel
+  qualification is pending. These unit results do not close that WPT case,
+  the remaining focused failures or full6548. Parent size checking excludes
+  vendor and is not presented as a W3COS size gate.
+
+  Intermediate optimized runner `forced-break-source-v1` builds in 4m29s
+  including queued unit-build waits, SHA256
+  `8cd5c26a7b08d45ae756b89536a946b56087fe318fb80138f0225f4dca7e0f37`.
+  Start 24 remains 7/8: the float case improves from 50200 to 36800 pixels,
+  but is not qualified or published. The native source order is restored
+  and br height is 200; float and abspos are still 292px below the wrapper.
+  Forced-break projection falls back to the parent's paint/em-box y,
+  retaining its extra 92px half-leading. It now anchors an empty preceding
+  line to the preserved break rectangle's raw origin. A direct projection
+  regression covers both the float and nested abspos. Unit and pixel
+  qualification for `forced-break-source-v2` remain pending.
+
+  Final projection regression is GREEN in 2m49s; the final executable
+  passes all 35 exact positioning/break checks. Receipt
+  `forced-break-source-v2-unit-neighbors.json`. Optimized runner builds in
+  4m50s including its unit-build lock wait, SHA256
+  `041de32edd370d1fad76925e3698d1f5e82525dfdbb9be3c388da4c3d6dfd803`.
+  Pinned starts 0,8,16,24 and six related float batches
+  (1358,1366,1385,1400,1408,1416) finish 78/80 PASS; only the two existing
+  dynamic-inline harness failures remain. Ordered full test-object comparison
+  changes only the float/abspos case, from 50200 pixels to exact zero; every
+  other report is identical, with no old PASS lost. Receipt
+  `forced-break-source-v2-comparison.json`. Native float and abspos now both
+  start 200px below the wrapper, matching the isolated Chromium measurement.
+  Static `git diff --check` passes. This is focused qualification, not a
+  full-runtime module gate or final full6548 acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -9375,6 +9375,19 @@ fn hoist_floats_into_block_formatting_context(
         }
     }
 
+    fn inline_contains_forced_break(component: &w3cos_std::Component) -> bool {
+        use w3cos_std::style::{Display, Float, Position};
+        if component.style.display == Display::None || component.style.float != Float::None
+            || matches!(component.style.position, Position::Absolute | Position::Fixed)
+        {
+            return false;
+        }
+        matches!(&component.kind,
+            w3cos_std::ComponentKind::Text { content } if content == "\u{2028}")
+            || (component.style.display == Display::Inline
+                && component.children.iter().any(inline_contains_forced_break))
+    }
+
     fn merge_adjacent_text_runs(
         components: Vec<w3cos_std::Component>,
     ) -> Vec<w3cos_std::Component> {
@@ -9638,6 +9651,7 @@ fn hoist_floats_into_block_formatting_context(
             && component.style.float == w3cos_std::style::Float::None
         {
             let mut has_prior_in_flow = false;
+            let mut has_prior_forced_break = false;
             let mut retained = Vec::new();
             let children = std::mem::take(&mut component.children);
             for (index, child) in children.iter().cloned().enumerate() {
@@ -9649,12 +9663,17 @@ fn hoist_floats_into_block_formatting_context(
                 // when its float is first. A first float in an unbroken nowrap
                 // run instead retains that run's source anchor; extracting it
                 // to the trailing queue would place it after the entire run.
-                let extract_child = child.style.float != w3cos_std::style::Float::Right
+                // Same-line float extraction may not cross an earlier forced
+                // break. Keep that float in its inline source context so the
+                // outer BFC can resolve its line-constrained placement.
+                let extract_child = !has_prior_forced_break && (
+                    child.style.float != w3cos_std::style::Float::Right
                     || has_prior_in_flow
-                    || component.style.white_space != w3cos_std::style::WhiteSpace::NoWrap;
+                    || component.style.white_space != w3cos_std::style::WhiteSpace::NoWrap);
                 if let Some(child) = collect(child, extract_child,
                     component.style.white_space == w3cos_std::style::WhiteSpace::NoWrap, left, right) {
                     has_prior_in_flow |= contributes_in_flow_content(&child);
+                    has_prior_forced_break |= inline_contains_forced_break(&child);
                     retained.push(child);
                 } else if nested_left_float && has_prior_in_flow && has_later_in_flow {
                     // A float between block descendants still leaves the
@@ -10677,6 +10696,32 @@ mod image_component_tests {
         assert_eq!(style.display, Display::Block);
         assert_eq!(style.max_width, Dimension::Px(120.0));
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn float_after_forced_break_keeps_its_inline_source_anchor() {
+        use w3cos_std::style::{Display, Float, Style, Dimension};
+        let line_break = w3cos_std::Component::text("\u{2028}", Style {
+            display: Display::Inline, height: Dimension::Px(200.0),
+            line_height: 12.5, ..Style::default()
+        });
+        for side in [Float::Left, Float::Right] {
+            let floating = w3cos_std::Component::boxed(Style {
+                display: Display::Block, float: side,
+                width: Dimension::Px(200.0), height: Dimension::Px(200.0),
+                ..Style::default()
+            }, vec![]);
+            let inline = w3cos_std::Component::boxed(Style {
+                display: Display::Inline, line_height: 12.5, ..Style::default()
+            }, vec![line_break.clone(), floating]);
+            let fixed = hoist_floats_into_block_formatting_context(&Style::default(), vec![inline]);
+            assert_eq!(fixed.len(), 1, "a float must not cross a prior forced line break");
+            assert_eq!(fixed[0].style.display, Display::Inline);
+            assert_eq!(fixed[0].children.len(), 2);
+            assert!(matches!(&fixed[0].children[0].kind,
+                w3cos_std::ComponentKind::Text { content } if content == "\u{2028}"));
+            assert_eq!(fixed[0].children[1].style.float, side);
+        }
     }
 
     #[test]
