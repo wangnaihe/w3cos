@@ -2472,6 +2472,41 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   suite or upstream files changed. Nested inline float ownership, broader
   multi-run line layout and final same-clean-SHA6548 proof remain open.
 
+### First nested right-float ownership and nowrap anchors
+
+- Baselinee2c5638 case1388 (`001c`) remains RED at13110px. A new paired DOM
+  regression is RED in20.64s: an initial right float in a wrappable Inline
+  descendant is not extracted (outer count0 versus1). Ordinary static inline
+  descendants share the outer context; atomic inline-block/flex/table and
+  floated principal boxes retain descendant ownership. The collector now
+  respects these boundaries and extracts first right floats in wrappable runs.
+- The old static-line unit used InlineFlex as a synthetic inline model while
+  requiring descendant hoisting. Correct that native unit fixture to Inline;
+  keep its extraction/order assertions and add explicit atomic-box negative
+  ownership checks. No upstream WPT file or suite fixture changed.
+- Fresh Chromium800x600 probes show an Inline right float at outer x358,
+  InlineBlock(width100) at its own x93.546875, and InlineFlex at x43.546875
+  as its own item. These prove ownership boundaries, not full Flex parity.
+- Intermediate runner2m05s gives neighbor starts1358/1366/1385 as7/8,8/8,5/8:
+  1388 reaches0 but1363's mismatch falsely reaches0. Receipt suffix
+  `inline-float-ownership-after-v1` preserves that unqualified regression.
+  An initial float in an unbroken nowrap run must retain its source anchor,
+  not move to the queue after the entire run. Preserve that anchor and add a
+  paired nowrap counter. Chromium upstream3-ref/4 float y38/y23 confirms the
+  two paths must differ (host monospace13px, not native font raster proof).
+- Final DOM optimized16.89s passes15/15 float tests. Fresh runner2m05s SHA256
+  `a14941d35db69106aac2221a8a1f072860dafda39bb23929b4600a785c1bf8c7`:
+  starts1358/1366/1385 now8/8,8/8,5/8;1386/1387/1388 all PASS0;1363
+  mismatch is restored at6986px.1385/1390/1391 still FAIL10000/20000/20000px;
+  1389/1392 stayPASS0. Receipts use`inline-float-ownership-nowrap-after-v1`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 exact-zero matches, four expected
+  mismatches); ordered paths/statuses/full pixel-diff objects match e2c5638.
+  Receipts use`inline-float-ownership-nowrap-final-v1`. Runtime unit binaries
+  were not rebuilt for this DOM-only change; native runtime proof here is the
+  fresh runner's focused WPT receipts. Broader source-order/atomic layout and
+  final same-clean-SHA6548 acceptance remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

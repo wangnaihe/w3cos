@@ -9596,13 +9596,12 @@ fn hoist_floats_into_block_formatting_context(
             return Some(component);
         }
 
-        if matches!(
-            component.style.display,
-            w3cos_std::style::Display::Inline
-                | w3cos_std::style::Display::InlineBlock
-                | w3cos_std::style::Display::InlineFlex
-                | w3cos_std::style::Display::InlineTable
-        ) {
+        // Only non-positioned, non-floating inline boxes share this outer
+        // formatting context. Atomic inline boxes and floated principal boxes
+        // establish their own context and retain descendant float ownership.
+        if component.style.display == w3cos_std::style::Display::Inline
+            && component.style.float == w3cos_std::style::Float::None
+        {
             let mut has_prior_in_flow = false;
             let mut retained = Vec::new();
             let children = std::mem::take(&mut component.children);
@@ -9611,8 +9610,13 @@ fn hoist_floats_into_block_formatting_context(
                 let has_later_in_flow = children[index + 1..]
                     .iter()
                     .any(contributes_in_flow_content);
-                let extract_child =
-                    child.style.float != w3cos_std::style::Float::Right || has_prior_in_flow;
+                // Wrappable inline content shares the outer line context even
+                // when its float is first. A first float in an unbroken nowrap
+                // run instead retains that run's source anchor; extracting it
+                // to the trailing queue would place it after the entire run.
+                let extract_child = child.style.float != w3cos_std::style::Float::Right
+                    || has_prior_in_flow
+                    || component.style.white_space != w3cos_std::style::WhiteSpace::NoWrap;
                 if let Some(child) = collect(child, extract_child,
                     component.style.white_space == w3cos_std::style::WhiteSpace::NoWrap, left, right) {
                     has_prior_in_flow |= contributes_in_flow_content(&child);
@@ -10664,7 +10668,9 @@ mod image_component_tests {
         );
 
         let mut inline_style = w3cos_std::style::Style::default();
-        inline_style.display = Display::InlineFlex;
+        // Model a shared inline context, not a genuine atomic Flex context.
+        // Atomic boundaries are checked by the paired ownership regression.
+        inline_style.display = Display::Inline;
         let inline = w3cos_std::Component::boxed(
             inline_style,
             vec![text("nested"), floating_box(Float::Right)],
@@ -10795,6 +10801,47 @@ mod image_component_tests {
                     assert!(!fixed.iter().any(|child| matches!(&child.kind,
                         ComponentKind::Text { content } if content == " ")));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn initial_nowrap_right_float_retains_its_unbroken_run_anchor() {
+        let inline = w3cos_std::style::Style { display: Display::Inline,
+            white_space: w3cos_std::style::WhiteSpace::NoWrap, ..Default::default() };
+        let nested = w3cos_std::Component::boxed(inline.clone(), vec![
+            w3cos_std::Component::boxed(w3cos_std::style::Style {
+                display: Display::Inline, float: Float::Right, ..Default::default()
+            }, vec![]), w3cos_std::Component::text("overflowing run", inline),
+        ]);
+        let fixed = hoist_floats_into_block_formatting_context(
+            &w3cos_std::style::Style::default(), vec![nested]);
+        assert_eq!(fixed.len(), 1);
+        assert_eq!(fixed[0].children[0].style.float, Float::Right);
+    }
+
+    #[test]
+    fn initial_nested_right_float_belongs_to_the_outer_inline_context_only() {
+        for display in [Display::Inline, Display::InlineBlock, Display::InlineFlex, Display::InlineTable] {
+            let inline = w3cos_std::style::Style { display: Display::Inline, ..Default::default() };
+            let nested = w3cos_std::Component::boxed(w3cos_std::style::Style {
+                display, ..Default::default()
+            }, vec![
+                w3cos_std::Component::boxed(w3cos_std::style::Style {
+                    display: Display::Inline, float: Float::Right,
+                    width: Dimension::Px(50.0), height: Dimension::Px(50.0),
+                    ..Default::default()
+                }, vec![]),
+                w3cos_std::Component::text("Kitty", inline.clone()),
+            ]);
+            let fixed = hoist_floats_into_block_formatting_context(
+                &w3cos_std::style::Style::default(), vec![
+                    w3cos_std::Component::text("Hello", inline), nested,
+                ]);
+            let outer = fixed.iter().filter(|child| child.style.float == Float::Right).count();
+            assert_eq!(outer, usize::from(display == Display::Inline), "display={display:?}");
+            if display != Display::Inline {
+                assert_eq!(fixed[1].children[0].style.float, Float::Right);
             }
         }
     }
