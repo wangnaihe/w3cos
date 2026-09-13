@@ -4694,6 +4694,7 @@ fn project_simple_float_margin_boxes(
         let mut previous_in_flow = None::<(usize, &Component)>;
         let mut float_since_in_flow = false;
         let mut normal_flow_correction = 0.0_f32;
+        let mut imported_float_group = false;
         let mut skipped_positioned = false;
         let mut child_index = component_index + 1;
         let content_box = layout_position.get(&component_index).map(|position| {
@@ -4708,12 +4709,70 @@ fn project_simple_float_margin_boxes(
             LayoutRect { x: parent.x + left,
                 width: (parent.width - left - right).max(0.0), ..parent }
         });
+        let relative_shift = |style: &w3cos_std::style::Style| {
+            if style.position != WPos::Relative { return (0.0, 0.0); }
+            let containing = content_box.unwrap_or(LayoutRect {
+                x: 0.0, y: 0.0, width: 0.0, height: 0.0,
+            });
+            let horizontal = |dimension: WDim| dimension.resolve(containing.width,
+                ROOT_FONT_SIZE, style.font_size, viewport_w, viewport_h);
+            let vertical = |dimension: WDim| {
+                if matches!(dimension, WDim::Percent(_)) && matches!(component.style.height, WDim::Auto) {
+                    None
+                } else { dimension.resolve(containing.height,
+                    ROOT_FONT_SIZE, style.font_size, viewport_w, viewport_h) }
+            };
+            let x = if component.style.direction == w3cos_std::style::TextDirection::Rtl {
+                horizontal(style.right).map(|value| -value)
+                    .or_else(|| horizontal(style.left)).unwrap_or(0.0)
+            } else { horizontal(style.left)
+                .or_else(|| horizontal(style.right).map(|value| -value)).unwrap_or(0.0) };
+            let y = vertical(style.top)
+                .or_else(|| vertical(style.bottom).map(|value| -value)).unwrap_or(0.0);
+            (x, y)
+        };
+        let float_margin_box = |rect: LayoutRect, style: &w3cos_std::style::Style| {
+            let width = content_box.map_or(0.0, |rect| rect.width);
+            let spacing = |value| resolve_spacing_for_layout(value, width,
+                style.font_size, viewport_w, viewport_h);
+            let (x, y) = relative_shift(style);
+            let left = spacing(style.margin.left);
+            let right = spacing(style.margin.right);
+            let top = spacing(style.margin.top);
+            let bottom = spacing(style.margin.bottom);
+            LayoutRect { x: rect.x - left - x, y: rect.y - top - y,
+                width: rect.width + left + right, height: rect.height + top + bottom }
+        };
         for child in &component.children {
             let child_count = count_nodes(child);
             if matches!(child.style.position, WPos::Absolute | WPos::Fixed)
                 || child.style.display == WDisplay::None
             {
                 skipped_positioned |= matches!(child.style.position, WPos::Absolute | WPos::Fixed);
+                child_index += child_count;
+                continue;
+            }
+            if child.style.float == WFloat::None && child.style.custom_properties.as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-anonymous-float-group"))
+                .is_some_and(|value| value == "1")
+            {
+                let mut float_index = child_index + 1;
+                let mut group_has_floats = false;
+                for floating in &child.children {
+                    if floating.style.float != WFloat::None
+                        && floating.style.display != WDisplay::None
+                        && !matches!(floating.style.position, WPos::Absolute | WPos::Fixed)
+                        && let Some(position) = layout_position.get(&float_index).copied()
+                    {
+                        let rect = layouts[position].0;
+                        active_floats.push((floating.style.float, float_margin_box(rect, &floating.style)));
+                        previous = Some((float_index, floating));
+                        group_has_floats = true;
+                    }
+                    float_index += count_nodes(floating);
+                }
+                imported_float_group |= group_has_floats;
+                float_since_in_flow |= group_has_floats;
                 child_index += child_count;
                 continue;
             }
@@ -4764,6 +4823,11 @@ fn project_simple_float_margin_boxes(
             if child.style.float != WFloat::None
                 && let Some((previous_index, previous_child)) = previous
                 && previous_child.style.float == WFloat::None
+                && !(matches!(previous_child.style.display,
+                    WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable)
+                    && child.style.custom_properties.as_ref()
+                        .and_then(|properties| properties.get("--w3cos-internal-left-float-after-inline"))
+                        .is_some_and(|value| value == "1"))
                 && let (Some(previous_position), Some(child_position)) = (
                     layout_position.get(&previous_index).copied(),
                     layout_position.get(&child_index).copied(),
@@ -4771,9 +4835,10 @@ fn project_simple_float_margin_boxes(
             {
                 let previous_margin = previous_child.style.margin_lengths();
                 let child_margin = child.style.margin_lengths();
-                let target_y = layouts[previous_position].0.y
+                let target_y = layouts[previous_position].0.y - relative_shift(&previous_child.style).1
                     + layouts[previous_position].0.height
-                    + collapse([previous_margin.bottom, child_margin.top]);
+                    + collapse([previous_margin.bottom, child_margin.top])
+                    + relative_shift(&child.style).1;
                 let delta_y = target_y - layouts[child_position].0.y;
                 if delta_y < -f32::EPSILON {
                     shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
@@ -4999,6 +5064,49 @@ fn project_simple_float_margin_boxes(
                         child.style.margin.right, containing_width,
                         child.style.font_size, viewport_w, viewport_h,
                     );
+                    if imported_float_group && let Some(containing) = content_box {
+                        let minimum_flow_y = previous_in_flow
+                            .and_then(|(index, _)| layout_position.get(&index))
+                            .map_or(containing.y, |position| {
+                                let rect = layouts[*position].0;
+                                let (_, previous_child) = previous_in_flow.unwrap();
+                                let leading = if previous_child.style.display == WDisplay::Inline
+                                    && matches!(previous_child.kind, ComponentKind::Text { .. }) {
+                                    (previous_child.style.font_size * previous_child.style.line_height
+                                        - previous_child.style.font_size) * 0.5
+                                } else { 0.0 };
+                                rect.y + rect.height + leading
+                                    + previous_child.style.margin_lengths().bottom
+                            });
+                        let mut y = active_floats.iter().map(|(_, rect)| rect.y)
+                            .fold(minimum_flow_y, f32::max);
+                        for (side, rect) in &active_floats {
+                            if matches!((child.style.clear, *side),
+                                (WClear::Both, _) | (WClear::Left, WFloat::Left)
+                                    | (WClear::Right, WFloat::Right)) {
+                                y = y.max(rect.y + rect.height);
+                            }
+                        }
+                        let exclusions: Vec<_> = active_floats.iter().map(|(side, margin_box)|
+                            FloatExclusion { side: *side, margin_box: *margin_box }).collect();
+                        let width = layouts[position].0.width + margin_right
+                            + resolve_spacing_for_layout(child.style.margin.left, containing_width,
+                                child.style.font_size, viewport_w, viewport_h);
+                        loop {
+                            let box_height = float_margin_box(layouts[position].0, &child.style).height;
+                            let band = float_line_band(containing, y, box_height, &exclusions);
+                            if width <= band.width + 0.01 { break; }
+                            let next = active_floats.iter().map(|(_, rect)| rect.y + rect.height)
+                                .filter(|bottom| *bottom > y + 0.01).min_by(f32::total_cmp);
+                            let Some(next) = next else { break; };
+                            y = next;
+                        }
+                        let (_, relative_y) = relative_shift(&child.style);
+                        let margin_top = resolve_spacing_for_layout(child.style.margin.top, containing_width,
+                            child.style.font_size, viewport_w, viewport_h);
+                        let delta_y = y + margin_top + relative_y - layouts[position].0.y;
+                        shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
+                    }
                     let right = active_floats.iter()
                         .filter(|(side, rect)| *side == WFloat::Right
                             && rect.y < layouts[position].0.y + layouts[position].0.height
@@ -5025,13 +5133,9 @@ fn project_simple_float_margin_boxes(
                     shift_subtree_x(layouts, layout_position, child_index, child_count, delta_x);
                 }
                 let rect = layouts[position].0;
-                active_floats.push((
-                    child.style.float,
-                    LayoutRect {
-                        height: rect.height + child.style.margin_lengths().bottom,
-                        ..rect
-                    },
-                ));
+                let exclusion = if imported_float_group { float_margin_box(rect, &child.style) }
+                    else { LayoutRect { height: rect.height + child.style.margin_lengths().bottom, ..rect } };
+                active_floats.push((child.style.float, exclusion));
                 float_since_in_flow = true;
             } else {
                 previous_in_flow = Some((child_index, child));
@@ -18357,6 +18461,62 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(get(3).y, get(2).y);
+    }
+
+    #[test]
+    fn right_float_shares_anonymous_group_last_row_but_not_a_real_flex_box() {
+        for (anonymous, relative, clear) in [
+            (false, 0.0, WClear::None), (true, 0.0, WClear::None),
+            (false, 5.0, WClear::None), (true, 5.0, WClear::None),
+            (true, 0.0, WClear::Both), (true, 5.0, WClear::Both),
+        ] {
+            let mut group_style = Style { display: WDisp::Flex, flex_wrap: WWrap::Wrap,
+                width: WDim::Percent(100.0), ..Style::default() };
+            if anonymous {
+                group_style.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-anonymous-float-group".into(), "1".into());
+            }
+            let floating = |width, height, side| Component::row(Style {
+                display: WDisp::Block, float: side, width: WDim::Px(width),
+                height: WDim::Px(height), ..Style::default()
+            }, Vec::new());
+            let mut right = floating(30.0, 30.0, WFloat::Right);
+            right.style.position = WPos::Relative;
+            right.style.top = WDim::Px(relative);
+            right.style.clear = clear;
+            let root = Component::row(Style { display: WDisp::Block,
+                width: WDim::Px(100.0), ..Style::default() }, vec![
+                Component::row(group_style, vec![
+                    floating(100.0, 100.0, WFloat::Left),
+                    floating(30.0, 30.0, WFloat::Left),
+                ]), right,
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            let expected_y = if anonymous && clear == WClear::None { get(3).y }
+                else { get(1).y + get(1).height } + relative;
+            assert_eq!(get(4).y, expected_y, "anonymous={anonymous}");
+            assert_eq!(get(4).x, 70.0);
+        }
+    }
+
+    #[test]
+    fn hidden_anonymous_float_group_does_not_bypass_parent_padding() {
+        let mut group = Style { display: WDisp::Flex, width: WDim::Percent(100.0),
+            ..Style::default() };
+        group.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-anonymous-float-group".into(), "1".into());
+        let hidden = || Component::row(Style { display: WDisp::None, float: WFloat::Left,
+            width: WDim::Px(100.0), height: WDim::Px(100.0), ..Style::default() }, Vec::new());
+        let root = Component::row(Style { display: WDisp::Block, width: WDim::Px(100.0),
+            padding: w3cos_std::style::Edges { top: WSpacing::Px(10.0), ..Default::default() },
+            ..Style::default() }, vec![
+            Component::row(group, vec![hidden(), hidden()]),
+            Component::row(Style { display: WDisp::Block, float: WFloat::Right,
+                width: WDim::Px(30.0), height: WDim::Px(30.0), ..Style::default() }, Vec::new()),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout.iter().find(|(_, index)| *index == 4).unwrap().0.y, 10.0);
     }
 
     #[test]

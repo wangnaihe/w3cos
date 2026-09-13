@@ -9485,6 +9485,9 @@ fn hoist_floats_into_block_formatting_context(
                     .map_or(w3cos_std::style::Clear::None, |component| {
                         component.style.clear
                     });
+            } else {
+                row_style.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-anonymous-float-group".into(), "1".into());
             }
             grouped.push(w3cos_std::Component::row(
                 row_style,

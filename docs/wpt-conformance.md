@@ -2147,6 +2147,67 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   1358/1359/1361/1363/1374 remain PASS. This is a qualified partial repair,
   not a claim that1389 passes or that the final6548 suite is complete.
 
+### Anonymous float group continuation
+
+- Baselinee8d6b1e leaves1389 at1800px: the right float starts at y144
+  instead of reference y114. Grouping left floats creates a Flex row with
+  no identity, so the surrounding block mistakes its whole130px height
+  for normal-flow advancement.
+- New `right_float_shares_anonymous_group_last_row_but_not_a_real_flex_box`
+  is RED at the immediate baseline: anonymous=true gets y130 instead of
+  y100, while the real-Flex counterexample passes. Preserve its executable
+  at `target/wpt-targeted/w3cos-runtime-float-group-red-e8d6b1e` and baseline
+  runner at `target/wpt-targeted/w3cos-wpt-float-group-baseline-e8d6b1e`.
+- Mark generated non-BFC float groups explicitly. Their direct floats
+  contribute exclusions/source-order bounds to the surrounding block;
+  the generated row does not become the preceding normal-flow box.
+  Subsequent right floats search the remaining band at or below the last
+  preceding float top and real normal-flow end, honoring clear boundaries.
+  Real Flex boxes and clearance-created floated BFC rows are not imported.
+- Extend the focused test with5px relative offsets and clear:both. Keep
+  relative paint shifts separate from imported margin-box exclusions.
+  An earlier draft compile was explicitly stopped after these safeguards
+  superseded its source snapshot; the combined source is being verified.
+  Final qualification and full6548 zero-failure proof remain pending.
+- Type checking caught an unsupported `LayoutRect::default()` fallback;
+  replace it with explicit zero fields before qualification. Also require
+  actual visible, non-positioned float data before setting imported/pending
+  group state. A hidden-group counter checks that following floats retain
+  the parent's10px padding. These safeguards superseded one draft build;
+  owned obsolete compiler processes were deliberately stopped, not passed.
+- The combined anonymous selector is9PASS/2FAIL: hidden-group counter
+  passes, while the new real-Flex relative-offset case loses its5px shift
+  (y130 versus135) in the generic preceding-box float projection. Preserve
+  relative shifts when deriving that position. Marked floats following
+  actual inline content keep their extraction-stage line anchor instead
+  of being pulled above the established line by that generic projection.
+  The other selector failure (anonymous inline negative-margin wrapping)
+  also fails in the preserved immediate production baseline and remains open.
+- Final optimized same-feature library build completes in4m36s. The
+  anonymous-versus-real-Flex test passes all six clear/relative variants;
+  the hidden-group padding counter passes. Float selector is35PASS/1FAIL:
+  the existing inline-following float line-anchor failure now passes,
+  while leading-float/normal-flow margin expectation24 versus80 remains
+  unchanged and open. Text-layout remains28/28. The existing anonymous
+  negative-margin wrapping counter still fails10 versus20; do not infer
+  complete float or inline layout coverage. Fresh WPT pixels are pending.
+- Fresh runner build completes in2m06s, SHA256
+  `88fc943ee2251638d546bd9e35ea31aa0831947ef98cbbde18ecef8ac0117a17`.
+  DOM float selector passes11/11. Zero-allowance WPT1389 passes1800->0px
+  and1392 `floats-placement-vertical-004.xht` passes800->0px. Neighbor
+  batch1385 improves0/8 to2/8; batch1366 remains6/8. All eight remaining
+  neighbor failures retain identical pixel differences and statuses.
+  Receipts: `case-1389-anonymous-group-final-v1/results.json` and
+  `batch-<1366|1385>-anonymous-group-final-v1/results.json` below
+  `target/wpt-targeted`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 remain104/104PASS:100 exact zero-pixel matches and
+  four expected mismatches. Ordered paths, statuses and full pixel-diff
+  objects are unchanged versus immediate baseline receipts. Final receipts
+  use `batch-<start>-anonymous-group-final-v1/results.json`. This qualifies
+  a focused Skia repair, not all float sizing/margin/percentage semantics,
+  GPU/device parity, or the final same-clean-SHA6548 zero-failure gate.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
