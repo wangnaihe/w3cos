@@ -3081,6 +3081,35 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   overlapping focused executions are not the global remaining count;
   final clean-SHA full6548 acceptance remains open.
 
+### Preserve computed collapsed-row height floors
+
+- Based on `16f6f833c055d40e5a32f38d81a4086dd7e3269f`, the existing
+  `collapsed_table_adds_outer_half_border_to_specified_row_height` test
+  reproduces RED 96px versus 144px. Tree construction already computed
+  the 144px minimum; later auto-height settlement discarded that computed
+  floor because it read only the declared `min-height`.
+- Settlement now reuses `collapsed_table_specified_rows_min_height` and
+  caption-height accounting on the same component tree, preserving the
+  computed grid floor without changing declared CSS or inventing a second
+  collapsed-border formula. The regression is GREEN in 3m14s; exact-name
+  table checks improve from 58/64 to 59/64, with the other five recorded
+  failures unchanged. Isolated Chromium 141 fixtures at 800x600 confirm
+  144px outer table heights for both 96px top and bottom cell borders.
+  Chromium also reports the top-border row at y=48 versus native y=0;
+  row-position equivalence is not claimed by this height/pixel repair.
+- Optimized runner finishes in 5m11s including its unit-build lock wait;
+  SHA256
+  `776fcffe1fe40fdc9816e318605a1eb19727292fe17e8e9354db0c10004217a8`.
+  Receipts `collapsed-row-floor-v1` bind the pinned revision, frozen suite
+  and 800x600. Start 5284 becomes 8/8, with collapsing-border-model-003/009
+  improving from 2400 pixels each to exact zero. All 23 eight-case batches
+  now finish 184/184 execution PASS. Full ordered path/status/pixel-diff
+  comparison changes only those two cases; every other report is identical
+  to `bottom-caption-margin-v1`, with no old PASS lost. Overlapping focused
+  executions are not the global remaining count. The stored full report
+  still dates to 2026-08-22; final same-clean-SHA full6548 acceptance remains
+  open, as does the observed top-row coordinate difference.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

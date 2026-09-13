@@ -2572,7 +2572,7 @@ impl LayoutEngine {
         project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
-        project_auto_table_child_heights(&mut results, flat, viewport_w, viewport_h);
+        project_auto_table_child_heights(&mut results, root, flat, viewport_w, viewport_h);
         align_table_cell_baselines(&mut results, flat);
         project_table_cell_inline_vertical_padding(&mut results, flat);
         align_inline_table_first_row_baselines(&mut results, flat);
@@ -2719,7 +2719,7 @@ pub fn compute_with_scroll(
     project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
-    project_auto_table_child_heights(&mut results, &flat, viewport_w, viewport_h);
+    project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h);
     align_table_cell_baselines(&mut results, &flat);
     project_table_cell_inline_vertical_padding(&mut results, &flat);
     align_inline_table_first_row_baselines(&mut results, &flat);
@@ -3530,10 +3530,24 @@ fn project_collapsed_table_row_rects(
 
 fn project_auto_table_child_heights(
     layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
     flat: &[FlatNodeInfo<'_>],
     viewport_w: f32,
     viewport_h: f32,
 ) {
+    fn collect_collapsed_floors(component: &Component, floors: &mut Vec<f32>) {
+        let floor = if matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
+            && component.style.border_collapse && matches!(component.style.height, WDim::Auto) {
+            collapsed_table_specified_rows_min_height(component)
+                .map(|height| height + table_caption_intrinsic_height(component)).unwrap_or(0.0)
+        } else { 0.0 };
+        floors.push(floor);
+        for child in &component.children { collect_collapsed_floors(child, floors); }
+    }
+    // Reuse the same grid minimum as tree construction; post-layout float
+    // settlement must not discard the outer collapsed half-border floor.
+    let mut collapsed_floors = Vec::with_capacity(flat.len());
+    collect_collapsed_floors(root, &mut collapsed_floors);
     let positions = layouts
         .iter()
         .enumerate()
@@ -3613,7 +3627,7 @@ fn project_auto_table_child_heights(
             } else { 0.0 };
             rect.y - relative_y + rect.height + margin - container_y + bottom_edge
         }).reduce(f32::max).unwrap_or(0.0);
-        declared_floor.max(float_floor)
+        declared_floor.max(float_floor).max(collapsed_floors[index])
     };
     for (table, node) in flat.iter().enumerate().rev() {
         if !matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
@@ -17496,7 +17510,7 @@ mod tests {
             (LayoutRect { x: 0.0, y: 0.0, width: 98.0, height: 20.0 }, 1),
             (LayoutRect { x: 0.0, y: 36.0, width: 98.0, height: 100.0 }, 2),
         ];
-        project_auto_table_child_heights(&mut layout, &pre_flatten(&table), 800.0, 600.0);
+        project_auto_table_child_heights(&mut layout, &table, &pre_flatten(&table), 800.0, 600.0);
         assert_eq!(layout[0].0.height, 152.0);
     }
 
@@ -19009,11 +19023,11 @@ mod tests {
             (LayoutRect { x: 19.0, y: 15.0, width: 291.0, height: 103.0 }, 0),
             (LayoutRect { x: 22.0, y: 17.0, width: 287.0, height: 97.0 }, 1),
         ];
-        project_auto_table_child_heights(&mut layout, &flat, 800.0, 600.0);
+        project_auto_table_child_heights(&mut layout, &table, &flat, 800.0, 600.0);
         assert_eq!(layout[0].0.height, 103.0);
         let mut separated = table.clone();
         separated.style.border_collapse = false;
-        project_auto_table_child_heights(&mut layout, &pre_flatten(&separated), 800.0, 600.0);
+        project_auto_table_child_heights(&mut layout, &separated, &pre_flatten(&separated), 800.0, 600.0);
         assert_eq!(layout[0].0.height, 115.0, "separate borders retain padding and full edge");
     }
 
@@ -19025,7 +19039,7 @@ mod tests {
         }, vec![])]);
         let mut layout = vec![(LayoutRect { x: 8.0, y: 8.0, width: 300.0, height: 150.0 }, 0),
             (LayoutRect { x: 8.0, y: 8.0, width: 300.0, height: 100.0 }, 1)];
-        project_auto_table_child_heights(&mut layout, &pre_flatten(&table), 800.0, 600.0);
+        project_auto_table_child_heights(&mut layout, &table, &pre_flatten(&table), 800.0, 600.0);
         assert_eq!(layout[0].0.height, 100.0);
     }
 
@@ -19046,7 +19060,7 @@ mod tests {
             let mut layout = vec![(rect(0.0, old_table + 20.0), 0),
                 (rect(0.0, old_table), 1), (rect(0.0, 100.0), 2),
                 (rect(old_table, 20.0), 3)];
-            project_auto_table_child_heights(&mut layout, &pre_flatten(&root), 800.0, 600.0);
+            project_auto_table_child_heights(&mut layout, &root, &pre_flatten(&root), 800.0, 600.0);
             assert_eq!(layout[1].0.height, expected_table);
             assert_eq!(layout[3].0.y, expected_table);
             assert_eq!(layout[0].0.height, expected_table + 20.0);
@@ -19069,7 +19083,7 @@ mod tests {
             let rect = |y, height| LayoutRect { x: 0.0, y, width: 300.0, height };
             let mut layout = vec![(rect(0.0, 200.0), 0), (rect(relative, 200.0), 1),
                 (rect(0.0, 150.0), 2), (rect(0.0, 100.0), 3)];
-            project_auto_table_child_heights(&mut layout, &pre_flatten(&root), 800.0, 600.0);
+            project_auto_table_child_heights(&mut layout, &root, &pre_flatten(&root), 800.0, 600.0);
             assert_eq!(layout[0].0.height, 200.0);
             assert_eq!(layout[1].0.y, relative);
             assert_eq!(layout[2].0.height, 100.0);
@@ -19085,7 +19099,7 @@ mod tests {
         }, vec![])]);
         let mut layout = vec![(LayoutRect { x: 0.0, y: 0.0, width: 300.0, height: 154.0 }, 0),
             (LayoutRect { x: 2.0, y: 2.0, width: 296.0, height: 100.0 }, 1)];
-        project_auto_table_child_heights(&mut layout, &pre_flatten(&table), 800.0, 600.0);
+        project_auto_table_child_heights(&mut layout, &table, &pre_flatten(&table), 800.0, 600.0);
         assert_eq!(layout[0].0.height, 104.0);
     }
 
@@ -19126,7 +19140,7 @@ mod tests {
             ),
         ];
 
-        project_auto_table_child_heights(&mut layout, &flat, 800.0, 600.0);
+        project_auto_table_child_heights(&mut layout, &table, &flat, 800.0, 600.0);
 
         assert_eq!(layout[0].0.height, 40.0);
     }
