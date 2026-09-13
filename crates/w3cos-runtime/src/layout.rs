@@ -145,9 +145,11 @@ pub(crate) fn resolve_float_text_layouts(
         let Some(parent_rect) = rects.get(parent_index).copied().flatten() else { continue; };
         let children: Vec<_> = children_by_parent[parent_index].iter()
             .map(|index| (*index, &nodes[*index])).collect();
-        let prefix = children.iter().take_while(|(_, (_, style, _))| style.float != WFloat::None).count();
-        if prefix == 0 || children.len() != prefix + 1 { continue; }
-        let (text_index, (kind, style, _)) = children[prefix];
+        // Floats retain their source-order placement, but text exclusion is
+        // independent of whether the float precedes or follows the text leaf.
+        let mut normal = children.iter().filter(|(_, (_, style, _))| style.float == WFloat::None);
+        let Some(&(text_index, (kind, style, _))) = normal.next() else { continue; };
+        if normal.next().is_some() { continue; }
         let ComponentKind::Text { content: text } = kind else { continue; };
         if style.display != WDisplay::Inline || style.float != WFloat::None
             || matches!(style.white_space, WWhiteSpace::Pre | WWhiteSpace::NoWrap)
@@ -165,7 +167,8 @@ pub(crate) fn resolve_float_text_layouts(
         let content = LayoutRect { x: parent_rect.x + left,
             y: parent_rect.y + top + (line_height - style.font_size) * 0.5,
             width: (parent_rect.width - left - right).max(0.0), height: style.font_size };
-        let exclusions: Vec<_> = children[..prefix].iter().filter_map(|(index, (_, style, _))| {
+        let exclusions: Vec<_> = children.iter().filter(|(_, (_, style, _))| style.float != WFloat::None)
+            .filter_map(|(index, (_, style, _))| {
             let rect = rects.get(*index).copied().flatten()?;
             let ml = spacing(style.margin.left, style.font_size);
             let mr = spacing(style.margin.right, style.font_size);
@@ -5062,6 +5065,25 @@ fn project_simple_float_margin_boxes(
             if child.style.float != WFloat::None
                 && let Some(position) = layout_position.get(&child_index).copied()
             {
+                // Anonymous CSS lines use Flex internally, but CSS floats
+                // belong to physical edges, not the line's justification.
+                // Genuine flex items deliberately do not enter this path.
+                if component.style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.contains_key("--w3cos-internal-inline-formatting-context"))
+                    && let Some(containing) = content_box
+                {
+                    let current = layouts[position].0;
+                    let margin_box = float_margin_box(current, &child.style);
+                    let exclusions: Vec<_> = active_floats.iter().map(|(side, margin_box)|
+                        FloatExclusion { side: *side, margin_box: *margin_box }).collect();
+                    let band = float_line_band(containing, margin_box.y, margin_box.height, &exclusions);
+                    let margin_left = resolve_spacing_for_layout(child.style.margin.left,
+                        containing.width, child.style.font_size, viewport_w, viewport_h);
+                    let target = if child.style.float == WFloat::Left { band.x }
+                        else { band.x + band.width - margin_box.width };
+                    shift_subtree_x(layouts, layout_position, child_index, child_count,
+                        target + margin_left + relative_shift(&child.style).0 - current.x);
+                }
                 if child.style.float == WFloat::Right
                     && component.style.display == WDisplay::Block
                     && let Some(parent_position) = layout_position.get(&component_index).copied()
@@ -18616,6 +18638,36 @@ mod tests {
         assert!((get(2).y - get(0).y).abs() < 0.01, "float={:?}", get(2));
         assert!((get(3).y - get(1).y).abs() < 0.01);
         assert!((get(0).height - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn anonymous_float_edges_ignore_line_justification_but_real_flex_does_not() {
+        for anonymous in [false, true] {
+            for side in [WFloat::Left, WFloat::Right] {
+                let mut style = Style { display: WDisp::Flex, width: WDim::Px(400.0),
+                    justify_content: WJustify::FlexEnd, ..Style::default() };
+                if anonymous {
+                    style.custom_properties.get_or_insert_with(Default::default).insert(
+                        "--w3cos-internal-inline-formatting-context".into(), "1".into());
+                }
+                let root = Component::row(style, vec![
+                    Component::row(Style { display: WDisp::Block, float: side,
+                        width: WDim::Px(50.0), height: WDim::Px(50.0),
+                        ..Style::default() }, vec![]),
+                    Component::text("Hello", Style { display: WDisp::Inline,
+                        ..Style::default() }),
+                ]);
+                let mut layout = vec![
+                    (LayoutRect { x: 8.0, y: 16.0, width: 400.0, height: 50.0 }, 0),
+                    (LayoutRect { x: 290.0, y: 16.0, width: 50.0, height: 50.0 }, 1),
+                    (LayoutRect { x: 340.0, y: 17.6, width: 68.0, height: 16.0 }, 2),
+                ];
+                project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
+                let expected = if !anonymous { 290.0 }
+                    else if side == WFloat::Left { 8.0 } else { 358.0 };
+                assert_eq!(layout[1].0.x, expected, "anonymous={anonymous} side={side:?}");
+            }
+        }
     }
 
     #[test]

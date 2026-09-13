@@ -2405,6 +2405,35 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   This qualifies a partial BFC/line-metric repair, not closure of the five
   remaining pixel failures, full float semantics, or final6548 acceptance.
 
+### Anonymous-line physical float edges (focused follow-up)
+
+- Only marked CSS inline-formatting contexts project floats to their physical
+  left/right exclusion-band edges; genuine Flex justification is unchanged.
+  Single-text-leaf exclusion layout now accepts floats on either side of the
+  leaf in source order, without moving their resolved vertical placement.
+- Baseline case1386 remains RED at20000px. Raw reference RTL/right-aligned
+  floats incorrectly had x289.5625. A fresh headless Chromium800x600 geometry
+  check of the unmodified local upstream reference and001c confirms six float
+  origins `(8,16),(358,82),(8,148),(358,214),(8,280),(358,346)`.
+- Optimized library build3m13s: the new anonymous-line/real-Flex counter passes;
+  float selector41PASS/1FAIL (unchanged24-vs80 margin expectation), text-layout
+  28/28 and BFC3/3 pass. Runner build2m14s, SHA256
+  `ccc023f1c22643d90ab21089cd29dd9a67294b153835aa14ded3913f661c451b`.
+- Neighbor starts1358/1366/1385 yield8/8,8/8,3/8. Case1387 (`001b`) improves
+  10000->0px and now PASS;1386 (`001a`) improves20000->1910px but still FAIL.
+  1388 (`001c`) changes13454->13558px, still FAIL: its nested right floats
+  remain incorrectly owned by inner inline geometry (x43.546875/325.10938,
+  not browser358). Correcting the shared reference is not a closure of that
+  source-side error.1385/1390/1391 remain10000/20000/20000px;1389/1392 stay0.
+  Receipts `batch-<start>-float-physical-edges-after-v1/results.json`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 zero-pixel matches, four expected
+  mismatches), with ordered paths/statuses/full pixel-diff objects identical
+  to the preceding BFC receipts. New receipts use suffix
+  `float-physical-edges-final-v1`. No tolerance, upstream fixture or suite
+  changes. Multi-run/nested-inline ownership, full margin/relative-float
+  packing and final same-SHA6548 acceptance remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
