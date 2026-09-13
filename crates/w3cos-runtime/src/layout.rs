@@ -1012,15 +1012,39 @@ fn set_collapsed_layout_edge_width(style: &mut w3cos_std::style::Style, side: us
     }
 }
 
+#[derive(Clone, Copy)]
+struct CollapsedLayoutEdge {
+    width: f32,
+    hidden: bool,
+}
+
+impl CollapsedLayoutEdge {
+    fn max(self, other: Self) -> Self {
+        if self.hidden || other.hidden {
+            Self { width: 0.0, hidden: true }
+        } else {
+            Self { width: self.width.max(other.width), hidden: false }
+        }
+    }
+}
+
+fn collapsed_layout_edge(style: &w3cos_std::style::Style, side: usize) -> CollapsedLayoutEdge {
+    let hidden = style.border_styles[side] == Some(w3cos_std::style::BorderLineStyle::Hidden);
+    CollapsedLayoutEdge {
+        width: if hidden { 0.0 } else { collapsed_layout_edge_width(style, side) },
+        hidden,
+    }
+}
+
 /// Resolve the widths of shared collapsed grid lines before handing the tree to
 /// Taffy. The paint tree keeps the authored styles so conflict ownership and
 /// colors are still resolved there; this layout-only clone gives both cells on
 /// a boundary the winning width. Without it, a one-sided border is omitted
 /// from one cell's border box and the negative overlap shortens every track.
 fn resolve_collapsed_table_layout_borders(root: &mut Component) {
-    fn collect_columns(component: &Component, columns: &mut Vec<[f32; 4]>) {
+    fn collect_columns(component: &Component, columns: &mut Vec<[CollapsedLayoutEdge; 4]>) {
         for child in &component.children {
-            let edges = std::array::from_fn(|side| collapsed_layout_edge_width(&child.style, side));
+            let edges = std::array::from_fn(|side| collapsed_layout_edge(&child.style, side));
             match child.style.display {
                 WDisplay::TableColumn => columns.push(edges),
                 WDisplay::TableColumnGroup => {
@@ -1043,28 +1067,28 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
         }
     }
 
-    fn collect_rows(component: &Component, rows: &mut Vec<Vec<[f32; 4]>>) {
+    fn collect_rows(component: &Component, rows: &mut Vec<Vec<[CollapsedLayoutEdge; 4]>>) {
         if component.style.display == WDisplay::TableRow {
-            let mut edges: Vec<[f32; 4]> = component
+            let mut edges: Vec<[CollapsedLayoutEdge; 4]> = component
                     .children
                     .iter()
                     .filter(|child| child.style.display == WDisplay::TableCell)
                     .map(|cell| {
                         [
-                            collapsed_layout_edge_width(&cell.style, 0)
-                                .max(collapsed_layout_edge_width(&component.style, 0)),
-                            collapsed_layout_edge_width(&cell.style, 1),
-                            collapsed_layout_edge_width(&cell.style, 2)
-                                .max(collapsed_layout_edge_width(&component.style, 2)),
-                            collapsed_layout_edge_width(&cell.style, 3),
+                            collapsed_layout_edge(&cell.style, 0)
+                                .max(collapsed_layout_edge(&component.style, 0)),
+                            collapsed_layout_edge(&cell.style, 1),
+                            collapsed_layout_edge(&cell.style, 2)
+                                .max(collapsed_layout_edge(&component.style, 2)),
+                            collapsed_layout_edge(&cell.style, 3),
                         ]
                     })
                     .collect();
             if let Some(first) = edges.first_mut() {
-                first[3] = first[3].max(collapsed_layout_edge_width(&component.style, 3));
+                first[3] = first[3].max(collapsed_layout_edge(&component.style, 3));
             }
             if let Some(last) = edges.last_mut() {
-                last[1] = last[1].max(collapsed_layout_edge_width(&component.style, 1));
+                last[1] = last[1].max(collapsed_layout_edge(&component.style, 1));
             }
             rows.push(edges);
             return;
@@ -1084,20 +1108,20 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
             let group_rows = &mut rows[start..];
             if let Some(first) = group_rows.iter_mut().find(|row| !row.is_empty()) {
                 for cell in first {
-                    cell[0] = cell[0].max(collapsed_layout_edge_width(&component.style, 0));
+                    cell[0] = cell[0].max(collapsed_layout_edge(&component.style, 0));
                 }
             }
             if let Some(last) = group_rows.iter_mut().rev().find(|row| !row.is_empty()) {
                 for cell in last {
-                    cell[2] = cell[2].max(collapsed_layout_edge_width(&component.style, 2));
+                    cell[2] = cell[2].max(collapsed_layout_edge(&component.style, 2));
                 }
             }
             for row in group_rows {
                 if let Some(first) = row.first_mut() {
-                    first[3] = first[3].max(collapsed_layout_edge_width(&component.style, 3));
+                    first[3] = first[3].max(collapsed_layout_edge(&component.style, 3));
                 }
                 if let Some(last) = row.last_mut() {
-                    last[1] = last[1].max(collapsed_layout_edge_width(&component.style, 1));
+                    last[1] = last[1].max(collapsed_layout_edge(&component.style, 1));
                 }
             }
         }
@@ -1110,7 +1134,7 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
         }
     }
 
-    fn apply_rows(component: &mut Component, rows: &mut impl Iterator<Item = Vec<[f32; 4]>>) -> bool {
+    fn apply_rows(component: &mut Component, rows: &mut impl Iterator<Item = Vec<[CollapsedLayoutEdge; 4]>>) -> bool {
         if component.style.display == WDisplay::TableRow {
             if let Some(edges) = rows.next() {
                 let has_cells = !edges.is_empty();
@@ -1121,7 +1145,7 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
                     .zip(edges)
                 {
                     for (side, width) in widths.into_iter().enumerate() {
-                        set_collapsed_layout_edge_width(&mut cell.style, side, width);
+                        set_collapsed_layout_edge_width(&mut cell.style, side, width.width);
                     }
                 }
                 if has_cells {
@@ -1183,10 +1207,10 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
                 }
             }
 
-            let table_top = collapsed_layout_edge_width(&root.style, 0);
-            let table_right = collapsed_layout_edge_width(&root.style, 1);
-            let table_bottom = collapsed_layout_edge_width(&root.style, 2);
-            let table_left = collapsed_layout_edge_width(&root.style, 3);
+            let table_top = collapsed_layout_edge(&root.style, 0);
+            let table_right = collapsed_layout_edge(&root.style, 1);
+            let table_bottom = collapsed_layout_edge(&root.style, 2);
+            let table_left = collapsed_layout_edge(&root.style, 3);
             let last_row = rows.len() - 1;
             for cell in &mut rows[0] {
                 cell[0] = cell[0].max(table_top);
@@ -2622,7 +2646,10 @@ impl LayoutEngine {
                             | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
                             | WDisplay::TableColumn | WDisplay::TableColumnGroup
                     )
-                    && (0..4).any(|side| collapsed_layout_edge_width(node.style, side) > 0.0)
+                    && (0..4).any(|side| {
+                        let edge = collapsed_layout_edge(node.style, side);
+                        edge.width > 0.0 || edge.hidden
+                    })
             })
             .then(|| {
                 let mut resolved = root.clone();
@@ -17880,6 +17907,39 @@ mod tests {
         let caption = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
 
         assert_eq!((caption.x, caption.y), (table.x, table.y));
+    }
+
+    #[test]
+    fn hidden_table_parts_suppress_collapsed_cell_layout_widths() {
+        use w3cos_std::style::BorderLineStyle;
+        for display in [WDisp::TableRow, WDisp::TableRowGroup,
+            WDisp::TableColumn, WDisp::TableColumnGroup] {
+            let hidden = Style { display, border_collapse: true,
+                border_styles: [Some(BorderLineStyle::Hidden); 4], ..Style::default() };
+            let cell = Component::boxed(Style { display: WDisp::TableCell,
+                border_width: 3.0, border_collapse: true,
+                border_styles: [Some(BorderLineStyle::Solid); 4], ..Style::default() }, vec![]);
+            let row = Component::row(if display == WDisp::TableRow { hidden.clone() }
+                else { Style { display: WDisp::TableRow, border_collapse: true, ..Style::default() } }, vec![cell]);
+            let children = if display == WDisp::TableRowGroup {
+                vec![Component::boxed(hidden, vec![row])]
+            } else if matches!(display, WDisp::TableColumn | WDisp::TableColumnGroup) {
+                vec![Component::boxed(hidden, vec![]), row]
+            } else { vec![row] };
+            let mut table = Component::boxed(Style { display: WDisp::Table,
+                border_collapse: true, ..Style::default() }, children);
+            resolve_collapsed_table_layout_borders(&mut table);
+            fn check(component: &Component, display: WDisp) {
+                if component.style.display == WDisp::TableCell {
+                    for side in 0..4 {
+                        assert_eq!(collapsed_layout_edge_width(&component.style, side), 0.0,
+                            "{display:?} side {side}");
+                    }
+                }
+                for child in &component.children { check(child, display); }
+            }
+            check(&table, display);
+        }
     }
 
     #[test]

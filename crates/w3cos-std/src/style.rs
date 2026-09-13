@@ -3,6 +3,29 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
+/// Authored line style retained independently from the used border width.
+/// In collapsed tables, hidden suppresses competitors while none does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BorderLineStyle {
+    None,
+    Hidden,
+    Dotted,
+    Dashed,
+    Solid,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+}
+
+impl BorderLineStyle {
+    pub fn is_visible(self) -> bool {
+        !matches!(self, Self::None | Self::Hidden)
+    }
+}
+
 /// Resolve CSS absolute lengths to canonical CSS pixels (96 px per inch).
 /// Unitless values remain accepted for the runtime's existing native-style
 /// compatibility; CSS declaration validation decides where only zero is legal.
@@ -168,6 +191,10 @@ pub struct Style {
     pub border_bottom_left_radius: Option<f32>,
     pub border_width: f32,
     pub border_color: Color,
+    /// Physical edges in top/right/bottom/left order. None preserves older
+    /// native numeric styles without inventing an authored CSS declaration.
+    #[serde(default)]
+    pub border_styles: [Option<BorderLineStyle>; 4],
     #[serde(default)]
     pub border_top_width: Option<f32>,
     #[serde(default)]
@@ -324,6 +351,7 @@ impl Default for Style {
             border_bottom_left_radius: None,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            border_styles: [None; 4],
             border_top_width: None,
             border_right_width: None,
             border_bottom_width: None,
@@ -450,6 +478,7 @@ impl Style {
             border_bottom_left_radius,
             border_width,
             border_color,
+            border_styles,
             border_top_width,
             border_right_width,
             border_bottom_width,
@@ -558,6 +587,7 @@ impl Style {
             border_bottom_left_radius: border_bottom_left_radius_b,
             border_width: border_width_b,
             border_color: border_color_b,
+            border_styles: border_styles_b,
             border_top_width: border_top_width_b,
             border_right_width: border_right_width_b,
             border_bottom_width: border_bottom_width_b,
@@ -664,6 +694,7 @@ impl Style {
             && border_bottom_left_radius == border_bottom_left_radius_b
             && border_width == border_width_b
             && border_color == border_color_b
+            && border_styles == border_styles_b
             && border_top_width == border_top_width_b
             && border_right_width == border_right_width_b
             && border_bottom_width == border_bottom_width_b

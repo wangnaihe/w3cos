@@ -999,20 +999,23 @@ impl CSSStyleDeclaration {
             (1, "border-right-style", "borderRightStyle", "border-right"),
             (2, "border-bottom-style", "borderBottomStyle", "border-bottom"),
             (3, "border-left-style", "borderLeftStyle", "border-left")] {
-            let visibility = self.inline_declarations.iter().rev().find_map(|(name, value)| {
+            let line_style = self.inline_declarations.iter().rev().find_map(|(name, value)| {
                 let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
-                if name == physical || name == alias { parse_border_style_visibility(value) }
+                if name == physical || name == alias { parse_border_line_style(value) }
                 else if matches!(name.as_str(), "border-style" | "borderStyle") {
-                    parse_border_style_edges(value).map(|edges| edges[edge])
+                    parse_border_line_style_edges(value).map(|edges| edges[edge])
                 } else if name == "border" || name == shorthand {
                     let parts = split_css_whitespace(value);
                     if parts.iter().all(|part| parse_border_width(part).is_some()
                         || Color::from_css(part).is_some() || parse_border_style_visibility(part).is_some()) {
-                        parts.iter().find_map(|part| parse_border_style_visibility(part))
+                        parts.iter().find_map(|part| parse_border_line_style(part))
                     } else { None }
                 } else { None }
             });
-            if visibility == Some(false) {
+            if let Some(line_style) = line_style {
+                style.border_styles[edge] = Some(line_style);
+            }
+            if line_style.is_some_and(|line_style| !line_style.is_visible()) {
                 match edge {
                     0 => style.border_top_width = Some(0.0),
                     1 => style.border_right_width = Some(0.0),
@@ -1636,6 +1639,35 @@ fn split_css_whitespace(value: &str) -> Vec<String> {
         parts.push(value[from..].to_string());
     }
     parts
+}
+
+fn parse_border_line_style(value: &str) -> Option<w3cos_std::style::BorderLineStyle> {
+    use w3cos_std::style::BorderLineStyle;
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "none" => BorderLineStyle::None,
+        "hidden" => BorderLineStyle::Hidden,
+        "dotted" => BorderLineStyle::Dotted,
+        "dashed" => BorderLineStyle::Dashed,
+        "solid" => BorderLineStyle::Solid,
+        "double" => BorderLineStyle::Double,
+        "groove" => BorderLineStyle::Groove,
+        "ridge" => BorderLineStyle::Ridge,
+        "inset" => BorderLineStyle::Inset,
+        "outset" => BorderLineStyle::Outset,
+        _ => return None,
+    })
+}
+
+fn parse_border_line_style_edges(value: &str) -> Option<[w3cos_std::style::BorderLineStyle; 4]> {
+    let values = split_css_whitespace(value).into_iter()
+        .map(|value| parse_border_line_style(&value)).collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
+        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
+        _ => None,
+    }
 }
 
 fn parse_border_style_visibility(value: &str) -> Option<bool> {
@@ -2657,6 +2689,35 @@ mod tests {
         assert_eq!(declaration.inner.border_right_width, Some(2.0));
         assert_eq!(declaration.inner.border_bottom_width, Some(2.0));
         assert_eq!(declaration.inner.border_left_width, Some(0.0));
+    }
+
+    #[test]
+    fn hidden_border_style_retains_distinct_conflict_identity() {
+        for property in ["border-style", "border-top-style", "border-right-style",
+            "border-bottom-style", "border-left-style", "border", "border-top"] {
+            let mut hidden = CSSStyleDeclaration::new();
+            let mut none = CSSStyleDeclaration::new();
+            hidden.set_property(property, "hidden");
+            none.set_property(property, "none");
+            assert_ne!(hidden.to_style(), none.to_style(),
+                "{property}: hidden suppresses conflicting collapsed edges; none does not");
+        }
+    }
+
+    #[test]
+    fn border_line_style_identity_follows_the_physical_edge_cascade() {
+        use w3cos_std::style::BorderLineStyle::{Hidden, None as NoLine, Solid};
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-style", "hidden solid none");
+        declaration.set_property("border-left-style", "hidden");
+        declaration.set_property("border-left-width", "12px");
+        declaration.set_property("border-left-style", "not-a-style");
+        assert_eq!(declaration.to_style().border_styles,
+            [Some(Hidden), Some(Solid), Some(NoLine), Some(Hidden)]);
+        assert_eq!(declaration.to_style().border_left_width, Some(0.0));
+        declaration.set_property("border-left", "3px solid red");
+        assert_eq!(declaration.to_style().border_styles[3], Some(Solid));
+        assert_eq!(declaration.to_style().border_left_width, Some(3.0));
     }
 
     #[test]

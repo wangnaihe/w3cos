@@ -4013,6 +4013,141 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   acceptance. Scoped commit/push is authorized; remote main still matches
   c1b53c8 after fetch. Clean-SHA replay remains required before push.
 
+### Hidden collapsed-border conflict discovery (after 980a6e3)
+
+- Published main is `980a6e35357a7a1d4a899a08098b1c3680a7c93d`.
+  Clean-SHA replay batches 568/488/5593 retained complete result objects:
+  8/8, 6/8 and 8/8. Receipt:
+  `relative-border-width-980a6e3-clean-replay.json`; normal main push and
+  remote ref verification succeeded.
+- New strict discovery batches 576/584/592/600 each pass 8/8. Batch 608
+  is 6/8: border-color-applies-to-006 and -012 each fail by one pixel,
+  respectively (111,57) and (11,107), actual RGBA (20,138,20,255) versus
+  (0,128,0,255). These match the coordinates/colors of the recorded
+  border-applies font-ink failures; they remain FAIL, not tolerated away.
+- Batch 616 is 4/8. Indices 620/621/622/623, border-conflict-style-101
+  through -104, fail by 2448/2436/2436/2436 pixels. Upstream fixtures apply
+  `border-style: hidden` to table row/column-group/column/row-group while
+  cells declare red solid borders. The reference contains no table ink.
+- Root-cause inspection: CSSStyleDeclaration reduces both none and hidden
+  to the same false visibility and zero width; shared Style carries widths
+  and colors but no border-style identity. PaintArtifact conflict resolution
+  compares widths, so a hidden zero-width track cannot suppress a solid
+  cell edge. The native index620 dump records a 205x203 cell grid:
+  `border-conflict-620-980a6e3-layout.log` and its actual frame.
+  This is failure/root-cause evidence, not a repair or RED/GREEN unit proof.
+  Next repair must preserve hidden identity through DOM-to-layout/paint and
+  resolve suppression before width comparison, including geometry; merely
+  erasing red ink would not close the general border-conflict behavior.
+- No production source edits or new commit in the discovery step. The
+  parent repository size check passed but excludes vendor and is not a
+  W3COS size qualification. Full6548 acceptance remains unproven.
+
+### Hidden border identity retention (unpublished candidate after 980a6e3)
+
+- Exact CSSStyleDeclaration test
+  `css_style::tests::hidden_border_style_retains_distinct_conflict_identity`
+  runs one test and correctly fails: hidden and none produce equal Style
+  values. Receipt: `hidden-border-identity-real-red.log`. Seven property
+  iterations were not all reached after the first failing assertion.
+- Candidate adds serializable `BorderLineStyle` identity in physical
+  top/right/bottom/left order, independently of used widths. Optional edges
+  default to unspecified for old native numeric styles. Style paint-effect
+  equality now compares this identity. CSSStyleDeclaration retains the last
+  valid style declaration through global/side shorthands and physical styles.
+- Exact identity GREEN passes all seven property iterations. Added edge
+  cascade test covers mixed global styles, side override, later width,
+  invalid style and later shorthand reset. Real-DOM computed-style test
+  passes for table/tbody/tr/colgroup/col/td. These are computed-style proofs,
+  not DOM-to-PaintArtifact or pixel acceptance. The isolated DOM/CSS border
+  neighbors pass 26/26; `hidden-border-identity-v1-unit-neighbors.json`.
+- Layout and paint conflict collectors still compare widths and do not yet
+  consume the retained hidden identity. Explicit inherit/pseudo propagation
+  and wire compatibility coverage also remain to verify. Production runner
+  has not been rebuilt; indices 620..623 are not claimed fixed. No commit or
+  push of this partial candidate; the active full6548 goal remains open.
+
+- Subsequent exact runtime layout RED:
+  `layout::tests::hidden_table_parts_suppress_collapsed_cell_layout_widths`
+  runs one test and fails at TableRow top edge, 3px versus required 0px.
+  Receipt: `hidden-border-layout-real-red.log`; the later row-group/column/
+  column-group iterations were not reached. Candidate layout collection now
+  carries width plus hidden state, resolves hidden before maximum width and
+  retains it across column/group/row/shared/table-edge merges. Fast geometry
+  projection also triggers for zero-width hidden parts. Exact GREEN build is
+  running; no GREEN, runtime neighbor or production pixel claim yet. Paint
+  conflict consumption remains unimplemented. No commit/push.
+
+- Layout exact GREEN is now terminal PASS, reaching all four table-part
+  cases. Receipt: `hidden-border-layout-green-v1.log`. The isolated runtime
+  border/collapsed-layout/paint neighbors pass 46/46:
+  `hidden-border-layout-v1-runtime-neighbors.json`. This selection does not
+  include every layout/paint test or establish whole-module green.
+- Added exact PaintArtifact regression test
+  `paint_artifact::tests::hidden_table_parts_suppress_solid_cell_paint_edges`,
+  with real PaintNode table/part/row/cell ownership for the same four parts.
+  Its RED compilation is live; no RED outcome is claimed before terminal
+  execution. Layout source is frozen during that build. Native production
+  pixels remain unverified and this candidate remains unpublished.
+
+- Paint exact RED is now terminal and runs one failing test: TableRow
+  leaves all four cell edge widths at 3px versus expected 0px. Later part
+  iterations were not reached. Receipt: `hidden-border-paint-real-red.log`.
+  Native index621 structure also confirms an empty colgroup is an implicit
+  column, without explicit col children:
+  `border-conflict-621-980a6e3-layout.log` and actual frame.
+- Candidate PaintArtifact conflict resolution now transfers hidden identity
+  to boundary cells for row/group and explicit/implicit column/group parts,
+  propagates suppression across adjacent cell edges and protects it during
+  table boundary width comparisons. Column coverage uses nearest-table and
+  parent ownership; only hidden column edges enter this added projection.
+  Exact paint GREEN is compiling; no success or production pixel outcome is
+  claimed yet. No source mutation during that build, commit or push.
+
+- Paint exact GREEN is terminal PASS and reaches all four part iterations:
+  `hidden-border-paint-green-v1.log`. The same isolated runtime border/
+  collapsed neighbor selection again passes 46/46, with no lost prior PASS:
+  `hidden-border-paint-v1-runtime-neighbors.json`. The new paint test's name
+  does not match that neighbor selection and is proved separately by its
+  exact execution; do not count it as one of the 46.
+- Production runner rebuild is live:
+  `hidden-border-v1-production-build.log`. Source is frozen. Next required
+  evidence is strict batch616 acceptance plus ordered-result regression
+  comparison against the published binary. Four WPT fixes, production pixel
+  acceptance and full6548 closure remain unclaimed. No candidate commit/push.
+
+- Production build is terminal PASS in 2m05s. Strict target batch616 is now
+  8/8: indices620..623 improve 2448/2436/2436/2436 differing pixels to zero,
+  with maximum channel difference zero and both allowances unchanged at
+  zero. Receipt: `batch-616-hidden-border-v1/results.json`.
+- The 688-execution qualification is live, comparing the previous 640
+  complete records plus discovery batches576/584/592/600/608/616. It also
+  freezes the shared Style source blob along with DOM/CSS/layout/paint,
+  production binary and pinned suite fingerprints. Target pixel proof does
+  not establish full qualification or full6548 acceptance. Source remains
+  frozen and no candidate commit/push has occurred.
+
+- While the same 688 comparison remains live, the existing shared Style
+  test selection `style::tests::` passes 2/2 (33 filtered):
+  `hidden-border-v1-std-style-tests.log`. This is not a new wire round-trip
+  test or whole-std/module compatibility proof. Static inspection confirms
+  explicit border inherit/pseudo copy paths still need coverage for the new
+  identity; no broadened compatibility claim or source edit during the
+  frozen production qualification. `git diff --check` passes.
+
+- Qualification is terminal PASS: 688 executions, 675 PASS, 13 retained
+  FAIL. Only the four batch616 targets change FAIL to PASS; the other 684
+  complete ordered objects are unchanged, with no lost PASS. Receipt:
+  `hidden-border-v1-comparison.json`. Binary SHA256:
+  `3ac46dc750515b7dfcfca7b4053216b95f7c1cf77719f341856fc1822f4d1a8d`.
+  Shared Style blob `55eac2f796ecf55569a94ebb065c962c20db7ea7` is sealed
+  alongside DOM/CSS/layout/paint blobs in that receipt. These executions
+  overlap and do not represent 688 unique cases or full6548 closure.
+- User authorizes scoped small commits and normal main push. Fetch confirms
+  remote main still equals base980a6e3. This repair is ready for scoped commit
+  and clean-SHA replay before push; unverified inherit/pseudo/wire boundaries
+  and the 13 strict failures are not converted into completion claims.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -700,6 +700,13 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             }
         }
     }
+    fn hidden(style: &Style, side: usize) -> bool {
+        style.border_styles[side] == Some(w3cos_std::style::BorderLineStyle::Hidden)
+    }
+    fn hide_edge(style: &mut Style, side: usize) {
+        style.border_styles[side] = Some(w3cos_std::style::BorderLineStyle::Hidden);
+        set_edge(style, side, 0.0, Color::TRANSPARENT);
+    }
     fn suppress_edge(style: &mut Style, side: usize, width: f32) {
         const NAMES: [&str; 4] = ["top", "right", "bottom", "left"];
         set_edge(style, side, width, Color::TRANSPARENT);
@@ -749,15 +756,18 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         .enumerate()
         .rev()
         .filter(|(_, node)| {
-            node.style.border_collapse && matches!(
+            node.style.border_collapse && (matches!(
                 node.style.display,
                 Display::TableRow | Display::TableRowGroup
                     | Display::TableHeaderGroup | Display::TableFooterGroup
-            )
+            ) || (matches!(node.style.display, Display::TableColumn | Display::TableColumnGroup)
+                && (0..4).any(|side| hidden(&node.style, side))))
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     for part in parts {
+        let column_part = matches!(nodes[part].style.display,
+            Display::TableColumn | Display::TableColumnGroup);
         let part_rows = if nodes[part].style.display == Display::TableRow {
             vec![part]
         } else {
@@ -766,6 +776,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                     if nearest_table(nodes, *row) != nearest_table(nodes, part) {
                         return false;
                     }
+                    if column_part { return true; }
                     let mut parent = nodes[*row].parent;
                     while let Some(index) = parent {
                         if index == part {
@@ -796,10 +807,58 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                 boundary_cells[1].push(*last);
             }
         }
+        if column_part {
+            fn descendant(nodes: &[PaintNode], mut index: usize, ancestor: usize) -> bool {
+                while let Some(parent) = nodes[index].parent {
+                    if parent == ancestor { return true; }
+                    index = parent;
+                }
+                false
+            }
+            fn span(style: &Style) -> usize {
+                style.custom_properties.as_ref()
+                    .and_then(|properties| properties.get("--w3cos-internal-table-column-span"))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1).clamp(1, 1000)
+            }
+            let mut columns = Vec::new();
+            for (index, node) in nodes.iter().enumerate() {
+                if nearest_table(nodes, index) != nearest_table(nodes, part) { continue; }
+                let implicit_group = node.style.display == Display::TableColumnGroup
+                    && !nodes.iter().enumerate().any(|(child, node)| {
+                        node.style.display == Display::TableColumn && descendant(nodes, child, index)
+                    });
+                if node.style.display == Display::TableColumn || implicit_group {
+                    columns.extend(std::iter::repeat_n(index, span(&node.style)));
+                }
+            }
+            let covered = columns.iter().enumerate().filter(|(_, column)| {
+                **column == part || descendant(nodes, **column, part)
+            }).map(|(column, _)| column).collect::<Vec<_>>();
+            let Some(start) = covered.first().copied() else { continue; };
+            let end = covered.last().copied().unwrap_or(start) + 1;
+            boundary_cells = std::array::from_fn(|_| Vec::new());
+            for row in &part_rows {
+                let mut column = 0usize;
+                for cell in row_cells(nodes, *row) {
+                    let next = column + span(&nodes[cell].style);
+                    if column < end && next > start {
+                        if *row == first { boundary_cells[0].push(cell); }
+                        if *row == last { boundary_cells[2].push(cell); }
+                    }
+                    if column == start { boundary_cells[3].push(cell); }
+                    if next == end { boundary_cells[1].push(cell); }
+                    column = next;
+                }
+            }
+        }
         for side in 0..4 {
+            if column_part && !hidden(&nodes[part].style, side) { continue; }
             let part_edge = edge(&nodes[part].style, side);
             for cell in &boundary_cells[side] {
-                if part_edge.0 > edge(&nodes[*cell].style, side).0 {
+                if hidden(&nodes[part].style, side) || hidden(&nodes[*cell].style, side) {
+                    hide_edge(&mut nodes[*cell].style, side);
+                } else if part_edge.0 > edge(&nodes[*cell].style, side).0 {
                     set_edge(&mut nodes[*cell].style, side, part_edge.0, part_edge.1);
                 }
             }
@@ -818,6 +877,11 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             let right = pair[1];
             let left_edge = edge(&nodes[left].style, 1);
             let right_edge = edge(&nodes[right].style, 3);
+            if hidden(&nodes[left].style, 1) || hidden(&nodes[right].style, 3) {
+                hide_edge(&mut nodes[left].style, 1);
+                hide_edge(&mut nodes[right].style, 3);
+                continue;
+            }
             let left_collapsed = nodes[left].style.visibility == Visibility::Collapse;
             let right_collapsed = nodes[right].style.visibility == Visibility::Collapse;
             let left_wins = if left_collapsed != right_collapsed {
@@ -892,6 +956,10 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         for side in 0..4 {
             let table_edge = edge(&nodes[table].style, side);
             for cell in &boundary_cells[side] {
+                if hidden(&nodes[table].style, side) || hidden(&nodes[*cell].style, side) {
+                    hide_edge(&mut nodes[*cell].style, side);
+                    continue;
+                }
                 let cell_edge = edge(&nodes[*cell].style, side);
                 let winner = if table_edge.0 > cell_edge.0 {
                     table_edge
@@ -924,6 +992,11 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         for (top, bottom) in top_cells.into_iter().zip(bottom_cells) {
             let top_edge = edge(&nodes[top].style, 2);
             let bottom_edge = edge(&nodes[bottom].style, 0);
+            if hidden(&nodes[top].style, 2) || hidden(&nodes[bottom].style, 0) {
+                hide_edge(&mut nodes[top].style, 2);
+                hide_edge(&mut nodes[bottom].style, 0);
+                continue;
+            }
             let top_collapsed = nodes[top].style.visibility == Visibility::Collapse;
             let bottom_collapsed = nodes[bottom].style.visibility == Visibility::Collapse;
             if (top_collapsed && !bottom_collapsed) || bottom_edge.0 > top_edge.0 {
@@ -2015,6 +2088,44 @@ mod tests {
         suppress_hidden_empty_cell_paint(&mut nodes);
         assert_eq!(nodes[0].style.background, Color::TRANSPARENT);
         assert_eq!(nodes[0].style.border_width, 0.0);
+    }
+
+    #[test]
+    fn hidden_table_parts_suppress_solid_cell_paint_edges() {
+        use w3cos_std::style::BorderLineStyle;
+        let node = |display, parent| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true, ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        for display in [Display::TableRow, Display::TableRowGroup,
+            Display::TableColumn, Display::TableColumnGroup] {
+            let mut nodes = vec![node(Display::Table, None)];
+            let cell;
+            if display == Display::TableRow {
+                nodes.push(node(display, Some(0)));
+                cell = 2;
+                nodes.push(node(Display::TableCell, Some(1)));
+            } else if display == Display::TableRowGroup {
+                nodes.push(node(display, Some(0)));
+                nodes.push(node(Display::TableRow, Some(1)));
+                cell = 3;
+                nodes.push(node(Display::TableCell, Some(2)));
+            } else {
+                nodes.push(node(display, Some(0)));
+                nodes.push(node(Display::TableRow, Some(0)));
+                cell = 3;
+                nodes.push(node(Display::TableCell, Some(2)));
+            }
+            nodes[1].style.border_styles = [Some(BorderLineStyle::Hidden); 4];
+            nodes[cell].style.border_styles = [Some(BorderLineStyle::Solid); 4];
+            nodes[cell].style.border_width = 3.0;
+            nodes[cell].style.border_color = Color::rgb(255, 0, 0);
+            resolve_collapsed_cell_border_conflicts(&mut nodes);
+            let style = &nodes[cell].style;
+            assert_eq!([style.border_top_width, style.border_right_width,
+                style.border_bottom_width, style.border_left_width], [Some(0.0); 4], "{display:?}");
+        }
     }
 
     #[test]

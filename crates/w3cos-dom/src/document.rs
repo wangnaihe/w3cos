@@ -13854,6 +13854,23 @@ mod computed_style_cache_tests {
     }
 
     #[test]
+    fn hidden_border_identity_survives_table_part_computed_style() {
+        use w3cos_std::style::BorderLineStyle;
+        for tag in ["table", "tbody", "tr", "colgroup", "col", "td"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#target", &[("border-style", "hidden")]);
+            let mut document = Document::new();
+            let target = document.create_element(tag);
+            target.set_attribute(&mut document, "id", "target");
+            document.body().append_child(&mut document, target);
+            let style = document.computed_style_for(target.id);
+            assert_eq!(style.border_styles, [Some(BorderLineStyle::Hidden); 4], "{tag}");
+            assert_eq!(style.border_top_width, Some(0.0), "{tag}");
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn invalid_relative_border_width_preserves_the_valid_computed_width() {
         for prior in [None, Some("1em")] {
             for invalid in ["-1em", "-1rem", "-1ex"] {
