@@ -9364,7 +9364,11 @@ fn inline_absolute_static_rect(
                 (
                     width,
                     height,
-                    content.chars().any(|character| !character.is_whitespace()),
+                    // Unicode spaces such as NBSP survive CSS whitespace
+                    // collapsing and make this a non-empty preceding line.
+                    content.chars().any(|character| {
+                        !matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
+                    }),
                 )
             }
             _ => (layout.size.width, layout.size.height, true),
@@ -11975,6 +11979,42 @@ mod tests {
             &end, containing_block, fallback, 800.0, 600.0, end.direction, false,
         );
         assert_eq!((rect.x, rect.y), (152.0, 123.0));
+    }
+
+    #[test]
+    fn absolute_block_after_nbsp_uses_the_next_line_static_position() {
+        let root = Component::row(Style {
+            display: WDisp::Flex,
+            width: WDim::Px(400.0),
+            font_size: 16.0,
+            line_height: 1.25,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into(),
+            )])),
+            ..Style::default()
+        }, vec![
+            Component::text("\u{a0}", Style {
+                display: WDisp::Inline, font_size: 16.0, line_height: 1.25,
+                ..Style::default()
+            }),
+            Component::boxed(Style {
+                display: WDisp::Block, position: WPos::Absolute,
+                width: WDim::Px(200.0), height: WDim::Px(200.0),
+                ..Style::default()
+            }, vec![]),
+            Component::boxed(Style {
+                display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(200.0), height: WDim::Px(200.0),
+                margin: w3cos_std::style::Edges {
+                    top: WSpacing::Px(20.0), ..w3cos_std::style::Edges::ZERO
+                }, ..Style::default()
+            }, vec![]),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        // Chromium places both boxes 20px below the preceding NBSP line.
+        assert_eq!(rect(2).y - rect(0).y, 20.0);
+        assert_eq!(rect(3).y - rect(0).y, 20.0);
     }
 
     #[test]

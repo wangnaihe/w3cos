@@ -3179,6 +3179,42 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   evidence, not a current global remaining count. Full6548 acceptance is
   still open.
 
+### Preserve non-collapsing Unicode spaces in abspos static positions
+
+- Based on published `f005de5d3ad18ffea7cf921cf4f4797a21872d2c`, fresh
+  eight-case starts 0,8,16,24 finish 26/32 PASS and six FAIL. Receipts:
+  `batch-<start>-nbsp-before`. These are current focused results, not the
+  old 2026-08-22 global failure count.
+- `between-float-and-text.html` has a NBSP line followed by an auto-inset
+  absolutely positioned block and a float with 20px top margin. Chromium
+  places both blocks 20px below that line's start; native puts the abspos
+  at the line start (8000 different pixels). The new exact-name
+  `absolute_block_after_nbsp_uses_the_next_line_static_position` reproduces
+  RED y=0 versus 20 in 3m22s, without changing WPT expectations.
+- Static-position accounting previously used Unicode `is_whitespace` to
+  classify a line as empty. NBSP and other Unicode spaces survive CSS
+  whitespace collapsing. It now tests the CSS collapsible character set
+  (space, tab, LF, CR, form feed), retaining non-collapsing line content.
+- Exact-name positioning/forced-break baseline is 30/34. Besides the new
+  RED, three existing tests fail: forced-break inline static position,
+  decorated inline fragment block static position and standalone forced
+  break strut. Receipt `nbsp-static-unit-before.json`. GREEN and pixel
+  qualification of this candidate remain pending; no full-runtime or
+  full6548 acceptance is claimed. The parent size check excludes vendor.
+- The new regression is GREEN in 3m06s. The same exact-name 34 checks now
+  pass 31/34; ordered status comparison changes only the new NBSP test,
+  with the three other failures unchanged and no old PASS lost. Receipt:
+  `nbsp-static-unit-after.json`. Optimized-runner pixel qualification is
+  still pending at this stage.
+- Optimized runner builds in 5m13s including its unit-build lock wait,
+  SHA256 `0865d761c8ffe28226046c007cd91550d5b58aec9f982529c1be7b87f82e419a`.
+  Pinned starts 0,8,16,24 now finish 27/32 PASS and five FAIL. Ordered full
+  test-object comparison changes only `between-float-and-text.html`, from
+  8000 pixels to exact zero; the other 31 reports are identical, with no
+  old PASS lost. Receipt `nbsp-static-v1-comparison.json`. This qualifies
+  the NBSP repair, not the five remaining focused failures or full6548.
+  Static `git diff --check` passes. All source changes remain within W3COS.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
