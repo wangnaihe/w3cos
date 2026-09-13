@@ -5049,7 +5049,24 @@ impl Document {
                         if anonymous_inline_formatting_context
                             && style.white_space != w3cos_std::style::WhiteSpace::NoWrap
                         {
-                            style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
+                            // A sole atomic inline cannot create another line.
+                            // Keep its flex line on the automatic block's strut;
+                            // wrapped flex lines otherwise ignore the minimum
+                            // line height when resolving top/bottom alignment.
+                            let sole_atomic_line = authored_block
+                                && children.len() == 1
+                                && matches!(children[0].style.display,
+                                    w3cos_std::style::Display::InlineBlock
+                                        | w3cos_std::style::Display::InlineFlex
+                                        | w3cos_std::style::Display::InlineTable)
+                                && matches!(style.height, w3cos_std::style::Dimension::Auto)
+                                && matches!(style.min_height, w3cos_std::style::Dimension::Auto)
+                                && matches!(style.max_height, w3cos_std::style::Dimension::Auto);
+                            style.flex_wrap = if sole_atomic_line {
+                                w3cos_std::style::FlexWrap::NoWrap
+                            } else {
+                                w3cos_std::style::FlexWrap::Wrap
+                            };
                             style.align_content = w3cos_std::style::AlignContent::FlexStart;
                         }
                         if authored_block

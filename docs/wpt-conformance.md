@@ -3487,6 +3487,58 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   included in the 224 successful repair/regression executions and are not
   declared fixed. Final 6548 same-clean-SHA conformance remains pending.
 
+### Sole atomic inline line-strut alignment (follow-up to ccbebd1)
+
+- Clean-source discovery at `ccbebd1` examines 15 eight-case batches,
+  starts 168 through 280, under the same pinned 6548 manifest and 800x600
+  viewport: **115 PASS / 5 FAIL / 120 executions**. Four failures retain
+  the known one-pixel font-overhang result signatures; the fifth is
+  `background-position-applies-to-001.xht` (index 284), **450 pixels**.
+  These remain raw FAIL results, not relaxed or counted as passes.
+- For index 284, both blue regions contain 225 pixels. The test background
+  occupies `(92,154)-(106,168)`; the reference image occupies
+  `(92,73)-(106,87)`. Layout dumps confirm the table row-group background
+  is correctly bottom-right, while the reference's 15px image with
+  `vertical-align:bottom` is incorrectly top-aligned inside a 96px line.
+  The reference is also rendered by W3COS; no WPT fixture is modified.
+- New real-DOM unit
+  `jsdom::tests::sole_inline_image_bottom_aligns_inside_the_block_line_strut`
+  first fails with **3px versus 84px**. Its 102px container and 15px
+  image height assertions pass before the failing alignment assertion.
+  RED build: 2m31s. DOM-lowering correction passes this exact unit;
+  intermediate build: 2m47s.
+- The isolated pre-correction image/strut neighbors receipt contains
+  **15/17 PASS**: the new DOM test and the existing direct-component
+  `layout::tests::block_inline_image_uses_line_height_strut_and_vertical_align`
+  both fail with the same 3px/84px signature. The same wrapped-flex
+  line-strut problem therefore has both DOM and direct-component entry
+  points, rather than being a table background-positioning error.
+- Both entry points retain a single flex line for a sole atomic inline
+  in an automatic-height block with automatic min/max height. This line
+  can use the font strut for cross-axis alignment; real multi-child lines
+  and explicit height/min/max constraints retain the wrapping path.
+  The direct-component exact unit passes after the second entry-point
+  correction (2m36s build). The final isolated neighbors receipt passes
+  **17/17**, with no previous PASS lost.
+- Production build succeeds in **2m24s**, binary SHA-256
+  `ff5c83eaaf5426debd2164d32712174b2f3989067f3278b36a9ec26d8cca7077`.
+  Target batch 280 passes **8/8**; index 284 is now **0 differing pixels**
+  and **0 maximum difference**, with both allowed thresholds still zero.
+- All 28 prior successful eight-case regression batches, all 15 discovery
+  batches, and the separate open batch at 144 are replayed:
+  **346 PASS / 6 FAIL / 352 executions**. Ordered full-object comparison
+  changes only index 284 from FAIL to PASS; the other 351 executed
+  objects are unchanged, with no prior PASS lost. See
+  `sole-atomic-strut-v1-comparison.json` and the two
+  `sole-image-strut-neighbors-{before,after}.json` receipts.
+- The four newly discovered font-overhang aliases are verified at the
+  same coordinates/colors as the two original open cases: 006 variants
+  differ at `(103,55)` RGB20 versus RGB0; 012 variants differ at `(7,103)`
+  RGB245 versus RGB255. All six remain strict FAIL, with no font swap,
+  glyph clipping, fixture edit, or tolerance change. These are not a
+  fresh total remaining count for the 6548 suite. Same-clean-SHA final
+  full-suite conformance remains unproven.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

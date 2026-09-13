@@ -23239,6 +23239,30 @@ try {
     }
 
     #[test]
+    fn sole_inline_image_bottom_aligns_inside_the_block_line_strut() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let outer = create_in_body("div");
+        let style = outer.get_property("style");
+        style.set_property("width", Value::string("96px"));
+        style.set_property("lineHeight", Value::string("96px"));
+        style.set_property("border", Value::string("3px solid black"));
+        let image = document_value().call_method("createElement", vec![Value::string("img")]);
+        let image_style = image.get_property("style");
+        image_style.set_property("width", Value::string("15px"));
+        image_style.set_property("height", Value::string("15px"));
+        image_style.set_property("paddingLeft", Value::string("81px"));
+        image_style.set_property("verticalAlign", Value::string("bottom"));
+        outer.call_method("appendChild", vec![image.clone()]);
+        let outer_rect = outer.call_method("getBoundingClientRect", vec![]);
+        let image_rect = image.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(outer_rect.get_property("height").to_number(), 102.0);
+        assert_eq!(image_rect.get_property("height").to_number(), 15.0);
+        assert_eq!(image_rect.get_property("top").to_number()
+            - outer_rect.get_property("top").to_number(), 84.0);
+    }
+
+    #[test]
     fn block_in_inline_static_position_ignores_adjacent_collapsible_whitespace() {
         setup();
         set_viewport(320.0, 240.0);

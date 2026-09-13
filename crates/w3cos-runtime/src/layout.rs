@@ -7493,7 +7493,19 @@ fn build_taffy_tree(
         // the row cross axis.
         style.display = taffy::Display::Flex;
         style.flex_direction = FlexDirection::Row;
-        style.flex_wrap = FlexWrap::Wrap;
+        // A sole atomic inline has exactly one line. On an automatic block,
+        // use that line's strut as the cross size instead of leaving the
+        // wrapped flex line shorter than the block's minimum line height.
+        let mut line_children = normal_flow_children.clone();
+        let sole_atomic_line = line_children.next().is_some_and(|child| {
+            matches!(child.style.display,
+                WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable)
+        }) && line_children.next().is_none()
+            && comp.style.display == WDisplay::Block
+            && matches!(comp.style.height, WDim::Auto)
+            && matches!(comp.style.min_height, WDim::Auto)
+            && matches!(comp.style.max_height, WDim::Auto);
+        style.flex_wrap = if sole_atomic_line { FlexWrap::NoWrap } else { FlexWrap::Wrap };
         style.align_items = Some(AlignItems::FlexStart);
         style.align_content = Some(AlignContent::FlexStart);
         style.justify_content = Some(match (comp.style.text_align, comp.style.direction) {
