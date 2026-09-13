@@ -1995,6 +1995,49 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   failure remains in these observed ranges. This is scoped Skia qualification,
   not full float conformance, CPU/GPU acceptance or final6548 zero-failure proof.
 
+### Root float shrink-to-fit and block end alignment
+
+- Immediate baseline `c548231` reproduces `float-root.html` (index1371)
+  at179 differing pixels, max255, with zero allowances. Its root float was
+  still800px wide; the reference body's21.328125px right float remained at
+  the left edge. Resolve an auto-width floated root through the same
+  shrink-to-fit sizing as other floats, place its margin box against the
+  viewport end, and align right floats in a block's content box using
+  overlapping right-float edges. Descendants move with their float.
+- Fresh optimized library build passes the previously RED
+  `right_float_aligns_to_the_containing_block_end` (x0 becomes x50) and the
+  new `floated_root_shrink_wraps_and_aligns_its_margin_box` (50px root,
+  asymmetric8/12px margins, x738 in an800px viewport).
+- First candidate runner SHA256
+  `336c375ce0ce9fd3c1add6b804b07bee8fb4b93ae6aafa8e2a744be93facab8c`
+  passes1371 at exact zero pixels. Receipts:
+  `target/wpt-targeted/case-1371-root-float-before-v2/results.json` and
+  `target/wpt-targeted/case-1371-root-float-after-v2/results.json`.
+- Text-layout tests pass28/28. The broader float filter is28PASS/2FAIL;
+  paint-artifact tests are32PASS/2FAIL. All four failed tests also fail in
+  the preserved older1178-test executable, but it has different build
+  flags and is not a same-SHA immediate baseline qualification. Keep these
+  failures open. Index1389 remains2640px, unchanged from the verified WPT
+  baseline. This is a focused root-float repair, not full float conformance
+  or final6548 zero-failure proof.
+- First candidate related regression passes104/104:100 exact zero-pixel
+  matches and four expected mismatches, under `batch-<start>-root-float-v2`
+  at starts5769/5761/5753/5745/5737/5729/5721/5689/5681/5665/5545/5553/5593.
+  Extra controls1358/1359/1361/1363/1371/1372/1374/1389 improve5/8 to6/8;
+  the remaining105/2640px differences are unchanged. Before publication,
+  preserve relative offsets, resolve float percentage margins against
+  parent content width, and exclude positioned roots from float sizing.
+  A relative right float with10px parent padding,10% margin and5px left
+  offset receives a separate focused test; final-build verification follows.
+- Final optimized build passes right-float filter4/4, root shrink-fit1/1
+  and text-layout28/28. Final runner SHA256
+  `13eecdbd8bcd19b8389b8491ab33ce7974cd7f16ee160f88cf116c480e4c7d5d`
+  repeats1371 at exact zero, related104/104 (100 zero-pixel matches and four
+  expected mismatches), and extra6/8 with identical105/2640px open failures.
+  Final receipts use `batch-<start>-root-float-final-v3/results.json` and
+  `case-<index>-root-float-final-v3/results.json` below
+  `target/wpt-targeted`. No fixture, suite, viewport or allowance was changed.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

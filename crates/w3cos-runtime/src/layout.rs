@@ -4925,6 +4925,47 @@ fn project_simple_float_margin_boxes(
             if child.style.float != WFloat::None
                 && let Some(position) = layout_position.get(&child_index).copied()
             {
+                if child.style.float == WFloat::Right
+                    && component.style.display == WDisplay::Block
+                    && let Some(parent_position) = layout_position.get(&component_index).copied()
+                {
+                    let parent = layouts[parent_position].0;
+                    let containing_width = component_content_width(
+                        &component.style, parent.width, viewport_w, viewport_h,
+                    );
+                    let padding_right = resolve_spacing_for_layout(
+                        component.style.padding.right, parent.width,
+                        component.style.font_size, viewport_w, viewport_h,
+                    );
+                    let margin_right = resolve_spacing_for_layout(
+                        child.style.margin.right, containing_width,
+                        child.style.font_size, viewport_w, viewport_h,
+                    );
+                    let right = active_floats.iter()
+                        .filter(|(side, rect)| *side == WFloat::Right
+                            && rect.y < layouts[position].0.y + layouts[position].0.height
+                            && rect.y + rect.height > layouts[position].0.y)
+                        .map(|(_, rect)| rect.x)
+                        .fold(parent.x + parent.width - padding_right
+                            - component.style.border_right_width.unwrap_or(component.style.border_width), f32::min);
+                    let relative_x = if child.style.position == WPos::Relative {
+                        let resolve = |dimension: WDim| dimension.resolve(
+                            containing_width, ROOT_FONT_SIZE, child.style.font_size,
+                            viewport_w, viewport_h,
+                        );
+                        if component.style.direction == w3cos_std::style::TextDirection::Rtl {
+                            resolve(child.style.right).map(|value| -value)
+                                .or_else(|| resolve(child.style.left)).unwrap_or(0.0)
+                        } else {
+                            resolve(child.style.left)
+                                .or_else(|| resolve(child.style.right).map(|value| -value))
+                                .unwrap_or(0.0)
+                        }
+                    } else { 0.0 };
+                    let delta_x = right - margin_right - layouts[position].0.width + relative_x
+                        - layouts[position].0.x;
+                    shift_subtree_x(layouts, layout_position, child_index, child_count, delta_x);
+                }
                 let rect = layouts[position].0;
                 active_floats.push((
                     child.style.float,
@@ -5727,6 +5768,12 @@ fn root_auto_margin_offset(
     let Some(style) = style else {
         return 0.0;
     };
+    if style.float == WFloat::Right
+        && !matches!(style.position, WPos::Absolute | WPos::Fixed)
+    {
+        let margins = root_used_margins(Some(style), viewport_w, viewport_h);
+        return viewport_w - root_width - margins.right - margins.left;
+    }
     let WSpacing::Auto = style.margin.left else {
         return 0.0;
     };
@@ -7649,6 +7696,8 @@ fn build_taffy_tree(
             || matches!(comp.style.right, WDim::Auto));
         if matches!(comp.style.width, WDim::Auto)
             && (absolute_auto_shrink_to_fit
+                || (parent_display.is_none() && comp.style.float != WFloat::None
+                    && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed))
                 || ((comp.style.float != WFloat::None
                     || matches!(
                         comp.style.display,
@@ -17885,6 +17934,45 @@ mod tests {
 
         assert_eq!(float_rect.width, 50.0);
         assert_eq!(float_rect.x, root_rect.x + 50.0);
+    }
+
+    #[test]
+    fn floated_root_shrink_wraps_and_aligns_its_margin_box() {
+        let child = Component::boxed(Style {
+            display: WDisp::Block, width: WDim::Px(50.0), height: WDim::Px(20.0),
+            ..Style::default()
+        }, Vec::new());
+        let root = Component::boxed(Style {
+            display: WDisp::Block, float: WFloat::Right,
+            margin: w3cos_std::style::Edges {
+                left: WSpacing::Px(8.0), right: WSpacing::Px(12.0),
+                ..Default::default()
+            },
+            ..Style::default()
+        }, vec![child]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        assert_eq!(rect.width, 50.0);
+        assert_eq!(rect.x, 738.0);
+    }
+
+    #[test]
+    fn right_float_preserves_relative_offset_and_percentage_margin() {
+        let root = Component::boxed(Style {
+            display: WDisp::Block, width: WDim::Px(100.0),
+            padding: w3cos_std::style::Edges::xy(10.0, 0.0),
+            ..Style::default()
+        }, vec![Component::boxed(Style {
+            display: WDisp::Block, float: WFloat::Right,
+            position: WPos::Relative, left: WDim::Px(5.0),
+            width: WDim::Px(50.0), height: WDim::Px(20.0),
+            margin: w3cos_std::style::Edges {
+                right: WSpacing::Percent(10.0), ..Default::default()
+            }, ..Style::default()
+        }, Vec::new())]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(rect.x, 55.0);
     }
 
     #[test]
