@@ -3422,6 +3422,71 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   receipt. This next repair batch is still open. Full 6548 conformance,
   whole-module gates and browser application acceptance remain unproven.
 
+### Background references, serif overhang and block/inline text baselines
+
+- Start from published `b6bc6f5` and its recorded v4 runner. The two one-pixel
+  failures at 144 remain open. Isolated Chromium 141.0.7390.37 at 800x600,
+  device scale 1, also fails literal fixture-versus-reference comparison:
+  `background-applies-to-006.xht` differs at (103,53), RGB 5 versus 0;
+  `background-applies-to-012.xht` at (7,101), RGB 252 versus 255. Browser
+  default family is Times. These are comparisons within Chromium, not
+  Chromium/native pixel parity; the native coordinates and values differ.
+- Temporary Skia font diagnostics (2m34s unit build) show Times `b` ink
+  bounds with left -1 and Times New Roman with left -2. Both paint a tiny
+  negative-side-bearing edge; Georgia does as well. The native generic
+  serif fallback resolves to Times New Roman. No font swap, blanket glyph
+  clipping, fuzzy threshold or reference change is introduced to hide the
+  two failures. The temporary diagnostic was removed.
+- Next clean-source runner discovery at 152 passes 8/8. At 160 it stops at
+  6/8, with `background-bg-pos-204.xht` differing by 3071 pixels and
+  `background-bg-pos-208.xht` by 3579. Both are still open. Actual and
+  expected fuchsia diamond extents match: (790,590)-(799,599) for 204 and
+  (790,41)-(799,50) for 208, with 60 fuchsia pixels each. Root box geometry
+  is also recorded in `root-background-162-before-layout.log` and
+  `root-background-163-before-layout.log`, alongside their reference logs.
+- The large differences lie in paragraph text, not background positioning.
+  The reference contains an out-of-flow image and therefore lowers its
+  text into an inline fragment. Current single-line block painting applies
+  a string-dependent ink-bottom-overflow correction, while inline painting
+  retains the shared font baseline. A new block-versus-inline descender
+  raster regression has been added; its RED build is pending. No production
+  correction or publication has been made for this batch.
+
+- The first direct baseline unit used default white foreground on a white
+  surface and misleadingly passed; it is not valid regression evidence.
+  The fixture now explicitly uses black text and asserts visible pixels in
+  both renderings. Its corrected exact RED reproduces **3071 differing
+  pixels**, matching the real WPT 204 difference (2m31s build).
+  Real text ink bounds are one pixel higher in actual than reference:
+  204 actual (32,34)-(525,47), reference (32,35)-(525,48);
+  208 actual (0,34)-(582,47), reference (0,35)-(582,48).
+- Candidate removes the string-dependent single-line ink-bottom correction
+  rather than changing background positioning, clipping text or adjusting
+  references. Its exact GREEN build is pending. Seven focused baseline
+  units pass 6/7 before the correction, with only the new descender unit
+  failing. Wider isolated renderer-module before/after receipts are retained
+  separately; no publication or WPT closure is claimed yet.
+
+- Final candidate exact descender unit passes with **0 differing pixels**
+  (2m31s build). Isolated renderer module improves **39/41 to 40/41**,
+  with no previous PASS lost. Only the previously failing
+  `default_ascii_text_is_pixel_invariant_across_inline_fragments` remains.
+  Before/after receipts are `block-inline-render-module-before.json` and
+  `block-inline-render-module-after.json`; no whole-runtime green is claimed.
+- Production build: **1m57s**; runner SHA256
+  `3813553c4b54cb75de6b8d1992874f85c653310abcfda79e78d1392aa140ca50`.
+  Fixed batch 160 passes 8/8, with indices 162 and 163 improving respectively
+  **3071 to 0** and **3579 to 0** differing pixels. All prior 27 related
+  eight-case batches also pass, giving **224/224 executions** including 160.
+  Ordered full-object comparison against the published empty-line v4
+  receipts (and the clean-source discovery receipt at 160) changes only
+  these two cases; the other 222 executed objects are unchanged and no prior
+  PASS is lost. See `block-inline-descender-v1-comparison.json`.
+- The separate open batch at 144 remains **6/8**, with all eight result
+  objects identical to its v4 receipt. The two one-pixel failures are not
+  included in the 224 successful repair/regression executions and are not
+  declared fixed. Final 6548 same-clean-SHA conformance remains pending.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

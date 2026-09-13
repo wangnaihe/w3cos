@@ -1416,7 +1416,6 @@ fn draw_text_in_rect(
             style.font_weight,
             Some(style),
         );
-        let line_height = style.font_size * style.line_height;
         let advance = measure_skia_text_advance(&layout.lines[0], typeface, style);
         let alignment_ink_left = alignment_ink_left(
             &layout.lines[0],
@@ -1431,22 +1430,12 @@ fn draw_text_in_rect(
             alignment_ink_left,
             advance,
         );
-        // The monospace path paints on a fixed em baseline. Fallback ink
-        // bounds must not move that baseline according to the string's glyphs.
-        // Ordinary inline fragments likewise share the font baseline: short
-        // line-height permits ink overflow, not per-string upward relocation.
-        let ink_bottom_overflow = if line_height <= 0.0
-            || style.display == Display::Inline
-            || style_uses_generic_monospace(style)
-        {
-            0.0
-        } else {
-            (ink.top + ink.height - line_height).max(0.0)
-        };
+        // CSS text shares its font baseline in both block and inline leaves.
+        // Short line-height permits ink overflow; the current string's ink
+        // bounds must not relocate its baseline upward.
         let top = content.y
-            + text_vertical_offset(style, content.height, line_height)
-            + line_box_half_leading(style)
-            - ink_bottom_overflow;
+            + text_vertical_offset(style, content.height, style.font_size * style.line_height)
+            + line_box_half_leading(style);
         draw_text_line(
             canvas,
             x,
@@ -2967,6 +2956,35 @@ mod tests {
         };
         let serif = generic_serif_typeface(&style).expect("system serif typeface");
         assert_ne!(serif.family_name(), "Inter");
+    }
+
+    #[test]
+    fn block_and_inline_text_share_the_same_baseline_with_descenders() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style { display: Display::Block,
+            color: w3cos_std::color::Color::BLACK,
+            font_family: Some("serif".into()), ..Style::default() };
+        let kind = ComponentKind::Text { content:
+            "There should be a single fuchsia diamond at the bottom right of the viewport.".into() };
+        let raster = |display, y, height| {
+            let mut surface = Surface::new_raster_n32_premul((800, 80)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            render_node(surface.canvas(), 0,
+                LayoutRect { x: 32.0, y, width: 736.0, height }, &kind,
+                &Style { display, ..style.clone() }, &typeface,
+                crate::layout::layout_font(), None, false, false);
+            let info = ImageInfo::new((800, 80), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 800 * 80 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 800 * 4, (0, 0)));
+            pixels
+        };
+        let block = raster(Display::Block, 32.0, 19.2);
+        let inline = raster(Display::Inline, 33.6, 16.0);
+        assert!(block.chunks_exact(4).any(|pixel| pixel[..3] != [255, 255, 255]));
+        assert!(inline.chunks_exact(4).any(|pixel| pixel[..3] != [255, 255, 255]));
+        let different_pixels = block.chunks_exact(4).zip(inline.chunks_exact(4))
+            .filter(|(left, right)| left != right).count();
+        assert_eq!(different_pixels, 0, "block and inline must share their font baseline");
     }
 
     #[test]
