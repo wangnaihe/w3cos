@@ -707,7 +707,37 @@ fn render_node(
         }
     }
 
-    if style.border_width > 0.0 && style.border_color.a > 0 {
+    if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
+        let widths = [style.border_top_width.unwrap_or(style.border_width),
+            style.border_right_width.unwrap_or(style.border_width),
+            style.border_bottom_width.unwrap_or(style.border_width),
+            style.border_left_width.unwrap_or(style.border_width)];
+        let colors = [style.border_top_color.unwrap_or(style.border_color),
+            style.border_right_color.unwrap_or(style.border_color),
+            style.border_bottom_color.unwrap_or(style.border_color),
+            style.border_left_color.unwrap_or(style.border_color)];
+        let bounds = Rect::new(rect.x as f64, rect.y as f64,
+            (rect.x + rect.width) as f64, (rect.y + rect.height) as f64);
+        scene.push_layer(Fill::NonZero, vello::peniko::Mix::Normal,
+            if needs_compositor_layer { 1.0 } else { opacity }, dpi, &bounds);
+        for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors) {
+            let mut path = BezPath::new();
+            for points in layer.polygons {
+                    path.move_to((points[0].0 as f64, points[0].1 as f64));
+                    for point in &points[1..] { path.line_to((point.0 as f64, point.1 as f64)); }
+                    path.close_path();
+            }
+            let mut color = node_color(layer.color, 1.0, color_chain);
+            if layer.shadow {
+                color.a = 255;
+                scene.push_layer(Fill::NonZero, vello::peniko::BlendMode::new(
+                    vello::peniko::Mix::Normal, vello::peniko::Compose::SrcAtop), 1.0, dpi, &bounds);
+            }
+            scene.fill(Fill::NonZero, dpi, color_to_vello(color), None, &path);
+            if layer.shadow { scene.pop_layer(); }
+        }
+        scene.pop_layer();
+    } else if style.border_width > 0.0 && style.border_color.a > 0 {
         let border = node_color(style.border_color, opacity, color_chain);
         draw_border(
             scene,

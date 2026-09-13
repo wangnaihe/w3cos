@@ -113,6 +113,7 @@ pub mod observers_web;
 pub mod orientation_web;
 mod overscroll;
 pub mod paint_artifact;
+mod border_paint;
 mod table_paint;
 mod bidi_paint;
 pub mod payment_web;

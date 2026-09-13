@@ -821,6 +821,7 @@ fn render_node(
         || style.border_left_color.is_some()
         || (style.border_collapse
             && matches!(style.display, Display::TableColumn | Display::TableColumnGroup | Display::TableCell));
+    let has_edge_border = has_edge_border || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
     if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         let mut border = color_paint(style.border_color, style.opacity);
         border.set_style(paint::Style::Stroke);
@@ -853,9 +854,28 @@ fn render_node(
             style.border_left_color.unwrap_or(style.border_color),
         ];
         let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
-        for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
-            if width > 0.0 && color.a > 0 {
-                draw_round_rect(canvas, edge, 0.0, &color_paint(color, style.opacity));
+        if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
+            let layer_paint = color_paint(w3cos_std::Color::rgb(255, 255, 255), style.opacity);
+            canvas.save_layer(&SaveLayerRec::default().paint(&layer_paint));
+            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors) {
+                let mut builder = PathBuilder::new();
+                for points in layer.polygons {
+                    builder.move_to(points[0]);
+                    for point in &points[1..] { builder.line_to(*point); }
+                    builder.close();
+                }
+                let mut color = layer.color;
+                if layer.shadow { color.a = 255; }
+                let mut paint = color_paint(color, 1.0);
+                if layer.shadow { paint.set_blend_mode(skia_safe::BlendMode::SrcATop); }
+                canvas.draw_path(&builder.detach(), &paint);
+            }
+            canvas.restore();
+        } else {
+            for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
+                if width > 0.0 && color.a > 0 {
+                    draw_round_rect(canvas, edge, 0.0, &color_paint(color, style.opacity));
+                }
             }
         }
     }
@@ -2538,6 +2558,44 @@ mod tests {
         assert_eq!(content.y, 60.0);
         assert_eq!(content.width, 168.0);
         assert_eq!(content.height, 44.0);
+    }
+
+    #[test]
+    fn groove_and_ridge_default_borders_paint_opposite_half_bands() {
+        use w3cos_std::style::BorderLineStyle;
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        for (line_style, outer, inner) in [
+            (BorderLineStyle::Groove, 154, 238),
+            (BorderLineStyle::Ridge, 238, 154),
+        ] {
+            let style = Style {
+                border_width: 10.0,
+                border_color: w3cos_std::color::Color::BLACK,
+                border_top_width: Some(10.0),
+                border_right_width: Some(10.0),
+                border_bottom_width: Some(10.0),
+                border_left_width: Some(10.0),
+                border_styles: [Some(line_style); 4],
+                border_current_color: Some([true; 4]),
+                ..Style::default()
+            };
+            let mut surface = Surface::new_raster_n32_premul((120, 120)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            render_node(surface.canvas(), 0,
+                LayoutRect { x: 0.0, y: 0.0, width: 120.0, height: 120.0 },
+                &ComponentKind::Column, &style, &typeface,
+                crate::layout::layout_font(), None, false, false);
+            let info = ImageInfo::new((120, 120), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 120 * 120 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 120 * 4, (0, 0)));
+            let pixel = |x: usize, y: usize| &pixels[(y * 120 + x) * 4..(y * 120 + x) * 4 + 4];
+            assert_eq!(pixel(60, 2), &[outer, outer, outer, 255], "{line_style:?} outer top band");
+            assert_eq!(pixel(60, 7), &[inner, inner, inner, 255], "{line_style:?} inner top band");
+            assert_eq!(pixel(60, 112), &[outer, outer, outer, 255], "{line_style:?} inner bottom band");
+            assert_eq!(pixel(60, 117), &[inner, inner, inner, 255], "{line_style:?} outer bottom band");
+            assert_eq!(pixel(117, 2), &[196, 196, 196, 255], "{line_style:?} outer miter coverage");
+            assert_eq!(pixel(112, 7), &[196, 196, 196, 255], "{line_style:?} inner miter coverage");
+        }
     }
 
     #[test]

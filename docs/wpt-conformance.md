@@ -4874,6 +4874,65 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   clean-SHA72 replay976/968/840/600/824/624/488/608/5593 and actual push
   pending. Groove/ridge remain unrepaired; full6548 closure unproven.
 
+### Three-dimensional border shading and miter coverage (in progress)
+
+- Published predecessor: `fd349a23d831e5ed272dc2067aa85c5879187d6e`;
+  its 72-execution clean-SHA replay matched qualification before normal push.
+- Frozen suite/revision/viewport remain 6548 /
+  `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0` / 800×600.
+- 982/983 (`groove-default.html`, `ridge-default.html`) are **Mismatch**
+  reftests against the solid-border notref. Their WPT success alone does not
+  demonstrate browser parity: candidate v1 passed 976–983 (8/8, no lost PASS),
+  but each original Chromium 141.0.7390.37 screenshot still differed at 4400
+  pixels, including 400 corner pixels. Preserve `three-dimensional-border-v1-pixel-comparison.json`
+  and `3d-border-browser-three-dimensional-border-v1.json` as failed parity evidence.
+- Real raster RED: the default outer band was black instead of RGB 154;
+  `groove-ridge-real-red.log`. The initial half-band test then passed, but
+  the new miter assertion exposed RGB 221 instead of 196;
+  `groove-ridge-corners-real-red.log`.
+- DOM provenance RED: `10px groove` incorrectly carried four concrete-color
+  flags; `absolute-border-current-color-real-red-exact.log`. The classifier
+  now accepts physical/keyword widths as well as relative widths. Its
+  directed test and all 36 DOM neighbors passed; see
+  `absolute-border-current-color-green-v1.log` and
+  `three-dimensional-border-provenance-v1-unit-neighbors.json`.
+- Candidate v2 still had miter RGB 192 instead of 196; retain
+  `groove-ridge-corners-green-v2.log` as failed evidence. A fast standalone
+  Skia probe distinguished nonconvex path coverage from convex-band coverage.
+  Candidate v3 groups the light ring, overlaps shared same-color corners and
+  overlays separate convex shadow bands; Skia/CPU/GPU consume these same
+  layers. Color/keyword handling follows the pinned browser's primary source:
+  [BorderSideColor](https://github.com/chromium/chromium/blob/141.0.7390.37/third_party/blink/renderer/core/css/properties/computed_style_utils.cc),
+  [border shading](https://github.com/chromium/chromium/blob/141.0.7390.37/third_party/blink/renderer/core/paint/box_border_painter.cc),
+  [sRGB quantization](https://github.com/chromium/chromium/blob/141.0.7390.37/third_party/blink/renderer/platform/graphics/color.cc).
+- Real corner GREEN and shading quantization tests now pass;
+  `groove-ridge-corners-green-v3.log` and `three-dimensional-border-v3-shading-unit.log`.
+  The 136 directed runtime neighbors retain 135 PASS and the same known
+  leading-float margin failure, with no lost PASS; 49 paint neighbors pass.
+  CPU/GPU/Skia combined type-check passes (7.91 s), not pixel acceptance;
+  `three-dimensional-border-v3-alternate-backends-check.log`.
+- Extra isolated Chromium alpha/opacity probes remain nonconformant;
+  `3d-alpha-chromium-oracle.json` and `probe-shared-border.log` retain exact
+  point values. They are supplemental fixtures, not added to the frozen suite.
+- Production build v3 completes in 2m01s. Focus 976–983 is 8/8 PASS; only
+  982/983 change from FAIL to PASS and the other six complete objects remain
+  identical. Each Mismatch now differs from the solid notref at 4400 pixels,
+  max 238, as expected. Against the separately frozen original Chromium
+  screenshots, **both complete 800×600 images have zero differing pixels,
+  zero max difference and zero corner residual**, with no tolerance;
+  `three-dimensional-border-v3-pixel-comparison.json` and
+  `3d-border-browser-three-dimensional-border-v3.json`.
+- Expanded candidate qualification completes at **1048 executions / 1034 PASS /
+  14 existing FAIL**. Only 982/983 change FAIL→PASS; the other 1046 ordered
+  complete result objects are identical, with no lost PASS. The receipt
+  `three-dimensional-border-v3-comparison.json` freezes the five existing
+  DOM/layout/paint/Style blobs plus all five newly affected renderer/module
+  blobs, the production binary and the suite. Its binary matches the
+  separately sealed zero-difference browser comparison.
+- Clean-SHA replay of 72 executions and normal publication remain pending.
+  Rounded/unequal-width 3D borders are not accepted by the two default-color
+  fixtures. No full-suite zero-failure claim is made.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

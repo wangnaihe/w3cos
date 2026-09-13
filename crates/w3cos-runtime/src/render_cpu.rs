@@ -827,6 +827,7 @@ fn render_node(
         || style.border_bottom_color.is_some()
         || style.border_left_color.is_some()
         || (style.border_collapse && style.display == w3cos_std::style::Display::TableCell);
+    let has_edge_border = has_edge_border || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
     if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         draw_border(
             pixmap,
@@ -850,15 +851,40 @@ fn render_node(
             style.border_left_color.unwrap_or(style.border_color),
         ];
         let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
-        for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
-            if width > 0.0 && color.a > 0 {
-                draw_rect(
-                    pixmap,
-                    edge,
-                    node_color(color, opacity, color_chain),
-                    0.0,
-                    clip_mask,
-                );
+        if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
+            let origin = (rect.x.floor(), rect.y.floor());
+            let layer_width = (rect.x + rect.width).ceil() - origin.0;
+            let layer_height = (rect.y + rect.height).ceil() - origin.1;
+            let mut border_layer = Pixmap::new(layer_width.max(1.0) as u32, layer_height.max(1.0) as u32);
+            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors) {
+                let mut builder = PathBuilder::new();
+                for points in layer.polygons {
+                    builder.move_to(points[0].0 - origin.0, points[0].1 - origin.1);
+                    for point in &points[1..] { builder.line_to(point.0 - origin.0, point.1 - origin.1); }
+                    builder.close();
+                }
+                if let Some(path) = builder.finish() {
+                    let mut color = node_color(layer.color, 1.0, color_chain);
+                    if layer.shadow { color.a = 255; }
+                    let mut paint = Paint::default();
+                    paint.set_color(SkColor::from_rgba8(color.r, color.g, color.b, color.a));
+                    paint.anti_alias = true;
+                    if layer.shadow { paint.blend_mode = tiny_skia::BlendMode::SourceAtop; }
+                    if let Some(border_layer) = border_layer.as_mut() {
+                        border_layer.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    }
+                }
+            }
+            if let Some(border_layer) = border_layer {
+                let paint = tiny_skia::PixmapPaint { opacity, ..Default::default() };
+                pixmap.draw_pixmap(origin.0 as i32, origin.1 as i32, border_layer.as_ref(),
+                    &paint, Transform::identity(), clip_mask);
+            }
+        } else {
+            for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
+                if width > 0.0 && color.a > 0 {
+                    draw_rect(pixmap, edge, node_color(color, opacity, color_chain), 0.0, clip_mask);
+                }
             }
         }
     }

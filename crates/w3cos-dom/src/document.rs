@@ -2075,7 +2075,8 @@ impl Document {
                 } else if css_property_eq(property, "border")
                     || css_property_eq(property, properties[2]) {
                     crate::css_style::border_shorthand_color(value, style.color,
-                        |token| relative_border_width_px(token, &style)).is_some()
+                        |token| relative_border_width_px(token, &style)
+                            .or_else(|| crate::css_style::parse_border_width(token))).is_some()
                         && !split_css_tokens(value).iter()
                             .any(|token| w3cos_std::Color::from_css(token).is_some())
                 } else {
@@ -14412,6 +14413,22 @@ mod computed_style_cache_tests {
             for color in [style.border_right_color, style.border_bottom_color, style.border_left_color] {
                 assert_eq!(color, Some(w3cos_std::Color::rgb(0, 0, 255)));
             }
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn absolute_border_shorthand_preserves_current_color_provenance() {
+        for (value, keyword) in [("10px groove", true), ("10px ridge currentColor", true),
+            ("10px groove black", false), ("medium inset", true)] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#target", &[("border", value)]);
+            let mut document = Document::new();
+            let target = document.create_element("div");
+            target.set_attribute(&mut document, "id", "target");
+            document.body().append_child(&mut document, target);
+            let style = document.computed_style_for(target.id);
+            assert_eq!(style.border_current_color, Some([keyword; 4]), "{value}");
         }
         crate::stylesheet::clear_rules();
     }
