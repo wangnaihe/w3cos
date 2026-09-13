@@ -1119,6 +1119,24 @@ impl Document {
         }
         // Presentational hints are author-origin declarations before author
         // stylesheets, not UA defaults that normal user rules can override.
+        if node.node_type == NodeType::Element
+            && node.is_html_element && node.tag.as_str().eq_ignore_ascii_case("table")
+            && let Some(dimension) = node.attributes.iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("width"))
+                .and_then(|(_, value)| parse_html_dimension_attribute(value))
+        {
+            // HTML table width maps to a dimension hint, ignoring zero.
+            // Keep it inside the cascade so authored auto/percent/important
+            // values win, and computed style and component layout agree.
+            let value = match dimension {
+                w3cos_std::style::Dimension::Px(value) if value > 0.0 => Some(format!("{value}px")),
+                w3cos_std::style::Dimension::Percent(value) if value > 0.0 => Some(format!("{value}%")),
+                _ => None,
+            };
+            if let Some(value) = value {
+                user_normal.push(("width".to_string(), value, 0));
+            }
+        }
         user_normal.extend(author_declarations);
         user_normal.extend(user_important);
         let author_declarations = user_normal;
@@ -9472,7 +9490,10 @@ fn hoist_floats_into_block_formatting_context(
             row_style.display = w3cos_std::style::Display::Flex;
             row_style.flex_direction = w3cos_std::style::FlexDirection::Row;
             row_style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
-            row_style.align_items = w3cos_std::style::AlignItems::Baseline;
+            // Floats align their margin tops, not descendant baselines.
+            // This synthetic row is an implementation detail, not a CSS
+            // flex container allowed to vertically displace shorter floats.
+            row_style.align_items = w3cos_std::style::AlignItems::FlexStart;
             row_style.width = w3cos_std::style::Dimension::Percent(100.0);
             row_style.font_size = formatting_context_style.font_size;
             row_style.font_family = formatting_context_style.font_family.clone();
@@ -12129,6 +12150,56 @@ mod image_component_tests {
             tree.children[0].children[0].children[0].style.padding,
             w3cos_std::style::Edges::all(7.0)
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn grouped_float_boxes_align_their_top_edges_not_descendant_baselines() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        for (width, height) in [(100, 100), (200, 50)] {
+            let floating = document.create_element("div");
+            let style = document.get_style_mut(floating.id);
+            style.set_property("float", "left");
+            style.set_property("width", &format!("{width}px"));
+            style.set_property("height", &format!("{height}px"));
+            let child = document.create_element("div");
+            document.get_style_mut(child.id).set_property("width", "150px");
+            document.get_style_mut(child.id).set_property("height", "50px");
+            floating.append_child(&mut document, child);
+            host.append_child(&mut document, floating);
+        }
+        document.body().append_child(&mut document, host);
+        let tree = document.to_component_tree();
+        fn find_group(node: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if node.style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-anonymous-float-group")) {
+                Some(node)
+            } else { node.children.iter().find_map(find_group) }
+        }
+        let group = find_group(&tree).expect("consecutive floats form an anonymous float group");
+        assert_eq!(group.children.len(), 2);
+        assert_eq!(group.style.align_items, w3cos_std::style::AlignItems::FlexStart);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn table_width_attribute_is_a_cascaded_presentational_hint() {
+        use w3cos_std::style::Dimension;
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let table = document.create_element("table");
+        document.body().append_child(&mut document, table);
+        for (value, expected) in [("300", Dimension::Px(300.0)),
+            ("50%", Dimension::Percent(50.0)), ("0", Dimension::Auto),
+            ("-1", Dimension::Auto)] {
+            table.set_attribute(&mut document, "width", value);
+            assert_eq!(document.computed_style_for(table.id).width, expected);
+        }
+        table.set_attribute(&mut document, "width", "300");
+        crate::stylesheet::register_rule("table", &[("width", "auto")]);
+        assert_eq!(document.computed_style_for(table.id).width, Dimension::Auto);
         crate::stylesheet::clear_rules();
     }
 

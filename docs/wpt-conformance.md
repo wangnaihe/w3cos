@@ -2610,6 +2610,48 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   erase it. Percentage-spacing/general geometry and final same-clean-SHA
   6548 acceptance are not proven by this focused batch.
 
+### In-progress automatic BFC and table settlement qualification
+
+- Base main `dbb06cb`; fixed WPT revision and 800x600 manifest are unchanged.
+  HTML table width attributes enter the presentational-hint cascade before
+  authored declarations. Consecutive synthetic left-float groups align their
+  margin-box tops rather than descendant baselines.
+- Auto-width overflow BFCs reflow their complete subtree into the available
+  float band, preserving viewport units and the original containing-block
+  basis for root percentage padding and width bounds. Settled auto-table
+  heights propagate signed changes through ordinary flow ancestors/siblings;
+  independent owned floats and minimum heights remain containment floors.
+- Initial settlement omitted the separated table's outer bottom spacing:
+  `float-table-align-left-quirk.html` regressed by338 strict pixels. Restoring
+  that spacing returns it to exact0. The opt-level1 runtime unit build passes
+  auto-table9/9, BFC8/8 and text-layout28/28; this is not the production runner
+  optimization profile or a full runtime gate.
+- Fresh default optimized runner takes2m42s, SHA256
+  `8a43b64ccf7a659d1757ac56ef96ac03daad5a6e457400ef4e8558b820d47244`.
+  Receipts `batch-1366-auto-bfc-spacing-v2` and
+  `batch-1393-auto-bfc-spacing-v2` pass8/8 each.
+  `batch-1400-auto-bfc-spacing-v2` passes1/8: case1400 becomes exact0;
+  cases1401–1407 retain22500/20000/7500/35200/35200/18300/18300 pixels.
+  The auto table wrapper still stretches beyond its intrinsic grid, and
+  mixed-side/wrapping float cases need separate repairs. Neighbor starts1358/
+  1385 pass16/16; the13 related eight-case starts listed in the preceding
+  batch pass104/104 (100 zero-pixel matches, four expected mismatches).
+- A focused real-flex-item negative test is RED: float-band reflow wrongly
+  changes a300px flex item to200px. The new reflow now excludes genuine
+  flex/inline-flex/grid parents while retaining anonymous inline/float
+  formatting contexts. GREEN float-band qualification passes3/3 in2m57s;
+  auto-table9/9, BFC8/8 and text-layout28/28 pass again. Float tests52/53
+  retain the previously recorded leading-margin failure. Fresh production
+  runner SHA256`b97dac5715f00907643bf4aff15a4ecddc9ea4dde49eb8e583e3117aaba6d9a2`
+  finishes in4m43s including the unit-build lock wait. Eighteen eight-case
+  receipts use`auto-bfc-track-guard-v3`:137/144 pass, and ordered paths,
+  statuses and complete pixel-diff objects are identical to spacing-v2.
+  The seven remaining failures are the explicitly listed1401–1407 cases.
+  Opt-level1 RED compilation
+  takes4m10s; do not claim it is a demonstrated build-speed improvement.
+- This is focused candidate evidence, not final same-clean-SHA6548
+  acceptance. Do not infer a current global remaining-failure count from it.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
