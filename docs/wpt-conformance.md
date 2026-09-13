@@ -2898,6 +2898,30 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
  52944. No additional complete WPT case is claimed repaired by this step;
   final same-clean-SHA6548 zero-failure acceptance is still open.
 
+### Cross-group float static-top qualification
+
+- Base`55825f1`; an anonymous float wrapper no longer uses preceding
+  out-of-flow float height as its static starting position. Its initial
+  top is bounded by previous normal content and float source-order tops;
+  shared-BFC collision/clearance still decides individual float positions.
+  A direct simple/shared projection regression is RED(0,20) versus(0,0)
+  for the first grouped left float in2m28s, then GREEN2m45s; the later
+ 150px float correctly moves to(0,6) beside the external right float.
+  Table78/84 and float60/61 retain the same six/one known failures;
+  BFC11/11 and text-layout28/28 pass.
+- Default optimized runner4m42s includes the unit-build lock wait,
+  SHA256`f99fedf583fff131174e6cccf5ed98bfd7f57893c615867d076eebf19c32fd2e`.
+  Receipts`cross-group-static-top-v1` retain the frozen revision/suite and
+ 800x600 viewport. Case1412 becomes exact0 from20100 pixels, improving
+  start1408 from5/8 to6/8. Start1400 remains8/8 exact0;1413 retains exact0
+  and start1416 remains2/8. Twenty eight-case batches finish152/160 PASS,
+ 8 FAIL with no previous PASS lost. Only start1408's full ordered
+  path/status/pixel-diff report changes; the17 related/neighbor batches
+  remain136/136 PASS. Execution counts overlap and are not global counts.
+- Caption1414 remains52944 pixels,1415 remains17650, and the six selected
+  margin failures remain open. No clean-SHA full6548 zero-failure claim
+  follows from this focused cross-group repair.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

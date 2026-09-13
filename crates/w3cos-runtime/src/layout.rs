@@ -4918,6 +4918,26 @@ fn project_simple_float_margin_boxes(
                 .and_then(|properties| properties.get("--w3cos-internal-anonymous-float-group"))
                 .is_some_and(|value| value == "1")
             {
+                if let Some(containing) = content_box
+                    && let Some(position) = layout_position.get(&child_index).copied()
+                {
+                    // This wrapper is not normal-flow content after the
+                    // preceding float. Its floats share the parent's static
+                    // top, subject to prior content and float source order.
+                    let flow_floor = previous_in_flow.and_then(|(index, previous_child)|
+                        layout_position.get(&index).map(|position| {
+                            let rect = layouts[*position].0;
+                            rect.y - relative_shift(&previous_child.style).1 + rect.height
+                                + resolve_spacing_for_layout(previous_child.style.margin.bottom,
+                                    containing.width, previous_child.style.font_size, viewport_w, viewport_h)
+                        })).unwrap_or(containing.y);
+                    let target_y = active_floats.iter().map(|(_, rect)| rect.y)
+                        .fold(flow_floor, f32::max);
+                    let delta_y = target_y - layouts[position].0.y;
+                    if delta_y < -f32::EPSILON {
+                        shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
+                    }
+                }
                 let mut float_index = child_index + 1;
                 let mut group_has_floats = false;
                 for floating in &child.children {
@@ -15124,6 +15144,32 @@ mod tests {
             assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
             assert_eq!(get(2).y, get(1).y, "parent={display:?}");
         }
+    }
+
+    #[test]
+    fn anonymous_float_group_after_right_float_keeps_the_shared_static_top() {
+        let mut group_style = Style { display: WDisp::Flex, width: WDim::Percent(100.0),
+            flex_wrap: WWrap::Wrap, ..Style::default() };
+        group_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-anonymous-float-group".into(), "1".into());
+        let floating = |side, width, height| Component::boxed(Style {
+            display: WDisp::Block, float: side, width: WDim::Px(width),
+            height: WDim::Px(height), flex_shrink: 0.0, ..Style::default() }, vec![]);
+        let root = Component::boxed(Style { display: WDisp::Block,
+            width: WDim::Px(300.0), height: WDim::Px(20.0), ..Style::default() }, vec![
+            floating(WFloat::Right, 100.0, 20.0), Component::row(group_style,
+                vec![floating(WFloat::Left, 100.0, 6.0), floating(WFloat::Left, 150.0, 10.0)])]);
+        let mut layout = vec![
+            (LayoutRect { x: 0.0, y: 0.0, width: 300.0, height: 20.0 }, 0),
+            (LayoutRect { x: 200.0, y: 0.0, width: 100.0, height: 20.0 }, 1),
+            (LayoutRect { x: 0.0, y: 20.0, width: 300.0, height: 10.0 }, 2),
+            (LayoutRect { x: 0.0, y: 20.0, width: 100.0, height: 6.0 }, 3),
+            (LayoutRect { x: 100.0, y: 20.0, width: 150.0, height: 10.0 }, 4),
+        ];
+        project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
+        project_shared_bfc_float_collisions(&mut layout, &pre_flatten(&root), 800.0, 600.0);
+        assert_eq!((layout[3].0.x, layout[3].0.y), (0.0, 0.0));
+        assert_eq!((layout[4].0.x, layout[4].0.y), (0.0, 6.0));
     }
 
     #[test]
