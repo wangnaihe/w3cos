@@ -1094,6 +1094,10 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
 }
 
 fn table_track_widths(component: &Component) -> Vec<f32> {
+    table_intrinsic_track_widths(component, false)
+}
+
+fn table_intrinsic_track_widths(component: &Component, minimum: bool) -> Vec<f32> {
     fn collect_columns(component: &Component, tracks: &mut Vec<f32>) {
         for child in &component.children {
             match child.style.display {
@@ -1119,7 +1123,7 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
         }
     }
 
-    fn collect_rows(component: &Component, tracks: &mut Vec<f32>, collapsed: bool) {
+    fn collect_rows(component: &Component, tracks: &mut Vec<f32>, collapsed: bool, minimum: bool) {
         if component.style.display == WDisplay::TableRow {
             let mut column = 0;
             for cell in component
@@ -1129,7 +1133,8 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
             {
                 let span = table_cell_column_span(&cell.style);
                 tracks.resize(tracks.len().max(column + span), 0.0);
-                let mut width = component_max_content_width(cell);
+                let mut width = if minimum { component_min_content_width(cell) }
+                    else { component_max_content_width(cell) };
                 if collapsed {
                     width -=
                         (table_cell_edge_width(cell, 1) + table_cell_edge_width(cell, 3)) / 2.0;
@@ -1151,7 +1156,7 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
                     | WDisplay::TableFooterGroup
                     | WDisplay::TableColumnGroup
             ) {
-                collect_rows(child, tracks, collapsed);
+                collect_rows(child, tracks, collapsed, minimum);
             }
         }
     }
@@ -1172,7 +1177,7 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
 
     let mut tracks = Vec::new();
     collect_columns(component, &mut tracks);
-    collect_rows(component, &mut tracks, component.style.border_collapse);
+    collect_rows(component, &mut tracks, component.style.border_collapse, minimum);
     let mut collapsed_columns = Vec::new();
     collect_collapsed_columns(component, &mut collapsed_columns);
     for (column, collapsed) in collapsed_columns.into_iter().enumerate() {
@@ -1496,6 +1501,25 @@ fn auto_table_track_widths(component: &Component, percentage_basis: Option<f32>)
         for track in &mut tracks {
             if !track.is_sign_negative() {
                 *track += extra;
+            }
+        }
+    } else if grid_width < intrinsic_width && visible_tracks > 0 {
+        let minimums = table_intrinsic_track_widths(component, true);
+        let capacities = tracks.iter().enumerate().map(|(index, width)| {
+            if width.is_sign_negative() { 0.0 } else {
+                (width - minimums.get(index).copied().unwrap_or(*width).max(0.0)).max(0.0)
+            }
+        }).collect::<Vec<_>>();
+        let capacity = capacities.iter().sum::<f32>();
+        if capacity > 0.0 {
+            // Contract only flexible content, never rigid columns or the
+            // minimum intrinsic widths. An undersized declared width may
+            // therefore retain a larger grid instead of overflowing cells.
+            let deficit = (intrinsic_width - grid_width).min(capacity);
+            for (width, available) in tracks.iter_mut().zip(capacities) {
+                if available > 0.0 {
+                    *width -= deficit * (available / capacity);
+                }
             }
         }
     }
@@ -10768,6 +10792,35 @@ mod tests {
         let layout = compute(&table, 800.0, 600.0).unwrap();
         let table_rect = layout.iter().find(|(_, item)| *item == 0).unwrap().0;
         assert_eq!(table_rect.width, 100.0);
+    }
+
+    #[test]
+    fn auto_table_tracks_contract_only_down_to_cell_min_content() {
+        let wrapping_cell = || {
+            let mut style = Style { display: WDisp::Flex, flex_wrap: WWrap::Wrap,
+                ..Style::default() };
+            style.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into());
+            let span = || Component::boxed(Style { display: WDisp::InlineBlock,
+                width: WDim::Px(150.0), height: WDim::Px(50.0),
+                ..Style::default() }, vec![]);
+            Component::boxed(Style { display: WDisp::TableCell, ..Style::default() },
+                vec![Component::row(style, vec![span(), Component::text(" ",
+                    Style { display: WDisp::Inline, ..Style::default() }), span()])])
+        };
+        let rigid_cell = |width| Component::boxed(Style { display: WDisp::TableCell,
+            ..Style::default() }, vec![Component::boxed(Style {
+            display: WDisp::InlineBlock, width: WDim::Px(width),
+            ..Style::default() }, vec![])]);
+        let table = |width, cells| Component::boxed(Style { display: WDisp::Table,
+            width: WDim::Px(width), ..Style::default() }, vec![Component::row(Style {
+            display: WDisp::TableRow, ..Style::default() }, cells)]);
+        assert_eq!(auto_table_track_widths(&table(300.0, vec![wrapping_cell()]), None), vec![300.0]);
+        assert_eq!(auto_table_track_widths(&table(300.0, vec![rigid_cell(350.0)]), None), vec![350.0]);
+        assert_eq!(auto_table_track_widths(&table(300.0,
+            vec![wrapping_cell(), rigid_cell(80.0)]), None), vec![220.0, 80.0]);
+        assert_eq!(auto_table_track_widths(&table(200.0,
+            vec![wrapping_cell(), rigid_cell(80.0)]), None), vec![150.0, 80.0]);
     }
 
     #[test]

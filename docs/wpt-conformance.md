@@ -2735,6 +2735,35 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   reports remain identical to`mixed-float-top-band-v1`. Final same-clean-SHA
  6548 acceptance is not established by this focused repair.
 
+### Constrained automatic table-track contraction qualification
+
+- Base`f73ad53`; maximum and minimum cell tracks share the existing
+  column/row/span/collapsed-column collection path. When the declared grid
+  is smaller than maximum content, contraction is distributed in proportion
+  to each column's available max-minus-min space. Rigid columns do not
+  contract, and insufficient declared width retains the minimum total.
+  Existing growth/already-fitting paths do not perform the additional min
+  collection. This is not clipping, a fixture change or a fuzzy allowance.
+- New unit is RED305.33594 versus300 in2m49s, then GREEN in2m41s. It
+  covers one flexible column, rigid350 content, flexible/rigid columns
+  producing220+80 at width300, and their150+80 minimum at declared200.
+  Table units76/82 retain the same six recorded failures; BFC9/9 and
+  text-layout28/28 pass; float55/56 retains the known leading-margin failure.
+- Default optimized runner4m50s includes unit-build lock waiting;
+  SHA256`6f4ab2c3c225d51146c460ce84bc276ff6cf1184de6314337eb71b0e0191a5f5`.
+  Receipts use`auto-track-contraction-v1`. Start1400 improves4/8 to6/8:
+  cases1404/1406 become exact0 from400/800;1400–1403 remain exact0.
+  Cases1405/1407 still fail35200 pixels each and require auto-width nested
+  table band sizing and corresponding track reflow.
+- Saved previous runner`w3cos-wpt-before-track-contraction-f73ad53` has
+  SHA256`359b593e45de9f6ca308c2777b3ac4cb072bf73f9480ae5cfd99888e64d8759e`.
+  All20 batches pass147/160 (13 FAIL), preserving every previous PASS.
+  Eighteen full ordered path/status/pixel-diff reports remain identical to
+  `anonymous-bfc-reflow-v1`. Besides1400, start1408 changes only failed
+  caption-combination case1414 from45745 to52944 pixels; its full cause
+  remains unqualified and it is not declared repaired. Final same-clean-SHA
+ 6548 acceptance is not established by this focused contraction repair.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
