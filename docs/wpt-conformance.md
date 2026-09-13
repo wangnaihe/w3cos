@@ -3539,6 +3539,42 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   fresh total remaining count for the 6548 suite. Same-clean-SHA final
   full-suite conformance remains unproven.
 
+### Post-3aa670e discovery: font aliases and bidi fragment whitespace
+
+- Published clean source `3aa670e`, unchanged production binary
+  `ff5c83eaaf5426debd2164d32712174b2f3989067f3278b36a9ec26d8cca7077`:
+  ten eight-case batches at starts 296 through 368 yield
+  **74 PASS / 6 FAIL / 80 executions**, under the pinned revision,
+  frozen 6548 manifest and 800x600 viewport. Discovery stops on each
+  unfamiliar failure, then resumes only after classification. All raw
+  FAIL results and zero thresholds are preserved.
+- `background-position-applies-to-012` differs only at `(10,125)`,
+  RGB20 versus RGB0: white `b` spills left onto its black border.
+  Chromium 141.0.7390.37 independently comparing the same literal fixture
+  and reference at 800x600/DPR1 also has one differing pixel, `(10,122)`,
+  RGB5 versus RGB0. This supports a font-overhang diagnosis, not native
+  pixel equivalence or a PASS claim.
+- `background-repeat-applies-to-006` differs only at `(107,55)`,
+  RGB(20,138,20) versus (0,128,0); its 012 variant only at `(7,105)`,
+  RGB(243,249,243) versus white. Chromium independently reproduces one
+  pixel in each paired fixture/reference comparison: 006 at `(107,53)`
+  RGB(5,130,5) versus green; 012 at `(7,103)` RGB(252,254,252) versus white.
+  These three additional font cases remain open, alongside the six
+  previous cases; this is not a full-suite remaining count.
+- Batch 368 stops at three new failures: index 368 `bidi-006`,
+  **1299 pixels**; index 372 `bidi-010`, **10240 pixels**; index 375
+  `bidi-text/bidi-003`, **246 pixels**. The other five cases pass.
+- Index 375 actual/reference screenshots and native layout dumps show
+  correct visual text order, but incorrect decorated-fragment whitespace
+  ownership. In the second paragraph, actual `ddd eee fff` has width
+  88.28906 instead of reference `ddd eee fff ` width 92.28906; actual
+  `jjj kkk lll` is 77.671875 instead of 81.671875. Origins and heights
+  match. Both lost trailing spaces are exactly 4px; their border spans
+  are correspondingly shortened. The next bounded repair target is
+  `reorder_explicit_bidi_children` edge-whitespace normalization, not
+  replacement of the existing bidi algorithm. No implementation fix is
+  claimed by this discovery entry; 368/372/375 remain strict FAIL.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
