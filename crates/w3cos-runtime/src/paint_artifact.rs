@@ -1009,11 +1009,13 @@ pub(crate) fn border_edge_paint_rects(
     {
         // Column boxes describe grid tracks, not inset border boxes. A
         // collapsed border is centered on the corresponding grid line.
+        // Block edges include the adjacent inline half-borders so the
+        // outer corner quadrants are covered, not four disconnected strips.
         return [
             LayoutRect {
-                x: rect.x,
+                x: rect.x - widths[3] / 2.0,
                 y: rect.y - widths[0] / 2.0,
-                width: rect.width,
+                width: rect.width + (widths[3] + widths[1]) / 2.0,
                 height: widths[0],
             },
             LayoutRect {
@@ -1023,9 +1025,9 @@ pub(crate) fn border_edge_paint_rects(
                 height: rect.height,
             },
             LayoutRect {
-                x: rect.x,
+                x: rect.x - widths[3] / 2.0,
                 y: rect.y + rect.height - widths[2] / 2.0,
-                width: rect.width,
+                width: rect.width + (widths[3] + widths[1]) / 2.0,
                 height: widths[2],
             },
             LayoutRect {
@@ -1810,6 +1812,21 @@ fn establishes_stacking_context(node: &PaintNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_column_edges_cover_outer_corner_quadrants() {
+        for display in [Display::TableColumn, Display::TableColumnGroup] {
+            let style = Style { display, border_collapse: true, ..Style::default() };
+            let edges = border_edge_paint_rects(&style,
+                LayoutRect { x: 10.0, y: 53.0, width: 100.0, height: 100.0 },
+                [4.0; 4]);
+            for (x, y) in [(8.5, 51.5), (111.5, 51.5), (8.5, 154.5), (111.5, 154.5)] {
+                assert!(edges.iter().any(|rect| x >= rect.x && x < rect.x + rect.width
+                    && y >= rect.y && y < rect.y + rect.height),
+                    "{display:?} leaves the outer corner ({x}, {y}) uncovered");
+            }
+        }
+    }
 
     fn rect(y: f32) -> LayoutRect {
         LayoutRect {

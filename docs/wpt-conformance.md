@@ -3846,6 +3846,95 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   This qualifies the focused repair, not full6548 acceptance. References
   and zero tolerances remain unchanged; clean-SHA replay is still pending.
 
+### Column border conflict inputs (after 34b3936)
+
+- Discovery batch 488 is 5/8. Border-applies-to-005/006 differ by
+  1987/2015 pixels; border-applies-to-012 differs by one pixel.
+- Native column/group tables are 96px high with no outer half-border
+  inset. Isolated standards-mode Chromium confirms 104px height, 2px
+  grid inset and 50px rows. Geometry receipt:
+  `target/wpt-targeted/border-columns-488-489-chromium-geometry.json`.
+  The collapsed-border layout conflict collector currently includes rows,
+  row groups and table borders, but omits column/group borders.
+- Added `collapsed_column_borders_participate_in_cell_height_minimums`
+  to reproduce the 104px minimum for both column and column-group inputs;
+  exact RED reproduced 96px versus 104px on the individual-column input.
+  The group iteration was not reached after that assertion failed.
+  Candidate now collects column/group edge ranges and merges them into
+  boundary cells before existing adjacent-grid conflict resolution.
+  Exact GREEN compilation completed but the individual-column unit still
+  fails: height improved from 96px to 102px, not the required 104px.
+  The group iteration remains unexecuted after that first assertion.
+  This candidate is not qualified; investigate the remaining row/grid
+  settlement before production pixel qualification. No commit/push.
+- The 2px deficit traces to post-layout auto-height settlement: its
+  original-tree bottom-half query ignores column borders even after the
+  layout clone has resolved them onto cells. Candidate v2 adds column/group
+  block edges to the table outer-half query and includes those part types
+  in the fast-layout resolved projection trigger. Exact GREEN passed after
+  2m29s: both individual-column and column-group iterations reach 104px.
+  Isolated table/collapsed sample is 79/84, with the same five baseline
+  failed names and no new failures. Receipt:
+  `target/wpt-targeted/collapsed-column-border-v2-unit-neighbors.json`.
+  Production build and pixel qualification are pending; not full-module
+  or full6548 acceptance, and no candidate commit/push yet.
+- Production build completed in 2m00s. Batch 488 remains 5/8: column-group
+  target improves 1987 to 16 differing pixels; column target 2015 to 17.
+  Frames show sixteen common missing green pixels, four 2x2 outer corner
+  patches at x=8/9 and 110/111, y=51/52 and 153/154. Individual-column
+  target has one additional white-text pixel at (111,57). No zero-diff
+  target or regression qualification is claimed; investigate collapsed
+  border corner replay before commit/push.
+- Added `paint_artifact::tests::collapsed_column_edges_cover_outer_corner_quadrants`
+  for both column and column-group displays. It checks the union of border
+  rectangles at all four outer half-border corner quadrants; exact RED
+  reproduced the missing column corner (8.5,51.5). The column-group loop
+  was not reached after that first assertion. Candidate extends the top
+  and bottom border rectangles to the adjacent inline half-border outer
+  edges; exact GREEN passed after 3m17s compilation, both displays executed.
+  Replaying 84 table tests yields the same five failed names. Running all
+  36 isolated PaintArtifact tests yields 34 PASS and two newly observed
+  failures: `auto_positioned_subtree_paints_after_later_normal_flow_content`
+  and `inline_fragment_clip_keeps_layout_rect_and_clips_only_paint`.
+  No matching modification-before receipt was found, so they are not
+  classified as confirmed baseline failures or proven regressions.
+  Combined receipt: `collapsed-column-corners-v1-unit-neighbors.json`
+  (113/120). Production pixel acceptance and regression qualification
+  remain pending; no commit/push yet.
+- Production build completed in 2m25s. Strict batch 488 now gives 6/8:
+  column-group case 005 improves 1987 pixels to zero; individual-column
+  006 improves 2015 to one white-text pixel, and inline-block 012 remains
+  one pixel. Both remaining cases are still FAIL at zero tolerance.
+  Receipt: `batch-488-column-corners-v1-pixel-check/results.json`.
+  The 560-execution comparison will qualify this partial geometry/corner
+  repair without claiming the two text-ink failures are fixed or the
+  full6548 objective is complete.
+- The 560-execution comparison completed: 549 PASS, 11 FAIL, no old PASS
+  lost. Only 005 changes FAIL to PASS and 006 improves 2015 to one pixel
+  while remaining FAIL; the other 558 complete test objects are unchanged.
+  Receipt: `collapsed-column-border-v3-comparison.json`, layout blob
+  `4425bacda1d80dce80edb5360a90399da1b3285e`, paint blob
+  `03d3ccfe4b8e1470282e883e19b1ce1b5e00a448`, production SHA256
+  `f8e036223346415877727967d982e507db21e13717d29aeee702f9c73889dc7b`.
+  This qualifies the partial column geometry/corner repair only; the two
+  strict text-ink failures remain open. Clean-SHA replay is pending.
+- Chromium column-group/reference screenshots have zero pixel difference;
+  individual-column/reference has one differing pixel at (111,57), RGBA
+  (5,130,5,255) versus green (0,128,0,255). Native at that point is
+  (20,138,20,255), so this is not a native parity proof. Screenshots are
+  `border-005-chromium.png` / `border-006-chromium.png` in the artifact folder.
+- The separate inline-block case's sole pixel is (11,107), native RGBA
+  (20,138,20,255) versus reference (0,128,0,255). Its second white text
+  `b` starts at x=12,y=103.2 adjacent to the left green border. This is
+  evidence for a text-ink investigation, not permission to clip overhang,
+  replace fonts, alter references or relax zero tolerance.
+- Isolated Chromium actual/reference screenshots for the same inline-block
+  case also differ by one pixel: (11,105), (5,130,5,255) versus green
+  (0,128,0,255). Retained as `border-012-chromium.png` and
+  `border-001-ref-chromium.png` in `target/wpt-targeted/`. This does not
+  establish native parity (different y/color), nor turn the strict native
+  failure into a PASS. The original zero-tolerance requirement is intact.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
