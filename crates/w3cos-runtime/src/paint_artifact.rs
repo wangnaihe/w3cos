@@ -1197,6 +1197,9 @@ pub(crate) fn table_grid_paint_rect(style: &Style, mut rect: LayoutRect) -> Layo
     let bottom = bottom * scale_y;
     rect.y += top;
     rect.height = (rect.height - top - bottom).max(0.0);
+    if let Some(right) = parts.next().and_then(|value| value.parse::<f32>().ok()) {
+        rect.width = (rect.width - right * style.transform.scale_x).max(0.0);
+    }
     rect
 }
 
@@ -1205,7 +1208,17 @@ fn annotate_table_caption_paint_insets(
     rect_by_index: &[Option<LayoutRect>],
 ) {
     let mut insets = vec![(0.0_f32, 0.0_f32); nodes.len()];
+    let mut grid_widths = vec![None::<f32>; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
+        if matches!(node.style.display, Display::TableRow | Display::TableRowGroup
+            | Display::TableHeaderGroup | Display::TableFooterGroup)
+            && !matches!(node.style.position, Position::Absolute | Position::Fixed)
+            && let Some(parent) = node.parent
+            && matches!(nodes[parent].style.display, Display::Table | Display::InlineTable)
+            && let Some(rect) = rect_by_index.get(index).copied().flatten()
+        {
+            grid_widths[parent] = Some(grid_widths[parent].unwrap_or(0.0).max(rect.width));
+        }
         if node.style.display != Display::TableCaption {
             continue;
         }
@@ -1233,11 +1246,25 @@ fn annotate_table_caption_paint_insets(
         if top <= 0.0 && bottom <= 0.0 {
             continue;
         }
+        let style = &nodes[index].style;
+        let right = if !style.border_collapse {
+            grid_widths[index].zip(rect_by_index.get(index).copied().flatten())
+                .map_or(0.0, |(grid_width, rect)| {
+                    let padding = style.padding_lengths();
+                    let edges = padding.left + padding.right
+                        + style.border_left_width.unwrap_or(style.border_width)
+                        + style.border_right_width.unwrap_or(style.border_width)
+                        + 2.0 * style.border_spacing_x;
+                    // The wrapper includes the caption, but table background
+                    // paints only the grid and its own edges.
+                    (rect.width - grid_width - edges).max(0.0)
+                })
+        } else { 0.0 };
         nodes[index]
             .style
             .custom_properties
             .get_or_insert_with(Default::default)
-            .insert(TABLE_CAPTION_INSETS.to_string(), format!("{top} {bottom}"));
+            .insert(TABLE_CAPTION_INSETS.to_string(), format!("{top} {bottom} {right}"));
     }
 }
 
@@ -2262,6 +2289,34 @@ mod tests {
         assert_eq!(nodes[9].style.visibility, Visibility::Collapse);
         assert_eq!(nodes[9].style.overflow_x, Some(Overflow::Hidden));
         assert_eq!(nodes[9].style.overflow_y, Some(Overflow::Hidden));
+    }
+
+    #[test]
+    fn table_background_paint_rect_uses_grid_width_not_wider_caption() {
+        for bottom in [false, true] {
+            let mut nodes = vec![
+                PaintNode { kind: ComponentKind::Box,
+                    style: Style { display: Display::Table, ..Style::default() },
+                    parent: None, sticky_counter_signal: None },
+                PaintNode { kind: ComponentKind::Box,
+                    style: Style { display: Display::TableCaption,
+                        caption_side_bottom: bottom, ..Style::default() },
+                    parent: Some(0), sticky_counter_signal: None },
+                PaintNode { kind: ComponentKind::Box,
+                    style: Style { display: Display::TableRowGroup, ..Style::default() },
+                    parent: Some(0), sticky_counter_signal: None },
+            ];
+            let grid_y = if bottom { 0.0 } else { 30.0 };
+            let rects = vec![
+                Some(LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 60.0 }),
+                Some(LayoutRect { x: 0.0, y: if bottom { 30.0 } else { 0.0 },
+                    width: 192.0, height: 30.0 }),
+                Some(LayoutRect { x: 0.0, y: grid_y, width: 100.0, height: 30.0 }),
+            ];
+            annotate_table_caption_paint_insets(&mut nodes, &rects);
+            assert_eq!(table_grid_paint_rect(&nodes[0].style, rects[0].unwrap()),
+                LayoutRect { x: 0.0, y: grid_y, width: 100.0, height: 30.0 });
+        }
     }
 
     #[test]

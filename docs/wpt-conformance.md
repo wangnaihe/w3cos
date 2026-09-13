@@ -2973,6 +2973,34 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   unchanged. Neither this partial repair nor its push proves full6548
   clean-SHA zero-failure acceptance.
 
+### Caption-wide wrapper versus table-grid background qualification
+
+- Base `e99adf2`: table background now excludes the horizontal extent
+  contributed only by a wider caption, using the widest laid-out direct
+  row/group and retaining table padding, borders and separated spacing.
+  This changes the shared PaintArtifact path consumed by both raster
+  backends, not caption layout or application CSS. Missing grid data keeps
+  the old width; collapsed-border horizontal painting is unchanged.
+  The new top/bottom caption regression is RED 192px versus 100px in
+  2m42s, then GREEN with the existing vertical-inset test in 2m47s.
+  Paint-artifact tests finish 33/35; the two failures also reproduce in
+  the saved older executable (32/34), with the same previously recorded
+  positioned-subtree and inline-fragment assertions.
+- Default optimized runner finishes in 5m00s including the unit-build
+  lock wait; SHA256
+  `bb8ab39badf23eb38b9e13f90976a9b3fb8fb53fc61c9364e24b34da149937e4`.
+  Receipts `caption-grid-background-v1` retain the pinned revision,
+  frozen suite and 800x600 viewport. Caption 1414 becomes exact zero
+  from 5460 pixels; start 1408 is now 8/8 PASS. The original twenty
+  eight-case batches improve to 154/160 PASS, 6 FAIL. Only start 1408's
+  full ordered path/status/pixel-diff report changes; no old PASS is lost.
+- Additional starts 5268/5276/5284 reproduce the pushed-base 21/24 PASS
+  with identical full reports: caption-position-001 (876 pixels) and
+  collapsing-border-model-003/009 (2400 each) remain FAIL. All 23 batches
+  finish 175/184 execution PASS, 9 FAIL; overlapping executions are not
+  a current global remaining count. The six selected float-margin
+  failures remain unchanged; final clean-SHA full6548 acceptance is open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
