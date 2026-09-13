@@ -2208,6 +2208,50 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   a focused Skia repair, not all float sizing/margin/percentage semantics,
   GPU/device parity, or the final same-clean-SHA6548 zero-failure gate.
 
+### Inline text line-bottom continuation
+
+- Immediate productionc81c7e4 still fails1369 `float-nowrap-9.html` at96px.
+  Raw source/reference layouts contain identical visible text but lower the
+  nowrap run as InlineBlock versus Inline. Its following right float starts
+  at y46.4 versus44.800003; the generic preceding-box float projection uses
+  the Inline glyph-box bottom without the remaining half-leading.
+- Add `float_after_inline_text_uses_line_bottom_not_glyph_bottom`:10px
+  overflowing nowrap Inline text with20px line-height must retain5px
+  trailing half-leading before an already-next-line float. The first draft
+  compute test used short text; its3m08s build fails0 versus20 because the
+  float can correctly fit alongside that text. This is an invalid regression
+  expectation, not valid RED evidence, and is replaced rather than weakened.
+- Isolate the continuation projection with an explicit160px text layout
+  overflowing its100px container: glyph box y5/height10, next-line float
+  y20. Preserve that float's line-top instead of pulling it to glyph-bottom15.
+  Production projection includes trailing half-leading only for Inline text;
+  existing upward-only correction does not force a same-line float downward.
+  Real WPT1369's96px failure supplies the repair's RED pixel evidence.
+  Revised unit build and fresh pixel qualification are pending. Keep1367 separate: it has a
+  zero-width shrunken float and an extra anonymous whitespace node, not just
+  this line-bottom discrepancy.
+- Re-run the immediate production runner (SHA256
+  `88fc943ee2251638d546bd9e35ea31aa0831947ef98cbbde18ecef8ac0117a17`):
+  `case-1369-line-bottom-before-v1/results.json` retains96 differing pixels,
+  max-channel255, both allowed thresholds0. Preserve the baseline binary
+  at `target/wpt-targeted/w3cos-wpt-line-bottom-baseline-c81c7e4`.
+- Revised optimized same-feature library build completes in3m45s; the
+  isolated overflowing-line projection test passes. Float selector is
+  36PASS/1FAIL (the unchanged leading-float/normal-flow margin expectation
+  24 versus80); text-layout remains28/28. Fresh runner pixels are pending.
+- Fresh runner completes in2m29s, SHA256
+  `ff9126a1c7bbd289a92b3ccdfcbc2ad350ee65241301e58c3d985a3cd8bde4ce`.
+  Neighbor1366 improves6/8 to7/8 through1369's96->0px zero-allowance PASS.
+  Neighbor1385 remains2/8. Ordered paths/statuses/pixel counts confirm the
+  other seven failures are unchanged. Receipts below `target/wpt-targeted`:
+  `batch-<1366|1385>-line-bottom-after-v1/results.json`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104,100 exact-zero matches plus four expected
+  mismatches. Ordered paths, statuses and full pixel-diff objects match the
+  immediate baseline. Receipts `batch-<start>-line-bottom-after-v1/results.json`.
+  This closes one historical pixel failure in focused Skia evidence, not the
+  remaining nowrap/float capabilities or final6548 same-clean-SHA gate.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

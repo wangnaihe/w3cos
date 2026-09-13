@@ -4835,8 +4835,14 @@ fn project_simple_float_margin_boxes(
             {
                 let previous_margin = previous_child.style.margin_lengths();
                 let child_margin = child.style.margin_lengths();
+                let trailing_leading = if previous_child.style.display == WDisplay::Inline
+                    && matches!(previous_child.kind, ComponentKind::Text { .. }) {
+                    (previous_child.style.font_size * previous_child.style.line_height
+                        - previous_child.style.font_size) * 0.5
+                } else { 0.0 };
                 let target_y = layouts[previous_position].0.y - relative_shift(&previous_child.style).1
                     + layouts[previous_position].0.height
+                    + trailing_leading
                     + collapse([previous_margin.bottom, child_margin.top])
                     + relative_shift(&child.style).1;
                 let delta_y = target_y - layouts[child_position].0.y;
@@ -18461,6 +18467,29 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(get(3).y, get(2).y);
+    }
+
+    #[test]
+    fn float_after_inline_text_uses_line_bottom_not_glyph_bottom() {
+        let root = Component::row(Style { display: WDisp::Flex, flex_wrap: WWrap::Wrap,
+            width: WDim::Px(100.0), font_size: 10.0, line_height: 2.0,
+            ..Style::default() }, vec![
+            Component::text("nowrap text that overflows the parent", Style { display: WDisp::Inline,
+                white_space: w3cos_std::style::WhiteSpace::NoWrap,
+                font_size: 10.0, line_height: 2.0, ..Style::default() }),
+            Component::row(Style { display: WDisp::Block, float: WFloat::Right,
+                width: WDim::Px(20.0), height: WDim::Px(20.0),
+                ..Style::default() }, Vec::new()),
+        ]);
+        // The line has already overflowed its containing width. This projection
+        // must not pull the next-line float up into the glyph's trailing leading.
+        let mut layout = vec![
+            (LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 }, 0),
+            (LayoutRect { x: 0.0, y: 5.0, width: 160.0, height: 10.0 }, 1),
+            (LayoutRect { x: 80.0, y: 20.0, width: 20.0, height: 20.0 }, 2),
+        ];
+        project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
+        assert_eq!(layout[2].0.y, 20.0);
     }
 
     #[test]
