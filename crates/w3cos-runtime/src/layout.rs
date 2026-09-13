@@ -16766,6 +16766,62 @@ mod tests {
     }
 
     #[test]
+    fn nowrap_dom_text_keeps_intrinsic_width_and_inline_baseline() {
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(".host", &[
+            ("white-space", "nowrap"), ("font-size", "32px"),
+            ("line-height", "32px"), ("font-family", "serif"),
+        ]);
+        w3cos_dom::stylesheet::register_rule(".decorated", &[
+            ("border", "3px solid black"), ("padding-top", "3.2px"),
+            ("padding-bottom", "3.2px"),
+        ]);
+        let mut document = w3cos_dom::Document::new();
+        for wrapped in [false, true] {
+            let host = document.create_element("div");
+            host.set_attribute(&mut document, "class", "host");
+            for content in ["a", "b", "fgh"] {
+                let child = if wrapped || content == "b" {
+                    let span = document.create_element("span");
+                    if content == "b" {
+                        span.set_attribute(&mut document, "class", "decorated");
+                    }
+                    span.set_text_content(&mut document, content);
+                    span
+                } else { document.create_text_node(content) };
+                host.append_child(&mut document, child);
+            }
+            document.body().append_child(&mut document, host);
+        }
+        let tree = document.to_component_tree();
+        fn text_rects(component: &Component) -> Vec<LayoutRect> {
+            fn flatten<'a>(component: &'a Component, nodes: &mut Vec<&'a Component>) {
+                nodes.push(component);
+                for child in &component.children { flatten(child, nodes); }
+            }
+            let mut nodes = Vec::new();
+            flatten(component, &mut nodes);
+            let layout = compute(component, 800.0, 600.0).unwrap();
+            nodes.iter().enumerate().filter_map(|(index, node)| {
+                if matches!(&node.kind, ComponentKind::Text { content } if content == "a" || content == "fgh") {
+                    Some(layout.iter().find(|(_, id)| *id == index).unwrap().0)
+                } else { None }
+            }).collect()
+        }
+        let actual = text_rects(&tree.children[0]);
+        let reference = text_rects(&tree.children[1]);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(reference.len(), 2);
+        for (actual, reference) in actual.iter().zip(reference.iter()) {
+            assert!(actual.width > 0.0);
+            assert_eq!(actual.width, reference.width);
+            assert!((actual.y - reference.y).abs() < 0.0001,
+                "anonymous nowrap text must share the inline baseline: {actual:?} vs {reference:?}");
+        }
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn block_inline_image_uses_line_height_strut_and_vertical_align() {
         let image = Component::image(
             "line-box.png",

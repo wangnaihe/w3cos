@@ -3672,6 +3672,38 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   difference is a separate next repair target; index 368 is not declared
   fixed by the boundary-space correction.
 
+### Anonymous nowrap text inline semantics (after 46461db)
+
+- New real-DOM-to-layout unit
+  `layout::tests::nowrap_dom_text_keeps_intrinsic_width_and_inline_baseline`
+  compares bare `a`/`fgh` runs with equivalent ordinary span runs beside
+  a bordered, vertically padded inline. First valid RED build: **3m23s**.
+  The first width assertion passes, **14.203125px** in both layouts, but
+  actual relative y is **-6.199999px** versus reference **0px**. Both
+  runs are present with nonzero widths; this is not an empty-fixture pass.
+- DOM lowering used InlineBlock solely to retain nowrap text advance.
+  Current layout already resolves intrinsic width for nowrap Inline
+  text, so anonymous text nodes now keep Inline display, including under
+  nowrap. This removes unintended atomic-box baseline semantics without
+  changing principal inline-block elements or swapping font metrics.
+- GREEN build: **2m49s**, the new unit passes both runs' intrinsic-width
+  and baseline assertions. The focused runtime sample is **14/14 post-fix**;
+  its original `before` filename is misleading because compilation had
+  already replaced the executable. It is not a before/after comparison.
+  DOM bidi/RTL comparison remains **18/19**, with the same existing
+  `rtl_inline_block_aligns_its_single_text_line_to_the_inline_end` failure
+  and no prior PASS lost. Production build completes in **2m05s**.
+- Production qualification: **464 executions, 452 PASS / 12 existing FAIL**.
+  Only `css/CSS2/bidi-006.xht` and `css/CSS2/bidi-text/bidi-006a.xht`
+  change, each **1299 differing pixels -> 0**, with zero tolerance and
+  unchanged references. Other 462 complete result objects are unchanged;
+  no previous PASS is lost. Target batches 368/376/5593 are 7/8, 8/8, 8/8.
+  Receipt: `target/wpt-targeted/nowrap-anonymous-inline-v1-comparison.json`.
+  Binary SHA256:
+  `851c7df04273a637e1f8c650e421a50c07f810dc86e2e4e8231d7048c5107f58`.
+  These focused executions are not a new full-6548 remaining-failure count
+  or a completed pixel-parity acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

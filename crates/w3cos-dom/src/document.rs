@@ -3744,14 +3744,11 @@ impl Document {
             NodeType::Text | NodeType::CdataSection | NodeType::ProcessingInstruction => {
                 let text = node.text_content.as_deref().unwrap_or("");
                 // Text nodes do not generate principal CSS boxes of their
-                // own. In the component IR, however, a nowrap text leaf must
-                // carry an intrinsic inline width so anonymous line-box
-                // whitespace advances exactly like browser text shaping.
-                style.display = if style.white_space == w3cos_std::style::WhiteSpace::NoWrap {
-                    w3cos_std::style::Display::InlineBlock
-                } else {
-                    w3cos_std::style::Display::Inline
-                };
+                // own, including under nowrap. The layout engine computes
+                // nowrap inline text's intrinsic width without making it an
+                // atomic inline-block, whose baseline differs from an
+                // anonymous glyph run beside decorated inline boxes.
+                style.display = w3cos_std::style::Display::Inline;
                 // Text nodes inherit computed table properties from their
                 // element parent, but those properties do not apply to the
                 // anonymous inline box used by the component IR. Normalize
