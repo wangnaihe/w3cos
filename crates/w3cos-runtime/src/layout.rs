@@ -5815,7 +5815,32 @@ fn project_auto_height_bfc_float_heights(
                         .style
                         .border_bottom_width
                         .unwrap_or(component.style.border_width);
-                let height = capped_height(index, container.height.max(float_bottom + bottom_edge - container.y),
+                let float_only = component.children.iter().filter(|child|
+                    child.style.display != WDisplay::None
+                        && !matches!(child.style.position, WPos::Absolute | WPos::Fixed))
+                    .all(|child| child.style.float != WFloat::None);
+                let natural_height = float_bottom + bottom_edge - container.y;
+                let required_height = if float_only {
+                    // The original height may include block-stacked float
+                    // positions. Float-only BFCs use their final occupied
+                    // extent, not that stale height as an implicit minimum.
+                    let parent_height = flat[index].parent.and_then(|parent| positions.get(&parent))
+                        .map_or(viewport_h, |position| layouts[*position].0.height);
+                    let indefinite = matches!(component.style.min_height, WDim::Percent(_))
+                        && flat[index].parent.is_some_and(|parent|
+                            matches!(flat[parent].style.height, WDim::Auto));
+                    let minimum = if indefinite { None } else {
+                        component.style.min_height.resolve(parent_height, ROOT_FONT_SIZE,
+                            component.style.font_size, viewport_w, viewport_h)
+                    }.unwrap_or(0.0);
+                    let minimum_edges = if component.style.box_sizing == WBoxSizing::BorderBox { 0.0 }
+                        else { bottom_edge
+                            + resolve_spacing_for_layout(component.style.padding.top,
+                                container.width, component.style.font_size, viewport_w, viewport_h)
+                            + component.style.border_top_width.unwrap_or(component.style.border_width) };
+                    natural_height.max(minimum + minimum_edges)
+                } else { container.height.max(natural_height) };
+                let height = capped_height(index, required_height,
                     layouts, positions, flat, viewport_w, viewport_h);
                 let mut owner = index;
                 let mut delta = height - container.height;
@@ -15163,6 +15188,29 @@ mod tests {
             assert_eq!(get(2).width, 150.0, "parent={display:?}");
             assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
             assert_eq!(get(2).y, get(1).y, "parent={display:?}");
+        }
+    }
+
+    #[test]
+    fn float_only_auto_bfc_height_settles_after_upward_repositioning() {
+        for minimum in [WDim::Auto, WDim::Px(100.0)] {
+            let floating = |side, width, height| Component::boxed(Style {
+                display: WDisp::Block, float: side, width: WDim::Px(width),
+                height: WDim::Px(height), ..Style::default() }, vec![]);
+            let root = Component::boxed(Style { display: WDisp::TableCell,
+                width: WDim::Px(300.0), min_height: minimum, ..Style::default() }, vec![
+                floating(WFloat::Left, 150.0, 1.0), floating(WFloat::Right, 100.0, 30.0),
+                floating(WFloat::Right, 230.0, 30.0)]);
+            let mut layout = vec![
+                (LayoutRect { x: 0.0, y: 0.0, width: 300.0,
+                    height: if minimum == WDim::Auto { 90.0 } else { 100.0 } }, 0),
+                (LayoutRect { x: 0.0, y: 0.0, width: 150.0, height: 1.0 }, 1),
+                (LayoutRect { x: 200.0, y: 16.0, width: 100.0, height: 30.0 }, 2),
+                (LayoutRect { x: 70.0, y: 46.0, width: 230.0, height: 30.0 }, 3),
+            ];
+            project_auto_height_bfc_float_heights(&mut layout, &root,
+                &pre_flatten(&root), 800.0, 600.0);
+            assert_eq!(layout[0].0.height, if minimum == WDim::Auto { 76.0 } else { 100.0 });
         }
     }
 

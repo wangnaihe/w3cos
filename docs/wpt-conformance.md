@@ -2946,6 +2946,33 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
 - Caption1414 remains52944 pixels and the six selected margin failures
   remain open. This focused repair is not final clean-SHA6548 acceptance.
 
+### Cleared-float intrinsic wrappers and float-only BFC height settlement
+
+- Base `c48cb6f`: cleared synthetic floated wrappers now use automatic
+  intrinsic width instead of excluding the entire parent with `100%`.
+  The DOM regression is RED (percentage versus automatic width), then
+  GREEN; table 41/43 and float 17/18 retain their recorded failures.
+  Automatic float-only BFC height now uses final occupied float extents,
+  preserving explicit minimum height. Its regression is RED 90px versus
+  76px, then GREEN, including the 100px minimum-height control.
+  Runtime table 78/84 and float 62/63 retain the same six/one failures;
+  BFC 13/13 and text-layout 28/28 pass.
+- Optimized runner SHA256
+  `b64cb47b02c5172d9a5e8958dd15d89c80939ac4f5e18dced573444641a8f5a1`.
+  Receipts `float-only-height-settlement-v1` use the pinned revision,
+  frozen suite and 800x600 viewport. Twenty eight-case batches finish
+  153/160 PASS, 7 FAIL, with no prior PASS lost; only start 1408's full
+  ordered path/status/pixel-diff report changes. The 17 neighboring
+  batches remain 136/136 PASS. These overlapping executions are not a
+  global remaining count.
+- Caption 1414 improves from 52944 to 5460 differing pixels, but remains
+  FAIL. The unpublished wrapper-only intermediate worsened it to 67294;
+  final float-only height settlement removes that stale-height mismatch.
+  The remaining differences are two table-grid background strips when
+  the caption is wider than the grid. Six selected margin failures remain
+  unchanged. Neither this partial repair nor its push proves full6548
+  clean-SHA zero-failure acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

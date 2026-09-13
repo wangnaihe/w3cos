@@ -9510,6 +9510,9 @@ fn hoist_floats_into_block_formatting_context(
             row_style.line_height = formatting_context_style.line_height;
             row_style.line_height_is_normal = formatting_context_style.line_height_is_normal;
             if force_formatting_context {
+                // A floated implementation wrapper must shrink-wrap its
+                // content; 100% would exclude the entire parent float band.
+                row_style.width = w3cos_std::style::Dimension::Auto;
                 row_style.float = w3cos_std::style::Float::Left;
                 row_style.clear = left_floats
                     .first()
@@ -12248,6 +12251,23 @@ mod image_component_tests {
         crate::stylesheet::register_rule("table", &[("width", "auto")]);
         assert_eq!(document.computed_style_for(table.id).width, Dimension::Auto);
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn cleared_float_wrapper_uses_intrinsic_width_instead_of_parent_percentage() {
+        let mut document = Document::new();
+        let floating = document.create_element("div");
+        let style = document.get_style_mut(floating.id);
+        for (property, value) in [("float", "left"), ("clear", "left"),
+            ("width", "150px"), ("height", "1px")] {
+            style.set_property(property, value);
+        }
+        document.body().append_child(&mut document, floating);
+        let tree = document.to_component_tree();
+        let wrapper = &tree.children[0];
+        assert_eq!(wrapper.style.float, w3cos_std::style::Float::Left);
+        assert_eq!(wrapper.style.width, w3cos_std::style::Dimension::Auto);
+        assert_eq!(wrapper.children[0].style.width, w3cos_std::style::Dimension::Px(150.0));
     }
 
     #[test]
