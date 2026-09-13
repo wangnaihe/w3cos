@@ -5113,18 +5113,31 @@ fn project_simple_float_margin_boxes(
                     }
                 }
                 let current = layouts[position].0;
-                let fits_float_band = !avoids_floats || content_box.is_some_and(|containing| {
+                let fitting_float_y = if !avoids_floats { Some(float_top) } else {
+                    content_box.and_then(|containing| {
                     let exclusions = active_floats.iter().map(|(side, margin_box)|
                         FloatExclusion { side: *side, margin_box: *margin_box }).collect::<Vec<_>>();
-                    let band = float_line_band(containing, float_top, current.height, &exclusions);
                     let horizontal_margin = [child.style.margin.left, child.style.margin.right]
                         .into_iter().map(|margin| resolve_spacing_for_layout(
                             margin, containing.width, child.style.font_size, viewport_w, viewport_h,
                         )).sum::<f32>();
-                    current.width + horizontal_margin <= band.width + 0.01
-                });
-                if current.y - leading + f32::EPSILON >= float_bottom && fits_float_band {
-                    let delta_y = float_top + leading - current.y;
+                    // A shorter float may release enough space while another
+                    // still overlaps. Try each exclusion boundary, not only
+                    // the initial band or the bottom of every float.
+                    let mut candidates = vec![float_top];
+                    candidates.extend(exclusions.iter().map(|float|
+                        float.margin_box.y + float.margin_box.height));
+                    candidates.sort_by(f32::total_cmp);
+                    candidates.dedup();
+                    candidates.into_iter().find(|y| {
+                        let band = float_line_band(containing, *y, current.height, &exclusions);
+                        current.width + horizontal_margin <= band.width + 0.01
+                    })
+                }) };
+                if current.y - leading + f32::EPSILON >= float_bottom
+                    && let Some(fitting_y) = fitting_float_y
+                {
+                    let delta_y = fitting_y + leading - current.y;
                     shift_subtree(
                         layouts,
                         layout_position,
@@ -5232,7 +5245,7 @@ fn project_simple_float_margin_boxes(
                     let next_y = overlapping
                         .iter()
                         .map(|(_, float)| float.y + float.height)
-                        .fold(current.y, f32::max);
+                        .reduce(f32::min).unwrap_or(current.y);
                     let delta_y = next_y - current.y;
                     if delta_y <= f32::EPSILON {
                         break;
@@ -15104,6 +15117,28 @@ mod tests {
             assert_eq!(get(2).width, 150.0, "parent={display:?}");
             assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
             assert_eq!(get(2).y, get(1).y, "parent={display:?}");
+        }
+    }
+
+    #[test]
+    fn first_table_bfc_uses_the_band_released_by_the_shorter_float() {
+        for (long_side, short_side) in [(WFloat::Left, WFloat::Left),
+            (WFloat::Left, WFloat::Right), (WFloat::Right, WFloat::Left),
+            (WFloat::Right, WFloat::Right)] {
+            let floating = |side, height| Component::boxed(Style {
+                display: WDisp::Block, float: side, width: WDim::Px(100.0),
+                height: WDim::Px(height), ..Style::default()
+            }, vec![]);
+            let root = Component::boxed(Style { display: WDisp::Block,
+                width: WDim::Px(300.0), ..Style::default()
+            }, vec![floating(long_side, 20.0), floating(short_side, 6.0),
+                Component::boxed(Style { display: WDisp::Table,
+                    width: WDim::Px(150.0), height: WDim::Px(10.0),
+                    ..Style::default() }, vec![])]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let table = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+            assert_eq!(table.y, 6.0, "sides={long_side:?}/{short_side:?}");
+            assert_eq!(table.x, if long_side == WFloat::Left { 100.0 } else { 0.0 });
         }
     }
 

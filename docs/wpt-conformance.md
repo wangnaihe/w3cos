@@ -2795,6 +2795,32 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   remains52944 pixels; the remaining float/margin failures are not repaired.
   Final same-clean-SHA6548 acceptance remains unestablished.
 
+### Intermediate float-release band qualification
+
+- Base`51e7a72`; the first independent table/BFC searches float-bottom
+  boundaries for a fitting band instead of testing only the initial band.
+  Collision advancement releases the shortest overlapping float first.
+  The new unit reproduces26px versus6px (RED2m37s), then passes all four
+  left/right combinations (GREEN3m09s). Table78/84 and float57/58 retain
+  the same six/one recorded failures; BFC10/10 and text-layout28/28 pass.
+- Default optimized runner build5m27s includes the test-build lock wait;
+  SHA256`f09ea15ef399140caa5cf6a063e2652bf75541abab44b3bcb567757f2d26acf6`.
+  Receipts`partial-float-band-v1` use the unchanged pinned suite/revision
+  and800x600 viewport. Case1416 becomes exact0 from5000 pixels; start1416
+  improves1/8 to2/8. Start1400 remains8/8 exact0. Twenty eight-case batches
+  finish150/160 PASS,10 FAIL, with no previous PASS lost; all18 reports
+  outside starts1408/1416 retain identical ordered path/status/pixel diff.
+  Batch executions overlap and are not a global remaining count.
+- Case1412 improves44000 to30100 pixels but is not repaired: source
+  tables now correctly fit at the shorter float's6px bottom with20px outer
+  heights; the runtime-rendered reference still misplaces its float boxes.
+  Case1413 worsens25707 to29277 and remains unqualified: its source table
+  is now correctly below the20px float, but authored HTML height20 remains
+  absent from its projected style (Auto,12px content), unlike the reference.
+  These unresolved reference-float/HTML-height paths require separate fixes,
+  not fixture/tolerance changes. Caption1414 remains52944 pixels. Final
+  same-clean-SHA6548 zero-failure acceptance is still not established.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
