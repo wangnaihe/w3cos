@@ -46,10 +46,19 @@ impl CSSStyleDeclaration {
     }
 
     pub fn set_property(&mut self, name: &str, value: &str) {
-        self.inline_declarations
-            .push((name.to_string(), value.to_string()));
+        let raw_value = value;
         let (parsed_value, important) = crate::stylesheet::declaration_value_and_importance(value);
         let value = if important { parsed_value } else { value };
+        if matches!(name, "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
+            | "borderTop" | "borderRight" | "borderBottom" | "borderLeft"
+            | "border-inline-start" | "border-inline-end" | "border-block-start" | "border-block-end"
+            | "borderInlineStart" | "borderInlineEnd" | "borderBlockStart" | "borderBlockEnd")
+            && !valid_border_shorthand_source(value)
+        {
+            return;
+        }
+        self.inline_declarations
+            .push((name.to_string(), raw_value.to_string()));
         if name.starts_with("--") {
             self.inner
                 .custom_properties
@@ -1802,6 +1811,28 @@ pub(crate) fn border_shorthand_color(
     Some(color.unwrap_or(current_color))
 }
 
+fn valid_border_shorthand_source(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer")
+        || lower.contains("var(")
+    {
+        // Pending substitutions stay in the existing computed-value resolver.
+        return true;
+    }
+    border_shorthand_color(value, Color::BLACK, |token| {
+        let token = token.to_ascii_lowercase();
+        parse_border_width(&token).or_else(|| match parse_spacing(&token) {
+            Some(Spacing::Em(value) | Spacing::Rem(value) | Spacing::Vw(value) | Spacing::Vh(value)) => Some(value),
+            _ => None,
+        }).or_else(|| {
+            // Classify a deferred length expression without resolving it in
+            // declaration storage; the existing length resolver owns its value.
+            ["calc(", "min(", "max(", "clamp(", "env("].iter()
+                .any(|prefix| token.starts_with(prefix) && token.ends_with(')')).then_some(0.0)
+        })
+    }).is_some()
+}
+
 fn apply_border_shorthand(style: &mut Style, value: &str) {
     let mut width = None;
     let mut color = None;
@@ -2711,6 +2742,45 @@ mod tests {
             declaration.inner.border_color,
             Color::rgba(215, 224, 238, 235)
         );
+    }
+
+    #[test]
+    fn invalid_border_subproperty_duplicates_do_not_enter_the_cascade() {
+        for property in ["border", "border-top", "border-right", "border-bottom", "border-left",
+            "borderTop", "borderRight", "borderBottom", "borderLeft"] {
+            for value in ["red solid 16px red", "red 16px solid red", "red solid thick red",
+                "red thick solid red", "2px 3px solid red", "2px solid dashed red",
+                "6px sold green"] {
+                let mut empty = CSSStyleDeclaration::new();
+                empty.set_property(property, value);
+                assert!(empty.inline_declarations.is_empty(), "fresh {property}: {value}");
+                assert_eq!(empty.to_style(), CSSStyleDeclaration::new().to_style());
+                let mut declaration = CSSStyleDeclaration::new();
+                declaration.set_property(property, "2px solid cyan");
+                let before = declaration.inner.clone();
+                let computed_before = declaration.to_style();
+                let declarations_before = declaration.inline_declarations.clone();
+                declaration.set_property(property, value);
+                assert_eq!(declaration.inner, before, "{property}: {value}");
+                assert_eq!(declaration.to_style(), computed_before, "computed {property}: {value}");
+                assert_eq!(declaration.inline_declarations, declarations_before,
+                    "invalid declaration must not hide a valid one: {property}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn border_shorthand_validation_retains_valid_and_deferred_sources() {
+        for property in ["border", "border-top", "border-right", "border-bottom", "border-left"] {
+            for value in ["2px solid cyan", "solid 1em", "2ex solid currentColor", "medium solid",
+                "none", "hidden", "inherit", "initial", "unset", "revert", "revert-layer",
+                "2px solid cyan !important", "var(--border)", "calc(1em + 2px) solid red"] {
+                let mut declaration = CSSStyleDeclaration::new();
+                declaration.set_property(property, value);
+                assert_eq!(declaration.inline_declarations,
+                    vec![(property.to_string(), value.to_string())], "{property}: {value}");
+            }
+        }
     }
 
     #[test]

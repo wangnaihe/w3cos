@@ -4933,6 +4933,49 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Rounded/unequal-width 3D borders are not accepted by the two default-color
   fixtures. No full-suite zero-failure claim is made.
 
+### Reject duplicate border subproperties before cascade storage (in progress)
+
+- Predecessor `fbf7b0317b5fc119bfe9e0cb483ae5af58d1ac0d` was normally
+  pushed after its 72-execution clean-SHA replay matched qualification.
+- On that clean version, new bounded discovery 984–991 yielded 1 PASS /
+  7 FAIL, sealed across the ten relevant source files, binary and manifest;
+  `discovery-984-fbf7b03-sealed.json`. This is newly covered territory, not
+  evidence of seven regressions in the predecessor's 1048-execution range.
+- 985 (`shand-border-001.xht`) used repeated color tokens in otherwise
+  recognizable border/global/physical shorthands. The parser overwrote the
+  prior color/width instead of rejecting the entire declaration; invalid
+  source also remained in cascade storage. Real unit RED:
+  `invalid-border-duplicates-real-red.log`.
+- Declaration storage now shares the width/style/color multiplicity
+  classifier and rejects invalid shorthand before mutating either the
+  Style or ordered declaration vector. Relative lengths, CSS-wide keywords,
+  raw priority markers and pending substitutions retain their existing path.
+  Deferred functional lengths are classified, not evaluated or accepted as
+  a completed modern-length implementation by this change.
+- Unit GREEN checks fresh and previously styled declarations, every physical
+  edge and camelCase aliases; a second test verifies valid/deferred source
+  retention. All 38 directed DOM neighbors pass with no lost PASS;
+  `invalid-border-duplicates-v2-unit-neighbors.json`.
+- Production build v2: 2m06s. Focus 984–991 improves to **2 PASS / 6 FAIL**;
+  only 985 changes, from 131712 differing pixels/max255 to **0/max0**. The
+  other seven complete objects remain identical. Border neighbors 976–983
+  remain 8/8 and all eight complete objects are unchanged;
+  `invalid-border-duplicates-v2-pixel-comparison.json` and
+  `invalid-border-duplicates-v2-border-style-neighbors-pixel-comparison.json`.
+- Original Chromium groove/ridge whole-image parity is also retained at
+  **zero differing pixels / max0 / zero corner residual**, with original
+  oracle hashes and candidate source/binary seals verified;
+  `3d-border-browser-invalid-border-duplicates-v2-border-style-neighbors.json`.
+- Expanded qualification completes at **1056 executions / 1036 PASS / 20 FAIL**;
+  only 985 changes FAIL→PASS, with all other 1055 ordered complete objects
+  identical and no lost PASS. The 20 are residuals in this selected coverage,
+  not a full-suite remainder. `invalid-border-duplicates-v2-comparison.json`
+  seals ten source blobs, binary, suite and viewport; the browser parity
+  receipt has the same binary hash.
+- Clean-SHA 80-execution replay and normal publication remain pending.
+  The six direction/inline-box failures remain unfixed. No full-suite closure
+  is claimed.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
