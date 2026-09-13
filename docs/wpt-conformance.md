@@ -2108,6 +2108,45 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   and1389 in the compared neighbor batches, the original eight extra float
   controls now pass7/8; only1389 remains2640px in that selected control set.
 
+### Grouped float stale preceding-line marker
+
+- Immediate baseline98bfb7b reproduces index1389
+  `floats-placement-vertical-003.xht` at2640px. Its anonymous float group
+  starts at y14, but the marked blue float starts at y20; the reference's
+  blue box starts at y14. A marker inherited before grouping still reserves
+  one6px line despite there being no preceding inline sibling in the float's
+  new parent. A separate right-float ordering issue remains: the source's
+  right yellow box starts at y144, versus reference y114.
+- New `grouped_marked_left_float_does_not_add_another_inline_line` is RED
+  before production changes: float y12 versus group y6. Preserve that
+  same-feature executable at
+  `target/wpt-targeted/w3cos-runtime-grouped-float-red-98bfb7b`.
+  Only reserve an extra preceding line when actual same-parent inline
+  content exists; do not treat the retained marker alone as a line box.
+- Immediate baseline runner is preserved at
+  `target/wpt-targeted/w3cos-wpt-grouped-float-baseline-98bfb7b`;
+  baseline receipt `case-1389-grouped-float-before-v1/results.json` below
+  `target/wpt-targeted`. Qualification is pending. This stage does not claim
+  that1389 or the final6548 suite is closed.
+- Optimized same-feature library qualification: new grouped-marker test
+  passes. Float filter improves31PASS/3FAIL at the preserved immediate
+  baseline to32PASS/2FAIL; the two other failures are unchanged.
+  Text-layout remains28/28. WPT runner rebuild and pixel qualification
+  are pending; do not infer the remaining right-float fix from this unit.
+- Fresh runner SHA256
+  `2b0721ff8a9534e6584007a04921848930862341c253f2cfd38597cbebe42d35`:
+  1389 improves2640px to1800px, still FAIL with zero allowances. Raw layout
+  confirms the blue float now starts at y14 (reference y14), while the right
+  yellow float still starts at y144 (reference y114). Receipt
+  `case-1389-grouped-float-after-v1/results.json` below `target/wpt-targeted`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 exact zero-pixel matches, four expected
+  mismatches), under `batch-<start>-grouped-float-after-v1`. Neighbor batches
+  1366/1385 remain6/8 and0/8; their only pixel change is1389's improvement.
+  No new failure is observed in these compared ranges. Additional controls
+  1358/1359/1361/1363/1374 remain PASS. This is a qualified partial repair,
+  not a claim that1389 passes or that the final6548 suite is complete.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

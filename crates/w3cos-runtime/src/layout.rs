@@ -8184,7 +8184,7 @@ fn collect_layouts_fast(
                                 shifted[*index] |= flat[*index].parent.is_some_and(|parent| shifted[parent]);
                                 if shifted[*index] { prior_rect.x += outer_width; }
                             }
-                        } else {
+                        } else if !prior_inline.is_empty() {
                             rect.y = rect.y.max(
                                 relative_containing_block.y + line_height.max(0.0) + margin_top,
                             );
@@ -18331,6 +18331,32 @@ mod tests {
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(get(2).y, get(0).y);
         assert_eq!(get(1).x, get(0).x + 85.0);
+    }
+
+    #[test]
+    fn grouped_marked_left_float_does_not_add_another_inline_line() {
+        let mut floating = Style { display: WDisp::Block, float: WFloat::Left,
+            width: WDim::Px(100.0), height: WDim::Px(100.0),
+            font_size: 5.0, line_height: 1.2, ..Style::default() };
+        floating.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-left-float-after-inline".into(), "1".into());
+        let root = Component::row(Style { display: WDisp::Block,
+            width: WDim::Px(100.0), font_size: 5.0, line_height: 1.2,
+            ..Style::default() }, vec![
+            Component::text("H", Style { display: WDisp::Inline,
+                font_size: 5.0, line_height: 1.2, ..Style::default() }),
+            Component::row(Style { display: WDisp::Flex, flex_wrap: WWrap::Wrap,
+                width: WDim::Percent(100.0), font_size: 5.0, line_height: 1.2,
+                ..Style::default() }, vec![
+                Component::row(floating, Vec::new()),
+                Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(30.0), height: WDim::Px(30.0),
+                    ..Style::default() }, Vec::new()),
+            ]),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(3).y, get(2).y);
     }
 
     #[test]
