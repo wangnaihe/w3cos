@@ -3057,6 +3057,30 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   dynamic-script color serialization failure. Those failures are not
   claimed fixed or proven baseline against the published base.
 
+### Bottom-caption wrapper margin repair
+
+- Based on `a5df27d6141c636a8d7814b021af9664985ee01d`, auto-table height
+  settlement now includes caption bottom margins, not margins on internal
+  row/group boxes. The source and reference cat images already had identical
+  positions and sizes; the second source wrapper was 16px too short.
+- `auto_table_wrapper_retains_bottom_caption_margin` reproduces RED
+  136px versus 152px, then GREEN in 2m36s. An isolated Chromium 141 fixture
+  at 800x600 confirms a 20px row plus 100px bottom caption with 16px top and
+  bottom margins has a 152px wrapper and caption y=36. Exact-name layout
+  table checks finish 58/64, retaining the same six recorded failures.
+- Optimized runner build finishes in 4m48s including the unit-build lock
+  wait; SHA256
+  `29a8ae97f6804d0bf35850f4e8f8f3906d0357e3ed0b298025d46a0afb6cb55b`.
+  Receipts `bottom-caption-margin-v1` bind the pinned WPT revision, frozen
+  suite and 800x600 viewport. Start 5268 becomes 8/8; caption-position-001
+  improves from 876 pixels to exact zero. Across all 23 eight-case batches,
+  182/184 executions PASS and two FAIL. Full ordered path/status/pixel-diff
+  comparison changes only this caption case; all other reports are
+  identical to `flow-root-qualified-v1`, with no old PASS lost.
+  Collapsing-border-model-003/009 remain at 2400 pixels each. These
+  overlapping focused executions are not the global remaining count;
+  final clean-SHA full6548 acceptance remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

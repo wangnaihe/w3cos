@@ -3627,7 +3627,15 @@ fn project_auto_table_child_heights(
         let table_y = layouts[table_position].0.y;
         let Some(child_bottom) = children[table].iter().map(|child| {
             let rect = layouts[positions[child]].0;
-            rect.y + rect.height
+            // Captions are outside the grid but inside its table wrapper.
+            // Keep their margin-box extent when settling the wrapper height;
+            // margins do not apply to internal row/group boxes.
+            let margin = if flat[*child].style.display == WDisplay::TableCaption {
+                resolve_spacing_for_layout(flat[*child].style.margin.bottom,
+                    layouts[table_position].0.width, flat[*child].style.font_size,
+                    viewport_w, viewport_h)
+            } else { 0.0 };
+            rect.y + rect.height + margin
         }).reduce(f32::max) else {
             continue;
         };
@@ -17468,6 +17476,28 @@ mod tests {
             final_cell.x + final_cell.width <= table.x + table.width + 0.01,
             "the table max-content width must include cell borders: table={table:?}, final_cell={final_cell:?}"
         );
+    }
+
+    #[test]
+    fn auto_table_wrapper_retains_bottom_caption_margin() {
+        let table = Component::boxed(Style { display: WDisp::Table,
+            width: WDim::Px(98.0), ..Style::default() }, vec![
+            Component::row(Style { display: WDisp::TableRow,
+                height: WDim::Px(20.0), ..Style::default() }, vec![]),
+            Component::boxed(Style { display: WDisp::TableCaption,
+                caption_side_bottom: true, height: WDim::Px(100.0),
+                margin: w3cos_std::style::Edges {
+                    top: w3cos_std::style::Spacing::Px(16.0),
+                    bottom: w3cos_std::style::Spacing::Px(16.0),
+                    ..Default::default() }, ..Style::default() }, vec![]),
+        ]);
+        let mut layout = vec![
+            (LayoutRect { x: 0.0, y: 0.0, width: 98.0, height: 152.0 }, 0),
+            (LayoutRect { x: 0.0, y: 0.0, width: 98.0, height: 20.0 }, 1),
+            (LayoutRect { x: 0.0, y: 36.0, width: 98.0, height: 100.0 }, 2),
+        ];
+        project_auto_table_child_heights(&mut layout, &pre_flatten(&table), 800.0, 600.0);
+        assert_eq!(layout[0].0.height, 152.0);
     }
 
     #[test]
