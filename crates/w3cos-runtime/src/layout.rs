@@ -4853,7 +4853,11 @@ fn project_simple_float_margin_boxes(
         let mut imported_float_group = false;
         let mut skipped_positioned = false;
         let ordinary_float_context = matches!(component.style.display,
-            WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell);
+            WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell)
+            || (component.style.display == WDisplay::Flex
+                && component.style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.get("--w3cos-internal-anonymous-float-group")
+                        .is_some_and(|value| value == "1")));
         let mut child_index = component_index + 1;
         let content_box = layout_position.get(&component_index).map(|position| {
             let parent = layouts[*position].0;
@@ -15119,6 +15123,29 @@ mod tests {
             assert_eq!(get(2).width, 150.0, "parent={display:?}");
             assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
             assert_eq!(get(2).y, get(1).y, "parent={display:?}");
+        }
+    }
+
+    #[test]
+    fn anonymous_float_group_releases_space_at_each_float_bottom() {
+        for anonymous in [false, true] {
+            let mut style = Style { display: WDisp::Flex, width: WDim::Px(300.0),
+                flex_wrap: WWrap::Wrap, align_items: WAlign::FlexStart,
+                ..Style::default() };
+            if anonymous {
+                style.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-anonymous-float-group".into(), "1".into());
+            }
+            let floating = |width, height| Component::boxed(Style {
+                display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(width), height: WDim::Px(height), flex_shrink: 0.0,
+                ..Style::default() }, vec![]);
+            let root = Component::row(style, vec![floating(100.0, 20.0),
+                floating(100.0, 6.0), floating(150.0, 10.0)]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let third = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+            assert_eq!((third.x, third.y), if anonymous { (100.0, 6.0) }
+                else { (0.0, 20.0) }, "anonymous={anonymous}");
         }
     }
 

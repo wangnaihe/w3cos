@@ -2872,6 +2872,32 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   context path. This needs a separate generic float fix, not a reference
   or tolerance change. Final same-clean-SHA6548 acceptance remains open.
 
+### Anonymous float-group ordinary formatting qualification
+
+- Base`d330313`; internal Flex carrying the exact anonymous-float-group
+  marker now participates in ordinary float positioning. Genuine authored
+  Flex remains excluded. The new regression is RED(0,20) versus(100,6)
+  for the third float in3m18s, then GREEN3m06s; its unmarked genuine Flex
+  control retains(0,20). A fixture type-alias compile error was corrected
+  before this logical RED and is not counted as a reproduced layout bug.
+  Table78/84 and float59/60 retain the same six/one failures; BFC11/11
+  and text-layout28/28 pass.
+- Default optimized runner build5m15s includes the unit-build lock wait,
+  SHA256`d063d6a02e5dd3402f30a51bccc7279880fa2516b1f9439c45ab201828fe5aa9`.
+  Receipts`anonymous-float-group-v1` use the unchanged frozen revision/suite
+  and800x600 viewport. Twenty eight-case batches remain151/160 PASS,
+ 9 FAIL; no previous PASS is lost, and only start1408's ordered
+  path/status/pixel-diff report changes. The17 related/neighbor batches
+  remain136/136 PASS. Counts overlap and are not a global remaining count.
+- Case1412 improves30100 to20100 pixels, without becoming PASS. Reference
+  dumps confirm its first two float groups now correctly release space at
+  the6px boundary. The remaining mixed cases have an anonymous group's
+  original vertical position below an external right float, and subsequent
+  shared-BFC float positions still differ. This needs a separate generic
+  cross-group placement fix. Case1413 retains exact0; caption1414 remains
+ 52944. No additional complete WPT case is claimed repaired by this step;
+  final same-clean-SHA6548 zero-failure acceptance is still open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
