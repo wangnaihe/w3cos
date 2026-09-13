@@ -1000,6 +1000,10 @@ pub(crate) fn border_edge_paint_rects(
     rect: LayoutRect,
     widths: [f32; 4],
 ) -> [LayoutRect; 4] {
+    let rect = if style.border_collapse && style.display == Display::TableCell {
+        LayoutRect { y: rect.y - widths[0] / 2.0,
+            height: rect.height + widths[0] / 2.0 + widths[2] / 2.0, ..rect }
+    } else { rect };
     if style.border_collapse
         && matches!(style.display, Display::TableColumn | Display::TableColumnGroup)
     {
@@ -1093,16 +1097,8 @@ fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
 
 pub(crate) fn box_background_paint_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
     if style.border_collapse && style.display == Display::TableCell {
-        let top = style.border_top_width.unwrap_or(style.border_width) / 2.0;
-        let bottom = style.border_bottom_width.unwrap_or(style.border_width) / 2.0;
-        // Inline cell rects already end on shared grid-line centers. Only
-        // block-axis layout still contains the full border-edge extents.
-        return LayoutRect {
-            x: rect.x,
-            y: rect.y + top,
-            width: rect.width,
-            height: (rect.height - top - bottom).max(0.0),
-        };
+        // Cell rects end on shared grid-line centers on both axes.
+        return rect;
     }
     if style.border_collapse && matches!(style.display, Display::Table | Display::InlineTable) {
         return rect;
@@ -2204,11 +2200,11 @@ mod tests {
             box_background_paint_rect(
                 &style,
                 LayoutRect {
-                    // Inline layout already uses shared grid-line centers.
+                    // Both axes now use shared grid-line centers.
                     x: 138.0,
-                    y: 53.0,
+                    y: 55.0,
                     width: 57.0,
-                    height: 23.0,
+                    height: 19.0,
                 },
             ),
             LayoutRect {

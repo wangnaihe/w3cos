@@ -1698,25 +1698,6 @@ fn collapsed_table_part_block_edge_width(component: &Component, edge: usize) -> 
         .unwrap_or(own)
 }
 
-fn collapsed_empty_row_overlap(component: &Component) -> Option<f32> {
-    if component.style.display == WDisplay::TableRow
-        && component.style.visibility == WVisibility::Collapse
-    {
-        return Some(0.0);
-    }
-    if component.style.display != WDisplay::TableRow
-        || component
-            .children
-            .iter()
-            .any(|child| child.style.display == WDisplay::TableCell)
-    {
-        return None;
-    }
-    // An empty row contributes its used height between the neighboring grid
-    // lines. It has no cell border box to overlap with the following row.
-    Some(0.0)
-}
-
 fn shrink_to_fit_used_width(component: &Component) -> f32 {
     let outer_width = component_max_content_width(component);
     if component.style.float != WFloat::None
@@ -3191,17 +3172,18 @@ fn align_table_cell_baselines(layouts: &mut [(LayoutRect, usize)], flat: &[FlatN
             continue;
         };
         let padding = node.style.padding_lengths();
+        let border_scale = if node.style.border_collapse { 0.5 } else { 1.0 };
         let available_top = cell_rect.y
             + node
                 .style
                 .border_top_width
-                .unwrap_or(node.style.border_width)
+                .unwrap_or(node.style.border_width) * border_scale
             + padding.top;
         let available_bottom = cell_rect.y + cell_rect.height
             - node
                 .style
                 .border_bottom_width
-                .unwrap_or(node.style.border_width)
+                .unwrap_or(node.style.border_width) * border_scale
             - padding.bottom;
         let delta = match alignment {
             WAlignSelf::Center => {
@@ -3535,13 +3517,17 @@ fn project_auto_table_child_heights(
     viewport_w: f32,
     viewport_h: f32,
 ) {
-    fn collect_collapsed_floors(component: &Component, floors: &mut Vec<f32>) {
+    fn collect_collapsed_floors(component: &Component, floors: &mut Vec<(f32, f32)>) {
         let floor = if matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
             && component.style.border_collapse && matches!(component.style.height, WDim::Auto) {
             collapsed_table_specified_rows_min_height(component)
                 .map(|height| height + table_caption_intrinsic_height(component)).unwrap_or(0.0)
         } else { 0.0 };
-        floors.push(floor);
+        let bottom_half = if matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
+            && component.style.border_collapse {
+            collapsed_table_part_block_edge_width(component, 2) / 2.0
+        } else { 0.0 };
+        floors.push((floor, bottom_half));
         for child in &component.children { collect_collapsed_floors(child, floors); }
     }
     // Reuse the same grid minimum as tree construction; post-layout float
@@ -3627,7 +3613,7 @@ fn project_auto_table_child_heights(
             } else { 0.0 };
             rect.y - relative_y + rect.height + margin - container_y + bottom_edge
         }).reduce(f32::max).unwrap_or(0.0);
-        declared_floor.max(float_floor).max(collapsed_floors[index])
+        declared_floor.max(float_floor).max(collapsed_floors[index].0)
     };
     for (table, node) in flat.iter().enumerate().rev() {
         if !matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
@@ -3658,7 +3644,7 @@ fn project_auto_table_child_heights(
         let bottom_edge = if node.style.border_collapse {
             // Collapsed tables have no padding. The row grid ends on the
             // border center, so its outer box adds only the remaining half.
-            border_bottom / 2.0
+            collapsed_floors[table].1
         } else {
             padding.bottom + border_bottom + effective_table_border_spacing(node.style).1
         };
@@ -6508,36 +6494,12 @@ fn project_table_column_background_rects(
             continue;
         }
         let mut bounds = vec![None::<LayoutRect>; column_count];
-        for (row, (row_index, cells)) in rows.iter().enumerate() {
+        for (row_index, cells) in &rows {
             let mut row_bounds = None::<LayoutRect>;
             for (column, (_, cell)) in cells.iter().enumerate() {
-                let top = if row == 0 {
-                    collapsed_layout_edge_width(table_node.style, 0) / 2.0
-                } else {
-                    rows[row - 1].1.get(column).map_or(0.0, |(_, previous)| {
-                        (previous.y + previous.height - cell.y).max(0.0) / 2.0
-                    })
-                };
-                let bottom = if row + 1 == rows.len() {
-                    collapsed_layout_edge_width(table_node.style, 2) / 2.0
-                } else {
-                    rows[row + 1].1.get(column).map_or(0.0, |(_, next)| {
-                        (cell.y + cell.height - next.y).max(0.0) / 2.0
-                    })
-                };
-                let projected = if table_node.style.border_collapse {
-                    // Inline cell rects already follow the shared grid;
-                    // retain their bounds for every table-part background.
-                    // Vertical rects still carry the legacy painted halves.
-                    LayoutRect {
-                        x: cell.x,
-                        y: cell.y + top,
-                        width: cell.width,
-                        height: (cell.height - top - bottom).max(0.0),
-                    }
-                } else {
-                    *cell
-                };
+                // Collapsed cell rectangles already end on grid-line centers
+                // on both axes. Table-part backgrounds retain that full grid.
+                let projected = *cell;
                 row_bounds = Some(row_bounds.map_or(projected, |rect| union(rect, projected)));
                 bounds[column] =
                     Some(bounds[column].map_or(projected, |rect| union(rect, projected)));
@@ -7024,6 +6986,7 @@ fn build_taffy_tree(
         style.max_size.width = Dimension::percent(1.0);
     }
     if owns_table_layout && comp.style.border_collapse {
+        style.box_sizing = BoxSizing::BorderBox;
         // Collapsed outer borders are centered on the table grid edge and
         // participate in the same conflict set as boundary cell borders. The
         // boundary cells carry the resolved paint; the table wrapper must not
@@ -7090,7 +7053,7 @@ fn build_taffy_tree(
         let padding = comp.style.padding_lengths();
         let (spacing_x, spacing_y) = effective_table_border_spacing(&comp.style);
         let padding_top = if comp.style.border_collapse {
-            0.0
+            collapsed_table_part_block_edge_width(comp, 0) / 2.0
         } else {
             padding.top
         };
@@ -7100,7 +7063,7 @@ fn build_taffy_tree(
             padding.right
         };
         let padding_bottom = if comp.style.border_collapse {
-            0.0
+            collapsed_table_part_block_edge_width(comp, 2) / 2.0
         } else {
             padding.bottom
         };
@@ -8257,6 +8220,32 @@ fn build_taffy_tree(
                             || !matches!(comp.style.min_height, WDim::Auto)),
                         active_border_spacing,
                     )?;
+                    if c.style.display == WDisplay::TableCell && c.style.border_collapse
+                        && !matches!(c.style.height, WDim::Auto | WDim::Percent(_))
+                        && let Some(height) = c.style.height.resolve(viewport_h, ROOT_FONT_SIZE,
+                            c.style.font_size, viewport_w, viewport_h)
+                    {
+                        // Cell height is a minimum grid-box height, not a
+                        // content height plus another round of border halves.
+                        let edges = (c.style.border_top_width.unwrap_or(c.style.border_width)
+                            + c.style.border_bottom_width.unwrap_or(c.style.border_width)) / 2.0
+                            + [c.style.padding.top, c.style.padding.bottom].into_iter()
+                                .map(|padding| resolve_spacing_for_layout(padding, child_containing_width,
+                                    c.style.font_size, viewport_w, viewport_h)).sum::<f32>();
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.size.height = Dimension::auto();
+                        let cell_floor = if c.style.box_sizing == WBoxSizing::BorderBox {
+                            height
+                        } else { (height - edges).max(0.0) };
+                        let declared_minimum = if matches!(c.style.min_height, WDim::Percent(_))
+                            && own_definite_height_basis.is_none() { None } else {
+                            c.style.min_height.resolve(own_definite_height_basis.unwrap_or(viewport_h),
+                                ROOT_FONT_SIZE, c.style.font_size, viewport_w, viewport_h)
+                        };
+                        child_style.min_size.height = Dimension::length(cell_floor
+                            .max(declared_minimum.unwrap_or(0.0)));
+                        tree.set_style(node, child_style)?;
+                    }
                     if c.style.float == WFloat::Right
                         && matches!(comp.style.display,
                             WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
@@ -8482,68 +8471,22 @@ fn build_taffy_tree(
                             || active_table_tracks
                                 .and_then(|tracks| tracks.get(next_column))
                                 .is_some_and(|width| width.is_sign_negative());
-                        collapsed_overlap = Some((
-                            true,
+                        collapsed_overlap = Some(
                             if collapsed_column {
                                 0.0
                             } else {
                                 table_cell_edge_width(c, 1).max(table_cell_edge_width(next, 3))
                             },
-                        ));
-                    } else if comp.style.border_collapse
-                        && (matches!(
-                            comp.style.display,
-                            WDisplay::Table
-                                | WDisplay::InlineTable
-                                | WDisplay::TableRowGroup
-                                | WDisplay::TableHeaderGroup
-                                | WDisplay::TableFooterGroup
-                        ) || (comp.style.display == WDisplay::Block
-                            && comp.children.iter().any(|child| {
-                                matches!(
-                                    child.style.display,
-                                    WDisplay::TableRowGroup
-                                        | WDisplay::TableHeaderGroup
-                                        | WDisplay::TableFooterGroup
-                                )
-                            })))
-                        && matches!(
-                            c.style.display,
-                            WDisplay::TableRow
-                                | WDisplay::TableRowGroup
-                                | WDisplay::TableHeaderGroup
-                                | WDisplay::TableFooterGroup
-                        )
-                        && let Some(next) = comp.children[source_index + 1..].iter().find(|next| {
-                            matches!(
-                                next.style.display,
-                                WDisplay::TableRow
-                                    | WDisplay::TableRowGroup
-                                    | WDisplay::TableHeaderGroup
-                                    | WDisplay::TableFooterGroup
-                            )
-                        })
-                    {
-                        let boundary_width = collapsed_table_part_block_edge_width(c, 2)
-                            .max(collapsed_table_part_block_edge_width(next, 0));
-                        collapsed_overlap = Some((
-                            false,
-                            collapsed_empty_row_overlap(c)
-                                .unwrap_or(boundary_width),
-                        ));
+                        );
                     }
-                    if let Some((inline, overlap)) = collapsed_overlap
+                    if let Some(overlap) = collapsed_overlap
                         && overlap > 0.0
                     {
                         let mut child_style = tree.style(node)?.clone();
-                        if inline {
-                            if comp.style.direction == w3cos_std::style::TextDirection::Rtl {
-                                child_style.margin.left = LengthPercentageAuto::length(-overlap);
-                            } else {
-                                child_style.margin.right = LengthPercentageAuto::length(-overlap);
-                            }
+                        if comp.style.direction == w3cos_std::style::TextDirection::Rtl {
+                            child_style.margin.left = LengthPercentageAuto::length(-overlap);
                         } else {
-                            child_style.margin.bottom = LengthPercentageAuto::length(-overlap);
+                            child_style.margin.right = LengthPercentageAuto::length(-overlap);
                         }
                         tree.set_style(node, child_style)?;
                     }
@@ -8597,6 +8540,37 @@ fn build_taffy_tree(
             };
         let mut child_nodes: Vec<NodeId> =
             child_nodes.into_iter().map(|(_, _, node)| node).collect();
+        if comp.style.display == WDisplay::Block && comp.style.border_collapse
+            && !comp.children.is_empty()
+            && comp.children.iter().all(|child| matches!(child.style.display,
+                WDisplay::TableRow | WDisplay::TableRowGroup
+                    | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup))
+        {
+            // Native component trees can contain table parts without the DOM
+            // fixup pass. Keep the principal block intact and place its grid
+            // inside a context-free anonymous table, including outer halves.
+            let half = |edge| {
+                let boundary = if edge == 0 { comp.children.first() } else { comp.children.last() };
+                boundary.map(|child| collapsed_table_part_block_edge_width(child, edge))
+                    .unwrap_or(0.0) / 2.0
+            };
+            let (left, right) = comp.children.iter()
+                .map(collapsed_table_outer_inline_edges)
+                .fold((0.0_f32, 0.0_f32), |(left, right), (a, b)| (left.max(a), right.max(b)));
+            let width = comp.children.iter().map(component_max_content_width)
+                .reduce(f32::max).unwrap_or(0.0);
+            let anonymous = tree.new_with_children(Style {
+                display: taffy::Display::Flex, flex_direction: FlexDirection::Column,
+                box_sizing: BoxSizing::BorderBox,
+                size: Size { width: Dimension::length(width),
+                    height: Dimension::auto() },
+                padding: Rect { top: LengthPercentage::length(half(0)),
+                    bottom: LengthPercentage::length(half(2)),
+                    left: LengthPercentage::length(left), right: LengthPercentage::length(right) },
+                ..Style::default()
+            }, &child_nodes)?;
+            child_nodes = vec![anonymous];
+        }
         if let Some(group_width) = rescue_overwide_first_pair {
             // Inline layout does not break before the first box on an empty
             // line. A following negative-margin box can therefore pull that
@@ -9982,6 +9956,9 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         margin.left = LengthPercentageAuto::auto();
     }
 
+    let block_border_scale = if s.border_collapse && s.display == WDisplay::TableCell {
+        0.5
+    } else { 1.0 };
     Style {
         display,
         box_sizing: match s.box_sizing {
@@ -10089,9 +10066,9 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             left: to_taffy_spacing(s.padding.left, s.font_size, viewport_w, viewport_h),
         },
         border: Rect {
-            top: LengthPercentage::length(s.border_top_width.unwrap_or(s.border_width)),
+            top: LengthPercentage::length(s.border_top_width.unwrap_or(s.border_width) * block_border_scale),
             right: LengthPercentage::length(s.border_right_width.unwrap_or(s.border_width)),
-            bottom: LengthPercentage::length(s.border_bottom_width.unwrap_or(s.border_width)),
+            bottom: LengthPercentage::length(s.border_bottom_width.unwrap_or(s.border_width) * block_border_scale),
             left: LengthPercentage::length(s.border_left_width.unwrap_or(s.border_width)),
         },
         margin,
@@ -11414,7 +11391,8 @@ mod tests {
 
         let layout = compute(&table, 800.0, 600.0).unwrap();
         let rect = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
-        assert_eq!((rect(2).y, rect(5).y, rect(6).y), (0.0, 20.0, 22.0));
+        // Chromium's row boxes start/end on collapsed grid-line centers.
+        assert_eq!((rect(2).y, rect(5).y, rect(6).y), (5.0, 25.0, 27.0));
         assert_eq!(rect(0).height, 52.0);
     }
 
@@ -16518,6 +16496,10 @@ mod tests {
         }
         assert_eq!(bounds(2), (10.0, 40.0));
         assert_eq!(bounds(3), (50.0, 40.0));
+        for index in [1, 2, 3, 4, 5] {
+            let rect = layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+            assert_eq!((rect.y, rect.height), (0.0, 60.0));
+        }
     }
 
     #[test]
@@ -18037,6 +18019,25 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_top_border_row_rect_begins_at_grid_line_center() {
+        let table = Component::boxed(Style { display: WDisp::Table,
+            border_collapse: true, ..Style::default() }, vec![
+            Component::row(Style { display: WDisp::TableRow,
+                border_collapse: true, height: WDim::Px(96.0),
+                ..Style::default() }, vec![
+                Component::boxed(Style { display: WDisp::TableCell,
+                    border_collapse: true, width: WDim::Px(50.0),
+                    border_top_width: Some(96.0), ..Style::default() }, vec![]),
+            ]),
+        ]);
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(rect(0).height, 144.0);
+        assert_eq!(rect(1).y - rect(0).y, 48.0);
+        assert_eq!(rect(1).height, 96.0);
+    }
+
+    #[test]
     fn collapsed_table_adds_outer_half_border_to_specified_row_height() {
         let cell = Component::boxed(
             Style {
@@ -18118,10 +18119,9 @@ mod tests {
                 .0
         });
 
-        assert_eq!(
-            wrapper_rect.height,
-            group_rects.iter().map(|rect| rect.height).sum::<f32>() - 16.0
-        );
+        assert_eq!(wrapper_rect.height, 68.0);
+        assert_eq!(group_rects.map(|rect| (rect.y, rect.height)),
+            [(4.0, 20.0), (24.0, 20.0), (44.0, 20.0)]);
     }
 
     #[test]

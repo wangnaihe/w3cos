@@ -3110,6 +3110,75 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   still dates to 2026-08-22; final same-clean-SHA full6548 acceptance remains
   open, as does the observed top-row coordinate difference.
 
+### Normalize collapsed block-axis grid-line centers
+
+- Based on `6b322346f991fa5e88edbb3b942c9712bf1443bd`, the new exact-name
+  `collapsed_top_border_row_rect_begins_at_grid_line_center` regression is
+  RED at row y=0 versus Chromium's y=48, despite matching the 144px outer
+  height. The fix represents cell block-axis borders as half-width layout
+  edges, includes the outer grid halves in the table wrapper and expands
+  the paint rectangle back to the full border footprint. Obsolete vertical
+  negative-margin overlap is removed; horizontal conflict handling remains.
+- Auto-height settlement also preserves the resolved descendant bottom
+  half-border for auto rows. Explicit cell heights remain minimum grid-box
+  heights, and cell baseline alignment uses the same half-border geometry.
+  Native block trees containing only rows/row groups receive a context-free
+  anonymous table without changing the principal block's own CSS box.
+- Isolated Chromium 141 fixtures establish the empty-row coordinates
+  (5,25,27) at outer height 52, and the three anonymous groups at
+  (y,height)=(4,20),(24,20),(44,20), outer height 68. The former unit
+  expectations encoded full-border overlap and are corrected to those
+  browser measurements. Exact regressions are GREEN: row center 2m50s,
+  equal-border bottom edge 2m41s, inline-table baseline 3m05s and anonymous
+  wrapper 3m44s. The final unit executable passes 77/82 exact-name table or
+  collapsed checks; five previously recorded failures remain. Receipt:
+  `target/wpt-targeted/collapsed-grid-center-v2-unit-neighbors.json`.
+- Intermediate runner `collapsed-grid-center-v2` builds in 2m25s, SHA256
+  `a89337318eb05acdcef30aed012f5771949f486786a1c52f007fdbbbfa81f766`.
+  All 23 eight-case reports finish 180/184 PASS; four old background PASS
+  cases regress at start 5553. Full ordered report comparison changes only
+  those four cases. The candidate is held, not published as qualified.
+- Chromium's column-background fixture has table height 103 and column
+  (y,height)=(17,97), whereas the intermediate native result is 99 and
+  (19,91). Table-part projection still removed legacy block-axis border
+  halves after cell geometry had switched to grid centers. Both table-part
+  and cell backgrounds now retain the complete center-bounded cell box;
+  the projection unit gains block-axis assertions (GREEN in 4m07s).
+  Intermediate `collapsed-grid-center-v3` builds in 6m08s including its
+  preceding unit-build lock wait, SHA256
+  `54c9cd4bee576aee4f4917e68b9f6af7f3b088841ee5198342554dd6860215d3`.
+  Start 5553 recovers to 7/8; only the cell image case remains, at 2130
+  pixels. The background-image padding-origin calculation still uses full
+  block-axis borders. It now halves all four resolved cell borders; its
+  fixture uses the measured center-bounded cell box (138,55,57,19).
+  The corrected paint-background fixture is rebuilt and GREEN in 5m00s
+  including its preceding runner-build lock wait. At this intermediate
+  stage, final image-origin unit and pixel qualification are pending;
+  earlier prototype receipts do not qualify the later source.
+- Final runner `collapsed-grid-center-v4` builds in 4m22s including its
+  unit-build lock wait, SHA256
+  `d2bd2e43ffbde41dd5beb84849e7e784dfeae33fe38f2b136a4cee4cd3a7b881`.
+  The original background batch returns to 8/8, all exact-zero pixel diffs.
+  All 23 eight-case batches finish 184/184 PASS. Full ordered test-object
+  comparison with `collapsed-row-floor-v1` reports no differences, with no
+  old PASS lost; receipt `collapsed-grid-center-v4-report-comparison.json`.
+  The final native column fixture now agrees with Chromium: table height
+  103, column y=17 and height 97. Receipts use the pinned revision, frozen
+  suite and its 800x600 viewport. These overlapping executions do not
+  constitute a full6548 run or a global remaining count.
+- The final image-origin regression is rebuilt and GREEN in 5m04s including
+  its runner-build lock wait. The final executable passes 87/92 exact-name
+  table, collapsed paint and image-origin checks; the same five recorded
+  table failures remain, with no additional failure. Receipt:
+  `collapsed-grid-center-v4-unit-neighbors.json`. Static `git diff --check`
+  passes. The parent size check excludes vendor and is not represented as
+  a W3COS size gate. No whole-runtime gate or full6548 acceptance is claimed.
+- Fresh eight-case probes at starts 0 and 8 pass 16/16; start 16 is 4/8,
+  with two dynamic-inline containing-block assertion failures and two
+  hypothetical abspos reftest failures. These are current failure-subset
+  evidence, not a current global remaining count. Full6548 acceptance is
+  still open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

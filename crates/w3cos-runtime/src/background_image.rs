@@ -530,10 +530,11 @@ fn background_box(style: &Style, rect: LayoutRect, kind: BoxKind) -> LayoutRect 
             .max(0.0),
     ];
     if style.border_collapse && style.display == w3cos_std::style::Display::TableCell {
-        // Inline cell layout uses grid-line centers, so the padding edge is
+        // Cell layout uses grid-line centers, so the padding edge is
         // only half a collapsed border inside that rect (not a full border).
-        borders[1] *= 0.5;
-        borders[3] *= 0.5;
+        for border in &mut borders {
+            *border *= 0.5;
+        }
     }
     let padding = style.padding_lengths();
     let padding_edges = [
@@ -1249,7 +1250,7 @@ mod tests {
             border_left_width: Some(2.0),
             ..Style::default()
         };
-        let rect = LayoutRect { x: 138.0, y: 53.0, width: 57.0, height: 23.0 };
+        let rect = LayoutRect { x: 138.0, y: 55.0, width: 57.0, height: 19.0 };
         assert_eq!(background_box(&style, rect, BoxKind::Border), rect);
         assert_eq!(background_box(&style, rect, BoxKind::Padding),
             LayoutRect { x: 139.0, y: 57.0, width: 55.0, height: 15.0 });
@@ -1258,7 +1259,7 @@ mod tests {
             LayoutRect { x: 141.0, y: 57.0, width: 53.0, height: 15.0 });
         style.border_collapse = false;
         assert_eq!(background_box(&style, rect, BoxKind::Padding),
-            LayoutRect { x: 144.0, y: 57.0, width: 49.0, height: 15.0 });
+            LayoutRect { x: 144.0, y: 59.0, width: 49.0, height: 11.0 });
     }
 
     fn install_image(source: &str, width: u32, height: u32) {
