@@ -3215,6 +3215,38 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   the NBSP repair, not the five remaining focused failures or full6548.
   Static `git diff --check` passes. All source changes remain within W3COS.
 
+### Use the inline line-box origin for descendant positioning
+
+- Based on published `082b9c721e068ce02d25908b288a736be512ddc5`, the exact
+  existing `block_static_position_follows_a_decorated_inline_fragment` test
+  is RED y=142 versus 100. The 42px excess is the inline half-leading for
+  16px text at 100px line height. Receipt `inline-static-line-origin-red.log`.
+- Ordinary descendants already recurse from the inline line-box origin,
+  subtracting the paint/em box's half-leading. The relative containing box
+  passed to positioning omitted that subtraction. It now uses the same
+  origin, without changing authored line height or adding case-specific CSS.
+- WPT `static-inside-inline-002.html` and the existing unit require a 100px
+  static offset; the published runner differs by 8400 pixels. Isolated
+  Chromium 141 instead reports a 0px relative offset for this fixture.
+  This discrepancy is retained explicitly: pinned WPT is the acceptance
+  criterion here, and browser equivalence is not claimed for this case.
+- Unit GREEN and the four eight-case abspos batches remain pending for this
+  candidate. Existing `nbsp-static-v1` receipts are the comparison baseline
+  (27/32 PASS, five FAIL). Final full6548 acceptance remains open; the parent
+  size check excludes vendor and is not a W3COS size gate.
+
+  The existing regression is GREEN in 2m34s. Exact-name positioning/break
+  checks improve from 31/34 to 32/34, with only the decorated-inline status
+  changed. Receipt `inline-line-origin-v1-unit-neighbors.json`.
+  Optimized runner builds in 4m23s including its unit-build lock wait,
+  SHA256 `d2bb4d073ec417bffb4305eea055ec342b3367525c5dd6fec9d9fb8676310810`.
+  Pinned starts 0,8,16,24 finish 28/32 PASS and four FAIL. Ordered full test
+  comparison changes only `static-inside-inline-002.html`, from 8400 pixels
+  to exact zero; every other report is identical and no old PASS is lost.
+  Receipt `inline-line-origin-v1-comparison.json`. Static `git diff --check`
+  passes. This closes the pinned WPT defect, not the documented Chromium
+  discrepancy or the remaining focused/global failures.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

@@ -9090,7 +9090,10 @@ fn collect_layouts_fast(
 
     let child_relative_containing_block = LayoutRect {
         x: rect.x + layout.border.left + layout.padding.left,
-        y: rect.y + passive_inline_top_edge - passive_inline_alignment_offset
+        // Positioning uses the same line-box origin as ordinary descendants,
+        // not the inline paint/em box shifted down by its half-leading.
+        y: rect.y + passive_inline_top_edge - passive_inline_half_leading
+            - passive_inline_alignment_offset
             + layout.border.top + layout.padding.top,
         width: layout.content_box_width(),
         height: layout.content_box_height(),
