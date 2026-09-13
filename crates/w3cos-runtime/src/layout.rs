@@ -5095,6 +5095,16 @@ fn project_simple_float_margin_boxes(
                 child_index += child_count;
                 continue;
             }
+            if child.style.float == WFloat::None
+                && child.style.clear == WClear::None
+                && child.style.display == WDisplay::Inline
+                && !inline_line_has_in_flow_content(child)
+            {
+                // Collapsed empty inline content must not replace the last
+                // line's flow floor, especially a clearing forced break.
+                child_index += child_count;
+                continue;
+            }
             if child.style.float == WFloat::None && child.style.custom_properties.as_ref()
                 .and_then(|properties| properties.get("--w3cos-internal-anonymous-float-group"))
                 .is_some_and(|value| value == "1")
@@ -5115,7 +5125,7 @@ fn project_simple_float_margin_boxes(
                     let target_y = active_floats.iter().map(|(_, rect)| rect.y)
                         .fold(flow_floor, f32::max);
                     let delta_y = target_y - layouts[position].0.y;
-                    if delta_y < -f32::EPSILON {
+                    if delta_y.abs() > f32::EPSILON {
                         shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
                     }
                 }
@@ -5188,6 +5198,9 @@ fn project_simple_float_margin_boxes(
                 && previous_child.style.float == WFloat::None
                 && !(matches!(previous_child.style.display,
                     WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable)
+                    && previous_child.style.clear == WClear::None
+                    && !matches!(&previous_child.kind,
+                        ComponentKind::Text { content } if content == "\u{2028}")
                     && child.style.custom_properties.as_ref()
                         .and_then(|properties| properties.get("--w3cos-internal-left-float-after-inline"))
                         .is_some_and(|value| value == "1"))
@@ -5199,7 +5212,8 @@ fn project_simple_float_margin_boxes(
                 let previous_margin = previous_child.style.margin_lengths();
                 let child_margin = child.style.margin_lengths();
                 let trailing_leading = if previous_child.style.display == WDisplay::Inline
-                    && matches!(previous_child.kind, ComponentKind::Text { .. }) {
+                    && matches!(&previous_child.kind, ComponentKind::Text { content }
+                        if content != "\u{2028}") {
                     (previous_child.style.font_size * previous_child.style.line_height
                         - previous_child.style.font_size) * 0.5
                 } else { 0.0 };
@@ -5518,9 +5532,30 @@ fn project_simple_float_margin_boxes(
                         0.0
                     };
                     let static_y = current_y - relative_offset;
-                    let target_y = (static_y - leading_margin_group(child))
-                        .max(clearance_bottom)
-                        + relative_offset;
+                    let clearing_break = child.style.float == WFloat::None
+                        && child.style.display == WDisplay::Inline
+                        && matches!(&child.kind,
+                            ComponentKind::Text { content } if content == "\u{2028}");
+                    let target_y = if clearing_break {
+                        // A clearing BR advances the line bottom past floats,
+                        // not its top plus another full line-height. Synthetic
+                        // float-group height must not become normal-flow input.
+                        let flow_floor = previous_in_flow.and_then(|(index, previous_child)| {
+                            layout_position.get(&index).map(|position| {
+                                let rect = layouts[*position].0;
+                                rect.y - relative_shift(&previous_child.style).1 + rect.height
+                                    + resolve_spacing_for_layout(previous_child.style.margin.bottom,
+                                        content_box.map_or(0.0, |rect| rect.width),
+                                        previous_child.style.font_size, viewport_w, viewport_h)
+                            })
+                        }).unwrap_or_else(|| content_box.map_or(static_y, |rect| rect.y));
+                        let line_height = layouts[position].0.height;
+                        (flow_floor + line_height).max(clearance_bottom) - line_height
+                            + relative_offset
+                    } else {
+                        (static_y - leading_margin_group(child)).max(clearance_bottom)
+                            + relative_offset
+                    };
                     if (target_y - current_y).abs() > f32::EPSILON {
                         shift_subtree(
                             layouts,
@@ -5535,7 +5570,11 @@ fn project_simple_float_margin_boxes(
             if child.style.float != WFloat::None
                 && let Some(position) = layout_position.get(&child_index).copied()
             {
-                if ordinary_float_context && !imported_float_group
+                if ordinary_float_context
+                    && (!imported_float_group || previous_in_flow.is_some_and(|(_, prior)|
+                        prior.style.clear != WClear::None
+                            && matches!(&prior.kind,
+                                ComponentKind::Text { content } if content == "\u{2028}")))
                     && !active_floats.is_empty()
                     && let Some(containing) = content_box
                 {
@@ -5548,7 +5587,8 @@ fn project_simple_float_margin_boxes(
                             layout_position.get(&index).map(|position| {
                                 let rect = layouts[*position].0;
                                 let leading = if previous_child.style.display == WDisplay::Inline
-                                    && matches!(previous_child.kind, ComponentKind::Text { .. }) {
+                                    && matches!(&previous_child.kind, ComponentKind::Text { content }
+                                        if content != "\u{2028}") {
                                     (previous_child.style.font_size * previous_child.style.line_height
                                         - previous_child.style.font_size) * 0.5
                                 } else { 0.0 };
@@ -7698,6 +7738,38 @@ fn build_taffy_tree(
             );
         }
     }
+    let mixed_leading_margin_child = if mixed_inline_block_flex_fallback
+        && comp.style.float == WFloat::None
+        && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed)
+        && comp.style.resolved_overflow_x() == WOverflow::Visible
+        && comp.style.resolved_overflow_y() == WOverflow::Visible
+        && parent_display.is_some_and(|display|
+            matches!(display, WDisplay::Block | WDisplay::ListItem))
+        && comp.style.border_top_width.unwrap_or(comp.style.border_width) == 0.0
+        && resolve_spacing_for_layout(comp.style.padding.top, containing_width,
+            comp.style.font_size, viewport_w, viewport_h) == 0.0
+    {
+        comp.children.iter().enumerate().find(|(_, child)| {
+            child.style.float == WFloat::None
+                && !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+                && child.style.display != WDisplay::None
+                && inline_line_has_in_flow_content(child)
+                && !child.style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.contains_key("--w3cos-internal-anonymous-float-group"))
+        }).filter(|(_, child)| child.style.clear == WClear::None
+            && matches!(child.style.display, WDisplay::Block | WDisplay::Flex
+                | WDisplay::Grid | WDisplay::ListItem | WDisplay::Table))
+            .map(|(index, child)| {
+                let parent_margin = resolve_spacing_for_layout(comp.style.margin.top,
+                    containing_width, comp.style.font_size, viewport_w, viewport_h);
+                let child_margin = resolve_spacing_for_layout(child.style.margin.top,
+                    containing_width, child.style.font_size, viewport_w, viewport_h);
+                let collapsed = parent_margin.max(child_margin).max(0.0)
+                    + parent_margin.min(child_margin).min(0.0);
+                style.margin.top = LengthPercentageAuto::length(collapsed);
+                index
+            })
+    } else { None };
     if mixed_inline_block_flex_fallback {
         // Inline runs on either side of an in-flow block generate anonymous
         // block boxes. Wrapped flex lines model those runs without inserting
@@ -8603,6 +8675,11 @@ fn build_taffy_tree(
                         )
                     {
                         let mut child_style = tree.style(node)?.clone();
+                        if mixed_leading_margin_child == Some(source_index) {
+                            // Preserve CSS Block parent/first-child collapse
+                            // despite the internal Flex representation.
+                            child_style.margin.top = LengthPercentageAuto::length(0.0);
+                        }
                         child_style.size.width = Dimension::percent(1.0);
                         child_style.flex_basis = Dimension::percent(1.0);
                         child_style.flex_grow = 0.0;
@@ -15812,6 +15889,122 @@ mod tests {
         project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
         assert_eq!(layout[3].0.y, 10.0);
         assert_eq!(layout[0].0.height, 15.0);
+    }
+
+    #[test]
+    fn mixed_float_clear_flow_preserves_leading_block_margin_collapse() {
+        for mixed_flow in [false, true] {
+            let paragraph = Component::row(Style { display: WDisp::Flex,
+                height: WDim::Px(19.2), margin: w3cos_std::style::Edges {
+                    top: WSpacing::Px(16.0), bottom: WSpacing::Px(16.0),
+                    ..Default::default() }, ..Style::default() },
+                vec![Component::text("Test", Style::default())]);
+            let mut children = vec![paragraph];
+            if mixed_flow {
+                let mut group = Style { display: WDisp::Flex,
+                    width: WDim::Percent(100.0), ..Style::default() };
+                group.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-anonymous-float-group".into(), "1".into());
+                children.push(Component::row(group, vec![Component::boxed(Style {
+                    display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(50.0), height: WDim::Px(50.0),
+                    ..Style::default() }, vec![])]));
+                children.push(Component::text("\u{2028}", Style {
+                    display: WDisp::Inline, clear: w3cos_std::style::Clear::Both,
+                    width: WDim::Px(0.0), height: WDim::Px(19.2),
+                    ..Style::default() }));
+            } else {
+                children.push(Component::boxed(Style { display: WDisp::Block,
+                    width: WDim::Px(200.0), height: WDim::Px(200.0),
+                    ..Style::default() }, vec![]));
+            }
+            let body = Component::row(Style { display: WDisp::Block,
+                margin: w3cos_std::style::Edges { top: WSpacing::Px(8.0),
+                    right: WSpacing::Px(8.0), bottom: WSpacing::Px(8.0),
+                    left: WSpacing::Px(8.0) }, ..Style::default() }, children);
+            let root = Component::row(Style { display: WDisp::Block,
+                width: WDim::Px(800.0), ..Style::default() }, vec![body]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let paragraph = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+            assert_eq!(paragraph.y, 16.0, "mixed_flow={mixed_flow}");
+        }
+    }
+
+    #[test]
+    fn clearing_break_before_direct_floating_tables_keeps_the_flow_floor() {
+        let floating = || {
+            let mut style = Style { display: WDisp::Table, float: WFloat::Left,
+                width: WDim::Px(50.0), height: WDim::Px(50.0), flex_shrink: 0.0,
+                ..Style::default() };
+            style.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-left-float-after-inline".into(), "1".into());
+            Component::boxed(style, vec![])
+        };
+        let mut group_style = Style { display: WDisp::Flex, width: WDim::Percent(100.0),
+            flex_wrap: WWrap::Wrap, align_items: WAlign::FlexStart, ..Style::default() };
+        group_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-anonymous-float-group".into(), "1".into());
+        let mut children = vec![Component::row(group_style, (0..4).map(|_| floating()).collect()),
+            Component::text("\u{2028}", Style { display: WDisp::Inline,
+                clear: w3cos_std::style::Clear::Both, width: WDim::Px(0.0),
+                height: WDim::Px(19.2), ..Style::default() })];
+        children.extend((0..4).map(|_| floating()));
+        children.push(Component::text("\u{2028}", Style { display: WDisp::Inline,
+            clear: w3cos_std::style::Clear::Both, width: WDim::Px(0.0),
+            height: WDim::Px(19.2), ..Style::default() }));
+        children.push(children[0].clone());
+        for collapsed_empty_text in [false, true] {
+            let mut children = children.clone();
+            if collapsed_empty_text {
+                children.insert(2, Component::text("", Style {
+                    display: WDisp::Inline, ..Style::default() }));
+            }
+            let root = Component::boxed(Style { display: WDisp::Block,
+                width: WDim::Px(800.0), ..Style::default() }, children);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            for (first_float, row_y) in [(7, 50.0), (13, 100.0)] {
+                let first_float = first_float + usize::from(collapsed_empty_text);
+                for column in 0..4 {
+                    let rect = layout.iter().find(|(_, index)| *index == first_float + column).unwrap().0;
+                    assert_eq!((rect.x, rect.y), (column as f32 * 50.0, row_y),
+                        "column {column}, row_y={row_y}, collapsed_empty_text={collapsed_empty_text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_break_between_float_groups_does_not_add_a_second_strut() {
+        let mut group_style = Style { display: WDisp::Flex, width: WDim::Percent(100.0),
+            flex_wrap: WWrap::Wrap, align_items: WAlign::FlexStart, ..Style::default() };
+        group_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-anonymous-float-group".into(), "1".into());
+        let group = || Component::row(group_style.clone(), (0..4).map(|_| {
+            Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(50.0), height: WDim::Px(50.0), flex_shrink: 0.0,
+                ..Style::default() }, vec![])
+        }).collect());
+        let mut children = Vec::new();
+        for row in 0..4 {
+            if row > 0 {
+                children.push(Component::text("\u{2028}", Style {
+                    display: WDisp::Inline, clear: w3cos_std::style::Clear::Both,
+                    width: WDim::Px(0.0), height: WDim::Px(19.2), ..Style::default()
+                }));
+            }
+            children.push(group());
+        }
+        let root = Component::boxed(Style { display: WDisp::Block,
+            width: WDim::Px(800.0), ..Style::default() }, children);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        for row in 0..4 {
+            for column in 0..4 {
+                let index = 2 + row * 6 + column;
+                let rect = layout.iter().find(|(_, candidate)| *candidate == index).unwrap().0;
+                assert_eq!((rect.x, rect.y), (column as f32 * 50.0, row as f32 * 50.0),
+                    "row {row}, column {column}");
+            }
+        }
     }
 
     #[test]

@@ -10715,6 +10715,40 @@ mod image_component_tests {
     }
 
     #[test]
+    fn clear_breaks_between_floating_tables_keep_their_clearance_identity() {
+        use w3cos_std::style::{Clear, Float};
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("table", &[("float", "left")]);
+        crate::stylesheet::register_rule("br", &[("clear", "both")]);
+        let mut document = Document::new();
+        for row in 0..4 {
+            if row > 0 {
+                let br = document.create_element("br");
+                document.body().append_child(&mut document, br);
+            }
+            for _ in 0..4 {
+                let table = document.create_element("table");
+                let tr = document.create_element("tr");
+                let td = document.create_element("td");
+                tr.append_child(&mut document, td);
+                table.append_child(&mut document, tr);
+                document.body().append_child(&mut document, table);
+            }
+        }
+        fn count(component: &w3cos_std::Component) -> (usize, usize) {
+            let is_break = matches!(&component.kind,
+                w3cos_std::ComponentKind::Text { content } if content.contains('\u{2028}'));
+            if is_break { assert_eq!(component.style.clear, Clear::Both); }
+            component.children.iter().map(count).fold(
+                (usize::from(is_break), usize::from(component.style.float == Float::Left)),
+                |(breaks, floats), (next_breaks, next_floats)|
+                    (breaks + next_breaks, floats + next_floats))
+        }
+        assert_eq!(count(&document.to_component_tree()), (3, 16));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn float_hoisting_keeps_the_positioned_inline_ancestor() {
         use w3cos_std::style::{Display, Float, Position, Style};
         let absolute = w3cos_std::Component::boxed(Style {

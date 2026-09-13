@@ -4194,6 +4194,21 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Complete comparison, clean-SHA replay and full6548 closure remain pending.
   No candidate commit/push has occurred.
 
+- Production color-owner build is terminal PASS in2m06s. Strict batch488
+  remains6/8 with all eight complete results unchanged from the published
+  initial-none records. Batch624 remains7/8; only failure626 improves
+  52740 to43940 differing pixels, still strict FAIL. Pure red pixels drop
+  from13850 to0, but this is partial ink evidence, not case acceptance.
+  Receipts: `batch-488-collapsed-color-owner-v1/results.json` and
+  `batch-624-collapsed-color-owner-v1/results.json`.
+- Same-binary actual/reference layout dumps additionally prove top-margin
+  mismatch: actual paragraph y24 and first float y59.2, reference paragraph
+  y16 and green square y51.2. Thus the earlier Chromium top-position
+  difference also affects the native reftest, not merely browser typography.
+  Actual/ref frame and logs: `border-color-owner-626-v1` and `-v1-ref`.
+  Flow grouping, margin collapse and BR clear remain to diagnose/fix. No
+  completed WPT qualification, candidate commit or push is claimed.
+
 - While that qualification remains live, index626 diagnostic evidence shows
   multiple independent gaps, not only color-owner precedence. Actual frame
   and layout receipt `border-color-owner-626-initial-none-v1-layout.log`
@@ -4218,6 +4233,233 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
 - User authorizes small scoped commit/normal main push. Fetch confirms
   remote main still equals4e817e0. Clean-SHA replay is required before push;
   failure626 and existing font/ink failures remain open.
+
+### Collapsed color-owner precedence (candidate after 467bfee)
+
+- Published main is `467bfeed9cf58f4ee7b8b8a4ee776453e1c06237`.
+  Clean-SHA replay624/616/5593 is 7/8, 8/8, 8/8 with complete objects
+  unchanged: `initial-border-none-467bfee-clean-replay.json`. Normal push
+  and remote ref verification completed; current worktree was clean.
+- Exact PaintArtifact RED runs one failing test:
+  `paint_artifact::tests::collapsed_column_color_defers_to_cell_and_row_owners`.
+  The column retains independent unspecified side widths (falling back to
+  authored25px) instead of zero after ownership transfer; later cell-owner
+  iteration was not reached. Receipt: `collapsed-color-owner-real-red.log`.
+- Candidate includes visible columns/groups in the existing shared boundary
+  resolution and orders table parts by row, row-group, column, column-group
+  precedence. Equal-width edges retain the existing higher-priority cell or
+  part color; cells own the resulting ink and source rings are cleared.
+  The GREEN test now covers column/column-group versus cell/row ownership.
+  Exact GREEN build is live; no GREEN or production pixel claim yet.
+- Floating-table/BR-clear geometry failure in626 remains independently open,
+  along with font/ink debt. No commit/push of the current candidate. Source
+  is frozen during its exact test build; full6548 acceptance remains unproven.
+
+- Exact color-owner GREEN is terminal PASS, reaching all four column/group
+  and cell/row combinations: `collapsed-color-owner-green-v1.log`.
+  Expanded isolated runtime border/collapsed/hidden neighbors pass48/48;
+  the prior46 passing names remain passing:
+  `collapsed-color-owner-v1-runtime-neighbors.json`. This is not whole-module
+  green or native WPT pixel proof. Production build is now live:
+  `collapsed-color-owner-v1-production-build.log`. Source remains frozen;
+  recent column corner pixels and failure626 need production verification.
+  No candidate commit/push has occurred.
+
+- Flow investigation adds real DOM test
+  `document::image_component_tests::clear_breaks_between_floating_tables_keep_their_clearance_identity`.
+  All three clear-both breaks and16 floating-table identities survive
+  lowering. The first cargo selector used the wrong module and ran0 tests;
+  `floating-table-clear-identity-red.log` is not RED/PASS evidence. After
+  exe `--list` verification, the exact real test runs1 and PASS:
+  `floating-table-clear-identity-real-test.log`. This excludes identity loss
+  in that minimal shape, not every styled/coalesced DOM path.
+- Added layout test with four50px floats per anonymous group and three
+  clear-both forced-break markers. Expected grid positions follow the
+  isolated Chromium50px clearance geometry; exact test compilation is live:
+  `floating-group-clear-real-test.log`. No outcome or fix is claimed before
+  terminal execution. Margin-collapse mismatch remains independently open.
+
+- Clearing-group exact test is now terminal RED, runs1 test and fails at
+  row1 column0: y69.2 versus required50. Later rows were not reached.
+  Receipt: `floating-group-clear-real-test.log`. Candidate clear handling
+  constrains the forced-break line bottom against active float bottoms,
+  deriving its floor from preceding normal-flow content rather than the
+  synthetic group height. Ordinary break strut height is retained. Exact
+  GREEN compilation is live: `floating-group-clear-green-v1.log`. No GREEN,
+  neighbor, production pixel or case626 completion claim yet. No commit/push.
+
+- Clearing-group exact GREEN is terminal PASS and reaches all16 grid
+  positions: `floating-group-clear-green-v1.log`. Expanded isolated runtime
+  float/clear/strut/border/collapsed selection is130/131; all48 prior passing
+  names still pass. The initial selection omitted one prior hidden-paint
+  name; that was a verifier coverage mismatch, not a lost execution PASS.
+  The missing exact test was executed and merged before sealing:
+  `floating-group-clear-v1-runtime-neighbors.json` has no lost prior PASS.
+- Newly observed failing unit
+  `leading_float_margin_does_not_collapse_with_its_containing_block` reports
+  y8 versus80. Its fixture has no clear declarations, so the changed clearing
+  branch is not directly implicated; no before execution was captured, so
+  neither baseline failure nor introduced regression is claimed. Assertion
+  remains unchanged and this is not whole-module green.
+- Production runner build is live:
+  `floating-group-clear-v1-production-build.log`. Current source remains
+  frozen for actual626 and neighbor pixel verification. Margin collapse,
+  the unit above and full6548 closure remain open. No candidate commit/push.
+
+- Clearing-group production build is terminal PASS. Batch624 stays7/8;
+  failure626 still43940 differing pixels, so the all-group unit GREEN did
+  not establish real-page improvement. Same-binary dump shows BR26 moves
+  y109.2 to90, while following direct floating tables remain y128.4; later
+  clear markers also move but tables retain wrong bands. Receipts:
+  `batch-624-floating-group-clear-v1/results.json` and
+  `border-color-owner-626-clear-v1-layout.log`/actual frame.
+- Added separate layout test for the observed mixed shape: one anonymous
+  group, a clear-both break and four direct floating tables carrying the
+  after-inline source marker. Exact compilation is live:
+  `direct-floating-table-clear-real-test.log`; no outcome claimed yet.
+  Source is frozen. No completed pixel qualification or candidate push.
+
+- Mixed direct-floating-table exact test is terminal RED, runs1 test and
+  fails at the first direct table; receipt:
+  `direct-floating-table-clear-real-test.log`. Candidate restricts the
+  after-inline exemption to non-clearing/non-forced prior inline content.
+  A forced-break marker already owns a full line strut, so the following
+  float no longer adds text half-leading to that marker. Exact GREEN build
+  is live: `direct-floating-table-clear-green-v1.log`. No GREEN or real-page
+  pixel improvement is claimed yet. Other margin/flow gaps remain open;
+  source frozen during build and no candidate commit/push.
+
+- The first mixed-table candidate is terminal FAIL: `(200, 48.4)` instead
+  of `(0, 50)`, unchanged from RED. The diagnostic rerun also fails and
+  records the clearing break at y30.8, height19.2 (bottom50), while all
+  four subsequent direct floats remain at y48.4. Receipts:
+  `direct-floating-table-clear-green-v1.log` and
+  `direct-floating-table-clear-diagnostic-v1.log`. This proves the break
+  clearance itself is correct in this minimal shape; imported-group mode
+  skips the subsequent ordinary float flow-floor settlement. The next
+  candidate enables that settlement after a clearing forced break, without
+  adding ordinary-text half-leading to the break. Exact validation pending;
+  no production pixel improvement or candidate publication claimed.
+
+- The second mixed-table candidate is terminal GREEN: exactly1 test passed,
+  all four direct tables meet the unchanged `(column*50, 50)` assertion.
+  Receipt: `direct-floating-table-clear-green-v2.log` (build2m31s). This is
+  minimal layout evidence, not a WPT pixel PASS. The132-test isolated
+  neighbor replay and production runner build are started; source frozen.
+
+- Second-candidate neighbors finish132 executions,131PASS and the same
+  previously observed leading-float-margin failure; no prior PASS lost.
+  Production build succeeds, but624..631 remain7PASS/1FAIL with every
+  complete result object unchanged (`floating-group-clear-v2-pixel-comparison.json`).
+  Actual626 dump shows empty Inline Text nodes27/52 following clearing
+  breaks26/51. They overwrite the normal-flow predecessor used by the
+  minimal fix. The test now covers both absence and presence of this empty
+  text, with unchanged position assertions; RED validation started.
+  No candidate publication or real-page closure claimed.
+
+- Empty-text variant is terminal RED at the first direct table:
+  `(200,48.4)` versus `(0,50)`, while the no-empty-text variant passed
+  first in the same test. Receipt: `direct-floating-table-empty-text-red.log`
+  (build2m32s). Candidate reuses `inline_line_has_in_flow_content` to keep
+  collapsed empty inline content from replacing float flow predecessors.
+  Nonempty/preserved text, clearing nodes and internal float struts retain
+  their existing path. Exact GREEN compilation started; not yet qualified.
+
+- Empty-text candidate exact test is terminal GREEN: no-empty and empty
+  variants both satisfy all four unchanged table positions. Receipt:
+  `direct-floating-table-empty-text-green.log`, build2m38s. Isolated
+  neighbors remain132executions/131PASS, the same previously observed
+  leading-float-margin failure and no prior PASS lost:
+  `floating-group-clear-v3-runtime-neighbors.json`. Production runner
+  build started, source frozen; actual626 pixel result still pending.
+
+- Third-candidate production624..631 remain7PASS/1FAIL, but actual626
+  different_pixels43940→23940; the other7 complete objects are unchanged,
+  no lost PASS. Receipt: `floating-group-clear-v3-pixel-comparison.json`.
+  Dump `border-color-owner-626-clear-v3-layout.log` confirms direct rows
+  now start109.2 and159.2. The final anonymous float group still starts
+  147.6, above its preceding clearing-line bottom209.2; its floats collide
+  with the third row. The mixed minimal test now adds a final float group
+  after another clearing break; unchanged earlier assertions are retained
+  and a new100px row assertion is added. RED validation started. Parent
+  paragraph/reference margin mismatch is still a separate open gap.
+
+- Trailing-group variant is terminal RED: empty-text case last-row first
+  float `(200,88.399994)` instead of `(0,100)`; no-empty-text case passed
+  first. Receipt: `direct-floating-table-trailing-group-red.log`,2m33s.
+  Candidate applies the already computed anonymous-group static flow
+  position in both directions, rather than silently dropping downward
+  settlement. Exact GREEN compilation started; no production claim.
+
+- Trailing-group exact validation is terminal GREEN (2m31s): both variants
+  retain the direct-row50px assertions and meet the final-group100px
+  assertions. Receipt: `direct-floating-table-trailing-group-green.log`.
+  Isolated132-neighbor replay remains131PASS, the same previously observed
+  leading-float-margin failure, no old PASS lost:
+  `floating-group-clear-v4-runtime-neighbors.json`. Production build is
+  started; actual pixel improvement is not yet known, source frozen.
+
+- Fourth-candidate production624..631 remains7PASS/1FAIL; actual626
+  different_pixels23940→7140, other7 complete objects unchanged and no
+  lost PASS (`floating-group-clear-v4-pixel-comparison.json`, compared
+  against the earlier43940 baseline). Actual dump confirms all four rows
+  at59.2/109.2/159.2/209.2, now properly aligned. Remaining paragraph
+  actualy24 versus referencey16 shifts the entire square by8px. The actual
+  body enters mixed-inline/block Flex fallback, which prevents native
+  first-child margin collapse; reference stays block layout. Added a
+  minimal plain-versus-mixed leading paragraph margin test; RED started,
+  no completion or publication claimed.
+
+- Leading-margin exact test is terminal RED: plain variant passes at16,
+  mixed variant fails at24 (`mixed-float-leading-margin-red.log`,2m37s),
+  reproducing the actual/reference discrepancy. Candidate promotes the
+  first in-flow block's top margin into the mixed fallback parent's top
+  margin using positive/negative margin collapse, then removes that child's
+  duplicate internal top margin. Float/positioned/overflow/BFC and genuine
+  Flex/Grid parent boundaries are excluded, as are top border/padding and
+  clearing first children. Exact GREEN compilation started; source frozen.
+
+- Leading-margin exact GREEN completes2m31s, plain and mixed paragraph
+  bothy16 (`mixed-float-leading-margin-green.log`). Isolated neighbors
+  finish133executions/132PASS, the same previously observed leading-float
+  margin failure and no prior PASS lost:
+  `floating-group-clear-v5-runtime-neighbors.json`. Production build is
+  live, source frozen; actual626 strict pixels remain to be verified.
+
+- Fifth-candidate production624..631 is terminal8PASS/0FAIL; actual626
+  different_pixels7140→0 and max_difference0 under zero tolerances, the
+  other7 complete objects unchanged. Receipt:
+  `floating-group-clear-v5-pixel-comparison.json`. This closes the focused
+  owner/float-clear/empty-inline/leading-margin chain at production pixels,
+  not the6548-suite goal. The696-execution sealed directed qualification
+  against published initial-border-none-v1 starts with target624; sources
+  remain frozen, no candidate commit/push before qualification finishes.
+
+- While696 qualification remains live, four separate next8 discovery
+  batches632/640/648/656 each finish8PASS/0FAIL with the same candidate
+  production binary and frozen suite; receipts:
+  `batch-{632,640,648,656}-collapsed-color-clear-v1-discovery/results.json`.
+  These32 executions are additional focused evidence, not part of the696
+  old-PASS qualification or a6548 completion claim. No source mutation or
+  candidate publication during qualification.
+
+- Next discovery batches664/672/680/688 each finish8PASS/0FAIL, another32
+  focused executions with the same production binary during source-frozen
+  qualification. Combined next8 discovery632..695 is64PASS/0FAIL; it is
+  additional coverage, not a replacement for the696 old-PASS comparison.
+  No candidate commit/push before qualification and clean-SHA replay.
+
+- Candidate qualification is terminal696executions/683PASS/13FAIL, only
+  actual626 FAIL→PASS and all other695 complete objects unchanged; no
+  prior PASS lost. Receipt: `collapsed-color-clear-v1-comparison.json`,
+  base467bfee, binarySHA256
+  `b4f856078c1c5d874ff44df06bd01815aad9638c0d636179119151e7f104f098`.
+  Five source blobs and frozen suite hash stay sealed through completion.
+  The13 strict font/ink failures are this selected sample, not the current
+  remaining count of6548. Parent `pnpm files:size:check` passes but excludes
+  vendor W3COS; it does not prove renderer file-size compliance. Scoped
+  normal commit is authorized by the user's small-step commit/push request;
+  clean-SHA focused replay is still required before normal main push.
 
 ## Prepare the pinned upstream checkout
 

@@ -751,20 +751,29 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         }
         None
     }
-    let parts = nodes
+    let mut parts = nodes
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, node)| {
-            node.style.border_collapse && (matches!(
+            node.style.border_collapse && matches!(
                 node.style.display,
                 Display::TableRow | Display::TableRowGroup
                     | Display::TableHeaderGroup | Display::TableFooterGroup
-            ) || (matches!(node.style.display, Display::TableColumn | Display::TableColumnGroup)
-                && (0..4).any(|side| hidden(&node.style, side))))
+                    | Display::TableColumn | Display::TableColumnGroup
+            )
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    // Equal-width/color conflicts retain the higher-priority owner. Cells
+    // already own their authored edges; resolve parts in CSS precedence
+    // order, independently of their order in the flattened paint tree.
+    parts.sort_by_key(|index| match nodes[*index].style.display {
+        Display::TableRow => 0,
+        Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => 1,
+        Display::TableColumn => 2,
+        _ => 3,
+    });
     for part in parts {
         let column_part = matches!(nodes[part].style.display,
             Display::TableColumn | Display::TableColumnGroup);
@@ -853,7 +862,6 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             }
         }
         for side in 0..4 {
-            if column_part && !hidden(&nodes[part].style, side) { continue; }
             let part_edge = edge(&nodes[part].style, side);
             for cell in &boundary_cells[side] {
                 if hidden(&nodes[part].style, side) || hidden(&nodes[*cell].style, side) {
@@ -2088,6 +2096,34 @@ mod tests {
         suppress_hidden_empty_cell_paint(&mut nodes);
         assert_eq!(nodes[0].style.background, Color::TRANSPARENT);
         assert_eq!(nodes[0].style.border_width, 0.0);
+    }
+
+    #[test]
+    fn collapsed_column_color_defers_to_cell_and_row_owners() {
+        let green = Color::rgb(0, 128, 0);
+        let red = Color::rgb(255, 0, 0);
+        let node = |display, width, color, parent| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true,
+                border_width: width, border_color: color, ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        for (cell_owner, display) in [(false, Display::TableColumn), (true, Display::TableColumn),
+            (false, Display::TableColumnGroup), (true, Display::TableColumnGroup)] {
+            let mut nodes = vec![
+                node(Display::Table, 0.0, red, None),
+                node(display, 25.0, red, Some(0)),
+                node(Display::TableRow, if cell_owner { 0.0 } else { 25.0 }, green, Some(0)),
+                node(Display::TableCell, if cell_owner { 25.0 } else { 0.0 }, green, Some(2)),
+            ];
+            resolve_collapsed_cell_border_conflicts(&mut nodes);
+            assert_eq!([nodes[1].style.border_top_width, nodes[1].style.border_right_width,
+                nodes[1].style.border_bottom_width, nodes[1].style.border_left_width],
+                [Some(0.0); 4], "cell owner: {cell_owner}");
+            assert_eq!([nodes[3].style.border_top_color, nodes[3].style.border_right_color,
+                nodes[3].style.border_bottom_color, nodes[3].style.border_left_color],
+                [Some(green); 4], "cell owner: {cell_owner}");
+        }
     }
 
     #[test]
