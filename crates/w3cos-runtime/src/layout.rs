@@ -1745,7 +1745,8 @@ fn collapsed_table_part_block_edge_width(component: &Component, edge: usize) -> 
 
 fn shrink_to_fit_used_width(component: &Component) -> f32 {
     let outer_width = component_max_content_width(component);
-    if component.style.float != WFloat::None
+    if matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+        || component.style.float != WFloat::None
         || matches!(
             component.style.display,
             WDisplay::Inline
@@ -1755,7 +1756,7 @@ fn shrink_to_fit_used_width(component: &Component) -> f32 {
                 | WDisplay::Table
         )
     {
-        // Taffy applies an inline-level box's margins separately. Its assigned
+        // Taffy applies positioned and inline-level margins separately. The assigned
         // width is the border box, so do not make the painted background span
         // the margin. Table max-content aggregation still needs outer widths.
         let margin = component.style.margin_lengths();
@@ -1827,10 +1828,11 @@ fn component_min_content_width(component: &Component) -> f32 {
 fn shrink_to_fit_used_width_with_available(component: &Component, available_width: f32) -> f32 {
     let preferred_width = shrink_to_fit_used_width(component);
     // Both intrinsic bounds must describe the assigned border box. Taffy
-    // applies inline/float margins separately; only removing them from the
+    // applies positioned/inline/float margins separately; only removing them from the
     // preferred bound inflates a constrained minimum by the outer margins.
     let margin = component.style.margin_lengths();
-    let outer_margin = if component.style.float != WFloat::None
+    let outer_margin = if matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+        || component.style.float != WFloat::None
         || matches!(component.style.display, WDisplay::Inline | WDisplay::InlineBlock
             | WDisplay::InlineFlex | WDisplay::InlineTable | WDisplay::Table)
     {
@@ -18678,6 +18680,35 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((parent.width, parent.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn absolute_shrink_fit_border_box_excludes_its_own_horizontal_margins() {
+        for position in [WPos::Absolute, WPos::Fixed] {
+            let component = Component::row(
+                Style {
+                    position,
+                    display: WDisp::Block,
+                    margin: w3cos_std::style::Edges {
+                        left: WSpacing::Px(32.0),
+                        right: WSpacing::Px(32.0),
+                        ..w3cos_std::style::Edges::default()
+                    },
+                    ..Style::default()
+                },
+                vec![Component::boxed(Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(96.0),
+                    height: WDim::Px(20.0),
+                    ..Style::default()
+                }, vec![])],
+            );
+            assert_eq!(component_max_content_width(&component), 160.0);
+            assert_eq!(shrink_to_fit_used_width(&component), 96.0);
+            assert_eq!(shrink_to_fit_used_width_with_available(&component, 32.0), 96.0);
+            let layout = compute(&component, 800.0, 600.0).unwrap();
+            assert_eq!(layout[0].0.width, 96.0);
+        }
     }
 
     #[test]

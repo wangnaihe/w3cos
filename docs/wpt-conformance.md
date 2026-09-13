@@ -3704,6 +3704,36 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   These focused executions are not a new full-6548 remaining-failure count
   or a completed pixel-parity acceptance.
 
+### Positioned shrink-fit margin boundary (after 0da29e3)
+
+- Current index 372 (`css/CSS2/bidi-010.xht`) actual/reference layout
+  dumps show identical internal text coordinates, but the positioned
+  painted container is 372.82813px wide versus 308.82813px in the float
+  reference: its two 32px horizontal margins are included in its own
+  assigned width. Dumps are retained under `target/wpt-targeted/` as
+  `bidi-010-current-layout.log` and `bidi-010-reference-layout.log`.
+- New unit `absolute_shrink_fit_border_box_excludes_its_own_horizontal_margins`
+  yields valid RED: outer max-content is 160px, but the assigned-width
+  helper returns 160px instead of the expected 96px. The first Absolute
+  iteration fails; Fixed and layout assertions are not claimed RED-executed.
+- Both preferred and min-content border-box bounds now exclude own
+  horizontal margins for Absolute/Fixed as for inline/float boxes.
+  GREEN build completes in **3m10s**, with Absolute/Fixed, constrained
+  available width and computed border-box assertions all passing.
+  A focused runtime post-fix sample is **12/12**; no before/after unit
+  comparison is claimed. Receipt:
+  `target/wpt-targeted/absolute-margin-runtime-neighbors-after.json`.
+  Production build completes in **2m22s**. Initial batches 368/376/384
+  are all **8/8**, including the three bidi-010 targets. Final qualification
+  is **464 executions, 455 PASS / 9 existing FAIL**, with no prior PASS lost.
+  Only bidi-010 and bidi-010a/b change, each **10240 differing pixels -> 0**;
+  other 461 complete result objects are unchanged. No reference or tolerance
+  is changed. Receipt:
+  `target/wpt-targeted/absolute-margin-shrink-fit-v1-comparison.json`.
+  Binary SHA256:
+  `1e5892f6023244f5cc178b06e434409f84b603c3c0879c884cd92186aae4614c`.
+  This focused receipt is not full-6548 acceptance or a global remaining count.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
