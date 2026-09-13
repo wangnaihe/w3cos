@@ -9285,11 +9285,10 @@ fn inline_absolute_static_rect(
         ]
         .into_iter()
         .any(|value| value.abs() > f32::EPSILON);
-    let mut cursor_x = if matches!(parent_style.display, WDisplay::Inline) {
-        parent_margin.left + parent_padding.left + parent_border_left
-    } else {
-        0.0
-    };
+    // The supplied containing box already starts after the parent's inline
+    // edges. Count content advance from zero, otherwise padding is counted
+    // twice and can spuriously wrap the first text fragment.
+    let mut cursor_x = 0.0_f32;
     let mut cursor_y = 0.0_f32;
     let mut line_height = if inline_start_is_meaningful {
         parent_style.font_size * parent_style.line_height

@@ -3247,6 +3247,40 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   passes. This closes the pinned WPT defect, not the documented Chromium
   discrepancy or the remaining focused/global failures.
 
+### Count inline static advance from the content origin
+
+- Based on published `d9da5bf14d4db98124ed93d91da30395fc8600db`, the existing
+  `auto_inset_absolute_inline_uses_the_line_after_a_forced_break` test is
+  RED y=38.4 versus 19.2. Receipt `inline-cursor-content-origin-red.log`.
+  Pinned WPT `hypothetical-inline-alone-on-second-line.html` remains at
+  454 different pixels in the `inline-line-origin-v1` baseline.
+- The containing box already starts after the parent's inline edges.
+  Static-position accounting nevertheless initialized its local cursor
+  with margin/border/padding again. For a padded inline, comparing this
+  padded cursor with the unpadded content width spuriously wraps the first
+  fragment, adding one line before the real forced break. The cursor now
+  starts at zero; authored padding and the post-break fragment correction
+  remain intact. This is a shared coordinate fix, not a test-path exception.
+- Unit GREEN and pinned starts 0,8,16,24 are pending. Comparison baselines
+  are `inline-line-origin-v1-unit-neighbors.json` (32/34) and the associated
+  WPT batches (28/32 PASS, four FAIL). No full6548 acceptance is claimed;
+  the parent size check excludes vendor and is not a W3COS size gate.
+
+  The existing regression is GREEN in 2m26s. Exact-name positioning/break
+  checks improve from 32/34 to 33/34; only the forced-break static-position
+  status changes, with no old PASS lost. The standalone break-strut failure
+  remains. Receipt `inline-cursor-v1-unit-neighbors.json`. Pixel qualification
+  is still pending at this stage.
+
+  Optimized runner builds in 4m13s including its unit-build lock wait,
+  SHA256 `2a65635fcba5b226582d1a666841d4f78b4e45c36492f04071a826908a7d32c9`.
+  Pinned starts 0,8,16,24 now finish 29/32 PASS and three FAIL. Ordered full
+  test-object comparison changes only the hypothetical second-line case,
+  from 454 pixels to exact zero; every other report is identical, with no
+  old PASS lost. Receipt `inline-cursor-v1-comparison.json`. Static
+  `git diff --check` passes. The remaining three focused failures and
+  full6548 acceptance are not closed by this repair.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
