@@ -1378,7 +1378,7 @@ fn parse_px(value: &str) -> Option<f32> {
     w3cos_std::style::parse_absolute_length_px(value)
 }
 
-fn parse_border_width(value: &str) -> Option<f32> {
+pub(crate) fn parse_border_width(value: &str) -> Option<f32> {
     match value.trim().to_ascii_lowercase().as_str() {
         "thin" => Some(1.0),
         "medium" => Some(3.0),
@@ -1692,7 +1692,7 @@ fn split_css_whitespace(value: &str) -> Vec<String> {
     parts
 }
 
-fn parse_border_line_style(value: &str) -> Option<w3cos_std::style::BorderLineStyle> {
+pub(crate) fn parse_border_line_style(value: &str) -> Option<w3cos_std::style::BorderLineStyle> {
     use w3cos_std::style::BorderLineStyle;
     Some(match value.trim().to_ascii_lowercase().as_str() {
         "none" => BorderLineStyle::None,

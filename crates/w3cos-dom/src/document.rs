@@ -1765,6 +1765,39 @@ impl Document {
                 style.border_bottom_color = parent.border_bottom_color;
                 style.border_left_color = parent.border_left_color;
             }
+            for (side, properties, width_properties) in [
+                (0, ["border", "border-style", "border-top", "border-top-style"],
+                    ["border", "border-width", "border-top", "border-top-width"]),
+                (1, ["border", "border-style", "border-right", "border-right-style"],
+                    ["border", "border-width", "border-right", "border-right-width"]),
+                (2, ["border", "border-style", "border-bottom", "border-bottom-style"],
+                    ["border", "border-width", "border-bottom", "border-bottom-width"]),
+                (3, ["border", "border-style", "border-left", "border-left-style"],
+                    ["border", "border-width", "border-left", "border-left-width"]),
+            ] {
+                if declared_property_value(&properties)
+                    .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit")) {
+                    style.border_styles[side] = parent.border_styles[side];
+                    // to_style masked the initially-none edge before its
+                    // inherited line style was known. Restore authored width
+                    // or CSS's initial medium; width inheritance below still
+                    // copies the parent's computed length independently.
+                    if parent.border_styles[side].is_some_and(|style| style.is_visible())
+                        && !declared_property_value(&width_properties)
+                            .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit")) {
+                        let raw_widths = [merged.inner.border_top_width, merged.inner.border_right_width,
+                            merged.inner.border_bottom_width, merged.inner.border_left_width];
+                        let width = if declared_property_value(&width_properties).is_none() { 3.0 }
+                            else { raw_widths[side].unwrap_or(merged.inner.border_width) };
+                        match side {
+                            0 => style.border_top_width = Some(width),
+                            1 => style.border_right_width = Some(width),
+                            2 => style.border_bottom_width = Some(width),
+                            _ => style.border_left_width = Some(width),
+                        }
+                    }
+                }
+            }
             if declared_property_value(&["border-top"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
@@ -1861,6 +1894,23 @@ impl Document {
                     .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
                 {
                     *target = parent_value;
+                }
+            }
+        }
+        for (side, properties) in [
+            (0, ["border", "border-style", "border-top", "border-top-style"]),
+            (1, ["border", "border-style", "border-right", "border-right-style"]),
+            (2, ["border", "border-style", "border-bottom", "border-bottom-style"]),
+            (3, ["border", "border-style", "border-left", "border-left-style"]),
+        ] {
+            if let Some((property, value)) = declared_property_value(&properties) {
+                if (css_property_eq(property, "border") || css_property_eq(property, properties[2]))
+                    && crate::css_style::border_shorthand_color(value, style.color, |token|
+                        relative_border_width_px(token, &style)
+                            .or_else(|| crate::css_style::parse_border_width(token))).is_some() {
+                    style.border_styles[side] = Some(split_css_tokens(value).iter()
+                        .find_map(|token| crate::css_style::parse_border_line_style(token))
+                        .unwrap_or(w3cos_std::style::BorderLineStyle::None));
                 }
             }
         }
@@ -14257,6 +14307,57 @@ mod computed_style_cache_tests {
         assert_eq!(style.right, w3cos_std::style::Dimension::Px(16.0));
         assert_eq!(style.bottom, w3cos_std::style::Dimension::Px(16.0));
         assert_eq!(style.left, w3cos_std::style::Dimension::Px(-32.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inherited_border_line_style_keeps_independent_width_declarations() {
+        for (width, expected) in [(None, 3.0), (Some("0px"), 0.0), (Some("7px"), 7.0)] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#parent", &[("border", "solid 16px")]);
+            crate::stylesheet::register_rule("#child", &[("border-style", "inherit")]);
+            if let Some(width) = width {
+                crate::stylesheet::register_rule("#child", &[("border-width", width)]);
+            }
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            parent.set_attribute(&mut document, "id", "parent");
+            let child = document.create_element("div");
+            child.set_attribute(&mut document, "id", "child");
+            parent.append_child(&mut document, child);
+            document.body().append_child(&mut document, parent);
+            let style = document.computed_style_for(child.id);
+            assert_eq!(style.border_styles, [Some(w3cos_std::style::BorderLineStyle::Solid); 4]);
+            for value in [style.border_top_width, style.border_right_width,
+                style.border_bottom_width, style.border_left_width] {
+                assert_eq!(value, Some(expected), "width={width:?}");
+            }
+            crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn border_style_inherit_preserves_line_style_across_generations() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#grandparent", &[("border", "1em solid transparent")]);
+        crate::stylesheet::register_rule("#parent", &[("border-style", "inherit"), ("border-width", "inherit")]);
+        crate::stylesheet::register_rule("#child", &[("border-style", "inherit"),
+            ("border-width", "inherit"), ("border-color", "green")]);
+        let mut document = Document::new();
+        let grandparent = document.create_element("div");
+        grandparent.set_attribute(&mut document, "id", "grandparent");
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        grandparent.append_child(&mut document, parent);
+        document.body().append_child(&mut document, grandparent);
+        for element in [parent, child] {
+            let style = document.computed_style_for(element.id);
+            assert_eq!(style.border_styles, [Some(w3cos_std::style::BorderLineStyle::Solid); 4]);
+            assert_eq!(style.border_top_width, Some(16.0));
+        }
         crate::stylesheet::clear_rules();
     }
 

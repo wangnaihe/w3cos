@@ -410,6 +410,23 @@ impl Default for Style {
 }
 
 impl Style {
+    /// Resolve only an owned layout/paint snapshot. The source computed style
+    /// must retain its lengths so explicit inheritance can copy them.
+    pub fn resolve_used_border_widths(&mut self) {
+        for (line_style, width) in self.border_styles.iter().zip([
+            &mut self.border_top_width, &mut self.border_right_width,
+            &mut self.border_bottom_width, &mut self.border_left_width,
+        ]) {
+            if line_style.is_some_and(|style| !style.is_visible()) {
+                *width = Some(0.0);
+            }
+        }
+        if self.border_styles.iter().all(|style|
+            style.is_some_and(|style| !style.is_visible())) {
+            self.border_width = 0.0;
+        }
+    }
+
     /// Equality that ignores `display`.
     ///
     /// Layout's Show-slot path used to `clone` both styles, zero `display`,

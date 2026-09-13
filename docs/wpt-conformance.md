@@ -4681,6 +4681,148 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Preparing scoped4-file commit under user's small-step commit/push
   authorization; clean-SHA48 replay and actual push still pending.
 
+- CurrentColor fix published as `4f772eb61496de43d16492739dbcdd6d51d561ce`.
+  Normal push0a09e37→4f772eb terminalsuccess; remote main verified exactSHA.
+  Clean-SHA48 replay840/824/624/488/608/5593 has all full result objects
+  identical qualification; additional600 clean8/8 identical,56 directed
+  executions total. Five source blobs and binary/suite hashes sealed.
+  Receipts: `border-shorthand-current-color-4f772eb-clean-replay.json`,
+  `border-shorthand-current-color-4f772eb-extra-600-clean-replay.json`.
+  No full6548 current acceptance claim. Next uncommitted small step adds
+  runtime unit `nonvisible_css_border_widths_do_not_enter_box_geometry`
+  checking none/hidden used offsets0 versus solid/native-unspecified32,
+  and preserving original computed width32. RED run started, terminal
+  result pending; no fix yet.
+
+- Nonvisible-border geometry test is real RED: child(32,32) versus(0,0)
+  for Some(None); terminal1FAIL/1473filtered on published-current-color
+  production sources plus new test. Receipt: `nonvisible-border-box-real-red.log`.
+  Candidate shares Style::resolve_used_border_widths across owned layout
+  and paint snapshots, physical none/hidden widths0, uniform width0 only
+  when all edges nonvisible; source computed width stays32 and line-style
+  identity retained. Layout normalization precedes collapsed-table conflict
+  resolution, so hidden still participates. New paint snapshot regression
+  covers none/hidden/solid/native-unspecified; GREEN compile started.
+  Production968 strict pixels, directed regression and performance remain
+  unverified; no candidate commit/push.
+
+- Nonvisible-border GREENv1 geometry and paint snapshot tests both PASS.
+  Runtime136 directed neighbors135PASS/1 previously recorded failure, no
+  prior PASS lost (`floating-group-clear-nonvisible-border-v1-runtime-neighbors.json`).
+  Independent49 collapsed-border/paint neighbors allPASS/no lost PASS
+  (`nonvisible-border-paint-v1-neighbors.json`). Avoiding an unconditional
+  extra whole-tree clone: layout now creates the extra used snapshot only
+  when a known none/hidden edge has nonzero width (including masked global
+  fallback), otherwise borrows original root as before. This adds a
+  read-only predicate walk; latency impact not benchmarked. GREENv2 compile
+  started on this final-source variant. Production968 remains unverified.
+
+- Conditional-copy GREENv2 is terminal1PASS/1474filtered. Same final
+  production sources:136 runtime neighbors135PASS/1 previously recorded
+  failure/no prior PASS lost, and49 collapsed-border/paint neighbors49PASS
+  (`floating-group-clear-nonvisible-border-v2-runtime-neighbors.json`,
+  `nonvisible-border-paint-v2-neighbors.json`). Production build started
+  under `nonvisible-border-box-v1`; source frozen for968..975 strict
+  pixel verification and1040 directed qualification. No candidate commit
+  or push before terminal qualification and clean-SHA replay.
+
+- Nonvisible-border production build completes2m22s; strict968..975
+  terminal6PASS/2FAIL. Both969/970 targets102504→0/max0, but972
+  border-width-014 loses priorPASS (23040pixels),975 one-pixel failure
+  unchanged. Receipt: `nonvisible-border-box-v1-pixel-comparison.json`.
+  No larger qualification started, no candidate commit/push. Fixture972
+  inherits both border-width and border-style across two generations;
+  Document previously copies widths but has no border-style inheritance,
+  so used-value masking exposes the missing line-style inheritance that
+  formerly passed via numeric-only border rendering. Minimal DOM test
+  `border_style_inherit_preserves_line_style_across_generations` added;
+  real RED run started, terminal pending.
+
+- Border-style inheritance unit is realRED: four None styles instead of
+  Solid (`border-style-inherit-real-red.log`). Candidate copies each
+  winning global/physical/shorthand inherited style from corresponding
+  parent edge, restoring independent authored widths before used masking.
+  Separate default-medium/explicit0/7px width test PASS. First GREEN attempt
+  still fails inherited line styles: fixture's grandparent relative-width
+  shorthand itself lost Solid in early parsing (`border-style-inherit-green-v1.log`).
+  Finalization now validates relative/absolute shorthand width using shared
+  classifier after font metrics and restores its line style; invalid tokens
+  do not acquire a line style. GREENv2 running, terminalpending. No candidate
+  commit/push or larger pixel qualification; production968 must be rerun.
+
+- Border-style inheritance GREENv2 is terminal1PASS/455filtered on final
+  source including relative shorthand line-style finalization. All34
+  directed DOM neighbors PASS/no lost PASS (prior32 plus2 inheritance
+  regressions); receipt `nonvisible-border-box-v2-unit-neighbors.json`.
+  Final-source runtime GREENv3 rebuild started; prior runtime/paint receipts
+  predate this DOM inheritance fix and are not substituted as final-source
+  proof. Production968 v2 replay still pending; v1 lostPASS972 retained
+  explicitly in failed receipt. No candidate commit/push.
+
+- Final-source runtime GREENv3 is terminal1PASS/1474filtered. Runtime136
+  directed neighbors135PASS/1 previously recorded failure/no lost PASS,
+  and49 independent collapsed-border/paint neighbors49PASS/no lost PASS:
+  `floating-group-clear-nonvisible-border-v3-runtime-neighbors.json`,
+  `nonvisible-border-paint-v3-neighbors.json`. These bind the DOM line-style
+  inheritance correction, unlike older v1/v2 runtime receipts. Production
+  `nonvisible-border-box-v2` build started, source frozen;968 v2 strict
+  pixel replay pending. No candidate commit/push.
+
+- Nonvisible-border productionv2 build terminal2m07s. Strict968..975
+  terminal7PASS/1FAIL: targets969/970102504→0/max0;972 inherited-style
+  reftest recoveredPASS, complete object identical published baseline;
+  other6 complete objects unchanged,975 one-pixel failure retained. No
+  lost PASS. Receipt: `nonvisible-border-box-v2-pixel-comparison.json`.
+  Fresh1040 directed qualificationv2 starts with968, compares prior912
+  against current-color-v2 and848..975 against exact sealed discovery
+  baselines. Sources frozen until terminal result; no candidate commit
+  or push before qualification plus clean-SHA64 replay. No full6548 proof.
+
+- Bounded next discovery976..983 stops after8 executions3PASS/5FAIL:
+  border-width-shorthand-002/003/004 diffs1344/22512/22432; groove-default
+  andridge-default mismatch tests incorrectly produce identical image to
+  their notref (0pixels). These two require a DIFFERENT image, not a
+  zero-diff target. Seal: `discovery-976-nonvisible-border-box-v2-sealed.json`.
+  No earlier baseline in this coverage, so these are discovered failures,
+  not proven candidate regressions. Current1040 qualification live and
+  sources frozen; next width-shorthand/3D-border repairs remain separate.
+
+- Next width-shorthand diagnosis is read-only while1040 qualification
+  runs. Original-file Chromium141 oracle confirms physical978 widths
+  [3,10,3,10],979[3,10,30,10],980[3,10,25,50]. Native979div height102
+  despite96content, consistent with four3px borders instead of top3/bottom30.
+  CSSStyleDeclaration border-width initially expands edges correctly, but
+  subsequent global border-style setter uses declared_uniform_border_width
+  and overwrites all four numeric edges with the first width. Existing
+  declared_side_border_width already resolves per-edge shorthand widths.
+  Minimal RED and correction deferred until current frozen publication
+  boundary. Oracle: `border-width-shorthand-978-980-chromium-oracle.json`;
+  dump: `border-width-979-layout.log`. No production source changed.
+
+- Next3D border diagnosis is read-only. RenderSkia edge path paints each
+  edge as a solid rectangle and ignores line-style shading. Original-file
+  Chromium141 oracle captures groove topouter5 pixels RGB154 andinner5
+  RGB238; ridge reverses them, while solid notref staysblack. Both retain
+  computed border color black, so painting fallback/provenance matters.
+  Oracle with four edge profiles and native browser PNGs:
+  `groove-ridge-982-983-chromium-oracle.json`. Blink BoxBorderPainter uses
+  outer/inner inset/outset halves and contrast-aware shade selection:
+  https://chromium.googlesource.com/chromium/src/+/d8a622d252ff81a0e14c49c3afdba8cd92b123bb/third_party/blink/renderer/core/paint/box_border_painter.cc
+  A later Chromium feature changes currentColor fallback/shading; it is
+  not substituted for our observed141 oracle. Exact141.0.7390.37 source
+  lookup failed (not treated as proof). No3D fix/source mutation yet;
+  source stays frozen for current1040 qualification.
+
+- Nonvisible-border qualificationv2 terminal1040 executions1026PASS/14FAIL.
+  Only969/970 FAIL→PASS; other1038 complete ordered objects identical
+  baselines, no lost PASS. These14 failures are selected-coverage residuals,
+  not the remaining6548-suite count. Receipt:
+  `nonvisible-border-box-v2-comparison.json`. Under user's explicit small-step
+  commit/push authorization, preparing scoped6-file commit. Clean-SHA64
+  replay968/840/600/824/624/488/608/5593 and actual push still pending.
+  No full6548 zero-failure proof; next978..980 shorthand and982/9833D
+  mismatch failures remain separately discovered, not included as repaired.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

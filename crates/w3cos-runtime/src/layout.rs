@@ -2721,6 +2721,27 @@ pub fn compute_with_scroll(
     Vec<(usize, LayoutRect, ScrollExtent)>,
     Vec<(usize, LayoutRect)>,
 )> {
+    fn resolve_used_borders(component: &mut Component) {
+        component.style.resolve_used_border_widths();
+        for child in &mut component.children { resolve_used_borders(child); }
+    }
+    fn needs_used_borders(component: &Component) -> bool {
+        let style = &component.style;
+        let widths = [style.border_top_width, style.border_right_width,
+            style.border_bottom_width, style.border_left_width];
+        style.border_styles.iter().zip(widths).any(|(line_style, width)|
+            line_style.is_some_and(|style| !style.is_visible())
+                && width.unwrap_or(style.border_width) != 0.0)
+            || (style.border_width != 0.0 && style.border_styles.iter().all(|style|
+                style.is_some_and(|style| !style.is_visible())))
+            || component.children.iter().any(needs_used_borders)
+    }
+    let used_root = needs_used_borders(root).then(|| {
+        let mut used = root.clone();
+        resolve_used_borders(&mut used);
+        used
+    });
+    let root = used_root.as_ref().unwrap_or(root);
     let flat = pre_flatten(root);
     let mut layout_root = root.clone();
     resolve_collapsed_table_layout_borders(&mut layout_root);
@@ -15897,6 +15918,25 @@ mod tests {
         project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
         assert_eq!(layout[3].0.y, 10.0);
         assert_eq!(layout[0].0.height, 15.0);
+    }
+
+    #[test]
+    fn nonvisible_css_border_widths_do_not_enter_box_geometry() {
+        use w3cos_std::style::BorderLineStyle;
+        for line_style in [Some(BorderLineStyle::None), Some(BorderLineStyle::Hidden),
+            Some(BorderLineStyle::Solid), None] {
+            let root = Component::row(Style { display: WDisp::Block,
+                width: WDim::Px(200.0), border_width: 32.0,
+                border_styles: [line_style; 4], ..Style::default() },
+                vec![Component::boxed(Style { display: WDisp::Block,
+                    width: WDim::Px(50.0), height: WDim::Px(10.0),
+                    ..Style::default() }, vec![])]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let child = layout.iter().find(|(_, node)| *node == 1).unwrap().0;
+            let expected = if line_style.is_some_and(|style| !style.is_visible()) { 0.0 } else { 32.0 };
+            assert_eq!((child.x, child.y), (expected, expected), "{line_style:?}");
+            assert_eq!(root.style.border_width, 32.0, "computed width must not be destroyed");
+        }
     }
 
     #[test]

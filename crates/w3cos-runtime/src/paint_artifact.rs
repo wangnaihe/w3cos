@@ -1420,6 +1420,7 @@ impl PaintArtifact {
         viewport: Option<(f32, f32)>,
     ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
+        for node in &mut nodes { node.style.resolve_used_border_widths(); }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
                 value
@@ -2850,6 +2851,28 @@ mod tests {
         );
 
         assert_eq!(artifact.canvas_background_positioning_rect, Some(root_rect));
+    }
+
+    #[test]
+    fn nonvisible_css_borders_use_zero_width_paint_snapshots() {
+        use w3cos_std::style::BorderLineStyle;
+        for line_style in [Some(BorderLineStyle::None), Some(BorderLineStyle::Hidden),
+            Some(BorderLineStyle::Solid), None] {
+            let source = Style { border_width: 32.0,
+                border_styles: [line_style; 4], ..Style::default() };
+            let artifact = PaintArtifact::build([PaintNode {
+                kind: ComponentKind::Column, style: source.clone(), parent: None,
+                sticky_counter_signal: None,
+            }], &[(rect(0.0), 0)], 1);
+            let used = &artifact.nodes[0].style;
+            let expected = if line_style.is_some_and(|style| !style.is_visible()) { 0.0 } else { 32.0 };
+            for width in [used.border_top_width, used.border_right_width,
+                used.border_bottom_width, used.border_left_width] {
+                assert_eq!(width.unwrap_or(used.border_width), expected, "{line_style:?}");
+            }
+            assert_eq!(used.border_styles, source.border_styles, "hidden identity retained");
+            assert_eq!(source.border_width, 32.0, "computed width retained");
+        }
     }
 
     #[test]
