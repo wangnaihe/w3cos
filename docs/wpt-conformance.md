@@ -2705,6 +2705,36 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   a previously passing case. Overall20 batches pass145/160 (15 FAIL), not
  160/160. This does not prove final same-clean-SHA6548 acceptance.
 
+### Anonymous inline BFC subtree-reflow qualification
+
+- Base`ddfc897`; the Block BFC float-band reflow also accepts Flex boxes
+  marked as internal anonymous inline formatting contexts. These implement
+  authored Block outer boxes; genuine Flex items remain protected by the
+  existing parent-context guard. Root containing-block/viewport constraints
+  and the complete wrapped subtree use the existing reflow machinery.
+- New unit is RED300 versus200 width in3m28s, then GREEN in2m48s. It
+  verifies200x100 bounds and two150x50 boxes on separate lines under both
+  Block and TableCell parents, with inter-box whitespace. BFC9/9,
+  auto-table10/10 and text-layout28/28 pass; float units55/56 retain only
+  the known leading-margin failure. The initial test fixture used a nonexistent
+  vertical-align field; it was corrected to the existing align-self mapping
+  before obtaining the logical RED receipt.
+- Default optimized runner5m22s includes unit-build lock waiting;
+  SHA256`359b593e45de9f6ca308c2777b3ac4cb072bf73f9480ae5cfd99888e64d8759e`.
+  Receipts use`anonymous-bfc-reflow-v1`. Start1400 remains4/8, but case1404
+  improves35200 to400 pixels and1406 improves36000 to800. Cases1405/1407
+  retain35200/36000. Do not represent the residual differences as zero.
+- Fresh native1404 geometry identifies the residual constraint failure:
+  authored outer table width300, internal row group/row/cell width304,
+  resulting overflow BFC width204 beside the100px float. This requires
+  proper constrained auto-track distribution, not clipping or a tolerance.
+  Saved previous runner`w3cos-wpt-before-anonymous-bfc-ddfc897` has SHA256
+  `c717e47ccbfb9f0f6d013957223823fe0c1000f17e4ac9a9b5734e520883a31e`.
+  All20 batches finish145/160 PASS (15 FAIL), preserving every prior PASS.
+  Only start1400's full path/status/pixel-diff report changes; the other19
+  reports remain identical to`mixed-float-top-band-v1`. Final same-clean-SHA
+ 6548 acceptance is not established by this focused repair.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

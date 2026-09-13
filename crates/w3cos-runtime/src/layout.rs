@@ -4983,7 +4983,11 @@ fn project_simple_float_margin_boxes(
                     && matches!(child.kind, ComponentKind::Text { .. }) {
                     (child.style.font_size * child.style.line_height - child.style.font_size) * 0.5
                 } else { 0.0 };
-                if avoids_floats && child.style.display == WDisplay::Block
+                if avoids_floats
+                    && (child.style.display == WDisplay::Block
+                        || (child.style.display == WDisplay::Flex
+                            && child.style.custom_properties.as_ref().is_some_and(|properties|
+                                properties.contains_key("--w3cos-internal-inline-formatting-context"))))
                     && matches!(child.style.width, WDim::Auto)
                     // Floats do not exclude space from genuine flex/grid
                     // tracks. Anonymous flex boxes represent ordinary CSS
@@ -14879,6 +14883,36 @@ mod tests {
             assert_eq!(get(2).width, 200.0);
             assert_eq!(get(3).width, 80.0);
             assert!((get(4).width - 83.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn anonymous_inline_bfc_reflows_wrapped_boxes_into_the_float_band() {
+        let mut inline_style = Style { display: WDisp::Flex, overflow: WOverflow::Hidden,
+            flex_wrap: WWrap::Wrap, align_items: w3cos_std::style::AlignItems::Baseline,
+            ..Style::default() };
+        inline_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-inline-formatting-context".into(), "1".into());
+        let span = || Component::boxed(Style { display: WDisp::InlineBlock,
+            width: WDim::Px(150.0), height: WDim::Px(50.0),
+            align_self: WAlignSelf::FlexEnd,
+            ..Style::default() }, vec![]);
+        for display in [WDisp::Block, WDisp::TableCell] {
+            let root = Component::boxed(Style { display, width: WDim::Px(300.0),
+                ..Style::default() }, vec![
+                Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(100.0), height: WDim::Px(100.0),
+                    ..Style::default() }, vec![]),
+                Component::row(inline_style.clone(), vec![span(),
+                    Component::text(" ", Style { display: WDisp::Inline,
+                        ..Style::default() }), span()]),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            assert_eq!((get(2).width, get(2).height), (200.0, 100.0), "parent={display:?}");
+            assert_eq!((get(2).x, get(2).y), (get(1).x + get(1).width, get(1).y));
+            assert_eq!((get(3).x, get(3).y), (get(2).x, get(2).y));
+            assert_eq!((get(5).x, get(5).y), (get(2).x, get(2).y + 50.0));
         }
     }
 
