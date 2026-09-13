@@ -8347,7 +8347,7 @@ fn build_taffy_tree(
                             | WDisplay::InlineTable
                             | WDisplay::Table
                     ))
-                    && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
+                    && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid | WDisplay::TableCell))
                         || (matches!(parent_display, Some(WDisplay::Flex))
                             && (matches!(
                                 comp.style.display,
@@ -14822,6 +14822,32 @@ mod tests {
             assert_eq!(get(2).width, 200.0);
             assert_eq!(get(3).width, 80.0);
             assert!((get(4).width - 83.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn auto_table_in_a_cell_uses_its_intrinsic_width_beside_a_float() {
+        let table = Component::boxed(Style { display: WDisp::Table,
+            ..Style::default() }, vec![Component::boxed(Style {
+            display: WDisp::TableRowGroup, ..Style::default()
+        }, vec![Component::row(Style { display: WDisp::TableRow,
+            ..Style::default() }, vec![Component::boxed(Style {
+            display: WDisp::TableCell, ..Style::default()
+        }, vec![Component::boxed(Style { display: WDisp::InlineBlock,
+            width: WDim::Px(150.0), height: WDim::Px(50.0),
+            ..Style::default() }, vec![])])])])]);
+        for display in [WDisp::Block, WDisp::TableCell] {
+            let root = Component::boxed(Style { display,
+                width: WDim::Px(300.0), ..Style::default() }, vec![
+                Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(100.0), height: WDim::Px(100.0),
+                    ..Style::default() }, vec![]), table.clone(),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            assert_eq!(get(2).width, 150.0, "parent={display:?}");
+            assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
+            assert_eq!(get(2).y, get(1).y, "parent={display:?}");
         }
     }
 

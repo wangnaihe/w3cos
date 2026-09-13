@@ -2652,6 +2652,29 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
 - This is focused candidate evidence, not final same-clean-SHA6548
   acceptance. Do not infer a current global remaining-failure count from it.
 
+### Nested automatic table intrinsic-width qualification
+
+- Base`223f35f`; static WPT revision/viewport/suite remain unchanged.
+  The atomic/table shrink-fit branch omitted TableCell containing blocks.
+  It now uses the existing intrinsic border-box sizing in cells as in blocks,
+  rather than shrinking a painted wrapper after the table grid was laid out.
+- New nested-table/float unit is RED300 versus150 under TableCell (3m27s),
+  then GREEN with150px width and top-aligned placement (3m18s). Float-band
+  tests3/3 pass. Broad table units75/81 retain six failures, all also present
+  in the saved earlier optimized runtime test binary; that older binary is
+  not an exact`223f35f` unit baseline. Do not label the broad unit gate green.
+- Default runner build5m58s includes waiting for the unit-build artifact
+  lock; SHA256`0b30c19dc45fe567270c7e6ce837b7d3b3989c031939eb664b5eab523905c514`.
+  Receipt`batch-1400-table-cell-intrinsic-v1` passes2/8. Case1401 improves
+ 22500 to exact0, while1400 stays0. Cases1402–1407 retain20000/15000/35200/
+ 35200/18300/18300 pixels. Case1403 increases7500 to15000: native source
+  purple150x50 is now at(8,8), but its native reference's second mixed-side
+  float remains at(8,108). This is unresolved reference rendering, not a
+  passing comparison. Seventeen neighboring/related eight-case receipts
+  pass136/136; ordered paths/statuses/full pixel-diff objects are identical
+  to`auto-bfc-track-guard-v3`. Overall18 batches pass138/144, not144/144.
+- This focused repair does not prove final same-clean-SHA6548 acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
