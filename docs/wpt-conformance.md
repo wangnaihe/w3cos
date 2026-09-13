@@ -2038,6 +2038,76 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   `case-<index>-root-float-final-v3/results.json` below
   `target/wpt-targeted`. No fixture, suite, viewport or allowance was changed.
 
+### Block table float avoidance
+
+- Baseline `c8feaf0`, index1372 `float-table-align-left-quirk.html`, fails
+  with105 differing pixels (max255, zero allowances). Raw layout diagnostics
+  show the third group's normal table at y108.8, overlapping its leading
+  float, while the reference places it at y134.0. The zero-width parent's
+  height also shrinks incorrectly from50.4 to25.2.
+- New `block_table_avoids_a_float_and_keeps_parent_height_when_it_cannot_fit`
+  is RED before the production change: expected y20, actual y0. It also
+  checks a fitting50px table beside a20px float in a100px content box.
+- Include block tables in float avoidance, test the available exclusion
+  band before pulling an atomic/BFC box upward, and shift fitting boxes
+  into the remaining horizontal band. Use parent content edges, preserve
+  relative inline offsets, and leave ordinary visible-overflow blocks
+  eligible to overlap floats. Rejecting an upward move preserves the
+  parent height rather than applying a stale negative flow correction.
+- Baseline receipt:
+  `target/wpt-targeted/case-1372-table-avoid-before-v1/results.json`.
+  Preserve immediate baseline runner
+  `target/wpt-targeted/w3cos-wpt-table-avoid-baseline-c8feaf0` (SHA256
+  `13eecdbd8bcd19b8389b8491ab33ce7974cd7f16ee160f88cf116c480e4c7d5d`).
+- Same-feature optimized RED executable (c8 production plus only the new
+  test) is preserved at
+  `target/wpt-targeted/w3cos-runtime-table-avoid-red-c8feaf0`.
+  Its float filter is29PASS/3FAIL; the candidate is30PASS/2FAIL, with the
+  new table test GREEN and the two other failures unchanged. Paint-artifact
+  tests remain32PASS/2FAIL at both immediate baseline and candidate;
+  text-layout tests pass28/28. Keep the four unchanged unit failures open.
+- Neighboring immediate baseline batches1366 and1385 pass5/8 and0/8;
+  receipts `batch-<start>-table-avoid-baseline-c8/results.json` below
+  `target/wpt-targeted`. They contain11 existing failures, not new candidate
+  failures. Final WPT qualification is pending; full6548 zero-failure proof
+  remains absent.
+- Initial candidate runner SHA256
+  `2be198eca14cfe2602b1b09dc6ed555a39889f68bea8f9fc1e6ac59614be59bd`
+  passes1372 at exact zero, receipt
+  `target/wpt-targeted/case-1372-table-avoid-initial-v1/results.json`.
+  Before publication, clamp only positions outside the available band
+  rather than replacing every fitting position with a band-edge alignment.
+  Add a separate auto-margin centering test, including a5px relative offset;
+  keep this final guard's qualification separate from the initial receipt.
+- Resolve atomic/BFC horizontal margins against parent content width in
+  both the upward-fit check and horizontal avoidance. The generic
+  `margin_lengths()` resolves percentages to zero and em against16px;
+  it is not sufficient for this used-layout calculation. Extend the first
+  table test with a10% left margin (x30 beside a20px float in100px).
+  The earlier centering-guard compile was superseded and deliberately
+  stopped (owned rustc SIGTERM), not a semantic test failure; the combined
+  final code is being verified from a new build.
+- Combined final library build passes both new table tests. The broad
+  `block_table_` selector also includes the existing wrapper-em-margin test:
+  it fails32 versus16 at both the direct c8 production baseline and final
+  candidate; keep it open rather than labeling the selector all-green.
+  Final float filter is31PASS/2FAIL (the two unchanged failures), and
+  text-layout remains28/28. Final WPT runner rebuild is pending.
+- Final runner SHA256
+  `53746f1c9b737e78203b7ae841df88225116ef1abcbed2dfba2946e424180b83`:
+  1372 passes exact zero. Related starts5769/5761/5753/5745/5737/5729/5721/
+  5689/5681/5665/5545/5553/5593 pass104/104 (100 zero-pixel matches and four
+  expected mismatches), receipts `batch-<start>-table-avoid-final-v2/results.json`
+  below `target/wpt-targeted`. Neighbor batch1366 improves5/8 to6/8 only
+  through1372 (105 becomes0); batch1385 stays0/8. All ten other neighboring
+  failures retain identical pixel differences and statuses. Keep them open;
+  no new failure is observed in these compared ranges. This is focused
+  Skia qualification, not final6548 zero-failure proof.
+- Additional controls1358/1359/1361/1363/1374 remain PASS, receipts
+  `case-<index>-table-avoid-final-v2/results.json`. Together with1371/1372
+  and1389 in the compared neighbor batches, the original eight extra float
+  controls now pass7/8; only1389 remains2640px in that selected control set.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

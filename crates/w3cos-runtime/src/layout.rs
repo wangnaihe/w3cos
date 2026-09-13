@@ -4696,6 +4696,18 @@ fn project_simple_float_margin_boxes(
         let mut normal_flow_correction = 0.0_f32;
         let mut skipped_positioned = false;
         let mut child_index = component_index + 1;
+        let content_box = layout_position.get(&component_index).map(|position| {
+            let parent = layouts[*position].0;
+            let spacing = |value| resolve_spacing_for_layout(
+                value, parent.width, component.style.font_size, viewport_w, viewport_h,
+            );
+            let left = spacing(component.style.padding.left)
+                + component.style.border_left_width.unwrap_or(component.style.border_width);
+            let right = spacing(component.style.padding.right)
+                + component.style.border_right_width.unwrap_or(component.style.border_width);
+            LayoutRect { x: parent.x + left,
+                width: (parent.width - left - right).max(0.0), ..parent }
+        });
         for child in &component.children {
             let child_count = count_nodes(child);
             if matches!(child.style.position, WPos::Absolute | WPos::Fixed)
@@ -4705,6 +4717,10 @@ fn project_simple_float_margin_boxes(
                 child_index += child_count;
                 continue;
             }
+            let avoids_floats = matches!(child.style.display,
+                WDisplay::Table | WDisplay::InlineTable | WDisplay::InlineBlock | WDisplay::InlineFlex)
+                || child.style.resolved_overflow_x() != WOverflow::Visible
+                || child.style.resolved_overflow_y() != WOverflow::Visible;
             if skipped_positioned && previous.is_none()
                 && child.style.float != WFloat::None && child.style.clear == WClear::None
                 && let (Some(parent_position), Some(child_position)) = (
@@ -4784,7 +4800,17 @@ fn project_simple_float_margin_boxes(
                     && matches!(child.kind, ComponentKind::Text { .. }) {
                     (child.style.font_size * child.style.line_height - child.style.font_size) * 0.5
                 } else { 0.0 };
-                if current.y - leading + f32::EPSILON >= float_bottom {
+                let fits_float_band = !avoids_floats || content_box.is_some_and(|containing| {
+                    let exclusions = active_floats.iter().map(|(side, margin_box)|
+                        FloatExclusion { side: *side, margin_box: *margin_box }).collect::<Vec<_>>();
+                    let band = float_line_band(containing, float_top, current.height, &exclusions);
+                    let horizontal_margin = [child.style.margin.left, child.style.margin.right]
+                        .into_iter().map(|margin| resolve_spacing_for_layout(
+                            margin, containing.width, child.style.font_size, viewport_w, viewport_h,
+                        )).sum::<f32>();
+                    current.width + horizontal_margin <= band.width + 0.01
+                });
+                if current.y - leading + f32::EPSILON >= float_bottom && fits_float_band {
                     let delta_y = float_top + leading - current.y;
                     shift_subtree(
                         layouts,
@@ -4817,20 +4843,20 @@ fn project_simple_float_margin_boxes(
             }
             if child.style.float == WFloat::None
                 && child.style.clear == WClear::None
-                && matches!(
+                && (avoids_floats || matches!(
                     child.style.display,
                     WDisplay::Inline
                         | WDisplay::InlineBlock
                         | WDisplay::InlineFlex
                         | WDisplay::InlineTable
-                )
+                ))
                 && !active_floats.is_empty()
                 && let (Some(parent_position), Some(child_position)) = (
                     layout_position.get(&component_index).copied(),
                     layout_position.get(&child_index).copied(),
                 )
             {
-                let containing = layouts[parent_position].0;
+                let containing = content_box.unwrap_or(layouts[parent_position].0);
                 let mut current = layouts[child_position].0;
                 loop {
                     let overlapping = active_floats
@@ -4853,9 +4879,41 @@ fn project_simple_float_margin_boxes(
                         .filter(|(side, _)| *side == WFloat::Right)
                         .map(|(_, float)| float.x)
                         .fold(containing.x + containing.width, f32::min);
-                    let margin = child.style.margin_lengths();
+                    let mut margin = child.style.margin_lengths();
+                    if avoids_floats {
+                        margin.left = resolve_spacing_for_layout(child.style.margin.left,
+                            containing.width, child.style.font_size, viewport_w, viewport_h);
+                        margin.right = resolve_spacing_for_layout(child.style.margin.right,
+                            containing.width, child.style.font_size, viewport_w, viewport_h);
+                    }
                     let outer_width = current.width + margin.left + margin.right;
                     if outer_width <= (right_edge - left_edge).max(0.0) + 0.01 {
+                        if avoids_floats {
+                            let resolve = |dimension: WDim| dimension.resolve(
+                                containing.width, ROOT_FONT_SIZE, child.style.font_size,
+                                viewport_w, viewport_h,
+                            );
+                            let rtl = component.style.direction == w3cos_std::style::TextDirection::Rtl;
+                            let relative_x = if child.style.position == WPos::Relative {
+                                if rtl {
+                                    resolve(child.style.right).map(|value| -value)
+                                        .or_else(|| resolve(child.style.left)).unwrap_or(0.0)
+                                } else {
+                                    resolve(child.style.left)
+                                        .or_else(|| resolve(child.style.right).map(|value| -value))
+                                        .unwrap_or(0.0)
+                                }
+                            } else { 0.0 };
+                            // Preserve an already fitting authored position (for
+                            // example auto-margin centering); only displace boxes
+                            // whose normal position intersects a float.
+                            let minimum_x = left_edge + margin.left + relative_x;
+                            let maximum_x = (right_edge - margin.right - current.width
+                                + relative_x).max(minimum_x);
+                            let target_x = current.x.clamp(minimum_x, maximum_x);
+                            shift_subtree_x(layouts, layout_position, child_index, child_count,
+                                target_x - current.x);
+                        }
                         break;
                     }
                     let next_y = overlapping
@@ -14101,6 +14159,63 @@ mod tests {
         let hidden_block = hidden.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!(hidden_block.y, hidden_float.y);
         assert_eq!(hidden_block.x, hidden_float.x + hidden_float.width);
+    }
+
+    #[test]
+    fn block_table_avoids_a_float_and_keeps_parent_height_when_it_cannot_fit() {
+        for (width, margin_percent) in [(0.0, 0.0), (100.0, 0.0), (100.0, 10.0)] {
+            let root = Component::boxed(Style {
+                display: WDisp::Block, width: WDim::Px(width), ..Style::default()
+            }, vec![
+                Component::boxed(Style {
+                    display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(20.0), height: WDim::Px(20.0), ..Style::default()
+                }, Vec::new()),
+                Component::boxed(Style {
+                    display: WDisp::Table, width: WDim::Px(50.0),
+                    height: WDim::Px(20.0),
+                    margin: w3cos_std::style::Edges {
+                        left: WSpacing::Percent(margin_percent), ..Default::default()
+                    }, ..Style::default()
+                }, Vec::new()),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+            let table = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+            if width == 0.0 {
+                assert_eq!(table.y, 20.0);
+                assert!(parent.height >= table.y + table.height);
+            } else {
+                assert_eq!(table.y, 0.0);
+                assert_eq!(table.x, 20.0 + width * margin_percent / 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn block_table_float_avoidance_preserves_fitting_auto_margin_centering() {
+        for relative in [0.0, 5.0] {
+            let root = Component::boxed(Style {
+                display: WDisp::Block, width: WDim::Px(200.0), ..Style::default()
+            }, vec![
+                Component::boxed(Style {
+                    display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(20.0), height: WDim::Px(20.0), ..Style::default()
+                }, Vec::new()),
+                Component::boxed(Style {
+                    display: WDisp::Table, width: WDim::Px(50.0), height: WDim::Px(20.0),
+                    position: WPos::Relative, left: WDim::Px(relative),
+                    margin: w3cos_std::style::Edges {
+                        left: WSpacing::Auto, right: WSpacing::Auto, ..Default::default()
+                    }, ..Style::default()
+                }, Vec::new()),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+            let table = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+            assert_eq!(table.y, 0.0);
+            assert_eq!(table.x, (parent.width - table.width) * 0.5 + relative);
+        }
     }
 
     #[test]
