@@ -2575,6 +2575,41 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   float queue failure, not complete browser geometry, all historic failures,
   or final same-clean-SHA6548 acceptance.
 
+### Shared-BFC floats outside their immediate containing block
+
+- Baseline38982c7 fresh start1393 is3/8: cases1394/1396 are9500px,
+  1397 is8500px and1398 is8160px RED. Local-parent exclusions miss
+  earlier floats in the same BFC but outside the immediate containing block.
+- Both layout entry paths now project these cross-parent float collisions
+  against full margin boxes in source order, applying CSS2 float rules3/7
+  and clearance while moving the complete floated subtree. Independent
+  overflow/atomic BFCs and real flex/grid items retain separate ownership;
+  hidden subtrees and ignored track-item floats do not create exclusions.
+  Same-parent layout continues through the existing local float solver.
+- Optimized runtime tests3m49s: new shared-BFC3/3, BFC6/6 and text28/28
+  pass. Float tests48/49 retain only the known leading-margin failure24
+  versus80. Forced-break6/8 retain the same known16 versus200 and40
+  versus19.2 failures; these are not represented as passing gates.
+- Fresh runner2m18s SHA256
+  `ce37081b54b2ff80c31e666ad096d7657343f5a863aaf1ed37ca0f75a3eb0755`:
+  start1393 is7/8; all four targeted failures become exact0px and prior
+  passing cases remain passing. Case1400 retains25000px and requires a
+  separate in-flow BFC avoidance repair. Neighbor starts1358/1366/1385
+  pass24/24. Related starts5769/5761/5753/5745/5737/5729/5721/5689/
+  5681/5665/5545/5553/5593 pass104/104 (100 exact-zero matches, four
+  expected mismatches); ordered paths/statuses/full pixel-diff objects are
+  identical to38982c7. Receipts use`shared-bfc-final-v1`.
+- This is pinned normative WPT conformance, **not Chromium pixel parity**.
+  [CSS2.2 §9.5.1](https://www.w3.org/TR/CSS22/visuren.html#float-position)
+  scopes the placement rules to the shared BFC. In fresh800x600 source
+  geometry, installed Chromium141.0.7390.37 places all four blue floats
+  at y8, whereas the upstream references require y308. Browser x values
+  are8/33/108/-17 respectively. Firefox/WebKit binaries are unavailable;
+  cross-engine behavior is unverified. Preserve this standard-versus-browser
+  acceptance discrepancy; do not change fixtures, suite or tolerances to
+  erase it. Percentage-spacing/general geometry and final same-clean-SHA
+  6548 acceptance are not proven by this focused batch.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

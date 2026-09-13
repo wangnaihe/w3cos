@@ -2479,6 +2479,7 @@ impl LayoutEngine {
             viewport_h,
         );
         project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
+        project_shared_bfc_float_collisions(&mut results, flat, viewport_w, viewport_h);
         project_float_text_layouts(&mut results, flat, viewport_w, viewport_h);
         project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
@@ -2625,6 +2626,7 @@ pub fn compute_with_scroll(
         viewport_h,
     );
     project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
+    project_shared_bfc_float_collisions(&mut results, &flat, viewport_w, viewport_h);
     project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h);
     project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
@@ -5235,6 +5237,144 @@ fn project_simple_float_margin_boxes(
     );
 }
 
+fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
+    let anonymous = style.custom_properties.as_ref().is_some_and(|properties|
+        properties.contains_key("--w3cos-internal-inline-formatting-context")
+            || properties.contains_key("--w3cos-internal-anonymous-float-group"));
+    root || style.float != WFloat::None
+        || matches!(style.position, WPos::Absolute | WPos::Fixed)
+        || style.resolved_overflow_x() != WOverflow::Visible
+        || style.resolved_overflow_y() != WOverflow::Visible
+        || matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineTable | WDisplay::TableCell)
+        || (!anonymous && matches!(style.display, WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid))
+}
+
+fn project_shared_bfc_float_collisions(
+    layouts: &mut [(LayoutRect, usize)], flat: &[FlatNodeInfo<'_>], vw: f32, vh: f32,
+) {
+    let mut positions = vec![None; flat.len()];
+    for (position, (_, index)) in layouts.iter().enumerate() { positions[*index] = Some(position); }
+    let mut owners = vec![None; flat.len()];
+    let mut visible = vec![true; flat.len()];
+    let mut depths = vec![0; flat.len()];
+    let mut ends = vec![flat.len(); flat.len()];
+    let mut stack = Vec::<usize>::new();
+    let genuine_tracks = |style: &w3cos_std::style::Style| {
+        matches!(style.display, WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
+            && !style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-inline-formatting-context")
+                    || properties.contains_key("--w3cos-internal-anonymous-float-group"))
+    };
+    for index in 0..flat.len() {
+        visible[index] = flat[index].style.display != WDisplay::None
+            && flat[index].parent.is_none_or(|parent| visible[parent]);
+        if let Some(parent) = flat[index].parent {
+            depths[index] = depths[parent] + 1;
+            let track_item = flat[parent].parent.is_some_and(|grandparent|
+                genuine_tracks(flat[grandparent].style));
+            owners[index] = if track_item
+                || establishes_float_bfc(flat[parent].style, flat[parent].parent.is_none()) {
+                Some(parent)
+            } else { owners[parent] };
+        }
+        while stack.last().is_some_and(|prior| depths[*prior] >= depths[index]) {
+            ends[stack.pop().unwrap()] = index;
+        }
+        stack.push(index);
+    }
+    let mut groups = HashMap::<usize, Vec<(FloatExclusion, Option<usize>)>>::new();
+    for index in 0..flat.len() {
+        let node = &flat[index];
+        if node.style.float == WFloat::None || !visible[index]
+            || matches!(node.style.position, WPos::Absolute | WPos::Fixed) { continue; }
+        let (Some(owner), Some(parent), Some(position)) = (owners[index], node.parent, positions[index])
+            else { continue; };
+        let Some(parent_position) = positions[parent] else { continue; };
+        if genuine_tracks(flat[parent].style) { continue; }
+        let parent_rect = layouts[parent_position].0;
+        let style = node.style;
+        let parent_style = flat[parent].style;
+        let spacing = |value, size| resolve_spacing_for_layout(value, parent_rect.width, size, vw, vh);
+        let left = parent_rect.x + spacing(parent_style.padding.left, parent_style.font_size)
+            + parent_style.border_left_width.unwrap_or(parent_style.border_width);
+        let right = parent_rect.x + parent_rect.width
+            - spacing(parent_style.padding.right, parent_style.font_size)
+            - parent_style.border_right_width.unwrap_or(parent_style.border_width);
+        let ml = spacing(style.margin.left, style.font_size);
+        let mr = spacing(style.margin.right, style.font_size);
+        let mt = spacing(style.margin.top, style.font_size);
+        let mb = spacing(style.margin.bottom, style.font_size);
+        let resolve_x = |value: WDim| value.resolve(right - left, ROOT_FONT_SIZE, style.font_size, vw, vh);
+        let resolve_y = |value: WDim| {
+            if matches!(value, WDim::Percent(_)) && matches!(parent_style.height, WDim::Auto) { None }
+            else { value.resolve(parent_rect.height, ROOT_FONT_SIZE, style.font_size, vw, vh) }
+        };
+        let (rx, ry) = if style.position == WPos::Relative {
+            let x = if parent_style.direction == w3cos_std::style::TextDirection::Rtl {
+                resolve_x(style.right).map(|value| -value).or_else(|| resolve_x(style.left))
+            } else { resolve_x(style.left).or_else(|| resolve_x(style.right).map(|value| -value)) };
+            (x.unwrap_or(0.0), resolve_y(style.top)
+                .or_else(|| resolve_y(style.bottom).map(|value| -value)).unwrap_or(0.0))
+        } else { (0.0, 0.0) };
+        let rect = layouts[position].0;
+        let margin_box = LayoutRect { x: rect.x - ml - rx, y: rect.y - mt - ry,
+            width: rect.width + ml + mr, height: rect.height + mt + mb };
+        let previous = groups.entry(owner).or_default();
+        let mut x = margin_box.x;
+        let mut y = margin_box.y;
+        if previous.iter().any(|(_, prior_parent)| *prior_parent != node.parent) {
+            y = previous.iter().map(|(prior, _)| prior.margin_box.y).fold(y, f32::max);
+            for (prior, _) in previous.iter() {
+                if matches!((style.clear, prior.side), (WClear::Both, _)
+                    | (WClear::Left, WFloat::Left) | (WClear::Right, WFloat::Right)) {
+                    y = y.max(prior.margin_box.y + prior.margin_box.height);
+                }
+            }
+            loop {
+                let active: Vec<_> = previous.iter().map(|(prior, _)| prior).filter(|prior|
+                    prior.margin_box.y < y + margin_box.height
+                        && prior.margin_box.y + prior.margin_box.height > y).collect();
+                let same = active.iter().any(|prior| prior.side == style.float);
+                x = if style.float == WFloat::Left {
+                    active.iter().filter(|prior| prior.side == WFloat::Left)
+                        .map(|prior| prior.margin_box.x + prior.margin_box.width).fold(left, f32::max)
+                } else {
+                    active.iter().filter(|prior| prior.side == WFloat::Right)
+                        .map(|prior| prior.margin_box.x - margin_box.width)
+                        .fold(right - margin_box.width, f32::min)
+                };
+                // Oversized floats may overflow their own containing block,
+                // but cannot cross an opposing float, or overflow beside a
+                // preceding same-side float in the shared BFC (CSS2 rules3/7).
+                let blocked = if style.float == WFloat::Left {
+                    (same && x + margin_box.width > right + 0.01)
+                        || active.iter().any(|prior| prior.side == WFloat::Right
+                            && prior.margin_box.x + prior.margin_box.width > x
+                            && x + margin_box.width > prior.margin_box.x + 0.01)
+                } else {
+                    (same && x < left - 0.01)
+                        || active.iter().any(|prior| prior.side == WFloat::Left
+                            && prior.margin_box.x < x + margin_box.width
+                            && x < prior.margin_box.x + prior.margin_box.width - 0.01)
+                };
+                if !blocked { break; }
+                let next = active.iter().map(|prior| prior.margin_box.y + prior.margin_box.height)
+                    .filter(|bottom| *bottom > y + 0.01).min_by(f32::total_cmp);
+                let Some(next) = next else { break; };
+                y = next;
+            }
+            for descendant in index..ends[index] {
+                if let Some(position) = positions[descendant] {
+                    layouts[position].0.x += x - margin_box.x;
+                    layouts[position].0.y += y - margin_box.y;
+                }
+            }
+        }
+        previous.push((FloatExclusion { side: style.float,
+            margin_box: LayoutRect { x, y, ..margin_box } }, node.parent));
+    }
+}
+
 fn project_auto_height_bfc_float_heights(
     layouts: &mut [(LayoutRect, usize)],
     root: &Component,
@@ -5249,16 +5389,7 @@ fn project_auto_height_bfc_float_heights(
         .collect::<HashMap<_, _>>();
 
     fn establishes_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
-        let anonymous = style.custom_properties.as_ref().is_some_and(|properties|
-            properties.contains_key("--w3cos-internal-inline-formatting-context")
-                || properties.contains_key("--w3cos-internal-anonymous-float-group"));
-        root || style.float != WFloat::None
-            || matches!(style.position, WPos::Absolute | WPos::Fixed)
-            || style.resolved_overflow_x() != WOverflow::Visible
-            || style.resolved_overflow_y() != WOverflow::Visible
-            || matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineTable | WDisplay::TableCell)
-            || (!anonymous && matches!(style.display,
-                WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid))
+        establishes_float_bfc(style, root)
     }
 
     fn capped_height(index: usize, height: f32, layouts: &[(LayoutRect, usize)],
@@ -18692,6 +18823,71 @@ mod tests {
         assert!((get(2).y - get(0).y).abs() < 0.01, "float={:?}", get(2));
         assert!((get(3).y - get(1).y).abs() < 0.01);
         assert!((get(0).height - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn shared_bfc_float_collision_respects_opposing_and_same_side_overflow_rules() {
+        for side in [WFloat::Left, WFloat::Right] {
+            for (same, width, expected_y) in [(false, 425.0, 0.0),
+                (false, 475.0, 300.0), (true, 425.0, 300.0)] {
+                let prior_side = if same { side } else if side == WFloat::Left { WFloat::Right }
+                    else { WFloat::Left };
+                let mut wrapper = Style { display: WDisp::Block, width: WDim::Px(400.0),
+                    ..Style::default() };
+                if (side == WFloat::Left) == same { wrapper.margin.left = WSpacing::Px(100.0); }
+                else { wrapper.margin.right = WSpacing::Px(100.0); }
+                let root = Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(500.0), height: WDim::Px(500.0), ..Style::default() }, vec![
+                    Component::row(Style { display: WDisp::Block, float: prior_side,
+                        width: WDim::Px(50.0), height: WDim::Px(300.0), ..Style::default() }, vec![]),
+                    Component::row(wrapper, vec![Component::row(Style { display: WDisp::Block,
+                        float: side, width: WDim::Px(width), height: WDim::Px(10.0),
+                        ..Style::default() }, vec![])]),
+                ]);
+                let layout = compute(&root, 800.0, 600.0).unwrap();
+                let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+                assert_eq!(get(3).y - get(0).y, expected_y, "side={side:?} same={same} width={width}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_bfc_float_collision_stops_at_an_independent_overflow_context() {
+        let root = Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+            width: WDim::Px(500.0), height: WDim::Px(500.0), ..Style::default() }, vec![
+            Component::row(Style { display: WDisp::Block, float: WFloat::Right,
+                width: WDim::Px(50.0), height: WDim::Px(300.0), ..Style::default() }, vec![]),
+            Component::row(Style { display: WDisp::Block, width: WDim::Px(400.0),
+                overflow: WOverflow::Hidden, ..Style::default() }, vec![
+                Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(475.0), height: WDim::Px(10.0), ..Style::default() }, vec![]),
+            ]),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(get(3).y, get(2).y);
+    }
+
+    #[test]
+    fn shared_bfc_float_collision_ignores_hidden_and_separates_track_items() {
+        for tracks in [false, true] {
+            let root = Component::row(Style { display: if tracks { WDisp::Flex } else { WDisp::Block },
+                width: WDim::Px(500.0), height: WDim::Px(500.0), ..Style::default() }, vec![
+                Component::row(Style { display: if tracks { WDisp::Block } else { WDisp::None },
+                    ..Style::default() }, vec![Component::row(Style { display: WDisp::Block,
+                        float: WFloat::Right, ..Style::default() }, vec![])]),
+                Component::row(Style { display: WDisp::Block, ..Style::default() }, vec![
+                    Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+                        ..Style::default() }, vec![]),
+                ]),
+            ]);
+            let rect = |x, y, width, height| LayoutRect { x, y, width, height };
+            let mut layout = vec![(rect(0.0, 0.0, 500.0, 500.0), 0),
+                (rect(0.0, 0.0, 400.0, 0.0), 1), (rect(450.0, 0.0, 50.0, 300.0), 2),
+                (rect(0.0, 0.0, 400.0, 0.0), 3), (rect(0.0, 0.0, 475.0, 10.0), 4)];
+            project_shared_bfc_float_collisions(&mut layout, &pre_flatten(&root), 800.0, 600.0);
+            assert_eq!(layout[4].0.y, 0.0, "tracks={tracks}");
+        }
     }
 
     #[test]
