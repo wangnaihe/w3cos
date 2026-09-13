@@ -3935,6 +3935,49 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   establish native parity (different y/color), nor turn the strict native
   failure into a PASS. The original zero-tolerance requirement is intact.
 
+### Physical border style and invalid widths (after aa9a8ac)
+
+- Discovery batches 496/504/512/520 each pass 8/8. Batch 528 is 5/8:
+  border-bottom-style-001/002 and border-bottom-width-001 each differ by
+  2352 pixels. References and zero tolerances are unchanged.
+- Valid RED units in CSSStyleDeclaration reproduce a none edge becoming
+  3px after a width declaration, and invalid -1px replacing valid 5px.
+  Candidate accepts physical side-style longhands, computes visibility
+  independently from later width declarations, rejects negative/nonfinite
+  widths and leaves an invalid side-width assignment unapplied.
+- First 12 isolated border units passed, but a new restoration RED finds
+  explicit 0px becoming provisional 3px after none then solid. Candidate
+  v2 resolves the last valid side-width declaration independently (including
+  uniform and side shorthands); exact restoration GREEN passed for 0px/5px.
+  Its 5px iteration was not reached in RED after the 0px assertion failed.
+  This is not production pixel qualification, and no commit/push yet.
+- Isolated CSSStyleDeclaration sample is 42/43. The sole observed failure
+  `negative_margin_and_character_relative_lengths_remain_valid` expects
+  Em(4.0) for 4ch but receives Ch(4.0), before testing the negative margin.
+  Its dimension parser is not modified by this border change; no matching
+  modification-before execution was obtained, so this is not full-module
+  green or a confirmed baseline classification. Receipt:
+  `target/wpt-targeted/side-border-style-v2-css-style-tests.json`.
+  All thirteen isolated border-specific tests pass. Production build and
+  strict batch 528 pixel qualification are pending.
+- Production build passed in 2m05s. Strict batch 528 is now 8/8:
+  border-bottom-style-001/002 and border-bottom-width-001 each improve
+  2352 differing pixels to zero (maximum difference also zero).
+  The 600-execution comparison against published 560 records plus
+  discovery batches 496/504/512/520/528 is running, with CSS source blob
+  checks added to the existing DOM/layout/paint/binary/suite seals.
+  This is targeted pixel proof, not completed regression qualification or
+  full6548 acceptance. No candidate commit/push yet.
+
+- The 600-execution comparison completed: 589 PASS, 11 existing FAIL,
+  no old PASS lost. Only the three batch-528 targets change FAIL to PASS;
+  the other 597 complete result objects are unchanged. Receipt:
+  `side-border-style-v2-comparison.json`, CSS source blob
+  `78fd6db00630ea56613954bdc7da58a607d8a1e7`, production SHA256
+  `4fbf43eb5029aade085a6576b46cbdf37994626a4651cc216c4c83be9aaeac73`.
+  This qualifies the focused repair, not full6548 acceptance. Clean-SHA
+  replay is pending; the known text-ink FAILs remain open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

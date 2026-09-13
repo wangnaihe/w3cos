@@ -427,16 +427,34 @@ impl CSSStyleDeclaration {
                 }
             }
             "border-top-width" | "borderTopWidth" => {
-                self.inner.border_top_width = parse_border_width(value)
+                if let Some(width) = parse_border_width(value) { self.inner.border_top_width = Some(width); }
             }
             "border-right-width" | "borderRightWidth" => {
-                self.inner.border_right_width = parse_border_width(value)
+                if let Some(width) = parse_border_width(value) { self.inner.border_right_width = Some(width); }
             }
             "border-bottom-width" | "borderBottomWidth" => {
-                self.inner.border_bottom_width = parse_border_width(value)
+                if let Some(width) = parse_border_width(value) { self.inner.border_bottom_width = Some(width); }
             }
             "border-left-width" | "borderLeftWidth" => {
-                self.inner.border_left_width = parse_border_width(value)
+                if let Some(width) = parse_border_width(value) { self.inner.border_left_width = Some(width); }
+            }
+            "border-top-style" | "borderTopStyle" | "border-right-style" | "borderRightStyle"
+            | "border-bottom-style" | "borderBottomStyle" | "border-left-style" | "borderLeftStyle" => {
+                if let Some(visible) = parse_border_style_visibility(value) {
+                    let edge = if name.contains("top") || name.contains("Top") { 0 }
+                        else if name.contains("right") || name.contains("Right") { 1 }
+                        else if name.contains("bottom") || name.contains("Bottom") { 2 } else { 3 };
+                    let widths = [self.inner.border_top_width, self.inner.border_right_width,
+                        self.inner.border_bottom_width, self.inner.border_left_width];
+                    let width = if visible { self.declared_side_border_width(edge)
+                        .or(widths[edge].filter(|width| *width > 0.0)).unwrap_or(3.0) } else { 0.0 };
+                    match edge {
+                        0 => self.inner.border_top_width = Some(width),
+                        1 => self.inner.border_right_width = Some(width),
+                        2 => self.inner.border_bottom_width = Some(width),
+                        _ => self.inner.border_left_width = Some(width),
+                    }
+                }
             }
             "border-style" | "borderStyle" => {
                 if let Some(edges) = parse_border_style_edges(value) {
@@ -973,7 +991,58 @@ impl CSSStyleDeclaration {
     }
 
     pub fn to_style(&self) -> Style {
-        self.inner.clone()
+        let mut style = self.inner.clone();
+        // Width and style cascade independently. A later width declaration
+        // cannot make an explicitly none/hidden edge visible.
+        for (edge, physical, alias, shorthand) in [
+            (0, "border-top-style", "borderTopStyle", "border-top"),
+            (1, "border-right-style", "borderRightStyle", "border-right"),
+            (2, "border-bottom-style", "borderBottomStyle", "border-bottom"),
+            (3, "border-left-style", "borderLeftStyle", "border-left")] {
+            let visibility = self.inline_declarations.iter().rev().find_map(|(name, value)| {
+                let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+                if name == physical || name == alias { parse_border_style_visibility(value) }
+                else if matches!(name.as_str(), "border-style" | "borderStyle") {
+                    parse_border_style_edges(value).map(|edges| edges[edge])
+                } else if name == "border" || name == shorthand {
+                    let parts = split_css_whitespace(value);
+                    if parts.iter().all(|part| parse_border_width(part).is_some()
+                        || Color::from_css(part).is_some() || parse_border_style_visibility(part).is_some()) {
+                        parts.iter().find_map(|part| parse_border_style_visibility(part))
+                    } else { None }
+                } else { None }
+            });
+            if visibility == Some(false) {
+                match edge {
+                    0 => style.border_top_width = Some(0.0),
+                    1 => style.border_right_width = Some(0.0),
+                    2 => style.border_bottom_width = Some(0.0),
+                    _ => style.border_left_width = Some(0.0),
+                }
+            }
+        }
+        style
+    }
+
+    fn declared_side_border_width(&self, edge: usize) -> Option<f32> {
+        let (physical, alias, shorthand) = [
+            ("border-top-width", "borderTopWidth", "border-top"),
+            ("border-right-width", "borderRightWidth", "border-right"),
+            ("border-bottom-width", "borderBottomWidth", "border-bottom"),
+            ("border-left-width", "borderLeftWidth", "border-left")][edge];
+        self.inline_declarations.iter().rev().find_map(|(name, raw)| {
+            let (value, _) = crate::stylesheet::declaration_value_and_importance(raw);
+            if name == physical || name == alias { parse_border_width(value) }
+            else if matches!(name.as_str(), "border-width" | "borderWidth") {
+                parse_border_width_edges(value).map(|widths| widths[edge])
+            } else if name == "border" || name == shorthand {
+                let parts = split_css_whitespace(value);
+                if !parts.is_empty() && parts.iter().all(|part| parse_border_width(part).is_some()
+                    || Color::from_css(part).is_some() || parse_border_style_visibility(part).is_some()) {
+                    Some(parts.iter().find_map(|part| parse_border_width(part)).unwrap_or(3.0))
+                } else { None }
+            } else { None }
+        })
     }
 
     fn declared_uniform_border_width(&self) -> Option<f32> {
@@ -1260,7 +1329,7 @@ fn parse_border_width(value: &str) -> Option<f32> {
         "thin" => Some(1.0),
         "medium" => Some(3.0),
         "thick" => Some(5.0),
-        _ => parse_px(value),
+        _ => parse_px(value).filter(|width| width.is_finite() && *width >= 0.0),
     }
 }
 
@@ -2600,6 +2669,44 @@ mod tests {
 
         declaration.set_property("border-style", "none");
         assert_eq!(declaration.inner.border_width, 0.0);
+    }
+
+    #[test]
+    fn side_border_style_suppresses_later_width() {
+        for side in ["top", "right", "bottom", "left"] {
+            for visibility in ["none", "hidden"] {
+                let mut declaration = CSSStyleDeclaration::new();
+                declaration.set_property(&format!("border-{side}-style"), visibility);
+                declaration.set_property(&format!("border-{side}-width"), "3px");
+                let style = declaration.to_style();
+                let width = match side {
+                    "top" => style.border_top_width,
+                    "right" => style.border_right_width,
+                    "bottom" => style.border_bottom_width,
+                    _ => style.border_left_width,
+                };
+                assert_eq!(width, Some(0.0), "{side}: {visibility}");
+            }
+        }
+    }
+
+    #[test]
+    fn negative_border_width_does_not_replace_valid_declaration() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-bottom-width", "5px");
+        declaration.set_property("border-bottom-width", "-1px");
+        assert_eq!(declaration.to_style().border_bottom_width, Some(5.0));
+    }
+
+    #[test]
+    fn side_border_style_restores_independently_declared_width() {
+        for width in [0.0, 5.0] {
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("border-bottom-width", &format!("{width}px"));
+            declaration.set_property("border-bottom-style", "none");
+            declaration.set_property("border-bottom-style", "solid");
+            assert_eq!(declaration.to_style().border_bottom_width, Some(width));
+        }
     }
 
     #[test]
