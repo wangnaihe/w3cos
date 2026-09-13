@@ -2507,6 +2507,46 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   fresh runner's focused WPT receipts. Broader source-order/atomic layout and
   final same-clean-SHA6548 acceptance remain open.
 
+### Forced-break float struts and next-line exclusion bands
+
+- Baselinef147a68 cases1390/1391 (`004-ref/ref2`) are RED20000px each.
+  Raw first reference blue float is at(8,108), while Chromium800x600 puts
+  both references and the source at(108,14), following the6px text strut.
+  Forced-break projection incorrectly counted a100px float in line height.
+- Float/positioned boxes no longer enlarge the text strut or line alignment
+  width. Following floats retain the forced-break vertical source constraint
+  without advancing the normal text cursor; physical band projection then
+  resolves their horizontal edge. New isolated strut/cursor counter passes
+  after an optimized3m17s build.
+- Intermediate runner2m17s gives8/8,8/8,6/8 for starts1358/1366/1385:
+  1390/1391 reach0 but1392 becomes FAIL20000px. Its source frame is byte-for-
+  byte identical to baselinef147a68: correcting the reference exposed an
+  existing false agreement, not a source change from forced-break projection.
+  Receipts use`forced-break-float-strut-after-v1`.
+- For marked left floats after inline text that did not fit the current line,
+  try the next text line's exclusion band before jumping to earlier floats'
+  bottoms. Existing same-line placement is retained. A paired100/110px test
+  in a100px band checks both early fitting and required downward advancement.
+  Final optimized library4m43s passes that counter; float45PASS/1FAIL,
+  text-layout28/28, BFC3/3. Forced-break selector6PASS/2FAIL: the two old
+  counters still show40-vs19.2 and16-vs200, exactly reproduced with the saved
+  pre-change `w3cos-runtime-tall-float-red-bfc-candidate`. The old24-vs80
+  margin failure also remains. None of these failures is relabeled PASS.
+- Final runner2m20s SHA256
+  `b3066b5695b1722d4e77d753c9ee8495829b20217248b6c436e2c6eeab0a1321`:
+  starts1358/1366/1385 now8/8,8/8,7/8.1390/1391/1392 all PASS0;1386/1387/
+  1388/1389 stayPASS0.1385 (`008`) remains FAIL10000px. Native and browser
+  source colored boxes now share(8,8,100,100)/(108,14,100,100). Receipts use
+  `float-next-line-band-after-v1`; raw source`vertical004-source-next-band.frame`.
+- Related eight-case starts5769/5761/5753/5745/5737/5729/5721/5689/5681/
+  5665/5545/5553/5593 pass104/104 (100 exact-zero matches, four expected
+  mismatches), with ordered paths/statuses/full pixel-diff objects identical
+  to f147a68. Receipts use`float-next-line-band-final-v1`. No tolerance,
+  upstream file or suite changes. This closes focused pixel comparisons,
+  not full geometry: native source body/root heights remain200/216 whereas
+  Chromium reports6/114. Stale auto-height after float relocation, broader
+  packing/relative-offset closure and final same-clean-SHA6548 proof stay open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

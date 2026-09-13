@@ -5075,6 +5075,42 @@ fn project_simple_float_margin_boxes(
                     && let Some(containing) = content_box
                 {
                     let current = layouts[position].0;
+                    if child.style.float == WFloat::Left && child.style.clear == WClear::None
+                        && child.style.custom_properties.as_ref().is_some_and(|properties|
+                            properties.get("--w3cos-internal-left-float-after-inline")
+                                .is_some_and(|value| value == "1"))
+                        && let Some((previous_index, previous_child)) = previous
+                        && previous_child.style.float == WFloat::None
+                        && previous_child.style.display == WDisplay::Inline
+                        && matches!(&previous_child.kind, ComponentKind::Text { content }
+                            if content != "\u{2028}")
+                        && let Some(previous_position) = layout_position.get(&previous_index).copied()
+                    {
+                        let prior = layouts[previous_position].0;
+                        let leading = (previous_child.style.font_size * previous_child.style.line_height
+                            - previous_child.style.font_size) * 0.5;
+                        let mut y = prior.y - relative_shift(&previous_child.style).1
+                            + prior.height + leading;
+                        let margin_box = float_margin_box(current, &child.style);
+                        let exclusions: Vec<_> = active_floats.iter().map(|(side, margin_box)|
+                            FloatExclusion { side: *side, margin_box: *margin_box }).collect();
+                        // If it did not fit beside earlier inline content, try
+                        // the next line's available band before jumping below
+                        // every earlier float. Same-line placements stay put.
+                        while y < margin_box.y - 0.01 {
+                            let band = float_line_band(containing, y, margin_box.height, &exclusions);
+                            if margin_box.width <= band.width + 0.01 { break; }
+                            let next = active_floats.iter().map(|(_, rect)| rect.y + rect.height)
+                                .filter(|bottom| *bottom > y + 0.01).min_by(f32::total_cmp);
+                            let Some(next) = next else { break; };
+                            y = next;
+                        }
+                        if y < margin_box.y - 0.01 {
+                            shift_subtree(layouts, layout_position, child_index, child_count,
+                                y + current.y - margin_box.y - current.y);
+                        }
+                    }
+                    let current = layouts[position].0;
                     let margin_box = float_margin_box(current, &child.style);
                     let exclusions: Vec<_> = active_floats.iter().map(|(side, margin_box)|
                         FloatExclusion { side: *side, margin_box: *margin_box }).collect();
@@ -5431,6 +5467,12 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
         }
 
         for (position, (child, index)) in children.iter().enumerate() {
+            if child.style.float != WFloat::None
+                || matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+            {
+                // Out-of-flow boxes do not enlarge the inline line strut.
+                continue;
+            }
             let is_break = matches!(
                 &child.kind,
                 ComponentKind::Text { content } if content == "\u{2028}"
@@ -5447,7 +5489,8 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                 }
                 continue;
             }
-            if position > 0 && matches!(children[position - 1].0.style.display,
+            if position > 0 && children[position - 1].0.style.float == WFloat::None
+                && matches!(children[position - 1].0.style.display,
                 WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem | WDisplay::Table)
             {
                 // The mixed-flow fallback already reserves this empty line.
@@ -5495,7 +5538,8 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
             let line_width = following_line
                 .iter()
                 .filter(|(following, _)| {
-                    !matches!(following.style.position, WPos::Absolute | WPos::Fixed)
+                    following.style.float == WFloat::None
+                        && !matches!(following.style.position, WPos::Absolute | WPos::Fixed)
                 })
                 .filter_map(|(following, following_index)| {
                     let following_position = layout_position.get(following_index).copied()?;
@@ -5559,6 +5603,14 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                     _ => margin.right,
                 };
                 let following_rect = layouts[following_position].0;
+                if following.style.float != WFloat::None {
+                    // Keep its physical edge for float-band projection, but
+                    // retain the source constraint after this forced break.
+                    shift_subtree(layouts, layout_position, *following_index,
+                        count_nodes(following), 0.0,
+                        target_y + margin.top - following_rect.y);
+                    continue;
+                }
                 let target_x = cursor_x + margin_left;
                 shift_subtree(
                     layouts,
@@ -18640,6 +18692,56 @@ mod tests {
         assert!((get(2).y - get(0).y).abs() < 0.01, "float={:?}", get(2));
         assert!((get(3).y - get(1).y).abs() < 0.01);
         assert!((get(0).height - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn left_float_after_inline_tries_the_next_line_band_before_float_bottom() {
+        for width in [100.0, 110.0] {
+            let mut parent = Style { display: WDisp::Flex, width: WDim::Px(200.0),
+                font_size: 5.0, line_height: 1.2, ..Style::default() };
+            parent.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into());
+            let mut second = Style { display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(width), height: WDim::Px(100.0), ..Style::default() };
+            second.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-left-float-after-inline".into(), "1".into());
+            let root = Component::row(parent, vec![
+                Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(100.0), height: WDim::Px(100.0), ..Style::default() }, vec![]),
+                Component::text("H", Style { display: WDisp::Inline, font_size: 5.0,
+                    line_height: 1.2, ..Style::default() }), Component::row(second, vec![]),
+            ]);
+            let rect = |x, y, width, height| LayoutRect { x, y, width, height };
+            let mut layout = vec![(rect(0.0, 0.0, 200.0, 200.0), 0),
+                (rect(0.0, 0.0, 100.0, 100.0), 1), (rect(100.0, 0.5, 4.0, 5.0), 2),
+                (rect(0.0, 100.0, width, 100.0), 3)];
+            project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
+            assert_eq!(layout[3].0.y, if width == 100.0 { 6.0 } else { 100.0 });
+            assert_eq!(layout[3].0.x, if width == 100.0 { 100.0 } else { 0.0 });
+        }
+    }
+
+    #[test]
+    fn forced_break_strut_ignores_floats_and_float_width_does_not_advance_text() {
+        let inline = Style { display: WDisp::Inline, font_size: 5.0,
+            line_height: 1.2, ..Style::default() };
+        let float = || Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+            width: WDim::Px(100.0), height: WDim::Px(100.0), ..Style::default() }, vec![]);
+        let root = Component::row(Style { display: WDisp::Flex, width: WDim::Px(200.0),
+            font_size: 5.0, line_height: 1.2, ..Style::default() }, vec![
+            float(), Component::text("H", inline.clone()),
+            Component::text("\u{2028}", inline.clone()), float(),
+            Component::text("X", inline),
+        ]);
+        let rect = |x, y, width, height| LayoutRect { x, y, width, height };
+        let mut layout = vec![(rect(0.0, 0.0, 200.0, 200.0), 0),
+            (rect(0.0, 0.0, 100.0, 100.0), 1), (rect(100.0, 0.5, 4.0, 5.0), 2),
+            (rect(0.0, 5.5, 0.0, 5.0), 3), (rect(0.0, 100.0, 100.0, 100.0), 4),
+            (rect(100.0, 100.5, 4.0, 5.0), 5)];
+        project_forced_break_lines(&mut layout, &root);
+        assert_eq!(layout[4].0.y, 6.0);
+        assert_eq!(layout[5].0.y, 6.5);
+        assert_eq!(layout[5].0.x, 0.0);
     }
 
     #[test]
