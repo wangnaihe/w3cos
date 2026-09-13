@@ -746,6 +746,7 @@ impl Style {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Display {
     Block,
+    FlowRoot,
     #[default]
     Flex,
     Grid,

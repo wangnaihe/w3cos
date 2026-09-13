@@ -109,6 +109,42 @@ pub(crate) fn float_line_band(
     LayoutRect { x: left, y, width: (right - left).max(0.0), height: line_height }
 }
 
+fn bfc_inline_bounds(containing: LayoutRect, band: LayoutRect, left_margin: f32,
+    right_margin: f32, child: &Component, viewport_w: f32, viewport_h: f32) -> (f32, f32) {
+    // While floats narrow the band, negative margins cannot expand a BFC
+    // through either physical edge of that band. Once the floats release,
+    // ordinary block width resolution retains the authored negative margins.
+    let narrowed = band.width < containing.width - 0.01;
+    let left_margin = if narrowed { left_margin.max(0.0) } else { left_margin };
+    let right_margin = if narrowed { right_margin.max(0.0) } else { right_margin };
+    let normal_left = containing.x + left_margin;
+    let normal_right = containing.x + containing.width - right_margin;
+    let left = if band.x > containing.x + 0.01 { normal_left.max(band.x) }
+        else { normal_left };
+    let right = if band.x + band.width < containing.x + containing.width - 0.01 {
+        normal_right.min(band.x + band.width)
+    } else { normal_right };
+    let minimum = child.style.border_left_width.unwrap_or(child.style.border_width)
+        + child.style.border_right_width.unwrap_or(child.style.border_width)
+        + [child.style.padding.left, child.style.padding.right].into_iter()
+            .map(|padding| resolve_spacing_for_layout(padding, containing.width,
+                child.style.font_size, viewport_w, viewport_h)).sum::<f32>();
+    if right - left < minimum && band.width >= minimum {
+        // A line-end margin may overflow rather than force clearance when
+        // the float occupies line-start. Preserve the padding/border box.
+        if child.style.direction == w3cos_std::style::TextDirection::Ltr
+            && right_margin > 0.0 && band.x > containing.x + 0.01 {
+            return (left, left + minimum);
+        }
+        if child.style.direction == w3cos_std::style::TextDirection::Rtl
+            && left_margin > 0.0
+            && band.x + band.width < containing.x + containing.width - 0.01 {
+            return (right - minimum, right);
+        }
+    }
+    (left, right)
+}
+
 #[derive(Debug)]
 pub(crate) struct FloatTextLayout {
     pub text_index: usize,
@@ -4620,6 +4656,17 @@ fn project_simple_float_margin_boxes(
             child_index += count_nodes(child);
         }
 
+        let anonymous = component.style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                || properties.contains_key("--w3cos-internal-anonymous-float-group"));
+        if !anonymous && matches!(component.style.display,
+            WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
+        {
+            // Floats do not create exclusions among genuine flex/grid items.
+            // Children still settle their own independent formatting contexts.
+            return;
+        }
+
         // A leading right float's synthetic auto margin must not consume
         // inline line space. Keep a fitting prefix of right floats at the
         // content end and translate the following inline runs as one group.
@@ -4853,7 +4900,7 @@ fn project_simple_float_margin_boxes(
         let mut imported_float_group = false;
         let mut skipped_positioned = false;
         let ordinary_float_context = matches!(component.style.display,
-            WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell)
+            WDisplay::Block | WDisplay::FlowRoot | WDisplay::InlineBlock | WDisplay::ListItem | WDisplay::TableCell)
             || (component.style.display == WDisplay::Flex
                 && component.style.custom_properties.as_ref().is_some_and(|properties|
                     properties.get("--w3cos-internal-anonymous-float-group")
@@ -4959,7 +5006,7 @@ fn project_simple_float_margin_boxes(
                 continue;
             }
             let avoids_floats = matches!(child.style.display,
-                WDisplay::Table | WDisplay::InlineTable | WDisplay::InlineBlock | WDisplay::InlineFlex)
+                WDisplay::FlowRoot | WDisplay::Table | WDisplay::InlineTable | WDisplay::InlineBlock | WDisplay::InlineFlex)
                 || child.style.resolved_overflow_x() != WOverflow::Visible
                 || child.style.resolved_overflow_y() != WOverflow::Visible;
             if skipped_positioned && previous.is_none()
@@ -5054,7 +5101,7 @@ fn project_simple_float_margin_boxes(
                     (child.style.font_size * child.style.line_height - child.style.font_size) * 0.5
                 } else { 0.0 };
                 if avoids_floats
-                    && (child.style.display == WDisplay::Block
+                    && (matches!(child.style.display, WDisplay::Block | WDisplay::FlowRoot)
                         || matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable)
                         || (child.style.display == WDisplay::Flex
                             && child.style.custom_properties.as_ref().is_some_and(|properties|
@@ -5073,13 +5120,24 @@ fn project_simple_float_margin_boxes(
                     let exclusions = active_floats.iter().map(|(side, margin_box)|
                         FloatExclusion { side: *side, margin_box: *margin_box }).collect::<Vec<_>>();
                     let band = float_line_band(containing, float_top, current.height, &exclusions);
-                    let horizontal_margin = [child.style.margin.left, child.style.margin.right]
-                        .into_iter().map(|margin| resolve_spacing_for_layout(margin,
-                            containing.width, child.style.font_size, viewport_w, viewport_h))
-                        .sum::<f32>();
-                    let available = (band.width - horizontal_margin).max(0.0);
+                    let margins = [child.style.margin.left, child.style.margin.right]
+                        .map(|margin| resolve_spacing_for_layout(margin,
+                            containing.width, child.style.font_size, viewport_w, viewport_h));
+                    let (left, right) = bfc_inline_bounds(containing, band, margins[0], margins[1],
+                        child, viewport_w, viewport_h);
+                    let available = (right - left).max(0.0);
+                    let padding_border = [child.style.padding.left, child.style.padding.right].into_iter()
+                            .map(|padding| resolve_spacing_for_layout(padding, containing.width,
+                                child.style.font_size, viewport_w, viewport_h)).sum::<f32>()
+                        + child.style.border_left_width.unwrap_or(child.style.border_width)
+                        + child.style.border_right_width.unwrap_or(child.style.border_width);
+                    let minimum_border_box = (-(margins[0] + margins[1])).max(padding_border);
                     let table = matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable);
                     if available > 0.01 && available < current.width - 0.01
+                        // A negative margin on the opposite side may extend
+                        // `available` outside the containing block. That does
+                        // not enlarge the actual band left by the floats.
+                        && minimum_border_box <= band.width + 0.01
                         && (!table || table_min_content_border_box_width(child,
                             containing.width, viewport_w, viewport_h) <= available + 0.01)
                     {
@@ -5141,10 +5199,10 @@ fn project_simple_float_margin_boxes(
                     content_box.and_then(|containing| {
                     let exclusions = active_floats.iter().map(|(side, margin_box)|
                         FloatExclusion { side: *side, margin_box: *margin_box }).collect::<Vec<_>>();
-                    let horizontal_margin = [child.style.margin.left, child.style.margin.right]
-                        .into_iter().map(|margin| resolve_spacing_for_layout(
+                    let margins = [child.style.margin.left, child.style.margin.right]
+                        .map(|margin| resolve_spacing_for_layout(
                             margin, containing.width, child.style.font_size, viewport_w, viewport_h,
-                        )).sum::<f32>();
+                        ));
                     // A shorter float may release enough space while another
                     // still overlaps. Try each exclusion boundary, not only
                     // the initial band or the bottom of every float.
@@ -5155,7 +5213,9 @@ fn project_simple_float_margin_boxes(
                     candidates.dedup();
                     candidates.into_iter().find(|y| {
                         let band = float_line_band(containing, *y, current.height, &exclusions);
-                        current.width + horizontal_margin <= band.width + 0.01
+                        let (left, right) = bfc_inline_bounds(containing, band, margins[0], margins[1],
+                            child, viewport_w, viewport_h);
+                        current.width <= (right - left).max(0.0) + 0.01
                     })
                 }) };
                 if current.y - leading + f32::EPSILON >= float_bottom
@@ -5239,7 +5299,13 @@ fn project_simple_float_margin_boxes(
                             containing.width, child.style.font_size, viewport_w, viewport_h);
                     }
                     let outer_width = current.width + margin.left + margin.right;
-                    if outer_width <= (right_edge - left_edge).max(0.0) + 0.01 {
+                    let band = LayoutRect { x: left_edge, width: (right_edge - left_edge).max(0.0),
+                        ..current };
+                    let (bfc_left, bfc_right) = bfc_inline_bounds(containing, band, margin.left, margin.right,
+                        child, viewport_w, viewport_h);
+                    let fits = if avoids_floats { current.width <= (bfc_right - bfc_left).max(0.0) + 0.01 }
+                        else { outer_width <= band.width + 0.01 };
+                    if fits {
                         if avoids_floats {
                             let resolve = |dimension: WDim| dimension.resolve(
                                 containing.width, ROOT_FONT_SIZE, child.style.font_size,
@@ -5259,8 +5325,8 @@ fn project_simple_float_margin_boxes(
                             // Preserve an already fitting authored position (for
                             // example auto-margin centering); only displace boxes
                             // whose normal position intersects a float.
-                            let minimum_x = left_edge + margin.left + relative_x;
-                            let maximum_x = (right_edge - margin.right - current.width
+                            let minimum_x = bfc_left + relative_x;
+                            let maximum_x = (bfc_right - current.width
                                 + relative_x).max(minimum_x);
                             let target_x = current.x.clamp(minimum_x, maximum_x);
                             shift_subtree_x(layouts, layout_position, child_index, child_count,
@@ -5586,7 +5652,7 @@ fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
         || matches!(style.position, WPos::Absolute | WPos::Fixed)
         || style.resolved_overflow_x() != WOverflow::Visible
         || style.resolved_overflow_y() != WOverflow::Visible
-        || matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineTable | WDisplay::TableCell)
+        || matches!(style.display, WDisplay::FlowRoot | WDisplay::InlineBlock | WDisplay::InlineTable | WDisplay::TableCell)
         || (!anonymous && matches!(style.display, WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid))
 }
 
@@ -8169,6 +8235,20 @@ fn build_taffy_tree(
                             || !matches!(comp.style.min_height, WDim::Auto)),
                         active_border_spacing,
                     )?;
+                    if c.style.float == WFloat::Right
+                        && matches!(comp.style.display,
+                            WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
+                        && !comp.style.custom_properties.as_ref().is_some_and(|properties|
+                            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                                || properties.contains_key("--w3cos-internal-anonymous-float-group"))
+                    {
+                        // CSS float has no effect on a flex/grid item. Restore
+                        // the authored margin, not the block-float auto margin.
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.margin.left = to_taffy_margin(c.style.margin.left,
+                            c.style.font_size, viewport_w, viewport_h);
+                        tree.set_style(node, child_style)?;
+                    }
                     if c.style.float != WFloat::None
                         && comp.style.custom_properties.as_ref().is_some_and(|properties|
                             properties.contains_key("--w3cos-internal-inline-formatting-context"))
@@ -8705,6 +8785,7 @@ fn to_taffy_display(d: WDisplay) -> taffy::Display {
         | WDisplay::Contents => taffy::Display::Flex,
         WDisplay::Grid => taffy::Display::Grid,
         WDisplay::Block
+        | WDisplay::FlowRoot
         | WDisplay::Table
         | WDisplay::TableRowGroup
         | WDisplay::TableHeaderGroup
@@ -9740,7 +9821,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
                 height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
-        WDisplay::Block => (
+        WDisplay::Block | WDisplay::FlowRoot => (
             taffy::Display::Block,
             s.flex_grow,
             s.flex_shrink,
@@ -9890,6 +9971,18 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             WPos::Absolute | WPos::Fixed => taffy::Position::Absolute,
         },
         flex_direction: match (s.display, s.flex_direction) {
+            (WDisplay::Flex | WDisplay::InlineFlex, direction)
+                if s.direction == w3cos_std::style::TextDirection::Rtl
+                    && !s.custom_properties.as_ref().is_some_and(|properties|
+                        properties.contains_key("--w3cos-internal-inline-formatting-context")
+                            || properties.contains_key("--w3cos-internal-anonymous-float-group")
+                            || properties.contains_key("--w3cos-internal-unbroken-inline-word")) =>
+                match direction {
+                    WDir::Row => FlexDirection::RowReverse,
+                    WDir::RowReverse => FlexDirection::Row,
+                    WDir::Column => FlexDirection::Column,
+                    WDir::ColumnReverse => FlexDirection::ColumnReverse,
+                },
             (
                 WDisplay::Table
                 | WDisplay::TableRowGroup
@@ -15192,6 +15285,197 @@ mod tests {
     }
 
     #[test]
+    fn authored_flex_flow_root_respects_float_item_authored_margin() {
+        let root = Component::row(Style { display: WDisp::InlineFlex,
+            flex_direction: WDir::RowReverse, width: WDim::Px(30.0),
+            height: WDim::Px(40.0), border_width: 1.0, ..Style::default() }, vec![
+            Component::row(Style { display: WDisp::Block, float: WFloat::Right,
+                width: WDim::Px(7.0), height: WDim::Px(8.0), border_width: 1.0,
+                margin: w3cos_std::style::Edges {
+                    top: w3cos_std::style::Spacing::Px(1.0),
+                    bottom: w3cos_std::style::Spacing::Px(1.0),
+                    left: w3cos_std::style::Spacing::Px(2.0),
+                    right: w3cos_std::style::Spacing::Px(3.0) }, ..Style::default() }, vec![]),
+            Component::row(Style { display: WDisp::FlowRoot, flex_grow: 1.0,
+                height: WDim::Px(15.0), border_width: 1.0, ..Style::default() }, vec![]),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(rect(2).width, 16.0);
+        assert_eq!(rect(2).x, 1.0);
+        assert_eq!(rect(1).x, 19.0);
+    }
+
+    #[test]
+    fn unbroken_inline_word_keeps_physical_fragment_order_in_rtl() {
+        let root = Component::row(Style { display: WDisp::InlineFlex,
+            direction: w3cos_std::style::TextDirection::Rtl,
+            flex_direction: WDir::Row, custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-unbroken-inline-word".into(), "1".into())
+            ])), ..Style::default() }, vec![
+            Component::boxed(Style { width: WDim::Px(40.0), height: WDim::Px(20.0),
+                ..Style::default() }, vec![]),
+            Component::boxed(Style { width: WDim::Px(60.0), height: WDim::Px(20.0),
+                ..Style::default() }, vec![]),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(rect(1).x, 0.0);
+        assert_eq!(rect(2).x, 40.0);
+    }
+
+    #[test]
+    fn authored_rtl_flex_flow_root_uses_physical_row_direction() {
+        for reverse in [false, true] {
+            let root = Component::row(Style { display: WDisp::InlineFlex,
+                direction: w3cos_std::style::TextDirection::Rtl,
+                flex_direction: if reverse { WDir::RowReverse } else { WDir::Row },
+                width: WDim::Px(200.0), ..Style::default() }, vec![
+                Component::row(Style { display: WDisp::Block, float: WFloat::Left,
+                    width: WDim::Px(50.0), height: WDim::Px(40.0), ..Style::default() }, vec![]),
+                Component::row(Style { display: WDisp::FlowRoot, flex_grow: 1.0,
+                    height: WDim::Px(60.0), ..Style::default() }, vec![]),
+            ]);
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+            assert_eq!(rect(1).x, if reverse { 0.0 } else { 150.0 });
+            assert_eq!(rect(2).x, if reverse { 50.0 } else { 0.0 });
+            assert_eq!(rect(2).width, 150.0);
+        }
+    }
+
+    #[test]
+    fn authored_reverse_flex_ignores_float_when_placing_flow_root_item() {
+        let root = Component::boxed(Style { display: WDisp::InlineFlex,
+            flex_direction: WDir::RowReverse, width: WDim::Px(200.0), ..Style::default() }, vec![
+            Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(50.0), height: WDim::Px(40.0), ..Style::default() }, vec![]),
+            Component::boxed(Style { display: WDisp::FlowRoot, flex_grow: 1.0,
+                height: WDim::Px(60.0), ..Style::default() }, vec![]),
+        ]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(rect(2).y, rect(0).y, "CSS float must not exclude flex track space");
+        assert_eq!(rect(2).x, rect(0).x);
+        assert_eq!(rect(2).width, 150.0);
+    }
+
+    #[test]
+    fn flow_root_large_inline_end_margin_overflows_without_clearing_start_float() {
+        for rtl in [false, true] {
+            for margin in [15.0, 22.0, 28.0] {
+                let root = Component::boxed(Style { display: WDisp::InlineBlock,
+                    direction: if rtl { w3cos_std::style::TextDirection::Rtl }
+                        else { w3cos_std::style::TextDirection::Ltr },
+                    width: WDim::Px(30.0), height: WDim::Px(40.0), border_width: 1.0,
+                    ..Style::default() }, vec![
+                    Component::boxed(Style { display: WDisp::Block,
+                        float: if rtl { WFloat::Right } else { WFloat::Left },
+                        width: WDim::Px(7.0), height: WDim::Px(8.0), border_width: 1.0,
+                        margin: w3cos_std::style::Edges {
+                            top: w3cos_std::style::Spacing::Px(1.0),
+                            bottom: w3cos_std::style::Spacing::Px(1.0),
+                            left: w3cos_std::style::Spacing::Px(2.0),
+                            right: w3cos_std::style::Spacing::Px(3.0) }, ..Style::default() }, vec![]),
+                    Component::boxed(Style { display: WDisp::FlowRoot,
+                        direction: if rtl { w3cos_std::style::TextDirection::Rtl }
+                            else { w3cos_std::style::TextDirection::Ltr },
+                        height: WDim::Px(15.0), border_width: 1.0,
+                        margin: w3cos_std::style::Edges {
+                            left: w3cos_std::style::Spacing::Px(if rtl { margin } else { 0.0 }),
+                            right: w3cos_std::style::Spacing::Px(if rtl { 0.0 } else { margin }),
+                            ..Default::default() }, ..Style::default() }, vec![]),
+                ]);
+                let layout = compute(&root, 800.0, 600.0).unwrap();
+                let rect = layout.iter().find(|(_, node)| *node == 2).unwrap().0;
+                assert_eq!((rect.x, rect.y, rect.width), (15.0, 1.0, 2.0),
+                    "rtl={rtl}, margin={margin}");
+            }
+        }
+    }
+
+    #[test]
+    fn flow_root_small_negative_margin_stays_inside_float_band() {
+        for negative_right in [false, true] {
+            for margin in [-16.0, -15.0, -10.0, -1.0, 0.0] {
+                let root = Component::boxed(Style { display: WDisp::InlineBlock,
+                    width: WDim::Px(30.0), height: WDim::Px(40.0), border_width: 1.0,
+                    ..Style::default() }, vec![
+                    Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                        width: WDim::Px(7.0), height: WDim::Px(8.0), border_width: 1.0,
+                        margin: w3cos_std::style::Edges {
+                            top: w3cos_std::style::Spacing::Px(1.0),
+                            bottom: w3cos_std::style::Spacing::Px(1.0),
+                            left: w3cos_std::style::Spacing::Px(2.0),
+                            right: w3cos_std::style::Spacing::Px(3.0) }, ..Style::default() }, vec![]),
+                    Component::boxed(Style { display: WDisp::FlowRoot, height: WDim::Px(15.0),
+                        border_width: 1.0, margin: w3cos_std::style::Edges {
+                            left: w3cos_std::style::Spacing::Px(if negative_right { 0.0 } else { margin }),
+                            right: w3cos_std::style::Spacing::Px(if negative_right { margin } else { 0.0 }),
+                            ..Default::default() }, ..Style::default() }, vec![]),
+                ]);
+                let layout = compute(&root, 800.0, 600.0).unwrap();
+                let rect = layout.iter().find(|(_, node)| *node == 2).unwrap().0;
+                assert_eq!((rect.x, rect.y, rect.width), (15.0, 1.0, 16.0),
+                    "negative_right={negative_right}, margin={margin}");
+            }
+        }
+    }
+
+    #[test]
+    fn negative_margin_flow_root_does_not_overlap_float_margin_box() {
+        for negative_right in [false, true] {
+        let floating = Component::boxed(Style { display: WDisp::Block,
+            float: WFloat::Left, width: WDim::Px(7.0), height: WDim::Px(8.0),
+            border_width: 1.0, margin: w3cos_std::style::Edges {
+                top: w3cos_std::style::Spacing::Px(1.0),
+                bottom: w3cos_std::style::Spacing::Px(1.0),
+                left: w3cos_std::style::Spacing::Px(2.0),
+                right: w3cos_std::style::Spacing::Px(3.0) }, ..Style::default() }, vec![]);
+        let child = Component::boxed(Style { display: WDisp::FlowRoot,
+            height: WDim::Px(15.0), border_width: 1.0,
+            margin: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(if negative_right { 0.0 } else { -30.0 }),
+                right: w3cos_std::style::Spacing::Px(if negative_right { -30.0 } else { 0.0 }),
+                ..Default::default() }, ..Style::default() }, vec![]);
+        let root = Component::boxed(Style { display: WDisp::InlineBlock,
+            width: WDim::Px(30.0), height: WDim::Px(40.0), border_width: 1.0,
+            ..Style::default() }, vec![floating, child]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert!(rect(2).y >= rect(1).y + rect(1).height + 1.0 - 0.01,
+            "BFC must clear the float margin box: float={:?}, bfc={:?}", rect(1), rect(2));
+        assert_eq!(rect(2).width, 60.0, "negative_right={negative_right}");
+        }
+    }
+
+    #[test]
+    fn flow_root_with_large_inline_margin_avoids_float_on_both_sides() {
+        for rtl in [false, true] {
+            for display in [WDisp::FlowRoot, WDisp::Block] {
+                let floating = Component::boxed(Style { display: WDisp::Block,
+                    float: if rtl { WFloat::Left } else { WFloat::Right },
+                    width: WDim::Px(50.0), height: WDim::Px(40.0), ..Style::default() }, vec![]);
+                let child = Component::boxed(Style { display, height: WDim::Px(60.0),
+                    margin: w3cos_std::style::Edges {
+                        left: w3cos_std::style::Spacing::Px(if rtl { 0.0 } else { 51.0 }),
+                        right: w3cos_std::style::Spacing::Px(if rtl { 51.0 } else { 0.0 }),
+                        ..Default::default() }, ..Style::default() }, vec![]);
+                let root = Component::boxed(Style { display: WDisp::FlowRoot,
+                    width: WDim::Px(100.0),
+                    direction: if rtl { w3cos_std::style::TextDirection::Rtl }
+                        else { w3cos_std::style::TextDirection::Ltr },
+                    ..Style::default() }, vec![floating, child]);
+                let layout = compute(&root, 800.0, 600.0).unwrap();
+                let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                let offset = if display == WDisp::FlowRoot { 40.0 } else { 0.0 };
+                assert_eq!(rect(2).y - rect(0).y, offset, "rtl={rtl}, display={display:?}");
+                assert_eq!(rect(0).height, offset + 60.0, "rtl={rtl}, display={display:?}");
+            }
+        }
+    }
+
+    #[test]
     fn float_only_auto_bfc_height_settles_after_upward_repositioning() {
         for minimum in [WDim::Auto, WDim::Px(100.0)] {
             let floating = |side, width, height| Component::boxed(Style {
@@ -15359,7 +15643,10 @@ mod tests {
                 assert!(parent.height >= table.y + table.height);
             } else {
                 assert_eq!(table.y, 0.0);
-                assert_eq!(table.x, 20.0 + width * margin_percent / 100.0);
+                // The margin's normal offset is already inside the float's
+                // occupied band; Chromium places the border edge at 20px,
+                // not at float edge + 10% again.
+                assert_eq!(table.x, 20.0);
             }
         }
     }
@@ -19577,7 +19864,9 @@ mod tests {
     #[test]
     fn empty_right_float_does_not_shift_following_inline_text() {
         let root = Component::row(Style { display: WDisp::Flex,
-            width: WDim::Px(400.0), ..Style::default() }, vec![
+            width: WDim::Px(400.0), custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into())
+            ])), ..Style::default() }, vec![
             Component::row(Style { display: WDisp::Block, float: WFloat::Right,
                 ..Style::default() }, vec![]),
             Component::text("This text should be green.", Style {
@@ -19600,13 +19889,17 @@ mod tests {
             display: WDisp::Block, float: WFloat::Right, width: WDim::Px(width),
             height: WDim::Px(0.0), ..Style::default() }, vec![]);
         let root = Component::row(Style { display: WDisp::Flex,
-            width: WDim::Px(400.0), ..Style::default() }, vec![
+            width: WDim::Px(400.0), custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into())
+            ])), ..Style::default() }, vec![
             floating(20.0), floating(30.0), Component::text("Text", Style {
                 display: WDisp::Inline, width: WDim::Px(100.0), ..Style::default() })]);
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!(get(1).x, 380.0);
-        assert_eq!(get(2).x, 350.0);
+        // Zero-height floats do not exclude a horizontal band. Chromium
+        // places each at the physical right edge, so their boxes overlap.
+        assert_eq!(get(2).x, 370.0);
         assert_eq!(get(3).x, 0.0);
     }
 

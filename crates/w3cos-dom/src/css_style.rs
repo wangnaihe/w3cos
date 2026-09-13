@@ -775,6 +775,7 @@ impl CSSStyleDeclaration {
         match name {
             "display" => match self.inner.display {
                 Display::Block => "block".to_string(),
+                Display::FlowRoot => "flow-root".to_string(),
                 Display::Flex => "flex".to_string(),
                 Display::Grid => "grid".to_string(),
                 Display::Inline => "inline".to_string(),
@@ -1302,10 +1303,7 @@ fn parse_display(value: &str) -> Display {
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
         "inline-flex" => Display::InlineFlex,
-        // `flow-root` creates a block formatting context. The internal
-        // display model does not need a second block layout algorithm; map it
-        // to Block rather than falling through to the legacy Flex default.
-        "flow-root" => Display::Block,
+        "flow-root" => Display::FlowRoot,
         "table" => Display::Table,
         "inline-table" => Display::InlineTable,
         "table-row-group" => Display::TableRowGroup,
@@ -3094,10 +3092,19 @@ fn inline_flex_round_trips_without_falling_back_to_block_flex() {
 }
 
 #[test]
-fn flow_root_uses_block_layout_instead_of_flex_fallback() {
+fn flow_root_display_round_trips_and_can_be_reset_to_block() {
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("display", "flow-root");
-    assert_eq!(declaration.inner.display, Display::Block);
+    assert_eq!(declaration.get_property("display"), "flow-root");
+    declaration.set_property("display", "block");
+    assert_eq!(declaration.get_property("display"), "block");
+}
+
+#[test]
+fn flow_root_preserves_its_block_formatting_context_display() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "flow-root");
+    assert_eq!(declaration.inner.display, Display::FlowRoot);
 }
 
 #[test]

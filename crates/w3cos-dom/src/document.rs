@@ -4391,6 +4391,7 @@ impl Document {
                 if matches!(
                     style.display,
                     w3cos_std::style::Display::Block
+                        | w3cos_std::style::Display::FlowRoot
                         | w3cos_std::style::Display::InlineBlock
                         | w3cos_std::style::Display::ListItem
                         | w3cos_std::style::Display::TableCell

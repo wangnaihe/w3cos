@@ -791,6 +791,7 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     if let Some(ref d) = s.display {
         let variant = match d.as_str() {
             "block" => "Display::Block",
+            "flow-root" => "Display::FlowRoot",
             "grid" => "Display::Grid",
             "inline" => "Display::Inline",
             "inline-block" => "Display::InlineBlock",
@@ -1741,6 +1742,14 @@ mod tests {
         assert!(rust.contains("Component::text(\"hello\""));
         assert!(rust.contains("fn build_ui()"));
         assert!(rust.contains("w3cos_runtime::run_app"));
+    }
+
+    #[test]
+    fn codegen_preserves_flow_root_display_semantics() {
+        let style = StyleDecl { display: Some("flow-root".into()), ..StyleDecl::default() };
+        let node = test_node(NodeKind::Column, style);
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
+        assert!(rust.contains("display: Display::FlowRoot"), "{rust}");
     }
 
     #[test]

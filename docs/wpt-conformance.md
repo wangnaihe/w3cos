@@ -3001,6 +3001,62 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   a current global remaining count. The six selected float-margin
   failures remain unchanged; final clean-SHA full6548 acceptance is open.
 
+### Flow-root float-band and genuine-flex repair
+
+- Based on `59537d745265da90708e041ee0ff4c204197570e`, preserve
+  `Display::FlowRoot` through CSS declaration round-trip, DOM float fixup,
+  static codegen and runtime block/BFC mapping. This is an engine change,
+  not application CSS or a changed upstream fixture.
+- Auto-width BFCs use physical float bands, overlapping same-side margins
+  rather than adding them again. Small negative margins cannot enlarge the
+  float band; sufficiently negative margins force clearance. The minimum
+  padding/border box is not added twice to the negative-margin width floor.
+  Large line-end margins may overflow alongside a line-start float, in
+  both LTR and RTL. Genuine flex/grid items ignore float exclusion and keep
+  authored margins; RTL horizontal flex directions map to physical tracks.
+  Synthetic inline lines, float groups and unbroken inline words retain
+  their existing physical-order semantics.
+- Retained RED/GREEN receipts cover CSS round-trip (2 PASS), static
+  `codegen::tests::` selected by exact names (14 PASS), and seven layout
+  flow-root regressions plus the RTL unbroken-word regression (8 PASS).
+  Isolated Chromium 141 fixtures at 800x600 confirm the negative-margin,
+  positive line-end overflow, flex-item margin and RTL track geometries.
+  The old zero-height right-float fixture now explicitly represents an
+  anonymous inline context; browser proof corrects its second float x from
+  350 to 370, preserving overlap rather than inventing a nonzero exclusion.
+  The table margin fixture's x=20 also matches browser geometry; this does
+  not claim its empty-table height is browser-equivalent.
+- Intermediate candidates were not published: `flow-root-display-v1`,
+  `bfc-inline-bounds-v1`, `flow-root-authored-flex-v1` and
+  `flow-root-opposite-negative-v1` each retained four failures in start
+  1416, some worse than base. `flow-root-band-and-flex-v1` reached 7/8;
+  `flow-root-inline-end-v1` reached 8/8 but regressed RTL
+  `text-align-white-space-006` by 1200 pixels in start 5665. A minimal
+  unbroken-word test reproduces x=60 versus 0 before the synthetic-word
+  exclusion, then passes. The final word unit build takes 2m41s; the
+  optimized runner build takes 5m10s including its unit-build lock wait.
+- Final runner SHA256:
+  `c7efd7697029dacb144b6a0ae9bf10c32852e05828f62f198ad2ebc17479f29a`.
+  Receipts `flow-root-qualified-v1` bind WPT revision
+  `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, frozen suite and 800x600.
+  Original twenty eight-case batches now finish 160/160 PASS; start 1416
+  becomes 8/8 with exact zero differences for all six selected margins.
+  Additional starts 5268/5276/5284 remain 21/24 with identical full reports.
+  All 23 batches finish 181/184 execution PASS, 3 FAIL. Full ordered
+  path/status/pixel-diff comparison changes only the six repaired cases;
+  no old PASS is lost. Caption-position-001 (876 pixels) and collapsing
+  border-model-003/009 (2400 each) remain failures. Overlapping executions
+  are not a global remaining count; clean-SHA full6548 acceptance is open.
+- Neighbor layout checks retain the recorded float leading-margin failure,
+  six table failures and three text failures. The three text failures also
+  reproduce in the saved older `w3cos-runtime-auto-bfc-px-candidate-v1`
+  executable. BFC checks pass 13/13. Broader substring attempts are not
+  module-green evidence: `flow-root-codegen-module.log` was interrupted
+  after accidentally selecting ESM generated-project tests with three
+  failures; `flow-root-flex-margin-rtl-red.log` also selected an unrelated
+  dynamic-script color serialization failure. Those failures are not
+  claimed fixed or proven baseline against the published base.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
