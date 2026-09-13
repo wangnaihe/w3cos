@@ -8785,16 +8785,36 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
                 })
             })
     });
+    let line_ends = visual_fragments.iter().enumerate().map(|(index, fragment)| {
+        visual_fragments.get(index + 1)
+            .is_none_or(|next| next.line_index != fragment.line_index)
+    }).collect::<Vec<_>>();
     let mut edge_whitespace = Vec::with_capacity(visual_fragments.len());
-    for fragment in &mut visual_fragments {
+    let mut fragments_per_line = std::collections::HashMap::new();
+    for fragment in &visual_fragments {
+        *fragments_per_line.entry((fragment.unit_index, fragment.line_index))
+            .or_insert(0usize) += 1;
+    }
+    let split_fragments = visual_fragments.iter().map(|fragment| {
+        fragments_per_line[&(fragment.unit_index, fragment.line_index)] > 1
+    }).collect::<Vec<_>>();
+    for (index, fragment) in visual_fragments.iter_mut().enumerate() {
         let ComponentKind::Text { content } = &mut fragment.component.kind else {
             edge_whitespace.push((false, false));
             continue;
         };
         let leading = content.chars().next().is_some_and(is_css_whitespace);
         let trailing = content.chars().next_back().is_some_and(is_css_whitespace);
-        if leading || trailing {
-            *content = content.trim_matches(is_css_whitespace).to_string();
+        // Collapsed inter-fragment whitespace still belongs to its inline
+        // decoration. Moving every trailing space into an anonymous run
+        // shortens the inline's border/background by one space advance.
+        let owns_trailing_space = trailing && !line_ends[index]
+            && !principal_box_can_merge_generated_inline_text(&fragment.component.style);
+        if leading {
+            *content = content.trim_start_matches(is_css_whitespace).to_string();
+        }
+        if trailing && !owns_trailing_space {
+            *content = content.trim_end_matches(is_css_whitespace).to_string();
         }
         edge_whitespace.push((leading, trailing));
     }
@@ -8850,9 +8870,24 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             } else if boundary_has_space
                 && !left_owns_space
                 && !right_owns_space
-                && let Some(space) = &anonymous_space
             {
-                normalized.push(space.clone());
+                // A collapsed boundary space can have originated in the
+                // adjacent bare run before bidi reordering. Its visual
+                // advance must still extend the preceding decorated inline
+                // fragment, rather than cutting that fragment's paint span.
+                let extends_inline = split_fragments[index - 1]
+                    && normalized.last_mut().is_some_and(|previous| {
+                    if !principal_box_can_merge_generated_inline_text(&previous.style)
+                        && let ComponentKind::Text { content } = &mut previous.kind
+                        && !content.is_empty()
+                    {
+                        content.push(' ');
+                        true
+                    } else { false }
+                });
+                if !extends_inline && let Some(space) = &anonymous_space {
+                    normalized.push(space.clone());
+                }
             }
         }
         let preserve_wrapper = units[fragment.unit_index].wrapper.is_some()
@@ -13024,7 +13059,120 @@ mod image_component_tests {
     }
 
     #[test]
-    fn explicit_bidi_moves_collapsed_spaces_outside_decorated_fragments() {
+    fn wrapped_bidi_keeps_external_space_outside_single_fragments_per_line() {
+        let plain = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            style.font_family = Some("Ahem".to_string());
+            style.line_height = 1.0;
+            w3cos_std::Component::text(content, style)
+        };
+        let decorated = |content: &str| {
+            let mut style = plain("").style;
+            style.border_width = 3.0;
+            style.line_height = 3.0;
+            style.padding.left = w3cos_std::style::Spacing::Px(16.0);
+            style.padding.right = w3cos_std::style::Spacing::Px(16.0);
+            w3cos_std::Component::row(style, vec![plain(content)])
+        };
+        let mut style = plain("").style;
+        style.display = Display::Block;
+        style.width = w3cos_std::style::Dimension::Em(28.0);
+        style.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
+        style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
+        let mut line = w3cos_std::Component::row(style, vec![
+            decorated("pppp pppX ppXp \u{202e} ppXp XXpp XppX "),
+            plain("pppX XXXp pXXp "),
+            decorated("XpXp ppXX XXpX pXpX \u{202c} XXpX XXXp "),
+        ]);
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let runs = line.children.iter().map(|child| {
+            let content = match &child.kind {
+                ComponentKind::Text { content } => content.clone(),
+                _ => child.children.iter().filter_map(|inner| {
+                    if let ComponentKind::Text { content } = &inner.kind {
+                        Some(content.as_str())
+                    } else { None }
+                }).collect::<String>(),
+            };
+            (child.style.border_width, content)
+        }).collect::<Vec<_>>();
+        let fragment = line.children.iter().find_map(|child| {
+            if child.style.border_width > 0.0
+                && let ComponentKind::Text { content } = &child.kind
+                && content.trim_matches(is_css_whitespace) == "pXpX" {
+                Some(content.as_str())
+            } else { None }
+        }).unwrap_or_else(|| panic!("missing decorated pXpX fragment: {runs:?}"));
+        assert_eq!(fragment, "pXpX");
+    }
+
+    #[test]
+    fn ordinary_bidi_keeps_external_space_outside_unsplit_decorations() {
+        let plain = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            w3cos_std::Component::text(content, style)
+        };
+        let decorated = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            style.border_width = 3.0;
+            w3cos_std::Component::row(style, vec![plain(content)])
+        };
+        let mut style = w3cos_std::style::Style::default();
+        style.direction = w3cos_std::style::TextDirection::Rtl;
+        let mut line = w3cos_std::Component::row(style,
+            vec![decorated("inspect"), plain(" "), decorated("pause")]);
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let decorated_runs = line.children.iter().filter_map(|child| {
+            if child.style.border_width > 0.0
+                && let ComponentKind::Text { content } = &child.kind {
+                Some(content.as_str())
+            } else { None }
+        }).collect::<Vec<_>>();
+        assert_eq!(decorated_runs, ["inspect", "pause"]);
+    }
+
+    #[test]
+    fn explicit_bidi_preserves_decorated_fragment_trailing_space() {
+        let plain = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::InlineBlock;
+            w3cos_std::Component::text(content, style)
+        };
+        let decorated = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            style.border_width = 3.0;
+            w3cos_std::Component::row(style, vec![plain(content)])
+        };
+        let mut style = w3cos_std::style::Style::default();
+        style.white_space = w3cos_std::style::WhiteSpace::NoWrap;
+        let mut line = w3cos_std::Component::row(style, vec![
+            decorated(" aaa bbb ccc \u{202e} lll kkk jjj "),
+            plain(" iii hhh ggg "),
+            decorated("fff eee ddd \u{202c} mmm nnn ooo "),
+        ]);
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let decorated_runs = line.children.iter().filter_map(|child| {
+            if child.style.border_width > 0.0
+                && let ComponentKind::Text { content } = &child.kind {
+                Some(content.as_str())
+            } else { None }
+        }).collect::<Vec<_>>();
+        assert_eq!(decorated_runs, ["aaa bbb ccc ", "ddd eee fff ",
+            "jjj kkk lll ", "mmm nnn ooo"]);
+        let visual = line.children.iter().filter_map(|child| {
+            if let ComponentKind::Text { content } = &child.kind {
+                Some(content.as_str())
+            } else { None }
+        }).collect::<String>();
+        assert_eq!(visual, "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo");
+    }
+
+    #[test]
+    fn explicit_bidi_collapses_boundary_spaces_without_losing_fragment_ownership() {
         let plain = |content: &str| {
             let mut style = w3cos_std::style::Style::default();
             style.display = Display::InlineBlock;
@@ -13047,19 +13195,16 @@ mod image_component_tests {
 
         reorder_explicit_bidi_inline_rows(&mut line);
 
-        assert!(
-            line.children
-                .iter()
-                .filter(|child| child.style.border_width > 0.0)
-                .all(|child| matches!(
-                    &child.kind,
-                    ComponentKind::Text { content }
-                        if content == content.trim_matches(is_css_whitespace)
-                ))
-        );
+        let visual = line.children.iter().filter_map(|child| {
+            if let ComponentKind::Text { content } = &child.kind {
+                Some(content.as_str())
+            } else { None }
+        }).collect::<String>();
+        assert_eq!(visual, "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo");
         assert!(line.children.iter().any(|child| matches!(
             &child.kind,
-            ComponentKind::Text { content } if content == " " && child.style.border_width == 0.0
+            ComponentKind::Text { content }
+                if content == "ddd eee fff " && child.style.border_width > 0.0
         )));
     }
 

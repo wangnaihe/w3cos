@@ -3575,6 +3575,103 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   replacement of the existing bidi algorithm. No implementation fix is
   claimed by this discovery entry; 368/372/375 remain strict FAIL.
 
+### Bidi decorated-fragment boundary-space repair (after f8df510)
+
+- New exact DOM unit
+  `explicit_bidi_preserves_decorated_fragment_trailing_space` is first
+  RED: all three non-final decorated visual runs lose their trailing
+  spaces. Build 19.06s. The first correction preserves spaces already
+  present in those runs; the direct unit passes (17.24s build), but the
+  actual index-375 reftest remains **24 pixels FAIL**, down from 246.
+  The 24 remaining pixels are only the orange border's missing 4px span,
+  at x=221..224, y=155..189. This intermediate result is not acceptance.
+- Native layout confirms actual `ddd eee fff` still has width 88.28906,
+  while the reference's trailing-space run is 92.28906. In the real DOM
+  pipeline, prior logical whitespace collapse assigns the boundary space
+  to the adjacent bare run. The direct regression input is refined to
+  reproduce that normalized boundary and becomes RED again (23.37s
+  build), missing only the `ddd eee fff ` trailing space.
+- The second correction lets a collapsed visual boundary space extend
+  the preceding decorated inline's paint span, without duplicating the
+  space in the anonymous run. Line-end whitespace remains trimmed.
+  The ownership rule is font-independent; an intermediate font-specific
+  condition is removed rather than retained as a conformance workaround.
+  The refined exact unit passes (24.49s build).
+- The old unit `explicit_bidi_moves_collapsed_spaces_outside_decorated_fragments`
+  asserted the now-proven incorrect border-shortening behavior. Its same
+  fixture is retained in the corrected unit
+  `explicit_bidi_collapses_boundary_spaces_without_losing_fragment_ownership`,
+  checking exact single-space visual content and decorated ownership.
+  Before/after isolated bidi/RTL neighbors are **15/17 -> 16/17**;
+  the only remaining failure is the pre-existing
+  `rtl_inline_block_aligns_its_single_text_line_to_the_inline_end`.
+  Comparison explicitly maps this corrected test identity; it is not
+  presented as an unchanged old assertion. Whole DOM-module green is
+  not claimed.
+- Additional neighbor baselines at 376/384/392 are **21 PASS / 3 FAIL**,
+  collected while the old production binary hash remains unchanged.
+  Production v2 build succeeds in 2m29s, and index 375 reaches **0 pixels**
+  under zero thresholds. Qualification then stops at a prior-PASS
+  regression, index 5600 `bidi-span-003.html`, **168 pixels**. The partial
+  v2 receipt contains **191 PASS / 1 FAIL / 192 executions**; it is not
+  final qualification and this candidate is not committed.
+- The ordinary RTL fixture has two unsplit sibling inline decorations
+  separated by an external space. V2 incorrectly extends the first
+  border into that external space. New exact unit
+  `ordinary_bidi_keeps_external_space_outside_unsplit_decorations` is RED,
+  actual `["inspect ","pause"]` versus expected `["inspect","pause"]`.
+  V3 allows external-space reassignment only when the preceding source
+  inline really has multiple bidi visual fragments, preserving ordinary
+  unsplit sibling boundaries. This unit passes; final DOM bidi/RTL units
+  are **17/18**, with only the same pre-existing RTL-alignment failure.
+  V3 production build succeeds in 2m24s: index 375 and prior-regression
+  5600 both have zero differing pixels. Full comparison then stops at
+  another prior-PASS regression, index 376 `bidi-004`, **57 pixels**.
+  The partial v3 receipt is **435 PASS / 13 FAIL / 448 executions**;
+  only index 375 improves and index 376 regresses. No commit is made.
+- V3 counts a source inline's fragments across all visual lines. The
+  wrapped fixture's orange inline has multiple fragments overall, but
+  only one on each line; the extra external space must remain outside
+  its border. The first two direct-fixture attempts retain uncollapsed
+  logical boundary whitespace and produce a different wrap, so their
+  missing-fragment failures are explicitly not valid semantic RED proof.
+  After matching real DOM whitespace collapse, exact unit
+  `wrapped_bidi_keeps_external_space_outside_single_fragments_per_line`
+  is valid RED: `pXpX ` versus `pXpX`.
+- V4 counts fragments per `(source inline, visual line)` in a linear
+  hash-map pass. External boundary whitespace extends decoration only
+  for a source inline actually split on that same line, not for a
+  continuation created merely by wrapping. The normalized wrapped unit
+  passes. Final isolated DOM bidi/RTL neighbors are **18/19**, with only
+  the same old RTL-alignment failure. Whole-module green is not claimed.
+- V4 production build succeeds in **2m31s**. Binary SHA-256:
+  `f38327ce305d0565909a4d795f71383bd06e78e872e650941994260a3104d3f4`;
+  qualified DOM source blob: `4b221b56de53a922914f53d157d76b4148780671`;
+  frozen suite SHA-256:
+  `5d0468173f766098c4f2a39126337e027e8533de3ad195b684b70db6cb1e672c`.
+  Initial targets 375, 376 and 5600 all have **0 differing pixels** and
+  **0 maximum difference**, with both allowed thresholds still zero.
+- Final V4 qualification executes 58 eight-case batches:
+  **450 PASS / 14 FAIL / 464 executions**. Ordered full-object comparison
+  against the published sole-atomic-strut receipts, post-3aa670e discovery
+  and unchanged-source neighbor baselines changes only index 375 from
+  FAIL to PASS. All other 463 executed result objects are unchanged,
+  with no prior PASS lost. In particular, both intermediate regressions
+  376 and 5600 return to their original zero-pixel PASS. Source blob and
+  binary hash are checked throughout qualification; see
+  `bidi-trailing-space-v4-comparison.json` and
+  `bidi-trailing-space-neighbors-v4-after.json`.
+- The 14 failures remain open within this subset; this is not a fresh
+  global remaining count. Full same-clean-SHA 6548 zero-FAIL/ERROR
+  conformance is still pending. No fixture, font, glyph clipping or
+  tolerance workaround is introduced by this repair.
+- Independent read-only diagnosis of index 368 shows only three native
+  layout rows differ from its reference: bare `a`, `fgh`, and `lm` runs
+  retain InlineBlock display at y=197 rather than Inline at y=203.2.
+  Their x positions, widths and heights match. This 6.2px baseline-entry
+  difference is a separate next repair target; index 368 is not declared
+  fixed by the boundary-space correction.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
