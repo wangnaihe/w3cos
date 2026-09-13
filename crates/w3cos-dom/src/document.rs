@@ -1121,20 +1121,24 @@ impl Document {
         // stylesheets, not UA defaults that normal user rules can override.
         if node.node_type == NodeType::Element
             && node.is_html_element && node.tag.as_str().eq_ignore_ascii_case("table")
-            && let Some(dimension) = node.attributes.iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("width"))
-                .and_then(|(_, value)| parse_html_dimension_attribute(value))
         {
-            // HTML table width maps to a dimension hint, ignoring zero.
+            // HTML table dimensions are cascaded presentational hints.
             // Keep it inside the cascade so authored auto/percent/important
             // values win, and computed style and component layout agree.
-            let value = match dimension {
-                w3cos_std::style::Dimension::Px(value) if value > 0.0 => Some(format!("{value}px")),
-                w3cos_std::style::Dimension::Percent(value) if value > 0.0 => Some(format!("{value}%")),
-                _ => None,
-            };
-            if let Some(value) = value {
-                user_normal.push(("width".to_string(), value, 0));
+            for property in ["width", "height"] {
+                let Some(dimension) = node.attributes.iter()
+                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case(property))
+                    .and_then(|(_, value)| parse_html_dimension_attribute(value)) else { continue; };
+                // Retain the existing zero-width behavior; height allows zero.
+                let valid = |value: f32| value > 0.0 || (property == "height" && value == 0.0);
+                let value = match dimension {
+                    w3cos_std::style::Dimension::Px(value) if valid(value) => Some(format!("{value}px")),
+                    w3cos_std::style::Dimension::Percent(value) if valid(value) => Some(format!("{value}%")),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    user_normal.push((property.to_string(), value, 0));
+                }
             }
         }
         user_normal.extend(author_declarations);
@@ -12243,6 +12247,25 @@ mod image_component_tests {
         table.set_attribute(&mut document, "width", "300");
         crate::stylesheet::register_rule("table", &[("width", "auto")]);
         assert_eq!(document.computed_style_for(table.id).width, Dimension::Auto);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn table_height_attribute_is_a_cascaded_presentational_hint() {
+        use w3cos_std::style::Dimension;
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let table = document.create_element("table");
+        document.body().append_child(&mut document, table);
+        for (value, expected) in [("20", Dimension::Px(20.0)),
+            ("50%", Dimension::Percent(50.0)), ("0", Dimension::Px(0.0)),
+            ("-1", Dimension::Auto)] {
+            table.set_attribute(&mut document, "height", value);
+            assert_eq!(document.computed_style_for(table.id).height, expected);
+        }
+        table.set_attribute(&mut document, "height", "20");
+        crate::stylesheet::register_rule("table", &[("height", "auto")]);
+        assert_eq!(document.computed_style_for(table.id).height, Dimension::Auto);
         crate::stylesheet::clear_rules();
     }
 

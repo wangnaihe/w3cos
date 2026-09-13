@@ -2821,6 +2821,31 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   not fixture/tolerance changes. Caption1414 remains52944 pixels. Final
   same-clean-SHA6548 zero-failure acceptance is still not established.
 
+### Cascaded HTML table-height hint qualification
+
+- Base`c69b6db`; HTML table height now enters the existing author-origin
+  presentational-hint cascade before author declarations. Numeric/percent
+  heights, zero and invalid input are covered, and authored height:auto
+  overrides the hint. The existing zero-width behavior is unchanged.
+  Rendering authority: [HTML tables](https://html.spec.whatwg.org/multipage/rendering.html#tables-2).
+  DOM regression is RED Auto versus20px in18.73s, then GREEN18.71s;
+  DOM table tests41/43 retain the same two recorded failures.
+- Default optimized runner build2m35s includes a short test-build lock wait,
+  SHA256`92a9ddb550924f5009b0a2bc3e8c62bfb924e489e14ce2f30d0aa078335dc54a`.
+  Receipts`html-table-height-v1` use the unchanged pinned revision/suite
+  and800x600 viewport. Twenty eight-case batches remain150/160 PASS,
+ 10 FAIL, with no lost PASS; only start1408's ordered path/status/pixel
+  report changes. Related/neighbor batches remain136/136 PASS; executions
+  overlap and do not represent unique cases or a global remaining count.
+- Case1413 improves29277 to6000 pixels but still fails. Real source dumps
+  confirm nested table heights20px and enclosing table heights40px, matching
+  the reference dimensions. The remaining difference is the third source
+  overflow BFC at x208 instead of x8 after its left float has ended:
+  horizontal displacement still considers a non-overlapping float. That
+  independent float-band correction needs its own regression/fix. No case
+  is declared newly repaired by this height-only step; final clean-SHA6548
+  zero-failure acceptance remains unestablished.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
