@@ -2207,7 +2207,15 @@ fn leaf_taffy_size(
     let replaced_height = (matches!(kind, ComponentKind::Image { .. })
         && !matches!(style.height, WDim::Auto))
     .then(|| to_taffy_dim(style.height, style.font_size, viewport_w, viewport_h));
-    let width = if let Some(width) = replaced_width {
+    let generated_text_line_width = matches!(kind, ComponentKind::Text { .. })
+        && style.display == WDisplay::Inline
+        && style.custom_properties.as_ref().is_some_and(|properties|
+            properties.get("--w3cos-internal-text-line-width").is_some_and(|value| value == "1"));
+    let width = if generated_text_line_width {
+        // This is a constraint generated for the containing block's text
+        // line, not an authored width on a non-replaced principal inline.
+        to_taffy_dim(style.width, style.font_size, viewport_w, viewport_h)
+    } else if let Some(width) = replaced_width {
         width
     } else if matches!(style.width, WDim::Auto) {
         match kind {
@@ -18680,6 +18688,24 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((parent.width, parent.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn generated_inline_line_width_survives_leaf_auto_sizing() {
+        let kind = ComponentKind::Text { content: "X".to_string() };
+        let mut style = Style {
+            display: WDisp::Inline,
+            width: WDim::Percent(100.0),
+            ..Style::default()
+        };
+        let base = to_taffy_style(&style, 800.0, 600.0);
+        assert_eq!(leaf_taffy_size(&kind, &style, &base,
+            Some(WDisp::InlineBlock), 100.0, 800.0, 600.0).width, Dimension::auto());
+        style.custom_properties.get_or_insert_with(HashMap::new).insert(
+            "--w3cos-internal-text-line-width".to_string(), "1".to_string(),
+        );
+        assert_eq!(leaf_taffy_size(&kind, &style, &base,
+            Some(WDisp::InlineBlock), 100.0, 800.0, 600.0).width, Dimension::percent(1.0));
     }
 
     #[test]

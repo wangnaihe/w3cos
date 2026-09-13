@@ -3768,6 +3768,37 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   The RTL inline-block pixel difference is a 1px horizontal shift, not a
   missing glyph; it remains an independently tracked open failure.
 
+### Generated inline text line width (after ebd1433)
+
+- Open index 454 (`direction-applies-to-012.xht`) has 100 strict differing
+  pixels: a 50px black square is shifted right by 1px. Raw difference bounds
+  are x=58..108, y=51..100. Layout shows the text at x=108 with width=0,
+  versus the reference image at x=58 with width=50.
+- DOM generates a 100% text-line width for the definite-width inline-block,
+  but `to_taffy_style` correctly ignores authored non-replaced inline widths.
+  `leaf_taffy_size` previously reused that auto width for the generated line.
+- New unit `generated_inline_line_width_survives_leaf_auto_sizing` gives
+  valid RED: the unmarked authored-width assertion passes (auto), but a
+  marked generated line still returns auto instead of 100%.
+- Candidate marks the DOM-generated text-line constraint and honors its
+  semantic width only for that marked Inline Text leaf. Unmarked authored
+  widths remain auto. GREEN build completes in **2m53s**, and the new
+  unit passes both assertions. The focused runtime sample is **12/12**
+  (`generated-line-width-runtime-neighbors-after.json`). Production build
+  completes in **2m03s**. Index 454 changes **100 differing pixels -> 0**,
+  with the original reference and zero tolerance. The actual text layout
+  changes from x=108/width=0 to x=8/width=100; its black glyph paints at the
+  reference's inline-end position. Initial batches 448/368/376/384 are 8/8.
+  Final focused qualification is **520 executions, 511 PASS / 9 existing
+  FAIL**, no prior PASS lost. Only index 454 changes; other 519 complete
+  result objects are unchanged. Receipt:
+  `target/wpt-targeted/generated-line-width-v1-comparison.json`.
+  DOM bidi/RTL sample remains 18/19 with the same existing unit failure and
+  no prior PASS lost (`generated-line-width-dom-neighbors-after.json`).
+  Binary SHA256:
+  `c9140d5fdfba5805dd487b16cde8f5bb0bd8ca4d90ff422d49990ec18c72f39c`.
+  This focused receipt is not full-6548 acceptance or a global remaining count.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

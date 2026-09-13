@@ -4818,6 +4818,9 @@ impl Document {
                         // the portable text leaf instead of retaining its
                         // unconstrained max-content width.
                         children[0].style.width = w3cos_std::style::Dimension::Percent(100.0);
+                        children[0].style.custom_properties
+                            .get_or_insert_with(std::collections::HashMap::new)
+                            .insert("--w3cos-internal-text-line-width".to_string(), "1".to_string());
                         children[0].style.min_width = w3cos_std::style::Dimension::Px(0.0);
                         children[0].style.flex_shrink = 1.0;
                     }
