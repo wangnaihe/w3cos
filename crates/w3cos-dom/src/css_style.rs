@@ -471,16 +471,17 @@ impl CSSStyleDeclaration {
             }
             "border-style" | "borderStyle" => {
                 if let Some(edges) = parse_border_style_edges(value) {
-                    let width = self.declared_uniform_border_width().unwrap_or(3.0);
+                    let widths: [f32; 4] = std::array::from_fn(|side|
+                        self.declared_side_border_width(side).unwrap_or(3.0));
                     self.inner.border_width = if edges.into_iter().any(|visible| visible) {
-                        width
+                        widths[0]
                     } else {
                         0.0
                     };
-                    self.inner.border_top_width = Some(if edges[0] { width } else { 0.0 });
-                    self.inner.border_right_width = Some(if edges[1] { width } else { 0.0 });
-                    self.inner.border_bottom_width = Some(if edges[2] { width } else { 0.0 });
-                    self.inner.border_left_width = Some(if edges[3] { width } else { 0.0 });
+                    self.inner.border_top_width = Some(if edges[0] { widths[0] } else { 0.0 });
+                    self.inner.border_right_width = Some(if edges[1] { widths[1] } else { 0.0 });
+                    self.inner.border_bottom_width = Some(if edges[2] { widths[2] } else { 0.0 });
+                    self.inner.border_left_width = Some(if edges[3] { widths[3] } else { 0.0 });
                 }
             }
             "border-inline-width" | "borderInlineWidth" => {
@@ -1099,24 +1100,6 @@ impl CSSStyleDeclaration {
         })
     }
 
-    fn declared_uniform_border_width(&self) -> Option<f32> {
-        self.inline_declarations
-            .iter()
-            .rev()
-            .find_map(|(name, value)| {
-                if matches!(name.as_str(), "border-width" | "borderWidth") {
-                    split_css_whitespace(value)
-                        .first()
-                        .and_then(|part| parse_border_width(part))
-                } else if name == "border" {
-                    split_css_whitespace(value)
-                        .iter()
-                        .find_map(|part| parse_border_width(part))
-                } else {
-                    None
-                }
-            })
-    }
 }
 
 fn css_background_value(value: &str, initial: &str) -> Option<String> {
@@ -2843,6 +2826,40 @@ mod tests {
         declaration.set_property("border-left", "3px solid red");
         assert_eq!(declaration.to_style().border_styles[3], Some(Solid));
         assert_eq!(declaration.to_style().border_left_width, Some(3.0));
+    }
+
+    #[test]
+    fn border_style_changes_preserve_declared_physical_widths() {
+        for (value, expected) in [
+            ("3px 10px", [3.0, 10.0, 3.0, 10.0]),
+            ("3px 10px 30px", [3.0, 10.0, 30.0, 10.0]),
+            ("3px 10px 25px 50px", [3.0, 10.0, 25.0, 50.0]),
+            ("0px 10px 0px 50px", [0.0, 10.0, 0.0, 50.0]),
+        ] {
+            for width_first in [true, false] {
+                let mut declaration = CSSStyleDeclaration::new();
+                if !width_first { declaration.set_property("border-style", "solid"); }
+                declaration.set_property("border-width", value);
+                for line_style in ["solid", "none", "solid", "hidden", "solid"] {
+                    declaration.set_property("border-style", line_style);
+                    let style = declaration.to_style();
+                    let widths = [style.border_top_width, style.border_right_width,
+                        style.border_bottom_width, style.border_left_width]
+                        .map(|width| width.unwrap_or(style.border_width));
+                    assert_eq!(widths, if line_style == "solid" { expected } else { [0.0; 4] },
+                        "width={value}, style={line_style}, width_first={width_first}");
+                }
+            }
+        }
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-width", "3px 10px 25px 50px");
+        declaration.set_property("border-top-width", "0px");
+        declaration.set_property("border-right-width", "7px");
+        declaration.set_property("border-style", "solid");
+        let style = declaration.to_style();
+        assert_eq!([style.border_top_width, style.border_right_width,
+            style.border_bottom_width, style.border_left_width],
+            [Some(0.0), Some(7.0), Some(25.0), Some(50.0)]);
     }
 
     #[test]

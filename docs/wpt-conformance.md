@@ -4823,6 +4823,57 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   No full6548 zero-failure proof; next978..980 shorthand and982/9833D
   mismatch failures remain separately discovered, not included as repaired.
 
+- Nonvisible-border fix published as `1f6b32841a5dc90e08539d8e906850fcf878fcb0`,
+  normal push4f772eb→1f6b328 terminalsuccess, remote main verified exactSHA.
+  Clean-SHA64 replay968/840/600/824/624/488/608/5593 all full objects
+  identical qualification,5 source blobs and binary/suite hashes sealed:
+  `nonvisible-border-box-1f6b328-clean-replay.json`. No full6548 closure.
+  Next widths mini-step realRED: declaration3px10px thenborder-style solid
+  yields[3,3,3,3] versus[3,10,3,10],1FAIL/456filtered; receipt
+  `border-style-physical-widths-real-red.log`. Regression covers 2/3/4
+  values, both declaration orders, none/hidden→solid, explicit0 and
+  physical-edge overrides. Candidate resolves winning width independently
+  per physical edge in global border-style setter, reusing existing
+  declared_side_border_width; unused uniform-only helper removed. GREENv1
+  started, no candidate commit/push or production978..980 proof yet.
+
+- Width-preservation GREENv1 terminal1PASS/456filtered; all35 isolated
+  directed DOM neighborsPASS/no prior PASS lost (prior34 plusnewwidth
+  regression). Receipt: `border-style-physical-widths-v1-unit-neighbors.json`.
+  Production build started with source frozen for976..983 strict pixels.
+  No claim that3D groove/ridge shading is repaired. No candidate commit
+  or push until directed qualification and clean-SHA replay.
+
+- Width-preservation production build terminal2m32s. Strict976..983
+  terminal6PASS/2FAIL: targets978/979/980 diffs1344/22512/22432→0,
+  allmax0/zero tolerances; other5 full result objects unchanged, no lost
+  PASS. Groove/ridge mismatch failures remain unchanged, not repaired.
+  Receipt: `border-style-physical-widths-v1-pixel-comparison.json`.
+  Fresh1048 directed qualificationv1 begins with976, compares prior1040
+  exact nonvisible-border-box-v2 baselines plus976 sealed discovery.
+  Production sources frozen; no candidate commit/push before terminal
+  qualification and clean-SHA replay. No full6548 acceptance claim.
+
+- Next3D repair now has strict full-browser baseline, not just WPT
+  mismatch status. Current width-preservation candidate's actual groove
+  andridge PNGs each differ from original Chromium141 screenshots by4400
+  pixels/max238, including400 cornerpixels. Native PNGs are byteidentical
+  to each other, demonstrating missing groove/ridge distinction. Image
+  SHA256 and current focused7-file source/binary/suite seal retained in
+  `3d-border-browser-baseline.json`. Detached-canvas read-only PNG decode,
+  no image edits, fixture or tolerance changes. Future3D fix must verify
+  browser image/corner parity as well as mismatch success; source remains
+  frozen while1048 qualification runs.
+
+- Width-preservation qualificationv1 terminal1048 executions1032PASS/16FAIL.
+  Only978/979/980 FAIL→PASS; other1045 full ordered result objects identical
+  baselines, no lost PASS. Receipt:
+  `border-style-physical-widths-v1-comparison.json`. These16 failures are
+  selected-coverage residuals, not remaining6548 statistics. Preparing
+  scoped2-file commit under user's small-step commit/push authorization;
+  clean-SHA72 replay976/968/840/600/824/624/488/608/5593 and actual push
+  pending. Groove/ridge remain unrepaired; full6548 closure unproven.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
