@@ -5151,7 +5151,9 @@ fn project_simple_float_margin_boxes(
                     {
                         let left_float_edge = active_floats
                             .iter()
-                            .filter(|(side, _)| *side == WFloat::Left)
+                            .filter(|(side, rect)| *side == WFloat::Left
+                                && fitting_y < rect.y + rect.height
+                                && fitting_y + current.height > rect.y)
                             .map(|(_, rect)| rect.x + rect.width)
                             .reduce(f32::max)
                             .unwrap_or(current.x);
@@ -15117,6 +15119,30 @@ mod tests {
             assert_eq!(get(2).width, 150.0, "parent={display:?}");
             assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
             assert_eq!(get(2).y, get(1).y, "parent={display:?}");
+        }
+    }
+
+    #[test]
+    fn first_overflow_bfc_ignores_horizontal_edges_of_expired_floats() {
+        for display in [WDisp::Block, WDisp::Flex] {
+            for width in [WDim::Percent(50.0), WDim::Px(150.0)] {
+                let mut style = Style { display, width, height: WDim::Px(20.0),
+                    overflow: WOverflow::Hidden, ..Style::default() };
+                if display == WDisp::Flex {
+                    style.custom_properties.get_or_insert_with(Default::default).insert(
+                        "--w3cos-internal-inline-formatting-context".into(), "1".into());
+                }
+                let root = Component::boxed(Style { display: WDisp::Block,
+                    width: WDim::Px(300.0), ..Style::default() }, vec![
+                    Component::boxed(Style { display: WDisp::Block,
+                        float: WFloat::Left, width: WDim::Px(200.0),
+                        height: WDim::Px(20.0), ..Style::default() }, vec![]),
+                    Component::boxed(style, vec![])]);
+                let layout = compute(&root, 800.0, 600.0).unwrap();
+                let bfc = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+                assert_eq!((bfc.x, bfc.y, bfc.width), (0.0, 20.0, 150.0),
+                    "display={display:?}, width={width:?}");
+            }
         }
     }
 

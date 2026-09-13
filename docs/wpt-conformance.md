@@ -2846,6 +2846,32 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   is declared newly repaired by this height-only step; final clean-SHA6548
   zero-failure acceptance remains unestablished.
 
+### Expired-float horizontal displacement qualification
+
+- Base`cfcca41`; first overflow BFC horizontal displacement now uses only
+  left floats intersecting its selected vertical band. A float that has
+  already ended cannot push a below-float box sideways. Genuine flex/grid
+  ownership and the existing active-float fitting paths are unchanged.
+  Fresh WPT RED receipt`expired-float-red-v1` reproduces case1413 FAIL6000
+  pixels before editing. The new regression passes in2m57s and covers
+  Block/internal-IFC Flex with both50% and150px widths, expecting x0/y20.
+  BFC11/11 and text-layout28/28 pass; table78/84 and float58/59 retain
+  the same six/one recorded failures.
+- Default optimized runner5m13s includes the test-build artifact-lock wait,
+  SHA256`50401ae6354562708933a96482123e5df5568a1741734738fdc27f85b4b0fccc`.
+  Receipts`expired-float-edge-v1` retain the frozen WPT revision/suite and
+ 800x600 viewport. Case1413 becomes exact0 from6000 pixels; start1408
+  improves4/8 to5/8. Start1400 remains8/8 exact0 and start1416 remains2/8.
+  Twenty eight-case batches finish151/160 PASS,9 FAIL, with no lost prior
+  PASS. Only start1408's full ordered path/status/pixel-diff report changes;
+  the17 related/neighbor batches remain136/136 PASS. Execution counts
+  overlap and are not a current global remaining count.
+- Cases1412/1414/1415 and the six selected margin failures remain open.
+  In particular1412's runtime-rendered reference still has incorrect float
+  positions: internal anonymous float groups bypass the ordinary float
+  context path. This needs a separate generic float fix, not a reference
+  or tolerance change. Final same-clean-SHA6548 acceptance remains open.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
