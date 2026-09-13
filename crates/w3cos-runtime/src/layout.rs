@@ -5545,6 +5545,26 @@ fn project_simple_float_margin_boxes(
             && let Some(position) = layout_position.get(&component_index).copied()
         {
             layouts[position].0.height += normal_flow_correction;
+            if establishes_float_bfc(&component.style, component_index == 0)
+                && let Some((last_index, last_child)) = previous_in_flow
+                && let Some(last_position) = layout_position.get(&last_index).copied()
+            {
+                // Float avoidance can advance the last normal-flow BFC
+                // after its original upward correction. Settle auto height
+                // from that final static margin edge, not its old position.
+                let parent = layouts[position].0;
+                let last = layouts[last_position].0;
+                let containing_width = content_box.map_or(parent.width, |rect| rect.width);
+                let margin_bottom = resolve_spacing_for_layout(last_child.style.margin.bottom,
+                    containing_width, last_child.style.font_size, viewport_w, viewport_h);
+                let padding_bottom = resolve_spacing_for_layout(component.style.padding.bottom,
+                    parent.width, component.style.font_size, viewport_w, viewport_h);
+                let minimum_height = last.y - relative_shift(&last_child.style).1 + last.height
+                    + margin_bottom + padding_bottom
+                    + component.style.border_bottom_width.unwrap_or(component.style.border_width)
+                    - parent.y;
+                layouts[position].0.height = parent.height.max(minimum_height);
+            }
         }
     }
 
@@ -15144,6 +15164,30 @@ mod tests {
             assert_eq!(get(2).x, get(1).x + get(1).width, "parent={display:?}");
             assert_eq!(get(2).y, get(1).y, "parent={display:?}");
         }
+    }
+
+    #[test]
+    fn auto_cell_height_contains_bfc_shifted_below_a_float() {
+        let root = Component::boxed(Style { display: WDisp::TableCell,
+            width: WDim::Px(300.0), ..Style::default() }, vec![
+            Component::boxed(Style { display: WDisp::Block, float: WFloat::Left,
+                width: WDim::Px(150.0), height: WDim::Px(10.0),
+                ..Style::default() }, vec![]),
+            Component::boxed(Style { display: WDisp::Block, height: WDim::Px(5.0),
+                margin: w3cos_std::style::Edges { bottom: WSpacing::Px(4.0),
+                    ..Default::default() }, ..Style::default() }, vec![]),
+            Component::boxed(Style { display: WDisp::Block, overflow: WOverflow::Hidden,
+                width: WDim::Px(200.0), height: WDim::Px(5.0),
+                ..Style::default() }, vec![])]);
+        let mut layout = vec![
+            (LayoutRect { x: 0.0, y: 0.0, width: 300.0, height: 24.0 }, 0),
+            (LayoutRect { x: 0.0, y: 0.0, width: 150.0, height: 10.0 }, 1),
+            (LayoutRect { x: 0.0, y: 10.0, width: 300.0, height: 5.0 }, 2),
+            (LayoutRect { x: 0.0, y: 19.0, width: 200.0, height: 5.0 }, 3),
+        ];
+        project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
+        assert_eq!(layout[3].0.y, 10.0);
+        assert_eq!(layout[0].0.height, 15.0);
     }
 
     #[test]

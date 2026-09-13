@@ -2922,6 +2922,30 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   margin failures remain open. No clean-SHA full6548 zero-failure claim
   follows from this focused cross-group repair.
 
+### Post-float-avoidance automatic BFC height qualification
+
+- Base`a31cfd3`; after an upward float-flow correction, automatic BFC
+  height now settles against its last normal-flow child's final static
+  margin edge, with parent bottom padding/border. A later downward float
+  avoidance must not leave that child outside a stale contracted height.
+  Negative trailing margins and relative visual offsets remain accounted
+  for, rather than treating every painted descendant as in-flow content.
+  The new cell regression is RED14px versus15px in2m28s, then GREEN2m29s.
+  Table78/84 and float61/62 retain the same six/one recorded failures;
+  BFC12/12 and text-layout28/28 pass.
+- Default optimized runner4m37s includes the unit-build artifact-lock wait,
+  SHA256`de607c1f2b50a4369b02e9d12b8adf313ad734fcf762780ec7ca406da162f93c`.
+  Receipts`final-bfc-auto-height-v1` retain the frozen revision/suite and
+ 800x600 viewport. Case1415 becomes exact0 from17650 pixels, improving
+  start1408 from6/8 to7/8. Start1400 remains8/8 exact0;1412/1413 retain
+  exact0 and start1416 remains2/8. Twenty eight-case batches finish
+ 153/160 PASS,7 FAIL with no previous PASS lost; only start1408's full
+  ordered path/status/pixel-diff report changes. The17 related/neighbor
+  batches remain136/136 PASS. Execution counts overlap and are not a
+  current global remaining count.
+- Caption1414 remains52944 pixels and the six selected margin failures
+  remain open. This focused repair is not final clean-SHA6548 acceptance.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
