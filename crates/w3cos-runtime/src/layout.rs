@@ -510,6 +510,51 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
     leaf_intrinsic_size_with_containing(kind, style, None)
 }
 
+// CSS empty line boxes have zero height. Empty inline descendants (including
+// positioned ones) alone do not make the anonymous line nonempty.
+fn inline_line_has_in_flow_content(component: &Component) -> bool {
+    if component.style.display == WDisplay::None
+        || component.style.float != WFloat::None
+        || matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+    {
+        return false;
+    }
+    if component.style.display != WDisplay::Inline {
+        return true;
+    }
+    if let ComponentKind::Text { content } = &component.kind {
+        return content == "\u{2028}"
+            || (!content.is_empty()
+                && (matches!(component.style.white_space, WWhiteSpace::Pre | WWhiteSpace::PreWrap)
+                    || (component.style.white_space == WWhiteSpace::PreLine
+                        && content.contains(['\n', '\r']))
+                    || content.chars().any(|character|
+                        !matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}'))))
+            || component.style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-float-strut"));
+    }
+    if !matches!(component.kind, ComponentKind::Row | ComponentKind::Box) {
+        return true;
+    }
+    let style = &component.style;
+    let padding = style.padding_lengths();
+    let margin = style.margin_lengths();
+    let unresolved_nonzero = |spacing: WSpacing| matches!(spacing,
+        WSpacing::Percent(value) | WSpacing::Vw(value) | WSpacing::Vh(value)
+            if value != 0.0);
+    [padding.top, padding.right, padding.bottom, padding.left,
+        margin.top, margin.right, margin.bottom, margin.left]
+        .into_iter().any(|value| value != 0.0)
+        || [style.padding.top, style.padding.right, style.padding.bottom, style.padding.left,
+            style.margin.top, style.margin.right, style.margin.bottom, style.margin.left]
+            .into_iter().any(unresolved_nonzero)
+        || style.border_left_width.unwrap_or(style.border_width) != 0.0
+        || style.border_right_width.unwrap_or(style.border_width) != 0.0
+        || style.border_top_width.unwrap_or(style.border_width) != 0.0
+        || style.border_bottom_width.unwrap_or(style.border_width) != 0.0
+        || component.children.iter().any(inline_line_has_in_flow_content)
+}
+
 // The DOM's generated IFC rows are not authored flexboxes. Atomic inline
 // advances share a line, while explicit break opportunities delimit intrinsic
 // segments. Margins already contain any first-line indent displacement.
@@ -6078,7 +6123,11 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                 // A first break terminates its reserved line box. Its raw
                 // layout origin excludes the passive inline parent's em-box
                 // half-leading, unlike the parent's paint rectangle.
-                line_top.get_or_insert(layout.y);
+                // Flex-backed breaks may instead be zero-height boundaries
+                // located at the preceding line's bottom, not its origin.
+                if layout.height > f32::EPSILON {
+                    line_top.get_or_insert(layout.y);
+                }
                 line_height = line_height.max(layout.height);
             }
             let Some((_, next_index)) = children.get(position + 1) else {
@@ -7456,7 +7505,20 @@ fn build_taffy_tree(
             (w3cos_std::style::TextAlign::Center, _) => taffy::JustifyContent::Center,
             _ => taffy::JustifyContent::FlexStart,
         });
-        if matches!(comp.style.height, WDim::Auto)
+        let has_line_content = comp.children.iter().any(inline_line_has_in_flow_content);
+        if !has_line_content
+            && comp.style.display == WDisplay::Block
+            && matches!(comp.style.height, WDim::Auto)
+            && matches!(comp.style.min_height, WDim::Auto)
+            && matches!(comp.style.max_height, WDim::Auto)
+        {
+            // Collapsible whitespace inside nested empty inline boxes must
+            // not reserve a line either. Leaf measurement still carries a
+            // font strut, so suppress automatic content height as well.
+            style.size.height = Dimension::length(0.0);
+        }
+        if has_line_content
+            && matches!(comp.style.height, WDim::Auto)
             && matches!(comp.style.min_height, WDim::Auto)
             && matches!(comp.style.max_height, WDim::Auto)
         {
@@ -10415,6 +10477,39 @@ mod tests {
         Style::default()
     }
 
+    #[test]
+    fn empty_inline_line_content_preserves_css_nonempty_conditions() {
+        let inline = Style { display: WDisp::Inline, ..Style::default() };
+        let empty = Component::row(inline.clone(), vec![Component::row(
+            Style { position: WPos::Relative, ..inline.clone() },
+            vec![Component::text(" \t\n", inline.clone())],
+        )]);
+        assert!(!inline_line_has_in_flow_content(&empty));
+        for (text, white_space, expected) in [
+            (" ", WWhiteSpace::Normal, false),
+            (" ", WWhiteSpace::PreLine, false),
+            ("\n", WWhiteSpace::PreLine, true),
+            (" ", WWhiteSpace::Pre, true),
+            (" ", WWhiteSpace::PreWrap, true),
+            ("\u{a0}", WWhiteSpace::Normal, true),
+            ("\u{2028}", WWhiteSpace::Normal, true),
+        ] {
+            assert_eq!(inline_line_has_in_flow_content(&Component::text(text,
+                Style { white_space, ..inline.clone() })), expected, "{text:?} {white_space:?}");
+        }
+        for style in [
+            Style { border_top_width: Some(1.0), ..inline.clone() },
+            Style { padding: w3cos_std::style::Edges {
+                left: WSpacing::Percent(10.0), ..w3cos_std::style::Edges::ZERO
+            }, ..inline.clone() },
+            Style { display: WDisp::InlineBlock, ..inline.clone() },
+        ] {
+            assert!(inline_line_has_in_flow_content(&Component::row(style, Vec::new())));
+        }
+        assert!(!inline_line_has_in_flow_content(&Component::text("text",
+            Style { position: WPos::Absolute, ..inline })));
+    }
+
     fn col() -> Style {
         Style {
             display: WDisp::Flex,
@@ -12478,6 +12573,28 @@ mod tests {
         project_forced_break_lines(&mut layout, &root);
         assert_eq!(layout[2].0.y, 200.0);
         assert_eq!(layout[3].0.y, 200.0);
+    }
+
+    #[test]
+    fn zero_height_forced_break_keeps_the_preceding_line_origin() {
+        let inline = Style { display: WDisp::Inline, line_height: 6.25, ..Style::default() };
+        let root = Component::row(Style {
+            display: WDisp::Flex, line_height: 6.25, ..Style::default()
+        }, vec![
+            Component::text("\u{2028}", inline.clone()),
+            Component::text("", inline),
+            Component::row(Style {
+                display: WDisp::InlineBlock, width: WDim::Px(100.0), height: WDim::Px(100.0),
+                ..Style::default()
+            }, vec![]),
+        ]);
+        let rect = |y, height, width| LayoutRect { x: 0.0, y, width, height };
+        let mut layout = vec![
+            (rect(0.0, 200.0, 200.0), 0), (rect(100.0, 0.0, 200.0), 1),
+            (rect(42.0, 16.0, 0.0), 2), (rect(100.0, 100.0, 100.0), 3),
+        ];
+        project_forced_break_lines(&mut layout, &root);
+        assert_eq!(layout[3].0.y, 100.0);
     }
 
     #[test]

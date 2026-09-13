@@ -3337,6 +3337,91 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   Static `git diff --check` passes. This is focused qualification, not a
   full-runtime module gate or final full6548 acceptance.
 
+### Empty anonymous lines beside dynamically positioned inline ancestors
+
+- Based on published `d9faf5f`, the existing JS DOM regression
+  `block_in_inline_static_position_ignores_adjacent_collapsible_whitespace`
+  reproduces `offsetTop = 19.2` rather than `0`, even without a prior layout
+  flush. Transient tree diagnostics identify a zero-width pair of empty
+  inline descendants inside an anonymous block that reserves a 19.2px line.
+  Diagnostics were removed; no CSSOM getter correction was added.
+- Removing the unconditional line minimum makes the existing exact unit
+  pass (2m57s build). Prototype `dynamic-inline-empty-line-v1` builds in
+  2m11s and passes 7/8 at start 16: the nested-inline fixture still fails
+  because collapsible whitespace leaf measurement retains a font strut.
+- Prototype v2 additionally gives empty anonymous block lines zero automatic
+  content height. Build: 2m10s; runner SHA256
+  `1628f9b302e9eba85761a29ee79d08e80502562458588d355b41d7df293ba761`.
+  Ten eight-case batches at starts 0, 8, 16, 24, 1358, 1366, 1385, 1400,
+  1408 and 1416 pass **80/80**. Receipts bind revision
+  `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0` and 800x600; ordered full
+  test-object comparison against `forced-break-source-v2` changes only
+  indices 17 and 18 from FAIL to PASS, with the other 78 objects unchanged.
+  See `dynamic-inline-empty-line-v2-comparison.json`.
+- The first prototype retains 35/35 previously passing positioned-layout
+  units. Extended empty-inline checks pass 23/24. A control rebuild that
+  restores the original unconditional minimum and removes the zero-height
+  branch, leaving only the unused new helper, reproduces the same painted
+  inline failure (`y = 1.6000004`, expected `0`). This is a controlled
+  behavioral baseline, not a whole-module green run or a clean-SHA build.
+  See `dynamic-inline-painted-baseline-control.log` (3m36s build).
+- [CSS 2.2 section 9.4.2](https://www.w3.org/TR/CSS22/visuren.html#inline-formatting)
+  requires empty line boxes to have zero height, while preserving text,
+  preserved whitespace/newlines, decorated inlines and atomic in-flow boxes.
+  Candidate v3 extends the content predicate to all decoration edges,
+  unresolved percentage/viewport spacing, and correct `pre-line` whitespace
+  handling, with a focused predicate unit. Its unit build and production
+  qualification remain pending; v2 receipts do not qualify v3. No commit
+  or push has been made for this candidate and no full 6548 run is claimed.
+
+- Candidate v3 predicate unit passes (2m56s build); combined related exact
+  units pass 48/49, with only the controlled baseline painted-inline failure.
+  Production build: 2m10s; runner SHA256
+  `74d60506f4774465256221d86cbf4534c9706b3eda29e79aced6ee5a827eac5d`.
+  Expanded qualification stops after 13 eight-case batches: **103/104**.
+  `text-indent-on-blank-line-rtl-left-align.html` at index 5765 loses its
+  prior PASS from `collapsed-grid-center-v4`, differing by 20000 pixels.
+  No publication: an expanded older baseline detects a regression, but this
+  comparison alone does not attribute it specifically to the v3 predicate
+  rather than intervening forced-break changes.
+- Actual fixture layout shows its flex-backed break at the preceding line's
+  bottom, height zero. Treating this boundary as the reserved line's origin
+  projects the following inline block an additional 100px downward. Candidate
+  v4 anchors a break's origin only when the break actually reserves positive
+  height, retaining the existing positive-height float/abspos regression.
+  New direct projection unit and final production qualification are pending.
+  See `empty-line-v3-rtl-blank-5765-layout.log`; an earlier diagnostic at 5764
+  is a different fixture and is not evidence for the 5765 failure.
+- Separately, v2 bounded discovery at starts 32 through 112, in eight-case
+  batches, passes **88/88**. This locates the next discovery entrance at 120;
+  it does not bind those passes to v4 or establish global remaining failures.
+
+- Final v4 direct zero-height-break projection unit passes (3m00s build).
+  Combined related exact units pass **49/50**; the only failure remains the
+  controlled baseline painted-inline coordinate assertion. Production build:
+  **2m02s**; runner SHA256
+  `fb9c7b52b4114a1d18fd5825b4185630e74d5772d59feb921647ea9568bdf80d`.
+  The RTL batch at 5761 restores 8/8 and zero differing pixels. Expanded
+  qualification completes all 27 eight-case batches, **216/216 executions**.
+  Ordered full test-object comparison uses `forced-break-source-v2` for the
+  ten core batches and `collapsed-grid-center-v4` for the other 17. Only the
+  two dynamic-inline harness cases change from FAIL to PASS; the other 214
+  executed test objects are unchanged and no earlier PASS is lost. This is
+  an execution count, not a unique-case count or full-suite result.
+  See `dynamic-inline-empty-line-v4-comparison.json`.
+- Bounded v3 background discovery at 120, 128, 136 and 144 stops at **30/32**:
+  `background-applies-to-006.xht` differs at (103,55), actual RGB 20 versus
+  expected 0; `background-applies-to-012.xht` differs at (7,103), actual RGB
+  245 versus expected 255. Both are one-pixel failures. Root cause remains
+  unverified; no tolerance, reference change or blanket clipping is applied.
+  Candidate v4 recheck of this next eight-case repair batch is separate from
+  the successful 216-execution qualification.
+
+- Final v4 recheck at 144 remains **6/8** with the same two one-pixel
+  failures; all eight full test objects are identical to the v3 discovery
+  receipt. This next repair batch is still open. Full 6548 conformance,
+  whole-module gates and browser application acceptance remain unproven.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
