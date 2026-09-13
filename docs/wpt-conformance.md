@@ -2252,6 +2252,60 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   This closes one historical pixel failure in focused Skia evidence, not the
   remaining nowrap/float capabilities or final6548 same-clean-SHA gate.
 
+### Floated widths in anonymous nowrap rows
+
+- Production4bddd00 still fails1367 `float-nowrap-7.html` at2078px. Raw
+  source/reference layouts lower the block's nowrap line to Flex and shrink
+  the5ch right float from48px to0px beside overflowing text. The source also
+  retains an anonymous extraction whitespace strut; keep that distinct issue
+  open until pixel qualification rather than treating correct width as closure.
+- New `floated_boxes_in_anonymous_nowrap_rows_do_not_flex_shrink` checks
+  direct/nested left/right floats. RED at the immediate production baseline:
+  direct left float has flex-shrink1 versus0. The first test compile catches
+  a missing WhiteSpace enum qualification; fix that type error before RED.
+- At the block/inline-block/list-item/table-cell float lowering boundary,
+  preserve floats' used widths with flex-shrink0. Hidden nodes still return
+  before mutation; authored Flex containers do not enter this lowering call.
+  DOM selector and fresh WPT pixel qualification are pending; no full6548
+  or complete nowrap/float acceptance is claimed.
+- Width-only candidate: DOM selector12/12PASS, runner2m42s; neighbor
+  starts1358/1366/1385 pass8/8,7/8,2/8. The source float width is correctly
+  restored0->48px, but1367 worsens2078->3134px because its extra extracted
+  space shifts the source float10.664px and alters its baseline. No commit
+  is qualified by this intermediate result. Receipts below
+  `target/wpt-targeted`: `batch-<start>-float-shrink-after-v1/results.json`.
+- A nowrap inline run already owns its unbroken-line strut. Suppress the
+  extra extraction whitespace only for nowrap; ordinary wrapping extraction
+  keeps its existing static-line strut. Extend the nested-right counter to
+  require no anonymous single-space node. Combined qualification is pending.
+- Combined nowrap-strut candidate: DOM12/12PASS, runner2m26s. Neighbor
+  starts1358/1366/1385 pass8/8,8/8,2/8;1367 now passes exact-zero pixels.
+  Receipts `batch-<start>-float-shrink-strut-after-v1/results.json`. Before
+  qualifying a commit, add `extracted_right_float_strut_uses_its_inline_line_context`
+  with mismatched parent/float white-space values; the containing inline's
+  line behavior, not the float's internal text behavior, owns this decision.
+  Context-counter RED and final combined regression are pending.
+- Context counter is RED: lineNoWrap/floatNormal incorrectly retains a
+  space strut (true versusfalse). Pass the containing inline's nowrap state
+  explicitly into nested float extraction, independently of the float's
+  own white-space. Final DOM selector and fresh runner qualification pending.
+- Final DOM float selector13/13PASS, optimized build23.88s, including both
+  mismatched line/float white-space cases. Fresh final runner remains pending;
+  the earlier zero-pixel result does not attest the final context-safe source.
+- Final context-safe runner build2m21s, SHA256
+  `fbdc89f52d6b4d2f5400eaf725e2c09498e643b348545890dec4fcb876f05ef9`.
+  Neighbor starts1358/1366/1385 pass8/8,8/8,2/8.1367 improves2078->0px;
+  the other six neighbor failures retain identical pixel values/statuses.
+  Raw1367 layout confirms5ch float width48px and no extra whitespace leaf.
+  Receipts `batch-<start>-float-width-context-final-v1/results.json` below
+  `target/wpt-targeted`; raw frame `nowrap7-width-context-final.frame`.
+- Related starts5769/5761/5753/5745/5737/5729/5721/5689/5681/5665/5545/
+  5553/5593 pass104/104:100 exact-zero matches plus four expected mismatches.
+  Ordered paths/statuses/full pixel-diff objects are unchanged versus the
+  immediate baseline. Final receipts use the same float-width-context-final-v1
+  suffix. This is one qualified historical failure repair, not all CSS float
+  placement/nowrap semantics, CPU/GPU/device parity or final6548 closure.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

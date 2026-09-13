@@ -9530,6 +9530,7 @@ fn hoist_floats_into_block_formatting_context(
     fn collect(
         mut component: w3cos_std::Component,
         extract_self: bool,
+        nowrap_line: bool,
         left: &mut Vec<w3cos_std::Component>,
         right: &mut Vec<w3cos_std::Component>,
     ) -> Option<w3cos_std::Component> {
@@ -9537,6 +9538,11 @@ fn hoist_floats_into_block_formatting_context(
             // `display:none` suppresses the principal box; float must not
             // revive it through blockification.
             return Some(component);
+        }
+        // Anonymous line rows use Flex internally, but CSS floats are not
+        // flex items and must retain their used width beside overflowing text.
+        if component.style.float != w3cos_std::style::Float::None {
+            component.style.flex_shrink = 0.0;
         }
         if extract_self {
             match component.style.float {
@@ -9561,7 +9567,12 @@ fn hoist_floats_into_block_formatting_context(
                     strut_style.letter_spacing = component.style.letter_spacing;
                     strut_style.word_spacing = component.style.word_spacing;
                     strut_style.white_space = component.style.white_space;
-                    right.push(w3cos_std::Component::text(" ", strut_style));
+                    // A nowrap run already owns its unbroken line's strut.
+                    // Extra whitespace would advance that line and shift the
+                    // extracted float compared with a directly authored float.
+                    if !nowrap_line {
+                        right.push(w3cos_std::Component::text(" ", strut_style));
+                    }
                     component.style.display = w3cos_std::style::Display::Block;
                     right.push(component);
                     return None;
@@ -9600,7 +9611,8 @@ fn hoist_floats_into_block_formatting_context(
                     .any(contributes_in_flow_content);
                 let extract_child =
                     child.style.float != w3cos_std::style::Float::Right || has_prior_in_flow;
-                if let Some(child) = collect(child, extract_child, left, right) {
+                if let Some(child) = collect(child, extract_child,
+                    component.style.white_space == w3cos_std::style::WhiteSpace::NoWrap, left, right) {
                     has_prior_in_flow |= contributes_in_flow_content(&child);
                     retained.push(child);
                 } else if nested_left_float && has_prior_in_flow && has_later_in_flow {
@@ -9636,7 +9648,7 @@ fn hoist_floats_into_block_formatting_context(
         // A direct child is already owned by this formatting context. Only
         // extract floats nested inside inline descendants here; direct float
         // ordering is handled after blockification.
-        if let Some(mut child) = collect(child, false, &mut left, &mut right) {
+        if let Some(mut child) = collect(child, false, false, &mut left, &mut right) {
             let has_prior_in_flow = in_flow.iter().rev().find(|component| {
                 component.style.float == w3cos_std::style::Float::None
                     && !matches!(component.style.position,
@@ -10752,6 +10764,62 @@ mod image_component_tests {
                 && component.style.width == Dimension::Percent(100.0)
                 && matches!(component.children.as_slice(), [child] if child.style.float == Float::Left)
         }));
+    }
+
+    #[test]
+    fn floated_boxes_in_anonymous_nowrap_rows_do_not_flex_shrink() {
+        for side in [Float::Left, Float::Right] {
+            for nested in [false, true] {
+                let inline_style = w3cos_std::style::Style {
+                    display: Display::Inline, white_space: w3cos_std::style::WhiteSpace::NoWrap,
+                    ..Default::default()
+                };
+                let floating = w3cos_std::Component::boxed(w3cos_std::style::Style {
+                    display: Display::Inline, float: side, width: Dimension::Ch(5.0),
+                    white_space: w3cos_std::style::WhiteSpace::NoWrap,
+                    ..Default::default()
+                }, vec![]);
+                let children = vec![w3cos_std::Component::text(
+                    "nowrap text overflowing its parent", inline_style.clone()), floating];
+                let children = if nested {
+                    vec![w3cos_std::Component::boxed(inline_style, children)]
+                } else { children };
+                let fixed = hoist_floats_into_block_formatting_context(
+                    &w3cos_std::style::Style::default(), children);
+                let float = fixed.iter().find(|child| child.style.float == side).unwrap();
+                assert_eq!(float.style.width, Dimension::Ch(5.0));
+                assert_eq!(float.style.flex_shrink, 0.0, "side={side:?}, nested={nested}");
+                if side == Float::Right && nested {
+                    assert!(!fixed.iter().any(|child| matches!(&child.kind,
+                        ComponentKind::Text { content } if content == " ")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extracted_right_float_strut_uses_its_inline_line_context() {
+        use w3cos_std::style::WhiteSpace;
+        for (line_space, float_space, needs_strut) in [
+            (WhiteSpace::NoWrap, WhiteSpace::Normal, false),
+            (WhiteSpace::Normal, WhiteSpace::NoWrap, true),
+        ] {
+            let inline_style = w3cos_std::style::Style {
+                display: Display::Inline, white_space: line_space, ..Default::default()
+            };
+            let inline = w3cos_std::Component::boxed(inline_style.clone(), vec![
+                w3cos_std::Component::text("prefix", inline_style),
+                w3cos_std::Component::boxed(w3cos_std::style::Style {
+                    display: Display::Inline, float: Float::Right,
+                    white_space: float_space, ..Default::default()
+                }, vec![]),
+            ]);
+            let fixed = hoist_floats_into_block_formatting_context(
+                &w3cos_std::style::Style::default(), vec![inline]);
+            let has_strut = fixed.iter().any(|child| matches!(&child.kind,
+                ComponentKind::Text { content } if content == " "));
+            assert_eq!(has_strut, needs_strut, "line={line_space:?}, float={float_space:?}");
+        }
     }
 
     #[test]
