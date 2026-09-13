@@ -9,7 +9,7 @@ description = "W3C OS native runtime — layout engine, renderer, window manager
 default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
-skia = ["dep:skia-safe"]
+skia = ["dep:skia-safe", "dep:rustybuzz"]
 web-graphics-advanced = []
 web-media-advanced = []
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
@@ -46,6 +46,7 @@ parley = { workspace = true }
 unicode-bidi = { workspace = true }
 unicode-bidi-mirroring = { workspace = true }
 fontdue = { workspace = true }
+rustybuzz = { version = "=0.20.1", optional = true }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }
 image = { workspace = true }

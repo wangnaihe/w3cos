@@ -6151,6 +6151,21 @@ fn project_auto_height_bfc_float_heights(
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    fn inline_text_content_top(component: &Component) -> f32 {
+        if component.style.display == WDisplay::Inline
+            && matches!(&component.kind, ComponentKind::Text { content } if content != "\u{2028}")
+        {
+            component.style.padding_lengths().top
+                + component.style.border_top_width.unwrap_or(component.style.border_width)
+        } else { 0.0 }
+    }
+
+    fn inline_text_line_height(component: &Component) -> Option<f32> {
+        (component.style.display == WDisplay::Inline
+            && matches!(&component.kind, ComponentKind::Text { content } if content != "\u{2028}"))
+            .then_some(component.style.font_size * component.style.line_height)
+    }
+
     fn text_half_leading(component: &Component) -> f32 {
         if component.style.display == WDisplay::Inline
             && matches!(&component.kind, ComponentKind::Text { content } if content != "\u{2028}")
@@ -6242,8 +6257,12 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                     .map(|position| layouts[position].0)
                 {
                     // Text rects describe their em box, not the line strut.
-                    line_top.get_or_insert(layout.y - text_half_leading(child));
-                    line_height = line_height.max(layout.height);
+                    line_top.get_or_insert(layout.y + inline_text_content_top(child)
+                        - text_half_leading(child));
+                    // Non-replaced inline decoration can overflow its line,
+                    // but vertical padding/borders do not enlarge the strut.
+                    line_height = line_height.max(
+                        inline_text_line_height(child).unwrap_or(layout.height));
                 }
                 continue;
             }
@@ -6384,7 +6403,8 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                     *following_index,
                     count_nodes(following),
                     target_x - following_rect.x,
-                    target_y + text_half_leading(following) - following_rect.y,
+                    target_y + text_half_leading(following)
+                        - inline_text_content_top(following) - following_rect.y,
                 );
                 cursor_x = target_x + following_rect.width + margin_right;
             }
@@ -6394,13 +6414,17 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
 
         let descendant_bottom = children
             .iter()
-            .filter_map(|(_, index)| {
+            .filter_map(|(child, index)| {
                 layout_position
                     .get(index)
                     .copied()
-                    .map(|position| layouts[position].0)
+                    .map(|position| {
+                        let rect = layouts[position].0;
+                        inline_text_line_height(child).map_or(rect.y + rect.height, |height| {
+                            rect.y + inline_text_content_top(child) - text_half_leading(child) + height
+                        })
+                    })
             })
-            .map(|rect| rect.y + rect.height)
             .fold(parent_rect.y, f32::max);
         let line_box_bottom = line_top.map_or(parent_rect.y, |top| top + line_height);
         if matches!(component.style.height, WDim::Auto) {
@@ -12776,6 +12800,42 @@ mod tests {
         project_forced_break_lines(&mut layout, &root);
         assert_eq!(layout[2].0.y, 200.0);
         assert_eq!(layout[3].0.y, 200.0);
+    }
+
+    #[test]
+    fn decorated_inline_text_does_not_enlarge_the_forced_break_strut() {
+        let text_style = Style {
+            display: WDisp::Inline, font_size: 20.0, line_height: 1.2,
+            line_height_is_normal: false, border_width: 10.0,
+            padding: w3cos_std::style::Edges {
+                top: WSpacing::Px(5.0), bottom: WSpacing::Px(5.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let root = Component::row(Style {
+            display: WDisp::Flex, font_size: 20.0, line_height: 1.2,
+            line_height_is_normal: false, ..Style::default()
+        }, vec![
+            Component::text("One", text_style.clone()),
+            Component::text("\u{2028}", Style {
+                display: WDisp::Inline, font_size: 20.0, line_height: 1.2,
+                width: WDim::Px(0.0), height: WDim::Px(24.0), ..Style::default()
+            }),
+            Component::text("Two", text_style),
+        ]);
+        let rect = |y, height, width| LayoutRect { x: 0.0, y, width, height };
+        // The decorated em box starts 15px above its content top. Its
+        // content starts at half-leading=2; the line strut still starts at 0.
+        let mut layout = vec![
+            (rect(0.0, 48.0, 200.0), 0), (rect(-13.0, 50.0, 60.0), 1),
+            (rect(24.0, 0.0, 0.0), 2), (rect(11.0, 50.0, 60.0), 3),
+        ];
+        project_forced_break_lines(&mut layout, &root);
+        assert_eq!(layout[3].0.y, 11.0,
+            "the second decorated em box must remain on the 24px line strut");
+        assert_eq!(layout[0].0.height, 48.0,
+            "inline decoration overflow must not enlarge the parent's auto height");
     }
 
     #[test]

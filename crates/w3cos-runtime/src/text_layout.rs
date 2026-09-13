@@ -66,6 +66,22 @@ pub(crate) fn inline_text_continuation_box(
 
 /// Slice an inline decoration around a shaped line's advance box. Horizontal
 /// edges occur only at the logical first/last fragment; margins never paint.
+pub(crate) fn inline_fragment_border_widths(style: &Style, first: bool, last: bool) -> [f32; 4] {
+    let rtl = style.direction == w3cos_std::style::TextDirection::Rtl;
+    [
+        style.border_top_width.unwrap_or(style.border_width),
+        if (last && !rtl) || (first && rtl) {
+            style.border_right_width.unwrap_or(style.border_width)
+        } else { 0.0 },
+        style.border_bottom_width.unwrap_or(style.border_width),
+        if (first && !rtl) || (last && rtl) {
+            style.border_left_width.unwrap_or(style.border_width)
+        } else { 0.0 },
+    ]
+}
+
+/// Slice an inline decoration around a shaped line's advance box. Horizontal
+/// edges occur only at the logical first/last fragment; margins never paint.
 pub(crate) fn inline_fragment_background_box(
     line: crate::layout::LayoutRect,
     advance: f32,

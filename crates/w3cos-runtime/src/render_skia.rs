@@ -381,7 +381,15 @@ fn paint_display_list(
             normalized.opacity = 1.0;
             normalized
         });
-        render_node(
+        let line_context = frame.artifact.and_then(|artifact| artifact.inline_line_context(idx))
+            .map(|mut context| {
+                if let Some((sx, sy, _)) = frame.scroll_info.get(idx).copied().flatten() {
+                    context.line_box.x -= sx; context.line_box.y -= sy;
+                    context.first_line_box.x -= sx; context.first_line_box.y -= sy;
+                }
+                context
+            });
+        render_node_with_line_context(
             canvas,
             idx,
             rect,
@@ -392,6 +400,7 @@ fn paint_display_list(
             frame.text_input_values.get(&idx).map(String::as_str),
             frame.focused_index == Some(idx),
             bake_compositor_props,
+            line_context,
         );
         if matches!(local_filter, Some(Some(_))) {
             canvas.restore();
@@ -728,7 +737,7 @@ impl SkiaMetalPresenter {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_node(
+fn render_node_with_line_context(
     canvas: &Canvas,
     client_index: usize,
     rect: LayoutRect,
@@ -739,12 +748,20 @@ fn render_node(
     text_input_value: Option<&str>,
     focused: bool,
     bake_compositor_props: bool,
+    line_context: Option<crate::paint_artifact::InlineLineContext>,
 ) {
     let transform = if bake_compositor_props {
         style.transform
     } else {
         Transform2D::IDENTITY
     };
+    let line_context = line_context.map(|mut context| {
+        for line in [&mut context.line_box, &mut context.first_line_box] {
+            line.x = rect.x + (line.x - rect.x) * transform.scale_x + transform.translate_x;
+            line.width *= transform.scale_x;
+        }
+        context
+    });
     let rect = LayoutRect {
         x: rect.x + transform.translate_x,
         y: rect.y + transform.translate_y,
@@ -811,78 +828,14 @@ fn render_node(
             );
         }
     }
-    let has_edge_border = style.border_top_width.is_some()
-        || style.border_right_width.is_some()
-        || style.border_bottom_width.is_some()
-        || style.border_left_width.is_some()
-        || style.border_top_color.is_some()
-        || style.border_right_color.is_some()
-        || style.border_bottom_color.is_some()
-        || style.border_left_color.is_some()
-        || (style.border_collapse
-            && matches!(style.display, Display::TableColumn | Display::TableColumnGroup | Display::TableCell));
-    let has_edge_border = has_edge_border || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
-    if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
-        let mut border = color_paint(style.border_color, style.opacity);
-        border.set_style(paint::Style::Stroke);
-        border.set_stroke_width(style.border_width);
-        let inset = style.border_width * 0.5;
-        draw_rounded_rect(
-            canvas,
-            LayoutRect {
-                x: rect.x + inset,
-                y: rect.y + inset,
-                width: (rect.width - style.border_width).max(0.0),
-                height: (rect.height - style.border_width).max(0.0),
-            },
-            style
-                .border_corner_radii()
-                .map(|radius| (radius - inset).max(0.0)),
-            &border,
-        );
-    } else if has_edge_border {
-        let widths = [
-            style.border_top_width.unwrap_or(style.border_width),
-            style.border_right_width.unwrap_or(style.border_width),
-            style.border_bottom_width.unwrap_or(style.border_width),
-            style.border_left_width.unwrap_or(style.border_width),
-        ];
-        let colors = [
-            style.border_top_color.unwrap_or(style.border_color),
-            style.border_right_color.unwrap_or(style.border_color),
-            style.border_bottom_color.unwrap_or(style.border_color),
-            style.border_left_color.unwrap_or(style.border_color),
-        ];
-        let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
-        if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
-            let layer_paint = color_paint(w3cos_std::Color::rgb(255, 255, 255), style.opacity);
-            canvas.save_layer(&SaveLayerRec::default().paint(&layer_paint));
-            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors) {
-                let mut builder = PathBuilder::new();
-                for points in layer.polygons {
-                    builder.move_to(points[0]);
-                    for point in &points[1..] { builder.line_to(*point); }
-                    builder.close();
-                }
-                let mut color = layer.color;
-                if layer.shadow { color.a = 255; }
-                let mut paint = color_paint(color, 1.0);
-                if layer.shadow { paint.set_blend_mode(skia_safe::BlendMode::SrcATop); }
-                canvas.draw_path(&builder.detach(), &paint);
-            }
-            canvas.restore();
-        } else {
-            for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
-                if width > 0.0 && color.a > 0 {
-                    draw_round_rect(canvas, edge, 0.0, &color_paint(color, style.opacity));
-                }
-            }
-        }
+    if !(style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. })) {
+        draw_box_border(canvas, rect, style);
     }
 
     match kind {
         ComponentKind::Text { content } => {
-            draw_text_in_rect(canvas, rect, content, style, typeface, metrics_font);
+            draw_text_in_rect_with_line_context(canvas, rect, content, style, typeface,
+                metrics_font, line_context);
         }
         ComponentKind::Button { label } => {
             draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
@@ -976,6 +929,80 @@ fn render_node(
         | ComponentKind::Row
         | ComponentKind::Box
         | ComponentKind::VirtualList { .. } => {}
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn render_node(
+    canvas: &Canvas, client_index: usize, rect: LayoutRect, kind: &ComponentKind,
+    style: &Style, typeface: &Typeface, metrics_font: &fontdue::Font,
+    text_input_value: Option<&str>, focused: bool, bake_compositor_props: bool,
+) {
+    render_node_with_line_context(canvas, client_index, rect, kind, style, typeface,
+        metrics_font, text_input_value, focused, bake_compositor_props, None);
+}
+
+fn draw_box_border(canvas: &Canvas, rect: LayoutRect, style: &Style) {
+    let has_edge_border = style.border_top_width.is_some()
+        || style.border_right_width.is_some()
+        || style.border_bottom_width.is_some()
+        || style.border_left_width.is_some()
+        || style.border_top_color.is_some()
+        || style.border_right_color.is_some()
+        || style.border_bottom_color.is_some()
+        || style.border_left_color.is_some()
+        || (style.border_collapse
+            && matches!(style.display, Display::TableColumn | Display::TableColumnGroup | Display::TableCell));
+    let has_edge_border = has_edge_border || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
+    if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
+        let mut border = color_paint(style.border_color, style.opacity);
+        border.set_style(paint::Style::Stroke);
+        border.set_stroke_width(style.border_width);
+        let inset = style.border_width * 0.5;
+        draw_rounded_rect(canvas, LayoutRect {
+            x: rect.x + inset, y: rect.y + inset,
+            width: (rect.width - style.border_width).max(0.0),
+            height: (rect.height - style.border_width).max(0.0),
+        }, style.border_corner_radii().map(|radius| (radius - inset).max(0.0)), &border);
+    } else if has_edge_border {
+        let widths = [
+            style.border_top_width.unwrap_or(style.border_width),
+            style.border_right_width.unwrap_or(style.border_width),
+            style.border_bottom_width.unwrap_or(style.border_width),
+            style.border_left_width.unwrap_or(style.border_width),
+        ];
+        let colors = [
+            style.border_top_color.unwrap_or(style.border_color),
+            style.border_right_color.unwrap_or(style.border_color),
+            style.border_bottom_color.unwrap_or(style.border_color),
+            style.border_left_color.unwrap_or(style.border_color),
+        ];
+        let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
+        if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
+            let layer_paint = color_paint(w3cos_std::Color::rgb(255, 255, 255), style.opacity);
+            canvas.save_layer(&SaveLayerRec::default().paint(&layer_paint));
+            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors) {
+                let mut builder = PathBuilder::new();
+                for points in layer.polygons {
+                    builder.move_to(points[0]);
+                    for point in &points[1..] { builder.line_to(*point); }
+                    builder.close();
+                }
+                let mut color = layer.color;
+                if layer.shadow { color.a = 255; }
+                let mut paint = color_paint(color, 1.0);
+                if layer.shadow { paint.set_blend_mode(skia_safe::BlendMode::SrcATop); }
+                canvas.draw_path(&builder.detach(), &paint);
+            }
+            canvas.restore();
+        } else {
+            for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
+                if width > 0.0 && color.a > 0 {
+                    draw_round_rect(canvas, edge, 0.0, &color_paint(color, style.opacity));
+                }
+            }
+        }
     }
 }
 
@@ -1315,28 +1342,41 @@ fn draw_text_in_rect(
     text: &str,
     style: &Style,
     typeface: &Typeface,
-    _metrics_font: &fontdue::Font,
+    metrics_font: &fontdue::Font,
+) {
+    draw_text_in_rect_with_line_context(canvas, rect, text, style, typeface, metrics_font, None);
+}
+
+fn draw_text_in_rect_with_line_context(
+    canvas: &Canvas, rect: LayoutRect, text: &str, style: &Style,
+    typeface: &Typeface, _metrics_font: &fontdue::Font,
+    line_context: Option<crate::paint_artifact::InlineLineContext>,
 ) {
     let content = text_paint_box(rect, style);
-    let continuation_content = text_continuation_paint_box(rect, style);
+    let first_content = line_context.map(|context| LayoutRect {
+        y: content.y, height: content.height, ..context.fragment_box(style, true, false)
+    }).unwrap_or(content);
+    let continuation_content = line_context.map(|context| LayoutRect {
+        y: content.y, height: content.height, ..context.fragment_box(style, false, false)
+    }).unwrap_or_else(|| text_continuation_paint_box(rect, style));
     let image_info = canvas.image_info();
     let indent = style.resolved_text_indent(
-        content.width,
+        line_context.map_or(content.width, |context| context.line_box.width),
         image_info.width() as f32,
         image_info.height() as f32,
     );
-    let mut first_line_content = match style.direction {
+    let mut first_line_content = match line_context.map_or(style.direction, |context| context.direction) {
         w3cos_std::style::TextDirection::Ltr => LayoutRect {
-            x: content.x + indent,
-            width: (content.width - indent).max(1.0),
-            ..content
+            x: first_content.x + indent,
+            width: (first_content.width - indent).max(1.0),
+            ..first_content
         },
         w3cos_std::style::TextDirection::Rtl => LayoutRect {
             // A negative RTL indent is already represented by the block's
             // logical-start geometry in the portable line-box lowering.
             // Only contract the paintable first line for a positive indent.
-            width: (content.width - indent.max(0.0)).max(1.0),
-            ..content
+            width: (first_content.width - indent.max(0.0)).max(1.0),
+            ..first_content
         },
     };
     let float_bands: Vec<LayoutRect> = style.custom_properties.as_ref()
@@ -1393,7 +1433,9 @@ fn draw_text_in_rect(
         },
     );
     if style.display == Display::Inline
-        && (style.background.a > 0 || style.background_image.is_some())
+        && (style.background.a > 0 || style.background_image.is_some()
+            || text_layout::inline_fragment_border_widths(style, true, true)
+                .into_iter().any(|width| width > 0.0))
     {
         let line_height = style.font_size * style.line_height;
         let top = content.y + text_vertical_offset(
@@ -1401,8 +1443,11 @@ fn draw_text_in_rect(
         let paragraph_ends = text_layout::paragraph_terminal_lines(text, style.white_space, &layout.lines);
         for (index, line) in layout.lines.iter().enumerate() {
             let line_content = float_bands.get(index).copied().unwrap_or_else(||
-                if index == 0 { first_line_content } else { continuation_content });
-            let align = effective_text_align(style);
+                if index == 0 { first_line_content } else {
+                    line_context.map(|context| context.fragment_box(style, false, index + 1 == layout.lines.len()))
+                        .unwrap_or(continuation_content)
+                });
+            let align = line_context.map_or_else(|| effective_text_align(style), |context| context.alignment());
             let justify = align == TextAlign::Justify && !paragraph_ends[index]
                 && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal
                     | w3cos_std::style::WhiteSpace::PreLine);
@@ -1425,6 +1470,17 @@ fn draw_text_in_rect(
             }
             if style.background_image.is_some() {
                 draw_background_image(canvas, fragment, rect, style.border_radius, style, style.opacity);
+            }
+            let widths = text_layout::inline_fragment_border_widths(
+                style, index == 0, index + 1 == layout.lines.len());
+            if widths.into_iter().any(|width| width > 0.0) {
+                let mut fragment_style = style.clone();
+                fragment_style.border_width = 0.0;
+                fragment_style.border_top_width = Some(widths[0]);
+                fragment_style.border_right_width = Some(widths[1]);
+                fragment_style.border_bottom_width = Some(widths[2]);
+                fragment_style.border_left_width = Some(widths[3]);
+                draw_box_border(canvas, fragment, &fragment_style);
             }
         }
     }
@@ -1490,9 +1546,10 @@ fn draw_text_in_rect(
         let line_content = float_bands.get(index).copied().unwrap_or_else(|| if index == 0 {
             first_line_content
         } else {
-            continuation_content
+            line_context.map(|context| context.fragment_box(style, false, index + 1 == layout.lines.len()))
+                .unwrap_or(continuation_content)
         });
-        let align = effective_text_align(style);
+        let align = line_context.map_or_else(|| effective_text_align(style), |context| context.alignment());
         if align == TextAlign::Justify && !paragraph_ends[index]
             && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal | w3cos_std::style::WhiteSpace::PreLine)
         {
@@ -1774,9 +1831,15 @@ fn draw_text_line(
     let metric_height = (metrics.descent - metrics.ascent).max(f32::EPSILON);
     let baseline = top + font_size * (-metrics.ascent / metric_height).clamp(0.0, 1.0);
     for run in css_font_runs(font_text.as_ref(), typeface, style) {
-        let font = Font::new(run.typeface, font_size);
-        canvas.draw_str(run.text, (cursor_x, baseline), &font, &paint);
-        cursor_x += font.measure_str(run.text, Some(&paint)).0;
+        let font = Font::new(&run.typeface, font_size);
+        if let Some(shaped) = crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style) {
+            canvas.draw_glyphs_at(&shaped.glyphs, shaped.positions.as_slice(),
+                (cursor_x, baseline), &font, &paint);
+            cursor_x += shaped.advance;
+        } else {
+            canvas.draw_str(run.text, (cursor_x, baseline), &font, &paint);
+            cursor_x += font.measure_str(run.text, Some(&paint)).0;
+        }
     }
     cursor_x - x
 }
@@ -1839,8 +1902,16 @@ fn measure_skia_text_ink_bounds(
         |style| css_font_runs(font_text.as_ref(), typeface, style),
     );
     for run in runs {
-        let font = Font::new(run.typeface, font_size);
-        let (advance, bounds) = font.measure_str(run.text, None);
+        let font = Font::new(&run.typeface, font_size);
+        let default_style = Style { font_size, ..Style::default() };
+        let shaping_style = style.unwrap_or(&default_style);
+        let (advance, bounds) = if let Some(shaped) =
+            crate::skia_text_run::shape_visual_run(run.text, &run.typeface, shaping_style)
+        {
+            (shaped.advance, shaped.ink_bounds(&font).unwrap_or_default())
+        } else {
+            font.measure_str(run.text, None)
+        };
         if bounds.width() > 0.0 || bounds.height() > 0.0 {
             saw_ink = true;
             left = left.min(cursor_x + bounds.left);
@@ -1900,12 +1971,14 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
     css_font_runs(render_text.as_ref(), typeface, style)
         .into_iter()
         .map(|run| {
-            Font::new(run.typeface, style.font_size)
-                .measure_str(run.text, None)
-                .0
+            crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style)
+                .map(|shaped| shaped.advance)
+                .unwrap_or_else(|| Font::new(run.typeface, style.font_size)
+                    .measure_str(run.text, None).0
+                    + run.text.chars().filter(|character| is_word_spacing_character(*character))
+                        .count() as f32 * style.word_spacing)
         })
         .sum::<f32>()
-        + word_spacing
 }
 
 fn is_word_spacing_character(character: char) -> bool {
@@ -2418,6 +2491,90 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_inline_text_uses_parent_line_alignment_not_its_own_direction() {
+        let mut line_style = Style {
+            display: Display::Flex, font_size: 20.0, line_height: 1.0,
+            direction: w3cos_std::style::TextDirection::Rtl,
+            ..Style::default()
+        };
+        line_style.custom_properties.get_or_insert_with(Default::default).insert(
+            "--w3cos-internal-inline-formatting-context".into(), "1".into());
+        let text_style = Style {
+            display: Display::Inline, font_family: Some("Ahem".into()),
+            font_size: 20.0, line_height: 1.0,
+            direction: w3cos_std::style::TextDirection::Ltr,
+            border_width: 2.0, border_color: w3cos_std::Color::BLACK,
+            padding: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(5.0),
+                right: w3cos_std::style::Spacing::Px(10.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            margin: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(30.0),
+                right: w3cos_std::style::Spacing::Px(60.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let line_kind = ComponentKind::Row;
+        let text_kind = ComponentKind::Text { content: "p\u{2028}p".into() };
+        let layouts = [
+            (LayoutRect { x: 8.0, y: 8.0, width: 200.0, height: 40.0 }, 0),
+            (LayoutRect { x: 109.0, y: 6.0, width: 39.0, height: 24.0 }, 1),
+        ];
+        let artifact = PaintArtifact::build([
+            crate::paint_artifact::PaintNode { kind: line_kind.clone(), style: line_style.clone(),
+                parent: None, sticky_counter_signal: None },
+            crate::paint_artifact::PaintNode { kind: text_kind.clone(), style: text_style.clone(),
+                parent: Some(0), sticky_counter_signal: None },
+        ], &layouts, 1);
+        let nodes = [(0, layouts[0].0, &line_kind, &line_style),
+            (1, layouts[1].0, &text_kind, &text_style)];
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+        let font = test_font();
+        let inputs = HashMap::new();
+        let pixels = rasterizer.render_frame(256, 80, &nodes, &font, &[], &inputs,
+            None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
+        for (x, y, expected) in [(181, 15, 0), (109, 15, 255), (207, 15, 255),
+            (147, 35, 0), (109, 35, 255)] {
+            assert_eq!(pixels[(y * 256 + x) * 4], expected,
+                "parent-line-aligned border sample ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn forced_inline_break_slices_border_edges_instead_of_enclosing_both_lines() {
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style {
+            display: Display::Inline, font_family: Some("Ahem".into()),
+            font_size: 20.0, line_height: 1.0, line_height_is_normal: false,
+            border_width: 2.0, border_color: w3cos_std::Color::BLACK,
+            padding: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(5.0),
+                right: w3cos_std::style::Spacing::Px(10.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            margin: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(30.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let mut surface = Surface::new_raster_n32_premul((128, 80)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_text_in_rect(surface.canvas(), LayoutRect {
+            x: 38.0, y: 6.0, width: 39.0, height: 44.0,
+        }, "p\u{2028}p", &style, &typeface, crate::layout::layout_font());
+        let info = ImageInfo::new((128, 80), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 128 * 80 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 128 * 4, (0, 0)));
+        for (x, y, expected) in [(38, 15, 0), (64, 15, 255), (75, 15, 255),
+            (8, 35, 255), (39, 35, 0)] {
+            assert_eq!(pixels[(y * 128 + x) * 4], expected, "border sample ({x},{y})");
+        }
+    }
+
+    #[test]
     fn inline_background_uses_first_and_continuation_fragments() {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let style = Style {
@@ -2916,6 +3073,29 @@ mod tests {
         assert_eq!(aligned_text_x(rect, TextAlign::Center, 1.0, 40.0), 40.0);
         assert_eq!(aligned_text_x(rect, TextAlign::Left, 1.0, 40.0), 10.0);
         assert_eq!(aligned_text_x(rect, TextAlign::Left, -0.25, 40.0), 10.25);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn serif_text_advance_applies_font_positioning() {
+        // CSS2 inline-box cases use the browser's generic serif face. Its
+        // OpenType positioning adjusts Tw even though Skia's legacy pair
+        // adjustment API reports no adjustments for this face.
+        let style = Style {
+            font_family: Some("serif".to_string()),
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let typeface = generic_serif_typeface(&style).expect("macOS generic serif face");
+        let separate = ["T", "w", "o"]
+            .into_iter()
+            .map(|text| measure_skia_text_advance(text, &typeface, &style))
+            .sum::<f32>();
+        let together = measure_skia_text_advance("Two", &typeface, &style);
+        assert!(
+            together < separate - 0.5,
+            "font positioning must affect the inline advance: together={together}, separate={separate}"
+        );
     }
 
     #[test]

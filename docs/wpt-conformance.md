@@ -4976,6 +4976,172 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   The six direction/inline-box failures remain unfixed. No full-suite closure
   is claimed.
 
+### In progress: shared Skia font positioning for inline-box cases 986–991
+
+The published base is `d040d961fe9ad397bd632dc62131dc54118ad949`; a read-only
+remote check confirmed the same SHA on `refs/heads/main`. This candidate is not
+committed or published and does not close the six inline-box failures.
+
+The generic serif face used by the pinned CSS2 tests is Times New Roman on
+this macOS environment. A same-face table probe found GPOS/GSUB data, while
+Skia's legacy pair-adjustment query returned false. For `Two`, simple advance
+is 29.328125; Rustybuzz positioning produces 28.210938, versus the original
+Chromium oracle's 28.21875. Layout quantization and normal line metrics remain
+unresolved; these values are not hardcoded into production code.
+
+`render_skia::tests::serif_text_advance_applies_font_positioning` ran RED with
+together/separate advances both 29.328125, then GREEN after sharing positioned
+glyph runs between advance measurement, glyph paint, and ink bounds. The
+test builds took 3m00s and 2m53s; the production runner build took 2m03s.
+`serif-shaping-skia-neighbors-v1-comparison.json` records 43 directed Skia
+tests: 41→42 passed, only the new RED changed, and no lost passes. The existing
+`default_ascii_text_is_pixel_invariant_across_inline_fragments` failure was
+reproduced with the pre-shaping test binary and remains unclosed.
+
+`floating-group-clear-serif-shaping-v1-runtime-neighbors.json` records
+135/136 passes, the same known leading-float-margin failure, and no lost
+passes. `serif-shaping-v1-pixel-comparison.json` binds the runner, manifest,
+new module, Cargo configuration/lockfile and layout/paint sources before and
+after the fixed 800×600, zero-tolerance 984–991 run: 2 PASS / 6 FAIL, no lost
+passes. The six different-pixel counts changed 601→592, 737→735, 680→672,
+956→948, 916→912 and 816→813. Cross-line decoration fragments, inline/block
+interruptions and direction-sensitive start/end edges still need repair.
+This is not a full 6548-suite result or complete complex-script acceptance.
+
+#### In progress: decoration-owner and forced-break border slicing
+
+`document::image_component_tests::decorated_inline_forced_break_retains_decoration_on_the_text_owner`
+ran RED, then GREEN (24.23s build). The passive coalesced text/BR run now retains
+its principal span's box edges and DOM host instead of painting the edges on
+one enclosing Row. Shared box-border painting is reused by the first/last
+text fragments, with logical start/end side widths sliced per line.
+`render_skia::tests::forced_inline_break_slices_border_edges_instead_of_enclosing_both_lines`
+passed an actual raster check (3m09s build). Skia neighbors are 43/44, with the
+same already-reproduced baseline failure and no losses against the preceding
+43-test candidate. The production runner build took 2m04s.
+
+`serif-shaping-v2-decorations-pixel-comparison.json` records the sealed fixed
+984–991 batch: still 2 PASS / 6 FAIL, no lost PASS. Against the shaping-only
+candidate, `ltr-basic` improves 592→146 differing pixels but `ltr-span-only`
+worsens 948→1342; the other six complete WPT objects are unchanged. This
+candidate must not be published as closing this family.
+
+Actual/reference layout dumps for 986 and 989 are retained as
+`inline-decor-v2-*-layout.log`. Case 989's combined inline text starts at
+x=684.78906, while the reference first fragment starts at x=758.34375. The
+combined box consumes the last fragment's margin before the first line and
+does not carry a separate containing-line geometry/direction. Separately,
+`project_forced_break_lines` currently enlarges a line strut using decorated
+text rectangle heights. Both need independent, semantics-based repairs.
+
+The expanded DOM projection module ran 112 tests: 110 PASS / 2 FAIL
+(`float_fixup_preserves_static_line_and_block_order` and
+`rtl_inline_block_aligns_its_single_text_line_to_the_inline_end`). Their
+baseline status is still unverified; they are not waived or called new
+regressions. No commit/push or final/full-suite acceptance occurred here.
+
+#### In progress: decorated inline line-strut repair
+
+The pinned WPT checkout was reverified at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, with a clean worktree.
+`layout::tests::decorated_inline_text_does_not_enlarge_the_forced_break_strut`
+ran RED: the second decorated box moved to y=37 instead of y=11. The repair
+uses the text content origin and computed line-height for the line strut,
+subtracts decoration when placing the following text, and excludes inline
+decoration overflow from the parent's auto-height. GREEN also asserts the
+parent remains 48px high. RED/GREEN builds took 2m36s / 2m28s.
+
+`inline-strut-v1-unit-comparison.json` binds both unit binary hashes and
+records 17 directed break/forced-break tests: 16→17 PASS, only the new RED
+changed, no lost PASS. `floating-group-clear-inline-strut-v1-runtime-neighbors.json`
+records 135/136, the same known leading-float failure and no lost PASS.
+The production runner build took 2m23s.
+
+`serif-shaping-v3-strut-pixel-comparison.json` records the sealed fixed
+984–991 batch: 3 PASS / 5 FAIL, no lost PASS. `ltr-basic` is now zero pixels /
+max difference 0 (146→0). Other changed counts are `ltr-ib` 735→589,
+`ltr-span-only` 1342→1288, and `rtl-ib` 813→677. This remains a partial
+candidate, not full-family or 6548-suite acceptance.
+`serif-shaping-v3-strut-border-style-neighbors-pixel-comparison.json` keeps
+976–983 at 8/8 with all complete WPT objects unchanged; the same-binary
+default groove/ridge comparison to the original Chromium oracle passed at
+whole-image zero difference.
+
+The two DOM projection failures also reproduced individually, excluding
+module parallelism as their sole explanation. Their pre-change baseline is
+still unverified. Parent-line direction/geometry and inline-block interruption
+remain next; percentage padding and broader used-line-metric coverage have
+not been accepted by this pixel-length strut regression. No commit/push here.
+
+#### In progress: containing-line alignment distinct from inline direction
+
+`render_skia::tests::fragmented_inline_text_uses_parent_line_alignment_not_its_own_direction`
+ran an actual production-rasterizer/PaintArtifact RED: the expected first-line
+border sample (181,15) was white. It ran GREEN after passing typed
+`InlineLineContext` geometry/alignment separately from the inline owner's
+direction. Logical start/end margins and decoration occur only on their
+first/last fragments; existing normal-flow predecessors reduce first-line
+availability. The context follows the existing scroll/transform path. This
+does not claim complete mixed-fragment/last-line wrapping or percentage-edge
+coverage. The GREEN build took 2m54s; production build took 2m03s.
+
+`inline-parent-line-skia-neighbors-v1-comparison.json` records 45 directed
+Skia tests: all preceding 43 passes preserved, the new test passes, and the
+same already-reproduced baseline failure remains (44/45). Break neighbors
+remain 17/17; paint neighbors in `nonvisible-border-paint-v6-neighbors.json`
+are 49/49. The combined Skia/CPU/GPU type-check passed in 7.75s; this is not
+CPU/GPU pixel acceptance.
+
+`serif-shaping-v4-parent-line-pixel-comparison.json` records the sealed fixed
+984–991 batch: 4 PASS / 4 FAIL, no lost PASS. Only `ltr-span-only` changes,
+1288→0 differing pixels / max difference 0. `ltr-basic` retains zero. Border
+976–983 remains 8/8 with every complete WPT object unchanged.
+
+The direct DOM probe confirms an RTL anonymous line owner with an LTR span.
+The case-990 native layout probe separately exposes `One\nTwo` on one line.
+`reorder_explicit_bidi_inline_rows` joins visual lines with ordinary newline
+and resets inline direction; the hard-break marker and logical decoration
+direction need independent RED/GREEN repair next. Four interrupted/RTL
+cases remain failed. No inline whole-image Chromium acceptance, full 6548
+result, commit or push is claimed by this partial candidate.
+
+### RTL hard breaks and block-interruption margin edges
+
+The normal-bidi forced-break projection now retains U+2028 rather than
+converting it to a collapsible LF, and keeps the inline owner's logical
+direction after marking its glyph order visual. Mixed block-in-inline
+fragments retain only their logical first/last horizontal margin edges;
+vertical margins remain zero on the inline fragments.
+
+Both roots were reproduced with failing DOM unit tests before repair:
+`rtl-hard-break-real-red.log` and
+`inline-block-fragment-margins-real-red.log`. Their corresponding GREEN
+receipts cover the hard-break marker/direction and three paragraph/inline
+direction combinations. The local bidi paragraph fixture's expected break
+was corrected from LF to U+2028 without changing the expected glyph order.
+No pinned upstream test or pixel threshold was changed.
+
+`inline-bidi-box-v2-unit-neighbors.json` records 41/41 directed DOM PASS.
+`inline-bidi-box-v2-dom-projection-neighbors.log` records 112 PASS / 2 FAIL;
+the float-fixup and RTL inline-block failures remain disclosed, with their
+pre-candidate baseline still unverified.
+
+The sealed 800x600 `serif-shaping-v5-rtl-and-margins-pixel-comparison.json`
+records 8 PASS / 0 FAIL, zero difference for all Match references, and no
+lost PASS relative to v4. The last four failing inline-box cases now pass.
+This is native-versus-reference focused evidence, not full-suite or full
+Chromium rendering equivalence. Percentage edges, general wrapping and
+complex-script shaping, and CPU/GPU visual acceptance remain outside this
+receipt.
+
+The current-source production rebuild completed in 2m08s.
+`inline-bidi-box-v1-comparison.json` records 1,056 executions: 1,042 PASS /
+14 FAIL, six target FAIL-to-PASS transitions and no lost PASS versus
+`invalid-border-duplicates-v2`. Two text-indent non-Match pixel receipts
+changed while remaining PASS; their complete before/after objects are
+retained. The remaining 1,048 ordered objects are unchanged. This selected
+coverage is not the full 6,548-case suite or its current remaining count.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

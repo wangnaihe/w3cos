@@ -4723,6 +4723,24 @@ impl Document {
 
                 children = fixup_css_table_children(&style, children);
 
+                if style.display == w3cos_std::style::Display::Inline
+                    && !block_in_inline
+                    && rendered_child_ids.len() >= 2
+                    && rendered_child_ids.iter().all(|child| !self.events.has_listeners(*child))
+                    && children.len() == 1
+                    && children[0].children.is_empty()
+                    && let w3cos_std::ComponentKind::Text { content } = &children[0].kind
+                    && content.contains('\u{2028}')
+                {
+                    // Coalescing a passive text/BR run must not leave its
+                    // decoration on a single surrounding inline rectangle.
+                    // Retain the principal DOM host, with its authored box
+                    // edges, on the text that produces the line fragments.
+                    style.text_transform = children[0].style.text_transform;
+                    return self.attach_native_host(
+                        id, w3cos_std::Component::text(content.clone(), style));
+                }
+
                 if block_in_inline && !matches!(style.position, w3cos_std::style::Position::Static)
                 {
                     // A positioned inline remains the containing block for
@@ -5450,7 +5468,16 @@ impl Document {
                         fragment.min_height = w3cos_std::style::Dimension::Auto;
                         fragment.max_width = w3cos_std::style::Dimension::Auto;
                         fragment.max_height = w3cos_std::style::Dimension::Auto;
-                        fragment.margin = w3cos_std::style::Edges::ZERO;
+                        // Horizontal margins belong to the logical start/end
+                        // fragments just like padding and border edges.
+                        // Vertical inline margins do not become block margins.
+                        fragment.margin = w3cos_std::style::Edges {
+                            left: if retain_left { style.margin.left }
+                                else { w3cos_std::style::Spacing::Px(0.0) },
+                            right: if retain_right { style.margin.right }
+                                else { w3cos_std::style::Spacing::Px(0.0) },
+                            ..w3cos_std::style::Edges::ZERO
+                        };
                         fragment.padding.left = if retain_left {
                             style.padding.left
                         } else {
@@ -8254,8 +8281,10 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
                     .collect::<String>();
                 visual_lines.push(visual);
             }
-            *content = visual_lines.join("\n");
-            component.style.direction = w3cos_std::style::TextDirection::Ltr;
+            // A BR remains a hard layout marker under white-space:normal.
+            // Glyph order is already visual, but the original direction still
+            // owns the logical first/last inline decoration edges.
+            *content = visual_lines.join("\u{2028}");
             mark_bidi_visual_order(&mut component.style);
         }
     }
@@ -10392,6 +10421,90 @@ mod image_component_tests {
     use w3cos_std::style::{
         AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing,
     };
+
+    #[test]
+    fn block_interruption_slices_horizontal_margins_at_logical_fragment_edges() {
+        for (paragraph, inline) in [("ltr", "ltr"), ("rtl", "ltr"), ("rtl", "rtl")] {
+            crate::stylesheet::clear_rules();
+            let mut document = Document::new();
+            let div = document.create_element("div");
+            div.style_mut(&mut document).set_property("direction", paragraph);
+            let span = document.create_element("span");
+            for (name, value) in [("direction", inline), ("border", "2px solid"),
+                ("padding", "0 10px 0 5px"), ("margin", "9px 60px 11px 30px")] {
+                span.style_mut(&mut document).set_property(name, value);
+            }
+            let one = document.create_text_node("One");
+            let block = document.create_element("div");
+            let two = document.create_text_node("Two");
+            for child in [one, block, two] { span.append_child(&mut document, child); }
+            div.append_child(&mut document, span);
+            document.body().append_child(&mut document, div);
+            fn collect(component: &w3cos_std::Component, margins: &mut Vec<w3cos_std::style::EdgeLengths>) {
+                if component.style.display == Display::Inline
+                    && component.style.border_top_width.unwrap_or(component.style.border_width) > 0.0 {
+                    margins.push(component.style.margin_lengths());
+                }
+                for child in &component.children { collect(child, margins); }
+            }
+            let mut margins = Vec::new();
+            collect(&document.to_component_tree(), &mut margins);
+            assert_eq!(margins.len(), 2, "paragraph={paragraph}, inline={inline}");
+            let expected = if inline == "ltr" { [(30.0, 0.0), (0.0, 60.0)] }
+                else { [(0.0, 60.0), (30.0, 0.0)] };
+            for (margin, (left, right)) in margins.iter().zip(expected) {
+                assert_eq!((margin.left, margin.right), (left, right),
+                    "horizontal margin ownership: paragraph={paragraph}, inline={inline}");
+                assert_eq!((margin.top, margin.bottom), (0.0, 0.0),
+                    "non-replaced inline vertical margins must not become block margins");
+            }
+        }
+    }
+
+    #[test]
+    fn rtl_forced_break_preserves_layout_marker_and_inline_direction() {
+        let mut component = w3cos_std::Component::text("One\u{2028}Two", w3cos_std::Style {
+            display: Display::Inline,
+            direction: w3cos_std::style::TextDirection::Rtl,
+            border_width: 2.0,
+            ..w3cos_std::Style::default()
+        });
+        reorder_explicit_bidi_inline_rows(&mut component);
+        assert!(matches!(&component.kind, ComponentKind::Text { content }
+            if content == "One\u{2028}Two"),
+            "bidi must not turn a hard layout break into collapsible whitespace: {:?}", component.kind);
+        assert_eq!(component.style.direction, w3cos_std::style::TextDirection::Rtl,
+            "visual glyph order must not overwrite logical decoration direction");
+        assert_eq!(component.style.custom_properties.as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-bidi-visual-order"))
+            .map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn decorated_inline_forced_break_retains_decoration_on_the_text_owner() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let span = document.create_element("span");
+        span.style_mut(&mut document).set_property("border", "2px solid");
+        span.style_mut(&mut document).set_property("padding", "0 10px 0 5px");
+        span.style_mut(&mut document).set_property("margin", "0 60px 0 30px");
+        let one = document.create_text_node("One");
+        let br = document.create_element("br");
+        let two = document.create_text_node("Two");
+        for child in [one, br, two] { span.append_child(&mut document, child); }
+        document.body().append_child(&mut document, span);
+        let tree = document.to_component_tree();
+        let span = tree.children.first().expect("span owner");
+        assert!(matches!(&span.kind, ComponentKind::Text { content } if content == "One\u{2028}Two"),
+            "the decoration must belong to the fragmented text owner, not a single enclosing rectangle: {span:#?}");
+        assert_eq!(span.style.display, Display::Inline);
+        assert_eq!(span.style.border_width, 2.0);
+        assert_eq!(span.style.padding.left, Spacing::Px(5.0));
+        assert_eq!(span.style.padding.right, Spacing::Px(10.0));
+        assert_eq!(span.style.margin.left, Spacing::Px(30.0));
+        assert_eq!(span.style.margin.right, Spacing::Px(60.0));
+        assert!(span.children.is_empty());
+    }
 
     #[test]
     fn image_width_and_height_attributes_become_layout_hints() {
@@ -13560,7 +13673,7 @@ mod image_component_tests {
         assert!(matches!(
             &line.kind,
             w3cos_std::ComponentKind::Text { content }
-                if content == "\u{a0} ÷ × - + א\nת ÷ × - + \u{a0}"
+                if content == "\u{a0} ÷ × - + א\u{2028}ת ÷ × - + \u{a0}"
         ));
         assert_eq!(line.style.direction, w3cos_std::style::TextDirection::Ltr);
     }

@@ -24,6 +24,40 @@ pub struct PaintNode {
     pub sticky_counter_signal: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineLineContext {
+    pub line_box: LayoutRect,
+    pub first_line_box: LayoutRect,
+    pub direction: w3cos_std::style::TextDirection,
+    pub text_align: w3cos_std::style::TextAlign,
+}
+
+impl InlineLineContext {
+    pub fn fragment_box(&self, style: &Style, first: bool, last: bool) -> LayoutRect {
+        let line = if first { self.first_line_box } else { self.line_box };
+        let padding = style.padding_lengths();
+        let margin = style.margin_lengths();
+        let widths = crate::text_layout::inline_fragment_border_widths(style, first, last);
+        let rtl = style.direction == w3cos_std::style::TextDirection::Rtl;
+        let left = if (first && !rtl) || (last && rtl) {
+            margin.left + padding.left + widths[3]
+        } else { 0.0 };
+        let right = if (last && !rtl) || (first && rtl) {
+            margin.right + padding.right + widths[1]
+        } else { 0.0 };
+        LayoutRect { x: line.x + left, width: (line.width - left - right).max(1.0), ..line }
+    }
+
+    pub fn alignment(&self) -> w3cos_std::style::TextAlign {
+        use w3cos_std::style::{TextAlign, TextDirection};
+        match (self.text_align, self.direction) {
+            (TextAlign::Start, TextDirection::Rtl) | (TextAlign::End, TextDirection::Ltr) => TextAlign::Right,
+            (TextAlign::Start, TextDirection::Ltr) | (TextAlign::End, TextDirection::Rtl) => TextAlign::Left,
+            (align, _) => align,
+        }
+    }
+}
+
 pub fn effective_z_order(style: &Style, inherited: i32) -> i32 {
     if style.z_index != 0 {
         style.z_index
@@ -1348,6 +1382,57 @@ fn annotate_table_caption_paint_insets(
 }
 
 impl PaintArtifact {
+    /// The paragraph's available line geometry is distinct from the inline
+    /// owner's intrinsic decoration box and its own bidi direction.
+    pub(crate) fn inline_line_context(&self, index: usize) -> Option<InlineLineContext> {
+        let node = self.nodes.get(index)?;
+        let ComponentKind::Text { content } = &node.kind else { return None; };
+        if node.style.display != Display::Inline || !content.contains('\u{2028}') { return None; }
+        let mut owner = index;
+        let mut parent = node.parent?;
+        loop {
+            let ancestor = self.nodes.get(parent)?;
+            if matches!(ancestor.style.display, Display::Inline | Display::Contents) {
+                owner = parent;
+                parent = ancestor.parent?;
+                continue;
+            }
+            let anonymous = ancestor.style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-inline-formatting-context"));
+            if !anonymous && !matches!(ancestor.style.display,
+                Display::Block | Display::FlowRoot | Display::ListItem | Display::TableCell | Display::InlineBlock)
+            { return None; }
+            let rect = self.rect_by_index.get(parent).copied().flatten()?;
+            let padding = ancestor.style.padding_lengths();
+            let left = ancestor.style.border_left_width.unwrap_or(ancestor.style.border_width) + padding.left;
+            let right = ancestor.style.border_right_width.unwrap_or(ancestor.style.border_width) + padding.right;
+            let line_box = LayoutRect { x: rect.x + left, width: (rect.width - left - right).max(1.0), ..rect };
+            let mut first_line_box = line_box;
+            if let Some((previous_index, previous)) = self.nodes[..owner].iter().enumerate().rev()
+                .find(|(_, previous)| previous.parent == Some(parent)
+                    && previous.style.display != Display::None
+                    && previous.style.float == w3cos_std::style::Float::None
+                    && !matches!(previous.style.position, Position::Absolute | Position::Fixed))
+                && matches!(previous.style.display, Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+                && !matches!(&previous.kind, ComponentKind::Text { content } if content == "\u{2028}")
+                && let Some(previous_rect) = self.rect_by_index.get(previous_index).copied().flatten()
+            {
+                let margin = previous.style.margin_lengths();
+                match ancestor.style.direction {
+                    w3cos_std::style::TextDirection::Ltr => {
+                        first_line_box.x = (previous_rect.x + previous_rect.width + margin.right).max(line_box.x);
+                        first_line_box.width = (line_box.x + line_box.width - first_line_box.x).max(1.0);
+                    }
+                    w3cos_std::style::TextDirection::Rtl => {
+                        first_line_box.width = (previous_rect.x - margin.left - line_box.x).max(1.0);
+                    }
+                }
+            }
+            return Some(InlineLineContext { line_box, first_line_box,
+                direction: ancestor.style.direction, text_align: ancestor.style.text_align });
+        }
+    }
+
     pub fn paint_order_key(&self, index: usize) -> &[PaintOrderLevel] {
         self.paint_order.get(index).map_or(&[], Vec::as_slice)
     }

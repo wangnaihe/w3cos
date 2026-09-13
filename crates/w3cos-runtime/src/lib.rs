@@ -114,6 +114,8 @@ pub mod orientation_web;
 mod overscroll;
 pub mod paint_artifact;
 mod border_paint;
+#[cfg(feature = "skia")]
+mod skia_text_run;
 mod table_paint;
 mod bidi_paint;
 pub mod payment_web;
