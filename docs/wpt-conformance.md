@@ -4461,6 +4461,91 @@ No WPT input or tolerance changes, and final 6548-case proof remains open.
   normal commit is authorized by the user's small-step commit/push request;
   clean-SHA focused replay is still required before normal main push.
 
+- Publishedb4b8aa5 next8 discovery696/704/712/720 and728/736/744/752/760/
+  768/776/784/792/800/808/816 each finishes8PASS/0FAIL (128executions).
+  The next824 batch finishes7PASS/1FAIL and discovery stops immediately:
+  actual826 `border-right-width-095.xht`,7494different_pixels/max255.
+  Sealed receipts `discovery-{728,792}-b4b8aa5-sealed.json` and individual
+  batches retain fixed suite, source and binary evidence. Actual826 dump
+  shows bodyy16, paragraphy16, squarey52; reference body/rectangle/paragraph
+  y8, squarey44. Actual available width668 reflects the body's96px right
+  border and20px padding; this alone does not prove the div's inherited
+  border, and inheritance failure is not established. Suspected remaining
+  root is reference leading-float/normal-flow margin settlement; browser
+  oracle and minimal RED still needed. No next candidate patch or commit.
+
+- Isolated Chromium141/DPR1/800x600 loads the original XHTML files directly:
+  actual body/p y16 and divy52 with divcomputed right border96px solid;
+  reference body/rectangle/p y16 and squarey52. Receipt:
+  `border-right-inherit-826-chromium-oracle.json`. Native actual positions
+  match this oracle; native reference body/rectangle/p y8 and squarey44
+  do not. Added minimal leading-float/first-in-flow margin-collapse test
+  with unchanged browser coordinates; exact RED compilation started.
+  No border-inheritance parser change or production fix claimed.
+
+- Leading-float minimal test is terminal RED at bodyy8 versus16;
+  subsequent assertions were not reached. Receipt:
+  `leading-float-inflow-margin-red.log`. Candidate extends first-in-flow
+  top-margin promotion to a leading float/anonymous float-group prefix,
+  retaining the same authored border/padding/BFC eligibility checks, and
+  removes the first in-flow child's internal top margin in ordinary Block
+  as well as mixed fallback paths. Exact GREEN build started; no pixel
+  closure or candidate publication claimed yet.
+
+- Leading-float exact GREEN completes2m31s: body/leading float/paragraph
+  all16, trailing float52 (`leading-float-inflow-margin-green.log`).
+  Isolated134-neighbor replay finishes133PASS, the same previously observed
+  containing-block leading-float-margin failure and no prior PASS lost:
+  `floating-group-clear-leading-float-v1-runtime-neighbors.json`. Production
+  runner build started, source frozen; strict actual826 pixels still pending.
+
+- Leading-float production824..831 completes8PASS/0FAIL: actual826
+  different_pixels7494→0/max0 under zero tolerances, other7 complete objects
+  unchanged, no lost PASS (`leading-float-margin-v1-pixel-comparison.json`).
+  The896-execution sealed directed qualification now starts with824,
+  covering prior696 plus the200 next-discovery executions632..831, against
+  their exact published/candidate-baseline receipts. This is not a6548 run.
+  Sources frozen; no candidate commit/push before terminal qualification.
+
+- First896 qualification attempt terminates with verifier ENOENT, not a
+  rendering PASS regression: discovery baseline override erroneously also
+  catches high core start1358. The override is now bounded632..824. Resume
+  validates all source/binary/suite SHA256 values against the focused pixel
+  receipt before reusing completed same-candidate batches; missing batches
+  execute normally. Original error log retained, resume log separate.
+  Source unchanged, qualification not yet complete; no candidate publication.
+
+- Same frozen candidate runner next8 discovery832..839 finishes8PASS/0FAIL
+  while resumed qualification continues. Receipt:
+  `batch-832-leading-float-margin-v1-discovery/results.json`. This is
+  extra directed coverage, not part of896 old-PASS comparison or suite
+  completion. Production sources remain unchanged.
+
+- Next8 discovery840 stops at6PASS/2FAIL; shorthand002 has25088 differing
+  pixels, shorthand00312544. Sealed receipt:
+  `discovery-840-leading-float-margin-v1-sealed.json`. Viewed actual002 PNG
+  is a red bar where the reference is green. Higher-specificity border/
+  border-top shorthand omits color and should reset it to currentColor;
+  lower-specificity border-color:red is incorrectly retained. This next
+  root is read-only analysis while896 qualification runs; no color patch,
+  minimal RED or next candidate publication yet.
+
+- Next-root Chromium141 oracle directly loads original XHTML: shorthand002
+  has all four borders green/solid16px; shorthand003 topgreen/solid16px
+  while the other3 remain red/none0px. Receipt:
+  `border-shorthand-color-840-841-chromium-oracle.json`. This binds the
+  missing-color reset and single-side scope without altering fixtures or
+  tolerance. Current896 qualification remains live; production sources
+  frozen, next color RED/patch not started.
+
+- Resumed qualification is terminal896executions/883PASS/13FAIL, only826
+  FAIL→PASS, other895 complete objects unchanged and no prior PASS lost.
+  Receipt: `leading-float-margin-v1-comparison.json`. Fixed suite and five
+  source blobs/binary stay sealed, interrupted verifier error remains
+  separately retained. The13 strict failures belong to this sample, not
+  the6548 remaining count. Scoped commit authorized by small-step request;
+  clean-SHA focused replay remains required before normal main push.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

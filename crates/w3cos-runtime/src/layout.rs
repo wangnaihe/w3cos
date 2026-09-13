@@ -7738,7 +7738,13 @@ fn build_taffy_tree(
             );
         }
     }
-    let mixed_leading_margin_child = if mixed_inline_block_flex_fallback
+    let leading_float_before_flow = comp.style.display == WDisplay::Block
+        && normal_flow_children.clone().find(|child|
+            inline_line_has_in_flow_content(child) || child.style.float != WFloat::None)
+            .is_some_and(|child| child.style.float != WFloat::None
+                || child.style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.contains_key("--w3cos-internal-anonymous-float-group")));
+    let leading_block_margin_child = if (mixed_inline_block_flex_fallback || leading_float_before_flow)
         && comp.style.float == WFloat::None
         && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed)
         && comp.style.resolved_overflow_x() == WOverflow::Visible
@@ -8633,6 +8639,13 @@ fn build_taffy_tree(
                         child_style.flex_shrink = 1.0;
                         tree.set_style(node, child_style)?;
                     }
+                    if leading_block_margin_child == Some(source_index) {
+                        // CSS first-in-flow margin collapse ignores preceding
+                        // floats and survives the internal Flex fallback.
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.margin.top = LengthPercentageAuto::length(0.0);
+                        tree.set_style(node, child_style)?;
+                    }
                     if mixed_inline_block_flex_fallback
                         && matches!(&c.kind, ComponentKind::Text { content } if content == "\u{2028}")
                         && comp.children[..source_index].iter().rev().find(|child| {
@@ -8675,11 +8688,6 @@ fn build_taffy_tree(
                         )
                     {
                         let mut child_style = tree.style(node)?.clone();
-                        if mixed_leading_margin_child == Some(source_index) {
-                            // Preserve CSS Block parent/first-child collapse
-                            // despite the internal Flex representation.
-                            child_style.margin.top = LengthPercentageAuto::length(0.0);
-                        }
                         child_style.size.width = Dimension::percent(1.0);
                         child_style.flex_basis = Dimension::percent(1.0);
                         child_style.flex_grow = 0.0;
@@ -15889,6 +15897,34 @@ mod tests {
         project_simple_float_margin_boxes(&mut layout, &root, 800.0, 600.0);
         assert_eq!(layout[3].0.y, 10.0);
         assert_eq!(layout[0].0.height, 15.0);
+    }
+
+    #[test]
+    fn leading_float_does_not_block_first_in_flow_margin_collapse() {
+        let rectangle = Component::boxed(Style { display: WDisp::Block,
+            float: WFloat::Right, width: WDim::Px(96.0), height: WDim::Px(132.0),
+            margin: w3cos_std::style::Edges { left: WSpacing::Px(20.0),
+                ..Default::default() }, ..Style::default() }, vec![]);
+        let paragraph = Component::text("Test", Style { display: WDisp::Block,
+            line_height: 1.25, margin: w3cos_std::style::Edges {
+                top: WSpacing::Px(16.0), bottom: WSpacing::Px(16.0),
+                ..Default::default() }, ..Style::default() });
+        let square = Component::boxed(Style { display: WDisp::Block,
+            float: WFloat::Right, width: WDim::Px(96.0), height: WDim::Px(96.0),
+            ..Style::default() }, vec![]);
+        let body = Component::row(Style { display: WDisp::Block,
+            margin: w3cos_std::style::Edges { top: WSpacing::Px(8.0),
+                right: WSpacing::Px(8.0), bottom: WSpacing::Px(8.0),
+                left: WSpacing::Px(8.0) }, ..Style::default() },
+            vec![rectangle, paragraph, square]);
+        let root = Component::row(Style { display: WDisp::Block,
+            width: WDim::Px(800.0), ..Style::default() }, vec![body]);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(rect(1).y, 16.0, "body");
+        assert_eq!(rect(2).y, 16.0, "leading float");
+        assert_eq!(rect(3).y, 16.0, "first in-flow paragraph");
+        assert_eq!(rect(4).y, 52.0, "trailing float");
     }
 
     #[test]
