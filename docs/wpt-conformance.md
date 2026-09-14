@@ -5142,6 +5142,203 @@ changed while remaining PASS; their complete before/after objects are
 retained. The remaining 1,048 ordered objects are unchanged. This selected
 coverage is not the full 6,548-case suite or its current remaining count.
 
+### macOS default serif face: focused repair pending pixel acceptance
+
+The fresh Chromium 141 oracle for the original background-color table-column
+and inline-block pages reports the actual platform face Times / Times-Roman
+(`single-pixel-chromium-oracle.json`). Native generic serif instead selected
+Times New Roman. The direct test
+`generic_serif_matches_the_macos_browser_default_face` failed with that exact
+family mismatch in `macos-default-serif-real-red.log`, then passed after
+preferring system Times on macOS (`macos-default-serif-green-v1.log`, 2m59s).
+Other platforms retain the previous generic/fallback order. No hinting,
+clipping or pixel-threshold workaround was applied.
+
+`macos-default-serif-skia-neighbors-v1.log` records 45 PASS / 1 FAIL across
+46 Skia tests; the disclosed ASCII-fragment invariance failure remains.
+Independent raster experiments show that Times itself can still produce a
+weaker edge pixel, so the face repair alone is not claimed to close the
+14 selected one-pixel WPT failures. The production build completed in 2m12s.
+`serif-shaping-v6-macos-default-column-pixel-comparison.json` records 7 PASS /
+1 FAIL, with the target's one-pixel maximum difference reduced 20 to 5 but
+not eliminated. `serif-shaping-v6-macos-default-inline-box-pixel-comparison.json`
+retains all eight preceding inline-box PASS with identical complete objects.
+The inline-block subset also retains 7 PASS / 1 FAIL; its edge difference is
+reduced 10 to 3 (`serif-shaping-v6-macos-default-inline-block-pixel-comparison.json`).
+None of the three subsets lost a PASS. No commit or push has been made for this candidate;
+the residual raster edge still requires a root-cause repair.
+
+The original Chromium pages have now also been compared with their original
+reference, not merely inspected for font selection. At 800x600 / DPR1,
+Chromium 141 itself has one differing pixel on each: table column (103,53)
+has [5,5,5,255] instead of black, and inline-block (7,101) has
+[252,252,252,255] instead of white. These are the same maximum differences
+as the corrected native face. The fresh oracle's complete pixel samples and
+PNG pairs are retained in `single-pixel-chromium-oracle.json`.
+
+Consequently, these two strict WPT failures cannot be called native rendering
+bugs solely because they fail their square reference. They remain FAIL under
+the unchanged zero threshold. Clipping real glyph overhang or introducing a
+path-specific allowance would misrepresent rendering fidelity; neither has
+been done. This is not a waiver or full-suite closure. Further failure subsets
+can proceed independently while the zero-failure/reference-equivalence
+conflict remains explicit.
+
+### Sole block child in an inline: root repair pending pixel replay
+
+The newly sealed 992--999 subset records 7 PASS / 1 FAIL, with
+`block-in-inline-003.xht` differing by 14,767 pixels
+(`discovery-992-serif-shaping-v6-macos-default-column-sealed.json`). Its
+inline has no inline content, only one in-flow block child. The native
+layout dump shows its principal background incorrectly painting a full
+block box around that child.
+
+The all-block inline splitting branch required at least two children and
+therefore skipped this shape. It now accepts a nonempty all-block child
+list, reusing the existing empty-edge fragments and Contents wrapper.
+The new direct DOM test's actual assertion RED is recorded in
+`sole-block-inline-background-real-red-v3.log`; v1/v2 were test-authoring
+compile errors, not assertion RED. `sole-block-inline-background-green-v1.log`
+is GREEN, and `sole-block-inline-v1-unit-neighbors.json` retains 42/42
+directed DOM PASS with no lost PASS. The extended DOM projection module is
+113 PASS / 2 disclosed FAIL (`sole-block-inline-dom-projection-neighbors-v1.log`).
+Production rebuild completed in 2m15s. The sealed 992--999 replay is now
+8 PASS / 0 FAIL: `block-in-inline-003` improves 14,767 to zero differing pixels
+with maximum difference zero (`serif-shaping-v7-sole-block-inline-pixel-comparison.json`).
+The preceding eight inline-box complete result objects remain identical and
+all PASS (`serif-shaping-v7-sole-block-inline-neighbors-pixel-comparison.json`).
+Neither subset lost a PASS. Selected broader qualification is pending;
+this candidate has not yet been committed or published.
+
+### Next relative-inline failures: discovery without changing qualified sources
+
+While the sole-block selected qualification is running, the same sealed
+candidate was used for three bounded next subsets. 1000--1007 and
+1008--1015 each record 8 PASS / 0 FAIL. 1016--1023 records 6 PASS / 2 FAIL
+(`discovery-1000-serif-shaping-v7-sole-block-inline-sealed.json`,
+`discovery-1008-serif-shaping-v7-sole-block-inline-sealed.json`, and
+`discovery-1016-serif-shaping-v7-sole-block-inline-sealed.json`). Discovery
+stopped at those failures; no whole-suite rerun or source change was made.
+
+The next failures are `block-in-inline-relpos-001.xht` (13,560 differing
+pixels) and `block-in-inline-relpos-002.xht` (14,020). They require a relatively
+positioned inline's block/floating descendants to share its displacement
+while preserving their static formatting positions. The original-page
+native layout dump is retained in `relative-inline-1020-red-layout.log`.
+It shows the relative inline still enclosing leading text, a block, and
+trailing text in one row and producing five rather than three 20px lines.
+This is a compound splitting/positioning failure, not yet a proven single
+offset-only cause. These sources remain unchanged until current qualification
+is terminal; no fix or PASS claim is recorded for the relative pair.
+
+### Selected qualification stopped on bidi regressions; letter-spacing RED pending
+
+`sole-block-inline-v1-comparison.json` is a failed qualification, not a
+completed 1,064-case run: it stopped after 448 executions (436 PASS / 12 FAIL)
+because `bidi-005b`, `bidi-006b`, and `bidi-007b` lost their previous PASS.
+Each has one differing pixel, maximum difference 17. No commit or push was
+made. Complete failed receipts are retained.
+
+The native bidi layout dump shows single-character inline advances omitting
+their 32px letter spacing: a=14.203125, b=16, c=14.203125. Fresh original-page
+Chromium 141 span measurements are a=46.203125, b=48, c=46.203125 with
+computed letter-spacing=32px (`bidi-letter-spacing-chromium-oracle.json`).
+Spacing exists only inside a coalesced native run, leaving its styled-span
+boundaries too close and permitting ink overlap. The observed pixel is at
+(279,226), actual [172,146,26,255] versus expected [172,163,9,255].
+
+A new direct Skia advance test covers one, two and three characters and the
+trailing spacing that survives an inline boundary. Its assertion RED is
+pending compilation (`inline-letter-spacing-real-red.log`). This is not yet
+a repair or accepted regression recovery; reverting the correct platform
+font merely to regain accidental PASS is not the chosen solution.
+
+The advance test's assertion RED is now confirmed: a=14.203125 rather than
+46.203125 (`inline-letter-spacing-real-red.log`). Shaped Skia runs now add
+letter-spacing at every terminal glyph cluster, including the final one.
+The explicit Ahem and monospace measurement/paint branches retain the same
+trailing character advance. Their no-longer-used loop index/count was removed.
+The direct test was expanded to one/two/three characters in all three paths;
+`inline-letter-spacing-green-v1.log` is currently compiling, not yet GREEN.
+Unsupported unshaped-font fallback and CPU/GPU visual equivalence remain
+unaccepted; no generic cross-backend support or bidi regression recovery is
+claimed from this source change alone.
+
+The expanded serif/Ahem/monospace advance test is GREEN
+(`inline-letter-spacing-green-v1.log`, 2m36s). The first 47-test Skia module
+receipt retains the existing ASCII-fragment failure but exposes a stale
+Ahem advance assertion: expected 136, actual 232. Its separate ink-bounds
+assertion still correctly expects 136. A loaded original WPT Ahem font in
+Chromium 141 measures the same 20px `xx`, 96px letter spacing at exactly
+232px (`bidi-letter-spacing-chromium-oracle.json`, Ahem status loaded).
+Only that local advance expectation is corrected to 232; the 136px ink
+assertion and upstream tests/thresholds are unchanged. The updated full
+Skia-prefix receipt is compiling in `inline-letter-spacing-skia-neighbors-v2.log`.
+
+Production build before this test-only assertion correction completed in
+2m20s. The sealed bidi 376--383 replay is 8 PASS / 0 FAIL; all three lost
+bidi PASS recover with both pixel dimensions zero
+(`serif-shaping-v8-letter-spacing-bidi-pixel-comparison.json`). The 992--999
+complete objects remain unchanged and 8/8 PASS
+(`serif-shaping-v8-letter-spacing-sole-block-pixel-comparison.json`). No
+lost PASS occurred in either subset. Fresh current-source build and broader
+qualification are still required before publication.
+
+`inline-letter-spacing-skia-neighbors-v2-comparison.json` now records the
+current-source 47-test Skia prefix: 46 PASS / 1 disclosed FAIL, all prior
+45 PASS preserved, and the added letter-spacing test PASS. The stale Ahem
+advance assertion is corrected; its 136px ink assertion is still passing.
+The current 136-test layout neighbor receipt is 135 PASS / 1 previously
+disclosed leading-float-margin FAIL, with no lost PASS
+(`floating-group-clear-inline-letter-spacing-v2-runtime-neighbors.json`).
+Fresh current-source production build is running in
+`inline-letter-spacing-production-build-v2.log`; subsequent selected pixel
+qualification will include the additional 24 discovered cases for 1,088
+executions. Neither pending work nor disclosed failures are counted as PASS,
+and this candidate remains unpublished.
+
+The current-source production rebuild completed in 2m10s
+(`inline-letter-spacing-production-build-v2.log`). The 49-test paint neighbor
+receipt is 49 PASS / 0 FAIL / no lost PASS
+(`nonvisible-border-paint-v9-neighbors.json`). A new selected qualification
+is running as `sole-block-inline-v2-qualification.log`: 1,088 intended
+executions, targets 376 and 992 first, preserving the failed v1 receipt.
+No publication or completed-qualification claim is made while it is live.
+
+### Pre must not automatically wrap: second qualification regression repair
+
+`sole-block-inline-v2-comparison.json` is terminal FAIL after 440 executions
+(429 PASS / 11 FAIL), not a completed 1,088-case receipt. `bidi-006.xht` and
+`bidi-009.xht` lost PASS, each differing by 98,442 pixels. No publication was
+made. Native/reference layout dumps in `nowrap-spacing-368-*-layout.log` and
+`nowrap-spacing-371-*-layout.log` show 80px nowrap paragraphs versus 112px
+reference pre paragraphs: the anonymous flex line incorrectly wrapped pre
+content once correct inline letter spacing made its advance overflow.
+
+The anonymous inline-formatting lowering now chooses NoWrap for pre, without
+removing explicit hard-break handling. The four-mode direct test's pre RED
+is in `pre-inline-nowrap-real-red.log`. Its initial GREEN attempt passed pre
+but failed normal because the fixture formed one unbroken styled word `aa`,
+which legitimately remains unbroken. A real intervening word space was added,
+keeping all four expected policies unchanged. `pre-inline-nowrap-green-v2.log`
+is GREEN for pre, nowrap, pre-wrap and normal. No upstream fixture or threshold
+was changed.
+
+`pre-inline-nowrap-v2-unit-neighbors.json` is 43/43 PASS with no lost PASS.
+`pre-inline-nowrap-dom-projection-neighbors-v2.log` is 114 PASS / 2 disclosed
+prior FAIL. Production rebuild is running in
+`pre-inline-nowrap-production-build-v2.log`; bidi pixel recovery and broader
+qualification remain pending. The relative-inline pair remains a subsequent
+separate repair, and all current changes remain unpublished.
+
+### Pre nowrap production and focused pixel replay
+
+The same production build completed successfully in 2m 32s (`pre-inline-nowrap-production-build-v2.log`). Three source-sealed eight-case replays passed: `serif-shaping-v9-pre-nowrap`, `serif-shaping-v9-pre-nowrap-bidi-neighbors`, and `serif-shaping-v9-pre-nowrap-sole-block`. Both `bidi-006.xht` and `bidi-009.xht` recovered from 98,442 differing pixels to zero. The latter two groups preserved all previous result objects. No lost PASS occurred in these 24 executions. The 1,088-case `sole-block-inline-v3` qualification is pending; these focused receipts are not full-suite acceptance or publication evidence.
+
+### Sole-block-inline v3 qualification
+
+`sole-block-inline-v3-comparison.json` completed all 1,088 selected executions: 1,072 PASS, 16 FAIL, and no lost PASS. All six required bidi/sole-block paths passed with zero differing pixels. The 16 remaining failures comprise the previous 14 strict reference failures and two previously discovered relative-positioned block-in-inline failures; this is not a new full-suite remaining count. `pre-nowrap-alternate-backends-check.log` completed successfully in 10.85s for Skia/CPU/GPU combined features; this is type-check evidence, not alternate-backend pixel acceptance. Publication requires the subsequent clean-SHA replay and normal remote push verification.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

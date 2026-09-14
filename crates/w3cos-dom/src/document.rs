@@ -5188,7 +5188,10 @@ impl Document {
                                 && matches!(style.height, w3cos_std::style::Dimension::Auto)
                                 && matches!(style.min_height, w3cos_std::style::Dimension::Auto)
                                 && matches!(style.max_height, w3cos_std::style::Dimension::Auto);
-                            style.flex_wrap = if sole_atomic_line {
+                            // Pre preserves explicit breaks, but never creates
+                            // another line merely because inline advances overflow.
+                            style.flex_wrap = if sole_atomic_line
+                                || style.white_space == w3cos_std::style::WhiteSpace::Pre {
                                 w3cos_std::style::FlexWrap::NoWrap
                             } else {
                                 w3cos_std::style::FlexWrap::Wrap
@@ -5338,7 +5341,7 @@ impl Document {
 
                 if block_in_inline
                     && !self.events.has_listeners(id)
-                    && children.len() >= 2
+                    && !children.is_empty()
                     && children.iter().all(|child| {
                         matches!(
                             child.style.display,
@@ -10421,6 +10424,62 @@ mod image_component_tests {
     use w3cos_std::style::{
         AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing,
     };
+
+    #[test]
+    fn pre_inline_formatting_context_does_not_enable_automatic_flex_wrapping() {
+        for (white_space, expected) in [("pre", FlexWrap::NoWrap),
+            ("nowrap", FlexWrap::NoWrap), ("pre-wrap", FlexWrap::Wrap),
+            ("normal", FlexWrap::Wrap)] {
+            crate::stylesheet::clear_rules();
+            let mut document = Document::new();
+            let div = document.create_element("div");
+            for (name, value) in [("width", "80px"), ("font-size", "32px"),
+                ("letter-spacing", "32px"), ("white-space", white_space)] {
+                div.style_mut(&mut document).set_property(name, value);
+            }
+            for (index, color) in ["red", "blue"].into_iter().enumerate() {
+                let span = document.create_element("span");
+                span.style_mut(&mut document).set_property("color", color);
+                let text = document.create_text_node(if index == 0 { "a " } else { "a" });
+                span.append_child(&mut document, text);
+                div.append_child(&mut document, span);
+            }
+            document.body().append_child(&mut document, div);
+            fn find(component: &w3cos_std::Component) -> Option<FlexWrap> {
+                if component.style.font_size == 32.0 && component.style.custom_properties
+                    .as_ref().is_some_and(|properties| properties.contains_key(
+                        "--w3cos-internal-inline-formatting-context")) {
+                    return Some(component.style.flex_wrap);
+                }
+                component.children.iter().find_map(find)
+            }
+            assert_eq!(find(&document.to_component_tree()), Some(expected), "{white_space}");
+        }
+    }
+
+    #[test]
+    fn sole_block_child_does_not_paint_the_split_inline_principal_background() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let outer = document.create_element("div");
+        let inline = document.create_element("div");
+        inline.style_mut(&mut document).set_property("display", "inline");
+        inline.style_mut(&mut document).set_property("background", "red");
+        let block = document.create_element("div");
+        let text = document.create_text_node("There should be no red.");
+        block.append_child(&mut document, text);
+        inline.append_child(&mut document, block);
+        outer.append_child(&mut document, inline);
+        document.body().append_child(&mut document, outer);
+        fn check(component: &w3cos_std::Component) {
+            assert!(!(component.style.background == w3cos_std::Color::rgb(255, 0, 0)
+                && component.style.display != Display::Contents
+                && !component.children.is_empty()),
+                "a split inline must not paint a principal box around its sole block child");
+            for child in &component.children { check(child); }
+        }
+        check(&document.to_component_tree());
+    }
 
     #[test]
     fn block_interruption_slices_horizontal_margins_at_logical_fragment_edges() {

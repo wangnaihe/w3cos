@@ -128,9 +128,9 @@ pub(crate) fn shape_visual_run(text: &str, face: &Typeface, style: &Style) -> Op
             .get(i + 1)
             .is_none_or(|next| next.cluster != info.cluster);
         if cluster_ends {
-            if i + 1 < shaped.len() {
-                cursor += style.letter_spacing;
-            }
+            // CSS inline advances retain spacing after the final typographic
+            // character, including when the next character is in another run.
+            cursor += style.letter_spacing;
             if text
                 .get(info.cluster as usize..)
                 .and_then(|text| text.chars().next())

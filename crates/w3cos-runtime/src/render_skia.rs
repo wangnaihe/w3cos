@@ -51,9 +51,18 @@ thread_local! {
                 .expect("embedded Skia fallback font")
         }
     };
-    static GENERIC_SERIF_TYPEFACE: Option<Typeface> = FontMgr::default()
-        .match_family_style("serif", FontStyle::normal())
-        .or_else(|| FontMgr::default().match_family_style("Times New Roman", FontStyle::normal()));
+    static GENERIC_SERIF_TYPEFACE: Option<Typeface> = {
+        let manager = FontMgr::default();
+        // CoreText's generic alias can resolve to Times New Roman, whereas
+        // the macOS browser default serif face is the system Times family.
+        #[cfg(target_os = "macos")]
+        let platform_default = manager.match_family_style("Times", FontStyle::normal());
+        #[cfg(not(target_os = "macos"))]
+        let platform_default = None;
+        platform_default
+            .or_else(|| manager.match_family_style("serif", FontStyle::normal()))
+            .or_else(|| manager.match_family_style("Times New Roman", FontStyle::normal()))
+    };
     static SKIA_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
     static SKIA_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
 }
@@ -1769,8 +1778,7 @@ fn draw_text_line(
         let mut cursor_x = x;
         let snapped_top = top.round();
         let render_text = text_layout::font_render_text_for_style(text, style);
-        let character_count = render_text.chars().count();
-        for (index, character) in render_text.chars().enumerate() {
+        for character in render_text.chars() {
             if !character.is_whitespace() {
                 let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
                 canvas.draw_rect(
@@ -1784,9 +1792,7 @@ fn draw_text_line(
                 );
             }
             cursor_x += font_size;
-            if index + 1 < character_count {
-                cursor_x += style.letter_spacing;
-            }
+            cursor_x += style.letter_spacing;
             if is_word_spacing_character(character) {
                 cursor_x += style.word_spacing;
             }
@@ -1798,8 +1804,7 @@ fn draw_text_line(
         let font = Font::new(typeface, font_size);
         let monospace_advance = font.measure_str("0", Some(&paint)).0;
         let render_text = text_layout::font_render_text_for_style(text, style);
-        let character_count = render_text.chars().count();
-        for (index, character) in render_text.chars().enumerate() {
+        for character in render_text.chars() {
             if !character.is_whitespace() {
                 canvas.draw_str(
                     character.to_string(),
@@ -1809,9 +1814,7 @@ fn draw_text_line(
                 );
             }
             cursor_x += monospace_advance;
-            if index + 1 < character_count {
-                cursor_x += style.letter_spacing;
-            }
+            cursor_x += style.letter_spacing;
             if is_word_spacing_character(character) {
                 cursor_x += style.word_spacing;
             }
@@ -1956,7 +1959,7 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
     if style_uses_ahem(style) {
         let character_count = render_text.chars().count();
         return character_count as f32 * style.font_size
-            + character_count.saturating_sub(1) as f32 * style.letter_spacing
+            + character_count as f32 * style.letter_spacing
             + word_spacing;
     }
     if style_uses_generic_monospace(style) {
@@ -1965,7 +1968,7 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
             .measure_str("0", None)
             .0;
         return character_count as f32 * monospace_advance
-            + character_count.saturating_sub(1) as f32 * style.letter_spacing
+            + character_count as f32 * style.letter_spacing
             + word_spacing;
     }
     css_font_runs(render_text.as_ref(), typeface, style)
@@ -2574,6 +2577,40 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generic_serif_matches_the_macos_browser_default_face() {
+        let style = Style { font_family: Some("serif".into()), ..Style::default() };
+        let expected = FontMgr::default().match_family_style("Times", FontStyle::normal())
+            .expect("macOS system Times face");
+        let actual = generic_serif_typeface(&style).expect("generic serif face");
+        assert_eq!(actual.family_name(), expected.family_name());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn letter_spacing_keeps_the_last_character_advance_across_inline_boundaries() {
+        let typeface = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
+        for family in ["serif", "Ahem", "monospace"] {
+            let style = Style { font_family: Some(family.into()), font_size: 32.0,
+                letter_spacing: 32.0, ..Style::default() };
+            let font = Font::new(&typeface, style.font_size);
+            for text in ["a", "ab", "abc"] {
+                let expected = text.chars().map(|character| {
+                    let advance = match family {
+                        "Ahem" => style.font_size,
+                        "monospace" => font.measure_str("0", None).0,
+                        _ => font.measure_str(character.to_string(), None).0,
+                    };
+                    advance + style.letter_spacing
+                }).sum::<f32>();
+                let actual = measure_skia_text_advance(text, &typeface, &style);
+                assert!((actual - expected).abs() < 0.01,
+                    "{family}/{text:?}: the inline advance must retain trailing character spacing: {actual} != {expected}");
+            }
+        }
+    }
+
     #[test]
     fn inline_background_uses_first_and_continuation_fragments() {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
@@ -3121,7 +3158,7 @@ mod tests {
         };
         assert_eq!(
             measure_skia_text_advance("xx", &typeface, &letter_spaced),
-            136.0
+            232.0 // Advance includes the final spacing; ink below does not.
         );
         assert_eq!(
             measure_skia_text_ink_bounds("xx", 20.0, &typeface, 400, Some(&letter_spaced)),
