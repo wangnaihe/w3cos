@@ -7540,6 +7540,66 @@ because they pair a single text child with a fixed width - the same shape as
 them from `inline-non-replaced-width-001` is a further question, not a scope extension of this
 fix.
 
+### A block-in-inline percentage height resolves against the surrounding block, not the split inline host (2026-09-21)
+
+`css/CSS2/normal-flow/block-in-inline-percents-001.xht` fails by **17,280** pixels. The case
+places a `display: block; height: 50%` span inside an outer inline span; the containing block
+is the body (`height: 200px`), so the inner block should be 100 px tall plus its 20 px border.
+The reference is a plain `div` of the same dimensions.
+
+**Where the height went.** In `node_to_component` a block-in-inline host has its `display`
+changed from `Inline` to `Block` so that the split fragments are laid out against the
+surrounding containing block (`document.rs:4219`). That mutated style is then passed to
+`child_components` as the `parent_style` for every child (`document.rs:4253`). When the block
+child reaches the percentage-height guard (`document.rs:3712-3740`) it sees a parent whose
+`display` is `Block` and whose `height` is `Auto` — the split inline host has no explicit
+height — and the guard therefore cancels the percentage to `Auto`. The block then paints only
+its border (20 px) with zero content height.
+
+A direct `div` with `height: 50%` renders correctly (784×120), so the percentage resolver
+itself is fine. A block-in-inline child with a fixed `height: 100px` also renders correctly,
+which isolates the defect to the percentage-height guard, not to the split lowering.
+
+**The fix.** Save the original `display` before the mutation and pass a clone with that
+original display restored into `child_components`:
+
+```rust
+let original_display = style.display;
+// ... block_in_inline detection, style.display = Block ...
+let mut children = if block_in_inline {
+    let mut original_style = style.clone();
+    original_style.display = original_display;
+    self.child_components(&rendered_child_ids, &child_ids, ancestors, &original_style)
+} else {
+    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style)
+};
+```
+
+With the parent style back to `Inline`, the percentage-height guard no longer matches (its
+`matches!(parent.display, Block | InlineBlock | ...)` branch is false), so the `height: 50%`
+survives and later resolves against the real containing block — the body — exactly as the
+plain `div` does.
+
+**Evidence.**
+
+- Five probe variants measured against a blank reference:
+  - `pct1_original` (block-in-inline, `height: 50%`, border): bbox **784×20 → 784×120**
+  - `pct2_direct_div` (plain div, `height: 100px`, border): 784×120 (unchanged)
+  - `pct3_fixed_height` (block-in-inline, `height: 100px`, border): 784×120 (unchanged)
+  - `pct4_wrapped` (extra wrapper div): 784×20 → 784×120
+  - `pct5_no_border` (block-in-inline, `height: 50%`, no border): invisible (unchanged)
+- `block-in-inline-percents-001.xht` (the target): **17,280 px → pass**.
+- `cargo test -p w3cos-dom --lib` holds at **483 passed / 12 failed**, same 12 names.
+- rustfmt delta: 199 → 199 (+0).
+- `tests/wpt/w3cos-smoke.json` **2/2 rc=0**; `tests/wpt/w3cos-baseline.json` **9/10**.
+- Directed run over the full `block-in-inline` family (**170 cases**, 8 workers, 37s): **1 fixed,
+  0 regressed, 0 pixel-count changes**.
+- Full 6,548-case regression (14 x 500, 8 workers, 29m42s): **2 cases now pass**
+  (`6161 passed / 387 failed`). Both are the intended fix:
+  `css/CSS2/normal-flow/block-in-inline-percents-001.xht` and
+  `css/CSS2/visuren/percent-height-1.html` (each 17,280 px -> pass). **0 regressed, 0
+  pixel-count changes**.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

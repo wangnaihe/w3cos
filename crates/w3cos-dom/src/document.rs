@@ -4190,6 +4190,7 @@ impl Document {
                 } else {
                     false
                 };
+                let original_display = style.display;
                 let mut block_in_inline = style.display == w3cos_std::style::Display::Inline
                     && child_ids.iter().any(|child_id| {
                         let child = self.get_node(*child_id);
@@ -4250,8 +4251,18 @@ impl Document {
                                 )
                         }
                     });
-                let mut children =
-                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style);
+                let mut children = if block_in_inline {
+                    let mut original_style = style.clone();
+                    original_style.display = original_display;
+                    self.child_components(
+                        &rendered_child_ids,
+                        &child_ids,
+                        ancestors,
+                        &original_style,
+                    )
+                } else {
+                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style)
+                };
                 if !block_in_inline
                     && style.display == w3cos_std::style::Display::Inline
                     && children.iter().any(|child| {
