@@ -4927,8 +4927,19 @@ impl Document {
                 // is equivalent to one anonymous horizontal line box, so
                 // lower that visual box as flex-row while retaining the DOM
                 // children and their independently styled paint nodes.
+                //
+                // A block whose inline children are all passive text folds them
+                // into a single run *after* this decision, and a lone flex item
+                // cannot wrap - the run keeps its max-content width and overflows
+                // instead. When the block's own line box already supplies the
+                // width, the alignment and the indent, the row has nothing left to
+                // do, so keep the block and let its own line breaking apply.
                 if style.display != w3cos_std::style::Display::None
                     && (nowrap_inline_formatting_context || anonymous_inline_formatting_context)
+                    && !(style.display == w3cos_std::style::Display::Block
+                        && anonymous_inline_formatting_context
+                        && block_line_box_covers_the_inline_row(&style)
+                        && passive_inline_children_collapse_to_one_text_run(&children, &style))
                 {
                     let mut indented_unbroken_text_box = false;
                     if anonymous_inline_formatting_context {
@@ -9573,6 +9584,59 @@ fn plain_anonymous_inline_table_text(
     Some(w3cos_std::Component::text(content, style))
 }
 
+/// Does the block's own line box already supply everything the flex row would?
+///
+/// The row is what carries `text-indent` as a margin on the first inline box,
+/// `text-align` as `justify_content`, a bidi override as item order, and the block
+/// line width as a `width: 100%` constraint on a lone run. While any of those are
+/// in play the row earns its keep and must stay. Once none are, the block's own
+/// line box lays out the same line and the row only adds the single-item shape
+/// that cannot break.
+fn block_line_box_covers_the_inline_row(style: &w3cos_std::style::Style) -> bool {
+    style.text_indent == w3cos_std::style::Dimension::Px(0.0)
+        && style.text_align == w3cos_std::style::TextAlign::Start
+        && style.direction == w3cos_std::style::TextDirection::Ltr
+        && style.unicode_bidi == w3cos_std::style::UnicodeBidi::Normal
+        && !style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key("--w3cos-internal-text-align-last"))
+}
+
+/// Would the flex row be left holding one text item that it can no longer break?
+///
+/// The row breaks lines *between* its flex items, and it hands a lone text run the
+/// block line width through the `--w3cos-internal-text-line-width` branch. Neither
+/// reaches a run that only becomes single *after* the post-order coalescing pass:
+/// that fold runs once this decision is already made, so the item keeps its
+/// unconstrained max-content width and overflows the block instead of wrapping.
+/// When every inline child is passive text the fold is inevitable, and a block
+/// whose own line box already supplies the width, the alignment and the indent
+/// needs no row for that content - the single-text-node case already relies on it.
+///
+/// A single child is deliberately left alone. That shape is the retained inline
+/// fragment the row was introduced for, and it still goes through the row's
+/// indent and line-width handling; only a *fold* can defeat the row.
+///
+/// The probe runs on a throwaway row because the coalescing pass is the authority
+/// on what "passive text" means here; duplicating its predicate would let the two
+/// drift.
+fn passive_inline_children_collapse_to_one_text_run(
+    children: &[w3cos_std::Component],
+    parent_style: &w3cos_std::style::Style,
+) -> bool {
+    if children.len() < 2 {
+        return false;
+    }
+    let mut probe = w3cos_std::Component::row(parent_style.clone(), children.to_vec());
+    coalesce_passive_inline_text_children(&mut probe);
+    probe.children.len() == 1
+        && matches!(
+            probe.children[0].kind,
+            w3cos_std::ComponentKind::Text { .. }
+        )
+}
+
 fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
     use w3cos_std::component::ComponentKind;
 
@@ -10903,6 +10967,96 @@ mod image_component_tests {
             found,
             vec![0.5],
             "the hoisted block must not fall out of the split inline's group"
+        );
+    }
+
+    /// A block that paints a background must still wrap its passive inline run.
+    ///
+    /// The flex-row model breaks lines *between* its items, so it only works while
+    /// the inline boxes stay separate. A host background used to stop
+    /// `coalesced_inline_text_run` from folding its children - the comparison is
+    /// against the host style, which carries the background while a passive span
+    /// does not - and the surviving flex row then held one item that could not
+    /// break, so the run overflowed instead of wrapping.
+    /// `css/CSS2/box-display/delete-block-in-inlines-*.xht` measures exactly that:
+    /// the container that lost its block child must still match a plain text div.
+    #[test]
+    fn a_backgrounded_block_keeps_its_own_line_breaking() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container
+            .style_mut(&mut document)
+            .set_property("background-color", "fuchsia");
+        for child in [
+            document.create_element("span"),
+            document.create_text_node("inline text"),
+        ] {
+            container.append_child(&mut document, child);
+        }
+        document.body().append_child(&mut document, container);
+
+        fn fuchsia_host(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.background == w3cos_std::Color::rgb(255, 0, 255) {
+                return Some(component);
+            }
+            component.children.iter().find_map(fuchsia_host)
+        }
+        let tree = document.to_component_tree();
+        let host = fuchsia_host(&tree).expect("the fuchsia container must survive lowering");
+        assert_eq!(
+            host.style.display,
+            Display::Block,
+            "a block holding one passive text run must keep its own line breaking"
+        );
+        assert!(
+            matches!(host.children.as_slice(), [only]
+                if matches!(only.kind, w3cos_std::ComponentKind::Text { .. })),
+            "the passive inline run must collapse into one text child, got {} children",
+            host.children.len()
+        );
+    }
+
+    /// The counter-case: an inline box that paints for itself cannot be folded into
+    /// the host's text run, so the inline formatting context still needs the flex row
+    /// and its per-box items. Guarding the block path on "collapses to one text run"
+    /// must not take the flex row away from this shape.
+    #[test]
+    fn a_decorated_inline_run_keeps_the_flex_row() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container
+            .style_mut(&mut document)
+            .set_property("background-color", "fuchsia");
+        let decorated = document.create_element("span");
+        decorated
+            .style_mut(&mut document)
+            .set_property("background-color", "red");
+        let painted = document.create_text_node("painted");
+        decorated.append_child(&mut document, painted);
+        container.append_child(&mut document, decorated);
+        let text = document.create_text_node("inline text");
+        container.append_child(&mut document, text);
+        document.body().append_child(&mut document, container);
+
+        fn fuchsia_host(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.background == w3cos_std::Color::rgb(255, 0, 255) {
+                return Some(component);
+            }
+            component.children.iter().find_map(fuchsia_host)
+        }
+        let tree = document.to_component_tree();
+        let host = fuchsia_host(&tree).expect("the fuchsia container must survive lowering");
+        assert_eq!(
+            host.style.display,
+            Display::Flex,
+            "a self-painting inline box still needs its own flex item"
+        );
+        assert_eq!(
+            host.children.len(),
+            2,
+            "the painted box and the host text must stay separate items"
         );
     }
 

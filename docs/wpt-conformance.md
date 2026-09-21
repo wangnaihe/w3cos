@@ -7419,6 +7419,127 @@ directed run over `stacking-context` + `block-in-inline` + `box-display` + `casc
 workers) is **1 fixed, 0 regressed, 0 pixel-count changes** across the 23 that still fail. The
 fail-closed gate `tests/wpt/w3cos-baseline.json` moves 8/10 to **9/10**.
 
+### A block that paints a background still breaks its passive inline run (2026-09-21)
+
+`css/CSS2/box-display/delete-block-in-inlines-{beginning,middle,end}-001.xht` fail by the same
+**54,880** pixels each. Every case removes a block child from a `div.container` at load time and
+then compares that container against an identical container whose text was authored flat:
+
+```html
+<div class="container">
+  <div id="target-node-to-delete">Block to remove</div>
+<span>Several</span> <span>inline elements</span> are <span>in this</span> sentence.</div>
+
+<div class="container">Several inline elements are in this sentence.</div>
+```
+
+**The signature.** 100 differing rows, `20x52 + 60x744 + 20x460`. The first container is one line
+short, its run overflows the viewport - the black pixels at x=748..799 are `sentence.` clipped by
+the 800 px viewport - and the second container moves up by 20 px because the first never grew.
+Both containers share one class, so the only difference between them is *how many children the
+DOM has when the lowering runs*.
+
+**The mechanism.** A `display: block` container whose children are all inline-level and cannot be
+folded into the principal text leaf sets `anonymous_inline_formatting_context = true`
+(`document.rs:4669`), and that flag lowers the block to a **flex row** whose items are the inline
+boxes (`document.rs:4937`). The row breaks lines *between* its items. Later, in a **post-order**
+pass, `coalesce_passive_inline_text_children` (`document.rs:9640`) concatenates adjacent passive
+text children into one component - `previous_content.push_str(content)`. That pass runs from
+`reorder_explicit_bidi_inline_rows`, called *after* `node_to_component` has already decided the
+row, so the row ends up holding a single item.
+
+A lone flex item cannot break. The row's own remedy for that shape is the
+`--w3cos-internal-text-line-width` branch (`document.rs:5015`), which hands a single text run
+`width: 100%` + `min-width: 0` + the marker so the leaf wraps inside the block - but that branch
+requires `children.len() == 1`, and at that point the children are still six. The merged run
+therefore keeps its unconstrained max-content width (900 px against a 744 px container) and
+overflows.
+
+**Why the container's background is the trigger.** `coalesced_inline_text_run`'s
+`same_text_style` compares each candidate child against the **host** style, `background`
+included. A passive `<span>` is transparent while `div.container` paints fuchsia, so the fold
+fails, the flag is set and the row is built - and then the post-order pass folds the same children
+anyway, because *it* compares siblings against each other. The two predicates disagree about
+whose background matters, and that disagreement is what turns a harmless row into an unbreakable
+one.
+
+**The probe matrix** (one variable per document, each matched against its plain-text twin):
+
+| probe | children | container | height | run width | wraps |
+|---|---|---|---|---|---|
+| three spans + text | 6 | Flex | 20 | 900 | no |
+| one `<span>` + text | 2 | Flex | 20 | 900 | no |
+| a single text node | 1 | Block | 40 | 744 | yes |
+| a single `<span>` | 1 | Block | 40 | 744 | yes |
+| the same spans with `color: red` | 6 | Flex | **40** | 744 | **yes** |
+| the same spans, container background removed | 6 | Block | 40 | 744 | yes |
+
+The two middle rows matter most: identical spans and identical text, with the *only* change being
+whether `color` gives the fold something to disagree about. That isolates the defect to the fold
+rather than to the row.
+
+**The fix.** Keep the block a block when its own line box already supplies everything the row
+would have:
+
+```rust
+&& !(style.display == Display::Block
+    && anonymous_inline_formatting_context
+    && block_line_box_covers_the_inline_row(&style)
+    && passive_inline_children_collapse_to_one_text_run(&children, &style))
+```
+
+`passive_inline_children_collapse_to_one_text_run` runs the coalescing pass on a **throwaway row**
+and reports whether it leaves one text child. Probing the pass rather than re-deriving its
+predicate keeps a single authority for what "passive text" means. It requires
+`children.len() >= 2`: a single child already goes through the retained-fragment and lone-run
+width branches, so only a *fold* can defeat the row. `block_line_box_covers_the_inline_row`
+exempts `text-indent`, non-`start` `text-align`, RTL / `unicode-bidi` and
+`--w3cos-internal-text-align-last` - the properties the row is load-bearing for.
+
+**Scope, and the guard that was too wide.** The first version of the guard dropped only
+`style.display == Block && anonymous_inline_formatting_context && collapses-to-one-text-run`. It
+fixed six cases and **regressed thirteen**: seven `text-indent-*`, four
+`text-align-white-space-*`, `block-in-inline-align-justify-001` and
+`inline-non-replaced-width-001`. The unit tests flagged the same thing one property at a time -
+`indented_unbroken_inline_text_moves_its_background_box` failed with `left: Px(0.0)` against
+`right: Px(160.0)`, the indent having moved into the flex branch. Both signals are recorded here
+because the exemption list above is the constraint they encode.
+
+Fixed width is deliberately **not** exempted: `white-space-004`, `white-space-processing-013` and
+`-052` (`white-space: pre-wrap; width: 5em`) render correctly as blocks, and `width: 150px` /
+`width: 4em` span-split twins are pixel-identical to plain text.
+
+**Evidence.**
+
+- `cargo test -p w3cos-dom --lib` moves 481 passed / 12 failed to **483 passed / 12 failed**, the
+  same twelve names failing, both new tests green:
+  `a_backgrounded_block_keeps_its_own_line_breaking` (the block keeps its own line breaking) and
+  `a_decorated_inline_run_keeps_the_flex_row` (the counter-case: a self-painting span still needs
+  its own item, asserted as `display == Flex` with two children).
+- Five comparison probes, each a span-split case against its **plain-text twin**, all with
+  `fuzzy: {max_difference: 0, total_pixels: 0}`: auto width, `width: 150px`, `width: 4em` and
+  spans sharing the container background all pass at **0 differing pixels**, while the calibration
+  pair (`span { color: red }` against black plain text) fails by 10,800 px - so the suite
+  demonstrably can see a difference.
+- A directed run over `box-display` + `normal-flow` + `floats` + `floats-clear` + `text` +
+  `stacking-context` (**1,682 cases**, 4 x 500, 8 workers, 12m44s): **3 fixed, 0 regressed, 0
+  pixel-count changes**, with 1,489 pass-pass unchanged.
+- `tests/wpt/w3cos-smoke.json` **2/2, exit 0** (the fail-closed gate);
+  `tests/wpt/w3cos-baseline.json` holds at **9/10**.
+- Full 6,548-case regression (14 x 500, 8 workers, 48m28s): **13 cases now pass**
+  (`6159 passed / 389 failed`). Of those 13, the 3 `delete-block-in-inlines-*` are the intended
+  fix. The remaining 10 are `css/CSS2/css1/c534-bgrep*` / `c536-bgpos*` background-image cases
+  that also pass in an isolated 10-case rerun — they are flaky background-image renders
+  (pixel-diffs 675 to 53,235 in the baseline, 0 in isolation) and are not attributable to this
+  change. **0 regressed, 0 pixel-count changes**.
+
+**Still open.** Three cases render correctly as blocks but the narrow guard does not reach them,
+because they pair a single text child with a fixed width - the same shape as
+`inline-non-replaced-width-001`, which genuinely needs the row: `white-space-004` (2,400 px),
+`white-space-processing-013` (1,024 px) and `white-space-processing-052` (1,024 px). Separating
+them from `inline-non-replaced-width-001` is a further question, not a scope extension of this
+fix.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
