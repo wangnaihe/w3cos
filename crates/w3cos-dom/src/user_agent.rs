@@ -209,6 +209,26 @@ mod tests {
         assert_eq!(inherited.font_family, parent.font_family);
     }
 
+    /// The `font` shorthand carries `font-family` too, so `font: inherit` has
+    /// to reach it as well. `fonts-010` is `div { font: 1.25em/1 Ahem }` with
+    /// `pre { font: inherit }`: the size inherited but the face did not, so the
+    /// `pre` kept the UA monospace.
+    #[test]
+    fn pre_accepts_author_inheritance_through_the_font_shorthand() {
+        let mut document = crate::document::Document::new();
+        let div = document.create_element("div");
+        document.body().append_child(&mut document, div);
+        let pre = document.create_element("pre");
+        div.append_child(&mut document, pre);
+        div.style_mut(&mut document).set_property("font", "20px/1 Ahem");
+        pre.style_mut(&mut document).set_property("font", "inherit");
+        let inherited = document.computed_style_for(pre.id);
+        assert_eq!(inherited.font_family.as_deref(), Some("Ahem"));
+        assert_eq!(inherited.font_size, 20.0);
+        // `white-space` is not part of the shorthand, so `pre` keeps it.
+        assert_eq!(inherited.white_space, w3cos_std::style::WhiteSpace::Pre);
+    }
+
     #[test]
     fn negative_indent_pre_line_items_keep_the_preserved_newline() {
         fn has_newline(component: &w3cos_std::Component) -> bool {

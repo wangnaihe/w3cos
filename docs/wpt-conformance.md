@@ -5339,6 +5339,2086 @@ The same production build completed successfully in 2m 32s (`pre-inline-nowrap-p
 
 `sole-block-inline-v3-comparison.json` completed all 1,088 selected executions: 1,072 PASS, 16 FAIL, and no lost PASS. All six required bidi/sole-block paths passed with zero differing pixels. The 16 remaining failures comprise the previous 14 strict reference failures and two previously discovered relative-positioned block-in-inline failures; this is not a new full-suite remaining count. `pre-nowrap-alternate-backends-check.log` completed successfully in 10.85s for Skia/CPU/GPU combined features; this is type-check evidence, not alternate-backend pixel acceptance. Publication requires the subsequent clean-SHA replay and normal remote push verification.
 
+### Complete 6,548-case baseline at ef3fd2e (2026-09-19)
+
+The complete discovered suite was re-run against `origin/main` at `ef3fd2e`
+from a clean checkout. Discovery was regenerated with the recorded roots and
+reproduced the recorded inventory exactly: `W3COS_WPT_DISCOVERY runnable=6548
+limited=112 other=5083`, with the same 6,548 `(path, kind)` entries in the same
+order as `target/wpt-all/discovered-suite.json` (370 testharness, 6,178
+reftests).
+
+The run used 14 resumable ranges of 500 cases, 8 isolated workers,
+failure-only PNG artifacts and the prescribed CSS2 user-origin profile:
+
+```bash
+./target/wpt/w3cos-wpt --wpt-root ../wpt \
+  --suite target/wpt-all-20260919/discovered-suite.json \
+  --artifacts target/wpt-all-20260919/range-<start> \
+  --user-stylesheet tests/wpt/profiles/css2-userstyle.css \
+  --jobs 8 --failure-artifacts-only --case-start <start> --case-limit 500 \
+  --report-only
+```
+
+Range reports were merged with repeatable `--merge-report` into
+`target/wpt-all-20260919/results.json`; the merge fails closed on count, order,
+revision and viewport mismatch. Run window 2026-09-19 09:16:56 → 10:01:29
+(`/tmp/w3cos-baseline-run-20260919.log`); the runner built in 2m26s at the same
+revision.
+
+Recorded result: **6,007 passed / 541 failed / 0 worker errors** of 6,548.
+Reftests 5,642 pass / 536 fail; testharness 365 pass / 5 fail. No case ended
+as a worker error, versus 440 in the initial complete run.
+
+Comparison with the initial complete `target/wpt-all/results.json`:
+
+| transition | cases |
+| --- | --- |
+| fail → pass | 3,306 |
+| error → pass | 433 |
+| pass → pass | 2,268 |
+| fail → fail | 434 |
+| **pass → fail** | **100** |
+| error → fail | 7 |
+
+The 100 `pass → fail` transitions are the first investigation target and are
+not yet classified as true regressions. They cluster in `floats-clear` (23),
+`fonts` (14), `margin-padding-clear` (14), `visudet` (11) and `floats` (9).
+An earlier renderer emitting identical output on both reftest sides would
+produce the same signature without a regression; that has not been verified
+per case.
+
+Remaining failures by directory: `linebox` 88, `floats-clear` 80, `css1` 64,
+`normal-flow` 46, `floats` 39, `text` 38, `fonts` 37, `generated-content` 24,
+`visudet` 23, `margin-padding-clear` 17, `box-display` 16, `ui` 10.
+
+Failing-reftest pixel buckets: ≤10 px 25, 11–50 px 5, 51–200 px 23,
+201–1,000 px 154, 1,001–10,000 px 189, >10,000 px 140. Fifteen of the ≤10 px
+cases differ by exactly one pixel with a maximum channel difference of 3–5.
+
+Three failing reftests have zero differing pixels and zero maximum difference:
+`visudet/content-height-005.html`, `visudet/line-height-203.html` and
+`visudet/line-height-206.html`. All three use the `mismatch` relation, so the
+renderer produces identical actual and reference output where the test
+requires a difference. The other nine `mismatch` reftests pass.
+
+The five failing testharness cases are
+`linebox/vertical-align-top-bottom-001.html` (20/20 subtests),
+`linebox/inline-negative-margin-001.html` (4/13),
+`floats/hit-test-floats-005.html`, `floats/zero-space-between-floats-003.html`
+and `floats/zero-space-between-floats-004.html`. The first reports
+`expected (string) "0" but got (number) 0`, which points at value
+serialization rather than layout geometry.
+
+`css/CSS2/cascade/html-precedence-004.xht` (case 1132) now has zero differing
+pixels under the prescribed profile, down from 19,028 in the initial run,
+which did not use it.
+
+This is a complete-suite result at one revision and one 800x600 viewport. It
+does not close the 100 transitions, the 541 remaining failures, or the 112
+cases still classified at the runner boundary.
+
+### Transition qualification and the table-cell content-box height fix (2026-09-19)
+
+The 100 `pass -> fail` transitions are not all renderer defects. Each was
+re-rendered through headless Chrome at the same 800x600 viewport, comparing the
+case's own test document against its own reference:
+
+```
+chrome --headless --disable-gpu --no-sandbox --hide-scrollbars \
+  --force-device-scale-factor=1 --window-size=800,600 \
+  --virtual-time-budget=3000 --screenshot=<out> file://<document>
+```
+
+- 80 cases: Chrome's test-vs-reference difference is 0, so the reference is
+  self-consistent and the W3COS difference is a real defect.
+- 20 cases: Chrome's own test-vs-reference difference is non-zero, so the
+  reference is unsatisfiable and the case cannot be counted against W3COS.
+  `margin-bottom-applies-to-012..015` each differ by 25,520 px under Chrome
+  *and* under W3COS - the same number - which is the signature of a broken
+  reference, not of a renderer offset.
+
+Real defects by directory: floats-clear 23, fonts 13, margin-padding-clear 10,
+floats 9, visudet 7, normal-flow 5, cascade-import 3, linebox 3, and one each in
+box-display, css21-errata, csswg-issues, generated-content, lists,
+stacking-context and values.
+
+**Root cause of the `margin-bottom-applies-to-001..007` cluster.** All seven
+author an identical cell - `display: table-cell; height: 200px; width: 200px;
+border-bottom: 10px solid orange` - inside a `table-layout: fixed` table, and
+all seven differ by exactly 17,680 px. Probing the same markup against explicit
+190/200/207/210/217 px references isolates the behaviour:
+
+| probe | W3COS before | Chrome |
+|---|---|---|
+| `table-layout: fixed` cell `height: 200px` + `border-bottom: 10px` | 200 | 210 |
+| same, with `box-sizing: content-box` authored | 200 | 210 |
+| same, with `box-sizing: border-box` authored | 200 | 200 |
+| `table-layout: auto` cell, same declarations | 210 | 210 |
+| plain block, same declarations | 210 | 210 |
+
+Chrome treats a table-cell's `height` as a content-box height; only the cell's
+inline size acts as a border-box track in the fixed table algorithm. W3COS
+forced `box_sizing = BorderBox` on the cell for the width machinery, which
+silently reinterpreted the authored height and dropped the cell's own padding
+and border from the used height - 10 px short, exactly the authored
+`border-bottom`. The same forced value also overrode an explicitly authored
+`box-sizing: content-box`.
+
+`crates/w3cos-runtime/src/layout.rs` already encodes the correct invariant for
+the collapsed-track minimum ("Fixed table tracks switch Taffy cells to
+border-box sizing. Convert the authored minimum only when the actual Taffy
+sizing differs"). The fix applies the same conversion to the cell's used
+height: when the cell authored `ContentBox` but Taffy is `BorderBox`, add the
+vertical padding and border edges that Taffy will subtract, read from the Taffy
+style itself so collapsed-cell half-borders are included.
+
+Verification at `ef3fd2e` plus this change:
+
+- the four probes above match Chrome exactly (210 / 210 / 200 / 210);
+- `margin-bottom-applies-to-001..007` go from 17,680 differing pixels to 0;
+- neighbours `margin-bottom-applies-to-008` and `-009` are unchanged.
+
+A full 6,548-case re-run was then taken with the same 14x500 chunking, 8 workers and the
+same user stylesheet, and compared per path against the pre-fix baseline:
+
+| run | pass | fail | error |
+|---|---|---|---|
+| before the change (`ef3fd2e`) | 6,007 | 541 | 0 |
+| after the change | **6,014** | **534** | 0 |
+
+Transitions: `pass -> pass` 6,007, `fail -> fail` 534, `fail -> pass` 7, **`pass -> fail` 0**.
+The seven recovered cases are exactly `margin-bottom-applies-to-001..007`, so the change is a
+net +7 with no regression anywhere in the suite. Evidence lives in
+`target/wpt-afterfix-20260919/` (per-chunk `results.json` plus `comparison.json`).
+
+The change touches only a `display: table-cell` whose authored `box-sizing` is the initial
+`content-box` and whose Taffy sizing was forced to `border-box`, so its blast radius is the
+fixed-table-layout height path alone; the 6,007 unchanged passes confirm nothing else moved.
+
+Two things this does **not** close: the 534 remaining failures, and the 20 transitions that
+Chrome proves unsatisfiable. The latter should be re-marked expected-fail in the baseline
+before the next revision's numbers are compared, otherwise they will keep reading as
+W3COS regressions. `margin-bottom-applies-to-013..015` are among them: their orange band is
+the *table's own* `border-bottom`, and Chrome's test-vs-reference difference is 25,520 px -
+identical to W3COS's - so no conforming engine passes them as written.
+
+### Negative half-leading in inline text paint (2026-09-19)
+
+After the table-cell fix the largest homogeneous cluster left in `css/CSS2/linebox` was 30
+`line-height-NNN` cases, each differing by exactly 400 px - one 20x20 Ahem glyph displaced by
+one glyph. `line-height-002` measures it directly: the reference puts both blocks at
+`y = 41..60`, W3COS put the absolutely positioned `#div3` there but painted the Ahem `#div2`
+at `y = 51..70`, ten pixels low. The family is one template - `font: 20px/1 Ahem` with
+`line-height: 0` spelled in different units and signs (`0px`, `-0px`, `+0px`, `0pt`, `0em`,
+`0%`, ...) - so a single mechanism had to explain all 30.
+
+An Ahem probe scanned `line-height` at 0 / 10 / 20 / 24 / 40 px. CSS 2.1 10.8.1 predicts the
+glyph top at `(line_height - font_size) / 2`, i.e. `-10 / -5 / 0 / 2 / 10`; W3COS produced
+`0 / 0 / 0 / 2 / 10`. Positive half-leading was right and negative half-leading was clamped to
+zero. Layout was innocent - `rect.y` already carried the correct negative value - so the
+clamp had to be in the painter:
+
+- `render_skia.rs::text_vertical_offset` centres a text run inside its paint box when the box
+  is taller than the text. For an in-flow inline run the paint box *is* the em box
+  (`text_paint_box` returns `font_size`), so the centring term evaluated to
+  `(font_size - line_height) / 2` and added back exactly the half-leading that a short
+  `line-height` overflows by. Five measured values all fit that model:
+  `(L - 20) / 2 + (20 - L) / 2 = 0`.
+- The fix excludes in-flow inline runs (`display: inline`, `position: static`, not floated)
+  from that centring. Blockified inline runs - absolute, fixed, floated - keep their own line
+  box and still centre, which is what the new unit test
+  `inline_text_keeps_its_line_box_instead_of_centring_in_its_em_box` pins down.
+
+Probe after the change: `L = 0` ink `0..9` (clipped from `-10`), `L = 10` ink `0..14` with the
+marker block at `15` - exactly the predicted `-5` - and `L = 20 / 24 / 40` unchanged at
+`0..19 / 2..21 / 10..29`.
+
+Full 6,548-case regression, 14 x 500 chunks, 8 workers, 33m:
+
+| run | pass | fail | error |
+|---|---|---|---|
+| before the change | 6,014 | 534 | 0 |
+| after the change | **6,046** | **502** | 0 |
+
+Transitions: `pass -> pass` 6,014, `fail -> fail` 502, `fail -> pass` **32**, `pass -> fail`
+**0**. The 32 recovered cases are exactly the 30 `line-height-NNN` at 400 px plus
+`line-height-bleed-001` (15,563 px) and `line-height-bleed-002` (10,000 px) - the two whose
+names describe this very mechanism. Evidence lives in `target/wpt-afterfix2-20260919/`
+(per-chunk `results.json` plus `comparison-vs-afterfix.json`).
+
+### Positive `vertical-align` length raises the line box (2026-09-19)
+
+`vertical-align-NNN` failed in 18 cases, each differing by exactly 400 px - one 20x20 Ahem
+glyph again. `vertical-align-007` shows the shape: `#span1 { vertical-align: 96px }` was
+lifted correctly and the absolutely positioned `#div3`/`#div4` reference blocks sat correctly,
+but the *passive sibling* text on the same line (`<span id="span1">X</span>X`) stayed pinned
+to the line box top, leaving 400 px of red exposed where the second `X` belongs.
+
+Chrome (over HTTP, see the oracle note below) renders that case's test and reference
+identically, so this is a W3COS defect, not a broken reference. The mechanism is CSS 2.1
+10.8.1: a positive `vertical-align` length lifts an inline box above the baseline, the line
+box ascent grows with it, and the baseline - and therefore every *other* inline fragment on
+that line - moves down by that offset. Four unit systems agree on the same formula, the
+passive sibling shifting by exactly the offset: `007` (`96px`), `079` (`6em` = 120px), `091`
+(`6ex` = 96px) and `103` (`100%` = 20px). (`091`'s own reference `vertical-align-007-ref.xht`
+is separately broken - it renders as a table layout - so only its test document is usable as
+evidence.)
+
+The blast radius was measured before editing: of the 90 `vertical-align*` cases carrying a
+length, 60 already pass and **all 60 are zero-valued** (`0px`, `-0pt`, `+0%`, ...). The only
+non-zero lengths are the 18 failures, so the change could not disturb a passing case.
+
+- `w3cos-dom/src/document.rs` gains `annotate_inline_line_extra_ascent`, which records
+  `line box ascent - this fragment's ascent` on the passive fragments as
+  `--w3cos-internal-line-extra-ascent`. It skips any line holding a replaced box
+  (`Image`/`Canvas`/`SvgDocument`): a replaced box establishes the baseline from its own
+  height and the runtime's existing shared-baseline pass already owns those lines. Skipping
+  them was necessary - an earlier revision that moved replaced boxes took `c544-valgn-001`
+  from 2,370 px to 2,775 px before returning it to exactly 2,370 px.
+- `w3cos-runtime/src/layout.rs` gains the `apply_inline_line_extra_ascent` post-pass, which
+  applies that offset only to fragments that share the lifted fragment's line box.
+
+The style tree records the **magnitude** (it is the only place with the font metrics and the
+lift); layout decides the **scope**. That split is not cosmetic - see the regression below.
+
+A 210-case targeted run (every `vertical-align` case, the whole `css/CSS2/linebox`
+directory as control, `text-decoration-va-length`, `c544-valgn`) went **153 -> 169 pass**,
+`fail -> pass` 16 - exactly `vertical-align-{007,008,019,020,031,032,043,044,055,056,067,068,079,080,091,092}`,
+each 400 px to 0 - with **`pass -> fail` 0** and the other 194 cases bit-identical.
+`vertical-align-103`/`-104` still fail: their red square now moves correctly, but
+`div4 { top: 100% }` does not resolve against the containing block height, which is a
+percentage-offset issue and a separate follow-up.
+
+#### The first full run regressed `first-line-pseudo-012`, and the fix was scope, not magnitude
+
+The full 6,548-case run after the first revision of this fix gave **6,061 / 487**: the 16
+cases above recovered, but `css/CSS2/selectors/first-line-pseudo-012.xht` went `pass -> fail`
+at 8,000 px, so the net was +15 rather than +16.
+
+The pixel profile was misleading. Both renderings agreed exactly from the top of the box down
+to `y=177` - border, the 0.8em aqua, the 0.2em fuchsia, the 0.8em yellow - and the box itself
+was still exactly 140 px tall. Only the aqua block belonging to the **second line** was drawn
+40 px too low, overflowing the box bottom. So the *geometry* was right and a block of paint
+had moved: it reads like missing paint, not like a layout shift.
+
+The cause is the phase boundary. `annotate_inline_line_extra_ascent` runs on the **style
+tree**, which sees a parent's entire child list and nothing about line breaking. The document
+lifts only its first line (`:first-line { vertical-align: 0.8em }`), but the annotation was
+written onto the second line's `<span class="b">` as well, and layout applied it there - one
+whole line box too far down.
+
+The fix keeps the style tree as the **magnitude** carrier (it is the only place with the font
+metrics and the lift) and moves **scope** into layout, where the rects are known:
+`apply_inline_line_extra_ascent` shifts a fragment only when it still overlaps a lifted
+fragment's rect, testing both edges so a fragment that wrapped to a later line and one that
+stayed on an earlier line are both left alone.
+
+- Targeted re-run (587 cases: every `vertical-align`, the whole `linebox` directory, all 26
+  `first-line` cases, CSS2 `inline`): **483 -> 484**, `fail -> pass` 1, **`pass -> fail` 0**.
+  103 still-failing cases kept **identical** pixel counts; 0 got worse. All 26 `:first-line`
+  cases are back to their baseline status.
+- Full re-run: **6,046 / 502 -> 6,062 / 486**, `fail -> pass` **16**, **`pass -> fail` 0**.
+  Evidence: `target/wpt-va-linescope-20260919/{results.json,comparison-vs-afterfix2.json}`.
+- The 485 cases failing in both full runs kept identical pixel counts. Exactly two differed:
+  `first-line-pseudo-012` (8,000 -> 0, now passing) and one flaky case, below.
+
+#### A flaky case, not a regression: `abspos-replaced-width-margin-000`
+
+`css/CSS2/csswg-issues/submitted/css2.1/abspos-replaced-width-margin-000.xht` read 22,272 px
+in three runs and 217,252 px in the final one, which looks like a tenfold regression. It is
+not one:
+
+- The document contains **no `vertical-align` at all**, so `annotate_inline_line_extra_ascent`
+  never fires on it and `apply_inline_line_extra_ascent` returns at its first guard. The
+  change is a provable no-op for this document.
+- Re-running the single case with `--jobs 1` gives **22,272 in 6 runs and 119,720 in 2** - a
+  ~25 % flake, and 119,720 is exactly the value the earlier `wpt-afterfix-20260919` run
+  recorded. The case holds **512 `<img>` elements**, so an image load/decode race against the
+  capture is the obvious mechanism.
+
+Two consequences for the comparison method: a pixel-count change in an **already-failing**
+case is not evidence of a regression until the case is shown to be deterministic, and a
+single run cannot distinguish a flake from a real change. Repeat the individual case with
+`--jobs 1` before attributing it.
+
+### Re-qualifying "unsatisfiable" verdicts over HTTP (2026-09-19)
+
+The first Chrome qualification pass used `file://`, which silently invalidates every Ahem
+comparison: WPT links the font with the absolute path `/fonts/ahem.css`, that resolves
+against the filesystem root under `file://`, and Chrome falls back to a system font. Every
+one of the 20 "the reference cannot be satisfied" verdicts was therefore re-run against a
+local HTTP server.
+
+**19 held; 1 was overturned.** `css/CSS2/linebox/vertical-align-negative-leading-001.html`
+read 107,769 px under `file://` and **0** over HTTP - a real W3COS defect (85,620 px) that
+had been mis-filed as a broken reference. The unsatisfiable set is therefore **81 real
+defects / 19 unsatisfiable references**, not 80/20.
+
+The verdicts were re-derived over HTTP and are now pinned to full paths, so the next revision
+comparison can exclude them by path instead of re-reading them as W3COS regressions. The
+machine-readable record is `target/wpt-unsatisfiable-requalification/requalification.json`;
+the Chrome diffs below reproduce the numbers this document already carried.
+
+| Chrome diff | case |
+|---|---|
+| 25,520 | `css/CSS2/margin-padding-clear/margin-bottom-applies-to-{012,013,014,015}.xht` |
+| 1,800 | `css/CSS2/generated-content/content-counter-004.xht` |
+| 1,349 | `css/CSS2/syntax/declarations-009.xht` |
+| 1,138 | `css/CSS2/fonts/font-matching-rule-009.xht` |
+| 1,000 | `css/CSS2/css21-errata/s-11-1-1b-002.html` |
+| 800 | `css/CSS2/css21-errata/s-11-1-1b-{003,004}.html` |
+| 640 | `css/CSS2/visufx/overflow-applies-to-001.xht` |
+| 538 | `css/CSS2/visudet/inline-block-baseline-{003,004,005,006}.xht` |
+| 200 | `css/CSS2/css21-errata/s-11-1-1b-{001,008,009}.html` |
+| 198 | `css/CSS2/cascade/inherit-computed-001.html` |
+
+Two things to carry forward:
+
+- The shorthand `overflow-applies-to-001` was **ambiguous** - `css/CSS2/ui/` and
+  `css/CSS2/visufx/` both hold a file with that name. The 640 px belongs to **`visufx/`**.
+  (`ui/overflow-applies-to-001.xht` is *also* unsatisfiable at 142 px, so the original
+  20-case classification was not exhaustive; do not read the 19 as a closed set.)
+- The suite manifest has **no expected-fail field** (`TestCase` is `deny_unknown_fields`), so
+  these verdicts cannot be recorded in the suite itself. Either add a field to the runner or
+  keep the exclusion list beside the run artefacts, as `requalification.json` does now.
+
+### One-pixel glyph sliver on ascender glyphs (2026-09-19) - characterised, not fixed
+
+23 failing cases differ by at most 4 px with `max_difference <= 8`, and 20 of them differ by
+**exactly one pixel** with a delta of 3-5/255: all 14 `*-applies-to-012` and all 6
+`*-applies-to-006`. These are not layout bugs and they predate every fix in this file - they
+carry the same 1 px / delta 3-5 signature in `target/wpt-all-20260919/`, `wpt-afterfix-*` and
+`wpt-afterfix2-*`.
+
+A throwaway probe repository isolated the trigger. Minimal repro: a 96 px black box
+containing one 96 px block child holding the letter `b`, compared against a plain 96 px black
+box. W3COS paints one extra pixel at `(box_left - 1, child_top + 0.2 * font_size)` - the
+first column left of the box, on the glyph's topmost ink row - with a coverage of roughly
+`0.007em` squared (`252` at 16 px, `236` at 40 px, `254` at 8 px).
+
+What the probe rules in and out:
+
+| variant | result |
+|---|---|
+| plain block, no text | pass |
+| inline-block, no text | pass |
+| `inline-block` with two block children | **fail** |
+| plain block with two block children | **fail** - inline-block is irrelevant |
+| two *empty* block children | pass |
+| one block child with text | pass |
+| text in the first child only | pass |
+| text in a non-first child | **fail** |
+| same letter (`a`/`a`) in both children | pass |
+| `a` then `b` | **fail** |
+| one child holding `b` | **fail** at `(7, 11)` |
+| two children each holding `b` | **fail** - one sliver per child |
+| second child's `color: transparent` | pass |
+| no background anywhere, text on a blue page | **fail** - the sliver is glyph ink, not background |
+| `text-indent: 5px` on the second child | pass |
+
+So it is **glyph-dependent, not structure-dependent**: `b` produces it, `a` does not, and the
+child's position only decides *where* it lands. Rendering the same probe document in Chrome
+shows no sliver, and Chrome's own render of `width-applies-to-012.xht` is clean at the exact
+pixel W3COS differs on, so this is a genuine engine defect. At 100 px the sliver disappears
+entirely, which makes it a small-size rasterisation effect. `draw_glyphs_at` is Skia's plain
+`drawGlyphs`, W3COS sets no hinting or sub-pixel flags anywhere, and the glyph's measured
+stem edge lands on the integer `9.0` in W3COS where Chrome puts it at `8.914` - so the
+remaining suspects are the `Font` hinting/sub-pixel defaults and the interaction with
+`text_paint_box`. Probe documents and the exact measurement commands are in
+`/tmp/probe-inlinebg` (not part of the repository).
+
+#### The 20 single-pixel cases split into two mirrored sub-families
+
+The baseline run keeps the failure artefacts, so the stray pixel can be located exactly
+instead of re-derived. Every one of the 20 cases differs in **exactly one pixel**, and the
+position splits by test suffix:
+
+| sub-family | stray pixel | value | meaning |
+|---|---|---|---|
+| `*-applies-to-012` (and `replaced-intrinsic-001`) | one column **left** of the black box, `x = box_left - 1` | `252` vs `255` | dark ink bleeds left, ~1 % coverage |
+| `*-applies-to-006` | the box's **rightmost** column, `x = box_right - 1` | `5` vs `0` | *light* ink bleeds left, ~2 % coverage |
+
+Worked example, `normal-flow/min-width-applies-to-012.xht`: the inline-block's black
+background occupies `x 8..103`, `y 51..146`, and the single differing pixel is `(7, 102)`
+with `actual=252`, `expected=255`. The reference is `reference/ref-filled-black-96px-square.xht`,
+i.e. an `<img src="../support/black96x96.png">` - the reference box carries **no text at all**,
+so the stray pixel can only come from the test document's own glyphs.
+
+Two measurements pin the mechanism:
+
+- **The stray pixel is on a single row.** At `x = 7` only `y = 102` is non-white; the other
+  95 rows of the box are exactly `255`. A box whose left edge sat at `7.988` would tint every
+  row, so this is **not** background-box rounding - it is glyph ink.
+- **The row is the glyph's first ink row.** The box's two block children are `48 px` each, so
+  the second child starts at `y = 99` and `102 - 99 = 3`, matching the `0.2 * font_size`
+  offset already recorded above at 16 px. `box_left - 1` is where a glyph drawn *at* the box's
+  content edge deposits its antialiasing fringe if the fringe overshoots the origin by about
+  `0.012 px`.
+
+`*-applies-to-006` is the mirror image and confirms the reading. Those documents are
+`#test { display: table-column; background: black; width: 1in }` inside a `table-layout: fixed`
+table, with `div.cell + div.cell { color: white }` - so the **second** cell's text is white.
+Its stray pixel is `(103, 54)`, `actual = 5`, `expected = 0`: the black column's last column is
+98 % covered instead of 100 % because the neighbouring cell's *white* glyph fringe reaches
+`103.98` from an origin at `104.0`. Same single row (`box_top + 3`), same sub-`0.05 px`
+overshoot, opposite polarity.
+
+So both sub-families are one defect: **a glyph's antialiasing fringe overshoots its advance
+origin by roughly 0.02 px, and where a glyph starts exactly on a box edge that overshoot
+lands one column outside the box.** It is invisible when the ink and the background match
+(black on black) and only the fringe column shows. That is also why the 012 probe's
+`text-indent: 5px` variant passes: shifting the origin by a whole 5 px moves the fringe off
+the box edge. The `Ahem` paint path already rounds its origin (`cursor_x.round()`), which is
+why no Ahem-based case shows the artefact.
+
+A candidate fix therefore does not need to touch hinting at all: snap the glyph-run origin to
+the device grid in the non-Ahem path (or clip the run to its box), then replay these 20 cases
+plus the `css/CSS2/fonts` and `css/CSS2/text` directories as the regression control.
+
+### Background tile cap truncates coverage (2026-09-19) - characterised, not fixed
+
+`background_image.rs` caps a layer at `MAX_BACKGROUND_TILES_PER_LAYER = 4096` and stops the
+enumeration mid-row when the product of the two axis starts exceeds it. `c533-bgimage-000`
+reproduces it exactly: a `1x1-lime.png` tiled over a 784x19 paragraph needs 14,896 tiles, and
+the render paints 5 full rows plus 176 px of the sixth - `5 * 784 + 176 = 4096` - leaving the
+rest of the paragraph unpainted. The fix is not simply a larger constant: a 1x1 tile over an
+800x600 box needs 480,000 tiles, and `axis_tiles` caps each axis at 4096 independently as
+well. An exact fix needs either a repeating image shader (no `ImageShader` path exists in
+any of the three painters today) or a pre-tiled source bitmap. Only `c533-bgimage-000` is
+affected in the current suite; `line-height-201.html`, the other 1x1-image failure, uses
+`background-size: 50px 100px` and so needs a single tile.
+
+### Empty split fragments must not reserve a line box (2026-09-19)
+
+`css/CSS2/normal-flow/block-in-inline-insert-*` failed in **24 paths** (8 documents, each
+contributing up to three paths: the case, its `-ref` and its `-nosplit-ref`). It was the
+largest single family in `normal-flow`. Each test inserts a node into a `<span>` that
+block-level children have already split, and matches both a `-ref` and a `-nosplit-ref`.
+
+The failure looked structural - CSS 2.1 9.2.1.1 splitting and re-splitting - and the pixel
+profile said it was not. `block-in-inline-insert-001` renders **1,404 blue pixels in both**
+W3COS renderings: identical border ink, identical glyphs. The two renderings differ only in
+the **gap between two adjacent `<div>`s** (+19 px in one, +18 px in the other). Anonymous-block
+splitting, border slicing and text painting were already correct; one **extra line box** had
+been reserved.
+
+#### The wrong hypothesis, and the four cases that killed it
+
+First candidate: the split fragments themselves were missing. `insert-001-nosplit-ref` spells
+an empty fragment out explicitly as `<span class="notstart notend"></span>` between two
+adjacent `<div>`s, whereas `remove-006-nosplit-ref` writes nothing between them. If the
+reference depends on that fragment existing, `document.rs` should emit one.
+
+`document.rs` was changed to push an empty fragment whenever two blocks were lowered
+adjacently. It fixed **24 cases** and broke **4**:
+
+| regressed path | after pixels |
+|---|---|
+| `css/CSS2/normal-flow/block-in-inline-remove-006.xht` | 979 |
+| `css/CSS2/normal-flow/block-in-inline-remove-006-ref.xht` | 979 |
+| `css/CSS2/normal-flow/block-in-inline-remove-006-nosplit-ref.xht` | 979 |
+| `css/CSS2/visuren/remove-from-split-inline-6-ref.html` | 979 |
+
+The two references demand *opposite* things, so one of them had to be misread. Rendering the
+three variants in Chrome - no empty span, an empty `<span>`, and the unsplit form - gave
+**pixel-identical** output: all three carry the same ink rows `5-32, 35-47, 56-69, 71-98`
+(`/tmp/chrome-scratch/{without-empty,with-empty,unsplit}.png`). The explicit empty span
+therefore contributes **zero height**. The invariant is the fragment's *height*, not its
+existence. The `document.rs` change was reverted byte-for-byte and the height rule was
+attacked instead.
+
+**A candidate fix that trades one failure family for another is a wrong fix.** The 4-case
+regression cost twelve minutes and refuted the hypothesis long before it could reach a full
+run; `target/wpt-bii-targeted/comparison-vs-linescope.json` keeps that refutation on record.
+
+#### What Chrome actually does
+
+Ten one-variable probes were served from `vendor/wpt/.wptcache/probe/` on the WPT HTTP port
+and rendered headless (the oracle note above applies; a second HTTP server on a fresh port
+answers `curl` but makes Chrome render its own error page). The probe document is a
+`<span>One</span><div>Two</div>` sequence followed by an optional empty inline and then
+`<div>Three</div><span>Four</span>`; the columns are the probe, what the empty inline
+carries, the ink rows of the render, and whether an extra line box appeared.
+
+| probe | empty inline carries | ink rows | extra line? |
+|---|---|---|---|
+| `empty-none` | nothing at all (control) | `5-32 35-47 56-69 71-98` | no |
+| `empty-plain` | `<span></span>` | `5-32 35-47 56-69 71-98` | no |
+| `empty-space` | `<span> </span>` | `5-32 35-47 56-69 71-98` | no |
+| `empty-lh` | `line-height: 40px` | `5-32 35-47 56-69 71-98` | no |
+| `empty-width` | `width: 10px` (invalid on an inline) | `5-32 35-47 56-69 71-98` | no |
+| `empty-vpadding` | `padding: 4px 0` | `5-32 35-47 56-69 71-98` | no |
+| `empty-padding` | `padding: 0 4px` | `5-32 35-47 49-51 74-76 78-91 93-120` | **yes** |
+| `empty-lrborder` | `border-left/right: 5px` | `5-32 35-47 49-76 (x 8..13) 78-91 93-120` | **yes** |
+| `empty-rborder` | `border-right: 5px` | `5-32 35-47 49-76 (x 8..10) 78-91 93-120` | **yes** |
+| `empty-margin` | `margin: 0 4px` | `5-32 35-47 78-91 93-120` | **yes** |
+
+The law is that **only the horizontal extent decides**. A zero-width empty inline collapses
+its line box even when it carries vertical borders, vertical padding, or an explicit
+`line-height: 40px`; a non-zero left/right border, padding or margin keeps the line. That is
+exactly the shape the hand-written references rely on: `notstart notend` sets
+`border-left: none; border-right: none`, so an empty split fragment keeps **only its top and
+bottom borders** and must not reserve a line of its own.
+
+#### The fix: two predicates, one rule
+
+Two predicates in `w3cos-runtime/src/layout.rs` encode "is this line non-empty", and both
+encoded the bug - they counted *any* non-zero decoration, including vertical borders,
+vertical padding and vertical margins.
+
+- `inline_line_has_in_flow_content` (`:515`) now tests the horizontal extent only: left/right
+  padding, left/right margin (including unresolved `%`/`vw`/`vh` values), left/right border
+  width, plus recursion into children. This is the predicate that actually reserves the line:
+  it gates `has_line_content`, which sets `style.min_size.height = line_height`.
+- `empty_inline_establishes_visible_line` (`:7685`) was narrowed to the same rule. It gates the
+  mixed inline/block flex fallback and the inline-formatting-context predicate, so leaving it
+  on the old rule would have kept the two answers inconsistent.
+
+Tightening only the second predicate was **not sufficient** - the empty span still occupied
+19.2 px, because the height strut is set at the first. Two predicates that encode the same
+concept have to move together.
+
+The unit test `empty_inline_line_content_preserves_css_nonempty_conditions` had been asserting
+that `border-top-width: 1px` makes a line non-empty, i.e. it **encoded the bug**; it was
+updated to pin the horizontal rule in both directions. The replacement regression test,
+`empty_split_fragment_with_only_vertical_borders_adds_no_line`, drives a real DOM through
+layout and compares the content bottom with and without the empty fragment. It was checked for
+**discriminability**: with only `:7685` tightened it fails (`with=105.4, without=86.200005`),
+and it passes only once `:515` is fixed too. The first attempt at this test passed with the old
+predicate restored, which is how the non-discriminating version was caught.
+
+#### Verification
+
+- **Full run, all 6,548 cases: 6,062 / 486 -> 6,090 / 458.** `fail -> pass` **28**, `pass -> fail`
+  **0**, and 458 `fail -> fail`. Exactly one still-failing case changed its pixel count, and it is
+  the known flake (below). Evidence:
+  `target/wpt-bii-20260919/{results.json,comparison-vs-linescope.json}`.
+- Targeted run, 1,542 cases (`block-in-inline*`, `visuren`, `normal-flow`, `box-display`,
+  `floats`, `stacking-context`): **1,291 -> 1,319 pass**, `fail -> pass` **28**, **`pass -> fail`
+  0**, and 0 still-failing cases whose pixel count moved. Evidence:
+  `target/wpt-bii-final-targeted/{results.json,comparison-vs-linescope.json}`.
+- The 28 recovered are the 24 `block-in-inline-insert-*` paths plus four cases that had been
+  mis-filed as a different defect: `block-in-inline-empty-001.xht`,
+  `block-in-inline-empty-004.xht`, `css/CSS2/visuren/emptyspan-1.html` and
+  `css/CSS2/visuren/emptyspan-4.html` (226 px each). Those are the "sole block child in an
+  inline" shapes of the earlier section above - same root cause, not a separate repair.
+- Unit tests: `cargo test -p w3cos-runtime --lib` gives **1,233 passed / 33 failed** against
+  **1,232 / 33** on `HEAD`'s `layout.rs`; the 33 failure names are **set-identical** and the
+  extra pass is the new test. See the unit-test baseline section below for why
+  `headless::tests::block_in_inline_collapsible_whitespace_matches_the_direct_block` appears in
+  that list and is not attributable to this change.
+
+#### The one moved pixel count is the known flake, re-confirmed
+
+`css/CSS2/csswg-issues/submitted/css2.1/abspos-replaced-width-margin-000.xht` read **217,252** in
+the baseline run and **22,272** in this one. It is the flake already documented above, and the
+document contains no empty split fragment for this fix to affect. Re-run alone with `--jobs 1`
+six times: **22,272, 22,272, 22,272, 22,272, 119,804, 22,272** - a ~1/6 flake on a document
+holding 512 `<img>` elements, so the mechanism is an image load/decode race against the capture.
+Neither 217,252 nor 119,804 is this change's doing. Note that `--jobs 1` is required to see it:
+the flake does not reproduce reliably under the 8-job full run.
+
+#### Still failing in the family, and why they are separate
+
+Eleven `block-in-inline*` paths survived this fix and none of them is the line-box rule.
+`stacking-context/opacity-affects-block-in-inline.html` has since been fixed - the split dropped the
+host's opacity group, see "A split inline keeps its opacity group around the block it was split
+around" - leaving ten:
+
+| pixels | path | note |
+|---|---|---|
+| 54,880 | `box-display/delete-block-in-inlines-{beginning,end,middle}-001.xht` | DOM *removal* after the split |
+| 17,280 | `normal-flow/block-in-inline-percents-001.xht` | percentage height on the block child |
+| 14,020 / 13,560 | `box-display/block-in-inline-relpos-00{1,2}.xht` | relative positioning across the split |
+| 10,000 | `floats/block-in-inline-become-float.html` | `display: block` mutation to float |
+| 460 | `normal-flow/block-in-inline-float-in-layer-001.html` | float inside a layer |
+| 322 | `normal-flow/block-in-inline-float-between-001.xht` | float between the split halves |
+| 30 | `normal-flow/block-in-inline-nested-002.xht` | nested decorated inline; the reference's two fragments carry a 5 px `border-left` / `border-right`, so they *should* establish lines under the new rule - this one is a different defect |
+
+### Text keeps the glyph-advance origin in every box display (2026-09-19)
+
+`css/CSS2/generated-content/{after,before}-content-display-0{06,08,09,10,11,17}.xht` failed in
+**12 paths** (6 `after-`, 6 `before-`), and every one of them has the *same* signature: **465
+differing pixels**, `x` from 8 to 71, in rows 72..84 for `after-*` and rows 53..65 for
+`before-*`. Within that band `actual[x] == expected[x-1]` for all 465 pixels - the generated
+content's line is rendered exactly **1 px to the right** and nothing else in the document moves.
+
+The test structure is uniform: `<div>Filler text</div>` plus a `div:after` / `div:before` rule
+carrying `content: "Filler text"` and one `display` value, matched against
+`after-content-display-002-ref.xht` - which is simply two plain `<div>Filler text</div>`
+elements. The whole family is therefore "does the generated box start its text where a plain
+block does".
+
+#### The `display` value decides the text origin, not the layout
+
+`W3COS_DUMP_HEADLESS_LAYOUT=1` prints every node's `display`, `parent` and `rect`, and it
+settles the question immediately: the generated node's `rect.x` is **8.0 in all cases**,
+failing and passing alike. The layout is not the defect - the 1 px is added **at paint time**.
+
+| # | `display` | generated node | layout `x` | rendered text `x` | result |
+|---|---|---|---|---|---|
+| 001 | `inline` | Inline | 8.0 | 8 | pass |
+| 002 | `block` | Block | 8.0 | 8 | pass |
+| 003 | `list-item` | ListItem | 8.0 | 8 | pass |
+| 005 | `inline-block` | InlineBlock | 8.0 | 8 | pass |
+| **006** | **`table`** | **Table** | 8.0 | **9** | **fail** |
+| 007 | `inline-table` | InlineTable | 8.0 | 8 | pass |
+| **008** | **`table-row-group`** | **TableRowGroup** | 8.0 | **9** | **fail** |
+| **009** | **`table-header-group`** | **TableHeaderGroup** | 8.0 | **9** | **fail** |
+| **010** | **`table-footer-group`** | **TableFooterGroup** | 8.0 | **9** | **fail** |
+| **011** | **`table-row`** | **TableRow** | 8.0 | **9** | **fail** |
+| 012 | `table-column-group` | TableColumnGroup | 8.0 | 8 | pass |
+| 013 | `table-column` | TableColumn | 8.0 | 8 | pass |
+| 014 | `table-cell` | TableCell | 8.0 | 8 | pass |
+| 015 | `table-caption` | TableCaption | 8.0 | 8 | pass |
+| 016 | `none` | None | - | - | pass |
+| **017** | **`inherit`** | **Flex** | 8.0 | **9** | **fail** |
+| 018 | initial | Inline | 8.0 | 8 | pass |
+
+The failing set is exactly the set of displays that were missing from a whitelist in
+`render_skia.rs::alignment_ink_left`.
+
+#### Root cause: `alignment_ink_left` compensated the ink bearing for the wrong boxes
+
+The single-line paint path computes `x = aligned_text_x(rect, align, ink_left, advance)`, and
+for left alignment that is `rect.x - ink_left.min(0.0)` - a **negative** ink bearing shifts the
+text right. `alignment_ink_left` is what decides whether that compensation applies, and it did
+so by enumerating the displays that are exempt:
+
+```rust
+if matches!(style.display,
+        Display::Inline | Display::InlineBlock | Display::InlineFlex
+            | Display::InlineTable | Display::Block | Display::ListItem
+            | Display::TableCell | Display::TableCaption)
+    || style_uses_generic_monospace(style) { return 0.0; }
+```
+
+Measured for `"Filler text"` at `font_size: 16` the ink bearing is **-1**, so the arithmetic is
+unambiguous:
+
+| `display` | `content_x` | `ink_left` | final `x` |
+|---|---|---|---|
+| Block | 8 | -1 | **8** (whitelisted -> `0.0`) |
+| Inline | 8 | -1 | **8** (whitelisted) |
+| TableCell | 8 | -1 | **8** (whitelisted) |
+| Table | 8 | -1 | **9** (not whitelisted -> `-1`) |
+| TableRow | 8 | -1 | **9** (not whitelisted) |
+| Flex | 8 | -1 | **9** (not whitelisted) |
+
+The whitelist omits **every block-level container display**: `Table`, `TableRow`,
+`TableRowGroup`, `TableHeaderGroup`, `TableFooterGroup`, `TableColumnGroup`, `TableColumn`,
+`Flex`, `Grid` and `FlowRoot`. That `Block` and `TableCell` return `0.0` unconditionally while
+`Table` and `TableRow` do not is not a distinction CSS makes - a `display: table` box starts
+its text exactly like a `display: block` box.
+
+Two details make the omission worse than it looks:
+
+- **`Display::Flex` is the `#[default]` variant** (`crates/w3cos-std/src/style.rs`). Any node
+  whose display was never resolved falls back to it, so the bug is reachable from anything that
+  builds a `Style::default()` and forgets to set `display`.
+- That is exactly how case **017** fails. A probe with `div { display: inline }` and
+  `div:after { display: inherit }` produces an **Inline** text node for an explicit
+  `display: inline` (joining the line, `w = 66.27`) but a **Flex** text node on its own block
+  line for `display: inherit`. So `display: inherit` is **not resolved at all** - it silently
+  falls back to the `Flex` default. 017 therefore passes today *incidentally*, through the ink
+  fix, not because inheritance works. Resolving `inherit` properly is a separate defect in the
+  style layer and is **not** fixed here; it has no remaining visible symptom in this family
+  because a resolved `block` and the `Flex` fallback are both block-level and both now keep the
+  advance origin.
+
+#### The fix
+
+The predicate is inverted: every display that generates a box owns the line its text is laid
+out in, so all of them share the advance origin. Only `display: none` and `display: contents`
+generate no box of their own and never paint text, so they are the only displays that can still
+need the ink compensation.
+
+```rust
+if !matches!(style.display, Display::None | Display::Contents)
+    || style_uses_generic_monospace(style) {
+    return 0.0;
+}
+```
+
+Inverting rather than extending the list is deliberate: an allow-list has to be kept in step
+with `Display` by hand, and this one had already drifted by ten variants. The new predicate
+cannot drift.
+
+#### Verification
+
+`css/CSS2/generated-content` (all 225 paths) before and after:
+
+| run | passed | failed |
+|---|---|---|
+| `target/wpt-bii-20260919` (before) | 201 | 24 |
+| `target/wpt-cdfix-20260919` (after) | **213** | 12 |
+
+**12 fixed, 0 broken.** All 12 fixed paths are the `{after,before}-content-display-0{06,08,09,10,11,17}.xht`
+listed above. The 12 still failing in that directory are unrelated families
+(`before-after-*`, `content-172/177`, `content-counter-004`, `quotes-035/035a/036`), none of
+which moved.
+
+Because the change touches the text origin of *every* box display, and `Flex` is the default,
+the 225-case directory is not sufficient evidence on its own - a full 6,548-case re-run is the
+gate, recorded in the snapshot section below.
+
+A regression test pins the rule and the boundary in
+`render_skia::tests::text_origin_does_not_depend_on_the_box_display`: all 18 box displays must
+return `0.0` for a negative ink bearing, and `None` / `Contents` must keep returning `ink_left`.
+
+### `overflow` clips the contents of a box, not the box itself (2026-09-19)
+
+One `ClipNode` push in `paint_artifact.rs` carried two defects, and repairing the second
+exposed a third that the first had been masking.
+
+| # | defect | evidence |
+|---|---|---|
+| 1 | `overflow` clipped for **every** display | `css/CSS2/ui/overflow-applies-to-{001..004,008}.xht` expect a visible green bar; the green was gone entirely |
+| 2 | The clip rect was the **border box** | `overflow-applies-to-009.xht` leaked red in exactly `x 113..117` - the 5 px of `border: 5px solid transparent` |
+| 3 | A box painted its **own** border and background under its own overflow clip | the two regressions below |
+
+CSS 2.1 11.1.1 is the rule behind all three: `overflow` applies to block containers, and it
+clips "the contents of an element" to the padding box.
+
+#### Defect 2 as a border-width problem, not a coordinate problem
+
+A three-case probe settled whether the 5 px leak was an off-by-something or the border
+itself. `#blockoverflow { overflow: hidden; width: 5em }` with a transparent border of `0`,
+`5`, and `20` px leaked `0`, `5`, and `20` columns of red. The leak tracks the border width
+one-for-one, so the clip rect was the border box and the padding-box inset is the fix.
+
+#### Defect 3: the lost pixels are exactly the border areas
+
+Fixing (2) alone turned two previously passing cases red. The measured `different_pixels`
+counts equal the border area of the clipping box to the pixel, which localises the cause to
+the box's own border and rules out any content geometry:
+
+| case | clipping box | border area | `different_pixels` |
+|---|---|---|---|
+| `css/CSS2/normal-flow/negative-margin-001.html` | 2 x `inner.bfc`, `border: 10px solid orange`, border box 170x30, padding box 150x10 | 2 x (5,100 - 1,500) = **7,200** | **7,200** |
+| `css/CSS2/positioning/absolute-non-replaced-height-006.xht` | `#div1`, `border: 10px solid black`, 320x320 -> 300x300 | 102,400 - 90,000 = **12,400** | **12,400** |
+
+`render_skia::clip_path` walks from `node_properties[index].clip`, which is the clip a node
+**hands to its contents**. For every other clip in the tree those two roles coincide, so the
+conflation stayed invisible; `overflow` is the only clip that applies to the contents and not
+to the box. A border-box clip rect happened to cover the border, which is why defect 3 only
+appeared once defect 2 was repaired.
+
+#### The fix: separate the two chains
+
+`PaintArtifact` gains `self_clip`, a parallel array beside `node_properties` holding the chain
+each node's own background and border paint under; `clip_path` walks that instead. It is a
+parallel array rather than a field on `PaintProperties` because `PaintProperties` is the
+compositor's **layer identity**: `retained_layers::build_layers` merges consecutive chunks
+whose properties compare equal, so a differing field would have split every `overflow` box
+from its own contents into two compositor layers.
+
+`append_node` snapshots `inherited.clip` before the overflow push and refreshes the value
+after the `clip` property and inline-fragment clips, which *do* apply to the box itself.
+`content_fingerprint` hashes `self_clip` as well, because the chain a box paints under is not
+derivable from the clip tree alone once an overflow clip is in play.
+
+#### Verification
+
+An 18-case targeted suite over the affected families, against three stages of the same binary:
+
+| case | before any fix | padding-box only | with `self_clip` |
+|---|---|---|---|
+| `normal-flow/negative-margin-001.html` | pass | **fail** (7,200 px) | **pass** (0 px) |
+| `positioning/absolute-non-replaced-height-006.xht` | pass | **fail** (12,400 px) | **pass** (0 px) |
+| `ui/overflow-applies-to-{001..004,008}.xht` | fail | pass | pass |
+| `ui/overflow-applies-to-{009,012..015}.xht` | fail | pass | pass |
+| `visufx/overflow-applies-to-001.xht` | fail | pass | pass |
+| `ui/overflow-applies-to-{005,006,007}.xht` | pass | pass | pass |
+| `positioning/abspos-negative-margin-001.html` | pass | pass | pass |
+| `linebox/inline-negative-margin-001.html` | fail | fail | fail (pre-existing) |
+
+17/18. The one failure is a `testharness` case that has never passed in any of the three
+stages and is not an `overflow` case.
+
+A regression test pins the split in
+`paint_artifact::tests::overflow_clip_applies_to_the_contents_and_not_to_the_box`: the
+clipping box must hand a non-zero clip to its child, its own `self_clip` must stay `0`, and the
+child's `self_clip` must be that same clip.
+
+The full 6,548-case run is the gate. `target/wpt-selfclip-20260919/results.json` (14 x 500
+chunks at 8 workers, 22:43:10 -> 23:20:06) reads **6,113 passed / 435 failed**, against
+`target/wpt-cdfix-20260919` at 6,102 / 446: **11 fixed, 0 broken**, and the 11 are exactly the
+target set. Only two directories move (`css/CSS2/ui` 10 -> 0, `css/CSS2/visufx` 1 -> 0); every
+other directory keeps its count, and 432 of the 433 cases failing in both runs keep a
+byte-identical `different_pixels`. The snapshot section below has the tables.
+
+### Failure surface snapshot after the empty-inline line-box fix (2026-09-19)
+
+Per-directory counts from `target/wpt-bii-20260919/results.json` (**458 failures**, down from
+486), for whoever picks up the next cluster. Size matters more than count: a cluster of
+one-pixel differences is a rasterisation change, while a cluster of 50,000 px is a feature. The
+sub-cluster column names the dominant families with their pixel range.
+
+| directory | failures | dominant families (count, px range) |
+|---|---|---|
+| `css/CSS2/floats-clear` | 80 | `floats-*` 17 (454-50,000), `margin-collapse` 11 (5,056-74,960), `margin-collapse-clear` 8 (400-188,160), `float-replaced-width` 7 (675-20,000), `floats-clear-multicol{,-balancing}` 8 (1,710 / 2,850 - both need CSS Multicol) |
+| `css/CSS2/css1` | 64 | the `c*` legacy families, 120-53,235; `c534-bgreps`, `c414-flt-fit`, `c44-ln-box`, `c55xx` inline margin/padding |
+| `css/CSS2/linebox` | 40 | `inline-formatting-context` 12 (501-16,200), `line-height` 6 (240-11,906), `vertical-align` 6 (400-68,880), `vertical-align-baseline` 4 (2,170-66,503) |
+| `css/CSS2/floats` | 39 | `floats-wrap-top-below-*` 8, `floats-placement` 3, `new-fc-separates-from-float` 3 (13,000-80,000), `float-in-inline` 2 (53,793) |
+| `css/CSS2/text` | 38 | `white-space-processing` 12 (320-1,024), `white-space-normal` 6 (3,600-27,200), `white-space-pre` 4, `word-spacing` 3 (512 each) |
+| `css/CSS2/fonts` | 37 | `font-size` 11 (6-3,584), `font-family-invalid-characters` 6, `font` 3, `font-family` 2 |
+| `css/CSS2/generated-content` | 24 | `after-content-display` 6 and `before-content-display` 6 (465 each), `quotes` 3 |
+| `css/CSS2/visudet` | 23 | `content-height` 5, `inline-block-baseline` 5 (434 each), `line-height` 4 |
+| `css/CSS2/normal-flow` | 20 | **was 46**; the 30 `block-in-inline-*` paths are gone, leaving `inline-table-width` 4 (66-386), the 6 one-pixel `*-applies-to-012` cases, and inline-table/replaced one-offs |
+| `css/CSS2/box-display` | 16 | `display` 5, `block-in-inline-relpos` 2 (13,560-14,020), `box-generation` 2, `containing-block` 2, `delete-block-in-inlines-*` 3 (54,880 each) |
+
+Two families cut across directories rather than sitting in one:
+
+- **`block-in-inline*`: 11 failing paths over 4 directories, down from 37.** The line-box fix
+  removed the whole `block-in-inline-insert-*` sub-family. What is left needs something else:
+  DOM *removal* after the split (`delete-block-in-inlines-*`, 54,880 px), relative positioning
+  across the split (`relpos-001/002`), floats interacting with the split
+  (`become-float`, `float-between-001`, `float-in-layer-001`), opacity layering
+  (`opacity-affects-block-in-inline`), percentage height on the block child
+  (`percents-001`), and one nested-decorated-inline case whose reference *does* carry a 5 px
+  `border-left`/`border-right` on each fragment and therefore should establish lines under the
+  new rule (`nested-002`, 30 px). See the table in the fix section above.
+- **One-pixel glyph sliver: 20 paths** (9 `backgrounds/*-applies-to-{006,012}`,
+  5 `borders/*-applies-to-{006,012}`, 6 `normal-flow/min|max-{width,height}-applies-to-012`),
+  one pixel each at delta 3-5/255. The fix section above splits them into the two mirrored
+  sub-families and localises the stray pixel exactly, so this is the cheapest single change on
+  the board. Do not confuse them with `clear-applies-to-012` (13,824 px) or
+  `margin-bottom-applies-to-012` (25,520 px), which share the suffix but are large, and in the
+  latter case an unsatisfiable reference.
+
+Three `visudet` cases fail with **zero** differing pixels and a `mismatch` relation -
+`content-height-005.html`, `line-height-203.html`, `line-height-206.html`. The renderer is
+*identical* to the reference where the test requires a difference, so these are not paint
+defects; the relation or the reference is the thing to look at.
+
+### Failure surface snapshot after the text-origin fix (2026-09-19)
+
+Per-directory counts from `target/wpt-cdfix-20260919/results.json` (**446 non-pass**, down from
+458 in `target/wpt-bii-20260919/results.json`). The run is 14 x 500 chunks at 8 workers,
+20:25:40 -> 21:03:28.
+
+The regression signature is about as clean as it gets: **every directory is unchanged except
+`generated-content`, which halves**, and among the 444 cases failing in *both* runs the
+`different_pixels` count is **identical for all 444**.
+
+| directory | before | after |
+|---|---|---|
+| `css/CSS2/floats-clear` | 80 | 80 |
+| `css/CSS2/css1` | 64 | 64 |
+| `css/CSS2/linebox` | 40 | 40 |
+| `css/CSS2/floats` | 39 | 39 |
+| `css/CSS2/text` | 38 | 38 |
+| `css/CSS2/fonts` | 37 | 37 |
+| `css/CSS2/visudet` | 23 | 23 |
+| `css/CSS2/normal-flow` | 20 | 20 |
+| `css/CSS2/box-display` | 16 | 16 |
+| **`css/CSS2/generated-content`** | **24** | **12** |
+| `css/CSS2/margin-padding-clear` | 10 | 10 |
+| `css/CSS2/ui` | 10 | 10 |
+| `css/CSS2/backgrounds` | 9 | 9 |
+| `css/CSS2/css21-errata` | 8 | 8 |
+| `css/CSS2/borders` | 5 | 5 |
+| `css/CSS2/lists` | 5 | 5 |
+
+All 12 removals are the `{after,before}-content-display-0{06,08,09,10,11,17}.xht` family; the
+12 that remain in that directory are unrelated (`before-after-*`, `content-172/177`,
+`content-counter-004`, `quotes-035/035a/036`).
+
+Two cases report `error` instead of `fail` in this run. Both are a transient harness failure in
+the shared document loader, not a rendering difference:
+
+| path | baseline | this run | message |
+|---|---|---|---|
+| `css/CSS2/css21-errata/s-11-1-1b-006.html` | fail | error | `CONNECT proxy failed: proxy server responded 503/503` |
+| `css/CSS2/floats/adjoining-floats-dynamic.html` | fail | error | same |
+
+Both were re-run three times in isolation and returned `fail` - their baseline status - in 3/3,
+so the `error` is a proxy flake, not a consequence of this change. Both were already failing, so
+they do not affect the pass count either way.
+
+The full run is the gate for this change rather than a targeted directory, because the inverted
+predicate is reached by *every* box display and `Display::Flex` is the enum's default: a
+225-case directory could not have shown the blast radius.
+
+### Failure surface snapshot after the overflow-clip fix (2026-09-19)
+
+Per-directory counts from `target/wpt-selfclip-20260919/results.json` (**435 non-pass**, down
+from 446 in `target/wpt-cdfix-20260919/results.json`). The run is 14 x 500 chunks at 8 workers,
+22:43:10 -> 23:20:06.
+
+Exactly two directories move, and every other one holds:
+
+| directory | before | after |
+|---|---|---|
+| **`css/CSS2/ui`** | **10** | **0** |
+| **`css/CSS2/visufx`** | **1** | **0** |
+| `css/CSS2/floats-clear` | 80 | 80 |
+| `css/CSS2/css1` | 64 | 64 |
+| `css/CSS2/linebox` | 40 | 40 |
+| `css/CSS2/floats` | 39 | 39 |
+| `css/CSS2/text` | 38 | 38 |
+| `css/CSS2/fonts` | 37 | 37 |
+| `css/CSS2/visudet` | 23 | 23 |
+| `css/CSS2/normal-flow` | 20 | 20 |
+| `css/CSS2/box-display` | 16 | 16 |
+| `css/CSS2/generated-content` | 12 | 12 |
+
+`fail -> pass` is 11 and `pass -> fail` is **0**. The 11 are
+`ui/overflow-applies-to-{001..004,008,009,012..015}.xht` and `visufx/overflow-applies-to-001.xht`.
+
+#### One still-failing case moved its error surface, and the pixels say why
+
+`css/CSS2/generated-content/before-after-floated-001.xht` is the single case failing in both
+runs whose `different_pixels` changed: 26,904 -> 27,004 (+106, still failing). It is not a
+regression, and the reason is visible without reading the engine.
+
+The case is four `<div>`s with `border: 1px solid green; margin: 5px; overflow: auto` whose
+`:before` / `:after` content is floated, matched against a reference that spells the same
+floats out as explicit `<span style="float:left">` elements. Splitting the 178 changed pixels
+into "became right" and "became wrong" gives 36 and 142; the 142 sit on rows 28 and 77, where
+`cdfix` painted black or white and `selfclip` paints green.
+
+Row 28 is a **horizontal border line**, and the rows it lands on are the actual finding:
+
+| render | rows carrying > 50 green pixels |
+|---|---|
+| expected | 8, 41, 47, 80, 86, 119, 125, 158 |
+| `cdfix` actual | 8, **28**, 34, 71, **77**, 114, 120, 157 |
+| `selfclip` actual | 8, **28**, 34, 71, **77**, 114, 120, 157 |
+
+The row positions are **identical before and after** - the div heights are wrong in both, which
+is a pre-existing BFC / float-wrapping defect. Only the *width* changed: on row 28 the count goes
+480 -> **774**, and rows 8 and 77 go 742 -> **774**, and 774 is exactly the expected full-width
+border. So the fix makes each border paint **completely and correctly**, at a `y` the layout had
+already got wrong, where the border-box clip had been painting it *partially* - the smaller
+number was the mask, not the correct render. The +106 is the removal of that mask.
+
+Do not read this as "the fix made a case worse". A still-failing case whose count rises because
+the render became geometrically correct is a different thing from a case that regressed; compare
+the rows, not the totals.
+
+### Invalid `font-family` values invalidate the whole declaration (2026-09-20)
+
+`font-family` was the one property whose value syntax the engine never checked. CSS 2.1 15.3
+makes the value a comma-separated list of family names, and 4.1.3 gives the identifier grammar
+that bounds each unquoted name. A value that breaks either is a **parse error**, and 4.2 is
+explicit about the consequence: the declaration is dropped whole, not repaired.
+
+| # | defect | evidence |
+|---|---|---|
+| 1 | `declaration_value_is_valid` validated only `color` | every other property returned `true` (`document.rs:7257`) |
+| 2 | the `font-family` setter stored whatever it was handed | `css_style.rs:707` had no branch that could reject a value |
+
+Together they meant `font-family: test!foo, Ahem` was accepted as a two-family list, fell back
+per family to `Ahem`, and painted black bars the reference does not have. The reference for
+`font-family-invalid-characters-001` carries **no `font-family` at all**, so it renders in the
+default face; six cases in the `fonts` directory were failing this way.
+
+#### The rule, and where it has to be applied
+
+The predicate (`css_style.rs:2207`) splits the value on top-level commas - tracking quoted
+strings, so `"Times, New Roman"` stays one entry - and requires every entry to be either a single
+terminated string or one or more identifiers. The identifier check implements the full CSS 2.1
+production rather than a character whitelist, because several of the boundaries are not about
+characters at all:
+
+| input | verdict | why |
+|---|---|---|
+| `-testfoo`, `_testfoo`, `test-foo`, `test\foo`, `test-_foo` | valid | matches `[-]?{nmstart}{nmchar}*` |
+| `-5testfoo`, `testfoo -5` | invalid | a leading `-` must be followed by a letter, `_`, an escape or a non-ASCII character |
+| `--foo bar` | invalid | an identifier cannot start with two consecutive hyphens |
+| `inherit` alone | invalid | a CSS-wide keyword, not a family name |
+| `inherit foo`, `foo inherit` | valid | two ordinary identifiers |
+| `test"foo`, `'Courier` | invalid | unterminated string |
+
+`font-family-rule-004a.xht` carries the `--foo` and `inherit` boundaries in its own comments,
+which is what settled them. The case has no `rel="match"` and is not one of the 6,548, but its
+comments are upstream's statement of the rule.
+
+The check has to run in the **setter**, not only in the cascade's `declares` predicate. Rejecting
+the declaration at the cascade layer alone would leave `font-family-valid-characters-002` wrong:
+that case sets `div { font-family: Ahem }` and then overrides it per child with values such as
+`#div1 { font-family: 5testfoo, serif }`. Dropping the invalid declaration has to *reveal* the
+`div` rule underneath; skipping the declaration entirely falls through to **inheritance** and
+loses `Ahem`. Making it a no-op in the setter lets the cascade proceed to the next declaration
+exactly as if the invalid one had never been written, which is what 4.2 asks for.
+`declaration_value_is_valid` now delegates to the same predicate, so there is one rule in one
+place instead of two that can drift.
+
+`var()` is accepted unresolved, because validation runs on the raw value at `document.rs:1186`
+while substitution happens later, at `:1165`. `apply_font_shorthand` is deliberately left
+unvalidated: a sweep of all 126 distinct `font` shorthand values in the corpus found no family
+list the predicate rejects. The single hit is the text `font: 40px/130px` inside a CSS comment in
+`vertical-align-117a/118a.xht`, not a declaration.
+
+#### Pre-flight: what else the predicate could have caught
+
+A predicate that is slightly too strict silently deletes working declarations, so it was mirrored
+in Python and run over the whole corpus - all 8,587 documents the baseline report names as a case
+or a reference, parsed only inside `<style>` elements and `style=` attributes so that markup text
+cannot leak into a captured value:
+
+| measurement | count |
+|---|---|
+| documents scanned | 8,587 |
+| distinct `font-family` values | 91 |
+| values the predicate rejects | 40 (42 value/document pairs) |
+| currently **failing** cases touched | 8 |
+| currently **passing** cases touched | 1 |
+
+The eight are exactly the target cluster. The one passing case is
+`css/CSS2/syntax/unterminated-string-001.xht`, whose value is the unterminated string `'Courier`
+and whose assertion is itself "discard to the next `;`" - the predicate agrees with the case, and
+the case still passes in the full run below. No other document in the corpus changes behaviour.
+
+#### Verification
+
+A 161-case targeted suite over the affected family plus every `font-family*` and `fonts/*`
+guardrail:
+
+| case | before | after |
+|---|---|---|
+| `font-family-008.xht` | 16,901 px | **pass** |
+| `font-family-valid-characters-002.xht` | 8,972 px | **pass** |
+| `font-family-invalid-characters-002.xht` | 618 px | **pass** |
+| `font-family-invalid-characters-004.xht` | 618 px | **pass** |
+| `font-family-invalid-characters-005.xht` | 573 px | **pass** |
+| `font-family-invalid-characters-006.xht` | 246 px | **pass** |
+| `font-family-invalid-characters-001.xht` | 6,923 px | 162 px |
+| `font-family-invalid-characters-003.xht` | 470 px | 90 px |
+
+6 fixed, 0 regressed. Six unit tests pin the rule in `font_family_validity_tests`
+(`css_style.rs:2401`), including the one that matters most for the cascade: an invalid
+declaration must leave the previous value in place.
+
+#### The two partial cases, and why the leftover pixels are not the rule
+
+Both remaining differences are a single digit glyph off by about a pixel, and both come from
+something the fix deliberately does not touch. In `-001` the offending declaration is
+`#div12 { font-family: test;foo, Ahem; }` and in `-003` it is
+`#div3 { font-family: test}foo, Ahem; }`. The `;` and the `}` **terminate the declaration** during
+tokenisation, so the declaration that actually reaches the engine is the perfectly valid
+`font-family: test`. The rule has nothing to reject here, and a probe confirms the residue is
+unrelated to validity:
+
+| probe | render |
+|---|---|
+| `#unknown { font-family: test }` vs `#none { }`, identical content | **163 px** apart |
+
+That matches the 162 px left in `-001` almost exactly. The engine renders an *unknown family
+name* differently from *no declaration at all* by roughly one pixel on this glyph, and it did so
+before this change as well - `test` always passed the predicate. Closing the last 162 px and 90 px
+means making those two fallbacks identical, which is a font-resolution change with its own blast
+radius; it is a separate fix, not a loose end of this one.
+
+The full 6,548-case run is the gate. `target/wpt-ffvalid-20260920/results.json` (14 x 500 chunks
+at 8 workers, 09:40:48 -> 10:43:08) reads **6,119 passed / 429 failed**, against
+`target/wpt-selfclip-20260919` at 6,113 / 435: **6 fixed, 0 broken**. Only `css/CSS2/fonts` moves
+(37 -> 31, the six target cases), and among the 427 cases failing in both runs the
+`different_pixels` count is byte-identical - the only two that change are the two partial cases
+above, both downward. The snapshot below has the tables.
+
+### Failure surface snapshot after the font-family validity fix (2026-09-20)
+
+Per-directory counts from `target/wpt-ffvalid-20260920/results.json` (**429 non-pass**, down from
+435 in `target/wpt-selfclip-20260919/results.json`). The run is 14 x 500 chunks at 8 workers,
+09:40:48 -> 10:43:08.
+
+One directory moves and every other one holds:
+
+| directory | before | after |
+|---|---|---|
+| **`css/CSS2/fonts`** | **37** | **31** |
+| `css/CSS2/floats-clear` | 80 | 80 |
+| `css/CSS2/css1` | 64 | 64 |
+| `css/CSS2/linebox` | 40 | 40 |
+| `css/CSS2/floats` | 39 | 39 |
+| `css/CSS2/text` | 38 | 38 |
+| `css/CSS2/visudet` | 23 | 23 |
+| `css/CSS2/normal-flow` | 20 | 20 |
+| `css/CSS2/box-display` | 16 | 16 |
+| `css/CSS2/generated-content` | 12 | 12 |
+| `css/CSS2/margin-padding-clear` | 10 | 10 |
+| `css/CSS2/backgrounds` | 9 | 9 |
+| `css/CSS2/css21-errata` | 8 | 8 |
+| `css/CSS2/borders` | 5 | 5 |
+| `css/CSS2/lists` | 5 | 5 |
+| `css/CSS2/tables` | 5 | 5 |
+
+`fail -> pass` is 6 and `pass -> fail` is **0**:
+
+- `fonts/font-family-008.xht`
+- `fonts/font-family-valid-characters-002.xht`
+- `fonts/font-family-invalid-characters-00{2,4,5,6}.xht`
+
+Two still-failing cases moved their pixel count, both in the same direction:
+
+| case | before | after |
+|---|---|---|
+| `fonts/font-family-invalid-characters-001.xht` | 6,923 | 162 |
+| `fonts/font-family-invalid-characters-003.xht` | 470 | 90 |
+
+They are the `;` / `}` tokenisation cases described in the fix section; the residue is the
+pre-existing unknown-family fallback, not a declaration the new rule fails to catch.
+
+What is left in `fonts` - 31 cases - grouped by family, largest first. The two
+`invalid-characters` residues are the `;` / `}` cases the fix section explains:
+
+| family | cases | px range |
+|---|---|---|
+| `font-family-013`, `font-family-rule-002a`, `font-family-rule-001`, `font-family-applies-to-00{1,7}`, `invalid-characters-00{1,3}` | 7 | 64-58,284 |
+| `fonts-013`, `font-051`, `font-146`, `font-148`, `fonts-010`, `shand-font-00{0,1}` | 7 | 1,496-53,224 |
+| `font-size-*` | 11 | 6-3,584 |
+| `font-matching-rule-009`, `font-weight-applies-to-017`, `font-weight-rule-00{4,5}`, `font-variant-applies-to-017`, `font-applies-to-017` | 6 | 557-1,026 |
+
+### Failure surface snapshot after the Ahem coverage and `font` shorthand fixes (2026-09-20)
+
+Per-directory counts from `target/wpt-fontshort-full-20260920/results.json` (**423 non-pass**, down
+from 429 in `target/wpt-ffvalid-20260920/results.json`). 14 x 500 chunks at 8 workers,
+12:55:01 -> 13:46:04; merged with `--merge-report` x14, `--suite` and `--merge-output`.
+
+Two directories move and every other one holds:
+
+| directory | before | after |
+|---|---|---|
+| **`css/CSS2/fonts`** | **31** | **26** |
+| **`css/CSS2/visudet`** | **23** | **22** |
+| `css/CSS2/floats-clear` | 80 | 80 |
+| `css/CSS2/css1` | 64 | 64 |
+| `css/CSS2/linebox` | 40 | 40 |
+| `css/CSS2/floats` | 39 | 39 |
+| `css/CSS2/text` | 38 | 38 |
+| `css/CSS2/normal-flow` | 20 | 20 |
+| `css/CSS2/box-display` | 16 | 16 |
+| `css/CSS2/generated-content` | 12 | 12 |
+| `css/CSS2/margin-padding-clear` | 10 | 10 |
+| `css/CSS2/backgrounds` | 9 | 9 |
+| `css/CSS2/css21-errata` | 8 | 8 |
+
+`fail -> pass` is 6 and `pass -> fail` is **0**:
+
+- `fonts/font-family-013.xht` (Ahem coverage)
+- `fonts/font-051.xht`, `fonts/font-146.xht` (`font` shorthand validity)
+- `fonts/shand-font-000.xht`, `fonts/shand-font-001.xht` (`font` shorthand reset)
+- `visudet/content-height-004.html` (Ahem coverage; only visible in a full-suite run)
+
+Three still-failing cases moved their pixel count, all downward:
+
+| case | before | after |
+|---|---|---|
+| `fonts/fonts-013.xht` | 53,224 | 10,357 |
+| `fonts/font-148.xht` | 5,336 | 5,241 |
+| `text/white-space-processing-054.xht` | 768 | 256 |
+
+The other 420 failing cases are pixel-identical to the baseline.
+
+What is left in `fonts` - 26 cases, largest first - is the working queue for this directory:
+
+| group | cases | px range | next step |
+|---|---|---|---|
+| `fonts-013` | 1 | 10,357 | block-strut vs child font-size in `layout.rs:6525`; placement model still open |
+| `font-family-rule-002a`, `font-family-rule-001` | 2 | 92-8,958 | **environment-blocked**: needs an OS-installed `White Space` face; `support/AHEM_whitespace.ttf` is absent from the checkout |
+| `font-148` | 1 | 5,241 | needs `calc()` in the `font-size` slot |
+| `font-size-121`, `font-size-120` | 2 | 3,120-3,584 | keyword family (`xx-small`..`xx-large`, `larger`/`smaller`) and a line-box offset |
+| `font-size-123`, `-034`, `-056`, `-023`, `-067`, `-078`, `-045`, `-001`, `-012` | 9 | 6-2,000 | a negative `font-size` must be ignored, not applied |
+| `fonts-010` | 1 | 1,496 | `font: inherit` must also inherit `font-family` on `pre` |
+| `*-applies-to-017` (font, font-family, font-variant, font-weight) | 4 | 64-1,026 | `display: inherit` is not implemented |
+| `font-matching-rule-009`, `font-weight-rule-00{4,5}` | 3 | 557 | unknown-face matching, same residue as the `invalid-characters` pair |
+| `font-family-invalid-characters-00{1,3}`, `font-family-applies-to-001` | 3 | 64-162 | pre-existing unknown-family fallback |
+
+### Pre-existing unit-test baseline (2026-09-19)
+
+`cargo test -p w3cos-runtime --lib` at `ef3fd2e` reports **1,232 passed / 33 failed**, and the
+33 failures are unchanged by the inline text work. Record the number before attributing a unit
+test to a rendering change:
+
+- 15 are `indexed_db_web` and one each from `observers_web`, `user_mediated_web`,
+  `web_events`, `webxr_web` - web-platform JS surfaces with no relation to layout.
+- 11 are `layout::tests::*` and 2 are `paint_artifact::tests::*`.
+- `render_skia::tests::default_ascii_text_is_pixel_invariant_across_inline_fragments` fails
+  with an all-white render (every sampled byte `255`) at `render_skia.rs:3424` on the pristine
+  tree and `:3459` with the inline text changes applied - the same assertion, shifted by
+  exactly the 35 lines the changes add. It is an environment/font problem, not geometry.
+
+**Re-measured while landing the empty-inline line-box fix.** The number is a property of the
+tree, so measure both sides before attributing a failure to a change. Running
+`cargo test -p w3cos-runtime --lib` on `HEAD`'s `layout.rs` gives **1,232 passed / 33 failed /
+1 ignored**; with the line-box fix applied it gives **1,233 / 33 / 1**. The 33 failure names are
+**byte-identical** between the two runs (`diff` of the extracted name lists is empty; only the
+summary line differs), and the single extra pass is the new
+`empty_split_fragment_with_only_vertical_borders_adds_no_line`. Keep both name lists next to
+the run artefacts - comparing counts alone would have missed the fact that
+`headless::tests::block_in_inline_collapsible_whitespace_matches_the_direct_block` is a
+**pre-existing, flaky** failure: it fails 6/6 when run alone, sometimes passes inside the full
+run, and fails on `HEAD`'s `layout.rs` too. It is not attributable to the line-box change.
+
+**Re-measured while landing the text-origin fix.** With the `alignment_ink_left` change applied,
+`cargo test -p w3cos-runtime --lib` reports **1,234 passed / 33 failed / 1 ignored** (1,268
+tests). The 33 failure names are again **byte-identical** to the `HEAD` list in
+`/tmp/unit-head.txt`; the two extra passes are
+`empty_split_fragment_with_only_vertical_borders_adds_no_line` and
+`text_origin_does_not_depend_on_the_box_display`.
+
+**Re-measured while landing the overflow-clip fix.** With all three changes applied the suite
+reports **1,237 passed / 33 failed / 1 ignored** - the three extra passes are the three new
+tests (`empty_split_fragment_...`, `text_origin_does_not_depend_on_the_box_display`,
+`overflow_clip_applies_to_the_contents_and_not_to_the_box`). A *second* run of the identical
+binary reported **1,236 / 34 / 1**; the extra name was
+`fetch::tests::cancellable_text_fetch_stops_buffering_a_streaming_body`, and it is a
+**pre-existing flake**, proven by stashing back to a pristine `HEAD`:
+
+```sh
+git stash push -- crates/                                  # pristine HEAD
+cargo test --profile wpt -p w3cos-runtime --lib <the test>  # 5 runs
+git stash pop                                              # changes return intact
+```
+
+At `HEAD` the test gives **pass=3 / fail=2**; with the changes applied, run alone, it gives
+**0/10**. Note the direction: this one fails when the machine is **idle** and passes under load,
+because it asserts that a client cancellation closes a loopback socket before the fixture
+finishes 1 MiB of writes (`sleep(50ms)` plus 32 bounded writes). "Fails 10/10 in isolation" is
+not evidence a change caused it - only a run against the pristine tree is. `cargo test` rebuilds
+the crate, so do this before launching a long WPT run, not during one.
+
+**Do not run the unit suite while a full WPT run is in flight.** The first measurement of this
+fix was taken with the 8-worker suite running and read **1,233 / 34 / 1** - one failure more. The
+extra name was `layout::tests::layout_microbench`, and it is a **timing** test
+(`assert!(avg_us < 8_000)`), not a correctness test: it measured `avg 12946µs` under load and
+passes 3/3 when run alone with the identical binary. Any unit test that asserts a duration is
+load-sensitive; when a failure set gains exactly one such name, re-run it unloaded before
+attributing it to the change.
+
+**Re-measured while landing the `font-family` validity fix (2026-09-20).** The `vertical-align`
+fix above also reached `w3cos-dom`, but only the runtime suite was measured for it, so this is
+the first `w3cos-dom` baseline recorded here - and it needed both sides:
+
+| crate | `HEAD`'s `crates/` | with the changes applied | delta |
+|---|---|---|---|
+| `w3cos-dom` | 453 passed / 12 failed | 466 passed / 12 failed | +13 passed, +13 tests |
+| `w3cos-runtime` | not re-run | 1,237 passed / 33 failed / 1 ignored | reproduces the number above |
+
+The `w3cos-dom` "before" run is `git stash push -- crates/`, and the tree was compared against a
+`git diff` backup after `git stash pop` and is byte-identical. Attribution of the +13 is by name,
+not by count: the failure sets are **identical at 12**, no name disappears, and no shared name
+flips status. The 13 additions are 6 new tests from this change
+(`css_style::font_family_validity_tests::*`) plus the 7 `document::inline_line_extra_ascent_tests::*`
+from the `vertical-align` fix documented above, which is in the same worktree and was previously
+measured only through the WPT suite. In `w3cos-dom`'s diff the two contributions are also
+separable by hunk: 3 lines at `declaration_value_is_valid` are this change, while the other 224
+lines (`document.rs`) are that fix's `annotate_inline_line_extra_ascent` plus its test module.
+`w3cos-runtime` is untouched by this change and reproduces its recorded 1,237 / 33 / 1 exactly.
+
+The 12 `w3cos-dom` failures are pre-existing. Their panic locations move by exactly the number of
+inserted lines that precede them, and the sites in `lib.rs` - a file this change does not touch -
+do not move at all. That is what distinguishes "the same failures moved" from "different failures
+appeared":
+
+| site | `HEAD`'s `crates/` | with the changes applied | shift |
+|---|---|---|---|
+| `css_style.rs` | 3,214 | 3,542 | +328 (of 332 insertions; 4 land after it) |
+| `document.rs` | 11,244 | 11,471 | +227 (all 227 insertions precede it) |
+| `document.rs` | 12,276 | 12,503 | +227 |
+| `lib.rs`, 9 sites | unchanged | unchanged | 0 |
+
+The 12 names, in full:
+
+```
+css_style::tests::negative_margin_and_character_relative_lengths_remain_valid
+document::image_component_tests::float_fixup_preserves_static_line_and_block_order
+document::image_component_tests::rtl_inline_block_aligns_its_single_text_line_to_the_inline_end
+tests::authored_inline_block_with_an_image_stays_inline_level
+tests::authored_inline_table_stays_in_the_parent_inline_context
+tests::block_child_of_inline_host_uses_the_surrounding_block_width
+tests::document_element_is_the_stable_root_and_edge_whitespace_does_not_add_a_line
+tests::generated_pseudo_content_lowers_strings_and_attributes_in_tree_order
+tests::hidden_elements_and_ungenerated_pseudos_do_not_modify_counters
+tests::positioned_inline_replaced_content_stays_in_the_parent_line
+tests::stroke_only_svg_inherits_color_and_explicit_size_through_button_host
+tests::svg_current_color_uses_the_host_computed_color
+```
+
+`cargo fmt --check -p w3cos-dom` is **not** clean at `ef3fd2e`: `HEAD`'s `crates/` already
+reports 261 hunks (`document.rs` 196, `css_style.rs` 30, `lib.rs` 23, `stylesheet.rs` 7,
+`user_agent.rs` 5). Measured the same way on both sides, this change added exactly **one** of
+them - a test assertion long enough to need splitting - and that line was reformatted, returning
+`css_style.rs` to its baseline 30. The remaining delta is the 2 hunks inside the `vertical-align`
+fix's `annotate_inline_line_extra_ascent` / `inline_box_ascent`, which belong to that fix rather
+than to this one. The repository is not formatted wholesale; only the lines this change adds are
+held to rustfmt. The reformatted line sits inside `#[cfg(test)]`, so the binary the full run
+gated is unaffected by it.
+
+Three traps this baseline exposed:
+
+- `cargo check` and `cargo build` do **not** compile `#[cfg(test)]` code, so a test module can
+  be broken for a long time without any build failing. A test that was never compiled is not
+  evidence. `cargo test -p <crate> --lib --no-run` is the cheap gate.
+- `Style` derives `Clone` but not `Copy`, so `Style { field, ..base }` inside a loop moves
+  `base` on the first iteration and the following uses fail with `E0382`. Use `..base.clone()`.
+- A failure *count* is not a failure *set*. Diff the extracted name lists. Here the count moved
+  33 -> 34 and the set gained exactly one timing test, which is a completely different finding
+  from "the change broke a layout test" - and only the name diff tells them apart.
+
+### Ahem paints only the characters it covers (2026-09-20)
+
+CSS applies `font-family` per character, so `font-family: "Ahem", "Times New Roman"` must paint the
+characters Ahem lacks with Times. Three separate places assumed the opposite, and all three were
+keyed on the family *name* rather than on the face's cmap:
+
+| site | assumption | effect |
+|---|---|---|
+| `render_skia.rs` `style_uses_ahem` → `draw_text_line` | a stack that merely mentions `Ahem` paints one deterministic em cell per character | `Ţęşţ` painted as four 4em squares |
+| `render_skia.rs` `measure_skia_text_advance` / `measure_skia_text_ink_bounds` | the same rule | measurement agreed with the wrong painting |
+| `render_skia.rs` `measure_skia_text_intrinsic_size` / `measure_skia_wrapped_text_height` | `registered_typeface` resolves the stack by name alone, so the first registered family sizes the whole run | Ahem's glyph-less metrics sized Times text |
+
+Ahem's own cmap is the arbiter. `vendor/wpt/fonts/Ahem.ttf` carries two `cmap` subtables (platform
+0/3 and 3/1), both format 4 with 157 segments, covering **278 codepoints** - Latin-1 Supplement
+through U+00FF plus U+0131, U+0152/0153, U+0178, U+0192, a handful of Greek and CJK singletons -
+and **none of Latin Extended-A**. `U+0162`, `U+0119`, `U+015F`, `U+0163` and `U+0130` are all
+absent, which is exactly the gap `font-family-013` and `fonts-013` are built on.
+
+The registry's per-character machinery was already correct. `resolve_stack_for_character` filters
+each family through `supports_character`, which consults `unicode_ranges` and then the real cmap
+(`font.chars().contains_key(&character)`), and `resolve_style_runs` walks the text character by
+character. Two probes pinned that down:
+
+- `.wptcache/probe/fb-003.xht` registers the same `Ahem.ttf` under `ExtAhem` **from an external
+  stylesheet** and paints `"ExtAhem", serif` with `Ţ`. The `Ţ` comes out as a real serif glyph and
+  the ASCII as Ahem cells, so external `@font-face` registration and per-character fallthrough both
+  work. An earlier reading of `fb-001` as "the two registration paths disagree" was wrong; the only
+  variable is whether a family is literally named `Ahem`.
+- `.wptcache/probe/fb-004.xht` renders six one-line stacks over `Ţęşţ`. `.d` (`"Times New Roman"`
+  alone) puts the em dash at x=186; the other five - `"Ahem", "Times New Roman"`, `"ExtAhem",
+  "Times New Roman"`, `"Ahem"`, `"Times New Roman", "Ahem"`, `serif, "Ahem"` - all put it at x=171.
+  The name is not the variable either. **Having any family that resolves to a registered face** is,
+  which points straight at the intrinsic-size path above.
+
+**Fix.** `ahem_segments` splits a line where the Ahem face stops covering characters, and the three
+runtime paths consume the same split:
+
+- `AhemSegment::Cell` keeps the deterministic em cells, byte-identical to before.
+- `AhemSegment::Stack` is measured and painted through `css_font_runs`, so uncovered characters are
+  shaped as one run with their neighbours instead of one at a time. The control span in
+  `font-family-013` is a single shaped run, and matching it pixel for pixel needs the same.
+- `registered_typeface_covering` only lets a registered face size text it can actually paint.
+
+Without a *parsed* Ahem face the split is a single `Cell` segment, so every existing Ahem case is
+untouched: an unparsed registration reports every character as missing, and a stack that cannot
+prove non-coverage keeps its cells.
+
+**Blast radius.** A scan of all 6,548 cases for a `font-family` longhand list containing `Ahem`
+together with body text outside Ahem's coverage returned exactly one case -
+`css/CSS2/fonts/font-family-013.xht` - and it was already failing. `fonts-013.xht` reaches the same
+code through the `font` shorthand (`font: 4em "Ahem", "Times New Roman"`), which a longhand scan
+cannot see; it was failing too. No passing case matches either shape.
+
+**Targeted result.** `css/CSS2/fonts/`, 160 cases, `target/wpt-fonts-intrinsic-20260920`:
+
+| case | before | after |
+|---|---|---|
+| `font-family-013.xht` | 58,284 px | **pass** |
+| `fonts-013.xht` | 53,224 px | 10,357 px (open, see below) |
+| `fonts-012.xht` | pass | pass |
+
+129 passed / 31 failed → 130 passed / 30 failed, no regression. `fonts-012.xht` is the case that
+matters for the second half of the fix: the first version of this change, without
+`registered_typeface_covering`, regressed it from pass to 80 px, because `İ` (U+0130, also outside
+Ahem) began falling through to a real glyph whose advance the intrinsic-size path measured with
+Ahem's metrics. That is the same defect the `fb-004` probe isolates, and fixing it removed the
+regression.
+
+**Full-suite confirmation.** This fix was re-verified in the same authoritative 6,548-case run as the
+`font` shorthand fix (`target/wpt-fontshort-full-20260920`, **6,125 passed / 423 failed** against the
+6,119/429 baseline, no pass→fail). Beyond the fonts directory it also closes
+`css/CSS2/visudet/content-height-004.html` (1,118 px → pass), which no `css/CSS2/fonts`-only run can
+see. `fonts-013.xht` improves 53,224 → 10,357 px and stays open on the layout defect below.
+
+**Unit tests.** `render_skia::ahem_segment_tests` adds three tests against the pinned
+`wpt/fonts/Ahem.ttf` through a local `FontRegistry` (`FontRegistry::new` was widened to `pub(crate)`
+for cross-module use): ASCII is covered, `U+0162` is not, the cell/stack boundary lands where the
+cmap says, and the four uncovered characters stay one stack run. `w3cos-runtime`'s lib suite moves
+from 1,237 passed / 33 failed / 1 ignored to 1,242 / 33 / 1. The +5 is these three plus the two
+`font_face` tests the `font-family` validity fix added; the failure set is unchanged.
+
+**`fonts-013` stays open, on a layout defect.** After this change the two documents agree
+horizontally to the pixel - every column run in all three lines is identical - and differ only
+vertically. The test word's ink occupies rows 57..120 where the reference has 51..114: the same
+64-row glyph block, shifted down 6 px. The control word (57..114) and the em dash match exactly.
+
+An earlier reading of this - that `draw_text_line` derives its baseline per style through
+`text_baseline` → `registered_typeface`, so the Ahem span takes Ahem's metrics while its sibling
+takes the primary's - is **wrong**. `font-family-013` and `fonts-013` are the same document modulo
+one property, and `font-family-013` now passes with zero differing pixels, which it could not do if
+per-style baselines were the mechanism: the Ahem span and the Times span are siblings in both.
+
+The discriminator is the **block's own font-size**, not the longhand/shorthand spelling. A 2x2 probe
+(`.wptcache/probe/fb-008.xht`) crosses the two, measuring the test word's ink rows minus the control
+word's on each line:
+
+| line | block font-size | span spelling | span font-size | test - control |
+|---|---|---|---|---|
+| `.a` | 64 px | `font-family` longhand | inherited 64 px | **0** |
+| `.b` | 16 px | `font-family` longhand | `font-size: 4em` | **+7 px** |
+| `.c` | 64 px | `font: 1em ...` shorthand | 64 px | **0** |
+| `.d` | 16 px | `font: 4em ...` shorthand | 64 px | **+6 px** |
+
+`font-family-013` is row `.a` (`p { font-size: 4em }`, spans inherit) and `fonts-013` is row `.d`
+(`p` stays 16 px, the shorthand sets 4em on the spans). Both spellings fail when the block is small,
+both pass when it is 64 px, so the shorthand is irrelevant.
+
+That points at `layout.rs::align_inline_block_last_line_baselines` (`:6450`), the pass whose comment
+already says *"Equal-sized glyphs share a baseline even when their inline line-heights differ."* Its
+gate (`:6525`) realigns the block's in-flow inline text children only when every one of them is a
+`ComponentKind::Text` with `child.style.font_size == component.style.font_size`. It then snaps each
+child to `content_top + row * line_height + (line_height - child.font_size) * 0.5`, which for equal
+font sizes is the *same* `y` for every child - and a shared `y` is what makes the siblings share a
+baseline. `font-family-013` satisfies the gate (block and spans all 64 px); `fonts-013` does not
+(block 16 px, spans 64 px), so its fragments keep their pre-realignment placement and the 6 px
+appears.
+
+What is **not** yet pinned down is which per-fragment metric produces exactly 6 px in that
+unrealigned path: 6 px is `(0.8 - 0.70625) * 64`, i.e. the gap between Ahem's ascent ratio and the
+primary face's, but the sign of the offset says the fragment that resolves to Ahem ends up *lower*,
+which the obvious "box top = baseline - ascent" model predicts the other way round. Resolving that
+needs the layout rects and computed styles for both spans printed side by side, not more pixel
+archaeology. Until then the honest statement is: the gate is the discriminator, the placement model
+behind the 6 px is open.
+
+A probe that annotates the spans with `background` is **not** neutral for this question, which cost
+time before it was noticed. `.wptcache/probe/fb-006.xht` and `fb-007.xht` are byte-identical copies
+of the two documents plus `background: red` / `background: lime`, and both then show the same 6 px
+gap between the two spans - including `font-family-013`, which passes without the backgrounds. The
+likely reason is the gate above: a span that has a box to paint stops being flattened into a bare
+`ComponentKind::Text`, so `matches!(child.kind, ComponentKind::Text { .. })` no longer holds and the
+realignment is skipped. Background-annotated probes therefore change the very property under test.
+
+Three traps this cluster exposed:
+
+- Probe PNGs are hidden files. The runner writes
+  `.wptcache_probe_<case>-<hash>-actual.png`, so `ls` and `glob('*.png')` both miss them; use
+  `ls -a` or `os.listdir`. `--failure-artifacts-only` is required as well, or a probe that differs
+  from its blank reference produces no image at all.
+- A single-row scan is not a column projection. Reading one mid-line row made the test word appear to
+  start at x=41; projecting every column over the whole band gives x=24. The two disagree because a
+  mid-row cut only sees glyph stems. Compare like with like before concluding anything from pixels.
+- A **passing** case emits no artifacts, which is exactly when you want to look at it. A one-entry
+  suite can override the document's own `link rel=match`: pointing
+  `css/CSS2/fonts/font-family-013.xht` at the blank `.wptcache/probe/fb-ref.xht` makes it "fail" and
+  write `actual`/`expected`/`diff` PNGs while leaving the rendering itself unchanged. That is the only
+  way found so far to read the ink of a passing case without editing the case.
+- **Stacked probes need separators.** A probe whose blocks are flush against each other cannot be
+  measured row by row: a line that overflows its block paints over the next block's background, and
+  every row estimate after the first block is wrong. `fb-009`/`fb-010` were read that way and produced
+  "the text is anchored to the bottom of the box", which `fb-011` refuted as soon as a 10px
+  `background: blue` spacer delimited each block. Put a spacer of a colour nothing else uses between
+  the blocks, and read the box edges off the spacer rows.
+
+### The `font` shorthand validates and resets its longhands (2026-09-20)
+
+Three `css/CSS2/fonts` cases failed on the same shorthand, each asserting a different part of CSS 2.1
+§15.8:
+
+| case | declaration | asserted |
+|---|---|---|
+| `font-051.xht` | `font: serif` | the value needs a `font-size`; without one the declaration is invalid |
+| `font-146.xht` | `font: 4em/-2em serif` | a negative `line-height` invalidates the whole declaration |
+| `shand-font-000/001.xht` | `font-weight: bold;` then `font: 1em/normal serif` | the shorthand resets every longhand it can set |
+
+The two halves are independent, and so are their fixes.
+
+**Validity.** `apply_font_shorthand` returned early when it could not find a size token, which looks
+like the right thing, but the element was still recorded as declaring `font`. `inherit_text_style`
+skips the parent's font for any property the element declares, so the span kept the *initial* font
+(16 px, default family) instead of inheriting Ahem at 100 px - `font-051` is exactly that shape, a
+span with `font: serif` inside `div { font: 100px/1 Ahem }`. An invalid declaration has to stop
+counting as declared, not just stop applying. `document.rs::declaration_value_is_valid` already
+carried that notion for `color` and `font-family`; `is_valid_font_shorthand_value` extends it to
+`font`, and `apply_font_shorthand` gates on the same predicate so a rejected value cannot apply
+partially either.
+
+**Reset.** `apply_font_shorthand` reset `line-height` (there was already a comment about it) but left
+`font-weight` and `font-style` alone, so an omitted weight survived an earlier declaration in the
+same rule. Both now return to `Style::default()` before the leading tokens are applied.
+
+**Blast radius, measured statically first.** A scan of all 6,548 case files for `font:` declarations
+that the stricter predicate would newly reject returns three real ones - `font-051`, `font-146`,
+`font-148` - and all three were already failing; the other matches are comment and attribute-selector
+text that the CSS parser never sees as a declaration. No passing case declares a `font` shorthand the
+new predicate rejects. That is what made a change to declaration validity safe to attempt at all.
+
+**The regression that the second size path caused, and how it was found.** The first build fixed
+`font-051` and both `shand-font` cases but pushed `font-146` from 4,525 px to **114,447 px**. The
+cause was not the gate: `font-146`'s `font-size` was still 4em. Two more sites read the shorthand's
+size token straight out of the declaration list - `document.rs:1230`
+(`declared_property_value(&["font-size", "fontSize", "font"])`) and the same pattern in
+`text_pseudo_style` at `:7352` - and neither asked whether the declaration was valid. Both now filter
+through `declaration_value_is_valid`. After that `font-146` passes. The lesson is narrow but worth
+keeping: this codebase resolves a shorthand's sub-values in more than one place, so a validity rule
+has to be applied at every consumer, not only at the one that parses the shorthand.
+
+**Targeted result.** `css/CSS2/fonts/`, 160 cases, `target/wpt-fontshort2-20260920`:
+
+| case | before | after |
+|---|---|---|
+| `font-051.xht` | 39,967 px | **pass** |
+| `font-146.xht` | 4,525 px | **pass** |
+| `shand-font-000.xht` | 2,230 px | **pass** |
+| `shand-font-001.xht` | 2,230 px | **pass** |
+| `font-148.xht` | 5,336 px | 5,241 px (open: needs `calc()` in the size slot) |
+
+130 passed / 30 failed → **134 passed / 26 failed**, no regression.
+
+**Unit tests.** `css_style::font_shorthand_tests` gains six tests: no size, no family, negative
+line-height, an unresolvable `calc()` size, the keywords that must stay valid, and the weight/style
+reset. `w3cos-dom`'s lib suite moves from 453 passed / 12 failed to **472 / 12** - the same failure
+set, and the +19 includes 13 tests that were already failing on this defect. `w3cos-runtime` stays at
+1,242 passed / 33 failed / 1 ignored. That suite is flaky: three consecutive runs of one binary gave
+1,242/33, 1,241/34 and 1,242/33, the extra failure always an `indexed_db_web` cascade where the first
+assertion poisons a shared mutex and the rest fail on `PoisonError`. Compare failure *names*, not
+counts, before blaming a change.
+
+**Authoritative full-suite result.** The gate is the whole 6,548-case suite, and this change shares
+one run with the Ahem coverage fix above: `target/wpt-fontshort-full-20260920`, 14 x 500 chunks at 8
+workers, 12:55:01 → 13:46:04, merged with `--merge-report` x14 plus
+`--suite target/wpt-all-20260919/discovered-suite.json` and `--merge-output` (the merge refuses to
+run without `--suite`, and it validates count *and* order against the manifest):
+
+```
+W3COS_WPT_MERGED passed=6125 failed=423 total=6548
+```
+
+against the `target/wpt-ffvalid-20260920` baseline of **6,119 passed / 429 failed**. Six cases move
+from fail to pass and **none move from pass to fail**:
+
+| case | baseline | now |
+|---|---|---|
+| `css/CSS2/fonts/font-051.xht` | 39,967 px | **pass** |
+| `css/CSS2/fonts/font-146.xht` | 4,525 px | **pass** |
+| `css/CSS2/fonts/shand-font-000.xht` | 2,230 px | **pass** |
+| `css/CSS2/fonts/shand-font-001.xht` | 2,230 px | **pass** |
+| `css/CSS2/fonts/font-family-013.xht` | 58,284 px | **pass** (Ahem coverage fix) |
+| `css/CSS2/visudet/content-height-004.html` | 1,118 px | **pass** (Ahem coverage fix) |
+
+Three failing cases change pixel count without changing status - `font-148` 5,336 → 5,241,
+`fonts-013` 53,224 → 10,357 and `css/CSS2/text/white-space-processing-054.xht` 768 → 256 - and the
+remaining 420 failing cases are pixel-identical to the baseline. Per directory, only two counts move:
+`css/CSS2/fonts` 31 → 26 and `css/CSS2/visudet` 23 → 22. `floats-clear` (80), `css1` (64), `linebox`
+(40), `floats` (39) and `text` (38) are untouched, which is the point of running the whole suite for a
+change that touches declaration validity.
+
+### A negative `font-size` is ignored, not applied (2026-09-20)
+
+`font-size: -10px` is an invalid declaration. It must be dropped, the previous declaration in the
+same rule must survive, and it must not count as declared either. Three shapes assert it:
+
+| case | declaration | asserted |
+|---|---|---|
+| `font-size-123.xht` | `font-size: 20px; font-size: -10px` | the 20px survives; a 100x40 box is filled green |
+| `font-size-023/034/045/056/067/078.xht` | `font-size: 0; font-size: -1<unit>` | nothing is painted, so no red is visible |
+| `css1/c526-font-sz-003.xht` | `font-size: 1em; font-size: -0.5in` | the two navy squares keep the same size |
+
+`-0`, `-0px`, `-0%` and friends are a different matter: a negative *zero* is a valid zero length
+(`font-size-100.xht` passes today), so the predicate has to be numeric (`size < 0.0`, which `-0.0`
+fails) rather than a check for a leading `-`.
+
+**Three sites had to agree**, and this is where the previous fix's lesson paid off:
+
+| site | role |
+|---|---|
+| `CSSStyleDeclaration::set_property`, `"font-size"` arm | absolute units (`px`/`cm`/`mm`/`in`/`pt`/`pc`/bare) reached `parse_px` and were applied |
+| `document.rs::relative_font_size_px` | `em`/`rem`/`ex`/`%` are resolved after the cascade; `-1em` became -16px |
+| `document.rs::declaration_value_is_valid` | without this, the rejected declaration still counted as *declared*, so `inherit_text_style` skipped inheritance and the element kept the initial font |
+
+**A fourth site was a regression waiting to happen.** `document.rs:1230` used
+`declared_property_value(&["font-size", "fontSize", "font"])`, which returns the last matching
+declaration whether or not it is valid. `css1/c526-font-sz-003` is `font-size: 1em; font-size:
+-0.5in`, and once `-0.5in` was rejected the guard on the *last* declaration skipped the whole block,
+so the `1em` was never resolved to px and the second navy square collapsed to the initial 16px. The
+size slot now resolves against the last **valid** declaration (`declared_valid_property_value`).
+`font-146`'s regression in the `font` shorthand work was the same mistake in the same place.
+
+**Blast radius, measured statically first.** A tree-wide scan for `font-size: -` returns 23
+declarations, all inside `css/CSS2/fonts/` and `css/CSS2/css1/` - 22 in the suite, plus
+`font-size-rule-001.xht`, which the manifest does not contain. A scan for a negative size inside a
+`font` shorthand returns one line, `font-146.xht`'s `font: 4em/-2em serif`, which is a negative
+*line-height* and is handled by the shorthand's own rule. There is no negative `font-size` anywhere
+else in the checkout, so the targeted run below covers the whole radius.
+
+**Targeted result.** `css/CSS2/fonts/` plus the three `css1/c526-font-sz-*` cases, 163 cases,
+`target/wpt-fsneg-20260920`:
+
+| case | before | after |
+|---|---|---|
+| `css1/c526-font-sz-003.xht` | 5,424 px | **pass** |
+| `font-size-001.xht` | 7 px | **pass** |
+| `font-size-012.xht` | 6 px | **pass** |
+| `font-size-023.xht` | 128 px | **pass** |
+| `font-size-034.xht` | 304 px | **pass** |
+| `font-size-045.xht` | 32 px | **pass** |
+| `font-size-056.xht` | 408 px | **pass** |
+| `font-size-067.xht` | 128 px | **pass** |
+| `font-size-078.xht` | 64 px | **pass** |
+| `font-size-123.xht` | 2,000 px | **pass** |
+
+Ten fixed, **zero regressed**, and the 17 still-failing cases are pixel-identical - including the
+whole `-0` family (`font-size-004/015/026/037/048/059/070/081/092/100`), which is the check that the
+numeric predicate did not over-reject.
+
+**Unit tests.** `css_style::font_shorthand_tests` gains three tests: every unit in the family plus
+the `-0` forms, a rejected declaration leaving the previous one alone, and a shorthand with a
+negative size slot being invalid. `w3cos-dom`'s lib suite moves 472 passed / 12 failed → **475 / 12**,
+the same twelve names.
+
+**Full-suite result.** All ten pass in the authoritative 6,548-case run below. `css/CSS2/fonts` 26 → 15
+and `css/CSS2/css1` 64 → 62 are the only directories this rule moves, and no `-0` case changes status.
+
+### `pre { font: inherit }` reaches `font-family` (2026-09-20)
+
+`fonts-010.xht` is `div { font: 1.25em/1 Ahem }` with `pre { font: inherit; color: green }` around
+two lines of `xx`. The `div` is 40x40 and the two Ahem lines fill it exactly. The run painted the
+`pre` at the right size - 20px, inherited - but in the **UA monospace face**: the actual image is a
+40x40 red square with 104 px of green text 21 px wide, where the reference is a solid 40x40 green.
+
+The `pre` special case in `document.rs`'s `declares` closure exists because the UA stylesheet gives
+`pre` `font-family: monospace` and `white-space: pre`, and those must survive when the author says
+nothing. It fires when there is no author declaration for `font-family` - but the author here
+declared the **`font` shorthand**, which carries `font-family` with it. `font: inherit` therefore
+never reached the family while it did reach the size (`font-size` is read separately and
+`declares("font")` is false for `inherit`, so inheritance ran).
+
+The closure now also asks whether the winning `font` shorthand is `inherit`/`unset`, and only lets
+the UA value win when it is not. `white-space` is untouched: it is not part of the shorthand, so
+`pre` keeps its preserved newline. Unit test
+`user_agent::pre_accepts_author_inheritance_through_the_font_shorthand` pins both halves.
+
+**Full-suite result.** `fonts-010.xht` passes in the authoritative 6,548-case run below, one of the
+eleven `css/CSS2/fonts` cases the three fixes close.
+
+### A px `line-height` resolves against the final font-size (2026-09-20)
+
+`font-size-120.xht` is `.a { font-size: 30px }` with `.c { font-family: Ahem; line-height: 30px;
+height: 30px; width: 120px; background: red; color: green }` and one line of `FAIL`. The box is
+right in both images - 120x30 at the same place - but the glyphs sit **13 px too low**: the actual
+shows red rows 51..63 and green rows 64..93 where the reference has green 51..80.
+
+`Style::line_height` is a *ratio* multiplied by `font_size` at every use site, and
+`CSSStyleDeclaration::set_property` converts a px value with `parse_font_line_height(value,
+self.inner.font_size)` - the size it holds *at the moment the declaration is applied*. For `.c` that
+is the initial 16px, because `.c` inherits its size from `.a` and inheritance happens later in
+`document.rs`. So the ratio became 30/16 = 1.875, the line box 30 x 1.875 = 56.25px, and the 30px
+glyphs were centred in it: (56.25 - 30) / 2 = 13.125 px.
+
+Declaration **order inside one rule** decides the same way, which is what made the diagnosis
+provable. Four probes, each a 120px block with a 10px blue separator so the box edges are
+unambiguous:
+
+| probe | shape | text offset from the box top |
+|---|---|---|
+| `.wptcache/probe/fb-011.xht` | `line-height: 30px`, size inherited (30px) | **13 px** |
+| `.wptcache/probe/fb-011.xht` | `line-height: 30px`, `height: auto` | 13 px; the auto height grew to 56 px, i.e. the whole line box |
+| `.wptcache/probe/fb-011.xht` | `line-height: 1` | 0 px |
+| `.wptcache/probe/fb-013.xht` | one rule, `font-size: 30px` **before** `line-height: 30px` | **0 px** |
+| `.wptcache/probe/fb-013.xht` | one rule, `font-size: 30px` **after** `line-height: 30px` | **13 px** |
+| `.wptcache/probe/fb-013.xht` | `line-height: 30px` with `font-size: 16px` | 7 px = (30 - 16) / 2, already correct |
+
+An earlier reading of the same 13 px - "the text is anchored to the bottom of a fixed-height block" -
+came from a probe whose blocks had no separators, so an overflowing line from one block covered the
+next block's red and shifted every row estimate. The blue separators (`fb-011` onward) settled it:
+the offset is constant at 13 px for both the 30px and the 60px box, so it is a centring offset, not
+an edge anchor.
+
+**Fix.** After the font cascade, `document.rs` re-resolves the winning `line-height` longhand against
+the final `style.font_size`, exactly as `letter-spacing` and `text-indent` already do for `em`/`ex`.
+A unitless, `em`, `ex` or `%` value is font-size independent and re-resolves to itself; only `px` and
+`rem` change. The re-read only happens when the `line-height` longhand is the winning declaration, so
+a later `font` shorthand keeps ownership of the line-height it sets. Unit test
+`document::a_px_line_height_resolves_against_the_final_font_size` pins 30/30 = 1.0 and the unchanged
+30/16 = 1.875.
+
+**Targeted result.** The same 163-case suite, `target/wpt-lhfix-20260920`: `font-size-120.xht`
+3,120 px → **pass**, no regression, every other failing case pixel-identical.
+
+**Authoritative full-suite result.** 14 x 500 chunks, 8 jobs, `target/wpt-fontsize-full-20260920`,
+merged with `--suite target/wpt-all-20260919/discovered-suite.json`:
+
+```
+W3COS_WPT_MERGED passed=6140 failed=408 total=6548
+```
+
+against 6,125 / 423 before the three fixes: **15 fixed, 0 regressed**, with 6,125 pass→pass and 406
+fail→fail cases pixel-identical. Besides `font-size-120.xht`, resolving the longhand against the final
+size also closes `css1/c548-ln-ht-001.xht` (16,780 px), `linebox/leading-001.xht` (79,800 px) and
+`visudet/line-height-201.html` (23,700 px). The two failing cases whose pixel count moves are traced
+below; neither is a regression.
+
+### Failure surface snapshot after the negative font-size, `pre` inheritance and px line-height fixes (2026-09-21)
+
+`target/wpt-fontsize-full-20260920`, all 6,548 cases, **6,140 passed / 408 failed** - 15 fixed and 0
+regressed against `target/wpt-fontshort-full-20260920` (6,125 / 423).
+
+| case | before | after |
+|---|---|---|
+| `css/CSS2/linebox/leading-001.xht` | 79,800 px | **pass** |
+| `css/CSS2/visudet/line-height-201.html` | 23,700 px | **pass** |
+| `css/CSS2/css1/c548-ln-ht-001.xht` | 16,780 px | **pass** |
+| `css/CSS2/css1/c526-font-sz-003.xht` | 5,424 px | **pass** |
+| `css/CSS2/fonts/font-size-120.xht` | 3,120 px | **pass** |
+| `css/CSS2/fonts/font-size-123.xht` | 2,000 px | **pass** |
+| `css/CSS2/fonts/fonts-010.xht` | 1,496 px | **pass** |
+| `css/CSS2/fonts/font-size-056.xht` | 408 px | **pass** |
+| `css/CSS2/fonts/font-size-034.xht` | 304 px | **pass** |
+| `css/CSS2/fonts/font-size-023.xht` | 128 px | **pass** |
+| `css/CSS2/fonts/font-size-067.xht` | 128 px | **pass** |
+| `css/CSS2/fonts/font-size-078.xht` | 64 px | **pass** |
+| `css/CSS2/fonts/font-size-045.xht` | 32 px | **pass** |
+| `css/CSS2/fonts/font-size-001.xht` | 7 px | **pass** |
+| `css/CSS2/fonts/font-size-012.xht` | 6 px | **pass** |
+
+Only four directories move, and every other directory keeps both its pass and its fail count - the
+reason to spend a full suite on changes that touch declaration validity and inline metrics:
+
+| directory | before | after |
+|---|---|---|
+| `css/CSS2/fonts` | 26 | 15 |
+| `css/CSS2/css1` | 64 | 62 |
+| `css/CSS2/linebox` | 40 | 39 |
+| `css/CSS2/visudet` | 22 | 21 |
+
+`floats-clear` (80), `floats` (39), `text` (38), `normal-flow` (20) and `box-display` (16) are
+untouched.
+
+**Two failing cases change pixel count without changing status.** Both were already failing, so
+neither is a regression, and both were traced rather than accepted as noise.
+
+`css1/c548-ln-ht-002.xht` 12,120 → 14,080. The case is five paragraphs with `line-height: 200%`,
+`2`, `40px`, `-1em; 2em; -1em` and `2.5ex`; its reference render is byte-identical before and after
+(md5 `2bd2311af12b4e4ff0b77a49148ff88e`), so only the test moved. Splitting the diff by row:
+
+| rows | before | after |
+|---|---|---|
+| 0..210 (`.eight`, `.nine`) | 0 | 0 |
+| 210..300 (`.ten`, the fix's target) | 1,600 | **800** |
+| 300..600 (`.eleven`, `.seven`) | 10,520 | 13,280 |
+
+`.ten`'s first line now sits at rows 220..239, exactly where the reference puts it; before the fix it
+was at 225..244, five rows low from the 40/16 = 2.5 ratio. The fix halves the diff in the paragraph it
+targets. The aggregate grows because `.eleven` (a negative `line-height` clamped to 0 instead of
+ignored) and `.seven` (`2.5ex`) are still wrong and moved up five rows with it. That is a second-order
+geometric effect of a correct local change, not a new defect, and it should collapse once those two
+are fixed.
+
+`linebox/vertical-align-negative-leading-001.html` 85,620 → 100,680 - see the finding below.
+
+**New finding, characterised and not fixed: a non-baseline `vertical-align` paints a
+line-box-height window.** `vertical-align-negative-leading-001.html` is a
+`.container { line-height: 10px; font-size: 30px; font-family: Ahem }` whose spans carry
+`top`/`bottom`/`text-top`/`text-bottom`. The Ahem glyph is a solid block, so the orange run *is* the
+painted extent and a column scan reads it directly:
+
+| | test render | reference render |
+|---|---|---|
+| container heights | 10, 10, 10, 10, 10, 10 | 10, 30, 10, 10, 20, 20 |
+| baseline span glyph | 30 rows | 30 rows |
+| `top` / `text-top` span glyph | **10 rows**, the top 10 of its 30px content area | 30 rows |
+| `bottom` / `text-bottom` span glyph | **10 rows**, the bottom 10 of its 30px content area | 30 rows |
+
+After the fix both renders are individually conformant: the reference's container heights are exactly
+its `line-height` (10/30/10/10/20/20), and its glyph half-leading is exactly
+`(line-height - font-size) / 2` - -10 for the 10px containers, 0 for the 30px one, and -5 plus the
+probe's relative offset for the 20px ones. What still differs is that a span with a non-baseline
+`vertical-align` paints only `line-height` worth of its content area while a baseline span paints the
+full `font-size`. The engine models an inline formatting context as an anonymous flex line and maps
+`vertical-align` onto `align_self` (`css_style.rs:779-784`, `layout.rs:8705`), so those spans become
+flex items whose cross size is the line box instead of the content area.
+
+The defect predates the fix. Before it the painted window was 18.75px - the line box of the day - and
+`top` covered rows 24..42; now it is 10px and covers rows 20..29. Both are the top `line-height` of
+the same 30px content area starting at the same place, so the fix moved the window's *size* with the
+correct line box and the smaller window hides less of the 30px glyph. That is why the diff grows.
+
+`linebox/vertical-align-top-bottom-001.html` is a ready-made oracle for whoever takes this on: it is a
+`testharness` case (the runner executes testharness tests - 365 pass, 5 fail) that asserts the exact
+`offsetTop` deltas for each `vertical-align` against a 1.5 line-height, 20px Ahem section, and it
+fails today.
+
+### `font-weight` range validation and the `bolder` / `lighter` step (2026-09-21)
+
+Three `css/CSS2/fonts` cases fail on the same longhand for two different reasons.
+
+`font-matching-rule-009.xht` is `#span1 { font-weight: 400 }` next to `#span2 { font-weight: 9000 }`
+against a `font-weight-normal-ref.html` reference, and its assert is explicit: *invalid font weight
+values are set to the default weight of 400*. The engine stored `9000` verbatim and handed it to the
+font stack, which selected a heavier face, so the second line rendered wider than the first:
+
+| second line | expected | actual |
+|---|---|---|
+| widest row | `x=9..74`, 45 px | `x=9..77`, 56 px |
+| row above | `x=9..76`, 68 px | `x=9..78`, 70 px |
+
+CSS Fonts 4 §2.2 makes the longhand `<font-weight-absolute> | bolder | lighter`, with
+`<font-weight-absolute> = normal | bold | <number [1, 1000]>`. `9000` is therefore an invalid
+declaration: it has to be **dropped**, not clamped, and it must not count as declared either, or the
+element keeps the initial 400 instead of inheriting one. Clamping to 1000 was considered and rejected -
+1000 still selects a heavier face, so the two lines would still differ.
+
+`font-weight-rule-004/005` are the same longhand on the relative keywords. `-004` is
+`#parent { font-weight: 400 }` with `div div { font-weight: bolder }` against a 700 reference; `-005` is
+the same shape with a 900 parent and a 900 reference. Neither keyword was implemented: `set_property`
+matched only `normal`, `bold` and a number, so `"bolder".parse::<u16>()` failed and the declaration was
+silently dropped.
+
+**The two omissions were hiding each other.** `-006` (parent 700, child `lighter`, normal reference) and
+`-007` (parent 100, child `lighter`, 100 reference) pass today, and not by luck: a dropped relative
+keyword still leaves `declares("font-weight")` true, so `inherit_text_style` skips the parent's weight
+and the child keeps the initial 400 - which happens to equal `-006`'s reference, and matches `-007`'s
+because 100 and 400 resolve to the same serif face. Implementing `lighter` alone would have turned both
+green cases red.
+
+The step is CSS Fonts 4 §2.2.1, whose table is a set of ranges over the inherited value:
+
+| inherited `w` | `bolder` | `lighter` |
+|---|---|---|
+| `w < 100` | 400 | no change |
+| `100 ≤ w < 350` | 400 | 100 |
+| `350 ≤ w < 550` | 700 | 100 |
+| `550 ≤ w < 750` | 900 | 400 |
+| `750 ≤ w < 900` | 900 | 700 |
+| `900 ≤ w` | no change | 700 |
+
+`relative_font_weight` implements exactly those ranges and returns `None` for every absolute value, so
+the caller leaves those alone. The keywords are resolved **after** the cascade, next to the post-cascade
+`font-size` and px `line-height` re-resolution, because they need the parent's computed weight, which
+`set_property` cannot see. `set_property` leaves the weight untouched for them and `inherit_text_style`
+counts them as declared, so the step lands exactly once. The scan takes the last declaration among
+`font-weight` and `font` and only acts when it is the longhand, so a later `font` shorthand keeps owning
+the weight it sets.
+
+`is_valid_font_weight_value` is the shared predicate: the four keywords, the five CSS-wide keywords, and
+a finite number in `[1, 1000]`. `var()` and `calc()` stay valid because they cannot be judged before
+substitution. It gates both `set_property` and `declaration_value_is_valid`, so an out-of-range weight
+neither applies nor blocks inheritance. `apply_font_shorthand` applies the same range to the shorthand's
+weight token, so the shorthand cannot smuggle in a weight the longhand would reject.
+
+**Blast radius.** `font-weight: 9000` appears in exactly one file in the whole `vendor/wpt/css` tree -
+the target - and `bolder`/`lighter` in seven, of which four are in the suite and three are manual tests
+without a `rel="match"`. No file uses an unknown `font-weight` keyword, so the stricter predicate has no
+other case to move.
+
+**Targeted result.** 826 cases (`css/CSS2/fonts`, `css1`, `cascade`, `sec5`, `text`, `visuren`), 8 jobs,
+`target/wpt-fw-20260921`: **708 passed / 118 failed** - three fixed, zero regressed against the same
+subset of `target/wpt-fontsize-full-20260920`, and no still-failing case changes its pixel count.
+
+| case | before | after |
+|---|---|---|
+| `css/CSS2/fonts/font-weight-rule-004.xht` | 557 px | **pass** |
+| `css/CSS2/fonts/font-weight-rule-005.xht` | 557 px | **pass** |
+| `css/CSS2/fonts/font-matching-rule-009.xht` | 557 px | **pass** |
+
+`font-weight-rule-006` and `-007` stay green, which is the check that the step table did not overshoot.
+
+**Full-suite result.** `target/wpt-fwfull-20260921`, all 6,548 cases in 14 x 500 chunks at 8 workers,
+12:21:30 -> 12:54:51, merged with `--merge-report` x14, `--suite` and `--merge-output`:
+
+```
+W3COS_WPT_MERGED passed=6143 failed=405 total=6548
+```
+
+against 6,140 / 408: **3 fixed, 0 regressed**, with 6,140 pass→pass and 405 fail→fail cases
+pixel-identical and not one still-failing case changing its pixel count. `css/CSS2/fonts` 15 → 12 is the
+only directory that moves; the other twenty-nine hold both their pass and their fail count, including
+`css1` (62), `linebox` (39), `text` (38), `floats-clear` (80) and `visudet` (21).
+
+**Unit tests.** `css_style::tests` gains two: the predicate over its valid and invalid sets, including
+`9000` leaving a previous `400` in place, and the step table at every boundary. `w3cos-dom`'s lib suite
+is **479 passed / 12 failed** - the same twelve names recorded above. `cargo fmt --check -p w3cos-dom`
+reports 269 hunks against 261 at `ef3fd2e`; every one of the eight is inside a previous change, and
+checking each hunk that starts near this one's regions shows none of the lines this change adds is
+reformatted.
+
+### A forced break inside a split inline box restarts at the containing block edge (2026-09-21)
+
+Two of the four `*-applies-to-017` cases are not font bugs at all. Both share one fixture shape -
+`#parent, #reference { display: inline }` with `div div { display: inherit }` - and differ only in the
+property they name, so a fix that is property-agnostic settles both.
+
+| case | px | signature |
+|---|---|---|
+| `font-weight-applies-to-017.xht` | 1,026 | second line at `x=82..152`, expected `x=8..78` |
+| `font-variant-applies-to-017.xht` | 800 | second line at `x=79..145`, expected `x=8..74` |
+
+The glyphs were already correct - the run is 71 px wide in both renders, the same as the bold
+reference - and only the horizontal origin was wrong: the line after the break started where the
+previous line ended instead of at the line start.
+
+`display: inherit` is already implemented (`document.rs`, `declared_value(&["display"])`), and it is what
+puts the inner `div` into the inline context in the first place - without it the inner box would be a
+block at `x=8` and the case would pass. The lowered form of `<br/>` is a zero-width U+2028 text marker
+with `height = font-size * line-height` (`document.rs`), and a `display: inline` element whose children
+are inline becomes an anonymous flex row, so the marker and the following text are flex items of a
+**nested** row. `W3COS_DUMP_HEADLESS_LAYOUT` on the failing case shows exactly that, and it is what
+names the defect:
+
+```
+index=3 parent=1 Block  Row                  rect=(8,     51.2, 784,   57.6)   # body's IFC row
+index=4 parent=3 Inline Text "Filler Text"   rect=(8,     52.8, 70.38, 16)     # #reference
+index=6 parent=3 Inline Row                  rect=(82.38, 52.8, 70.38, 36.8)   # #parent, display: inline
+index=7 parent=6 Inline Text "\u{2028}"      rect=(82.38, 51.2, 0,     19.2)   # <br/>
+index=9 parent=6 Inline Text "Filler Text"   rect=(82.38, 72.0, 70.38, 16)     # should be x=8
+```
+
+The nested row's `x` is where the inline box lands on the line, and `project_forced_break_lines`
+derived its line origin from exactly that:
+
+```rust
+// layout.rs, before
+let line_start = parent_rect.x
+    + component.style.border_left_width.unwrap_or(component.style.border_width)
+    + padding.left;
+```
+
+That is right for the component that **owns** the line boxes - the anonymous row hosting the inline
+formatting context - and wrong for a `display: inline` box, which does not own them. CSS 2.1 §8.6
+drops an inline box's margins, borders and padding where the break splits it, and the new line box
+still spans the containing block, so the continuation starts at the containing block's content left
+edge (`x=8`), not at the fragment origin (`x=82.38`).
+
+The fix threads a line origin down the recursion and hands it to children only from components that
+own their lines:
+
+```rust
+#[derive(Clone, Copy)]
+struct LineOrigin {
+    content_left: f32,
+    content_width: f32,
+}
+
+fn owns_line_boxes(component: &Component) -> bool {
+    component.style.display != WDisplay::Inline
+        || component.style.float != WFloat::None
+        || matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+}
+```
+
+The internal marker `--w3cos-internal-inline-formatting-context` cannot be the discriminator:
+`document.rs` inserts it **only when `display: block`**, so a `display: inline` host never carries it
+and a `display: inline` test is the only reliable signal. The origin and the width must come from the
+**same** owner - keeping the inline box's own width while taking the containing block's origin would
+make `text-align: center` centre against a width it does not start in.
+
+After the fix both dumps read `x=8.0, y=72.0` for the continuation, matching the reference's second
+line. A 171-case targeted run (`applies-to-017` plus all of `css/CSS2/fonts`) went from 159/10 to
+161/10: **2 fixed, 0 regressed, 0 pixel-count changes among the still-failing**. Two units were added
+(`forced_break_inside_a_split_inline_box_restarts_at_the_containing_block_edge` pins the inline-box
+case, `forced_break_inside_an_inline_block_keeps_the_inline_block_edge` pins the boundary), and
+`cargo test -p w3cos-runtime --lib forced_break` reads 13 passed - the four pre-existing forced-break
+units are unchanged because every one of them hosts its break on a `display: block` component, where
+`owns_line_boxes` keeps the old value.
+
+Authoritative full suite, 14 x 500 at 8 workers against the same discovered manifest and user
+stylesheet: `W3COS_WPT_MERGED passed=6145 failed=403 total=6548`, from 6,143/405 - **2 fixed, 0
+regressed**, and 6,143 pass->pass plus 403 fail->fail identical by pixel count except for the one
+lateral move noted below. Per-directory only `css/CSS2/fonts` moves (12 -> 10).
+
+#### One lateral move in an already-failing case
+
+`css/CSS2/generated-content/quotes-036.xht` reads 1,842 in every run back to `wpt-ovfclip-20260919`
+and 1,840 here - a 2-pixel **improvement**, not a regression, but the mechanism is worth recording so
+the number is not mistaken for a fix. The case sets `.party1 * { display: inline }` and gives an
+inline `.b` div a `<br>` as its **first** child, so the fix moves that continuation from the `.b`
+fragment origin to `.test`'s content edge - `x=70..84` to `x=40..54`, the 30 px being `.test`'s
+`margin-left: 2em` minus the fragment offset. Pixel-by-pixel the move vacates 108 differing pixels and
+occupies 106, hence -2. The expected render is **blank** on those rows (`y=29..34` and `y=48..53`), so
+the ink is pre-existing spurious content and the case fails for an unrelated reason; the fix relocated
+it, it did not create it.
+
+### Still open: the merged `"text\u{2028}"` form and `vertical-align: top` (2026-09-21)
+
+The other two `*-applies-to-017` cases were not settled by the line-origin fix, and each needs a
+different change. Neither is a font bug.
+
+| case | px | why it is still failing |
+|---|---|---|
+| `font-applies-to-017.xht` | 906 | the break is not seen at all: two lines merged into one |
+| `font-family-applies-to-017.xht` | 64 | whole line 2 px low |
+
+**`font-applies-to-017.xht`.** `<div id="reference">Filler Text<br /></div>` lowers to a **single**
+text node `"Filler Text\u{2028}"` - `document.rs` appends the U+2028 marker to the preceding text run
+when a listener-free `<br>` sits between text nodes in the same inline parent - and
+`project_forced_break_lines` matches only `content == "\u{2028}"`, so a merged run is invisible to it.
+The measured difference is two 453-pixel bands: the actual keeps both runs on line 1 (`x=89..163`)
+while the expected puts the second at `y=72..85, x=9..83`. A predicate change is not enough on its
+own: the break was never reserved, so the line box has to grow from one line to two, and the
+projection pass only recomputes the component's **own** auto height - `body`'s height is already
+committed by the time it runs. Treat it as its own change, with the ancestor-height propagation
+designed in from the start.
+
+**`font-family-applies-to-017.xht`.** An Ahem `X` in a `display: inherit` inline box with
+`vertical-align: top`. The dump puts the row at `y=51.2` and the Ahem box at `y=52.8`; the 1.6 px is
+exactly the serif strut's half-leading (`(16 * 1.2 - 16) * 0.5`), and `vertical-align: top` should
+align the box's top with the line box top, `51.2`. `css_style.rs` maps `"top" | "text-top"` to one
+`AlignSelf::FlexStart` (and `"bottom" | "text-bottom"` to one `FlexEnd`), so the keyword conflation is
+real - but the measured placement shows the flex line's cross-start is the baseline-derived one, not
+the line box top, so fixing the keyword mapping alone will not move this box. Pin the placement model
+first.
+
+### A split inline keeps its opacity group around the block it was split around (2026-09-21)
+
+`css/CSS2/stacking-context/opacity-affects-block-in-inline.html` and its reference differ by exactly
+the whole box: **10,000** differing pixels - 100x100 - with a max channel difference of 126. Both
+draw the box in the same place; the actual paints it at full green and the reference at 50 % over
+white. This is one of the two failures the fail-closed baseline gate was carrying.
+
+```html
+<span style="opacity: 0.5;">
+  <div style="width: 100px; height: 100px; background: green;"></div>
+</span>
+```
+
+**Where the opacity went.** A `display: inline` host with an in-flow block child lowers to a
+`display: contents` wrapper holding the inline's fragments and the block it was split around, and
+`child_components` dissolves that wrapper into the surrounding block container
+(`document.rs:3455`). Two things then went wrong with the host's group opacity:
+
+- the `passive_fragment && first_block == 0` path - the one this case takes, because the
+  whitespace-only text nodes are dropped before the lowering - returned
+  `Component::boxed(Style::default(), children)`. A default wrapper, so the host's `opacity` and
+  `filter` were dropped outright.
+- the fragmenting paths clone the host style onto the fragments, so the fragments carried the
+  opacity and the **hoisted block did not**, painting at full strength next to faded fragments.
+
+A probe of this case's own component tree shows both halves at once. `opacity=0.5` reaches the
+lowering, and the tree it produces is
+
+```
+display=Block opacity=1   (body)
+  display=Block opacity=1   (empty leading fragment)
+  display=Block opacity=1   (the block child - should be 0.5)
+  display=Block opacity=1   (empty trailing fragment)
+```
+
+**The fix.** One helper, `boxed_split_inline_group(style, children)`, replaces the five
+`display: contents` wrappers the split lowers to. It hands the host's opacity to every box the
+wrapper is dissolved into - fragments and hoisted blocks alike - so the group is applied exactly
+once. The four fragment closures clear their own `opacity` back to `1.0` for the same reason. The
+two `principal_box_can_merge_generated_inline_text` paths need no change: that predicate already
+requires `style.filter.is_none() && style.opacity == 1.0 && style.transform == Transform2D::default()`
+(`document.rs:8315-8317`), so those flattening paths cannot lose a group effect in the first place.
+
+**Scope.** The group is distributed per box, which matches true group compositing whenever the
+fragments and the block do not overlap. `filter` and `transform` on a split inline are still
+dropped, and are deliberately not folded in here: a per-box filter is not equivalent to a group
+filter, so those two need the group represented as one node rather than distributed.
+
+**Evidence.** Two new unit tests, RED before the change (`left: [1.0]` against `right: [0.5]`) and
+green after: `split_inline_host_opacity_reaches_the_hoisted_block_child` (the flattening path) and
+`split_inline_fragments_and_block_child_share_one_host_opacity` (the fragmenting path).
+`cargo test -p w3cos-dom --lib` moves 479 passed / 12 failed to **481 passed / 12 failed** - the
+same twelve names failing for the same reason, so nothing is lost and nothing new breaks. A
+directed run over `stacking-context` + `block-in-inline` + `box-display` + `cascade` (284 cases, 8
+workers) is **1 fixed, 0 regressed, 0 pixel-count changes** across the 23 that still fail. The
+fail-closed gate `tests/wpt/w3cos-baseline.json` moves 8/10 to **9/10**.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
@@ -5368,7 +7448,9 @@ cargo run --profile wpt -p w3cos-wpt-runner -- \
   --artifacts target/wpt-smoke
 ```
 
-The broader ten-case baseline is also fail-closed:
+The broader ten-case baseline is also fail-closed. It currently reports 9 passing and 1 failing, and
+the failing case is a deliberate spec-version trade rather than a regression - read the note at the
+end of this section before treating that one case as red:
 
 ```bash
 cargo run --profile wpt -p w3cos-wpt-runner -- \
@@ -5392,10 +7474,29 @@ attributes with the same qualified name but different namespaces, keep quoted
 attribute values intact while splitting selector chains, and expose indexed
 NodeList entries as own properties.
 
-The recorded baseline is now 10 passing and 0 failing cases. Both new CSS
-reftests have zero differing pixels and zero maximum channel difference.
-`--report-only` remains available for intentionally red discovery manifests,
-but it is not used by either current gate.
+The recorded baseline reached 10 passing and 0 failing cases on 2026-08-24, and both of the CSS
+reftests it gained then have since regressed for reasons outside that gate's original scope. It is
+now **9 passing and 1 failing**, and the remaining failure is deliberate:
+
+| case | last pass | first fail | px then -> now |
+|---|---|---|---|
+| `css/CSS2/cascade/inherit-computed-001.html` | 2026-08-24 13:48 | 2026-08-24 23:50 | 1,256 -> 132 |
+| `css/CSS2/stacking-context/opacity-affects-block-in-inline.html` | 2026-08-25 06:08 | 2026-09-19 10:03 | 10,000 -> **pass** |
+
+`inherit-computed-001.html` is not an engine defect to chase. `em { border: inherit }` has to take
+the parent's **computed** border colour; CSS 2.1 resolves that to the parent's colour, while
+CSS Color 3 keeps `currentColor` a keyword that re-resolves against the inheriting element. The
+engine implements the CSS Color 3 rule on purpose: `4f772eb` ("resolve border currentColor without
+losing inheritance provenance") keeps the per-edge keyword mask so that
+`css/CSS2/borders/border-color-011.xht` and `-012.xht` - which inherit an omitted border colour from
+`border: none` and expect it to resolve on the receiving element - pass at zero pixels. Chromium 141
+fails `inherit-computed-001.html` as well (198 px in the 2026-09-19 over-HTTP requalification, where
+the case is already recorded as an unsatisfiable reference), so what it measures is the reference,
+not the engine. It stays in the manifest only because `TestCase` is `deny_unknown_fields` and has no
+expected-fail field.
+
+`--report-only` remains available for intentionally red discovery manifests, but it is not used by
+either current gate.
 
 `results.json` contains suite, case, subtest, and pixel-difference data.
 Reftests additionally emit `actual`, `expected`, and red-highlighted `diff`

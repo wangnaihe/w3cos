@@ -213,6 +213,17 @@ pub struct PaintArtifact {
     pub chunks: Vec<PaintChunk>,
     pub properties: PropertyTrees,
     pub node_properties: Vec<PaintProperties>,
+    /// The clip chain tip the node's own background and border paint under.
+    ///
+    /// This is `node_properties[index].clip` except for a box that clips its
+    /// own overflow: CSS 2.1 11.1.1 scopes an `overflow` clip to "the contents
+    /// of an element", so the box's own border and background stay outside its
+    /// clip. The `clip` property and inline fragment clips do apply to the box
+    /// itself, so they appear here as well. Kept beside `node_properties`
+    /// rather than inside `PaintProperties` because the latter is the
+    /// compositor's layer identity: an overflow box and its contents must keep
+    /// merging into one layer.
+    pub self_clip: Vec<PropertyNodeId>,
     pub z_order: Vec<i32>,
     pub paint_order: Vec<Vec<PaintOrderLevel>>,
     logical_paint_ordinals: Vec<usize>,
@@ -233,6 +244,7 @@ impl Default for PaintArtifact {
             chunks: Vec::new(),
             properties: PropertyTrees::default(),
             node_properties: Vec::new(),
+            self_clip: Vec::new(),
             z_order: Vec::new(),
             paint_order: Vec::new(),
             logical_paint_ordinals: Vec::new(),
@@ -1212,6 +1224,48 @@ fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
         .is_some_and(|value| value.split_ascii_whitespace().any(|side| side == name))
 }
 
+/// `overflow` applies to block containers (CSS 2.1 11.1.1). An inline box and
+/// the internal table boxes that are not block containers therefore never clip
+/// their overflowing content, however `overflow: hidden` is authored.
+fn establishes_overflow_clip(display: Display) -> bool {
+    !matches!(
+        display,
+        Display::Inline
+            | Display::TableRow
+            | Display::TableRowGroup
+            | Display::TableHeaderGroup
+            | Display::TableFooterGroup
+            | Display::TableColumn
+            | Display::TableColumnGroup
+    )
+}
+
+/// The overflow clipping region is the element's padding box (CSS 2.1 11.1.1),
+/// so the border widths come off the border box. A collapsed-border box owns
+/// only half of each shared edge, the same convention as
+/// `paint_inline_border_widths` and `box_background_positioning_rect`.
+fn overflow_clip_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
+    let scale = if style.border_collapse
+        && matches!(
+            style.display,
+            Display::TableCell | Display::Table | Display::InlineTable
+        ) {
+        0.5
+    } else {
+        1.0
+    };
+    let top = style.border_top_width.unwrap_or(style.border_width) * scale;
+    let right = style.border_right_width.unwrap_or(style.border_width) * scale;
+    let bottom = style.border_bottom_width.unwrap_or(style.border_width) * scale;
+    let left = style.border_left_width.unwrap_or(style.border_width) * scale;
+    LayoutRect {
+        x: rect.x + left,
+        y: rect.y + top,
+        width: (rect.width - left - right).max(0.0),
+        height: (rect.height - top - bottom).max(0.0),
+    }
+}
+
 pub(crate) fn box_background_paint_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
     if style.border_collapse && style.display == Display::TableCell {
         // Cell rects end on shared grid-line centers on both axes.
@@ -1635,6 +1689,7 @@ impl PaintArtifact {
             logical_paint_ordinals: logical_paint_ordinals(&nodes),
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
+            self_clip: vec![0; nodes.len()],
             z_order: vec![0; nodes.len()],
             paint_order: vec![Vec::new(); nodes.len()],
             sticky_owner: vec![None; nodes.len()],
@@ -1751,17 +1806,31 @@ impl PaintArtifact {
         }
         let overflow_x = node.style.resolved_overflow_x();
         let overflow_y = node.style.resolved_overflow_y();
-        if matches!(
-            overflow_x,
-            Overflow::Hidden | Overflow::Scroll | Overflow::Auto
-        ) || matches!(
-            overflow_y,
-            Overflow::Hidden | Overflow::Scroll | Overflow::Auto
-        ) {
+        // Snapshot the chain the box's own background and border paint under.
+        // `overflow` clips the box's contents, not the box: a
+        // `border: 10px solid black; overflow: auto` box keeps all ten pixels
+        // of its border, and a negative-margin child must not erase the
+        // parent's border either. The `clip` property and the inline fragment
+        // clip below do apply to the box itself, so each refreshes this value.
+        let mut self_clip = properties.clip;
+        if establishes_overflow_clip(node.style.display)
+            && (matches!(
+                overflow_x,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            ) || matches!(
+                overflow_y,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            ))
+        {
             properties.clip = self.properties.clips.len();
             self.properties.clips.push(ClipNode {
                 parent: inherited.clip,
-                rect: self.rect_by_index[index],
+                // The clipping region is the padding box, not the border box
+                // (CSS 2.1 11.1.1). Without the border inset a border lets
+                // exactly its own width of overflowing content show through:
+                // `css/CSS2/ui/overflow-applies-to-009.xht` leaks the 5 px of
+                // `border: 5px solid transparent`, and a 20 px border leaks 20.
+                rect: self.rect_by_index[index].map(|rect| overflow_clip_rect(&node.style, rect)),
             });
         }
         if let Some(rect) = self.rect_by_index[index]
@@ -1773,6 +1842,7 @@ impl PaintArtifact {
                 parent,
                 rect: Some(css_clip),
             });
+            self_clip = properties.clip;
         }
         if let Some(rect) = self.rect_by_index[index]
             && let Some(fragment_clip) = inline_fragment_clip_rect(&node.kind, &node.style, rect)
@@ -1783,6 +1853,7 @@ impl PaintArtifact {
                 parent,
                 rect: Some(fragment_clip),
             });
+            self_clip = properties.clip;
         }
         if node.style.opacity < 0.999 || node.style.filter.is_some() {
             properties.effect = self.properties.effects.len();
@@ -1803,6 +1874,7 @@ impl PaintArtifact {
             });
         }
         self.node_properties[index] = properties;
+        self.self_clip[index] = self_clip;
 
         if node.style.visibility != Visibility::Visible {
             return;
@@ -2002,6 +2074,126 @@ mod tests {
             width: 320.0,
             height: 80.0,
         }
+    }
+
+    #[test]
+    fn overflow_clips_only_block_containers() {
+        // `overflow` applies to block containers (CSS 2.1 11.1.1), so an inline
+        // box and the internal table boxes must leave their overflowing content
+        // visible however the author writes `overflow: hidden`
+        // (css/CSS2/ui/overflow-applies-to-008.xht and -001..-004).
+        for display in [
+            Display::Inline,
+            Display::TableRow,
+            Display::TableRowGroup,
+            Display::TableHeaderGroup,
+            Display::TableFooterGroup,
+            Display::TableColumn,
+            Display::TableColumnGroup,
+        ] {
+            assert!(
+                !establishes_overflow_clip(display),
+                "{display:?} is not a block container and must not clip"
+            );
+        }
+        for display in [
+            Display::Block,
+            Display::FlowRoot,
+            Display::Flex,
+            Display::Grid,
+            Display::InlineBlock,
+            Display::InlineFlex,
+            Display::ListItem,
+            Display::Table,
+            Display::InlineTable,
+            Display::TableCell,
+            Display::TableCaption,
+        ] {
+            assert!(
+                establishes_overflow_clip(display),
+                "{display:?} is a block container and must clip"
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_clip_region_is_the_padding_box() {
+        // The clipping region is the padding box, not the border box, so a
+        // border must not let its own width of overflowing content show
+        // through: css/CSS2/ui/overflow-applies-to-009.xht leaks exactly the
+        // 5 px of `border: 5px solid transparent` without this inset.
+        let style = Style {
+            border_width: 5.0,
+            ..Style::default()
+        };
+        let border_box = LayoutRect {
+            x: 8.0,
+            y: 51.2,
+            width: 110.0,
+            height: 30.0,
+        };
+        assert_eq!(
+            overflow_clip_rect(&style, border_box),
+            LayoutRect {
+                x: 13.0,
+                y: 56.2,
+                width: 100.0,
+                height: 20.0
+            }
+        );
+    }
+
+    #[test]
+    fn overflow_clip_applies_to_the_contents_and_not_to_the_box() {
+        // CSS 2.1 11.1.1 scopes an `overflow` clip to "the contents of an
+        // element", so a box keeps painting its own border and background while
+        // its descendants are clipped. `css/CSS2/normal-flow/negative-margin-001.html`
+        // (a `border: 10px solid orange` BFC whose negative margins push it past
+        // its parent) and `css/CSS2/positioning/absolute-non-replaced-height-006.xht`
+        // (`border: 10px solid black; overflow: auto`) both lost exactly the
+        // area of their own border when the box was clipped with its contents.
+        let outer = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let clipping = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                overflow: Overflow::Hidden,
+                border_width: 10.0,
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let child = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            vec![outer, clipping, child],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(20.0), 2)],
+            1,
+        );
+
+        let contents = artifact.node_properties[1].clip;
+        assert_ne!(contents, 0, "the clipping box hands a clip to its contents");
+        assert_eq!(
+            artifact.node_properties[2].clip, contents,
+            "the contents inherit the overflow clip"
+        );
+        assert_eq!(
+            artifact.self_clip[1], 0,
+            "the box paints its own border outside its overflow clip"
+        );
+        assert_eq!(
+            artifact.self_clip[2], contents,
+            "a descendant still paints under its parent's overflow clip"
+        );
     }
 
     #[test]

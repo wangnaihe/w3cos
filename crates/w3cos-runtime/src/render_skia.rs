@@ -147,6 +147,22 @@ fn registered_typeface(style: &Style) -> Option<(crate::font_face::LoadedFont, T
     Some((loaded, typeface))
 }
 
+/// The registered face for `style`, but only when it covers every character of
+/// `text`.
+///
+/// `css_font_runs` already prefers a registered family per character, so the
+/// registered face may only act as the fallback base for text it can paint
+/// itself. A stack such as `"Ahem", "Times New Roman"` must not measure Times
+/// characters with Ahem's metrics.
+fn registered_typeface_covering(
+    style: &Style,
+    text: &str,
+) -> Option<(crate::font_face::LoadedFont, Typeface)> {
+    let (font, typeface) = registered_typeface(style)?;
+    let render_text = text_layout::font_render_text_for_style(text, style);
+    font_covers_text(&font, render_text.as_ref()).then_some((font, typeface))
+}
+
 fn generic_serif_typeface(style: &Style) -> Option<Typeface> {
     let uses_serif = style.font_family.as_deref().is_some_and(|families| {
         families.split(',').any(|family| {
@@ -1096,10 +1112,14 @@ fn clip_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<Layou
     let Some(artifact) = artifact else {
         return Vec::new();
     };
+    // A box that clips its own overflow paints its background and border under
+    // the chain it inherited, not under the overflow clip it hands to its
+    // contents (CSS 2.1 11.1.1 clips "the contents of an element"). The
+    // artifact records both chains; this is the one the box itself uses.
     let mut current = artifact
-        .node_properties
+        .self_clip
         .get(client_index)
-        .map(|properties| properties.clip)
+        .copied()
         .unwrap_or_default();
     let mut path = Vec::new();
     while current != 0 {
@@ -1607,7 +1627,21 @@ fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) ->
     let is_extended_inline_fragment = style.custom_properties.as_ref().is_some_and(|properties| {
         properties.contains_key("--w3cos-internal-vertical-align-length")
     });
+    // An in-flow inline text run's box *is* its em box, not a container to
+    // centre within: the line box already placed it, negative half-leading
+    // included (CSS 2.1 10.8.1). Centring it here would add back exactly the
+    // `(font_size - line_height) / 2` that a short `line-height` overflows by,
+    // pinning the glyph to the line box top instead of letting it bleed above.
+    // Blockified inline runs (absolute, fixed or floated) keep their own line
+    // box, so they are excluded from this case.
+    let is_in_flow_inline = style.display == Display::Inline
+        && !matches!(
+            style.position,
+            w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+        )
+        && style.float == w3cos_std::style::Float::None;
     if is_extended_inline_fragment
+        || is_in_flow_inline
         || (style.display == Display::Block && style.justify_content != JustifyContent::Center)
     {
         0.0
@@ -1725,18 +1759,17 @@ fn alignment_ink_left(
     // inline run, an atomic inline wrapper or a lowered block leaf. Negative
     // ink bearings may overflow that origin; compensating them changes
     // otherwise identical CSS text.
-    if matches!(
-        style.display,
-        Display::Inline
-            | Display::InlineBlock
-            | Display::InlineFlex
-            | Display::InlineTable
-            | Display::Block
-            | Display::ListItem
-            | Display::TableCell
-            | Display::TableCaption
-    )
-        || style_uses_generic_monospace(style) {
+    //
+    // Every display that generates a box owns the line its text is laid out
+    // in, so all of them share that advance origin. A `display: table` or
+    // `display: table-row` box starts its text exactly like a `display: block`
+    // box (css/CSS2/generated-content/after-content-display-006.xht and
+    // -011.xht). `display: none` and `display: contents` generate no box of
+    // their own and never paint text, so they are the only displays that may
+    // still need the ink compensation below.
+    if !matches!(style.display, Display::None | Display::Contents)
+        || style_uses_generic_monospace(style)
+    {
         return 0.0;
     }
     let rendered = text_layout::font_render_text_for_style(text, style);
@@ -1774,28 +1807,27 @@ fn draw_text_line(
     style: &Style,
 ) -> f32 {
     let paint = color_paint(color, opacity);
+    let font_text = text_layout::font_render_text_for_style(text, style);
     if style_uses_ahem(style) {
+        // Ahem paints one deterministic em cell per character it covers, but
+        // `font-family` still applies per character: a stack such as
+        // `"Ahem", "Times New Roman"` keeps Times for every character Ahem
+        // has no glyph for.
         let mut cursor_x = x;
-        let snapped_top = top.round();
-        let render_text = text_layout::font_render_text_for_style(text, style);
-        for character in render_text.chars() {
-            if !character.is_whitespace() {
-                let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
-                canvas.draw_rect(
-                    Rect::from_xywh(
-                        cursor_x.round(),
-                        snapped_top + glyph_top.round(),
-                        font_size.round(),
-                        glyph_height.round(),
-                    ),
-                    &paint,
-                );
-            }
-            cursor_x += font_size;
-            cursor_x += style.letter_spacing;
-            if is_word_spacing_character(character) {
-                cursor_x += style.word_spacing;
-            }
+        let mut baseline = None;
+        for segment in ahem_segments(font_text.as_ref(), style) {
+            cursor_x += match segment {
+                AhemSegment::Cell(cells) => {
+                    draw_ahem_cells(canvas, cursor_x, top, cells, font_size, style, &paint)
+                }
+                AhemSegment::Stack(stack) => {
+                    let baseline = *baseline
+                        .get_or_insert_with(|| text_baseline(top, font_size, typeface, style));
+                    draw_font_stack_runs(
+                        canvas, cursor_x, baseline, stack, font_size, typeface, style, &paint,
+                    )
+                }
+            };
         }
         return cursor_x - x;
     }
@@ -1821,8 +1853,138 @@ fn draw_text_line(
         }
         return cursor_x - x;
     }
+    let baseline = text_baseline(top, font_size, typeface, style);
+    draw_font_stack_runs(
+        canvas,
+        x,
+        baseline,
+        font_text.as_ref(),
+        font_size,
+        typeface,
+        style,
+        &paint,
+    )
+}
+
+/// How a slice of a line has to be painted.
+#[derive(Debug)]
+enum AhemSegment<'a> {
+    /// Characters the Ahem face covers: one deterministic em cell each.
+    Cell(&'a str),
+    /// Characters Ahem does not cover: painted by the CSS font stack.
+    Stack(&'a str),
+}
+
+/// Split `text` where the Ahem face stops covering characters.
+///
+/// The deterministic cell is only known to be wrong once a registered Ahem
+/// face actually lacks the character, so a stack without one keeps cells for
+/// the whole line and every existing Ahem case is untouched.
+fn ahem_segments<'a>(text: &'a str, style: &Style) -> Vec<AhemSegment<'a>> {
+    let Some(ahem) = registered_ahem_face(style) else {
+        return vec![AhemSegment::Cell(text)];
+    };
+    ahem_segments_for_face(text, &ahem)
+}
+
+/// Split `text` at the characters `ahem` does not cover.
+fn ahem_segments_for_face<'a>(
+    text: &'a str,
+    ahem: &crate::font_face::LoadedFont,
+) -> Vec<AhemSegment<'a>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut covered_here = None;
+    for (index, character) in text.char_indices() {
+        let covered = ahem.supports_character(character);
+        if covered_here == Some(covered) {
+            continue;
+        }
+        if let Some(previous) = covered_here {
+            segments.push(ahem_segment(previous, &text[start..index]));
+        }
+        start = index;
+        covered_here = Some(covered);
+    }
+    if let Some(last) = covered_here {
+        segments.push(ahem_segment(last, &text[start..]));
+    }
+    segments
+}
+
+fn ahem_segment<'a>(covered: bool, text: &'a str) -> AhemSegment<'a> {
+    if covered {
+        AhemSegment::Cell(text)
+    } else {
+        AhemSegment::Stack(text)
+    }
+}
+
+/// Whether `font` has a glyph for every character of `text`.
+fn font_covers_text(font: &crate::font_face::LoadedFont, text: &str) -> bool {
+    text.chars().all(|character| font.supports_character(character))
+}
+
+/// The Ahem face, but only when a parsed one can prove character coverage.
+///
+/// A placeholder registration carries no bytes, and an unparsed face reports
+/// every character as missing, so coverage may only be trusted with a parsed
+/// face present.
+fn registered_ahem_face(style: &Style) -> Option<crate::font_face::LoadedFont> {
+    if !style_uses_ahem(style) {
+        return None;
+    }
+    let face_style = match style.font_style {
+        w3cos_std::style::FontStyle::Normal => crate::font_face::FontFaceStyle::Normal,
+        w3cos_std::style::FontStyle::Italic => crate::font_face::FontFaceStyle::Italic,
+        w3cos_std::style::FontStyle::Oblique => crate::font_face::FontFaceStyle::Oblique,
+    };
+    let ahem = crate::font_face::FontRegistry::global().resolve(
+        "Ahem",
+        crate::font_face::FontWeight(style.font_weight),
+        face_style,
+    )?;
+    ahem.parsed()?;
+    Some(ahem)
+}
+
+/// Paint one deterministic em cell per character and return the advance.
+fn draw_ahem_cells(
+    canvas: &Canvas,
+    x: f32,
+    top: f32,
+    text: &str,
+    font_size: f32,
+    style: &Style,
+    paint: &Paint,
+) -> f32 {
     let mut cursor_x = x;
-    let font_text = text_layout::font_render_text_for_style(text, style);
+    let snapped_top = top.round();
+    for character in text.chars() {
+        if !character.is_whitespace() {
+            let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
+            canvas.draw_rect(
+                Rect::from_xywh(
+                    cursor_x.round(),
+                    snapped_top + glyph_top.round(),
+                    font_size.round(),
+                    glyph_height.round(),
+                ),
+                paint,
+            );
+        }
+        cursor_x += font_size;
+        cursor_x += style.letter_spacing;
+        if is_word_spacing_character(character) {
+            cursor_x += style.word_spacing;
+        }
+    }
+    cursor_x - x
+}
+
+/// Distance from the line top to the alphabetic baseline, taken from the face
+/// that establishes the line's metrics.
+fn text_baseline(top: f32, font_size: f32, typeface: &Typeface, style: &Style) -> f32 {
     let registered = registered_typeface(style);
     let generic = generic_serif_typeface(style);
     let baseline_typeface = registered
@@ -1832,16 +1994,35 @@ fn draw_text_line(
         .unwrap_or(typeface);
     let (_, metrics) = Font::new(baseline_typeface, font_size).metrics();
     let metric_height = (metrics.descent - metrics.ascent).max(f32::EPSILON);
-    let baseline = top + font_size * (-metrics.ascent / metric_height).clamp(0.0, 1.0);
-    for run in css_font_runs(font_text.as_ref(), typeface, style) {
+    top + font_size * (-metrics.ascent / metric_height).clamp(0.0, 1.0)
+}
+
+/// Paint `text` with the CSS font stack and return the advance.
+fn draw_font_stack_runs(
+    canvas: &Canvas,
+    x: f32,
+    baseline: f32,
+    text: &str,
+    font_size: f32,
+    typeface: &Typeface,
+    style: &Style,
+    paint: &Paint,
+) -> f32 {
+    let mut cursor_x = x;
+    for run in css_font_runs(text, typeface, style) {
         let font = Font::new(&run.typeface, font_size);
         if let Some(shaped) = crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style) {
-            canvas.draw_glyphs_at(&shaped.glyphs, shaped.positions.as_slice(),
-                (cursor_x, baseline), &font, &paint);
+            canvas.draw_glyphs_at(
+                &shaped.glyphs,
+                shaped.positions.as_slice(),
+                (cursor_x, baseline),
+                &font,
+                paint,
+            );
             cursor_x += shaped.advance;
         } else {
-            canvas.draw_str(run.text, (cursor_x, baseline), &font, &paint);
-            cursor_x += font.measure_str(run.text, Some(&paint)).0;
+            canvas.draw_str(run.text, (cursor_x, baseline), &font, paint);
+            cursor_x += font.measure_str(run.text, Some(paint)).0;
         }
     }
     cursor_x - x
@@ -1857,38 +2038,89 @@ fn measure_skia_text_ink_bounds(
     if style.is_some_and(style_uses_ahem) {
         let style = style.expect("Ahem style checked above");
         let render_text = text_layout::font_render_text_for_style(text, style);
-        let character_count = render_text.chars().count();
         let mut cursor = 0.0_f32;
-        let mut left = None::<f32>;
-        let mut right = 0.0_f32;
+        let mut left = f32::MAX;
         let mut top = f32::MAX;
+        let mut right = f32::MIN;
         let mut bottom = f32::MIN;
-        for (index, character) in render_text.chars().enumerate() {
-            if !character.is_whitespace() {
-                left.get_or_insert(cursor);
-                right = cursor + font_size;
-                let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
-                top = top.min(glyph_top);
-                bottom = bottom.max(glyph_top + glyph_height);
+        let mut saw_ink = false;
+        for segment in ahem_segments(render_text.as_ref(), style) {
+            let (advance, ink) = match segment {
+                AhemSegment::Cell(cells) => ahem_cell_ink_bounds(cells, font_size, style),
+                AhemSegment::Stack(stack) => {
+                    font_stack_ink_bounds(stack, font_size, typeface, font_weight, Some(style))
+                }
+            };
+            if ink.width > 0.0 || ink.height > 0.0 {
+                saw_ink = true;
+                left = left.min(cursor + ink.left);
+                top = top.min(ink.top);
+                right = right.max(cursor + ink.left + ink.width);
+                bottom = bottom.max(ink.top + ink.height);
             }
-            cursor += font_size;
-            if index + 1 < character_count {
-                cursor += style.letter_spacing;
-            }
-            if is_word_spacing_character(character) {
-                cursor += style.word_spacing;
-            }
+            cursor += advance;
         }
-        return match left {
-            Some(left) => text_layout::InkBounds {
-                left,
-                top,
-                width: right - left,
-                height: bottom - top,
-            },
-            _ => text_layout::InkBounds::empty(),
+        if !saw_ink {
+            return text_layout::InkBounds::empty();
+        }
+        return text_layout::InkBounds {
+            left,
+            top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
         };
     }
+    font_stack_ink_bounds(text, font_size, typeface, font_weight, style).1
+}
+
+/// Ink and advance of the deterministic Ahem cells covering `text`.
+fn ahem_cell_ink_bounds(
+    text: &str,
+    font_size: f32,
+    style: &Style,
+) -> (f32, text_layout::InkBounds) {
+    let character_count = text.chars().count();
+    let mut cursor = 0.0_f32;
+    let mut left = None::<f32>;
+    let mut right = 0.0_f32;
+    let mut top = f32::MAX;
+    let mut bottom = f32::MIN;
+    for (index, character) in text.chars().enumerate() {
+        if !character.is_whitespace() {
+            left.get_or_insert(cursor);
+            right = cursor + font_size;
+            let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
+            top = top.min(glyph_top);
+            bottom = bottom.max(glyph_top + glyph_height);
+        }
+        cursor += font_size;
+        if index + 1 < character_count {
+            cursor += style.letter_spacing;
+        }
+        if is_word_spacing_character(character) {
+            cursor += style.word_spacing;
+        }
+    }
+    let bounds = match left {
+        Some(left) => text_layout::InkBounds {
+            left,
+            top,
+            width: right - left,
+            height: bottom - top,
+        },
+        _ => text_layout::InkBounds::empty(),
+    };
+    (cursor, bounds)
+}
+
+/// Ink and advance of `text` measured through the CSS font stack.
+fn font_stack_ink_bounds(
+    text: &str,
+    font_size: f32,
+    typeface: &Typeface,
+    font_weight: u16,
+    style: Option<&Style>,
+) -> (f32, text_layout::InkBounds) {
     let mut cursor_x = 0.0_f32;
     let mut left = f32::MAX;
     let mut top = f32::MAX;
@@ -1926,15 +2158,18 @@ fn measure_skia_text_ink_bounds(
     }
 
     if !saw_ink {
-        return text_layout::InkBounds::empty();
+        return (cursor_x, text_layout::InkBounds::empty());
     }
 
-    text_layout::InkBounds {
-        left,
-        top,
-        width: (right - left).max(0.0),
-        height: (bottom - top).max(0.0),
-    }
+    (
+        cursor_x,
+        text_layout::InkBounds {
+            left,
+            top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        },
+    )
 }
 
 fn ahem_glyph_vertical_bounds(character: char, font_size: f32) -> (f32, f32) {
@@ -1949,6 +2184,67 @@ fn ahem_glyph_vertical_bounds(character: char, font_size: f32) -> (f32, f32) {
     }
 }
 
+#[cfg(test)]
+mod ahem_segment_tests {
+    use super::{AhemSegment, ahem_segments_for_face, font_covers_text};
+    use crate::font_face::{FontFace, FontFaceStyle, FontRegistry, FontSource, FontWeight};
+
+    /// Ahem covers Latin-1 but stops short of Latin Extended-A, which is the
+    /// gap `font-family-013` builds `"Ahem", "Times New Roman"` on.
+    fn pinned_ahem() -> Option<crate::font_face::LoadedFont> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let bytes = std::fs::read(path).ok()?;
+        let registry = FontRegistry::new();
+        registry
+            .register(FontFace {
+                family: "Ahem".into(),
+                src: FontSource::Bytes(bytes),
+                ..Default::default()
+            })
+            .expect("Ahem registers");
+        registry.resolve("Ahem", FontWeight::NORMAL, FontFaceStyle::Normal)
+    }
+
+    #[test]
+    fn ahem_covers_ascii_but_not_latin_extended_a() {
+        let Some(ahem) = pinned_ahem() else {
+            eprintln!("skipped: no pinned WPT checkout");
+            return;
+        };
+        assert!(font_covers_text(&ahem, "T"));
+        assert!(!font_covers_text(&ahem, "\u{0162}"));
+        assert!(!font_covers_text(&ahem, "T\u{0162}"));
+    }
+
+    #[test]
+    fn cells_stop_at_the_coverage_boundary() {
+        let Some(ahem) = pinned_ahem() else {
+            eprintln!("skipped: no pinned WPT checkout");
+            return;
+        };
+        let segments = ahem_segments_for_face("T\u{0162}T", &ahem);
+        assert_eq!(segments.len(), 3, "{segments:?}");
+        assert!(matches!(segments[0], AhemSegment::Cell(t) if t == "T"));
+        assert!(matches!(segments[1], AhemSegment::Stack(t) if t == "\u{0162}"));
+        assert!(matches!(segments[2], AhemSegment::Cell(t) if t == "T"));
+    }
+
+    /// `font-family-013` and `fonts-013` are four uncovered characters in a
+    /// row; they must stay one run so the stack shapes them together.
+    #[test]
+    fn uncovered_text_stays_one_stack_run() {
+        let Some(ahem) = pinned_ahem() else {
+            eprintln!("skipped: no pinned WPT checkout");
+            return;
+        };
+        let segments = ahem_segments_for_face("\u{0162}\u{0119}\u{015f}\u{0163}", &ahem);
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert!(
+            matches!(segments[0], AhemSegment::Stack(t) if t == "\u{0162}\u{0119}\u{015f}\u{0163}")
+        );
+    }
+}
+
 fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
     let render_text = text_layout::font_render_text_for_style(text, style);
     let word_spacing = render_text
@@ -1957,10 +2253,13 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
         .count() as f32
         * style.word_spacing;
     if style_uses_ahem(style) {
-        let character_count = render_text.chars().count();
-        return character_count as f32 * style.font_size
-            + character_count as f32 * style.letter_spacing
-            + word_spacing;
+        return ahem_segments(render_text.as_ref(), style)
+            .into_iter()
+            .map(|segment| match segment {
+                AhemSegment::Cell(cells) => ahem_cell_advance(cells, style),
+                AhemSegment::Stack(stack) => font_stack_advance(stack, typeface, style),
+            })
+            .sum();
     }
     if style_uses_generic_monospace(style) {
         let character_count = render_text.chars().count();
@@ -1971,15 +2270,40 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
             + character_count as f32 * style.letter_spacing
             + word_spacing;
     }
-    css_font_runs(render_text.as_ref(), typeface, style)
+    font_stack_advance(render_text.as_ref(), typeface, style)
+}
+
+/// Advance of the deterministic Ahem cells covering `text`.
+fn ahem_cell_advance(text: &str, style: &Style) -> f32 {
+    let character_count = text.chars().count();
+    let word_spacing = text
+        .chars()
+        .filter(|character| is_word_spacing_character(*character))
+        .count() as f32
+        * style.word_spacing;
+    character_count as f32 * style.font_size
+        + character_count as f32 * style.letter_spacing
+        + word_spacing
+}
+
+/// Advance of `text` measured through the CSS font stack.
+fn font_stack_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
+    css_font_runs(text, typeface, style)
         .into_iter()
         .map(|run| {
             crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style)
                 .map(|shaped| shaped.advance)
-                .unwrap_or_else(|| Font::new(run.typeface, style.font_size)
-                    .measure_str(run.text, None).0
-                    + run.text.chars().filter(|character| is_word_spacing_character(*character))
-                        .count() as f32 * style.word_spacing)
+                .unwrap_or_else(|| {
+                    Font::new(run.typeface, style.font_size)
+                        .measure_str(run.text, None)
+                        .0
+                        + run
+                            .text
+                            .chars()
+                            .filter(|character| is_word_spacing_character(*character))
+                            .count() as f32
+                            * style.word_spacing
+                })
         })
         .sum::<f32>()
 }
@@ -2011,7 +2335,7 @@ fn style_uses_generic_monospace(style: &Style) -> bool {
 }
 
 pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
-    let registered = registered_typeface(style);
+    let registered = registered_typeface_covering(style, text);
     let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
         let primary = registered
@@ -2046,7 +2370,7 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
 }
 
 pub(crate) fn measure_skia_wrapped_text_height(text: &str, width: f32, style: &Style) -> f32 {
-    let registered = registered_typeface(style);
+    let registered = registered_typeface_covering(style, text);
     let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
         let primary = registered
@@ -3064,6 +3388,94 @@ mod tests {
             ..Style::default()
         };
         assert!((text_vertical_offset(&centered, 84.0, 19.2) - 32.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_text_keeps_its_line_box_instead_of_centring_in_its_em_box() {
+        // A short `line-height` overflows the line box symmetrically. The
+        // painter must not add that half-leading back as a centring offset, or
+        // the glyph lands on the line box top instead of bleeding above it.
+        let inline = Style {
+            display: Display::Inline,
+            font_size: 20.0,
+            line_height: 0.0,
+            ..Style::default()
+        };
+        assert_eq!(text_vertical_offset(&inline, 20.0, 0.0), 0.0);
+        assert_eq!(text_vertical_offset(&inline, 20.0, 10.0), 0.0);
+
+        // A blockified inline run owns its own line box and still centres.
+        for position in [
+            w3cos_std::style::Position::Absolute,
+            w3cos_std::style::Position::Fixed,
+        ] {
+            let blockified = Style {
+                position,
+                ..inline.clone()
+            };
+            assert!((text_vertical_offset(&blockified, 20.0, 0.0) - 10.0).abs() < 0.01);
+        }
+        let floated = Style {
+            float: w3cos_std::style::Float::Left,
+            ..inline.clone()
+        };
+        assert!((text_vertical_offset(&floated, 20.0, 0.0) - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_origin_does_not_depend_on_the_box_display() {
+        // Every display that generates a box owns the line its text is laid out
+        // in, so a negative ink bearing must not move it: `display: table` and
+        // `display: table-row` start their text exactly like `display: block`.
+        // A whitelist here silently regressed the table parts and `flex` (which
+        // is `Display`'s `#[default]`, so it also catches an unresolved
+        // `display: inherit`). See
+        // css/CSS2/generated-content/after-content-display-006.xht and -011.xht.
+        let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let ink_left = -1.0;
+        for display in [
+            Display::Block,
+            Display::FlowRoot,
+            Display::Flex,
+            Display::Grid,
+            Display::Inline,
+            Display::InlineBlock,
+            Display::InlineFlex,
+            Display::Table,
+            Display::InlineTable,
+            Display::TableRowGroup,
+            Display::TableHeaderGroup,
+            Display::TableFooterGroup,
+            Display::TableRow,
+            Display::TableColumnGroup,
+            Display::TableColumn,
+            Display::TableCell,
+            Display::TableCaption,
+            Display::ListItem,
+        ] {
+            let style = Style {
+                display,
+                ..Style::default()
+            };
+            assert_eq!(
+                alignment_ink_left("Filler text", ink_left, 16.0, &typeface, &style),
+                0.0,
+                "{display:?} owns its line box and must keep the advance origin"
+            );
+        }
+        // Only the displays that generate no box of their own keep the ink
+        // compensation, and those never paint text.
+        for display in [Display::None, Display::Contents] {
+            let style = Style {
+                display,
+                ..Style::default()
+            };
+            assert_eq!(
+                alignment_ink_left("Filler text", ink_left, 16.0, &typeface, &style),
+                ink_left,
+                "{display:?} generates no box and keeps the compensation"
+            );
+        }
     }
 
     #[test]

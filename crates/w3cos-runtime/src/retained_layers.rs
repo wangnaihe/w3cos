@@ -260,6 +260,12 @@ fn content_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> 
             None => 0u8.hash(&mut hasher),
         }
     }
+    // Which chain a box paints its own border and background under is not
+    // derivable from `node_properties` alone once an overflow clip is in play,
+    // so hash it explicitly rather than trusting the clip tree to imply it.
+    for clip in &artifact.self_clip {
+        clip.hash(&mut hasher);
+    }
     for effect in &artifact.properties.effects {
         effect.parent.hash(&mut hasher);
         effect.filter.hash(&mut hasher);

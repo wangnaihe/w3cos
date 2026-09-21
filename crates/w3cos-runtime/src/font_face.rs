@@ -444,7 +444,7 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
 }
 
 impl FontRegistry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             revision: AtomicU64::new(0),
             fonts: Mutex::new(HashMap::new()),
@@ -1230,6 +1230,90 @@ mod tests {
         );
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap().family, "Fallback");
+    }
+
+    /// The corpus's per-character fallback cases are all built on Ahem, which
+    /// covers 278 codepoints and none of Latin Extended-A. `font-family-013`
+    /// asserts that `"Ahem", "Times New Roman"` renders `U+0162` exactly like
+    /// `"Times New Roman"` alone, which only holds if cmap coverage - not the
+    /// family order - decides which face paints each character.
+    #[test]
+    fn ahem_does_not_claim_latin_extended_a() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skipped: no pinned WPT checkout at {path}");
+            return;
+        };
+        let registry = FontRegistry::new();
+        registry
+            .register(FontFace {
+                family: "Ahem".into(),
+                src: FontSource::Bytes(bytes),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let ahem = registry
+            .resolve("Ahem", FontWeight::NORMAL, FontFaceStyle::Normal)
+            .expect("Ahem resolves once registered");
+        assert!(ahem.supports_character('T'), "Ahem covers U+0054");
+        for character in ['\u{0162}', '\u{0119}', '\u{015f}', '\u{0163}'] {
+            assert!(
+                !ahem.supports_character(character),
+                "Ahem must not claim U+{:04X}",
+                character as u32
+            );
+        }
+    }
+
+    /// The same rule through the public entry point: an uncovered character
+    /// must move to the next family rather than being painted by the first.
+    #[test]
+    fn an_uncovered_character_falls_through_to_the_next_family() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let Ok(ahem_bytes) = std::fs::read(path) else {
+            eprintln!("skipped: no pinned WPT checkout at {path}");
+            return;
+        };
+        let registry = FontRegistry::new();
+        registry
+            .register(FontFace {
+                family: "Ahem".into(),
+                src: FontSource::Bytes(ahem_bytes),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .register(FontFace {
+                family: "Second".into(),
+                src: FontSource::Bytes(scaled_inter_font(1)),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let style = w3cos_std::style::Style {
+            font_family: Some("\"Ahem\", Second".into()),
+            ..Default::default()
+        };
+        let runs = registry.resolve_style_runs(&style, "\u{0162}T");
+        let families = runs
+            .iter()
+            .map(|run| {
+                run.font
+                    .as_ref()
+                    .map_or("<none>".to_string(), |font| font.family.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            families.first().map(String::as_str),
+            Some("Second"),
+            "U+0162 is not in Ahem, so the second family must paint it: {families:?}"
+        );
+        assert_eq!(
+            families.last().map(String::as_str),
+            Some("Ahem"),
+            "U+0054 is in Ahem, so the first family keeps it: {families:?}"
+        );
     }
 
     #[test]

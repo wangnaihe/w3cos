@@ -1178,6 +1178,23 @@ impl Document {
         let mut style = merged.to_style();
 
         if let Some(parent) = inherited {
+            // `pre` keeps the UA stylesheet's `monospace` unless the author asks
+            // for something else. The `font` shorthand asks for it too: `font:
+            // inherit` has to reach `font-family`, or `fonts-010`
+            // (`div { font: 1.25em/1 Ahem } pre { font: inherit }`) keeps the
+            // monospace face while inheriting the 20px size.
+            let font_shorthand_inherits = author_declarations
+                .iter()
+                .rev()
+                .find(|(name, value, _)| {
+                    css_property_eq(name, "font") && declaration_value_is_valid("font", value)
+                })
+                .is_some_and(|(_, value, _)| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "inherit" | "unset"
+                    )
+                });
             let declares = |property: &str| {
                 let winning_author_value = author_declarations
                     .iter()
@@ -1193,6 +1210,7 @@ impl Document {
                 if winning_author_value.is_none()
                     && node.tag.as_str() == "pre"
                     && matches!(property, "white-space" | "font-family")
+                    && !(font_shorthand_inherits && css_property_eq(property, "font-family"))
                 {
                     return true;
                 }
@@ -1227,7 +1245,24 @@ impl Document {
                 .map(|(name, value, _)| (name.as_str(), value.as_str()))
                 .last()
         };
-        if let Some((property, value)) = declared_property_value(&["font-size", "fontSize", "font"])
+        // An invalid declaration is dropped, so the size slot has to resolve
+        // against the last *valid* declaration rather than the last one.
+        // `css1/c526-font-sz-003` is `font-size: 1em; font-size: -0.5in`: the
+        // `1em` still has to be resolved to px.
+        let declared_valid_property_value = |properties: &[&str]| {
+            author_declarations
+                .iter()
+                .filter(|(name, value, _)| {
+                    properties
+                        .iter()
+                        .any(|property| css_property_eq(name, property))
+                        && declaration_value_is_valid(name, value)
+                })
+                .map(|(name, value, _)| (name.as_str(), value.as_str()))
+                .last()
+        };
+        if let Some((property, value)) =
+            declared_valid_property_value(&["font-size", "fontSize", "font"])
         {
             let parent = inherited.cloned().unwrap_or_default();
             let value = if css_property_eq(property, "font") {
@@ -1239,6 +1274,50 @@ impl Document {
             if let Some(relative_size) = relative_size {
                 style.font_size = relative_size;
             }
+        }
+        // A px or rem `line-height` is an absolute length, so it has to be
+        // resolved against the element's *final* computed font-size.
+        // `set_property` can only divide by the size it holds when the
+        // declaration is applied, which for an inherited size - or for a
+        // same-rule `line-height` written before `font-size` - is still the
+        // initial 16px. `font-size-120` is `.a { font-size: 30px }` with
+        // `.c { line-height: 30px }`: 30/16 = 1.875 made the line box 56.25px
+        // instead of 30px and pushed the text 13px down inside its box. A
+        // unitless, `em`, `ex` or `%` value is font-size independent and
+        // re-resolves to itself. Only the longhand is re-read, and only when
+        // it is the winning declaration - a later `font` shorthand owns the
+        // line-height it sets.
+        if let Some((name, value, _)) = author_declarations.iter().rev().find(|(name, _, _)| {
+            css_property_eq(name, "line-height") || css_property_eq(name, "font")
+        }) && css_property_eq(name, "line-height")
+        {
+            let value = value.trim();
+            if !value.eq_ignore_ascii_case("normal")
+                && let Some(resolved) = crate::css_style::parse_font_line_height(value, style.font_size)
+            {
+                style.line_height = resolved;
+            }
+        }
+        // `bolder` and `lighter` are relative to the parent's computed weight,
+        // so they can only be resolved once the parent is known. `set_property`
+        // deliberately leaves the weight untouched for them and
+        // `inherit_text_style` treats them as declared, so the step lands here.
+        // `font-weight-rule-004` (`#parent { font-weight: 400 }` with
+        // `div div { font-weight: bolder }` against a 700 reference), `-005`
+        // (900 stays 900), `-006` (700 → 400) and `-007` (100 stays 100) are
+        // the four cases that pin the step table down. Only the longhand is
+        // read, and only when it beats a later `font` shorthand - the shorthand
+        // owns the weight it sets.
+        if let Some((name, value, _)) = author_declarations.iter().rev().find(|(name, value, _)| {
+            (css_property_eq(name, "font-weight") || css_property_eq(name, "font"))
+                && declaration_value_is_valid(name, value)
+        }) && !css_property_eq(name, "font")
+            && let Some(weight) = crate::css_style::relative_font_weight(
+                value,
+                inherited.map(|parent| parent.font_weight).unwrap_or(400),
+            )
+        {
+            style.font_weight = weight;
         }
         let edge_ex_size = css_ex_size(&style);
         if let Some(value) = declared_value(&["text-indent", "textIndent"])
@@ -4493,6 +4572,7 @@ impl Document {
                     }
                 }
                 promote_passive_vertical_align_extension(&mut style, &children);
+                annotate_inline_line_extra_ascent(&mut children);
                 if matches!(
                     style.display,
                     w3cos_std::style::Display::Block
@@ -5354,6 +5434,8 @@ impl Document {
                     let fragment = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
                         fragment.display = w3cos_std::style::Display::Inline;
+                        // `boxed_split_inline_group` owns the host opacity.
+                        fragment.opacity = 1.0;
                         fragment.width = w3cos_std::style::Dimension::Auto;
                         fragment.height = w3cos_std::style::Dimension::Auto;
                         fragment.min_width = w3cos_std::style::Dimension::Auto;
@@ -5393,9 +5475,7 @@ impl Document {
                         }
                     }
                     fragments.push(fragment(!inline_start_is_left, inline_start_is_left));
-                    let mut contents_style = w3cos_std::style::Style::default();
-                    contents_style.display = w3cos_std::style::Display::Contents;
-                    return w3cos_std::Component::boxed(contents_style, fragments);
+                    return boxed_split_inline_group(&style, fragments);
                 }
 
                 if block_in_inline
@@ -5446,10 +5526,9 @@ impl Document {
                     if passive_fragment && first_block == 0 {
                         // A decoration-free inline has no principal box to
                         // preserve around a leading in-flow block. Its nearest
-                        // painted inline ancestor owns the split fragments.
-                        let mut contents_style = w3cos_std::style::Style::default();
-                        contents_style.display = w3cos_std::style::Display::Contents;
-                        return w3cos_std::Component::boxed(contents_style, children);
+                        // painted inline ancestor owns the split fragments, but
+                        // the host's opacity group still has to reach the block.
+                        return boxed_split_inline_group(&style, children);
                     }
                     let fragment_style = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
@@ -5461,6 +5540,8 @@ impl Document {
                         fragment.flex_direction = w3cos_std::style::FlexDirection::Row;
                         fragment.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
                         fragment.align_items = w3cos_std::style::AlignItems::Baseline;
+                        // `boxed_split_inline_group` owns the host opacity.
+                        fragment.opacity = 1.0;
                         fragment.width = if passive_fragment {
                             w3cos_std::style::Dimension::Percent(100.0)
                         } else {
@@ -5620,9 +5701,7 @@ impl Document {
                         false,
                         trailing,
                     ));
-                    let mut contents_style = w3cos_std::style::Style::default();
-                    contents_style.display = w3cos_std::style::Display::Contents;
-                    return w3cos_std::Component::boxed(contents_style, fragments);
+                    return boxed_split_inline_group(&style, fragments);
                 }
 
                 if block_in_inline
@@ -5647,6 +5726,8 @@ impl Document {
                     let fragment_style = |inline_start: bool| {
                         let mut fragment = style.clone();
                         fragment.display = w3cos_std::style::Display::Inline;
+                        // `boxed_split_inline_group` owns the host opacity.
+                        fragment.opacity = 1.0;
                         fragment.width = w3cos_std::style::Dimension::Auto;
                         fragment.height = w3cos_std::style::Dimension::Auto;
                         fragment.min_width = w3cos_std::style::Dimension::Auto;
@@ -5680,9 +5761,7 @@ impl Document {
                     let trailing = children.collect::<Vec<_>>();
                     let start = w3cos_std::Component::row(fragment_style(true), Vec::new());
                     let end = w3cos_std::Component::row(fragment_style(false), trailing);
-                    let mut contents_style = w3cos_std::style::Style::default();
-                    contents_style.display = w3cos_std::style::Display::Contents;
-                    return w3cos_std::Component::boxed(contents_style, vec![start, block, end]);
+                    return boxed_split_inline_group(&style, vec![start, block, end]);
                 }
 
                 if block_in_inline
@@ -5698,6 +5777,8 @@ impl Document {
                     let side_fragment = |left: bool| {
                         let mut fragment = style.clone();
                         fragment.display = w3cos_std::style::Display::Inline;
+                        // `boxed_split_inline_group` owns the host opacity.
+                        fragment.opacity = 1.0;
                         fragment.width = w3cos_std::style::Dimension::Auto;
                         fragment.height = w3cos_std::style::Dimension::Auto;
                         fragment.min_width = w3cos_std::style::Dimension::Auto;
@@ -5766,9 +5847,7 @@ impl Document {
                         {
                             fragments.push(side_fragment(!inline_start_is_left));
                         }
-                        let mut contents_style = w3cos_std::style::Style::default();
-                        contents_style.display = w3cos_std::style::Display::Contents;
-                        return w3cos_std::Component::boxed(contents_style, fragments);
+                        return boxed_split_inline_group(&style, fragments);
                     }
                 }
 
@@ -7262,6 +7341,18 @@ fn declaration_value_is_valid(property: &str, value: &str) -> bool {
                 "currentcolor" | "inherit" | "initial" | "revert" | "revert-layer" | "unset"
             );
     }
+    if css_property_eq(property, "font-family") {
+        return crate::css_style::is_valid_font_family_value(value);
+    }
+    if css_property_eq(property, "font") {
+        return crate::css_style::is_valid_font_shorthand_value(value);
+    }
+    if css_property_eq(property, "font-size") {
+        return !crate::css_style::is_negative_font_size_value(value);
+    }
+    if css_property_eq(property, "font-weight") {
+        return crate::css_style::is_valid_font_weight_value(value);
+    }
     true
 }
 
@@ -7345,8 +7436,9 @@ fn text_pseudo_style(
     if let Some((property, value)) = declarations
         .iter()
         .rev()
-        .find(|(property, _, _)| {
-            css_property_eq(property, "font-size") || css_property_eq(property, "font")
+        .find(|(property, value, _)| {
+            (css_property_eq(property, "font-size") || css_property_eq(property, "font"))
+                && declaration_value_is_valid(property, value)
         })
         .map(|(property, value, _)| (property, value.as_str()))
     {
@@ -7381,7 +7473,7 @@ fn font_shorthand_size_token(value: &str) -> Option<&str> {
 
 fn relative_font_size_px(value: &str, parent: &w3cos_std::style::Style) -> Option<f32> {
     let value = value.trim();
-    value
+    let size = value
         .strip_suffix("rem")
         .and_then(|number| number.trim().parse::<f32>().ok())
         .map(|number| number * 16.0)
@@ -7402,7 +7494,10 @@ fn relative_font_size_px(value: &str, parent: &w3cos_std::style::Style) -> Optio
                 .strip_suffix('%')
                 .and_then(|number| number.trim().parse::<f32>().ok())
                 .map(|number| number * parent.font_size / 100.0)
-        })
+        });
+    // A negative `font-size` is an invalid declaration (`font-size-067` is
+    // `font-size: 0; font-size: -1em`), and `-0em` is a valid zero.
+    size.filter(|size| size.is_finite() && *size >= 0.0)
 }
 
 fn vertical_align_length_px(value: &str, style: &w3cos_std::style::Style) -> Option<f32> {
@@ -7515,6 +7610,117 @@ fn promote_passive_vertical_align_extension(
     promote_vertical_align_line_box_extension(style);
 }
 
+/// CSS 2.1 10.8.1: a positive `vertical-align` length lifts an inline box above
+/// the baseline, and the line box's ascent grows with it. The lifted fragment
+/// already carries that extra height (`promote_vertical_align_line_box_extension`),
+/// but every *other* inline fragment on the same line still has to start lower,
+/// because the baseline moved down together with the line box. Record the
+/// difference on those fragments so layout can place them; without it they stay
+/// pinned to the line box top and paint where the author expected the next box to
+/// cover them.
+///
+/// Only lines that actually carry a positive lift are touched, so a line whose
+/// baseline is raised by an ordinary taller box is left to the shared-baseline
+/// pass in the runtime. Lines that also hold a replaced box are skipped too: a
+/// replaced box establishes the baseline from its own height, and that pass
+/// already owns those lines.
+fn annotate_inline_line_extra_ascent(children: &mut [w3cos_std::Component]) {
+    if children.iter().any(|child| {
+        matches!(
+            child.kind,
+            w3cos_std::ComponentKind::Image { .. }
+                | w3cos_std::ComponentKind::Canvas { .. }
+                | w3cos_std::ComponentKind::SvgDocument { .. }
+        )
+    }) {
+        return;
+    }
+    let carries_a_lift = children.iter().any(|child| {
+        child
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-vertical-align-length"))
+            .and_then(|value| value.split_ascii_whitespace().next())
+            .and_then(|value| value.parse::<f32>().ok())
+            .is_some_and(|offset| offset > 0.0)
+    });
+    if !carries_a_lift {
+        return;
+    }
+    let Some(line_ascent) = children
+        .iter()
+        .filter_map(inline_box_ascent)
+        .fold(None, |tallest: Option<f32>, ascent| {
+            Some(tallest.map_or(ascent, |tallest| tallest.max(ascent)))
+        })
+    else {
+        return;
+    };
+    for child in children.iter_mut() {
+        // A fragment that carries the length itself is already promoted into its
+        // own line box, and a box that reaches at least as far above the baseline
+        // as the tallest one - a larger font, a taller inline block - stays put.
+        if child.style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-vertical-align-length")
+        }) {
+            continue;
+        }
+        let Some(ascent) = inline_box_ascent(child) else {
+            continue;
+        };
+        let lift = line_ascent - ascent;
+        if lift <= 0.0 {
+            continue;
+        }
+        child
+            .style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-line-extra-ascent".to_string(),
+                format!("{lift}"),
+            );
+    }
+}
+
+/// How far above the shared baseline this inline box asks the line box to
+/// reserve room (CSS 2.1 10.8.1): the half-leading plus the font's own ascent,
+/// plus any positive `vertical-align` lift. `None` means the box is not an
+/// in-flow inline-level box and takes no part in the line box.
+fn inline_box_ascent(component: &w3cos_std::Component) -> Option<f32> {
+    use w3cos_std::style::{Display, Float, Position};
+    if component.style.display == Display::None
+        || component.style.float != Float::None
+        || component.style.position != Position::Static
+    {
+        return None;
+    }
+    let lift = component
+        .style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-vertical-align-length"))
+        .and_then(|value| value.split_ascii_whitespace().next())
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|offset| *offset > 0.0)
+        .unwrap_or(0.0);
+    if !matches!(
+        component.style.display,
+        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+    ) {
+        return None;
+    }
+    // `Style::line_height` is a multiplier, and `0.8` is the same nominal
+    // ascent the shared-baseline pass in the runtime uses for text runs.
+    let line_height = component.style.font_size * component.style.line_height;
+    Some(
+        (line_height - component.style.font_size) * 0.5
+            + component.style.font_size * 0.8
+            + lift,
+    )
+}
+
 fn promote_vertical_align_line_box_extension(style: &mut w3cos_std::style::Style) {
     let Some(offset) = style
         .custom_properties
@@ -7538,6 +7744,118 @@ fn promote_vertical_align_line_box_extension(style: &mut w3cos_std::style::Style
             "--w3cos-internal-inline-fragment-clip".to_string(),
             format!("top {line_height}"),
         );
+}
+
+#[cfg(test)]
+mod inline_line_extra_ascent_tests {
+    use super::*;
+
+    fn text_style() -> w3cos_std::style::Style {
+        let mut style = w3cos_std::style::Style::default();
+        style.display = w3cos_std::style::Display::Inline;
+        style.font_size = 20.0;
+        style.line_height = 1.0;
+        style
+    }
+
+    fn lifted_fragment(offset: f32) -> w3cos_std::Component {
+        let mut style = text_style();
+        // `promote_vertical_align_line_box_extension` has already run on the
+        // fragment by the time the line is annotated.
+        style.display = w3cos_std::style::Display::InlineFlex;
+        style.custom_properties = Some(std::collections::HashMap::from([(
+            "--w3cos-internal-vertical-align-length".to_string(),
+            format!("{offset} {}", offset - 4.0),
+        )]));
+        w3cos_std::Component::text("X", style)
+    }
+
+    fn passive_fragment() -> w3cos_std::Component {
+        w3cos_std::Component::text("X", text_style())
+    }
+
+    fn extra_ascent(component: &w3cos_std::Component) -> Option<f32> {
+        component
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-line-extra-ascent"))
+            .and_then(|value| value.parse::<f32>().ok())
+    }
+
+    #[test]
+    fn a_lifted_fragment_moves_its_passive_siblings_below_the_line_box_top() {
+        let mut children = vec![lifted_fragment(96.0), passive_fragment()];
+        annotate_inline_line_extra_ascent(&mut children);
+        assert_eq!(extra_ascent(&children[0]), None);
+        let lift = extra_ascent(&children[1]).expect("passive fragment is annotated");
+        assert!((lift - 96.0).abs() < 0.01, "lift was {lift}");
+    }
+
+    #[test]
+    fn a_zero_valued_alignment_keeps_the_plain_line_box_strut() {
+        let mut children = vec![lifted_fragment(0.0), passive_fragment()];
+        annotate_inline_line_extra_ascent(&mut children);
+        assert_eq!(extra_ascent(&children[1]), None);
+    }
+
+    #[test]
+    fn the_largest_positive_lift_wins_and_a_negative_one_never_lifts() {
+        let mut children = vec![
+            lifted_fragment(-40.0),
+            lifted_fragment(20.0),
+            lifted_fragment(120.0),
+            passive_fragment(),
+        ];
+        annotate_inline_line_extra_ascent(&mut children);
+        let lift = extra_ascent(&children[3]).expect("passive fragment is annotated");
+        assert!((lift - 120.0).abs() < 0.01, "lift was {lift}");
+    }
+
+    #[test]
+    fn a_lifted_fragment_is_never_annotated_against_itself() {
+        let mut children = vec![lifted_fragment(96.0), lifted_fragment(20.0)];
+        annotate_inline_line_extra_ascent(&mut children);
+        assert_eq!(extra_ascent(&children[0]), None);
+        assert_eq!(extra_ascent(&children[1]), None);
+    }
+
+    #[test]
+    fn a_line_that_holds_a_replaced_box_is_left_to_the_shared_baseline_pass() {
+        let mut image_style = text_style();
+        image_style.height = w3cos_std::style::Dimension::Px(30.0);
+        let image = w3cos_std::Component {
+            kind: w3cos_std::component::ComponentKind::Image {
+                src: "swatch.png".to_string(),
+            },
+            style: image_style,
+            ..passive_fragment()
+        };
+        // The image establishes the baseline from its own height, and the runtime
+        // already aligns that line, so nothing on it is annotated.
+        let mut children = vec![image, lifted_fragment(10.0), passive_fragment()];
+        annotate_inline_line_extra_ascent(&mut children);
+        assert_eq!(extra_ascent(&children[0]), None);
+        assert_eq!(extra_ascent(&children[1]), None);
+        assert_eq!(extra_ascent(&children[2]), None);
+    }
+
+    #[test]
+    fn a_larger_font_on_the_line_keeps_its_own_place() {
+        let mut children = vec![lifted_fragment(10.0), passive_fragment()];
+        children[1].style.font_size = 60.0;
+        annotate_inline_line_extra_ascent(&mut children);
+        assert_eq!(extra_ascent(&children[1]), None);
+    }
+
+    #[test]
+    fn a_line_without_a_positive_lift_is_left_to_the_shared_baseline_pass() {
+        let mut tall = passive_fragment();
+        tall.style.font_size = 60.0;
+        let mut children = vec![tall, passive_fragment()];
+        annotate_inline_line_extra_ascent(&mut children);
+        assert_eq!(extra_ascent(&children[1]), None);
+    }
 }
 
 fn cloned_text_fragment(
@@ -7996,6 +8314,31 @@ fn principal_box_can_merge_generated_inline_text(style: &w3cos_std::style::Style
         && style.filter.is_none()
         && style.opacity == 1.0
         && style.transform == Transform2D::default()
+}
+
+/// Wrap the boxes a split inline lowers to in a boxless group.
+///
+/// A block-in-inline split lowers to a `display: contents` wrapper holding the
+/// inline's fragments and the in-flow blocks it was split around. That wrapper
+/// is dissolved into the surrounding block container, so the host's group
+/// opacity has to be carried by every box it is dissolved into. The fragments
+/// clone the host style, so they clear their own opacity and the group hands it
+/// back exactly once - to the fragments and to the hoisted blocks alike. Without
+/// this the block child paints at full strength while the fragments fade, which
+/// is what `css/CSS2/stacking-context/opacity-affects-block-in-inline.html`
+/// catches.
+fn boxed_split_inline_group(
+    style: &w3cos_std::style::Style,
+    mut children: Vec<w3cos_std::Component>,
+) -> w3cos_std::Component {
+    let mut group = w3cos_std::style::Style::default();
+    group.display = w3cos_std::style::Display::Contents;
+    if style.opacity < 1.0 {
+        for child in &mut children {
+            child.style.opacity *= style.opacity;
+        }
+    }
+    w3cos_std::Component::boxed(group, children)
 }
 
 fn painted_inline_text_box_can_merge(style: &w3cos_std::style::Style) -> bool {
@@ -10481,6 +10824,88 @@ mod image_component_tests {
         check(&document.to_component_tree());
     }
 
+    /// The opacity group a split inline establishes must cover every box the
+    /// inline lowers to, including the in-flow block it was split around.
+    ///
+    /// `css/CSS2/stacking-context/opacity-affects-block-in-inline.html` paints
+    /// the block child at full strength when the host's opacity is dropped on
+    /// the way through the split.
+    #[test]
+    fn split_inline_host_opacity_reaches_the_hoisted_block_child() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let span = document.create_element("span");
+        span.style_mut(&mut document).set_property("opacity", "0.5");
+        let block = document.create_element("div");
+        for (name, value) in [
+            ("width", "100px"),
+            ("height", "100px"),
+            ("background", "green"),
+        ] {
+            block.style_mut(&mut document).set_property(name, value);
+        }
+        for child in [
+            document.create_text_node(" "),
+            block,
+            document.create_text_node(" "),
+        ] {
+            span.append_child(&mut document, child);
+        }
+        document.body().append_child(&mut document, span);
+
+        fn green_opacity(component: &w3cos_std::Component, found: &mut Vec<f32>) {
+            if component.style.background == w3cos_std::Color::rgb(0, 128, 0) {
+                found.push(component.style.opacity);
+            }
+            for child in &component.children {
+                green_opacity(child, found);
+            }
+        }
+        let mut found = Vec::new();
+        green_opacity(&document.to_component_tree(), &mut found);
+        assert_eq!(
+            found,
+            vec![0.5],
+            "a leading in-flow block must stay inside the host's opacity group"
+        );
+    }
+
+    /// The same group has to survive the fragmenting path, where the host style
+    /// is cloned onto the fragments that carry the inline's decorations.
+    #[test]
+    fn split_inline_fragments_and_block_child_share_one_host_opacity() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let span = document.create_element("span");
+        span.style_mut(&mut document).set_property("opacity", "0.5");
+        let block = document.create_element("div");
+        block
+            .style_mut(&mut document)
+            .set_property("background", "green");
+        let one = document.create_text_node("One");
+        let two = document.create_text_node("Two");
+        for child in [one, block, two] {
+            span.append_child(&mut document, child);
+        }
+        document.body().append_child(&mut document, span);
+
+        fn green_opacity(component: &w3cos_std::Component, found: &mut Vec<f32>) {
+            if component.style.background == w3cos_std::Color::rgb(0, 128, 0) {
+                found.push(component.style.opacity);
+            }
+            for child in &component.children {
+                green_opacity(child, found);
+            }
+        }
+        let mut found = Vec::new();
+        green_opacity(&document.to_component_tree(), &mut found);
+        assert_eq!(
+            found,
+            vec![0.5],
+            "the hoisted block must not fall out of the split inline's group"
+        );
+    }
+
     #[test]
     fn block_interruption_slices_horizontal_margins_at_logical_fragment_edges() {
         for (paragraph, inline) in [("ltr", "ltr"), ("rtl", "ltr"), ("rtl", "rtl")] {
@@ -10899,6 +11324,35 @@ mod image_component_tests {
                     && item.children.len() == 1
                     && item.children[0].style.flex_shrink == 0.0)
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    /// `line-height: <px>` is absolute, so it must divide by the element's
+    /// final computed font-size. `font-size-120` is `.a { font-size: 30px }`
+    /// with `.c { line-height: 30px }`, and dividing by the initial 16px made
+    /// the line box 56.25px instead of 30px.
+    #[test]
+    fn a_px_line_height_resolves_against_the_final_font_size() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#outer", &[("font-size", "30px")]);
+        crate::stylesheet::register_rule("#inner", &[("line-height", "30px")]);
+        crate::stylesheet::register_rule("#plain", &[("line-height", "30px")]);
+
+        let mut document = Document::new();
+        let outer = document.create_element("div");
+        outer.set_attribute(&mut document, "id", "outer");
+        let inner = document.create_element("div");
+        inner.set_attribute(&mut document, "id", "inner");
+        outer.append_child(&mut document, inner);
+        document.body().append_child(&mut document, outer);
+        let plain = document.create_element("div");
+        plain.set_attribute(&mut document, "id", "plain");
+        document.body().append_child(&mut document, plain);
+
+        // 30px of a 30px font is a ratio of 1.
+        assert_eq!(document.computed_style_for(inner.id).line_height, 1.0);
+        // The same declaration at the initial 16px stays 1.875.
+        assert_eq!(document.computed_style_for(plain.id).line_height, 1.875);
         crate::stylesheet::clear_rules();
     }
 

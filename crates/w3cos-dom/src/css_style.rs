@@ -408,18 +408,33 @@ impl CSSStyleDeclaration {
                 }
             }
             "font-size" | "fontSize" => {
-                if let Some(v) = parse_px(value) {
+                // A negative size is invalid, so it is dropped and the previous
+                // declaration in the same rule survives (`font-size-123`).
+                if !is_negative_font_size_value(value)
+                    && let Some(v) = parse_px(value)
+                {
                     self.inner.font_size = v
                 }
             }
             "font" => apply_font_shorthand(&mut self.inner, value),
             "font-weight" | "fontWeight" => {
-                match value.trim().to_ascii_lowercase().as_str() {
-                    "normal" => self.inner.font_weight = 400,
-                    "bold" => self.inner.font_weight = 700,
-                    _ => {
-                        if let Ok(v) = value.parse() {
-                            self.inner.font_weight = v
+                // An out-of-range weight is invalid, so the declaration is
+                // dropped and the element inherits instead
+                // (`font-matching-rule-009`). `bolder` and `lighter` are
+                // relative to the parent, which `set_property` cannot see, so
+                // the cascade resolves them after the parent is known.
+                if is_valid_font_weight_value(value) {
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "normal" => self.inner.font_weight = 400,
+                        "bold" => self.inner.font_weight = 700,
+                        "bolder" | "lighter" => {}
+                        _ => {
+                            if let Ok(v) = value.trim().parse::<f32>()
+                                && v.is_finite()
+                                && (1.0..=1000.0).contains(&v)
+                            {
+                                self.inner.font_weight = v.round() as u16;
+                            }
                         }
                     }
                 }
@@ -705,8 +720,12 @@ impl CSSStyleDeclaration {
                 self.inner.text_overflow = parse_text_overflow(value)
             }
             "font-family" | "fontFamily" => {
-                self.inner.font_family =
-                    Some(value.trim_matches('"').trim_matches('\'').to_string());
+                // An invalid family list invalidates the whole declaration, so
+                // the previous (inherited or less specific) value survives.
+                if is_valid_font_family_value(value) {
+                    self.inner.font_family =
+                        Some(value.trim_matches('"').trim_matches('\'').to_string());
+                }
             }
             "font-style" | "fontStyle" => self.inner.font_style = parse_font_style(value),
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
@@ -2043,7 +2062,360 @@ fn parse_font_style(value: &str) -> w3cos_std::style::FontStyle {
     }
 }
 
+/// CSS-wide keywords. They are reserved, so on their own they name a keyword
+/// rather than a font family.
+fn is_css_wide_keyword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+fn is_css_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+}
+
+/// Consume one CSS escape (CSS 2.1 §4.1.3): either `\` followed by one to six
+/// hex digits and an optional trailing space, or `\` followed by any character
+/// that is not a newline.
+fn consume_css_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    match chars.peek().copied() {
+        None => false,
+        Some('\n') | Some('\r') | Some('\u{c}') => false,
+        Some(ch) if ch.is_ascii_hexdigit() => {
+            let mut digits = 0;
+            while digits < 6 && chars.peek().is_some_and(|ch| ch.is_ascii_hexdigit()) {
+                chars.next();
+                digits += 1;
+            }
+            if chars.peek().copied().is_some_and(is_css_whitespace) {
+                chars.next();
+            }
+            true
+        }
+        Some(_) => {
+            chars.next();
+            true
+        }
+    }
+}
+
+/// A single CSS 2.1 identifier: `[-]?{nmstart}{nmchar}*`. `--foo` is not an
+/// identifier, and a leading hyphen must be followed by a letter, `_`, an
+/// escape or a non-ASCII character rather than a digit.
+fn is_css_identifier(identifier: &str) -> bool {
+    let mut chars = identifier.chars().peekable();
+    if chars.peek() == Some(&'-') {
+        chars.next();
+        if chars.peek() == Some(&'-') {
+            return false;
+        }
+    }
+    let mut first = true;
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if !consume_css_escape(&mut chars) {
+                return false;
+            }
+        } else {
+            let allowed = if first {
+                ch == '_' || ch.is_ascii_alphabetic() || !ch.is_ascii()
+            } else {
+                ch == '_' || ch == '-' || ch.is_ascii_alphanumeric() || !ch.is_ascii()
+            };
+            if !allowed {
+                return false;
+            }
+        }
+        first = false;
+    }
+    !first
+}
+
+/// Whether `value` is exactly one terminated CSS string, e.g. `"Times New
+/// Roman"`. An unterminated string is a parse error that invalidates the
+/// declaration.
+fn is_css_string(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let Some(&quote) = bytes.first() else {
+        return false;
+    };
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\n' => return false,
+            byte if byte == quote => return index + 1 == bytes.len(),
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// Split a `font-family` value on top-level commas, honouring quoted strings.
+/// `None` means a string was left unterminated.
+fn split_font_family_list(value: &str) -> Option<Vec<&str>> {
+    let bytes = value.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' => {
+                let quote = bytes[index];
+                index += 1;
+                loop {
+                    if index >= bytes.len() {
+                        return None;
+                    }
+                    match bytes[index] {
+                        b'\\' => index += 2,
+                        b'\n' => return None,
+                        byte if byte == quote => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b',' => {
+                parts.push(&value[start..index]);
+                index += 1;
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    parts.push(&value[start..]);
+    Some(parts)
+}
+
+/// One `<family-name>`: either a single quoted string, or one or more
+/// identifiers. A lone `inherit` is a keyword rather than a family name, while
+/// `inherit foo` is an ordinary two-identifier name.
+fn is_font_family_name(name: &str) -> bool {
+    let name = name.trim_matches(is_css_whitespace);
+    if name.is_empty() {
+        return false;
+    }
+    if name.starts_with('"') || name.starts_with('\'') {
+        return is_css_string(name);
+    }
+    let identifiers = name
+        .split(is_css_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if identifiers.is_empty() {
+        return false;
+    }
+    if identifiers.len() == 1 && is_css_wide_keyword(identifiers[0]) {
+        return false;
+    }
+    identifiers.iter().all(|part| is_css_identifier(part))
+}
+
+/// Whether a `font-family` declaration is valid CSS 2.1 (see §15.3 and the
+/// identifier grammar in §4.1.3). Invalid characters invalidate the entire
+/// declaration rather than being used as a font list, which is what the
+/// `font-family-invalid-characters-*` tests assert.
+pub(crate) fn is_valid_font_family_value(value: &str) -> bool {
+    let value = value.trim_matches(is_css_whitespace);
+    if value.is_empty() {
+        return false;
+    }
+    // `var()` is substituted after the declaration has been validated, so the
+    // unresolved form has to be accepted here.
+    if value.contains("var(") {
+        return true;
+    }
+    if is_css_wide_keyword(value) {
+        return true;
+    }
+    split_font_family_list(value)
+        .is_some_and(|parts| parts.iter().all(|part| is_font_family_name(part)))
+}
+
+/// The `font` shorthand's own keywords, which stand in for the whole value.
+fn is_system_font_keyword(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
+    )
+}
+
+/// The absolute and relative `font-size` keywords. `parse_font_size` resolves
+/// lengths and percentages against the inherited size, so the caller's size is
+/// only a stand-in there; the keywords have to be listed separately because it
+/// does not know them.
+fn is_font_size_keyword(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "xx-small" | "x-small" | "small" | "medium" | "large" | "x-large" | "xx-large"
+            | "xxx-large" | "smaller" | "larger"
+    )
+}
+
+/// A negative `font-size` is an invalid declaration: it must be ignored rather
+/// than applied, and it must not count as declared either, or the element would
+/// keep the initial font instead of inheriting one. `-0` is a valid zero length
+/// (`font-size-100`), and `var()`/`calc()` cannot be judged before
+/// substitution. `font-size-123` (`font-size: 20px; font-size: -10px`), the
+/// `font-size-0xx` family (`font-size: 0; font-size: -1cm`) and
+/// `css1/c526-font-sz-003` (`font-size: 1em; font-size: -0.5in`) assert exactly
+/// that.
+pub(crate) fn is_negative_font_size_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.contains("var(") || value.contains("calc(") {
+        return false;
+    }
+    if let Some(number) = value.strip_suffix("ex") {
+        // `ex` is not one of `parse_font_size`'s units.
+        return number
+            .trim()
+            .parse::<f32>()
+            .is_ok_and(|number| number < 0.0);
+    }
+    parse_font_size(value, 16.0).is_some_and(|size| size < 0.0)
+}
+
+/// A token that can only be a `font-size`. A negative one is not a size at all,
+/// so `font: -10px Ahem` has no size slot and the whole shorthand is invalid.
+fn is_font_size_token(value: &str) -> bool {
+    is_font_size_keyword(value)
+        || (!is_negative_font_size_value(value) && parse_font_size(value, 16.0).is_some())
+}
+
+/// `font-weight` is `<font-weight-absolute> | bolder | lighter`, where
+/// `<font-weight-absolute>` is `normal | bold | <number [1, 1000]>`. A number
+/// outside that range is an invalid declaration: it must be dropped rather than
+/// applied, and it must not count as declared either, or the element would keep
+/// the initial weight instead of inheriting one. `font-matching-rule-009` is
+/// `#span1 { font-weight: 400 }` next to `#span2 { font-weight: 9000 }` against
+/// a `font-weight-normal-ref.html` reference, so `9000` has to leave the
+/// inherited 400 in place; storing it verbatim selected a heavier face and made
+/// the two lines differ.
+pub(crate) fn is_valid_font_weight_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.contains("var(") || value.contains("calc(") {
+        // The substituted value cannot be judged before variable resolution.
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "normal"
+            | "bold"
+            | "bolder"
+            | "lighter"
+            | "inherit"
+            | "initial"
+            | "unset"
+            | "revert"
+            | "revert-layer"
+    ) {
+        return true;
+    }
+    value
+        .parse::<f32>()
+        .is_ok_and(|weight| weight.is_finite() && (1.0..=1000.0).contains(&weight))
+}
+
+/// The `bolder` / `lighter` step relative to the parent's computed weight.
+///
+/// CSS Fonts 4 §2.2.1 gives the step as a table over the inherited value `w`:
+///
+/// | inherited `w`   | `bolder`  | `lighter` |
+/// |-----------------|-----------|-----------|
+/// | `w < 100`       | 400       | no change |
+/// | `100 ≤ w < 350` | 400       | 100       |
+/// | `350 ≤ w < 550` | 700       | 100       |
+/// | `550 ≤ w < 750` | 900       | 400       |
+/// | `750 ≤ w < 900` | 900       | 700       |
+/// | `900 ≤ w`       | no change | 700       |
+///
+/// `font-weight-rule-004` (`#parent { font-weight: 400 }` with `div div
+/// { font-weight: bolder }` against a 700 reference), `-005` (900 stays 900),
+/// `-006` (700 → 400) and `-007` (100 stays 100) are the four suite cases that
+/// pin the table down. Returns `None` for every other value, so the caller can
+/// leave an absolute weight alone.
+pub(crate) fn relative_font_weight(keyword: &str, parent_weight: u16) -> Option<u16> {
+    let parent = if (1..=1000).contains(&parent_weight) {
+        parent_weight
+    } else {
+        // The initial value, for a parent that never resolved a weight.
+        400
+    };
+    match keyword.trim().to_ascii_lowercase().as_str() {
+        "bolder" => Some(match parent {
+            0..350 => 400,
+            350..550 => 700,
+            550..900 => 900,
+            // `900 ≤ w` keeps the inherited weight instead of going bolder.
+            _ => parent,
+        }),
+        "lighter" => Some(match parent {
+            // `w < 100` keeps the inherited weight instead of going lighter.
+            0..100 => parent,
+            100..550 => 100,
+            550..750 => 400,
+            _ => 700,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether the optional `/ <line-height>` of a `font` shorthand is acceptable.
+/// CSS 2.1 §15.8 makes a negative line-height invalid, which invalidates the
+/// whole declaration; `parse_font_line_height` clamps instead, so the sign has
+/// to be checked before it runs.
+fn is_valid_font_line_height_token(value: &str) -> bool {
+    let value = value.trim();
+    !value.starts_with('-') && parse_font_line_height(value, 16.0).is_some()
+}
+
+/// `font` requires both a `font-size` and a `font-family`, and rejects a
+/// negative `line-height`. A value that fails any of those is an invalid
+/// declaration: it must neither apply partially nor count as declared, or the
+/// element would keep the initial font instead of inheriting one. `font-051`
+/// (`font: serif`), `font-148` (`font: calc(10 * 10px) sans-serif`) and
+/// `font-146` (`font: 4em/-2em serif`) assert exactly that.
+pub(crate) fn is_valid_font_shorthand_value(value: &str) -> bool {
+    let value = value.trim_matches(is_css_whitespace);
+    if value.is_empty() {
+        return false;
+    }
+    // `var()` is substituted after the declaration has been validated.
+    if value.contains("var(") {
+        return true;
+    }
+    if is_css_wide_keyword(value) || is_system_font_keyword(value) {
+        return true;
+    }
+    let (before_line_height, after_slash) = value
+        .split_once('/')
+        .map_or((value, None), |(before, after)| (before, Some(after)));
+    let before_parts = split_css_whitespace(before_line_height);
+    let Some(size_index) = before_parts.iter().rposition(|part| is_font_size_token(part)) else {
+        return false;
+    };
+    if let Some(after_slash) = after_slash {
+        let after_slash = after_slash.trim_start();
+        let line_height_end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
+        if !is_valid_font_line_height_token(&after_slash[..line_height_end]) {
+            return false;
+        }
+        return !after_slash[line_height_end..].trim().is_empty();
+    }
+    !before_parts[size_index + 1..].join(" ").trim().is_empty()
+}
+
 fn apply_font_shorthand(style: &mut Style, value: &str) {
+    if !is_valid_font_shorthand_value(value) {
+        return;
+    }
     let (before_line_height, after_slash) = value
         .split_once('/')
         .map_or((value, None), |(before, after)| (before, Some(after)));
@@ -2060,14 +2432,24 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
         return;
     };
 
+    // The shorthand resets every longhand it can set, so an omitted weight or
+    // style returns to its initial value instead of surviving an earlier
+    // declaration in the same rule (`shand-font-000`, `shand-font-001`).
+    style.font_weight = Style::default().font_weight;
+    style.font_style = Style::default().font_style;
     style.font_size = size;
     for part in &before_parts[..size_index] {
         match part.as_str() {
             "italic" | "oblique" | "normal" => style.font_style = parse_font_style(part),
             "bold" => style.font_weight = 700,
             _ => {
-                if let Ok(weight) = part.parse::<u16>() {
-                    style.font_weight = weight;
+                // The same `[1, 1000]` range as the longhand, so the shorthand
+                // cannot smuggle in a weight the longhand would reject.
+                if let Ok(weight) = part.parse::<f32>()
+                    && weight.is_finite()
+                    && (1.0..=1000.0).contains(&weight)
+                {
+                    style.font_weight = weight.round() as u16;
                 }
             }
         }
@@ -2124,7 +2506,7 @@ fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
     parse_px(value)
 }
 
-fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
+pub(crate) fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("normal") {
         return Some(1.2);
@@ -2220,6 +2602,156 @@ mod overflow_wrap_tests {
 }
 
 #[cfg(test)]
+mod font_family_validity_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_family_names_that_are_identifiers() {
+        for value in [
+            "Ahem",
+            "serif",
+            "monospace,serif",
+            "test, foo, Ahem",
+            "test-foo, Ahem",
+            "test_foo, Ahem",
+            "_testfoo, Ahem",
+            "-testfoo, Ahem",
+            "test-_foo, Ahem",
+            "test\\foo, Ahem",
+            "\\testfoo, Ahem",
+            "Ahem\\!",
+            "Courier New, Ahem",
+            "\"White Space\", serif",
+            "\"CSSTest Verify\"",
+            "inherit foo, \"CSSTest Fallback\"",
+            "foo inherit, \"CSSTest Fallback\"",
+            "fooinherit, \"CSSTest Fallback\"",
+            "inheritfoo, \"CSSTest Fallback\"",
+            "testfoo _5, Ahem",
+            "testfoo _5bar, Ahem",
+            "_5testfoo, Ahem",
+        ] {
+            assert!(
+                is_valid_font_family_value(value),
+                "expected {value:?} to be a valid font-family value"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_css_wide_keywords_and_unresolved_variables() {
+        for value in ["inherit", "initial", "unset", "revert", "revert-layer"] {
+            assert!(
+                is_valid_font_family_value(value),
+                "expected {value:?} to be valid"
+            );
+        }
+        // `var()` is substituted after the declaration has been validated.
+        assert!(is_valid_font_family_value("var(--mono)"));
+        assert!(is_valid_font_family_value("var(--mono), Ahem"));
+    }
+
+    #[test]
+    fn rejects_unquoted_invalid_characters() {
+        for value in [
+            "test!foo, Ahem",
+            "test@foo, Ahem",
+            "test#foo, Ahem",
+            "test$foo, Ahem",
+            "test%foo, Ahem",
+            "test^foo, Ahem",
+            "test&foo, Ahem",
+            "test*foo, Ahem",
+            "test=foo, Ahem",
+            "test+foo, Ahem",
+            "test|foo, Ahem",
+            "test:foo, Ahem",
+            "test.foo, Ahem",
+            "test/foo, Ahem",
+            "test?foo, Ahem",
+            "test`foo, Ahem",
+            "test~foo, Ahem",
+            "test)foo, Ahem",
+            "test(foo, Ahem",
+            "test(foo), Ahem",
+            "test{foo}, Ahem",
+            "test{foo, Ahem",
+            "test}foo, Ahem",
+            "test]foo, Ahem",
+            "test[foo, Ahem",
+            "test[foo], Ahem",
+            "test\"foo, Ahem",
+            "test\"foo\", Ahem",
+            "test'foo, Ahem",
+            "test'foo', Ahem",
+            "Ahem!",
+            "Ahem, foo(bar), sans-serif",
+            "Ahem, foo{bar}, sans-serif",
+        ] {
+            assert!(
+                !is_valid_font_family_value(value),
+                "expected {value:?} to be an invalid font-family value"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_family_names_that_are_not_identifiers() {
+        for value in [
+            // A family name must not start with a digit.
+            "1996, Ahem",
+            "5testfoo, serif",
+            "-5testfoo, serif",
+            "test 5foo, serif",
+            "testfoo 5-0, serif",
+            "testfoo -5, serif",
+            "testfoo -5bar, serif",
+            "testfoo 5_0, serif",
+            // An identifier must not start with two consecutive hyphens.
+            "--foo bar, \"CSSTest Fallback\"",
+            "bar --foo, \"CSSTest Fallback\"",
+            // A lone keyword is reserved and cannot name a font.
+            "inherit, \"CSSTest Fallback\"",
+            "\"CSSTest Fallback\", inherit",
+            // A family name is either one string or one or more identifiers.
+            "\"inherit\" foo, \"CSSTest Fallback\"",
+            // Empty list items are not family names.
+            "",
+            "Ahem,",
+            ", Ahem",
+        ] {
+            assert!(
+                !is_valid_font_family_value(value),
+                "expected {value:?} to be an invalid font-family value"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_declaration_keeps_the_previous_value() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-family", "Ahem");
+        declaration.set_property("font-family", "5testfoo, serif");
+        assert_eq!(
+            declaration.to_style().font_family.as_deref(),
+            Some("Ahem"),
+            "an invalid declaration must not replace the previous font family"
+        );
+        declaration.set_property("font-family", "test\"foo, Ahem");
+        assert_eq!(declaration.to_style().font_family.as_deref(), Some("Ahem"));
+    }
+
+    #[test]
+    fn quoted_family_names_are_accepted() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-family", "\"Times New Roman\"");
+        assert!(declaration.to_style().font_family.is_some());
+        declaration.set_property("font-family", "'Arial'");
+        assert!(declaration.to_style().font_family.is_some());
+    }
+}
+
+#[cfg(test)]
 mod font_shorthand_tests {
     use super::*;
 
@@ -2276,6 +2808,137 @@ mod font_shorthand_tests {
         declaration.set_property("line-height", "1em");
 
         assert_eq!(declaration.to_style().line_height, 1.0);
+    }
+
+    /// `font-051` is `font: serif` on a span inside `font: 100px/1 Ahem`, and
+    /// expects the span to keep Ahem at 100px: a shorthand with no font-size is
+    /// an invalid declaration, not a family-only shorthand.
+    #[test]
+    fn font_shorthand_without_a_font_size_is_invalid() {
+        assert!(!is_valid_font_shorthand_value("serif"));
+        assert!(!is_valid_font_shorthand_value("Arial, sans-serif"));
+        assert!(!is_valid_font_shorthand_value("bold"));
+
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font", "100px/1 Ahem");
+        declaration.set_property("font", "serif");
+        let style = declaration.to_style();
+        assert_eq!(style.font_size, 100.0);
+        assert_eq!(style.font_family.as_deref(), Some("Ahem"));
+    }
+
+    /// `font-146` is `font: 4em/-2em serif`; a negative line-height invalidates
+    /// the whole declaration, so the size and family must not survive it.
+    #[test]
+    fn font_shorthand_with_a_negative_line_height_is_invalid() {
+        assert!(!is_valid_font_shorthand_value("4em/-2em serif"));
+        assert!(is_valid_font_shorthand_value("4em/0 serif"));
+        assert!(is_valid_font_shorthand_value("4em/2em serif"));
+
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("font", "4em/-2em serif");
+        assert_eq!(declaration.to_style().font_size, 20.0);
+    }
+
+    /// `font-148` puts a `calc()` where the size belongs. The shorthand cannot
+    /// resolve it, so the declaration is invalid rather than family-only.
+    #[test]
+    fn font_shorthand_with_an_unresolvable_size_is_invalid() {
+        assert!(!is_valid_font_shorthand_value("calc(10 * 10px) sans-serif"));
+    }
+
+    #[test]
+    fn font_shorthand_requires_a_family_after_the_size() {
+        assert!(!is_valid_font_shorthand_value("12px"));
+        assert!(!is_valid_font_shorthand_value("12px/1.2"));
+        assert!(is_valid_font_shorthand_value("12px Ahem"));
+        assert!(is_valid_font_shorthand_value("12px/1.2 Ahem"));
+        assert!(is_valid_font_shorthand_value("italic small-caps bold 12px/1.2 Ahem"));
+        assert!(is_valid_font_shorthand_value("12px/1.2 \"White Space\", serif"));
+    }
+
+    /// The keywords stand in for the whole value, and `var()` is substituted
+    /// only after validation, so both forms have to be accepted here.
+    #[test]
+    fn font_shorthand_keywords_stay_valid() {
+        assert!(is_valid_font_shorthand_value("inherit"));
+        assert!(is_valid_font_shorthand_value("small-caption"));
+        assert!(is_valid_font_shorthand_value("var(--font)"));
+    }
+
+    /// `shand-font-000` and `shand-font-001` declare `font-weight: bold` and
+    /// then a `font` shorthand that omits the weight; the shorthand has to reset
+    /// it, or the paragraph stays bold.
+    #[test]
+    fn font_shorthand_resets_an_omitted_weight_and_style() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-weight", "bold");
+        declaration.set_property("font-style", "italic");
+        declaration.set_property("font", "1em/normal serif");
+
+        let style = declaration.to_style();
+        assert_eq!(style.font_weight, Style::default().font_weight);
+        assert_eq!(style.font_style, Style::default().font_style);
+
+        declaration.set_property("font", "bold italic 1em/normal serif");
+        let style = declaration.to_style();
+        assert_eq!(style.font_weight, 700);
+        assert_eq!(style.font_style, w3cos_std::style::FontStyle::Italic);
+    }
+
+    /// Every unit the `font-size-0xx` family exercises, plus the percentage and
+    /// the bare number. `-0` is a valid zero length and must stay accepted.
+    #[test]
+    fn negative_font_sizes_are_rejected_in_every_unit() {
+        for value in [
+            "-10px", "-1cm", "-1mm", "-1in", "-1pt", "-1pc", "-1em", "-1rem", "-1ex", "-1%",
+        ] {
+            assert!(
+                is_negative_font_size_value(value),
+                "{value} should be negative"
+            );
+        }
+        for value in [
+            "0", "0px", "10px", "1cm", "1in", "1pt", "1pc", "1em", "1rem", "1ex", "1%",
+            "larger", "xx-small", "var(--size)", "calc(10 * 10px)",
+        ] {
+            assert!(
+                !is_negative_font_size_value(value),
+                "{value} should not be negative"
+            );
+        }
+        for value in ["-0", "-0px", "-0cm", "-0mm", "-0in", "-0pt", "-0pc", "-0em", "-0ex", "-0%"] {
+            assert!(
+                !is_negative_font_size_value(value),
+                "{value} is a zero length, not a negative one"
+            );
+        }
+    }
+
+    /// A rejected declaration must not apply *and* must not survive as the
+    /// winning declaration: `font-size-123` is `font-size: 20px; font-size:
+    /// -10px`, so the 20px has to stand.
+    #[test]
+    fn a_negative_font_size_leaves_the_previous_declaration_alone() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("font-size", "-10px");
+        assert_eq!(declaration.to_style().font_size, 20.0);
+
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "0");
+        declaration.set_property("font-size", "-1cm");
+        assert_eq!(declaration.to_style().font_size, 0.0);
+    }
+
+    /// A negative size has no size slot, so the shorthand is invalid as a whole
+    /// rather than valid with a strange size.
+    #[test]
+    fn a_font_shorthand_with_a_negative_size_is_invalid() {
+        assert!(!is_valid_font_shorthand_value("-10px Ahem"));
+        assert!(!is_valid_font_shorthand_value("bold -1em/2 Ahem"));
+        assert!(is_valid_font_shorthand_value("0px Ahem"));
     }
 }
 
@@ -2637,6 +3300,72 @@ mod tests {
         assert_eq!(declaration.inner.font_weight, 700);
     }
     use super::*;
+
+    #[test]
+    fn font_weight_out_of_range_is_an_invalid_declaration() {
+        // `font-matching-rule-009`: `font-weight: 9000` has to be dropped so
+        // the element keeps the inherited 400 instead of selecting a heavier
+        // face. The longhand is `<number [1, 1000]>` (CSS Fonts 4 §2.2).
+        for invalid in ["9000", "0", "-100", "1001", "heavy", ""] {
+            assert!(
+                !is_valid_font_weight_value(invalid),
+                "{invalid} should be invalid"
+            );
+        }
+        for valid in [
+            "normal",
+            "bold",
+            "bolder",
+            "lighter",
+            "inherit",
+            "initial",
+            "unset",
+            "revert",
+            "revert-layer",
+            "1",
+            "100",
+            "400",
+            "700",
+            "900",
+            "1000",
+        ] {
+            assert!(is_valid_font_weight_value(valid), "{valid} should be valid");
+        }
+
+        let mut declaration = CSSStyleDeclaration::default();
+        declaration.set_property("font-weight", "400");
+        declaration.set_property("font-weight", "9000");
+        assert_eq!(declaration.inner.font_weight, 400);
+    }
+
+    #[test]
+    fn font_weight_relative_keywords_follow_the_fonts_4_step_table() {
+        // The four suite cases: `font-weight-rule-004` (400 → 700), `-005`
+        // (900 stays 900), `-006` (700 → 400) and `-007` (100 stays 100).
+        assert_eq!(relative_font_weight("bolder", 400), Some(700));
+        assert_eq!(relative_font_weight("bolder", 900), Some(900));
+        assert_eq!(relative_font_weight("lighter", 700), Some(400));
+        assert_eq!(relative_font_weight("lighter", 100), Some(100));
+        // The rest of the §2.2.1 table, including every boundary.
+        assert_eq!(relative_font_weight("bolder", 1), Some(400));
+        assert_eq!(relative_font_weight("bolder", 349), Some(400));
+        assert_eq!(relative_font_weight("bolder", 350), Some(700));
+        assert_eq!(relative_font_weight("bolder", 549), Some(700));
+        assert_eq!(relative_font_weight("bolder", 550), Some(900));
+        assert_eq!(relative_font_weight("bolder", 899), Some(900));
+        assert_eq!(relative_font_weight("bolder", 1000), Some(1000));
+        assert_eq!(relative_font_weight("lighter", 99), Some(99));
+        assert_eq!(relative_font_weight("lighter", 349), Some(100));
+        assert_eq!(relative_font_weight("lighter", 350), Some(100));
+        assert_eq!(relative_font_weight("lighter", 550), Some(400));
+        assert_eq!(relative_font_weight("lighter", 749), Some(400));
+        assert_eq!(relative_font_weight("lighter", 750), Some(700));
+        assert_eq!(relative_font_weight("lighter", 1000), Some(700));
+        // An absolute weight is left to the cascade.
+        for absolute in ["normal", "bold", "400", "900"] {
+            assert_eq!(relative_font_weight(absolute, 400), None);
+        }
+    }
 
     #[test]
     fn float_and_css_float_share_the_typed_property() {

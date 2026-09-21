@@ -542,16 +542,25 @@ fn inline_line_has_in_flow_content(component: &Component) -> bool {
     let unresolved_nonzero = |spacing: WSpacing| matches!(spacing,
         WSpacing::Percent(value) | WSpacing::Vw(value) | WSpacing::Vh(value)
             if value != 0.0);
-    [padding.top, padding.right, padding.bottom, padding.left,
-        margin.top, margin.right, margin.bottom, margin.left]
-        .into_iter().any(|value| value != 0.0)
-        || [style.padding.top, style.padding.right, style.padding.bottom, style.padding.left,
-            style.margin.top, style.margin.right, style.margin.bottom, style.margin.left]
-            .into_iter().any(unresolved_nonzero)
-        || style.border_left_width.unwrap_or(style.border_width) != 0.0
-        || style.border_right_width.unwrap_or(style.border_width) != 0.0
-        || style.border_top_width.unwrap_or(style.border_width) != 0.0
-        || style.border_bottom_width.unwrap_or(style.border_width) != 0.0
+    let uniform_border = style.border_width;
+    // Only the horizontal extent decides whether the line is empty. Measured
+    // against Chrome, a zero-width empty inline collapses its line box even
+    // when it carries vertical borders, vertical padding or an explicit
+    // line-height, while a non-zero left/right border, padding or margin keeps
+    // the line. The hand-written references of
+    // css/CSS2/normal-flow/block-in-inline-insert-* rely on that: an empty
+    // split fragment keeps only the top and bottom borders, so it must not
+    // reserve a line of its own.
+    padding.left != 0.0
+        || padding.right != 0.0
+        || margin.left != 0.0
+        || margin.right != 0.0
+        || unresolved_nonzero(style.padding.left)
+        || unresolved_nonzero(style.padding.right)
+        || unresolved_nonzero(style.margin.left)
+        || unresolved_nonzero(style.margin.right)
+        || style.border_left_width.unwrap_or(uniform_border) != 0.0
+        || style.border_right_width.unwrap_or(uniform_border) != 0.0
         || component.children.iter().any(inline_line_has_in_flow_content)
 }
 
@@ -2633,6 +2642,7 @@ impl LayoutEngine {
             &mut scroll_ancestor,
         );
 
+        apply_inline_line_extra_ascent(&mut results, root);
         project_rtl_fixed_block_alignment(&mut results, flat, viewport_w, viewport_h);
         project_empty_painted_inline_boxes(&mut results, flat);
         project_mixed_inline_block_definite_widths(&mut results, flat, viewport_w, viewport_h);
@@ -2826,6 +2836,7 @@ pub fn compute_with_scroll(
         &mut scroll_ancestor,
     );
 
+    apply_inline_line_extra_ascent(&mut results, root);
     project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h);
     project_empty_painted_inline_boxes(&mut results, &flat);
     project_mixed_inline_block_definite_widths(&mut results, &flat, viewport_w, viewport_h);
@@ -6151,6 +6162,50 @@ fn project_auto_height_bfc_float_heights(
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    /// The content box a forced break continues into.
+    ///
+    /// A forced break opens a new line box of the inline formatting context
+    /// that owns it, so the continuation starts at that context's content
+    /// left edge and is aligned within its content width. An inline box that
+    /// is split by the break contributes neither its own offset nor its own
+    /// width: CSS 2.1 §8.6 drops its margins, borders and padding where the
+    /// split occurs, and the line box still spans the containing block.
+    #[derive(Clone, Copy)]
+    struct LineOrigin {
+        content_left: f32,
+        content_width: f32,
+    }
+
+    /// Whether this component owns the line boxes of its inline children.
+    ///
+    /// A plain inline box does not: it is fragmented across the lines of the
+    /// enclosing formatting context, so it passes the inherited origin
+    /// through. Block containers, inline-blocks and the anonymous rows that
+    /// model an inline formatting context do own their lines, and a box that
+    /// blockifies through float or out-of-flow positioning owns them too.
+    fn owns_line_boxes(component: &Component) -> bool {
+        component.style.display != WDisplay::Inline
+            || component.style.float != WFloat::None
+            || matches!(component.style.position, WPos::Absolute | WPos::Fixed)
+    }
+
+    fn line_origin_of(component: &Component, rect: LayoutRect) -> LineOrigin {
+        let padding = component.style.padding_lengths();
+        let border_left = component
+            .style
+            .border_left_width
+            .unwrap_or(component.style.border_width);
+        let border_right = component
+            .style
+            .border_right_width
+            .unwrap_or(component.style.border_width);
+        LineOrigin {
+            content_left: rect.x + border_left + padding.left,
+            content_width: (rect.width - border_left - border_right - padding.left - padding.right)
+                .max(0.0),
+        }
+    }
+
     fn inline_text_content_top(component: &Component) -> f32 {
         if component.style.display == WDisplay::Inline
             && matches!(&component.kind, ComponentKind::Text { content } if content != "\u{2028}")
@@ -6200,10 +6255,20 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
+        inherited_line_origin: Option<LineOrigin>,
     ) {
+        let own_line_origin = layout_position
+            .get(&component_index)
+            .map(|position| line_origin_of(component, layouts[*position].0));
+        let line_origin = if owns_line_boxes(component) {
+            own_line_origin
+        } else {
+            inherited_line_origin.or(own_line_origin)
+        };
+
         let mut child_index = component_index + 1;
         for child in &component.children {
-            visit(child, child_index, layouts, layout_position);
+            visit(child, child_index, layouts, layout_position, line_origin);
             child_index += count_nodes(child);
         }
 
@@ -6212,12 +6277,15 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
         };
         let parent_rect = layouts[parent_position].0;
         let padding = component.style.padding_lengths();
-        let line_start = parent_rect.x
-            + component
-                .style
-                .border_left_width
-                .unwrap_or(component.style.border_width)
-            + padding.left;
+        let line_start = line_origin.map_or(
+            parent_rect.x
+                + component
+                    .style
+                    .border_left_width
+                    .unwrap_or(component.style.border_width)
+                + padding.left,
+            |origin| origin.content_left,
+        );
         let mut line_top = None::<f32>;
         let mut line_height = component.style.font_size * component.style.line_height;
         let mut child_index = component_index + 1;
@@ -6340,18 +6408,23 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                     Some(margin_left + layouts[following_position].0.width + margin_right)
                 })
                 .sum::<f32>();
-            let content_width = (parent_rect.width
-                - component
-                    .style
-                    .border_left_width
-                    .unwrap_or(component.style.border_width)
-                - component
-                    .style
-                    .border_right_width
-                    .unwrap_or(component.style.border_width)
-                - padding.left
-                - padding.right)
-                .max(0.0);
+            let content_width = line_origin.map_or_else(
+                || {
+                    (parent_rect.width
+                        - component
+                            .style
+                            .border_left_width
+                            .unwrap_or(component.style.border_width)
+                        - component
+                            .style
+                            .border_right_width
+                            .unwrap_or(component.style.border_width)
+                        - padding.left
+                        - padding.right)
+                        .max(0.0)
+                },
+                |origin| origin.content_width,
+            );
             let free_space = (content_width - line_width).max(0.0);
             let line_offset = match (component.style.text_align, component.style.direction) {
                 (w3cos_std::style::TextAlign::Center, _) => free_space / 2.0,
@@ -6433,7 +6506,7 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
         }
     }
 
-    visit(root, 0, layouts, &layout_position);
+    visit(root, 0, layouts, &layout_position, None);
 }
 
 fn align_inline_block_last_line_baselines(
@@ -6632,6 +6705,115 @@ fn align_inline_block_last_line_baselines(
             if delta_y.abs() > f32::EPSILON {
                 shift_subtree(layouts, positions, index, child, delta_y);
             }
+        }
+    }
+
+    visit(root, 0, layouts, &positions);
+}
+
+/// CSS 2.1 10.8.1: a positive `vertical-align` length lifts an inline box above
+/// the shared baseline, and the line box's ascent grows with it. Every *other*
+/// inline fragment **on that same line** therefore starts that much lower. The
+/// component tree records the difference on those fragments as
+/// `--w3cos-internal-line-extra-ascent`, because only it knows the font metrics
+/// and the lift.
+///
+/// The tree cannot, however, tell which children the line breaker put on the
+/// lifted line: it sees a parent's whole child list. Layout can. A fragment that
+/// wrapped onto a following line already starts at or below the lifted
+/// fragment's bottom edge, and adding the lift again would push it one whole
+/// line too far down. So the shift is applied here, where the rects are known,
+/// and only to fragments that still sit inside the lifted line box.
+fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn custom_length(component: &Component, property: &str) -> Option<f32> {
+        component
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(property))
+            .and_then(|value| value.split_ascii_whitespace().next())
+            .and_then(|value| value.parse::<f32>().ok())
+    }
+
+    fn shift_subtree(
+        layouts: &mut [(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>,
+        component_index: usize,
+        component: &Component,
+        delta_y: f32,
+    ) {
+        for index in component_index..component_index + count_nodes(component) {
+            if let Some(position) = positions.get(&index) {
+                layouts[*position].0.y += delta_y;
+            }
+        }
+    }
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        positions: &HashMap<usize, usize>,
+    ) {
+        let mut child_index = component_index + 1;
+        let children = component
+            .children
+            .iter()
+            .map(|child| {
+                let index = child_index;
+                child_index += count_nodes(child);
+                (child, index)
+            })
+            .collect::<Vec<_>>();
+        for (child, index) in &children {
+            visit(child, *index, layouts, positions);
+        }
+
+        // A lifted fragment is promoted to its own line box, so its rect is the
+        // box of the line it raised. Only a fragment that still overlaps that box
+        // is on the same line; one that wrapped to a following line starts below
+        // it, and one that stayed on an earlier line ends above it.
+        let lifted_lines = children
+            .iter()
+            .filter(|(child, _)| {
+                custom_length(child, "--w3cos-internal-vertical-align-length")
+                    .is_some_and(|offset| offset > 0.0)
+            })
+            .filter_map(|(_, index)| positions.get(index))
+            .map(|position| {
+                let rect = layouts[*position].0;
+                (rect.y, rect.y + rect.height)
+            })
+            .collect::<Vec<_>>();
+        if lifted_lines.is_empty() {
+            return;
+        }
+        // Absorbs the float noise of adding a half-leading to a line box origin,
+        // without ever bridging the gap between two stacked line boxes.
+        const LINE_SLACK: f32 = 0.01;
+        for (child, index) in &children {
+            let Some(delta_y) = custom_length(child, "--w3cos-internal-line-extra-ascent")
+                .filter(|delta_y| *delta_y > 0.0)
+            else {
+                continue;
+            };
+            let Some(position) = positions.get(index) else {
+                continue;
+            };
+            let rect = layouts[*position].0;
+            let shares_the_lifted_line = lifted_lines.iter().any(|(top, bottom)| {
+                rect.y + LINE_SLACK < *bottom && rect.y + rect.height + LINE_SLACK > *top
+            });
+            if !shares_the_lifted_line {
+                continue;
+            }
+            shift_subtree(layouts, positions, *index, child, delta_y);
         }
     }
 
@@ -7492,6 +7674,30 @@ fn build_taffy_tree(
         style.flex_grow = 0.0;
         style.flex_shrink = 0.0;
     }
+    if comp.style.display == WDisplay::TableCell
+        && comp.style.box_sizing == WBoxSizing::ContentBox
+        && style.box_sizing == BoxSizing::BorderBox
+        && let Some(height) = style.size.height.into_option()
+    {
+        // A table-cell's authored `height` is a content-box height (CSS 2.1
+        // 17.5.3 as implemented by browsers); only its inline size acts as a
+        // border-box track in the fixed table algorithm. The branches above
+        // switch Taffy to BorderBox so a track width is not expanded a second
+        // time, which would otherwise silently reinterpret the authored height
+        // as a border-box height and drop the cell's own padding and border.
+        // Convert the authored value exactly as the collapsed-track minimum
+        // does, reading the edges Taffy itself will subtract.
+        let resolve_edge = |edge: LengthPercentage| {
+            edge.resolve_or_zero(Some(containing_width), |_, _| {
+                unreachable!("used padding and border edges contain no calc handles")
+            })
+        };
+        let vertical_edges = resolve_edge(style.padding.top)
+            + resolve_edge(style.padding.bottom)
+            + resolve_edge(style.border.top)
+            + resolve_edge(style.border.bottom);
+        style.size.height = Dimension::length(height + vertical_edges);
+    }
     let normal_flow_children = comp.children.iter().filter(|child| {
         !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
             && child.style.display != WDisplay::None
@@ -7547,6 +7753,16 @@ fn build_taffy_tree(
         // preserving the authored used position exactly.
         style.padding.top = LengthPercentage::length(guard);
     }
+    // An empty inline establishes a line box only when it has a non-zero
+    // *horizontal* extent. Vertical borders, vertical padding and even an
+    // explicit line-height do not count: measured against Chrome, a zero-width
+    // empty inline collapses its line box in all of those cases, while a
+    // non-zero left/right border, padding or margin keeps it.
+    //
+    // This matters for the split-inline fragments of CSS 2.1 9.2.1.1. The
+    // hand-written references in css/CSS2/normal-flow/block-in-inline-insert-*
+    // spell an empty fragment out as `<span class="notstart notend"></span>`,
+    // which keeps only the top and bottom borders, so it must not add a line.
     let empty_inline_establishes_visible_line = |child: &Component| {
         if child.style.display != WDisplay::Inline
             || !child.children.is_empty()
@@ -7555,27 +7771,22 @@ fn build_taffy_tree(
             return false;
         }
         let padding = child.style.padding_lengths();
-        child.style.border_width > 0.0
-            || child
-                .style
-                .border_top_width
-                .is_some_and(|width| width > 0.0)
+        let margin = child.style.margin_lengths();
+        let uniform_border = child.style.border_width;
+        child
+            .style
+            .border_left_width
+            .unwrap_or(uniform_border)
+            > 0.0
             || child
                 .style
                 .border_right_width
-                .is_some_and(|width| width > 0.0)
-            || child
-                .style
-                .border_bottom_width
-                .is_some_and(|width| width > 0.0)
-            || child
-                .style
-                .border_left_width
-                .is_some_and(|width| width > 0.0)
-            || padding.top > 0.0
-            || padding.right > 0.0
-            || padding.bottom > 0.0
+                .unwrap_or(uniform_border)
+                > 0.0
             || padding.left > 0.0
+            || padding.right > 0.0
+            || margin.left > 0.0
+            || margin.right > 0.0
     };
     let establishes_inline_formatting_context = ((matches!(comp.kind, ComponentKind::Row)
         && comp.style.display == WDisplay::Block)
@@ -9176,7 +9387,8 @@ fn collect_layouts_fast(
                         .style
                         .border_top_width
                         .unwrap_or(info.style.border_width);
-                rect.y += half_leading - passive_inline_top_edge + passive_inline_alignment_offset;
+                rect.y += half_leading - passive_inline_top_edge
+                    + passive_inline_alignment_offset;
                 rect.height = info.style.font_size
                     + padding.top
                     + padding.bottom
@@ -10725,9 +10937,29 @@ mod tests {
                 Style { white_space, ..inline.clone() })), expected, "{text:?} {white_space:?}");
         }
         for style in [
+            // Vertical decorations alone leave the inline zero-width, and Chrome
+            // collapses the line box in that case.
             Style { border_top_width: Some(1.0), ..inline.clone() },
+            Style { border_bottom_width: Some(1.0), ..inline.clone() },
+            Style { padding: w3cos_std::style::Edges {
+                top: WSpacing::Px(4.0), bottom: WSpacing::Px(4.0),
+                ..w3cos_std::style::Edges::ZERO
+            }, ..inline.clone() },
+            Style { margin: w3cos_std::style::Edges {
+                top: WSpacing::Px(4.0), ..w3cos_std::style::Edges::ZERO
+            }, ..inline.clone() },
+            Style { line_height: 3.0, ..inline.clone() },
+        ] {
+            assert!(!inline_line_has_in_flow_content(&Component::row(style, Vec::new())));
+        }
+        for style in [
+            Style { border_left_width: Some(1.0), ..inline.clone() },
+            Style { border_right_width: Some(1.0), ..inline.clone() },
             Style { padding: w3cos_std::style::Edges {
                 left: WSpacing::Percent(10.0), ..w3cos_std::style::Edges::ZERO
+            }, ..inline.clone() },
+            Style { margin: w3cos_std::style::Edges {
+                right: WSpacing::Px(4.0), ..w3cos_std::style::Edges::ZERO
             }, ..inline.clone() },
             Style { display: WDisp::InlineBlock, ..inline.clone() },
         ] {
@@ -13024,6 +13256,142 @@ mod tests {
             "projected parent height was {}",
             rect(0).height
         );
+    }
+
+    #[test]
+    fn forced_break_inside_a_split_inline_box_restarts_at_the_containing_block_edge() {
+        // `#parent` is `display: inline`, so the break it contains belongs to
+        // the containing block's inline formatting context. The continuation
+        // must start at that context's content left edge (8), not at the
+        // fragment origin of the inline box (82.38).
+        let inline_style = || Style {
+            display: WDisp::Inline,
+            font_size: 16.0,
+            line_height: 1.2,
+            line_height_is_normal: false,
+            ..Style::default()
+        };
+        let inline_text = |content: &str| Component::text(content, inline_style());
+        let forced_break = || {
+            Component::text(
+                "\u{2028}",
+                Style {
+                    width: WDim::Px(0.0),
+                    height: WDim::Px(19.2),
+                    ..inline_style()
+                },
+            )
+        };
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                font_size: 16.0,
+                line_height: 1.2,
+                line_height_is_normal: false,
+                padding: w3cos_std::style::Edges {
+                    left: WSpacing::Px(8.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            },
+            vec![
+                inline_text("Filler Text"),
+                Component::row(
+                    inline_style(),
+                    vec![forced_break(), inline_text("Filler Text")],
+                ),
+            ],
+        );
+        let rect = |x, y, width, height| LayoutRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut layouts = vec![
+            (rect(0.0, 0.0, 800.0, 57.6), 0),
+            (rect(8.0, 1.6, 70.38, 16.0), 1),
+            (rect(82.38, 1.6, 70.38, 36.8), 2),
+            (rect(82.38, 0.0, 0.0, 19.2), 3),
+            (rect(82.38, 20.8, 70.38, 16.0), 4),
+        ];
+        project_forced_break_lines(&mut layouts, &root);
+        assert!(
+            (layouts[4].0.x - 8.0).abs() < 0.001,
+            "continuation restarted at the inline box ({})",
+            layouts[4].0.x
+        );
+        assert!((layouts[4].0.y - 20.8).abs() < 0.001);
+        assert!(
+            (layouts[3].0.x - 82.38).abs() < 0.001,
+            "the break marker is not a fragment"
+        );
+    }
+
+    #[test]
+    fn forced_break_inside_an_inline_block_keeps_the_inline_block_edge() {
+        // An inline-block owns its line boxes, so the same break geometry
+        // resolves against the inline-block's own content edge (100) and
+        // must not be pulled back to the outer block's edge (0).
+        let inline_style = || Style {
+            display: WDisp::Inline,
+            font_size: 16.0,
+            line_height: 1.2,
+            line_height_is_normal: false,
+            ..Style::default()
+        };
+        let forced_break = || {
+            Component::text(
+                "\u{2028}",
+                Style {
+                    width: WDim::Px(0.0),
+                    height: WDim::Px(19.2),
+                    ..inline_style()
+                },
+            )
+        };
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                font_size: 16.0,
+                line_height: 1.2,
+                line_height_is_normal: false,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::InlineBlock,
+                    width: WDim::Px(200.0),
+                    font_size: 16.0,
+                    line_height: 1.2,
+                    line_height_is_normal: false,
+                    ..Style::default()
+                },
+                vec![
+                    forced_break(),
+                    Component::text("Filler Text", inline_style()),
+                ],
+            )],
+        );
+        let rect = |x, y, width, height| LayoutRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut layouts = vec![
+            (rect(0.0, 0.0, 800.0, 40.0), 0),
+            (rect(100.0, 0.0, 200.0, 20.0), 1),
+            (rect(100.0, 0.0, 0.0, 19.2), 2),
+            (rect(100.0, 20.8, 50.0, 16.0), 3),
+        ];
+        project_forced_break_lines(&mut layouts, &root);
+        assert!(
+            (layouts[3].0.x - 100.0).abs() < 0.001,
+            "was {}",
+            layouts[3].0.x
+        );
+        assert!((layouts[3].0.y - 20.8).abs() < 0.001);
     }
 
     #[test]
@@ -18001,6 +18369,58 @@ mod tests {
             "inline={inline:?}, block={block:?}"
         );
         assert!(absolute.width > 0.0, "absolute={absolute:?}");
+    }
+
+    #[test]
+    fn empty_split_fragment_with_only_vertical_borders_adds_no_line() {
+        // A zero-width empty inline must not add a line of its own, even when it
+        // carries top and bottom borders. Chrome collapses that line, and the
+        // hand-written references of
+        // css/CSS2/normal-flow/block-in-inline-insert-* depend on it: they spell
+        // an empty split fragment out as `<span class="notstart notend">`, which
+        // keeps only the vertical borders.
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule("span", &[("border", "3px solid blue")]);
+        stylesheet::register_rule(".bare", &[("border-left", "none"), ("border-right", "none")]);
+
+        let build = |with_empty_fragment: bool| {
+            let mut document = Document::new();
+            let first = document.create_element("span");
+            first.set_text_content(&mut document, "One");
+            document.body().append_child(&mut document, first);
+            for (index, text) in ["Two", "Three"].into_iter().enumerate() {
+                let block = document.create_element("div");
+                block.set_text_content(&mut document, text);
+                document.body().append_child(&mut document, block);
+                if with_empty_fragment && index == 0 {
+                    let empty = document.create_element("span");
+                    empty.set_attribute(&mut document, "class", "bare");
+                    document.body().append_child(&mut document, empty);
+                }
+            }
+            let last = document.create_element("span");
+            last.set_text_content(&mut document, "Four");
+            document.body().append_child(&mut document, last);
+            document.to_component_tree()
+        };
+        let content_bottom = |component: &w3cos_std::Component| {
+            compute(component, 800.0, 600.0)
+                .unwrap()
+                .iter()
+                .map(|(rect, _)| rect.y + rect.height)
+                .fold(0.0_f32, f32::max)
+        };
+
+        let without = content_bottom(&build(false));
+        let with = content_bottom(&build(true));
+        assert!(
+            (with - without).abs() < 0.01,
+            "an empty fragment with only vertical borders must not add a line: \
+             with={with}, without={without}"
+        );
+        stylesheet::clear_rules();
     }
 
     #[test]
