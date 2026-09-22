@@ -6653,9 +6653,6 @@ fn align_inline_block_last_line_baselines(
                     .then_some(text_rect.y + child.style.font_size * 0.8)
             })
             .reduce(f32::max);
-        let Some(reference_baseline) = reference_baseline else {
-            return;
-        };
         let inline_blocks = children
             .iter()
             .filter(|(child, _)| {
@@ -6667,6 +6664,74 @@ fn align_inline_block_last_line_baselines(
                     .map(|baseline| (*child, *index, baseline))
             })
             .collect::<Vec<_>>();
+        let Some(reference_baseline) = reference_baseline else {
+            // CSS 2.1 10.8: a line that holds nothing but inline-level boxes
+            // still has one baseline, and every box on it that is
+            // `vertical-align: baseline` is aligned to that baseline. With no
+            // inline text to anchor it, Taffy leaves those boxes top-aligned,
+            // so the content area of an inline box drifts with its own
+            // `line-height` instead of staying put. Re-align the boxes of each
+            // line to the deepest baseline on that line.
+            // Only an inline formatting context aligns its boxes on a shared
+            // baseline. A real flex container lays its items out on the cross
+            // axis instead, and the anonymous rows an inline context builds
+            // either carry the internal marker or keep the block display of
+            // the container they were split out of - a genuine `display: flex`
+            // always keeps `Flex`.
+            let in_inline_context =
+                component
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .is_some_and(|properties| {
+                        properties.contains_key("--w3cos-internal-inline-formatting-context")
+                    })
+                    || !matches!(
+                        component.style.display,
+                        WDisplay::Flex | WDisplay::InlineFlex
+                    );
+            if !in_inline_context || inline_blocks.len() < 2 {
+                return;
+            }
+            // Taffy top-aligns the boxes of a wrapped row, so the boxes that
+            // share a line are the ones that share a top edge.
+            let mut lines: Vec<(f32, Vec<(&Component, usize, f32)>)> = Vec::new();
+            for entry in &inline_blocks {
+                let Some(position) = positions.get(&entry.1) else {
+                    continue;
+                };
+                let top = layouts[*position].0.y;
+                match lines
+                    .iter_mut()
+                    .find(|(line_top, _)| (line_top - top).abs() <= 0.5)
+                {
+                    Some(line) => line.1.push(*entry),
+                    None => lines.push((top, vec![*entry])),
+                }
+            }
+            for (_, line) in lines {
+                if line.len() < 2
+                    || !line.iter().all(|(child, _, _)| {
+                        matches!(
+                            child.style.align_self,
+                            WAlignSelf::Auto | WAlignSelf::Baseline
+                        )
+                    })
+                {
+                    continue;
+                }
+                let target = line
+                    .iter()
+                    .fold(f32::MIN, |deepest, (_, _, baseline)| deepest.max(*baseline));
+                for (child, index, baseline) in line {
+                    let delta_y = target - baseline;
+                    if delta_y.abs() > f32::EPSILON {
+                        shift_subtree(layouts, positions, index, child, delta_y);
+                    }
+                }
+            }
+            return;
+        };
         let target_baseline = inline_blocks
             .iter()
             .filter(|(child, _, _)| {

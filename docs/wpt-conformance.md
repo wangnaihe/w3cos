@@ -7650,6 +7650,57 @@ Cost, both measured: `replaced-intrinsic-002.xht` passes -> fails at **22,500** 
 - rustfmt: no diff block inside either edited region.
 - `tests/wpt/w3cos-smoke.json` **2/2**; `tests/wpt/w3cos-baseline.json` **9/10**.
 
+### Inline-level boxes on a text-free line still share one baseline (2026-09-22)
+
+`css/CSS2/visudet/content-height-00{1,2,3}.html` failed by **8,900**, **13,800** and
+**11,200** pixels.
+
+Each test puts three `display: inline-block` divs side by side at `font-size: 50px` with
+`line-height` of `200px`, `30px` and `normal`, and gives the inner `span` a blue background.
+The assertion is that the height of an inline box's content area does not depend on
+`line-height`, so all three blue boxes have to line up into a single rectangle.
+
+The engine already got the *height* right - every blue box measured exactly 50px. What was
+wrong is the *position*: the three boxes were top-aligned, so each content area sat one
+`half-leading` below its own top edge and the blue boxes landed at y=126, y=41 and y=56.
+
+CSS 2.1 10.8 gives a line box one baseline, and every `vertical-align: baseline` box on it is
+aligned to that baseline, so all three content areas must sit at the same y.
+`align_inline_block_last_line_baselines` already re-aligns inline-blocks to a baseline, but it
+only ever ran when the line also contained inline *text* to anchor it (`reference_baseline`).
+These lines hold nothing but the three divs, so it bailed out and Taffy's top alignment stood.
+
+The fall-back now groups the inline-blocks of a text-free line by their top edge - Taffy
+top-aligns a row, so the boxes of one line share a top - and shifts each one down to the
+deepest baseline in its group. That is the same `target_baseline - last_baseline` delta the
+existing loop already applies. Measured baselines before the fix: **166.2 / 81.2 / 96.2**;
+after it, all three are 166.2.
+
+The guard keeps this out of real flex containers, which lay their items out on the cross axis
+instead. A genuine `display: flex` always keeps `Flex` on the principal box, whereas the
+anonymous rows an inline context builds either carry
+`--w3cos-internal-inline-formatting-context` or keep the block display of the container they
+were split out of.
+
+`content-height-005.html` still fails. It is a `rel="mismatch"` test that needs two
+`@font-face` families to report different content-area heights - a font-selection gap, not a
+baseline one.
+
+**Evidence.**
+
+- Directed run over the `content-height` family (**5 cases**): **3 fixed, 0 regressed**,
+  each to 0 pixels; 004 still passes and 005 is unchanged.
+- Full 6,548-case regression (14 x 500, 38m07s): **6,169 passed / 379 failed** (was
+  6,167 / 381). One of the 379 is `anonymous-boxes-001.xht`, which errored with a local proxy
+  503 and passes 1/1 when re-run isolated, so the corrected result is **6,170 / 378**:
+  3 fixed, **0 regressed**.
+- `css/CSS2/csswg-issues/submitted/css2.1/abspos-replaced-width-margin-000.xht` also improved,
+  from **119,804** to **22,272** pixels, but still fails.
+- `cargo test -p w3cos-runtime --lib`: 1245 passed / 32 failed, the failure *name set*
+  byte-identical to the baseline.
+- rustfmt (edition 2024): no diff hunk inside the added block.
+- `tests/wpt/w3cos-smoke.json` **2/2**; `tests/wpt/w3cos-baseline.json` **9/10**.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
