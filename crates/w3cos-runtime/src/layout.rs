@@ -403,10 +403,13 @@ fn image_intrinsic_size(
                 let width = containing_width.unwrap_or(300.0).min(300.0).max(0.0);
                 (width, width / ratio)
             }
-            (None, None, _) => (
-                containing_width.unwrap_or(300.0).clamp(0.0, 300.0),
-                150.0,
-            ),
+            // CSS 2.1 10.3.2, last rule of the inline replaced width
+            // algorithm: with `auto` width, no intrinsic width, no intrinsic
+            // height and no intrinsic ratio, none of the preceding rules
+            // apply, so the used width is the default object size. It is a
+            // constant, not the containing block width - only the *ratio*
+            // rule above derives the width from the containing block.
+            (None, None, _) => (300.0, 150.0),
         }
     } else {
         decoded
@@ -14834,9 +14837,12 @@ mod tests {
         let kind = ComponentKind::Image {
             src: no_intrinsic_size.to_string(),
         };
+        // CSS 2.1 10.3.2: with no intrinsic width, height or ratio the used
+        // width is the 300px default object size. It does not follow the
+        // 150px containing block - only the intrinsic-ratio rule does.
         assert_eq!(
             leaf_intrinsic_size_with_containing(&kind, &Style::default(), Some(150.0)),
-            (150.0, 150.0)
+            (300.0, 150.0)
         );
 
         crate::image_loader::invalidate(ratio_only);

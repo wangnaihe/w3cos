@@ -7600,6 +7600,56 @@ plain `div` does.
   `css/CSS2/visuren/percent-height-1.html` (each 17,280 px -> pass). **0 regressed, 0
   pixel-count changes**.
 
+### A replaced element with no intrinsic size takes the 300x150 default object size (2026-09-22)
+
+`css/CSS2/visudet/replaced-elements-{all-auto,min-height-20,min-height-40,min-width-40,
+min-width-80}.html` failed by **15,000** pixels each and
+`replaced-elements-{height-20,max-height-20}.html` by **2,000** each. All seven are the same
+single image.
+
+Each test lays out seven images that between them cover every combination of intrinsic
+dimensions, and six of the seven are already sized correctly. Only `support/no-ratio.svg` is
+wrong: it carries no `width`, no `height` and no `viewBox`, so it has no intrinsic width, no
+intrinsic height and no intrinsic ratio, and it renders **200x150** against a
+`div { width: 200px }` where the reference asks for **300x150**.
+
+`image_intrinsic_size` resolved that arm from the containing block:
+
+```rust
+(None, None, _) => (containing_width.unwrap_or(300.0).clamp(0.0, 300.0), 150.0),
+```
+
+CSS 2.1 10.3.2 closes the inline replaced width algorithm with a constant: once `width` is
+`auto` and none of the preceding rules apply, the used width is **300px** - the default object
+size. Only the *intrinsic ratio* rule immediately above it derives the width from the
+containing block, which is why `ratio-2.svg` correctly keeps its 200x100. The arm now returns
+`(300.0, 150.0)`.
+
+**This is a deliberate trade, not a clean fix.** `css/CSS2/normal-flow/replaced-intrinsic-00{1,2}.xht`
+want the opposite reading: an `<object>` whose SVG omits both dimensions and the viewBox is
+expected to fill the 150px `html` width, on the theory that SVG's implied `width="100%"` is a
+percentage intrinsic size. `66d2596` chose that reading on purpose and pinned it with a unit
+test asserting `(150.0, 150.0)`; that expectation is now `(300.0, 150.0)`.
+
+The two families cannot both pass. `no-ratio.svg` and `replaced-intrinsic-001.svg` are
+indistinguishable at the sizing layer - both omit `width`, `height` and `viewBox` - so no rule
+keyed on the image alone satisfies both. `replaced-elements-all-auto-ref.html` states the
+300x150 default object size explicitly and is the more recent reading of 10.3.2, so it wins.
+
+Cost, both measured: `replaced-intrinsic-002.xht` passes -> fails at **22,500** pixels
+(reproduced 2/2 with `--jobs 1`), and `replaced-intrinsic-001.xht` moves from 1 pixel to
+**22,501**.
+
+**Evidence.**
+
+- Directed run over the `replaced-elements` family (**9 cases**): **7 fixed, 0 regressed**.
+- Full 6,548-case regression (14 x 500, 33m44s): **6,167 passed / 381 failed** (was
+  6,161 / 387). The seven intended cases; **1 regressed**, recorded above.
+- `cargo test -p w3cos-runtime --lib`: the failure *name set* is unchanged apart from the
+  documented flake `fetch::tests::cancellable_text_fetch_stops_buffering_a_streaming_body`.
+- rustfmt: no diff block inside either edited region.
+- `tests/wpt/w3cos-smoke.json` **2/2**; `tests/wpt/w3cos-baseline.json` **9/10**.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
