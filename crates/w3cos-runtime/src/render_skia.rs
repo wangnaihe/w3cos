@@ -1642,7 +1642,8 @@ fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) ->
         && style.float == w3cos_std::style::Float::None;
     if is_extended_inline_fragment
         || is_in_flow_inline
-        || (style.display == Display::Block && style.justify_content != JustifyContent::Center)
+        || (matches!(style.display, Display::Block | Display::InlineBlock)
+            && style.justify_content != JustifyContent::Center)
     {
         0.0
     } else {
@@ -3381,6 +3382,12 @@ mod tests {
             ..Style::default()
         };
         assert_eq!(text_vertical_offset(&block, 84.0, 19.2), 0.0);
+
+        let inline_block = Style {
+            display: Display::InlineBlock,
+            ..Style::default()
+        };
+        assert_eq!(text_vertical_offset(&inline_block, 84.0, 19.2), 0.0);
 
         let centered = Style {
             display: Display::Block,

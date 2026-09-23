@@ -6528,15 +6528,23 @@ fn align_inline_block_last_line_baselines(
         layouts: &[(LayoutRect, usize)],
         positions: &HashMap<usize, usize>,
     ) -> Option<f32> {
-        let own = (component.style.visibility == WVisibility::Visible
-            && !matches!(component.style.position, WPos::Absolute | WPos::Fixed)
-            && matches!(component.kind, ComponentKind::Text { .. }))
-        .then(|| {
-            positions
-                .get(&component_index)
-                .map(|position| layouts[*position].0.y + component.style.font_size * 0.8)
-        })
-        .flatten();
+        let own = match &component.kind {
+            ComponentKind::Text { content }
+                if component.style.visibility == WVisibility::Visible
+                    && !matches!(component.style.position, WPos::Absolute | WPos::Fixed) =>
+            {
+                positions.get(&component_index).map(|position| {
+                    // A forced break can be retained inside one text leaf. Its
+                    // layout rect starts at the first line, while the
+                    // inline-block baseline comes from the last line box.
+                    let last_line = content.matches('\u{2028}').count() as f32;
+                    layouts[*position].0.y
+                        + last_line * component.style.font_size * component.style.line_height
+                        + component.style.font_size * 0.8
+                })
+            }
+            _ => None,
+        };
         let mut child_index = component_index + 1;
         component.children.iter().fold(own, |latest, child| {
             let child_baseline = last_text_baseline(child, child_index, layouts, positions);
@@ -6655,13 +6663,20 @@ fn align_inline_block_last_line_baselines(
             .reduce(f32::max);
         let inline_blocks = children
             .iter()
-            .filter(|(child, _)| {
-                child.style.display == WDisplay::InlineBlock
-                    && matches!(child.style.overflow, WOverflow::Visible)
-            })
+            .filter(|(child, _)| child.style.display == WDisplay::InlineBlock)
             .filter_map(|(child, index)| {
-                last_text_baseline(child, *index, layouts, positions)
-                    .map(|baseline| (*child, *index, baseline))
+                // This pass handles boxes with an in-flow line. Empty boxes
+                // still use the layout engine's bottom-edge baseline.
+                let last_line = last_text_baseline(child, *index, layouts, positions)?;
+                let baseline = if matches!(child.style.overflow, WOverflow::Visible) {
+                    last_line
+                } else {
+                    // CSS 2.1 errata: for non-visible overflow, choose the
+                    // higher of the last in-flow line and bottom margin edge.
+                    let rect = layouts[*positions.get(index)?].0;
+                    last_line.min(rect.y + rect.height + child.style.margin_lengths().bottom)
+                };
+                Some((*child, *index, baseline))
             })
             .collect::<Vec<_>>();
         let Some(reference_baseline) = reference_baseline else {
@@ -6735,6 +6750,12 @@ fn align_inline_block_last_line_baselines(
         let target_baseline = inline_blocks
             .iter()
             .filter(|(child, _, _)| {
+                // A non-visible inline-block already contributes its chosen
+                // baseline through the margin-edge rule above. Do not push
+                // the surrounding text down again merely for that margin.
+                if !matches!(child.style.overflow, WOverflow::Visible) {
+                    return false;
+                }
                 let margin = child.style.margin_lengths();
                 let padding = child.style.padding_lengths();
                 margin.top.abs() > f32::EPSILON
@@ -13906,6 +13927,90 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
         assert_eq!(rect(1).height, 192.0);
         assert_eq!(rect(2).height, 96.0, "layout={layout:#?}");
+        stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inline_block_forced_break_uses_last_line_baseline() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule("body", &[("font-size", "15px")]);
+        stylesheet::register_rule(
+            "p",
+            &[("white-space", "nowrap"), ("line-height", "5")],
+        );
+        stylesheet::register_rule(
+            "span",
+            &[
+                ("display", "inline-block"),
+                ("overflow", "visible"),
+                ("line-height", "1"),
+            ],
+        );
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let lead = document.create_text_node("All the ");
+        paragraph.append_child(&mut document, lead);
+        let inline_block = document.create_element("span");
+        let first_line = document.create_text_node("\u{a0}");
+        inline_block.append_child(&mut document, first_line);
+        let line_break = document.create_element("br");
+        inline_block.append_child(&mut document, line_break);
+        let last_line = document.create_text_node("words");
+        inline_block.append_child(&mut document, last_line);
+        paragraph.append_child(&mut document, inline_block);
+        let trailing = document.create_text_node(" are aligned on the same baseline.");
+        paragraph.append_child(&mut document, trailing);
+        document.body().append_child(&mut document, paragraph);
+
+        let component = document.to_component_tree();
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        fn text_nodes(
+            component: &Component,
+            index: &mut usize,
+            out: &mut Vec<(usize, String, f32, f32)>,
+        ) {
+            let own = *index;
+            *index += 1;
+            if let ComponentKind::Text { content } = &component.kind {
+                out.push((
+                    own,
+                    content.clone(),
+                    component.style.font_size,
+                    component.style.line_height,
+                ));
+            }
+            for child in &component.children {
+                text_nodes(child, index, out);
+            }
+        }
+        let mut texts = Vec::new();
+        text_nodes(&component, &mut 0, &mut texts);
+        let baseline = |needle: &str| {
+            let (index, content, font_size, line_height) = texts
+                .iter()
+                .find(|(_, content, _, _)| content.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?}: {texts:?}"));
+            let line = content
+                .split('\u{2028}')
+                .position(|fragment| fragment.contains(needle))
+                .expect("needle is in the selected text node");
+            layout
+                .iter()
+                .find(|(_, candidate)| candidate == index)
+                .unwrap()
+                .0
+                .y
+                + line as f32 * font_size * line_height
+                + font_size * 0.8
+        };
+        let words = baseline("words");
+        let outer = baseline("are aligned");
+        assert!(
+            (words - outer).abs() < 0.5,
+            "last inline-block line must share the outside baseline: words={words}, outer={outer}"
+        );
         stylesheet::clear_rules();
     }
 

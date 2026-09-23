@@ -7757,6 +7757,35 @@ computed value.
 - rustfmt (edition 2024): no diff hunk inside the added lines.
 - `tests/wpt/w3cos-smoke.json` **2/2**; `tests/wpt/w3cos-baseline.json` **9/10**.
 
+### Inline-block last-line baselines and default text origin (2026-09-23)
+
+`css/CSS2/visudet/inline-block-baseline-002..006.xht` each differed by 434 pixels.
+The visible-overflow case (`002`) retains `NBSP + forced break + words` in one text
+leaf. Its rectangle starts at the first line, but `last_text_baseline` read that
+first line as the inline-block baseline. It now includes each retained forced
+break's line-height when finding the last in-flow line baseline.
+
+The non-visible-overflow cases (`003..006`) exercise the [CSS 2.1 baseline
+erratum](https://www.w3.org/Style/css2-updates/REC-CSS2-20110607-errata.html):
+choose the higher of the last in-flow line baseline and the bottom margin edge.
+`align_inline_block_last_line_baselines` now applies that rule while leaving the
+surrounding text's baseline alone. Chromium in the local Playwright check still
+uses the earlier bottom-margin-edge behavior for these four pages; this is a
+documented browser-versus-pinned-WPT difference, not a claim of Chrome parity.
+
+The last 8px in `003/004` came from paint centering single-line text inside an
+explicit-height inline-block. Default inline-block text now starts at its content
+box top, like block text; explicit `justify-content: center` keeps centering.
+
+At WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, 800x600 strict pixels:
+`001..006` are **6/6 pass**, with `002..006` each **434 → 0**. A 38-case
+`visudet` run changed only those five cases against the `8988c8e` full-run
+report. The 81-case `linebox/vertical-align` run, 34-case normal-flow
+`inline-block` run, and 120-case `box-display` run had no additional status or
+pixel-count changes. Two focused runtime tests passed; the smoke gate was 2/2
+and the documented ten-case baseline held at 9/10. No current full 6,548-case
+result is asserted here.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
