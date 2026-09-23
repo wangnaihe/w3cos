@@ -7701,6 +7701,51 @@ baseline one.
 - rustfmt (edition 2024): no diff hunk inside the added block.
 - `tests/wpt/w3cos-smoke.json` **2/2**; `tests/wpt/w3cos-baseline.json` **9/10**.
 
+### `inherit` on `height` must copy the computed percentage, not the collapsed used value (2026-09-22)
+
+**Root cause.** `crates/w3cos-dom/src/document.rs` rewrites a percentage `height`
+to `Auto` when the containing block is an auto-height block formatting context.
+This is correct as a *used-value* decision (CSS 2.1 §10.5: the percentage
+becomes `auto` for an indefinite containing block). However, `inherit` copies
+the *computed* value — and the rewrite happened *before* inheritance was
+resolved, so a child with `height: inherit` picked up `Auto` instead of the
+original percentage. This broke `css/CSS2/visudet/height-percentage-004.xht`,
+where `#container { height: 100% }` sits inside an auto-height block, and an
+absolutely positioned child uses `height: inherit` expecting to receive `100%`
+and resolve it against the viewport (its own containing block).
+
+**Fix.** Two changes in `crates/w3cos-dom/src/document.rs`:
+
+1. Before the percentage-to-`Auto` rewrite, stash the computed percentage
+   value into a `--w3cos-internal-computed-height-percent` custom property on
+   the same element's style.
+2. In the `inherit` arm of the box-dimension resolution loop, when
+   `property == "height"`, read back the stashed percentage and restore it as
+   the inherited `Dimension::Percent`.
+
+This preserves the CSS 2.1 invariant: the computed value of `height: 100%`
+stays a percentage even when the used value is `auto`; `inherit` copies the
+computed value.
+
+**Evidence.**
+
+- `css/CSS2/visudet/height-percentage-004.xht`: **fail 30,793 → pass 0**.
+- `css/CSS2/normal-flow/height-percentage-004.xht` also passes (0 px).
+- Directed 18-case `height-percentage` / `height-inherit` family suite:
+  **18/18 pass**, 1 changed (fail→pass), **0 regressed**.
+- Probe matrix: `height: inherit` with an absolute length (`300px`) passes
+  at 0 px (inherit mechanism itself was never broken); `height: 100%`
+  written directly passes at 0 px; only inheriting a *percentage* was broken
+  and is now fixed.
+- `cargo test -p w3cos-runtime --lib`: 1244 passed / 33 failed; one new failure
+  is `layout_microbench` — a performance budget test (`8.3 ms > 8 ms`) that
+  flaked under concurrent compilation; isolated re-run **passes**. All other
+  failure names match the baseline set.
+- Full 6,548-case regression: **6,171 passed / 377 failed** (from 6,170 / 378),
+  **0 regressed**, 1 fixed (`height-percentage-004` fail→pass).
+- rustfmt (edition 2024): no diff hunk inside the added lines.
+- `tests/wpt/w3cos-smoke.json` **2/2**; `tests/wpt/w3cos-baseline.json` **9/10**.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`

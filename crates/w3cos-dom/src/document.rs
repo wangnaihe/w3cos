@@ -1364,7 +1364,24 @@ impl Document {
             ] {
                 if let Some(value) = declared_value(&[property]) {
                     match value.trim().to_ascii_lowercase().as_str() {
-                        "inherit" => *target = inherited_box_dimension(parent_value, parent),
+                        "inherit" => {
+                            *target = inherited_box_dimension(parent_value, parent);
+                            // A parent whose percentage height was collapsed to
+                            // `auto` above still has the percentage as its
+                            // computed value, and that is what `inherit` copies.
+                            if property == "height" {
+                                let percent = parent
+                                    .custom_properties
+                                    .as_ref()
+                                    .and_then(|properties| {
+                                        properties.get("--w3cos-internal-computed-height-percent")
+                                    })
+                                    .and_then(|value| value.parse::<f32>().ok());
+                                if let Some(percent) = percent {
+                                    *target = w3cos_std::style::Dimension::Percent(percent);
+                                }
+                            }
+                        }
                         "initial" | "unset" | "revert" | "revert-layer" => {
                             *target = w3cos_std::style::Dimension::Auto;
                         }
@@ -3736,6 +3753,23 @@ impl Document {
                 // are indefinite and compute to the auto used height. Letting
                 // Taffy resolve the percentage against the block's eventual
                 // content height creates a cyclic non-zero box.
+                //
+                // This is a *used*-value decision, not a computed-value one:
+                // CSS 2.1 10.5 keeps the percentage as the computed value of
+                // `height`, and `inherit` copies the computed value. A child
+                // that inherits it must therefore see `100%` and resolve it
+                // against its own containing block - which for an absolutely
+                // positioned child is the viewport, not this block. Keep the
+                // percentage so `inherit` can read it back.
+                if let w3cos_std::style::Dimension::Percent(value) = style.height {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            "--w3cos-internal-computed-height-percent".to_string(),
+                            format!("{value}"),
+                        );
+                }
                 style.height = w3cos_std::style::Dimension::Auto;
             }
         }
