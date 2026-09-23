@@ -8480,6 +8480,10 @@ fn group_unbroken_ascii_inline_words(
         return children;
     }
     let eligible = |child: &Component| {
+        // A length vertical-align is lowered to a synthetic vertical margin.
+        // That margin changes the line box, not the word-break opportunities.
+        let synthetic_vertical_margin = child.style.custom_properties.as_ref().is_some_and(
+            |properties| properties.contains_key("--w3cos-internal-vertical-align-length"));
         matches!(&child.kind, ComponentKind::Text { content }
             if !content.is_empty() && content.chars().all(|ch| ch.is_ascii_alphanumeric()))
             && child.style.display == Display::Inline
@@ -8488,7 +8492,10 @@ fn group_unbroken_ascii_inline_words(
             && child.style.word_break == WordBreak::Normal
             && child.style.unicode_bidi == UnicodeBidi::Normal
             && child.style.direction == parent.direction
-            && child.style.margin == Edges::ZERO
+            && (child.style.margin == Edges::ZERO
+                || (synthetic_vertical_margin
+                    && child.style.margin.left == Spacing::Px(0.0)
+                    && child.style.margin.right == Spacing::Px(0.0)))
             && child.style.padding == Edges::ZERO
             && child.style.width == Dimension::Auto
             && child.style.border_width == 0.0
@@ -12584,6 +12591,43 @@ mod image_component_tests {
         assert_ne!(word.children[0].style.color, word.children[1].style.color);
         assert!(word.children.iter().all(|child| matches!(child.on_click,
             w3cos_std::EventAction::NativeHost { .. })));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn vertical_align_does_not_create_a_break_opportunity_inside_ascii_word() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#container",
+            &[("width", "20px"), ("font", "20px/1 Ahem")],
+        );
+        crate::stylesheet::register_rule("#lift", &[("vertical-align", "100%")]);
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "container");
+        let lifted = document.create_element("span");
+        lifted.set_attribute(&mut document, "id", "lift");
+        let lifted_text = document.create_text_node("X");
+        lifted.append_child(&mut document, lifted_text);
+        container.append_child(&mut document, lifted);
+        let following_text = document.create_text_node("X");
+        container.append_child(&mut document, following_text);
+        document.body().append_child(&mut document, container);
+
+        fn unbroken_word(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-unbroken-inline-word")) {
+                return Some(component);
+            }
+            component.children.iter().find_map(unbroken_word)
+        }
+        let tree = document.to_component_tree();
+        let word = unbroken_word(&tree).expect("vertical-align must not split XX into two lines");
+        assert_eq!(word.children.len(), 2);
+        assert!(word.children[0].style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-vertical-align-length")));
+        assert!(word.children[1].style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-line-extra-ascent")));
         crate::stylesheet::clear_rules();
     }
 

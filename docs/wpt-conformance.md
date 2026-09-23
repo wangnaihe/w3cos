@@ -5586,9 +5586,20 @@ A 210-case targeted run (every `vertical-align` case, the whole `css/CSS2/linebo
 directory as control, `text-decoration-va-length`, `c544-valgn`) went **153 -> 169 pass**,
 `fail -> pass` 16 - exactly `vertical-align-{007,008,019,020,031,032,043,044,055,056,067,068,079,080,091,092}`,
 each 400 px to 0 - with **`pass -> fail` 0** and the other 194 cases bit-identical.
-`vertical-align-103`/`-104` still fail: their red square now moves correctly, but
-`div4 { top: 100% }` does not resolve against the containing block height, which is a
-percentage-offset issue and a separate follow-up.
+At that point `vertical-align-103`/`-104` still failed by 400 pixels each. The initial
+diagnosis that `div4 { top: 100% }` used the wrong containing-block height was incorrect:
+its black square already matched the reference. The remaining square was the passive
+red `X`, incorrectly wrapped below the lifted inline `X` despite no break opportunity
+between the two characters.
+
+On 2026-09-23 the generated unbroken-ASCII-word grouping was taught to ignore only the
+synthetic vertical margin attached to a length-aligned text fragment. The authored
+horizontal edges and both child paint/event nodes remain intact. A DOM regression test
+went RED to GREEN. At pinned WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, 800x600
+strict reftests `vertical-align-103` and `-104` each moved from 400 differing pixels to 0.
+The 81-case `linebox/vertical-align*` directed run was 69 pass / 12 fail; compared with
+the `8988c8e` full-run report, those two cases alone changed, with no lost pass or changed
+pixel count in the other 79. This directed result does not assert a new full-suite total.
 
 #### The first full run regressed `first-line-pseudo-012`, and the fix was scope, not magnitude
 
