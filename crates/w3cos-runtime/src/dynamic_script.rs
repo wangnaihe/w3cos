@@ -1356,9 +1356,7 @@ fn html_meta_encoding_for_label(label: &str) -> Result<&'static encoding_rs::Enc
 }
 
 fn sniff_xml_charset(bytes: &[u8]) -> Result<Option<String>> {
-    if !bytes.starts_with(b"<?xml")
-        || !matches!(bytes.get(5), Some(b' ' | b'\t' | b'\r' | b'\n'))
-    {
+    if !bytes.starts_with(b"<?xml") || !matches!(bytes.get(5), Some(b' ' | b'\t' | b'\r' | b'\n')) {
         return Ok(None);
     }
     let Some(end) = bytes.windows(2).position(|window| window == b"?>") else {
@@ -3691,8 +3689,10 @@ impl ScriptLoader {
                 fetch.task.cancel();
             }
             self.inner.processed_frame_nodes.borrow_mut().remove(node);
+            crate::jsdom::clear_object_document(*node);
             self.complete_document_script_node(*node);
         }
+        self.rebuild_stylesheet_rules();
     }
 
     fn invalidate_stylesheet_nodes(&self, nodes: &HashSet<u32>) {
@@ -3829,6 +3829,64 @@ impl ScriptLoader {
             }
         }
         crate::jsdom::order_author_stylesheets(&sheet_nodes);
+        // Embedded documents share the node arena, not the author cascade.
+        // Their inline sheets are registered against their detached root;
+        // an empty child document must also reject host author styles.
+        let frame_nodes = self.inner.processed_frame_nodes.borrow().clone();
+        for host in frame_nodes {
+            if !crate::jsdom::node_is_connected(host) {
+                continue;
+            }
+            let frame_document = crate::jsdom::installed_frame_document(host);
+            let Some(root) =
+                crate::jsdom::node_id_of(&frame_document.get_property("documentElement"))
+            else {
+                continue;
+            };
+            let root_id = w3cos_dom::NodeId::from_u32(root);
+            w3cos_dom::stylesheet::register_document_scope(self.inner.stylesheet_owner, root_id);
+            let mut nodes = Vec::new();
+            collect_stylesheet_nodes_in_tree_order(root, &mut nodes);
+            for node in nodes {
+                if crate::dom::tag_name(node) != "style"
+                    || crate::dom::has_attribute(node, "disabled")
+                {
+                    continue;
+                }
+                let content_type = crate::dom::get_attribute(node, "type").unwrap_or_default();
+                if !content_type.is_empty() && !content_type.eq_ignore_ascii_case("text/css") {
+                    continue;
+                }
+                let sheet_media = crate::dom::get_attribute(node, "media").unwrap_or_default();
+                if !sheet_media.trim().is_empty()
+                    && !crate::jsdom::media_query_matches(&sheet_media)
+                {
+                    continue;
+                }
+                let source = crate::dom::inner_text(node);
+                let parsed = w3cos_compiler::esm_css::parse_css_source(&source, "embedded <style>");
+                for rule in parsed.rules {
+                    if rule
+                        .media
+                        .as_deref()
+                        .is_some_and(|media| !crate::jsdom::media_query_matches(media))
+                    {
+                        continue;
+                    }
+                    let declarations = rule
+                        .declarations
+                        .iter()
+                        .map(|(property, value)| (property.as_str(), value.as_str()))
+                        .collect::<Vec<_>>();
+                    w3cos_dom::stylesheet::register_rule_for_document(
+                        self.inner.stylesheet_owner,
+                        root_id,
+                        &rule.selector,
+                        &declarations,
+                    );
+                }
+            }
+        }
         let document_url = self.inner.document_url.borrow().clone();
         if let Some(document_url) = document_url {
             self.prepare_background_images(&document_url);
@@ -4030,7 +4088,11 @@ impl ScriptLoader {
         let Ok(base) = Url::parse(document_url) else {
             return;
         };
-        for node in crate::dom::get_elements_by_tag_name("iframe") {
+        for node in crate::dom::get_elements_by_tag_name("iframe")
+            .into_iter()
+            .chain(crate::dom::get_elements_by_tag_name("object"))
+            .filter(|node| is_document_frame_element(*node))
+        {
             if only_node.is_some_and(|only_node| node != only_node) {
                 continue;
             }
@@ -4049,8 +4111,13 @@ impl ScriptLoader {
                 nodes.borrow_mut().remove(&node);
             });
             let element = crate::jsdom::element_value(node);
-            let source = crate::dom::get_attribute(node, "src").unwrap_or_default();
+            let is_object = crate::dom::tag_name(node) == "object";
+            let source = crate::dom::get_attribute(node, if is_object { "data" } else { "src" })
+                .unwrap_or_default();
             if source.trim().is_empty() {
+                if is_object {
+                    continue;
+                }
                 if element.get_property("contentDocument").is_nullish() {
                     let document =
                         crate::jsdom::parse_frame_document("", "text/html", "about:blank");
@@ -4058,6 +4125,7 @@ impl ScriptLoader {
                 }
                 crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                 crate::jsdom::dispatch_element_lifecycle_event(node, "load");
+                self.rebuild_stylesheet_rules();
                 continue;
             }
             self.register_document_script(&element, false);
@@ -4073,6 +4141,11 @@ impl ScriptLoader {
             if resolved_url.scheme() == "data" {
                 let result = decode_frame_data_url(resolved_url.as_str()).and_then(
                     |(content_type, frame_source)| {
+                        if is_object && !is_object_document_mime(&content_type) {
+                            return Err(format!(
+                                "object data has unsupported media type {content_type:?}"
+                            ));
+                        }
                         let document_url = resolved_url.to_string();
                         let document = crate::jsdom::parse_frame_document(
                             &frame_source,
@@ -4080,7 +4153,8 @@ impl ScriptLoader {
                             &document_url,
                         );
                         crate::jsdom::install_frame_document(node, document.clone(), &document_url);
-                        let frame_window = element.get_property("contentWindow");
+                        self.rebuild_stylesheet_rules();
+                        let frame_window = crate::jsdom::installed_frame_window(node);
                         self.execute_frame_inline_scripts(&document, &frame_window, &document_url);
                         crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                         Ok(())
@@ -4096,13 +4170,14 @@ impl ScriptLoader {
                 self.complete_document_script_node(node);
                 continue;
             }
-            if resolved_url.scheme() == "javascript" {
+            if resolved_url.scheme() == "javascript" && !is_object {
                 let document = {
                     let current = element.get_property("contentDocument");
                     if current.is_nullish() {
                         let document =
                             crate::jsdom::parse_frame_document("", "text/html", "about:blank");
                         crate::jsdom::install_frame_document(node, document.clone(), "about:blank");
+                        self.rebuild_stylesheet_rules();
                         document
                     } else {
                         current
@@ -4134,6 +4209,7 @@ impl ScriptLoader {
                                 "about:blank",
                             );
                             crate::jsdom::install_frame_document(node, replacement, "about:blank");
+                            self.rebuild_stylesheet_rules();
                         }
                         crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                         crate::jsdom::dispatch_element_lifecycle_event(node, "load");
@@ -4629,7 +4705,7 @@ impl ScriptLoader {
             let Some(url) = base
                 .as_ref()
                 .and_then(|base| base.join(&import.href).ok())
-                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .filter(|url| matches!(url.scheme(), "http" | "https" | "data"))
             else {
                 eprintln!(
                     "[w3cos] warning: unsupported inline stylesheet @import URL {:?}",
@@ -4887,6 +4963,13 @@ impl ScriptLoader {
                         );
                         continue;
                     }
+                    if action.url.starts_with("data:") {
+                        if !action.root {
+                            graph.fetched_imports += 1;
+                        }
+                        self.advance_data_stylesheet_graph(graph, action);
+                        return;
+                    }
                     if !self.inner.policy.allow_network {
                         eprintln!(
                             "[w3cos] warning: stylesheet @import {} skipped because network loading is disabled",
@@ -4917,6 +5000,126 @@ impl ScriptLoader {
         }
     }
 
+    fn advance_data_stylesheet_graph(
+        &self,
+        mut graph: StylesheetGraphLoad,
+        action: StylesheetFetchAction,
+    ) {
+        let decoded = decode_frame_data_url(&action.url).and_then(|(mime, source)| {
+            if mime != "text/css" {
+                Err(format!(
+                    "stylesheet MIME check failed for {}: received {mime}",
+                    action.url
+                ))
+            } else {
+                Ok(source)
+            }
+        });
+        let source = match decoded {
+            Ok(source) => source,
+            Err(error) if action.root => {
+                self.inner.ready_stylesheets.borrow_mut().insert(
+                    graph.order,
+                    ReadyStylesheet {
+                        element: graph.element,
+                        node: graph.node,
+                        source: Err(error),
+                    },
+                );
+                self.drain_ready_stylesheets();
+                crate::font_loading_web::finish_font_readiness();
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[w3cos] warning: stylesheet @import {} failed: {error}",
+                    action.url
+                );
+                self.advance_stylesheet_graph(graph);
+                return;
+            }
+        };
+        let next_total = graph.total_source_bytes.saturating_add(source.len());
+        if next_total > self.inner.policy.max_source_bytes {
+            let error = format!(
+                "stylesheet graph exceeds source limit ({} > {} bytes)",
+                next_total, self.inner.policy.max_source_bytes
+            );
+            if action.root {
+                self.inner.ready_stylesheets.borrow_mut().insert(
+                    graph.order,
+                    ReadyStylesheet {
+                        element: graph.element,
+                        node: graph.node,
+                        source: Err(error),
+                    },
+                );
+                self.drain_ready_stylesheets();
+                crate::font_loading_web::finish_font_readiness();
+            } else {
+                eprintln!("[w3cos] warning: {error}; import skipped");
+                self.advance_stylesheet_graph(graph);
+            }
+            return;
+        }
+        graph.total_source_bytes = next_total;
+        if action.root {
+            graph.root_href = Some(action.url.clone());
+        }
+        let parsed = w3cos_compiler::esm_css::parse_css_source(&source, &action.url);
+        let font_faces = parsed
+            .font_faces
+            .into_iter()
+            .map(|mut face| {
+                face.media =
+                    combine_stylesheet_media(action.media.as_deref(), face.media.as_deref());
+                StylesheetFontFaceLoad {
+                    face,
+                    base_url: action.url.clone(),
+                    js_face: None,
+                    demanded: false,
+                }
+            })
+            .collect();
+        let mut ancestry = action.ancestry;
+        ancestry.push(action.url.clone());
+        graph.actions.push_front(StylesheetGraphAction::Append {
+            source,
+            base_url: action.url.clone(),
+            media: action.media.clone(),
+            font_faces,
+        });
+        for import in parsed.imports.into_iter().rev() {
+            let url = Url::parse(&import.href)
+                .ok()
+                .or_else(|| Url::parse(&action.url).ok()?.join(&import.href).ok())
+                .filter(|url| matches!(url.scheme(), "http" | "https" | "data"));
+            let Some(url) = url else {
+                eprintln!(
+                    "[w3cos] warning: unsupported stylesheet @import URL {:?} from {}",
+                    import.href, action.url
+                );
+                continue;
+            };
+            graph
+                .actions
+                .push_front(StylesheetGraphAction::Fetch(StylesheetFetchAction {
+                    url: url.to_string(),
+                    media: combine_stylesheet_media(
+                        action.media.as_deref(),
+                        import.media.as_deref(),
+                    ),
+                    depth: action.depth + 1,
+                    root: false,
+                    ancestry: ancestry.clone(),
+                    referrer_source: action.url.clone(),
+                    integrity: String::new(),
+                    fallback_encoding: Some("utf-8".to_string()),
+                }));
+        }
+        self.advance_stylesheet_graph(graph);
+    }
+
     fn demand_stylesheet_fonts_for_text(
         &self,
         style: &w3cos_std::style::Style,
@@ -4942,7 +5145,9 @@ impl ScriptLoader {
         let mut found = false;
         {
             let mut deferred = self.inner.deferred_stylesheet_fonts.borrow_mut();
-            for character in text.chars() {
+            // CSS Fonts defines the first available metrics face by U+0020,
+            // even if every painted glyph comes from another family.
+            for character in std::iter::once(' ').chain(text.chars().filter(|ch| *ch != ' ')) {
                 for family in &families {
                     let loaded_score = crate::font_face::FontRegistry::global()
                         .resolve_for_character(family, weight, face_style, character)
@@ -5009,8 +5214,32 @@ impl ScriptLoader {
         collect_dom_nodes_in_tree_order(root, &mut nodes);
         let text_runs = nodes
             .into_iter()
-            .filter(|node| crate::dom::node_type(*node) == 3)
             .filter_map(|node| {
+                if crate::dom::node_type(node) == 1 {
+                    let style = crate::dom::with_document(|document| {
+                        document.computed_style_for(w3cos_dom::node::NodeId::from_u32(node))
+                    });
+                    let padding = style.padding_lengths();
+                    // Empty non-replaced decoration still paints a font
+                    // content box. It needs metrics without inventing glyphs.
+                    let decorated_inline = style.display == w3cos_std::style::Display::Inline
+                        && (style.border_width > 0.0
+                            || [
+                                style.border_top_width,
+                                style.border_right_width,
+                                style.border_bottom_width,
+                                style.border_left_width,
+                            ]
+                            .into_iter()
+                            .any(|edge| edge.unwrap_or(0.0) > 0.0)
+                            || [padding.top, padding.right, padding.bottom, padding.left]
+                                .into_iter()
+                                .any(|edge| edge != 0.0));
+                    return decorated_inline.then_some((style, " ".into()));
+                }
+                if crate::dom::node_type(node) != 3 {
+                    return None;
+                }
                 let text = crate::dom::get_text_content(node)?;
                 if text.is_empty() {
                     return None;
@@ -5605,7 +5834,7 @@ impl ScriptLoader {
                 let Some(url) = base
                     .as_ref()
                     .and_then(|base| base.join(&import.href).ok())
-                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    .filter(|url| matches!(url.scheme(), "http" | "https" | "data"))
                 else {
                     eprintln!(
                         "[w3cos] warning: unsupported stylesheet @import URL {:?} from {}",
@@ -7494,6 +7723,11 @@ impl ScriptLoader {
                     .unwrap_or_default()
                     .trim()
                     .to_ascii_lowercase();
+                if crate::dom::tag_name(node) == "object" && !is_object_document_mime(&media_type) {
+                    return Err(format!(
+                        "object response has unsupported media type {media_type:?}"
+                    ));
+                }
                 let content_type = match media_type.as_str() {
                     "application/xhtml+xml" | "application/xml" | "text/xml" | "image/svg+xml" => {
                         media_type.as_str()
@@ -7531,7 +7765,8 @@ impl ScriptLoader {
                     crate::jsdom::parse_frame_document(&source, content_type, &document_url);
                 crate::jsdom::set_document_encoding(&document, encoding_name);
                 crate::jsdom::install_frame_document(node, document.clone(), &document_url);
-                let frame_window = crate::jsdom::element_value(node).get_property("contentWindow");
+                self.rebuild_stylesheet_rules();
+                let frame_window = crate::jsdom::installed_frame_window(node);
                 self.execute_frame_inline_scripts(&document, &frame_window, &document_url);
                 crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                 Ok(())
@@ -8938,7 +9173,7 @@ pub(crate) fn notify_node_inserted(node: u32) {
         collect_dom_nodes_in_tree_order(node, &mut inserted_nodes);
         for inserted_node in inserted_nodes {
             let tag = crate::dom::tag_name(inserted_node);
-            if tag.eq_ignore_ascii_case("iframe") {
+            if is_document_frame_element(inserted_node) {
                 loader.prepare_pending_frames_for_node(&document_url, Some(inserted_node));
             } else if tag.eq_ignore_ascii_case("meta")
                 && default_style_metas.contains(&inserted_node)
@@ -8999,7 +9234,23 @@ pub(crate) fn notify_script_mutated(node: u32) {
     if parser_insertion_active() || dom_post_insertion_steps_suppressed() {
         return;
     }
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object") {
+    if tag.eq_ignore_ascii_case("object") {
+        if !crate::dom::is_connected(node) {
+            return;
+        }
+        if let Some((loader, _)) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone()) {
+            loader.invalidate_frame_nodes(&HashSet::from([node]));
+        }
+        DYNAMIC_FRAME_NODES.with(|nodes| {
+            nodes.borrow_mut().insert(node);
+        });
+        DYNAMIC_IMAGE_NODES.with(|nodes| {
+            nodes.borrow_mut().insert(node);
+        });
+        schedule_document_script_pump();
+        return;
+    }
+    if tag.eq_ignore_ascii_case("img") {
         DYNAMIC_IMAGE_NODES.with(|nodes| {
             nodes.borrow_mut().insert(node);
         });
@@ -9265,11 +9516,33 @@ fn collect_image_nodes(node: u32, images: &mut HashSet<u32>) {
 }
 
 fn collect_frame_nodes(node: u32, frames: &mut HashSet<u32>) {
-    if crate::dom::tag_name(node).eq_ignore_ascii_case("iframe") {
+    if matches!(crate::dom::tag_name(node).as_str(), "iframe" | "object") {
         frames.insert(node);
     }
     for child in crate::dom::children(node) {
         collect_frame_nodes(child, frames);
+    }
+}
+
+fn is_object_document_mime(content_type: &str) -> bool {
+    matches!(
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "text/html" | "application/xhtml+xml"
+    )
+}
+
+fn is_document_frame_element(node: u32) -> bool {
+    match crate::dom::tag_name(node).as_str() {
+        "iframe" => true,
+        "object" => crate::dom::get_attribute(node, "type")
+            .is_some_and(|mime| is_object_document_mime(&mime)),
+        _ => false,
     }
 }
 
@@ -10521,6 +10794,101 @@ window.__defaultStylePost = defaultStylePost;
             "none"
         );
         assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+    }
+
+    #[test]
+    fn html_object_document_uses_an_isolated_cascade_and_retains_fallback_on_failure() {
+        use base64::Engine as _;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader.clone(), "https://example.test/index.html")
+                .unwrap();
+        let child = base64::engine::general_purpose::STANDARD.encode(
+            "<html><head><style>html,body,p{margin:0;height:100%}p{background:green;color:white}</style></head><body><p id='inner'>child</p></body></html>"
+        );
+        parser.write(&format!(
+            "<!doctype html><html><head><style>p{{color:red}}object{{width:160px;height:160px}}</style></head><body><p id='outer'>outer</p><object id='host' type='text/html' data='data:text/html;base64,{child}'>fallback</object><object id='bad' type='text/html' data='data:text/plain,not-html'>fallback</object><object id='image' type='image/png'>image fallback</object></body></html>"
+        )).unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        loader.prepare_pending_frames("https://example.test/index.html");
+        let document = crate::jsdom::document_value();
+        let host = document.call_method("getElementById", vec![Value::string("host")]);
+        let bad = document.call_method("getElementById", vec![Value::string("bad")]);
+        let image = document.call_method("getElementById", vec![Value::string("image")]);
+        let child_document =
+            crate::jsdom::installed_frame_document(crate::jsdom::node_id_of(&host).unwrap());
+        assert!(!child_document.is_nullish());
+        assert!(
+            host.get_property("contentDocument").is_null(),
+            "data documents have opaque origins"
+        );
+        assert!(host.get_property("contentWindow").is_undefined());
+        assert!(bad.get_property("contentDocument").is_null());
+        assert!(image.get_property("contentDocument").is_null());
+        let outer = document.call_method("getElementById", vec![Value::string("outer")]);
+        let inner = child_document.call_method("getElementById", vec![Value::string("inner")]);
+        let color = |element: &Value| {
+            crate::dom::with_document(|dom| {
+                w3cos_dom::stylesheet::matching_declarations_for_node(
+                    dom,
+                    w3cos_dom::NodeId::from_u32(crate::jsdom::node_id_of(element).unwrap()),
+                )
+                .into_iter()
+                .filter(|(property, _, _)| property == "color")
+                .map(|(_, value, _)| value)
+                .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(color(&outer), vec!["red"]);
+        assert_eq!(color(&inner), vec!["white"]);
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("frames")
+                .get_property("length")
+                .to_u32(),
+            0
+        );
+        let tree = crate::dom::to_component_tree();
+        fn find(component: &w3cos_std::Component, node: u32) -> Option<&w3cos_std::Component> {
+            if matches!(&component.on_click, w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node))
+            {
+                return Some(component);
+            }
+            component
+                .children
+                .iter()
+                .find_map(|child| find(child, node))
+        }
+        let host_node = crate::jsdom::node_id_of(&host).unwrap();
+        let host_box = find(&tree, host_node).expect("loaded object keeps its native host");
+        assert_eq!(host_box.style.width, w3cos_std::style::Dimension::Px(160.0));
+        assert_eq!(
+            host_box.style.height,
+            w3cos_std::style::Dimension::Px(160.0)
+        );
+        assert_eq!(
+            host_box.style.display,
+            w3cos_std::style::Display::InlineBlock
+        );
+        assert_eq!(host_box.children.len(), 1);
+        assert_eq!(
+            host_box.children[0].style.overflow,
+            w3cos_std::style::Overflow::Hidden
+        );
+        crate::dom::set_attribute(host_node, "data", "data:text/plain,no-longer-html");
+        loader.prepare_pending_frames("https://example.test/index.html");
+        assert!(host.get_property("contentDocument").is_null());
+        assert_eq!(color(&outer), vec!["red"]);
+        let tree = crate::dom::to_component_tree();
+        let fallback = find(&tree, host_node).expect("fallback keeps its host");
+        fn has_fallback(component: &w3cos_std::Component) -> bool {
+            matches!(&component.kind, w3cos_std::ComponentKind::Text { content } if content.contains("fallback"))
+                || component.children.iter().any(has_fallback)
+        }
+        assert!(has_fallback(fallback));
     }
 
     #[test]
@@ -15865,6 +16233,89 @@ window.__dynamicInlineHandler = dynamicInlineResult;
     }
 
     #[test]
+    fn stylesheet_font_face_loads_metrics_for_empty_decorated_inline() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let font_bytes = include_bytes!("../assets/Inter-Regular.ttf").to_vec();
+        let server = thread::spawn(move || {
+            let (mut document, _) = listener.accept().unwrap();
+            assert!(read_http_request(&mut document).starts_with("GET /index.html "));
+            let body = r#"<!doctype html><style>
+                @font-face { font-family: 'W3COS Empty Metrics'; src: url('/inter.ttf'); }
+                span { font-family: 'W3COS Empty Metrics'; border-top: 1px solid; padding-left: 1em; }
+                </style><span></span>"#;
+            write!(document, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut font = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "empty decorated inline must request its metrics face"
+                        );
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept metrics font: {error}"),
+                }
+            };
+            // On macOS an accepted socket can inherit the listener's
+            // nonblocking mode. Only accept polling is nonblocking; bounded
+            // request/response I/O must tolerate ordinary socket backpressure.
+            font.set_nonblocking(false).unwrap();
+            font.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            font.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            assert!(read_http_request(&mut font).starts_with("GET /inter.ttf "));
+            write!(font, "HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", font_bytes.len()).unwrap();
+            font.write_all(&font_bytes).unwrap();
+        });
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/index.html"))
+            .unwrap();
+        let registry = crate::font_face::FontRegistry::global();
+        for _ in 0..5_000 {
+            let progress = loader.poll();
+            // Match the render readiness boundary: polling navigation alone
+            // does not demand fonts after the streaming parser appends nodes.
+            crate::jsdom::document_value()
+                .get_property("fonts")
+                .get_property("ready");
+            if registry
+                .resolve(
+                    "W3COS Empty Metrics",
+                    crate::font_face::FontWeight::NORMAL,
+                    crate::font_face::FontFaceStyle::Normal,
+                )
+                .is_some()
+            {
+                break;
+            }
+            if let DocumentLoadProgress::Failed(error) = progress {
+                panic!("metrics font navigation failed: {error}");
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        server.join().expect("metrics fixture completed");
+        assert!(
+            registry
+                .resolve(
+                    "W3COS Empty Metrics",
+                    crate::font_face::FontWeight::NORMAL,
+                    crate::font_face::FontFaceStyle::Normal
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
     fn stylesheet_font_face_loads_woff2_subsets_and_cleans_up_with_owner() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -17725,7 +18176,12 @@ window.__dynamicInlineHandler = dynamicInlineResult;
                 .unwrap();
         assert_eq!(bom_bytes, 0);
         assert_eq!(decoder.encoding_name(), "Shift_JIS");
-        assert!(decoder.decode(source, true).unwrap().ends_with("<p>平和</p>"));
+        assert!(
+            decoder
+                .decode(source, true)
+                .unwrap()
+                .ends_with("<p>平和</p>")
+        );
         assert_eq!(
             sniff_xml_charset(b"<?xml-stylesheet encoding='shift-JIS'?>").unwrap(),
             None

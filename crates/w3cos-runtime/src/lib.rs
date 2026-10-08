@@ -4,7 +4,9 @@ mod background_image;
 pub mod badging_web;
 pub mod barcode_detection_web;
 pub mod battery_web;
+mod bidi_paint;
 pub mod bluetooth_web;
+mod border_paint;
 #[cfg(feature = "dynamic-js")]
 pub mod browser_controller;
 pub(crate) mod browser_http_cache;
@@ -113,11 +115,6 @@ pub mod observers_web;
 pub mod orientation_web;
 mod overscroll;
 pub mod paint_artifact;
-mod border_paint;
-#[cfg(feature = "skia")]
-mod skia_text_run;
-mod table_paint;
-mod bidi_paint;
 pub mod payment_web;
 pub mod perf;
 pub mod permissions_web;
@@ -143,6 +140,14 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+#[cfg(feature = "skia")]
+mod skia_text_run;
+#[cfg(feature = "skia")]
+mod inline_shaping;
+mod inline_line_metrics;
+mod inline_table_baseline;
+mod inline_whitespace;
+mod list_marker;
 pub mod speech;
 pub mod speech_synthesis_web;
 pub mod speech_web;
@@ -153,7 +158,11 @@ pub mod storage_manager_web;
 pub mod streams;
 pub mod streams_web;
 pub mod svg_renderer;
+#[cfg(feature = "skia")]
+mod svg_image_document;
 pub mod svg_values_web;
+mod table_grid;
+mod table_paint;
 pub mod text_encoding;
 pub mod text_layout;
 pub mod text_tracks_web;

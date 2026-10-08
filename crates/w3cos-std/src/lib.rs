@@ -1,6 +1,7 @@
 pub mod background;
 pub mod color;
 pub mod component;
+pub mod inline_text;
 pub mod keyboard_inset;
 pub mod safe_area;
 pub mod style;
@@ -16,6 +17,52 @@ pub use svg::{SvgPathCommand, SvgPathData};
 mod tests {
     use super::*;
     use crate::style::{Dimension, Style};
+
+    #[test]
+    fn css_uppercase_expands_greek_ypogegrammeni_like_browser() {
+        use crate::style::{transformed_text, TextTransform};
+        // Chromium141 original WPT captures/innerText, bicameral-fonts-v1906.
+        // The strict reference uses older simple mappings; it is independent.
+        for (source, expected) in [("ᾀ", "ἈΙ"), ("ᾐ", "ἨΙ"), ("ᾠ", "ὨΙ"),
+            ("ᾳ", "ΑΙ"), ("ῃ", "ΗΙ"), ("ῳ", "ΩΙ")] {
+            assert_eq!(transformed_text(source, TextTransform::Uppercase, None, false), expected);
+        }
+    }
+
+    #[test]
+    fn css_capitalize_retains_greek_titlecase_ypogegrammeni() {
+        use crate::style::{transformed_text, TextTransform};
+        for (source, expected) in [("ᾀ", "ᾈ"), ("ᾐ", "ᾘ"), ("ᾠ", "ᾨ"),
+            ("ᾳ", "ᾼ"), ("ῃ", "ῌ"), ("ῳ", "ῼ")] {
+            assert_eq!(transformed_text(source, TextTransform::Capitalize, None, false), expected);
+        }
+    }
+
+    #[test]
+    fn small_caps_participate_in_style_identity() {
+        let plain = Style::default();
+        let mut caps = plain.clone();
+        caps.font_variant = crate::style::FontVariant::SmallCaps;
+        assert_ne!(plain, caps);
+        assert!(!plain.eq_except_display(&caps));
+        assert_eq!(plain.font_size, caps.font_size);
+        assert_eq!(plain.line_height, caps.line_height);
+    }
+
+    #[test]
+    fn multicol_properties_participate_in_style_identity() {
+        let initial = Style::default();
+        for variant in 0..3 {
+            let mut other = initial.clone();
+            other.display = crate::style::Display::Inline;
+            match variant {
+                0 => other.column_width = Dimension::Px(100.0),
+                1 => other.column_count = Some(3),
+                _ => other.column_fill = crate::style::ColumnFill::Auto,
+            }
+            assert!(!initial.eq_except_display(&other), "variant={variant}");
+        }
+    }
 
     // --- Color tests ---
 
@@ -129,6 +176,15 @@ mod tests {
 
         let c = Color::rgba(0, 0, 0, 0);
         assert_eq!(c.a, 0);
+    }
+
+    #[test]
+    fn css_brown_named_color_resolves_for_backgrounds() {
+        for value in ["brown", "BROWN", " Brown "] {
+            assert_eq!(Color::from_css(value), Some(Color::rgb(165, 42, 42)));
+        }
+        assert_eq!(Color::from_named("brown"), Some(Color::rgb(165, 42, 42)));
+        assert_eq!(Color::from_css("brownish"), None);
     }
 
     #[test]

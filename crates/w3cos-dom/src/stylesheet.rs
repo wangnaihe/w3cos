@@ -360,6 +360,7 @@ struct Rule {
     /// Browser page styles use a loader-owned id so navigation can release
     /// only that page's rules without deleting the host application's CSS.
     owner: Option<u64>,
+    document_root: Option<NodeId>,
     /// Pseudo-elements participate in their own cascade and never style the
     /// originating element's principal box.
     pseudo_element: Option<String>,
@@ -426,17 +427,59 @@ pub fn register_user_rule(selector: &str, declarations: &[(&str, &str)]) {
 
 /// Register one page-owned Browser rule.
 pub fn register_rule_for_owner(owner: u64, selector: &str, declarations: &[(&str, &str)]) {
-    register_rule_with_owner(Some(owner), StylesheetOrigin::Author, selector, declarations);
+    register_rule_with_owner(
+        Some(owner),
+        StylesheetOrigin::Author,
+        selector,
+        declarations,
+    );
 }
 
-fn register_rule_with_owner(owner: Option<u64>, origin: StylesheetOrigin, selector: &str, declarations: &[(&str, &str)]) {
+/// Register author CSS for an embedded document, not its host document.
+pub fn register_rule_for_document(
+    owner: u64,
+    root: NodeId,
+    selector: &str,
+    declarations: &[(&str, &str)],
+) {
+    register_document_scope(owner, root);
+    if declarations.is_empty() {
+        return;
+    }
+    if let Some(parsed) = parse_selector_list(selector) {
+        register_parsed_rules(
+            Some(owner),
+            Some(root),
+            StylesheetOrigin::Author,
+            parsed,
+            declarations,
+        );
+    }
+}
+
+/// Establish a document boundary even when it has no author stylesheet.
+/// The loader releases both the boundary and its rules with `clear_owner`.
+pub fn register_document_scope(owner: u64, root: NodeId) {
+    let changed =
+        RULES.with(|rules| rules.borrow_mut().document_roots.insert(root, owner) != Some(owner));
+    if changed {
+        bump_generation();
+    }
+}
+
+fn register_rule_with_owner(
+    owner: Option<u64>,
+    origin: StylesheetOrigin,
+    selector: &str,
+    declarations: &[(&str, &str)],
+) {
     if declarations.is_empty() {
         return;
     }
     let Some(parsed) = parse_selector_list(selector) else {
         return;
     };
-    register_parsed_rules(owner, origin, parsed, declarations);
+    register_parsed_rules(owner, None, origin, parsed, declarations);
 }
 
 fn parse_selector_list(
@@ -489,6 +532,7 @@ pub fn register_compiled_rule(bytecode: &[u8], declarations: &[(&str, &str)]) {
     };
     register_parsed_rules(
         None,
+        None,
         StylesheetOrigin::Author,
         vec![(chain, combinators, pseudo_element)],
         declarations,
@@ -497,6 +541,7 @@ pub fn register_compiled_rule(bytecode: &[u8], declarations: &[(&str, &str)]) {
 
 fn register_parsed_rules(
     owner: Option<u64>,
+    document_root: Option<NodeId>,
     origin: StylesheetOrigin,
     parsed: Vec<(Vec<CompoundSelector>, Vec<Combinator>, Option<String>)>,
     declarations: &[(&str, &str)],
@@ -519,6 +564,7 @@ fn register_parsed_rules(
                 specificity,
                 order,
                 owner,
+                document_root,
                 pseudo_element,
                 ancestor_filter,
             });
@@ -545,9 +591,20 @@ fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
     ] {
         if lower.ends_with(authored) {
             let subject = &selector[..selector.len() - authored.len()];
-            let subject = subject.trim_end();
+            // A pseudo-element without a compound selector has an implicit
+            // universal subject. Keep the preceding combinator: `div :after`
+            // targets descendants of div, not div's own ::after box.
+            let implicit_subject = subject.chars().last().is_some_and(|character| {
+                character.is_ascii_whitespace() || matches!(character, '>' | '+' | '~')
+            });
             return (
-                if subject.is_empty() { "*" } else { subject }.to_string(),
+                if subject.trim().is_empty() {
+                    "*".to_string()
+                } else if implicit_subject {
+                    format!("{subject}*")
+                } else {
+                    subject.to_string()
+                },
                 Some(canonical.to_string()),
             );
         }
@@ -565,9 +622,13 @@ pub fn clear_owner(owner: u64) {
     let removed = RULES.try_with(|rules| {
         let mut rules = rules.borrow_mut();
         let initial_len = rules.rules.len();
+        let initial_roots = rules.document_roots.len();
         rules.rules.retain(|rule| rule.owner != Some(owner));
+        rules
+            .document_roots
+            .retain(|_, root_owner| *root_owner != owner);
         rules.rebuild_index();
-        rules.rules.len() != initial_len
+        rules.rules.len() != initial_len || rules.document_roots.len() != initial_roots
     });
     if matches!(removed, Ok(true)) {
         bump_generation();
@@ -578,7 +639,7 @@ pub fn clear_owner(owner: u64) {
 pub fn clear_rules() {
     let removed = RULES.with(|rules| {
         let mut rules = rules.borrow_mut();
-        let removed = !rules.rules.is_empty();
+        let removed = !rules.rules.is_empty() || !rules.document_roots.is_empty();
         *rules = RuleSet::default();
         removed
     });
@@ -626,6 +687,7 @@ pub fn matching_declarations_for_context(
             .map(|index| &rules.rules[index])
             .filter(|rule| {
                 rule.pseudo_element.is_none()
+                    && rule.document_root.is_none()
                     && !rule_has_container_query(rule)
                     && ancestor_bloom.might_contain(rule.ancestor_filter)
                     && rule_matches(rule, &ctx, ancestors)
@@ -671,12 +733,14 @@ fn matched_property_value(
     rules: &[Rule],
     document: &Document,
     node: NodeId,
+    document_scope: Option<NodeId>,
     property: &str,
 ) -> Option<String> {
     let ancestor_bloom = AncestorBloom::for_node(document, node);
     let mut declarations = rules
         .iter()
         .filter(|rule| rule.pseudo_element.is_none() && !rule_has_container_query(rule))
+        .filter(|rule| rule_matches_document_scope(rule, document_scope))
         .filter(|rule| ancestor_bloom.might_contain(rule.ancestor_filter))
         .filter(|rule| {
             matches_chain_node(
@@ -696,12 +760,16 @@ fn matched_property_value(
                 .find(|(name, _)| name.eq_ignore_ascii_case(property))
                 .map(|(_, value)| {
                     let (value, important) = declaration_value_and_importance(value);
-                    (cascade_rank(rule.origin, important), rule.specificity, rule.order, value.to_string())
+                    (
+                        cascade_rank(rule.origin, important),
+                        rule.specificity,
+                        rule.order,
+                        value.to_string(),
+                    )
                 })
         })
         .collect::<Vec<_>>();
-    declarations
-        .sort_by_key(|(priority, specificity, order, _)| (*priority, *specificity, *order));
+    declarations.sort_by_key(|(priority, specificity, order, _)| (*priority, *specificity, *order));
     declarations.pop().map(|(_, _, _, value)| value)
 }
 
@@ -761,19 +829,30 @@ fn container_condition_matches(prelude: &str, width: f32, height: f32) -> bool {
     })
 }
 
-fn container_query_matches(rules: &[Rule], document: &Document, node: NodeId, query: &str) -> bool {
+fn rule_matches_document_scope(rule: &Rule, scope: Option<NodeId>) -> bool {
+    rule.origin == StylesheetOrigin::User || rule.document_root == scope
+}
+
+fn container_query_matches(
+    rules: &RuleSet,
+    document: &Document,
+    node: NodeId,
+    query: &str,
+) -> bool {
+    let scope = rules.document_scope_for_node(document, node);
     let mut ancestor = document.get_node(node).parent;
     while let Some(candidate) = ancestor {
-        let container_type = matched_property_value(rules, document, candidate, "container-type");
+        let container_type =
+            matched_property_value(&rules.rules, document, candidate, scope, "container-type");
         if container_type
             .as_deref()
             .is_some_and(|value| matches!(value.trim(), "size" | "inline-size"))
         {
-            let width = matched_property_value(rules, document, candidate, "width")
+            let width = matched_property_value(&rules.rules, document, candidate, scope, "width")
                 .as_deref()
                 .and_then(css_length_px)
                 .unwrap_or_default();
-            let height = matched_property_value(rules, document, candidate, "height")
+            let height = matched_property_value(&rules.rules, document, candidate, scope, "height")
                 .as_deref()
                 .and_then(css_length_px)
                 .unwrap_or_default();
@@ -793,7 +872,13 @@ pub fn matching_declarations_for_node(
 ) -> Vec<(String, String, u32)> {
     matching_cascade_declarations_for_node(document, node)
         .into_iter()
-        .map(|declaration| (declaration.property, declaration.value, declaration.specificity))
+        .map(|declaration| {
+            (
+                declaration.property,
+                declaration.value,
+                declaration.specificity,
+            )
+        })
         .collect()
 }
 
@@ -812,12 +897,14 @@ pub(crate) fn matching_cascade_declarations_for_node(
     let ancestor_bloom = AncestorBloom::for_node(document, node);
     RULES.with(|rules| {
         let rules = rules.borrow();
+        let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
             .candidate_indices_for_node(document, node)
             .into_iter()
             .map(|index| &rules.rules[index])
             .filter(|rule| {
                 rule.pseudo_element.is_none()
+                    && rule_matches_document_scope(rule, document_scope)
                     && ancestor_bloom.might_contain(rule.ancestor_filter)
                     && matches_chain_node(
                         document,
@@ -832,9 +919,7 @@ pub(crate) fn matching_cascade_declarations_for_node(
                         .declarations
                         .iter()
                         .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
-                        .all(|(_, query)| {
-                            container_query_matches(&rules.rules, document, node, query)
-                        })
+                        .all(|(_, query)| container_query_matches(&rules, document, node, query))
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
@@ -845,8 +930,10 @@ pub(crate) fn matching_cascade_declarations_for_node(
                     let (value, is_important) = declaration_value_and_importance(value);
                     let declaration = CascadeDeclaration {
                         origin: rule.origin,
-                        property: prop.clone(), value: value.to_string(),
-                        specificity: rule.specificity, important: is_important,
+                        property: prop.clone(),
+                        value: value.to_string(),
+                        specificity: rule.specificity,
+                        important: is_important,
                     };
                     buckets[cascade_rank(rule.origin, is_important)].push(declaration);
                 }
@@ -867,11 +954,13 @@ pub fn matching_pseudo_declarations_for_node(
     let ancestor_bloom = AncestorBloom::for_node(document, node);
     RULES.with(|rules| {
         let rules = rules.borrow();
+        let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
             .candidate_indices_for_node(document, node)
             .into_iter()
             .map(|index| &rules.rules[index])
             .filter(|rule| rule.pseudo_element.as_deref() == Some(pseudo_element))
+            .filter(|rule| rule_matches_document_scope(rule, document_scope))
             .filter(|rule| ancestor_bloom.might_contain(rule.ancestor_filter))
             .filter(|rule| {
                 matches_chain_node(
@@ -886,7 +975,7 @@ pub fn matching_pseudo_declarations_for_node(
                     .declarations
                     .iter()
                     .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
-                    .all(|(_, query)| container_query_matches(&rules.rules, document, node, query))
+                    .all(|(_, query)| container_query_matches(&rules, document, node, query))
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
@@ -2485,6 +2574,33 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_before_a_pseudo_element_keeps_the_descendant_subject() {
+        setup();
+        let mut document = Document::new();
+        let outer = document.create_element("div");
+        let inner = document.create_element("p");
+        outer.append_child(&mut document, inner);
+        document.body().append_child(&mut document, outer);
+        register_rule("p:after", &[("content", "'FAILED'")]);
+        register_rule("div :after", &[("content", "'PASSED'")]);
+
+        let outer_declarations =
+            matching_pseudo_declarations_for_node(&document, outer.id, "::after");
+        assert!(
+            outer_declarations.is_empty(),
+            "a descendant pseudo must not match div itself"
+        );
+        let inner_declarations =
+            matching_pseudo_declarations_for_node(&document, inner.id, "::after");
+        assert_eq!(
+            inner_declarations
+                .last()
+                .map(|(_, value, _)| value.as_str()),
+            Some("'PASSED'")
+        );
+    }
+
+    #[test]
     fn comma_groups_split_into_rules() {
         setup();
         register_rule(".a, div.b , #c", &[("color", "red")]);
@@ -2648,18 +2764,103 @@ mod tests {
     }
 
     #[test]
+    fn embedded_document_rules_do_not_style_the_host_document() {
+        setup();
+        let mut document = Document::new();
+        let outer = document.create_element("p");
+        document.append_child(document.body().id, outer.id);
+        let root = document.create_element("html");
+        let inner = document.create_element("p");
+        document.append_child(root.id, inner.id);
+        register_rule_for_owner(7, "p", &[("color", "red")]);
+        register_rule_for_document(7, root.id, "p", &[("color", "green")]);
+        assert_eq!(
+            matching_declarations_for_node(&document, outer.id),
+            vec![("color".to_string(), "red".to_string(), 1)]
+        );
+        assert_eq!(
+            matching_declarations_for_node(&document, inner.id),
+            vec![("color".to_string(), "green".to_string(), 1)]
+        );
+        assert_eq!(
+            matching_declarations("p", None, &[], &[]),
+            vec![("color".to_string(), "red".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn embedded_document_scope_isolates_pseudos_and_keeps_user_origin() {
+        setup();
+        let mut document = Document::new();
+        let outer = document.create_element("p");
+        document.append_child(document.body().id, outer.id);
+        let root = document.create_element("html");
+        let inner = document.create_element("p");
+        document.append_child(root.id, inner.id);
+        let unstyled_root = document.create_element("html");
+        let unstyled = document.create_element("p");
+        document.append_child(unstyled_root.id, unstyled.id);
+        register_rule_for_owner(7, "p::before", &[("content", "'outer'")]);
+        register_rule_for_owner(7, "p", &[("color", "red")]);
+        register_rule_for_document(8, root.id, "p::before", &[("content", "'inner'")]);
+        register_rule_for_document(8, root.id, ":root", &[("color", "green")]);
+        register_document_scope(8, unstyled_root.id);
+        register_user_rule("p", &[("font-size", "20px")]);
+        assert_eq!(
+            matching_pseudo_declarations_for_node(&document, outer.id, "::before")[0].1,
+            "'outer'"
+        );
+        assert_eq!(
+            matching_pseudo_declarations_for_node(&document, inner.id, "::before")[0].1,
+            "'inner'"
+        );
+        assert_eq!(
+            matching_declarations_for_node(&document, root.id)[0].1,
+            "green"
+        );
+        for node in [inner.id, unstyled.id] {
+            assert_eq!(
+                matching_declarations_for_node(&document, node),
+                vec![("font-size".to_string(), "20px".to_string(), 1)]
+            );
+        }
+        assert!(
+            matching_pseudo_declarations_for_node(&document, unstyled.id, "::before").is_empty()
+        );
+        clear_owner(8);
+        RULES.with(|rules| assert!(rules.borrow().document_roots.is_empty()));
+        assert_eq!(
+            matching_pseudo_declarations_for_node(&document, outer.id, "::before")[0].1,
+            "'outer'"
+        );
+    }
+
+    #[test]
     fn user_origin_order_is_shared_by_context_node_and_pseudo() {
         for important in [false, true] {
             clear_rules();
-            let (author_selector, user_selector, author_value, user_value, expected) = if important {
-                ("#target", "span", "green !important", "red !important", "red")
+            let (author_selector, user_selector, author_value, user_value, expected) = if important
+            {
+                (
+                    "#target",
+                    "span",
+                    "green !important",
+                    "red !important",
+                    "red",
+                )
             } else {
                 ("span", "#target", "green", "red", "green")
             };
             register_rule(author_selector, &[("color", author_value)]);
             register_user_rule(user_selector, &[("color", user_value)]);
-            register_rule(&format!("{author_selector}::before"), &[("color", author_value)]);
-            register_user_rule(&format!("{user_selector}::before"), &[("color", user_value)]);
+            register_rule(
+                &format!("{author_selector}::before"),
+                &[("color", author_value)],
+            );
+            register_user_rule(
+                &format!("{user_selector}::before"),
+                &[("color", user_value)],
+            );
             let context = SelectorContext::new("span", Some("target"), &[]);
             let mut document = Document::new();
             let target = document.create_element("span");

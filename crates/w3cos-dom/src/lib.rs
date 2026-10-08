@@ -38,6 +38,195 @@ mod tests {
     // --- Document tests ---
 
     #[test]
+    fn split_inline_decoration_keeps_owner_without_inheriting_to_block_text() {
+        use w3cos_std::{Component, ComponentKind, style::TextDecoration};
+        fn owner_reaches_text(component: &Component, owns: bool) -> bool {
+            for owner in w3cos_std::inline_text::decoration_owners(&component.style) {
+                assert_eq!(owner.text_decoration, TextDecoration::Underline);
+                assert_eq!(owner.color, w3cos_std::Color::rgb(0, 0, 238));
+                assert_eq!(owner.font_size, 16.0);
+            }
+            let owns = owns || component.style.custom_properties.as_ref()
+                .is_some_and(|p| p.contains_key("--w3cos-internal-decoration-owner-count"));
+            if matches!(&component.kind, ComponentKind::Text { content } if content == "Owned") {
+                assert_eq!(component.style.text_decoration, TextDecoration::None);
+                assert_eq!(component.style.color, w3cos_std::Color::rgb(0, 128, 0));
+                return owns;
+            }
+            component.children.iter().any(|child| owner_reaches_text(child, owns))
+        }
+        let mut doc = Document::new();
+        let anchor = doc.create_element("a");
+        anchor.set_attribute(&mut doc, "href", "#");
+        let block = doc.create_element("div");
+        block.style_mut(&mut doc).set_property("color", "green");
+        let text = doc.create_text_node("Owned");
+        block.append_child(&mut doc, text);
+        anchor.append_child(&mut doc, block);
+        doc.body().append_child(&mut doc, anchor);
+        assert!(owner_reaches_text(&doc.to_component_tree(), false),
+            "boxless split lost its originating anchor decoration");
+        assert_eq!(doc.computed_style_for(block.id).text_decoration, TextDecoration::None);
+    }
+
+    #[test]
+    fn nested_text_decoration_keeps_its_owner_font_and_color() {
+        use w3cos_std::{Color, Component, ComponentKind, style::TextDecoration};
+        fn contains_owner(component: &Component) -> bool {
+            (component.style.text_decoration == TextDecoration::Underline
+                && component.style.color == Color::rgb(0, 128, 0)
+                && component.style.font_size == 16.0)
+                || component.children.iter().any(contains_owner)
+        }
+        fn text_style(component: &Component) -> Option<&w3cos_std::Style> {
+            if matches!(&component.kind, ComponentKind::Text { content } if content == "Owned") {
+                return Some(&component.style);
+            }
+            component.children.iter().find_map(text_style)
+        }
+        for display in ["inline", "inline-block"] {
+            let mut doc = Document::new();
+            let owner = doc.create_element("span");
+            let style = owner.style_mut(&mut doc);
+            style.set_property("text-decoration", "underline");
+            style.set_property("color", "green");
+            style.set_property("font-size", "16px");
+            let child = doc.create_element("span");
+            let style = child.style_mut(&mut doc);
+            style.set_property("display", display);
+            style.set_property("color", "blue");
+            style.set_property("font-size", "24px");
+            let text = doc.create_text_node("Owned");
+            child.append_child(&mut doc, text);
+            owner.append_child(&mut doc, child);
+            doc.body().append_child(&mut doc, owner);
+            let tree = doc.to_component_tree();
+            assert!(contains_owner(&tree), "decoration owner lost across {display}");
+            let style = text_style(&tree).unwrap();
+            assert_eq!(style.color, Color::rgb(0, 0, 255));
+            assert_eq!(style.font_size, 24.0);
+            assert_eq!(style.text_decoration, TextDecoration::None);
+            assert_eq!(doc.computed_style_for(child.id).text_decoration, TextDecoration::None);
+        }
+    }
+
+    #[test]
+    fn direct_text_decoration_survives_inline_lowering() {
+        use w3cos_std::{Component, ComponentKind, style::{Display, TextDecoration}};
+
+        fn text_style(component: &Component) -> Option<&w3cos_std::Style> {
+            if matches!(&component.kind, ComponentKind::Text { content } if content == "Filler Text") {
+                return Some(&component.style);
+            }
+            component.children.iter().find_map(text_style)
+        }
+        for (tag, display) in [
+            ("div", Some("inline")),
+            ("span", Some("block")),
+            ("span", Some("inline-block")),
+            ("u", None),
+        ] {
+            let mut doc = Document::new();
+            let element = doc.create_element(tag);
+            if let Some(display) = display {
+                let style = element.style_mut(&mut doc);
+                style.set_property("display", display);
+                style.set_property("text-decoration", "underline");
+            }
+            let text = doc.create_text_node("Filler Text");
+            element.append_child(&mut doc, text);
+            doc.body().append_child(&mut doc, element);
+            let tree = doc.to_component_tree();
+            assert_eq!(text_style(&tree).unwrap().text_decoration, TextDecoration::Underline,
+                "direct text lost decoration for {tag}, display={display:?}");
+            if tag == "u" {
+                assert_eq!(doc.computed_style_for(element.id).display, Display::Inline);
+                element.style_mut(&mut doc).set_property("text-decoration", "none");
+                let tree = doc.to_component_tree();
+                assert_eq!(text_style(&tree).unwrap().text_decoration, TextDecoration::None);
+            }
+        }
+    }
+
+    #[test]
+    fn text_decoration_is_not_inherited_between_element_computed_styles() {
+        use w3cos_std::style::TextDecoration;
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        parent.style_mut(&mut doc).set_property("text-decoration", "underline");
+        let child = doc.create_element("span");
+        parent.append_child(&mut doc, child);
+        doc.body().append_child(&mut doc, parent);
+        assert_eq!(doc.computed_style_for(parent.id).text_decoration, TextDecoration::Underline);
+        assert_eq!(doc.computed_style_for(child.id).text_decoration, TextDecoration::None);
+    }
+
+    #[test]
+    fn ua_link_defaults_follow_href_and_author_color_cascade() {
+        use w3cos_std::{Color, style::TextDecoration};
+        let mut doc = Document::new();
+        let body = doc.body();
+        body.style_mut(&mut doc).set_property("color", "green");
+        for (href, color, expected) in [
+            (false, None, Color::rgb(0, 128, 0)),
+            (true, None, Color::rgb(0, 0, 238)),
+            (true, Some("red"), Color::rgb(255, 0, 0)),
+            (true, Some("inherit"), Color::rgb(0, 128, 0)),
+            (true, Some("unset"), Color::rgb(0, 128, 0)),
+            (true, Some("initial"), Color::BLACK),
+            (true, Some("currentColor"), Color::rgb(0, 128, 0)),
+            (true, Some("not-a-color"), Color::rgb(0, 0, 238)),
+        ] {
+            let anchor = doc.create_element("a");
+            if href {
+                anchor.set_attribute(&mut doc, "href", "");
+            }
+            if let Some(color) = color {
+                anchor.style_mut(&mut doc).set_property("color", color);
+            }
+            body.append_child(&mut doc, anchor);
+            let style = doc.computed_style_for(anchor.id);
+            assert_eq!(style.color, expected, "href={href}, color={color:?}");
+            assert_eq!(
+                style.text_decoration,
+                if href { TextDecoration::Underline } else { TextDecoration::None }
+            );
+            anchor
+                .style_mut(&mut doc)
+                .set_property("text-decoration", "none");
+            assert_eq!(
+                doc.computed_style_for(anchor.id).text_decoration,
+                TextDecoration::None
+            );
+        }
+        let anchor = doc.create_element("a");
+        body.append_child(&mut doc, anchor);
+        anchor.set_attribute(&mut doc, "href", "#target");
+        assert_eq!(doc.computed_style_for(anchor.id).color, Color::rgb(0, 0, 238));
+        anchor.remove_attribute(&mut doc, "href");
+        assert_eq!(doc.computed_style_for(anchor.id).color, Color::rgb(0, 128, 0));
+    }
+
+    #[test]
+    fn ua_link_defaults_yield_to_user_stylesheet() {
+        use w3cos_std::{Color, style::TextDecoration};
+        stylesheet::clear_rules();
+        stylesheet::register_user_rule(
+            "#ua-link",
+            &[("color", "red"), ("text-decoration", "none")],
+        );
+        let mut doc = Document::new();
+        let anchor = doc.create_element("a");
+        anchor.set_attribute(&mut doc, "href", "#target");
+        anchor.set_attribute(&mut doc, "id", "ua-link");
+        doc.body().append_child(&mut doc, anchor);
+        let style = doc.computed_style_for(anchor.id);
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
+        assert_eq!(style.text_decoration, TextDecoration::None);
+        stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_document_create_element() {
         let mut doc = Document::new();
         let div = doc.create_element("div");
@@ -94,6 +283,30 @@ mod tests {
         assert_eq!(parent.children.len(), 1);
         assert_eq!(parent.children[0].style.flex_grow, 1.0);
         assert_eq!(parent.children[0].style.height, Dimension::Px(100.0));
+    }
+
+    #[test]
+    fn prefixed_svg_uses_local_name_default_and_keeps_author_display() {
+        use w3cos_std::style::Display;
+        fn svg_display(component: &w3cos_std::Component) -> Option<Display> {
+            if matches!(component.kind, w3cos_std::ComponentKind::SvgDocument { .. }) {
+                return Some(component.style.display);
+            }
+            component.children.iter().find_map(svg_display)
+        }
+        for name in ["svg", "svg:svg"] {
+            let mut doc = Document::new();
+            let svg = doc.create_element(name);
+            doc.get_node_mut(svg.id).is_html_element = false;
+            svg.set_attribute(&mut doc, "height", "50");
+            doc.body().append_child(&mut doc, svg);
+            assert_eq!(doc.computed_style_for(svg.id).display, Display::InlineBlock,
+                "qualified name {name} must use the SVG local-name default");
+            assert_eq!(svg_display(&doc.to_component_tree()), Some(Display::InlineBlock));
+            svg.style_mut(&mut doc).set_property("display", "block");
+            assert_eq!(doc.computed_style_for(svg.id).display, Display::Block);
+            assert_eq!(svg_display(&doc.to_component_tree()), Some(Display::Block));
+        }
     }
 
     #[test]
@@ -459,7 +672,8 @@ mod tests {
         let mut doc = Document::new();
         for position in ["absolute", "fixed"] {
             let image = doc.create_element("img");
-            doc.get_style_mut(image.id).set_property("position", position);
+            doc.get_style_mut(image.id)
+                .set_property("position", position);
             doc.append_child(doc.body().id, image.id);
             let whitespace = doc.create_text_node("\n  ");
             doc.append_child(doc.body().id, whitespace.id);
@@ -479,14 +693,17 @@ mod tests {
             if let w3cos_std::ComponentKind::Text { content } = &component.kind {
                 output.push_str(content);
             }
-            for child in &component.children { text(child, output); }
+            for child in &component.children {
+                text(child, output);
+            }
         }
         for position in ["absolute", "fixed"] {
             let mut doc = Document::new();
             let before = doc.create_text_node("x ");
             doc.append_child(doc.body().id, before.id);
             let positioned = doc.create_element("span");
-            doc.get_style_mut(positioned.id).set_property("position", position);
+            doc.get_style_mut(positioned.id)
+                .set_property("position", position);
             doc.append_child(doc.body().id, positioned.id);
             let after = doc.create_text_node(" y");
             doc.append_child(doc.body().id, after.id);
@@ -500,7 +717,8 @@ mod tests {
     fn decorated_inline_keeps_a_trailing_space_before_outer_text() {
         let mut doc = Document::new();
         let span = doc.create_element("span");
-        doc.get_style_mut(span.id).set_property("border", "1px solid black");
+        doc.get_style_mut(span.id)
+            .set_property("border", "1px solid black");
         let inside = doc.create_text_node("a ");
         doc.append_child(span.id, inside.id);
         doc.append_child(doc.body().id, span.id);
@@ -509,7 +727,9 @@ mod tests {
         let tree = doc.to_component_tree();
         fn find(component: &w3cos_std::Component) -> Option<&str> {
             if let w3cos_std::ComponentKind::Text { content } = &component.kind {
-                if content.starts_with('a') { return Some(content); }
+                if content.starts_with('a') {
+                    return Some(content);
+                }
             }
             component.children.iter().find_map(find)
         }
@@ -520,39 +740,63 @@ mod tests {
     fn decorated_inline_retains_its_outer_display_with_atomic_children() {
         let mut doc = Document::new();
         let span = doc.create_element("span");
-        doc.get_style_mut(span.id).set_property("border", "1px solid black");
+        doc.get_style_mut(span.id)
+            .set_property("border", "1px solid black");
         let text = doc.create_text_node("a");
         doc.append_child(span.id, text.id);
         let atomic = doc.create_element("div");
-        doc.get_style_mut(atomic.id).set_property("display", "inline-block");
+        doc.get_style_mut(atomic.id)
+            .set_property("display", "inline-block");
         doc.get_style_mut(atomic.id).set_property("width", "30px");
         doc.get_style_mut(atomic.id).set_property("height", "10px");
         doc.append_child(span.id, atomic.id);
         doc.append_child(doc.body().id, span.id);
         fn find(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
-            if component.style.border_width == 1.0 { return Some(component); }
+            if component.style.border_width == 1.0 {
+                return Some(component);
+            }
             component.children.iter().find_map(find)
         }
         let tree = doc.to_component_tree();
-        assert_eq!(find(&tree).unwrap().style.display, w3cos_std::style::Display::Inline);
+        assert_eq!(
+            find(&tree).unwrap().style.display,
+            w3cos_std::style::Display::Inline
+        );
     }
 
     #[test]
     fn absolute_table_parts_are_blockified_before_table_lowering() {
-        for display in ["table-column-group", "table-column", "table-row", "table-cell",
-            "table-row-group", "table-header-group", "table-footer-group", "table-caption"] {
+        for display in [
+            "table-column-group",
+            "table-column",
+            "table-row",
+            "table-cell",
+            "table-row-group",
+            "table-header-group",
+            "table-footer-group",
+            "table-caption",
+        ] {
             for position in ["absolute", "fixed"] {
-            let mut doc = Document::new();
-            let element = doc.create_element("div");
-            doc.get_style_mut(element.id).set_property("display", display);
-            doc.get_style_mut(element.id).set_property("position", position);
-            doc.append_child(doc.body().id, element.id);
-            assert_eq!(doc.computed_style_for(element.id).display,
-                w3cos_std::style::Display::Block, "{display}/{position}");
-            doc.get_style_mut(element.id).set_property("position", "static");
-            doc.mark_inline_style_dirty(element.id);
-            assert_ne!(doc.computed_style_for(element.id).display,
-                w3cos_std::style::Display::Block, "static {display}");
+                let mut doc = Document::new();
+                let element = doc.create_element("div");
+                doc.get_style_mut(element.id)
+                    .set_property("display", display);
+                doc.get_style_mut(element.id)
+                    .set_property("position", position);
+                doc.append_child(doc.body().id, element.id);
+                assert_eq!(
+                    doc.computed_style_for(element.id).display,
+                    w3cos_std::style::Display::Block,
+                    "{display}/{position}"
+                );
+                doc.get_style_mut(element.id)
+                    .set_property("position", "static");
+                doc.mark_inline_style_dirty(element.id);
+                assert_ne!(
+                    doc.computed_style_for(element.id).display,
+                    w3cos_std::style::Display::Block,
+                    "static {display}"
+                );
             }
         }
     }
@@ -562,13 +806,15 @@ mod tests {
         let mut doc = Document::new();
         let parent = doc.create_element("div");
         doc.get_style_mut(parent.id).set_property("width", "100px");
-        doc.get_style_mut(parent.id).set_property("text-indent", "40px");
+        doc.get_style_mut(parent.id)
+            .set_property("text-indent", "40px");
         let floating = doc.create_element("div");
         doc.get_style_mut(floating.id).set_property("float", "left");
         doc.get_style_mut(floating.id).set_property("width", "60px");
         doc.append_child(parent.id, floating.id);
         let inline = doc.create_element("div");
-        doc.get_style_mut(inline.id).set_property("display", "inline-block");
+        doc.get_style_mut(inline.id)
+            .set_property("display", "inline-block");
         doc.get_style_mut(inline.id).set_property("width", "60px");
         doc.append_child(parent.id, inline.id);
         doc.append_child(doc.body().id, parent.id);
@@ -578,8 +824,10 @@ mod tests {
             }
             component.children.iter().find_map(find)
         }
-        assert_eq!(find(&doc.to_component_tree()).unwrap().style.margin.left,
-            w3cos_std::style::Spacing::Px(40.0));
+        assert_eq!(
+            find(&doc.to_component_tree()).unwrap().style.margin.left,
+            w3cos_std::style::Spacing::Px(40.0)
+        );
     }
 
     #[test]
@@ -588,8 +836,13 @@ mod tests {
             let mut doc = Document::new();
             let parent = doc.create_element("div");
             let first = doc.create_element("span");
-            doc.get_style_mut(first.id).set_property("position", "relative");
-            let text = doc.create_text_node(if trailing { "Filler Text " } else { "Filler Text" });
+            doc.get_style_mut(first.id)
+                .set_property("position", "relative");
+            let text = doc.create_text_node(if trailing {
+                "Filler Text "
+            } else {
+                "Filler Text"
+            });
             doc.append_child(first.id, text.id);
             doc.append_child(parent.id, first.id);
             let second = doc.create_element("span");
@@ -601,7 +854,9 @@ mod tests {
                 if let w3cos_std::ComponentKind::Text { content } = &component.kind {
                     output.push_str(content);
                 }
-                for child in &component.children { collect(child, output); }
+                for child in &component.children {
+                    collect(child, output);
+                }
             }
             let mut output = String::new();
             collect(&doc.to_component_tree(), &mut output);
@@ -613,45 +868,81 @@ mod tests {
     fn normal_line_height_keyword_survives_font_inheritance() {
         let mut doc = Document::new();
         let body = doc.body().id;
-        doc.get_style_mut(body).set_property("line-height", "normal");
+        doc.get_style_mut(body)
+            .set_property("line-height", "normal");
         let span = doc.create_element("span");
-        doc.get_style_mut(span.id).set_property("font-family", "Ahem");
+        doc.get_style_mut(span.id)
+            .set_property("font-family", "Ahem");
         doc.get_style_mut(span.id).set_property("font-size", "20px");
         doc.append_child(body, span.id);
         assert!(doc.computed_style_for(span.id).line_height_is_normal);
-        doc.get_style_mut(span.id).set_property("line-height", "1.2");
+        doc.get_style_mut(span.id)
+            .set_property("line-height", "1.2");
         doc.mark_inline_style_dirty(span.id);
         assert!(!doc.computed_style_for(span.id).line_height_is_normal);
     }
 
     #[test]
     fn normal_line_height_provider_refreshes_cache_but_preserves_numeric_values() {
-        fn unavailable(_: &w3cos_std::style::Style) -> Option<f32> { None }
+        fn unavailable(_: &w3cos_std::style::Style) -> Option<f32> {
+            None
+        }
         fn loaded(style: &w3cos_std::style::Style) -> Option<f32> {
             (style.font_family.as_deref() == Some("MetricFixture")).then_some(1.0)
         }
         let mut doc = Document::new();
         let span = doc.create_element("span");
-        doc.get_style_mut(span.id).set_property("font-family", "MetricFixture");
+        doc.get_style_mut(span.id)
+            .set_property("font-family", "MetricFixture");
         doc.append_child(doc.body().id, span.id);
         doc.set_normal_line_height_provider(unavailable, 0);
         assert_eq!(doc.computed_style_for(span.id).line_height, 1.2);
         doc.set_normal_line_height_provider(loaded, 1);
         assert_eq!(doc.computed_style_for(span.id).line_height, 1.0);
         let child = doc.create_element("span");
-        doc.get_style_mut(child.id).set_property("font-family", "UnavailableFixture");
+        doc.get_style_mut(child.id)
+            .set_property("font-family", "UnavailableFixture");
         doc.append_child(span.id, child.id);
         assert_eq!(doc.computed_style_for(child.id).line_height, 1.2);
-        doc.get_style_mut(span.id).set_property("line-height", "1.2");
+        doc.get_style_mut(span.id)
+            .set_property("line-height", "1.2");
         doc.mark_inline_style_dirty(span.id);
         assert_eq!(doc.computed_style_for(span.id).line_height, 1.2);
+    }
+
+    #[test]
+    fn empty_decorated_inline_does_not_restart_collapsible_whitespace() {
+        fn text(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children {
+                text(child, output);
+            }
+        }
+        for (before, after, expected) in [("x ", " y", "x y"), ("x", " y", "x y"), ("x ", "y", "x y")] {
+            let mut doc = Document::new();
+            let before = doc.create_text_node(before);
+            doc.append_child(doc.body().id, before.id);
+            for _ in 0..2 {
+                let empty = doc.create_element("em");
+                doc.get_style_mut(empty.id).set_property("border", "3px solid black");
+                doc.append_child(doc.body().id, empty.id);
+            }
+            let after = doc.create_text_node(after);
+            doc.append_child(doc.body().id, after.id);
+            let mut output = String::new();
+            text(&doc.to_component_tree(), &mut output);
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]
     fn outer_text_does_not_duplicate_a_decorated_inline_trailing_space() {
         let mut doc = Document::new();
         let span = doc.create_element("span");
-        doc.get_style_mut(span.id).set_property("border", "1px solid black");
+        doc.get_style_mut(span.id)
+            .set_property("border", "1px solid black");
         let inside = doc.create_text_node("a ");
         doc.append_child(span.id, inside.id);
         doc.append_child(doc.body().id, span.id);
@@ -661,7 +952,9 @@ mod tests {
             if let w3cos_std::ComponentKind::Text { content } = &component.kind {
                 output.push_str(content);
             }
-            for child in &component.children { text(child, output); }
+            for child in &component.children {
+                text(child, output);
+            }
         }
         let mut output = String::new();
         text(&doc.to_component_tree(), &mut output);
@@ -1238,11 +1531,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_generated_attr_does_not_create_an_anonymous_line_box() {
+    fn missing_generated_attr_keeps_a_decorated_empty_inline_box() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
             "#item::before",
-            &[("content", "attr(missing)"), ("background", "red")],
+            &[
+                ("content", "attr(missing)"),
+                ("background", "red"),
+                ("border-left", "1px solid black"),
+            ],
         );
 
         let mut doc = Document::new();
@@ -1251,12 +1548,20 @@ mod tests {
         doc.body().append_child(&mut doc, item);
 
         let tree = doc.to_component_tree();
-        assert!(tree.children[0].children.is_empty());
+        assert!(matches!(tree.children[0].children.as_slice(),
+            [w3cos_std::Component {
+                kind: w3cos_std::ComponentKind::Box,
+                style: w3cos_std::style::Style {
+                    display: w3cos_std::style::Display::Inline, ..
+                },
+                children,
+                ..
+            }] if children.is_empty()));
         crate::stylesheet::clear_rules();
     }
 
     #[test]
-    fn explicit_empty_generated_string_keeps_a_shrink_to_fit_leaf() {
+    fn explicit_empty_generated_string_background_has_no_painted_area() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
             "#item::before",
@@ -1269,15 +1574,7 @@ mod tests {
         doc.body().append_child(&mut doc, item);
 
         let tree = doc.to_component_tree();
-        let generated = &tree.children[0].children[0];
-        assert!(matches!(
-            &generated.kind,
-            w3cos_std::ComponentKind::Text { content } if content.is_empty()
-        ));
-        assert_eq!(
-            generated.style.display,
-            w3cos_std::style::Display::InlineBlock
-        );
+        assert!(tree.children[0].children.is_empty());
         crate::stylesheet::clear_rules();
     }
 
@@ -1462,10 +1759,19 @@ mod tests {
         doc.body().append_child(&mut doc, list);
 
         let tree = doc.to_component_tree();
-        assert!(matches!(
-            &tree.children[0].children[2].kind,
-            w3cos_std::ComponentKind::Text { content } if content == "0"
-        ));
+        fn collect_text(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children {
+                collect_text(child, output);
+            }
+        }
+        // Inline lowering may merge or wrap these siblings. Assert the
+        // counter result, not an incidental component-tree child index.
+        let mut text = String::new();
+        collect_text(&tree, &mut text);
+        assert_eq!(text, "0");
         crate::stylesheet::clear_rules();
     }
 
@@ -1677,7 +1983,7 @@ mod tests {
         let host = &tree.children[0];
         assert_eq!(
             host.children[0].style.display,
-            w3cos_std::style::Display::InlineFlex
+            w3cos_std::style::Display::InlineBlock
         );
         assert!(host.children[0].children.iter().any(|component| {
             matches!(
@@ -1935,7 +2241,9 @@ mod tests {
             row.append_child(&mut doc, text);
             if content != "   " {
                 let image = doc.create_element("img");
-                image.style_mut(&mut doc).set_property("display", "table-cell");
+                image
+                    .style_mut(&mut doc)
+                    .set_property("display", "table-cell");
                 row.append_child(&mut doc, image);
             }
         }
@@ -1951,6 +2259,20 @@ mod tests {
         let row = &tree.children[0].children[0];
         assert_eq!(row.style.display, w3cos_std::style::Display::TableRow);
         assert_eq!(row.children.len(), 3);
+        let anonymous_line = &row.children[0].children[0];
+        assert_eq!(
+            anonymous_line.style.white_space,
+            w3cos_std::style::WhiteSpace::Pre
+        );
+        assert_eq!(anonymous_line.style.font_size, row.style.font_size);
+        assert!(
+            anonymous_line
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties
+                    .contains_key("--w3cos-internal-inline-formatting-context"))
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -2671,6 +2993,101 @@ mod tests {
             tree.children[0].children[0].style.color,
             w3cos_std::Color::rgb(0, 0, 255)
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inside_list_marker_reads_list_style_shorthand() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "li",
+            &[
+                ("list-style-image", "url(swatch-red.png)"),
+                ("list-style", "decimal inside"),
+            ],
+        );
+
+        let mut doc = Document::new();
+        let item = doc.create_element("li");
+        doc.body().append_child(&mut doc, item);
+        let tree = doc.to_component_tree();
+        assert!(matches!(
+            &tree.children[0].children[0].kind,
+            w3cos_std::ComponentKind::Text { content } if content == "1. "
+        ));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn decimal_inside_markers_follow_display_list_item_on_non_li_elements() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".numbered",
+            &[
+                ("display", "list-item"),
+                ("list-style-type", "decimal"),
+                ("list-style-position", "inside"),
+            ],
+        );
+
+        let mut doc = Document::new();
+        for _ in 0..2 {
+            let item = doc.create_element("div");
+            item.class_list_add(&mut doc, "numbered");
+            let text = doc.create_text_node("Line");
+            item.append_child(&mut doc, text);
+            doc.body().append_child(&mut doc, item);
+        }
+
+        let tree = doc.to_component_tree();
+        fn text_content(component: &w3cos_std::Component) -> String {
+            let own = match &component.kind {
+                w3cos_std::ComponentKind::Text { content } => content.as_str(),
+                _ => "",
+            };
+            own.to_string()
+                + &component
+                    .children
+                    .iter()
+                    .map(text_content)
+                    .collect::<String>()
+        }
+        for (index, expected) in ["1. Line", "2. Line"].into_iter().enumerate() {
+            let content = text_content(&tree.children[index]);
+            assert_eq!(content, expected, "item {index}");
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn list_item_counter_respects_an_explicit_negative_reset() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#list", &[("counter-reset", "list-item -4")]);
+        crate::stylesheet::register_rule(
+            "#list li::before",
+            &[("content", "counter(list-item) '. '")],
+        );
+
+        let mut doc = Document::new();
+        let list = doc.create_element("ol");
+        list.set_attribute(&mut doc, "id", "list");
+        for _ in 0..2 {
+            let item = doc.create_element("li");
+            list.append_child(&mut doc, item);
+        }
+        doc.body().append_child(&mut doc, list);
+
+        fn collect_text(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children {
+                collect_text(child, output);
+            }
+        }
+        let mut content = String::new();
+        collect_text(&doc.to_component_tree(), &mut content);
+        assert_eq!(content, "-3. -2. ");
         crate::stylesheet::clear_rules();
     }
 

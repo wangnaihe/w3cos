@@ -25,6 +25,81 @@ enum InternalMode {
     Render,
 }
 
+#[derive(Debug, Clone)]
+struct TestFont {
+    family: String,
+    path: PathBuf,
+}
+
+fn parse_test_font(value: &str) -> std::result::Result<TestFont, String> {
+    let (family, path) = value.split_once('=').ok_or("expected FAMILY=PATH")?;
+    if family.trim().is_empty() || path.is_empty() {
+        return Err("test font requires nonempty family and path".into());
+    }
+    Ok(TestFont { family: family.trim().into(), path: path.into() })
+}
+
+const TEST_FONT_OWNER: u64 = u64::MAX - 20261004;
+
+struct TestFontScope;
+impl Drop for TestFontScope {
+    fn drop(&mut self) {
+        w3cos_runtime::font_face::FontRegistry::global().clear_owner(TEST_FONT_OWNER);
+    }
+}
+
+fn install_test_fonts(fonts: &[TestFont]) -> Result<TestFontScope> {
+    let scope = TestFontScope;
+    for font in fonts {
+        w3cos_runtime::font_face::FontRegistry::global().register_for_owner(
+            TEST_FONT_OWNER,
+            w3cos_runtime::font_face::FontFace {
+                family: font.family.clone(),
+                src: w3cos_runtime::font_face::FontSource::Path(font.path.clone()),
+                ..Default::default()
+            },
+        ).map_err(anyhow::Error::msg)
+            .with_context(|| format!("test font prerequisite {}={}", font.family, font.path.display()))?;
+    }
+    Ok(scope)
+}
+
+#[cfg(test)]
+mod font_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_test_font_is_accepted_by_isolated_worker_cli() {
+        let cli = Cli::try_parse_from([
+            "w3cos-wpt", "--wpt-root", "../wpt", "--test-font",
+            "White Space=../wpt/css/CSS2/fonts/support/AHEM_whitespace.ttf",
+        ]);
+        assert!(cli.is_ok(), "explicit font prerequisite rejected: {cli:?}");
+    }
+
+    #[test]
+    fn test_font_scope_loads_bytes_cleans_up_and_rejects_missing_file() {
+        use w3cos_runtime::font_face::{FontFaceStyle, FontRegistry, FontWeight};
+        let family = "W3COS WPT lifecycle fixture";
+        let fonts = [TestFont {
+            family: family.into(),
+            path: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"),
+                "/../../../wpt/fonts/Ahem.ttf")),
+        }];
+        let lookup = || FontRegistry::global().resolve_stack(family, FontWeight::NORMAL, FontFaceStyle::Normal);
+        let scope = install_test_fonts(&fonts).expect("pinned font fixture loads");
+        assert!(lookup().is_some());
+        drop(scope);
+        assert!(lookup().is_none(), "fixture must not leak beyond its scope");
+        let missing = tempfile::tempdir().unwrap();
+        assert!(install_test_fonts(&[TestFont { family: family.into(), path: missing.path().join("absent.ttf") }]).is_err());
+        assert!(lookup().is_none());
+        for invalid in ["White Space", "=font.ttf", "White Space="] {
+            assert!(parse_test_font(invalid).is_err());
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "w3cos-wpt",
@@ -46,6 +121,9 @@ struct Cli {
     /// Explicit user-origin stylesheet profile, applied to test and reference.
     #[arg(long)]
     user_stylesheet: Option<PathBuf>,
+    /// Explicit process-local font prerequisite (repeatable FAMILY=PATH).
+    #[arg(long = "test-font", value_parser = parse_test_font)]
+    test_fonts: Vec<TestFont>,
     /// Produce evidence without making current conformance failures fatal.
     #[arg(long)]
     report_only: bool,
@@ -64,6 +142,9 @@ struct Cli {
     /// Keep PNG evidence only for failing reftests (recommended for large suites).
     #[arg(long)]
     failure_artifacts_only: bool,
+    /// Write structured results without retaining reftest PNGs.
+    #[arg(long, conflicts_with = "failure_artifacts_only")]
+    no_reftest_artifacts: bool,
     /// Zero-based first case to execute from the suite.
     #[arg(long, default_value_t = 0)]
     case_start: usize,
@@ -252,6 +333,7 @@ fn report_matches_manifest(report: &SuiteReport, manifest: &SuiteManifest) -> bo
 }
 
 fn run_worker(cli: &Cli, manifest: SuiteManifest, mode: InternalMode) -> Result<()> {
+    let _test_fonts = install_test_fonts(&cli.test_fonts)?;
     let index = cli
         .internal_case_index
         .ok_or_else(|| anyhow::anyhow!("internal worker requires a case index"))?;
@@ -265,8 +347,10 @@ fn run_worker(cli: &Cli, manifest: SuiteManifest, mode: InternalMode) -> Result<
         Duration::from_millis(cli.timeout_ms),
     );
     if let Some(path) = &cli.user_stylesheet {
-        runner.set_user_stylesheet(std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read user stylesheet {}", path.display()))?);
+        runner.set_user_stylesheet(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read user stylesheet {}", path.display()))?,
+        );
     }
     match mode {
         InternalMode::Testharness => {
@@ -289,8 +373,24 @@ fn run_isolated_suite(cli: &Cli, manifest: &SuiteManifest) -> Result<SuiteReport
         )
     })?;
     if let Some(path) = &cli.user_stylesheet {
-        std::fs::copy(path, cli.artifacts.join("user-stylesheet.css"))
-            .with_context(|| format!("failed to retain user stylesheet profile {}", path.display()))?;
+        std::fs::copy(path, cli.artifacts.join("user-stylesheet.css")).with_context(|| {
+            format!(
+                "failed to retain user stylesheet profile {}",
+                path.display()
+            )
+        })?;
+    }
+    let mut font_evidence = Vec::new();
+    for (index, font) in cli.test_fonts.iter().enumerate() {
+        let filename = format!("test-font-{index}.bin");
+        std::fs::copy(&font.path, cli.artifacts.join(&filename))
+            .with_context(|| format!("retain test font {}", font.path.display()))?;
+        font_evidence.push(serde_json::json!({
+            "family": font.family, "source": font.path, "artifact": filename,
+        }));
+    }
+    if !font_evidence.is_empty() {
+        std::fs::write(cli.artifacts.join("test-fonts.json"), serde_json::to_vec_pretty(&font_evidence)?)?;
     }
     let start = cli.case_start.min(manifest.tests.len());
     let end = cli
@@ -418,6 +518,7 @@ fn run_reftest_workers(cli: &Cli, manifest: &SuiteManifest, index: usize) -> Res
         &reference,
         &cli.artifacts,
         cli.failure_artifacts_only,
+        cli.no_reftest_artifacts,
     )
 }
 
@@ -452,6 +553,9 @@ fn spawn_worker(
     }
     if let Some(path) = &cli.user_stylesheet {
         command.arg("--user-stylesheet").arg(path);
+    }
+    for font in &cli.test_fonts {
+        command.arg("--test-font").arg(format!("{}={}", font.family, font.path.display()));
     }
     let mut child = command
         .stdout(Stdio::piped())

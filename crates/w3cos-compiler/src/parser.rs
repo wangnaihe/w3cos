@@ -88,6 +88,27 @@ pub enum NodeKind {
     TextInput,
 }
 
+/// Preserve an explicit auto reset independently of an absent declaration,
+/// including when a compiled style crosses the JSON boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnCount {
+    Auto,
+    Count(u32),
+}
+
+impl ColumnCount {
+    pub fn as_option(self) -> Option<u32> {
+        match self { Self::Auto => None, Self::Count(count) => Some(count) }
+    }
+}
+
+impl From<Option<u32>> for ColumnCount {
+    fn from(count: Option<u32>) -> Self {
+        count.map_or(Self::Auto, Self::Count)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StyleDecl {
     /// Compiler-only metadata for `<VirtualList>`; not emitted as CSS.
@@ -97,6 +118,9 @@ pub struct StyleDecl {
     pub gap: Option<f32>,
     pub row_gap: Option<f32>,
     pub column_gap: Option<f32>,
+    pub column_width: Option<w3cos_std::style::Dimension>,
+    pub column_count: Option<ColumnCount>,
+    pub column_fill: Option<w3cos_std::style::ColumnFill>,
     pub border_spacing_x: Option<f32>,
     pub border_spacing_y: Option<f32>,
     pub padding: Option<Spacing>,
@@ -178,6 +202,7 @@ pub struct StyleDecl {
     pub text_overflow: Option<String>,
     pub font_family: Option<String>,
     pub font_style: Option<String>,
+    pub font_variant: Option<String>,
     pub word_break: Option<String>,
     pub cursor: Option<String>,
     pub visibility: Option<String>,
@@ -1196,6 +1221,14 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "gap" => style.gap = val.parse().ok(),
                 "rowGap" | "row_gap" => style.row_gap = val.parse().ok(),
                 "columnGap" | "column_gap" => style.column_gap = val.parse().ok(),
+                "columnWidth" | "column_width" => style.column_width = val.parse::<f32>().ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(w3cos_std::style::Dimension::Px)
+                    .or_else(|| w3cos_dom::css_style::parse_column_width(val.trim_matches(['\'', '"']))),
+                "columnCount" | "column_count" => style.column_count =
+                    w3cos_dom::css_style::parse_column_count(val.trim_matches(['\'', '"'])).map(ColumnCount::from),
+                "columnFill" | "column_fill" => style.column_fill =
+                    w3cos_dom::css_style::parse_column_fill(val.trim_matches(['\'', '"'])),
                 "borderSpacing" | "border_spacing" => {
                     let values: Vec<f32> = val
                         .split_whitespace()
@@ -1407,6 +1440,22 @@ fn empty_column() -> Node {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multicol_jsx_numeric_width_and_auto_count_are_typed() {
+        let style = super::parse_style_object("{ columnWidth: 100, columnCount: 'auto', columnFill: 'auto' }").unwrap();
+        assert_eq!(style.column_width, Some(w3cos_std::style::Dimension::Px(100.0)));
+        assert_eq!(style.column_count, Some(super::ColumnCount::Auto));
+        assert_eq!(style.column_fill, Some(w3cos_std::style::ColumnFill::Auto));
+    }
+
+    #[test]
+    fn multicol_column_count_auto_survives_compiler_json_roundtrip() {
+        let style = super::parse_style_object("{ columnCount: 'auto' }").unwrap();
+        let json = serde_json::to_string(&style).unwrap();
+        let restored: super::StyleDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.column_count, style.column_count,
+            "explicit auto must remain distinct from an absent longhand");
+    }
     use super::*;
 
     #[test]

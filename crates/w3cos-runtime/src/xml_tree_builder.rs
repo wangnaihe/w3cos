@@ -16,6 +16,13 @@ pub(crate) struct StreamingXmlDocumentParser {
     source: String,
     parsed: bool,
     complete: bool,
+    parse_state: XmlParseState,
+}
+
+#[derive(Default)]
+struct XmlParseState {
+    next_event: usize,
+    stack: Vec<u32>,
 }
 
 impl StreamingXmlDocumentParser {
@@ -38,6 +45,7 @@ impl StreamingXmlDocumentParser {
             source: String::new(),
             parsed: false,
             complete: false,
+            parse_state: XmlParseState::default(),
         }
     }
 
@@ -69,7 +77,16 @@ impl StreamingXmlDocumentParser {
             return Ok(DocumentParseProgress::BlockedOnScript);
         }
         if !self.parsed {
-            parse_xml_document(&self.source, self.script_host.as_ref())?;
+            let progress = parse_xml_document_into(
+                &self.source,
+                self.script_host.as_ref(),
+                0,
+                &mut self.parse_state,
+                Some(&self.document_url),
+            )?;
+            if progress == DocumentParseProgress::BlockedOnScript {
+                return Ok(progress);
+            }
             self.parsed = true;
         }
         self.script_host
@@ -83,61 +100,77 @@ impl StreamingXmlDocumentParser {
     }
 }
 
-fn parse_xml_document(source: &str, script_host: &dyn ParserScriptHost) -> Result<()> {
-    parse_xml_document_into(source, script_host, 0)
-}
-
 pub(crate) fn append_xml_document_fragment(parent: u32, source: &str) -> Result<()> {
+    let mut state = XmlParseState::default();
     parse_xml_document_into(
         source,
         &crate::html_parser_host::InertParserScriptHost,
         parent,
-    )
+        &mut state,
+        None,
+    )?;
+    Ok(())
 }
 
 fn parse_xml_document_into(
     source: &str,
     script_host: &dyn ParserScriptHost,
     root_parent: u32,
-) -> Result<()> {
+    state: &mut XmlParseState,
+    document_url: Option<&str>,
+) -> Result<DocumentParseProgress> {
     let entities = internal_general_entities(source);
     let expanded = expand_general_entities(source, &entities);
     let mut reader = NsReader::from_str(&expanded);
     reader.config_mut().trim_text(false);
-    let mut stack = Vec::new();
+    let mut event_index = 0;
 
     loop {
         let (namespace, event) = reader.read_resolved_event()?;
         let namespace = resolved_namespace(namespace)?;
         let event = event.into_owned();
+        event_index += 1;
+        if event_index <= state.next_event {
+            continue;
+        }
+        state.next_event = event_index;
         match event {
             Event::Start(element) => {
                 let node = create_element(&reader, &namespace, &element, script_host)?;
-                append_xml_child(&stack, root_parent, node);
-                stack.push(node);
+                append_xml_child(&state.stack, root_parent, node);
+                state.stack.push(node);
             }
             Event::Empty(element) => {
                 let node = create_element(&reader, &namespace, &element, script_host)?;
-                append_xml_child(&stack, root_parent, node);
+                append_xml_child(&state.stack, root_parent, node);
+                if let Some(document_url) = document_url
+                    && checkpoint_xml_parser_element(node, script_host, document_url)?
+                {
+                    return Ok(DocumentParseProgress::BlockedOnScript);
+                }
             }
             Event::End(_) => {
-                stack.pop();
+                if let (Some(node), Some(document_url)) = (state.stack.pop(), document_url)
+                    && checkpoint_xml_parser_element(node, script_host, document_url)?
+                {
+                    return Ok(DocumentParseProgress::BlockedOnScript);
+                }
             }
             Event::Text(text) => {
                 let decoded = text.xml_content()?;
                 let text = quick_xml::escape::unescape(&decoded)?;
-                append_text(&stack, &text);
+                append_text(&state.stack, &text);
             }
             Event::CData(text) => {
                 let decoded = text.xml_content()?;
-                if let Some(parent) = stack.last().copied() {
+                if let Some(parent) = state.stack.last().copied() {
                     append_parser_child(parent, crate::dom::create_cdata_section(&decoded));
                 }
             }
             Event::Comment(comment) => {
                 let decoded = comment.decode()?;
                 let node = crate::dom::create_comment(&decoded);
-                append_xml_child(&stack, root_parent, node);
+                append_xml_child(&state.stack, root_parent, node);
             }
             Event::DocType(doctype) => {
                 if root_parent == 0 {
@@ -154,7 +187,7 @@ fn parse_xml_document_into(
             Event::GeneralRef(reference) => {
                 let name = reference.decode()?;
                 if let Some(value) = decoded_general_reference(&name, &entities) {
-                    append_text(&stack, &value);
+                    append_text(&state.stack, &value);
                 }
             }
             Event::PI(instruction) => {
@@ -163,7 +196,7 @@ fn parse_xml_document_into(
                     '\u{0009}', '\u{000a}', '\u{000c}', '\u{000d}', '\u{0020}',
                 ]);
                 let node = crate::dom::create_processing_instruction(target, data);
-                append_xml_child(&stack, root_parent, node);
+                append_xml_child(&state.stack, root_parent, node);
             }
             Event::Eof => break,
             Event::Decl(_) => {}
@@ -180,7 +213,25 @@ fn parse_xml_document_into(
     if root_parent == 0 {
         crate::jsdom::sync_global_document_child_relationships();
     }
-    Ok(())
+    Ok(DocumentParseProgress::Complete)
+}
+
+fn checkpoint_xml_parser_element(
+    node: u32,
+    script_host: &dyn ParserScriptHost,
+    document_url: &str,
+) -> Result<bool> {
+    match crate::dom::tag_name(node).as_str() {
+        "style" => script_host.finish_parser_style(node, document_url)?,
+        "script" => {
+            script_host.perform_microtask_checkpoint();
+            script_host.execute_pending_document_scripts(document_url)?;
+            script_host.perform_microtask_checkpoint();
+            return Ok(script_host.has_pending_parser_blocking_script());
+        }
+        _ => {}
+    }
+    Ok(false)
 }
 
 fn decoded_general_reference(name: &str, entities: &HashMap<String, String>) -> Option<String> {
@@ -262,6 +313,18 @@ fn append_text(stack: &[u32], text: &str) {
     if let Some(parent) = stack.last().copied()
         && !text.is_empty()
     {
+        // XML reader events split character references from surrounding text.
+        // These are not authored DOM boundaries: one uninterrupted character
+        // stream must remain one Text node (and one inline shaping source).
+        // Elements, comments and CDATA deliberately terminate the stream.
+        if let Some(previous) = crate::dom::last_child(parent)
+            && crate::dom::node_type(previous) == 3
+        {
+            let mut content = crate::dom::get_text_content(previous).unwrap_or_default();
+            content.push_str(text);
+            crate::dom::set_text_content(previous, &content);
+            return;
+        }
         append_parser_child(parent, crate::dom::create_text_node(text));
     }
 }
@@ -309,6 +372,103 @@ mod tests {
     use super::*;
     use crate::html_parser_host::InertParserScriptHost;
     use w3cos_core::Value;
+
+    #[test]
+    fn xml_character_references_share_one_text_node_without_crossing_boundaries() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        append_xml_document_fragment(parent,
+            "<span>--&gt; &#65;&#x42;&amp;<b/>tail&lt;<!--break-->after&amp;<![CDATA[cdata]]>last&gt;</span>")
+            .unwrap();
+        let span = crate::dom::first_child(parent).unwrap();
+        let children = crate::dom::children(span);
+        assert_eq!(children.iter().map(|id| crate::dom::node_type(*id)).collect::<Vec<_>>(),
+            vec![3, 1, 3, 8, 3, 4, 3]);
+        for (index, text) in [(0, "--> AB&"), (2, "tail<"), (4, "after&"), (5, "cdata"), (6, "last>")] {
+            assert_eq!(crate::dom::get_text_content(children[index]).as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn xhtml_parser_resumes_after_a_blocking_script_before_later_nodes() {
+        struct PausingHost {
+            blocked: std::cell::Cell<bool>,
+            executed: std::cell::Cell<bool>,
+        }
+        impl ParserScriptHost for PausingHost {
+            fn begin_document_parse(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn has_pending_parser_blocking_script(&self) -> bool {
+                self.blocked.get()
+            }
+            fn perform_microtask_checkpoint(&self) {}
+            fn execute_pending_document_scripts(&self, _: &str) -> Result<()> {
+                if !self.executed.replace(true) {
+                    self.blocked.set(true);
+                }
+                Ok(())
+            }
+            fn finish_parser_style(&self, _: u32, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn register_inline_event_handler(&self, _: u32, _: &str, _: &str) {}
+            fn finish_document_parse(&self) {}
+        }
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let _ = crate::jsdom::document_value();
+        let host = Rc::new(PausingHost {
+            blocked: std::cell::Cell::new(false),
+            executed: std::cell::Cell::new(false),
+        });
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            host.clone(),
+            "https://example.test/paused.xhtml",
+        );
+        parser.write("<html xmlns='http://www.w3.org/1999/xhtml'><head><script>0</script></head><body><p>after</p></body></html>").unwrap();
+        assert_eq!(
+            parser.finish().unwrap(),
+            DocumentParseProgress::BlockedOnScript
+        );
+        fn paragraphs(node: u32) -> usize {
+            usize::from(crate::dom::tag_name(node) == "p")
+                + crate::dom::children(node)
+                    .into_iter()
+                    .map(paragraphs)
+                    .sum::<usize>()
+        }
+        assert_eq!(
+            paragraphs(0),
+            0,
+            "the following node must not be parsed during the pause"
+        );
+        host.blocked.set(false);
+        assert_eq!(parser.resume().unwrap(), DocumentParseProgress::Complete);
+        assert_eq!(paragraphs(0), 1);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let _ = crate::jsdom::document_value();
+        host.executed.set(false);
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            host.clone(),
+            "https://example.test/empty-script.xhtml",
+        );
+        parser.write("<html xmlns='http://www.w3.org/1999/xhtml'><head><script/></head><body><p>after</p></body></html>").unwrap();
+        assert_eq!(
+            parser.finish().unwrap(),
+            DocumentParseProgress::BlockedOnScript
+        );
+        assert_eq!(paragraphs(0), 0);
+        host.blocked.set(false);
+        assert_eq!(parser.resume().unwrap(), DocumentParseProgress::Complete);
+        assert_eq!(paragraphs(0), 1);
+    }
 
     #[test]
     fn fragment_parser_allows_a_processing_instruction_without_an_element() {
@@ -461,6 +621,75 @@ mod tests {
 
     #[cfg(feature = "dynamic-js")]
     #[test]
+    fn xhtml_parser_runs_inline_script_before_following_stylesheet() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let url = "https://example.test/style-order.xhtml";
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        ));
+        loader.begin_document_parse(url).unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(loader, url);
+        parser
+            .write(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head>\
+             <script>var sheet = document.createElement('style'); \
+             sheet.appendChild(document.createTextNode('body { color: red; }')); \
+             document.getElementsByTagName('head')[0].appendChild(sheet);</script>\
+             <style>body { color: green; }</style></head><body><p>green</p></body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        let body = crate::jsdom::document_value().get_property("body");
+        let node = crate::jsdom::node_id_of(&body).expect("body node");
+        assert_eq!(
+            crate::dom::with_document(|document| document
+                .computed_style_for(w3cos_dom::node::NodeId::from_u32(node))
+                .color),
+            w3cos_std::Color::rgb(0, 128, 0)
+        );
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn xhtml_stylesheet_imports_a_css_data_url_before_local_rules() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let url = "https://example.test/data-import.xhtml";
+        let mut policy = crate::dynamic_script::ScriptPolicy::default();
+        policy.allow_network = false;
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(policy));
+        loader.begin_document_parse(url).unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(loader.clone(), url);
+        parser
+            .write(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head>\
+             <style>@import url(data:text/css,.test.test%20%7B%20color:%20green%3B%20%7D); \
+             .test { color: red; }</style></head><body><p class='test'>green</p></body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        let paragraph =
+            crate::jsdom::document_value().call_method("querySelector", vec![Value::string("p")]);
+        let node = crate::jsdom::node_id_of(&paragraph).expect("paragraph node");
+        assert_eq!(
+            crate::dom::with_document(|document| document
+                .computed_style_for(w3cos_dom::node::NodeId::from_u32(node))
+                .color),
+            w3cos_std::Color::rgb(0, 128, 0)
+        );
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
     fn xhtml_body_onload_routes_to_the_window_after_shell_replacement() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -512,10 +741,15 @@ mod tests {
             "div { direction: rtl; display: inline; unicode-bidi: bidi-override; }",
             "inline <style>",
         );
-        assert!(stylesheet.rules.iter().any(|rule| rule.declarations.iter()
-            .any(|(property, value)| property == "unicode-bidi" && value == "bidi-override")));
+        assert!(stylesheet.rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|(property, value)| property == "unicode-bidi" && value == "bidi-override")
+        }));
         for rule in stylesheet.rules {
-            let declarations = rule.declarations.iter()
+            let declarations = rule
+                .declarations
+                .iter()
                 .map(|(property, value)| (property.as_str(), value.as_str()))
                 .collect::<Vec<_>>();
             w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
@@ -527,9 +761,88 @@ mod tests {
             }
         }
         let direct = crate::dom::with_document(|document| document.to_component_tree());
-        assert_eq!(text(&direct).trim(), "instructionPASS PASS", "parsed DOM before runtime font provider");
+        assert_eq!(
+            text(&direct).trim(),
+            "instructionPASS PASS",
+            "parsed DOM before runtime font provider"
+        );
         let tree = crate::dom::to_component_tree();
         assert_eq!(text(&tree).trim(), "instructionPASS PASS");
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn xhtml_nested_inline_whitespace_keeps_six_cells_separated() {
+        w3cos_dom::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        ));
+        let url = "https://example.test/white-space-normal-007.xhtml";
+        loader.begin_document_parse(url).unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(loader, url);
+        parser
+            .write(
+                r#"<html xmlns="http://www.w3.org/1999/xhtml"><head/>
+<body><div><span class="red">
+
+   <span class="green">X <span class="red"><span class="red"> <span class="red">
+   </span></span> </span>X <span class="red">
+   </span>X<span class="red"><span class="red"><span class="green"> </span><span
+   class="red"> </span></span> </span>X
+<span class="red">
+
+   </span>
+   <span class="green">X<span class="green"> <span class="red"> </span></span><span
+   class="red"> </span>X<span class="red">
+
+  </span></span></span></span></div></body></html>"#,
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        w3cos_dom::stylesheet::register_rule("div", &[("font", "20px/1 Ahem")]);
+        w3cos_dom::stylesheet::register_rule(
+            ".green",
+            &[("background", "lime"), ("color", "green")],
+        );
+        w3cos_dom::stylesheet::register_rule(".red", &[("background", "red"), ("color", "maroon")]);
+        crate::dom::with_document(|document| {
+            let green = document.query_selector(".green").unwrap();
+            assert_eq!(
+                document.computed_style_for(green.id).background,
+                w3cos_std::Color::rgb(0, 255, 0)
+            );
+        });
+        fn text(component: &w3cos_std::Component) -> String {
+            if !component.children.is_empty() {
+                component.children.iter().map(text).collect()
+            } else {
+                match &component.kind {
+                    w3cos_std::ComponentKind::Text { content } => content.clone(),
+                    _ => String::new(),
+                }
+            }
+        }
+        let tree = crate::dom::to_component_tree();
+        fn runs(component: &w3cos_std::Component, output: &mut Vec<String>) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push(format!(
+                    "{content:?} {:?} children={}",
+                    component.style.background,
+                    component.children.len()
+                ));
+            }
+            for child in &component.children {
+                runs(child, output);
+            }
+        }
+        let mut fragments = Vec::new();
+        runs(&tree, &mut fragments);
+        assert_eq!(text(&tree).trim(), "X X X X X X", "{fragments:?}");
         w3cos_dom::stylesheet::clear_rules();
     }
 

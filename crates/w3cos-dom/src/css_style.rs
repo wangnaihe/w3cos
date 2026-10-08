@@ -1,8 +1,8 @@
 use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
-    AlignItems, BoxSizing, Contain, CssClipRect, Dimension, Display, Edges, FlexDirection,
-    Clear, FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
+    AlignItems, BoxSizing, Clear, ColumnFill, Contain, CssClipRect, Dimension, Display, Edges, FlexDirection,
+    FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
     UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
@@ -32,10 +32,16 @@ impl CSSStyleDeclaration {
     pub fn from_style(mut style: Style) -> Self {
         // Empty HTML defaults use CSS's initial none line style. Preserve
         // legacy native builders that explicitly supplied numeric borders.
-        if style.border_styles == [None; 4] && style.border_width == 0.0
-            && [style.border_top_width, style.border_right_width,
-                style.border_bottom_width, style.border_left_width]
-                .into_iter().all(|width| width.is_none_or(|width| width == 0.0))
+        if style.border_styles == [None; 4]
+            && style.border_width == 0.0
+            && [
+                style.border_top_width,
+                style.border_right_width,
+                style.border_bottom_width,
+                style.border_left_width,
+            ]
+            .into_iter()
+            .all(|width| width.is_none_or(|width| width == 0.0))
         {
             style.border_styles = [Some(w3cos_std::style::BorderLineStyle::None); 4];
         }
@@ -49,12 +55,33 @@ impl CSSStyleDeclaration {
         let raw_value = value;
         let (parsed_value, important) = crate::stylesheet::declaration_value_and_importance(value);
         let value = if important { parsed_value } else { value };
-        if matches!(name, "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
-            | "borderTop" | "borderRight" | "borderBottom" | "borderLeft"
-            | "border-inline-start" | "border-inline-end" | "border-block-start" | "border-block-end"
-            | "borderInlineStart" | "borderInlineEnd" | "borderBlockStart" | "borderBlockEnd")
-            && !valid_border_shorthand_source(value)
+        if matches!(
+            name,
+            "border"
+                | "border-top"
+                | "border-right"
+                | "border-bottom"
+                | "border-left"
+                | "borderTop"
+                | "borderRight"
+                | "borderBottom"
+                | "borderLeft"
+                | "border-inline-start"
+                | "border-inline-end"
+                | "border-block-start"
+                | "border-block-end"
+                | "borderInlineStart"
+                | "borderInlineEnd"
+                | "borderBlockStart"
+                | "borderBlockEnd"
+        ) && !valid_border_shorthand_source(value)
         {
+            return;
+        }
+        if matches!(name, "line-height" | "lineHeight") && !is_valid_line_height_value(value) {
+            return;
+        }
+        if !valid_multicol_declaration(name, value) {
             return;
         }
         self.inline_declarations
@@ -103,6 +130,21 @@ impl CSSStyleDeclaration {
             }
             "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
             "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
+            "column-width" | "columnWidth" => {
+                if let Some(width) = parse_column_width(value) { self.inner.column_width = width; }
+            }
+            "column-count" | "columnCount" => {
+                if let Some(count) = parse_column_count(value) { self.inner.column_count = count; }
+            }
+            "column-fill" | "columnFill" => {
+                if let Some(fill) = parse_column_fill(value) { self.inner.column_fill = fill; }
+            }
+            "columns" => {
+                if let Some((width, count)) = parse_columns(value) {
+                    self.inner.column_width = width;
+                    self.inner.column_count = count;
+                }
+            }
             "border-spacing" | "borderSpacing" => {
                 self.inner
                     .custom_properties
@@ -116,7 +158,10 @@ impl CSSStyleDeclaration {
                     .filter_map(|part| parse_px(&part))
                     .filter(|value| *value >= 0.0)
                     .collect();
-                if let Some(x) = values.first().copied() {
+                if value.trim().eq_ignore_ascii_case("initial") {
+                    self.inner.border_spacing_x = 0.0;
+                    self.inner.border_spacing_y = 0.0;
+                } else if let Some(x) = values.first().copied() {
                     self.inner.border_spacing_x = x;
                     self.inner.border_spacing_y = values.get(1).copied().unwrap_or(x);
                 }
@@ -411,7 +456,8 @@ impl CSSStyleDeclaration {
                 // A negative size is invalid, so it is dropped and the previous
                 // declaration in the same rule survives (`font-size-123`).
                 if !is_negative_font_size_value(value)
-                    && let Some(v) = parse_px(value)
+                    && let Some(v) = absolute_font_size_keyword_px(value, self.inner.font_family.as_deref())
+                        .or_else(|| parse_px(value))
                 {
                     self.inner.font_size = v
                 }
@@ -464,27 +510,56 @@ impl CSSStyleDeclaration {
                 }
             }
             "border-top-width" | "borderTopWidth" => {
-                if let Some(width) = parse_border_width(value) { self.inner.border_top_width = Some(width); }
+                if let Some(width) = parse_border_width(value) {
+                    self.inner.border_top_width = Some(width);
+                }
             }
             "border-right-width" | "borderRightWidth" => {
-                if let Some(width) = parse_border_width(value) { self.inner.border_right_width = Some(width); }
+                if let Some(width) = parse_border_width(value) {
+                    self.inner.border_right_width = Some(width);
+                }
             }
             "border-bottom-width" | "borderBottomWidth" => {
-                if let Some(width) = parse_border_width(value) { self.inner.border_bottom_width = Some(width); }
+                if let Some(width) = parse_border_width(value) {
+                    self.inner.border_bottom_width = Some(width);
+                }
             }
             "border-left-width" | "borderLeftWidth" => {
-                if let Some(width) = parse_border_width(value) { self.inner.border_left_width = Some(width); }
+                if let Some(width) = parse_border_width(value) {
+                    self.inner.border_left_width = Some(width);
+                }
             }
-            "border-top-style" | "borderTopStyle" | "border-right-style" | "borderRightStyle"
-            | "border-bottom-style" | "borderBottomStyle" | "border-left-style" | "borderLeftStyle" => {
+            "border-top-style"
+            | "borderTopStyle"
+            | "border-right-style"
+            | "borderRightStyle"
+            | "border-bottom-style"
+            | "borderBottomStyle"
+            | "border-left-style"
+            | "borderLeftStyle" => {
                 if let Some(visible) = parse_border_style_visibility(value) {
-                    let edge = if name.contains("top") || name.contains("Top") { 0 }
-                        else if name.contains("right") || name.contains("Right") { 1 }
-                        else if name.contains("bottom") || name.contains("Bottom") { 2 } else { 3 };
-                    let widths = [self.inner.border_top_width, self.inner.border_right_width,
-                        self.inner.border_bottom_width, self.inner.border_left_width];
-                    let width = if visible { self.declared_side_border_width(edge)
-                        .or(widths[edge].filter(|width| *width > 0.0)).unwrap_or(3.0) } else { 0.0 };
+                    let edge = if name.contains("top") || name.contains("Top") {
+                        0
+                    } else if name.contains("right") || name.contains("Right") {
+                        1
+                    } else if name.contains("bottom") || name.contains("Bottom") {
+                        2
+                    } else {
+                        3
+                    };
+                    let widths = [
+                        self.inner.border_top_width,
+                        self.inner.border_right_width,
+                        self.inner.border_bottom_width,
+                        self.inner.border_left_width,
+                    ];
+                    let width = if visible {
+                        self.declared_side_border_width(edge)
+                            .or(widths[edge].filter(|width| *width > 0.0))
+                            .unwrap_or(3.0)
+                    } else {
+                        0.0
+                    };
                     match edge {
                         0 => self.inner.border_top_width = Some(width),
                         1 => self.inner.border_right_width = Some(width),
@@ -495,8 +570,9 @@ impl CSSStyleDeclaration {
             }
             "border-style" | "borderStyle" => {
                 if let Some(edges) = parse_border_style_edges(value) {
-                    let widths: [f32; 4] = std::array::from_fn(|side|
-                        self.declared_side_border_width(side).unwrap_or(3.0));
+                    let widths: [f32; 4] = std::array::from_fn(|side| {
+                        self.declared_side_border_width(side).unwrap_or(3.0)
+                    });
                     self.inner.border_width = if edges.into_iter().any(|visible| visible) {
                         widths[0]
                     } else {
@@ -641,6 +717,8 @@ impl CSSStyleDeclaration {
                 if let Some(line_height) = parse_font_line_height(value, self.inner.font_size) {
                     self.inner.line_height = line_height;
                     self.inner.line_height_is_normal = value.trim().eq_ignore_ascii_case("normal");
+                    self.inner.line_height_computed_px =
+                        computed_line_height_length(value, self.inner.font_size, line_height);
                 }
             }
             "text-indent" | "textIndent" => {
@@ -665,6 +743,13 @@ impl CSSStyleDeclaration {
                 let value = value.trim();
                 let spacing = if value.eq_ignore_ascii_case("normal") {
                     Some(0.0)
+                } else if let Some(number) = value.strip_suffix('%') {
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|number| number.is_finite())
+                        .map(|number| number * self.inner.font_size / 100.0)
                 } else if let Some(number) = value.strip_suffix("rem") {
                     number
                         .trim()
@@ -706,6 +791,12 @@ impl CSSStyleDeclaration {
                         .parse::<f32>()
                         .ok()
                         .map(|number| number * self.inner.font_size)
+                } else if let Some(number) = value.strip_suffix("ex") {
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| number * self.inner.font_size * 0.5)
                 } else {
                     parse_px(value)
                 };
@@ -723,11 +814,23 @@ impl CSSStyleDeclaration {
                 // An invalid family list invalidates the whole declaration, so
                 // the previous (inherited or less specific) value survives.
                 if is_valid_font_family_value(value) {
-                    self.inner.font_family =
-                        Some(value.trim_matches('"').trim_matches('\'').to_string());
+                    self.inner.font_family = Some(normalize_font_family_value(value));
                 }
             }
             "font-style" | "fontStyle" => self.inner.font_style = parse_font_style(value),
+            "font-variant" | "fontVariant" => {
+                if let Some(variant) = parse_font_variant(value) {
+                    self.inner.font_variant = variant;
+                }
+            }
+            "font-kerning" | "fontKerning" => match value.trim().to_ascii_lowercase().as_str() {
+                "none" => self.inner.font_kerning = false,
+                "auto" | "normal" => self.inner.font_kerning = true,
+                _ => {}
+            },
+            "font-feature-settings" | "fontFeatureSettings" => {
+                self.inner.font_feature_kern = parse_kern_feature_override(value);
+            }
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
             "direction" => {
                 self.inner.direction = if value.trim().eq_ignore_ascii_case("rtl") {
@@ -770,14 +873,24 @@ impl CSSStyleDeclaration {
             "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
             "vertical-align" | "verticalAlign" => {
                 let value = value.trim();
+                const KEYWORD_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
+                if let Some(properties) = self.inner.custom_properties.as_mut() {
+                    properties.remove(KEYWORD_MARKER);
+                }
                 if let Some(offset) = parse_vertical_align_length(value, &self.inner) {
                     self.inner.align_self = w3cos_std::style::AlignSelf::Baseline;
                     let baseline_descent = self.inner.font_size * 0.2;
                     let line_extension = (offset.abs() - baseline_descent).max(0.0);
-                    if offset >= 0.0 {
-                        self.inner.margin.bottom = Spacing::Px(line_extension);
-                    } else {
-                        self.inner.margin.top = Spacing::Px(line_extension);
+                    if !matches!(self.inner.display,
+                        w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex
+                            | w3cos_std::style::Display::InlineTable)
+                    {
+                        if offset >= 0.0 {
+                            self.inner.margin.bottom = Spacing::Px(line_extension);
+                        } else {
+                            self.inner.margin.top = Spacing::Px(line_extension);
+                        }
                     }
                     self.inner
                         .custom_properties
@@ -792,6 +905,12 @@ impl CSSStyleDeclaration {
                         "bottom" | "text-bottom" => w3cos_std::style::AlignSelf::FlexEnd,
                         "middle" => w3cos_std::style::AlignSelf::Center,
                         _ => w3cos_std::style::AlignSelf::Baseline,
+                    };
+                    if matches!(value, "top" | "text-top" | "bottom" | "text-bottom") {
+                        self.inner
+                            .custom_properties
+                            .get_or_insert_with(Default::default)
+                            .insert(KEYWORD_MARKER.to_string(), value.to_string());
                     }
                 }
             }
@@ -813,8 +932,24 @@ impl CSSStyleDeclaration {
             "grid-column" | "gridColumn" => self.inner.grid_column = Some(value.trim().to_string()),
 
             // Outline
+            "outline" => {
+                let (mut width, mut line_style, mut color) = (None, None, None);
+                for part in split_css_whitespace(value) {
+                    if let Some(parsed) = parse_border_width(&part) {
+                        if width.replace(parsed).is_some() { return; }
+                    } else if matches!(part.as_str(), "none" | "solid" | "dashed" | "dotted"
+                        | "double" | "groove" | "ridge" | "inset" | "outset") {
+                        if line_style.replace(parse_outline_style(&part)).is_some() { return; }
+                    } else if let Some(parsed) = Color::from_css(&part) {
+                        if color.replace(parsed).is_some() { return; }
+                    } else { return; }
+                }
+                self.inner.outline_width = width.unwrap_or(3.0);
+                self.inner.outline_style = line_style.unwrap_or_default();
+                self.inner.outline_color = color.unwrap_or(self.inner.color);
+            }
             "outline-width" | "outlineWidth" => {
-                if let Some(v) = parse_px(value) {
+                if let Some(v) = parse_border_width(value) {
                     self.inner.outline_width = v
                 }
             }
@@ -833,6 +968,14 @@ impl CSSStyleDeclaration {
 
     pub fn get_property(&self, name: &str) -> String {
         match name {
+            "column-width" | "columnWidth" => dimension_to_css(&self.inner.column_width),
+            "column-count" | "columnCount" => self.inner.column_count
+                .map_or_else(|| "auto".into(), |count| count.to_string()),
+            "column-fill" | "columnFill" => match self.inner.column_fill {
+                ColumnFill::Auto => "auto", ColumnFill::Balance => "balance",
+                ColumnFill::BalanceAll => "balance-all",
+            }.into(),
+            "columns" => format!("{} {}", self.get_property("column-width"), self.get_property("column-count")),
             "display" => match self.inner.display {
                 Display::Block => "block".to_string(),
                 Display::FlowRoot => "flow-root".to_string(),
@@ -899,13 +1042,35 @@ impl CSSStyleDeclaration {
                 Clear::Right => "right".to_string(),
                 Clear::Both => "both".to_string(),
             },
-            "vertical-align" | "verticalAlign" => match self.inner.align_self {
-                w3cos_std::style::AlignSelf::FlexStart => "top".to_string(),
-                w3cos_std::style::AlignSelf::FlexEnd => "bottom".to_string(),
-                w3cos_std::style::AlignSelf::Center => "middle".to_string(),
-                _ => "baseline".to_string(),
-            },
+            "vertical-align" | "verticalAlign" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
+                .cloned()
+                .unwrap_or_else(|| match self.inner.align_self {
+                    w3cos_std::style::AlignSelf::FlexStart => "top".to_string(),
+                    w3cos_std::style::AlignSelf::FlexEnd => "bottom".to_string(),
+                    w3cos_std::style::AlignSelf::Center => "middle".to_string(),
+                    _ => "baseline".to_string(),
+                }),
             "font-size" | "fontSize" => format!("{}px", self.inner.font_size),
+            "font-variant" | "fontVariant" => match self.inner.font_variant {
+                w3cos_std::style::FontVariant::Normal => "normal".to_string(),
+                w3cos_std::style::FontVariant::SmallCaps => "small-caps".to_string(),
+            },
+            "font-kerning" | "fontKerning" => {
+                if self.inner.font_kerning {
+                    "auto".to_string()
+                } else {
+                    "none".to_string()
+                }
+            }
+            "font-feature-settings" | "fontFeatureSettings" => match self.inner.font_feature_kern {
+                Some(true) => "\"kern\" on".to_string(),
+                Some(false) => "\"kern\" off".to_string(),
+                None => "normal".to_string(),
+            },
             "color" => format!(
                 "#{:02x}{:02x}{:02x}",
                 self.inner.color.r, self.inner.color.g, self.inner.color.b
@@ -1034,27 +1199,50 @@ impl CSSStyleDeclaration {
 
     pub fn to_style(&self) -> Style {
         let mut style = self.inner.clone();
+        style.computed_border_widths =
+            std::array::from_fn(|edge| self.declared_side_border_width(edge));
         // Width and style cascade independently. A later width declaration
         // cannot make an explicitly none/hidden edge visible.
         for (edge, physical, alias, shorthand) in [
             (0, "border-top-style", "borderTopStyle", "border-top"),
             (1, "border-right-style", "borderRightStyle", "border-right"),
-            (2, "border-bottom-style", "borderBottomStyle", "border-bottom"),
-            (3, "border-left-style", "borderLeftStyle", "border-left")] {
-            let line_style = self.inline_declarations.iter().rev().find_map(|(name, value)| {
-                let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
-                if name == physical || name == alias { parse_border_line_style(value) }
-                else if matches!(name.as_str(), "border-style" | "borderStyle") {
-                    parse_border_line_style_edges(value).map(|edges| edges[edge])
-                } else if name == "border" || name == shorthand {
-                    let parts = split_css_whitespace(value);
-                    if parts.iter().all(|part| parse_border_width(part).is_some()
-                        || Color::from_css(part).is_some() || parse_border_style_visibility(part).is_some()) {
-                        parts.iter().find_map(|part| parse_border_line_style(part))
-                            .or(Some(w3cos_std::style::BorderLineStyle::None))
-                    } else { None }
-                } else { None }
-            }).or(style.border_styles[edge]);
+            (
+                2,
+                "border-bottom-style",
+                "borderBottomStyle",
+                "border-bottom",
+            ),
+            (3, "border-left-style", "borderLeftStyle", "border-left"),
+        ] {
+            let line_style = self
+                .inline_declarations
+                .iter()
+                .rev()
+                .find_map(|(name, value)| {
+                    let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+                    if name == physical || name == alias {
+                        parse_border_line_style(value)
+                    } else if matches!(name.as_str(), "border-style" | "borderStyle") {
+                        parse_border_line_style_edges(value).map(|edges| edges[edge])
+                    } else if name == "border" || name == shorthand {
+                        let parts = split_css_whitespace(value);
+                        if parts.iter().all(|part| {
+                            parse_border_width(part).is_some()
+                                || Color::from_css(part).is_some()
+                                || parse_border_style_visibility(part).is_some()
+                        }) {
+                            parts
+                                .iter()
+                                .find_map(|part| parse_border_line_style(part))
+                                .or(Some(w3cos_std::style::BorderLineStyle::None))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .or(style.border_styles[edge]);
             if let Some(line_style) = line_style {
                 style.border_styles[edge] = Some(line_style);
             }
@@ -1068,22 +1256,59 @@ impl CSSStyleDeclaration {
             }
         }
         for (edge, physical, alias, shorthand, shorthand_alias) in [
-            (0, "border-top-color", "borderTopColor", "border-top", "borderTop"),
-            (1, "border-right-color", "borderRightColor", "border-right", "borderRight"),
-            (2, "border-bottom-color", "borderBottomColor", "border-bottom", "borderBottom"),
-            (3, "border-left-color", "borderLeftColor", "border-left", "borderLeft")] {
-            let color = self.inline_declarations.iter().rev().find_map(|(name, value)| {
-                let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
-                if name == physical || name == alias {
-                    if value.eq_ignore_ascii_case("currentcolor") { Some(style.color) }
-                    else { Color::from_css(value) }
-                } else if matches!(name.as_str(), "border-color" | "borderColor") {
-                    if value.eq_ignore_ascii_case("currentcolor") { Some(style.color) }
-                    else { parse_border_color_edges(value).map(|edges| edges[edge]) }
-                } else if name == "border" || name == shorthand || name == shorthand_alias {
-                    border_shorthand_color(value, style.color, parse_border_width)
-                } else { None }
-            });
+            (
+                0,
+                "border-top-color",
+                "borderTopColor",
+                "border-top",
+                "borderTop",
+            ),
+            (
+                1,
+                "border-right-color",
+                "borderRightColor",
+                "border-right",
+                "borderRight",
+            ),
+            (
+                2,
+                "border-bottom-color",
+                "borderBottomColor",
+                "border-bottom",
+                "borderBottom",
+            ),
+            (
+                3,
+                "border-left-color",
+                "borderLeftColor",
+                "border-left",
+                "borderLeft",
+            ),
+        ] {
+            let color = self
+                .inline_declarations
+                .iter()
+                .rev()
+                .find_map(|(name, value)| {
+                    let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+                    if name == physical || name == alias {
+                        if value.eq_ignore_ascii_case("currentcolor") {
+                            Some(style.color)
+                        } else {
+                            Color::from_css(value)
+                        }
+                    } else if matches!(name.as_str(), "border-color" | "borderColor") {
+                        if value.eq_ignore_ascii_case("currentcolor") {
+                            Some(style.color)
+                        } else {
+                            parse_border_color_edges(value).map(|edges| edges[edge])
+                        }
+                    } else if name == "border" || name == shorthand || name == shorthand_alias {
+                        border_shorthand_color(value, style.color, parse_border_width)
+                    } else {
+                        None
+                    }
+                });
             if let Some(color) = color {
                 match edge {
                     0 => style.border_top_color = Some(color),
@@ -1093,15 +1318,25 @@ impl CSSStyleDeclaration {
                 }
             }
         }
-        if let Some(color) = self.inline_declarations.iter().rev().find_map(|(name, value)| {
-            let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
-            if name == "border" {
-                border_shorthand_color(value, style.color, parse_border_width)
-            } else if matches!(name.as_str(), "border-color" | "borderColor") {
-                if value.eq_ignore_ascii_case("currentcolor") { Some(style.color) }
-                else { parse_border_color_edges(value).map(|edges| edges[0]) }
-            } else { None }
-        }) {
+        if let Some(color) = self
+            .inline_declarations
+            .iter()
+            .rev()
+            .find_map(|(name, value)| {
+                let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+                if name == "border" {
+                    border_shorthand_color(value, style.color, parse_border_width)
+                } else if matches!(name.as_str(), "border-color" | "borderColor") {
+                    if value.eq_ignore_ascii_case("currentcolor") {
+                        Some(style.color)
+                    } else {
+                        parse_border_color_edges(value).map(|edges| edges[0])
+                    }
+                } else {
+                    None
+                }
+            })
+        {
             style.border_color = color;
         }
         style
@@ -1112,22 +1347,40 @@ impl CSSStyleDeclaration {
             ("border-top-width", "borderTopWidth", "border-top"),
             ("border-right-width", "borderRightWidth", "border-right"),
             ("border-bottom-width", "borderBottomWidth", "border-bottom"),
-            ("border-left-width", "borderLeftWidth", "border-left")][edge];
-        self.inline_declarations.iter().rev().find_map(|(name, raw)| {
-            let (value, _) = crate::stylesheet::declaration_value_and_importance(raw);
-            if name == physical || name == alias { parse_border_width(value) }
-            else if matches!(name.as_str(), "border-width" | "borderWidth") {
-                parse_border_width_edges(value).map(|widths| widths[edge])
-            } else if name == "border" || name == shorthand {
-                let parts = split_css_whitespace(value);
-                if !parts.is_empty() && parts.iter().all(|part| parse_border_width(part).is_some()
-                    || Color::from_css(part).is_some() || parse_border_style_visibility(part).is_some()) {
-                    Some(parts.iter().find_map(|part| parse_border_width(part)).unwrap_or(3.0))
-                } else { None }
-            } else { None }
-        })
+            ("border-left-width", "borderLeftWidth", "border-left"),
+        ][edge];
+        self.inline_declarations
+            .iter()
+            .rev()
+            .find_map(|(name, raw)| {
+                let (value, _) = crate::stylesheet::declaration_value_and_importance(raw);
+                if name == physical || name == alias {
+                    parse_border_width(value)
+                } else if matches!(name.as_str(), "border-width" | "borderWidth") {
+                    parse_border_width_edges(value).map(|widths| widths[edge])
+                } else if name == "border" || name == shorthand {
+                    let parts = split_css_whitespace(value);
+                    if !parts.is_empty()
+                        && parts.iter().all(|part| {
+                            parse_border_width(part).is_some()
+                                || Color::from_css(part).is_some()
+                                || parse_border_style_visibility(part).is_some()
+                        })
+                    {
+                        Some(
+                            parts
+                                .iter()
+                                .find_map(|part| parse_border_width(part))
+                                .unwrap_or(3.0),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
     }
-
 }
 
 fn css_background_value(value: &str, initial: &str) -> Option<String> {
@@ -1216,6 +1469,7 @@ fn parse_padding_spacing(value: &str) -> Option<Spacing> {
         | Spacing::Percent(value)
         | Spacing::Rem(value)
         | Spacing::Em(value)
+        | Spacing::Ch(value)
         | Spacing::Vw(value)
         | Spacing::Vh(value)
             if value < 0.0 =>
@@ -1289,11 +1543,7 @@ fn parse_spacing(value: &str) -> Option<Spacing> {
     }
     for (suffix, constructor) in [
         ("rem", Spacing::Rem as fn(f32) -> Spacing),
-        // `ch` is the advance of the zero glyph. The portable style IR does
-        // not yet carry per-font character-relative units, so retain it as
-        // the existing local-font-relative dimension. This is exact for
-        // monospace/Ahem and preserves responsive scaling on every target.
-        ("ch", Spacing::Em),
+        ("ch", Spacing::Ch),
         ("em", Spacing::Em),
         ("vw", Spacing::Vw),
         ("dvh", Spacing::Vh),
@@ -1372,7 +1622,7 @@ impl Default for CSSStyleDeclaration {
     }
 }
 
-fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
+pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
     match dim {
         w3cos_std::style::Dimension::Px(v) => format!("{v}px"),
         w3cos_std::style::Dimension::Percent(v) => format!("{v}%"),
@@ -1390,6 +1640,15 @@ fn parse_px(value: &str) -> Option<f32> {
 }
 
 pub(crate) fn parse_border_width(value: &str) -> Option<f32> {
+    // Relative zero lengths are context-free, including signed zero. Keep
+    // them distinct from unresolved non-zero font/viewport-relative lengths.
+    let normalized=value.trim().to_ascii_lowercase();
+    for unit in ["rem","em","ex","ch","rlh","lh","dvw","dvh","svw","svh",
+        "lvw","lvh","vmin","vmax","vw","vh"] {
+        if normalized.strip_suffix(unit).and_then(|v|v.parse::<f32>().ok())==Some(0.0) {
+            return Some(0.0);
+        }
+    }
     match value.trim().to_ascii_lowercase().as_str() {
         "thin" => Some(1.0),
         "medium" => Some(3.0),
@@ -1574,6 +1833,90 @@ fn parse_clip(value: &str) -> Option<Option<CssClipRect>> {
     }))
 }
 
+/// Shared by dynamic CSSOM and the static CSS compiler.
+pub fn parse_column_width(value: &str) -> Option<Dimension> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "auto" | "initial" | "unset") {
+        return Some(Dimension::Auto);
+    }
+    // A nonzero unitless number is a count, never a column length.
+    if value.parse::<f32>().is_ok_and(|number| number != 0.0) { return None; }
+    match parse_dimension_checked(&value)? {
+        Dimension::Auto | Dimension::Percent(_) => None,
+        width => {
+            let number = match width {
+                Dimension::Px(n) | Dimension::Rem(n) | Dimension::Em(n)
+                | Dimension::Ch(n) | Dimension::Vw(n) | Dimension::Vh(n) => n,
+                _ => return None,
+            };
+            (number.is_finite() && number >= 0.0).then_some(width)
+        }
+    }
+}
+
+pub fn parse_column_count(value: &str) -> Option<Option<u32>> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "auto" | "initial" | "unset") { return Some(None); }
+    let count = parse_css_integer_clamped(&value)?;
+    (count > 0).then_some(Some(count as u32))
+}
+
+pub fn parse_column_fill(value: &str) -> Option<ColumnFill> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(ColumnFill::Auto),
+        "balance" | "initial" | "unset" => Some(ColumnFill::Balance),
+        "balance-all" => Some(ColumnFill::BalanceAll),
+        _ => None,
+    }
+}
+
+pub fn parse_columns(value: &str) -> Option<(Dimension, Option<u32>)> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "initial" | "unset") { return Some((Dimension::Auto, None)); }
+    let parts = split_css_whitespace(&value);
+    if parts.is_empty() || parts.len() > 2 { return None; }
+    let mut width = None;
+    let mut count = None;
+    for part in parts {
+        if part == "auto" { continue; }
+        if let Some(Some(number)) = parse_column_count(&part) {
+            if count.replace(number).is_some() { return None; }
+        } else {
+            if matches!(part.as_str(), "initial" | "unset") { return None; }
+            let length = parse_column_width(&part)?;
+            if width.replace(length).is_some() { return None; }
+        }
+    }
+    Some((width.unwrap_or(Dimension::Auto), count))
+}
+
+pub fn valid_multicol_declaration(name: &str, value: &str) -> bool {
+    let Some(name) = multicol_property_name(name) else { return true; };
+    if matches!(value.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer") { return true; }
+    match name {
+        "column-width" => parse_column_width(value).is_some(),
+        "column-count" => parse_column_count(value).is_some(),
+        "column-fill" => parse_column_fill(value).is_some(),
+        "columns" => parse_columns(value).is_some(),
+        _ => true,
+    }
+}
+
+/// Canonicalize only this property family without allocating for ordinary
+/// declarations. CSSOM camel-case aliases share the same grammar.
+pub fn multicol_property_name(name: &str) -> Option<&'static str> {
+    let prefix = name.get(..6)?;
+    if !prefix.eq_ignore_ascii_case("column") { return None; }
+    let suffix = &name[6..];
+    if suffix.eq_ignore_ascii_case("s") { return Some("columns"); }
+    let suffix = suffix.strip_prefix('-').unwrap_or(suffix);
+    if suffix.eq_ignore_ascii_case("width") { Some("column-width") }
+    else if suffix.eq_ignore_ascii_case("count") { Some("column-count") }
+    else if suffix.eq_ignore_ascii_case("fill") { Some("column-fill") }
+    else { None }
+}
+
 fn parse_dimension(value: &str) -> Dimension {
     parse_dimension_checked(value).unwrap_or(Dimension::Auto)
 }
@@ -1721,8 +2064,10 @@ pub(crate) fn parse_border_line_style(value: &str) -> Option<w3cos_std::style::B
 }
 
 fn parse_border_line_style_edges(value: &str) -> Option<[w3cos_std::style::BorderLineStyle; 4]> {
-    let values = split_css_whitespace(value).into_iter()
-        .map(|value| parse_border_line_style(&value)).collect::<Option<Vec<_>>>()?;
+    let values = split_css_whitespace(value)
+        .into_iter()
+        .map(|value| parse_border_line_style(&value))
+        .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [all] => Some([*all; 4]),
         [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
@@ -1807,10 +2152,14 @@ fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
 }
 
 pub(crate) fn border_shorthand_color(
-    value: &str, current_color: Color, width: impl Fn(&str) -> Option<f32>,
+    value: &str,
+    current_color: Color,
+    width: impl Fn(&str) -> Option<f32>,
 ) -> Option<Color> {
     let parts = split_css_whitespace(value);
-    if parts.is_empty() { return None; }
+    if parts.is_empty() {
+        return None;
+    }
     let mut counts = [0; 3];
     let mut color = None;
     for part in parts {
@@ -1824,32 +2173,49 @@ pub(crate) fn border_shorthand_color(
             color = Some(current_color);
         } else if parse_border_line_style(&part).is_some() {
             counts[2] += 1;
-        } else { return None; }
-        if counts.into_iter().any(|count| count > 1) { return None; }
+        } else {
+            return None;
+        }
+        if counts.into_iter().any(|count| count > 1) {
+            return None;
+        }
     }
     Some(color.unwrap_or(current_color))
 }
 
 fn valid_border_shorthand_source(value: &str) -> bool {
     let lower = value.trim().to_ascii_lowercase();
-    if matches!(lower.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer")
-        || lower.contains("var(")
+    if matches!(
+        lower.as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) || lower.contains("var(")
     {
         // Pending substitutions stay in the existing computed-value resolver.
         return true;
     }
     border_shorthand_color(value, Color::BLACK, |token| {
         let token = token.to_ascii_lowercase();
-        parse_border_width(&token).or_else(|| match parse_spacing(&token) {
-            Some(Spacing::Em(value) | Spacing::Rem(value) | Spacing::Vw(value) | Spacing::Vh(value)) => Some(value),
-            _ => None,
-        }).or_else(|| {
-            // Classify a deferred length expression without resolving it in
-            // declaration storage; the existing length resolver owns its value.
-            ["calc(", "min(", "max(", "clamp(", "env("].iter()
-                .any(|prefix| token.starts_with(prefix) && token.ends_with(')')).then_some(0.0)
-        })
-    }).is_some()
+        parse_border_width(&token)
+            .or_else(|| match parse_spacing(&token) {
+                Some(
+                    Spacing::Em(value)
+                    | Spacing::Ch(value)
+                    | Spacing::Rem(value)
+                    | Spacing::Vw(value)
+                    | Spacing::Vh(value),
+                ) => Some(value),
+                _ => None,
+            })
+            .or_else(|| {
+                // Classify a deferred length expression without resolving it in
+                // declaration storage; the existing length resolver owns its value.
+                ["calc(", "min(", "max(", "clamp(", "env("]
+                    .iter()
+                    .any(|prefix| token.starts_with(prefix) && token.ends_with(')'))
+                    .then_some(0.0)
+            })
+    })
+    .is_some()
 }
 
 fn apply_border_shorthand(style: &mut Style, value: &str) {
@@ -2062,6 +2428,42 @@ fn parse_font_style(value: &str) -> w3cos_std::style::FontStyle {
     }
 }
 
+fn parse_kern_feature_override(value: &str) -> Option<bool> {
+    value.split(',').find_map(|feature| {
+        let feature = feature.trim().to_ascii_lowercase();
+        let suffix = feature
+            .strip_prefix("\"kern\"")
+            .or_else(|| feature.strip_prefix("'kern'"))?;
+        match suffix.trim() {
+            "" | "on" | "1" => Some(true),
+            "off" | "0" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod font_kerning_tests {
+    use super::CSSStyleDeclaration;
+
+    #[test]
+    fn font_kerning_and_feature_settings_disable_kern_shaping() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("font-kerning", "none");
+        assert!(!style.to_style().font_kerning);
+        style.set_property("font-kerning", "normal");
+        assert!(style.to_style().font_kerning);
+        style.set_property("font-feature-settings", "\"kern\" off");
+        assert_eq!(style.to_style().font_feature_kern, Some(false));
+        style.set_property("font-feature-settings", "'kern' on");
+        assert_eq!(style.to_style().font_feature_kern, Some(true));
+        style.set_property("font-kerning", "none");
+        assert_eq!(style.to_style().font_feature_kern, Some(true));
+        style.set_property("font-feature-settings", "normal");
+        assert_eq!(style.to_style().font_feature_kern, None);
+    }
+}
+
 /// CSS-wide keywords. They are reserved, so on their own they name a keyword
 /// rather than a font family.
 fn is_css_wide_keyword(value: &str) -> bool {
@@ -2191,6 +2593,26 @@ fn split_font_family_list(value: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
+/// Unquoted identifier sequences use one separating CSS whitespace. Quoted
+/// names preserve their string contents; escaped identifiers keep their
+/// existing representation until identifier escape decoding is performed.
+fn normalize_font_family_value(value: &str) -> String {
+    let families = split_font_family_list(value).unwrap_or_else(|| vec![value]);
+    let single = families.len() == 1;
+    families.into_iter().map(|family| {
+        let family = family.trim_matches(is_css_whitespace);
+        if family.starts_with(['"', '\'']) {
+            if single { family.trim_matches('"').trim_matches('\'').to_string() }
+            else { family.to_string() }
+        } else if family.contains('\\') {
+            family.to_string()
+        } else {
+            family.split(is_css_whitespace).filter(|part| !part.is_empty())
+                .collect::<Vec<_>>().join(" ")
+        }
+    }).collect::<Vec<_>>().join(", ")
+}
+
 /// One `<family-name>`: either a single quoted string, or one or more
 /// identifiers. A lone `inherit` is a keyword rather than a family name, while
 /// `inherit foo` is an ordinary two-identifier name.
@@ -2251,8 +2673,16 @@ fn is_system_font_keyword(value: &str) -> bool {
 fn is_font_size_keyword(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "xx-small" | "x-small" | "small" | "medium" | "large" | "x-large" | "xx-large"
-            | "xxx-large" | "smaller" | "larger"
+        "xx-small"
+            | "x-small"
+            | "small"
+            | "medium"
+            | "large"
+            | "x-large"
+            | "xx-large"
+            | "xxx-large"
+            | "smaller"
+            | "larger"
     )
 }
 
@@ -2284,6 +2714,29 @@ pub(crate) fn is_negative_font_size_value(value: &str) -> bool {
 fn is_font_size_token(value: &str) -> bool {
     is_font_size_keyword(value)
         || (!is_negative_font_size_value(value) && parse_font_size(value, 16.0).is_some())
+}
+
+fn is_font_prefix_token(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "normal"
+            | "italic"
+            | "oblique"
+            | "small-caps"
+            | "bolder"
+            | "lighter"
+            | "bold"
+            | "ultra-condensed"
+            | "extra-condensed"
+            | "condensed"
+            | "semi-condensed"
+            | "semi-expanded"
+            | "expanded"
+            | "extra-expanded"
+            | "ultra-expanded"
+    ) || value
+        .parse::<f32>()
+        .is_ok_and(|weight| weight.is_finite() && (1.0..=1000.0).contains(&weight))
 }
 
 /// `font-weight` is `<font-weight-absolute> | bolder | lighter`, where
@@ -2366,12 +2819,17 @@ pub(crate) fn relative_font_weight(keyword: &str, parent_weight: u16) -> Option<
 }
 
 /// Whether the optional `/ <line-height>` of a `font` shorthand is acceptable.
-/// CSS 2.1 §15.8 makes a negative line-height invalid, which invalidates the
-/// whole declaration; `parse_font_line_height` clamps instead, so the sign has
-/// to be checked before it runs.
+/// CSS 2.1 §15.8 makes a negative line-height invalid, but negative zero
+/// remains a valid zero after numeric parsing.
 fn is_valid_font_line_height_token(value: &str) -> bool {
-    let value = value.trim();
-    !value.starts_with('-') && parse_font_line_height(value, 16.0).is_some()
+    parse_font_line_height(value, 16.0).is_some()
+}
+
+pub(crate) fn is_valid_line_height_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) || parse_font_line_height(value, 16.0).is_some()
 }
 
 /// `font` requires both a `font-size` and a `font-family`, and rejects a
@@ -2392,13 +2850,21 @@ pub(crate) fn is_valid_font_shorthand_value(value: &str) -> bool {
     if is_css_wide_keyword(value) || is_system_font_keyword(value) {
         return true;
     }
-    let (before_line_height, after_slash) = value
-        .split_once('/')
+    let (before_line_height, after_slash) = split_top_level_once(value, '/')
         .map_or((value, None), |(before, after)| (before, Some(after)));
     let before_parts = split_css_whitespace(before_line_height);
-    let Some(size_index) = before_parts.iter().rposition(|part| is_font_size_token(part)) else {
+    let Some(size_index) = before_parts
+        .iter()
+        .rposition(|part| is_font_size_token(part))
+    else {
         return false;
     };
+    if before_parts[..size_index]
+        .iter()
+        .any(|part| !is_font_prefix_token(part))
+    {
+        return false;
+    }
     if let Some(after_slash) = after_slash {
         let after_slash = after_slash.trim_start();
         let line_height_end = after_slash
@@ -2412,12 +2878,19 @@ pub(crate) fn is_valid_font_shorthand_value(value: &str) -> bool {
     !before_parts[size_index + 1..].join(" ").trim().is_empty()
 }
 
+pub(crate) fn parse_font_variant(value: &str) -> Option<w3cos_std::style::FontVariant> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(w3cos_std::style::FontVariant::Normal),
+        "small-caps" => Some(w3cos_std::style::FontVariant::SmallCaps),
+        _ => None,
+    }
+}
+
 fn apply_font_shorthand(style: &mut Style, value: &str) {
     if !is_valid_font_shorthand_value(value) {
         return;
     }
-    let (before_line_height, after_slash) = value
-        .split_once('/')
+    let (before_line_height, after_slash) = split_top_level_once(value, '/')
         .map_or((value, None), |(before, after)| (before, Some(after)));
     let before_parts = split_css_whitespace(before_line_height);
     let Some((size_index, size)) =
@@ -2437,11 +2910,13 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
     // declaration in the same rule (`shand-font-000`, `shand-font-001`).
     style.font_weight = Style::default().font_weight;
     style.font_style = Style::default().font_style;
+    style.font_variant = Style::default().font_variant;
     style.font_size = size;
     for part in &before_parts[..size_index] {
         match part.as_str() {
             "italic" | "oblique" | "normal" => style.font_style = parse_font_style(part),
             "bold" => style.font_weight = 700,
+            "small-caps" => style.font_variant = w3cos_std::style::FontVariant::SmallCaps,
             _ => {
                 // The same `[1, 1000]` range as the longhand, so the shorthand
                 // cannot smuggle in a weight the longhand would reject.
@@ -2457,6 +2932,19 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
 
     let family = if let Some(after_slash) = after_slash {
         let after_slash = after_slash.trim_start();
+        let line_height_end = after_slash.find(char::is_whitespace).unwrap_or(after_slash.len());
+        after_slash[line_height_end..].trim().to_string()
+    } else {
+        before_parts[size_index + 1..].join(" ")
+    };
+    if !family.is_empty() {
+        style.font_family = Some(normalize_font_family_value(&family));
+    }
+    if let Some(size) = absolute_font_size_keyword_px(&before_parts[size_index], style.font_family.as_deref()) {
+        style.font_size = size;
+    }
+    if let Some(after_slash) = after_slash {
+        let after_slash = after_slash.trim_start();
         let line_height_end = after_slash
             .find(char::is_whitespace)
             .unwrap_or(after_slash.len());
@@ -2464,24 +2952,40 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
         if let Some(resolved_height) = parse_font_line_height(line_height, style.font_size) {
             style.line_height = resolved_height;
             style.line_height_is_normal = line_height.trim().eq_ignore_ascii_case("normal");
+            style.line_height_computed_px =
+                computed_line_height_length(line_height, style.font_size, resolved_height);
         }
-        after_slash[line_height_end..].trim()
     } else {
         // The font shorthand resets omitted longhands. In particular, an
         // inherited or previously declared explicit line-height must not
         // survive a shorthand that selects the normal line-height.
         style.line_height = Style::default().line_height;
         style.line_height_is_normal = true;
-        value_after_nth_whitespace_token(value, size_index + 1)
-    };
-
-    if !family.is_empty() {
-        style.font_family = Some(family.trim_matches('"').trim_matches('\'').to_string());
+        style.line_height_computed_px = None;
     }
 }
 
 fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
     let value = value.trim();
+    if let Some(size) = absolute_font_size_keyword_px(value, None) {
+        return Some(size);
+    }
+    // Declaration parsing uses a provisional inherited size. The document
+    // cascade resolves the token again against the actual computed parent.
+    match value.to_ascii_lowercase().as_str() {
+        "larger" => return Some((f64::from(inherited_size) * 1.2) as f32),
+        "smaller" => return Some((f64::from(inherited_size) / 1.2) as f32),
+        _ => {}
+    }
+    if let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return match evaluate_font_size_calc(inner, inherited_size)? {
+            FontCalcValue::Length(length) if length.is_finite() => Some(length),
+            _ => None,
+        };
+    }
     if let Some(number) = value.strip_suffix("rem") {
         return number
             .trim()
@@ -2506,65 +3010,152 @@ fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
     parse_px(value)
 }
 
-pub(crate) fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("normal") {
-        return Some(1.2);
-    }
-    if let Some(number) = value.strip_suffix("rem") {
-        return number
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|number| (number * 16.0 / font_size.max(1.0)).max(0.0));
-    }
-    if let Some(number) = value.strip_suffix("em") {
-        return number
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|number| number.max(0.0));
-    }
-    if let Some(number) = value.strip_suffix("ex") {
-        return number
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|number| (number * 0.5).max(0.0));
-    }
-    if let Some(number) = value.strip_suffix('%') {
-        return number
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|number| number / 100.0);
-    }
-    if let Ok(number) = value.parse::<f32>() {
-        return Some(number.max(0.0));
-    }
-    if let Some(px) = parse_px(value) {
-        return Some((px / font_size.max(1.0)).max(0.0));
-    }
-    None
+/// UA keyword defaults for proportional and generic monospace families.
+/// Keyword sizing uses the final family, not the parent's numeric size.
+pub(crate) fn absolute_font_size_keyword_px(value: &str, family: Option<&str>) -> Option<f32> {
+    let index = match value.trim().to_ascii_lowercase().as_str() {
+        "xx-small" => 0, "x-small" => 1, "small" => 2, "medium" => 3,
+        "large" => 4, "x-large" => 5, "xx-large" => 6, "xxx-large" => 7,
+        _ => return None,
+    };
+    let monospace = family
+        .is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"));
+    Some(if monospace { [9.0, 9.0, 10.0, 13.0, 16.0, 20.0, 26.0, 40.0][index] }
+        else { [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0][index] })
 }
 
-fn value_after_nth_whitespace_token(value: &str, token_count: usize) -> &str {
-    let mut seen = 0;
-    let mut in_token = false;
-    for (index, ch) in value.char_indices() {
-        if ch.is_whitespace() {
-            if in_token {
-                seen += 1;
-                in_token = false;
+#[derive(Clone, Copy)]
+enum FontCalcValue {
+    Number(f32),
+    Length(f32),
+}
+
+fn evaluate_font_size_calc(value: &str, inherited_size: f32) -> Option<FontCalcValue> {
+    fn split_operator<'a>(value: &'a str, operators: &[char]) -> Option<(&'a str, char, &'a str)> {
+        let mut depth = 0_u32;
+        let mut split = None;
+        for (index, ch) in value.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.checked_sub(1)?,
+                _ => {}
             }
-        } else if !in_token {
-            if seen == token_count {
-                return &value[index..];
+            if depth != 0 || !operators.contains(&ch) {
+                continue;
             }
-            in_token = true;
+            let left = value[..index].trim_end();
+            let right = value[index + ch.len_utf8()..].trim_start();
+            if left.is_empty()
+                || right.is_empty()
+                || left
+                    .chars()
+                    .last()
+                    .is_some_and(|character| matches!(character, '+' | '-' | '*' | '/' | 'e' | 'E'))
+            {
+                continue;
+            }
+            split = Some((left, ch, right));
         }
+        (depth == 0).then_some(split).flatten()
     }
-    ""
+
+    let value = value.trim();
+    if let Some((left, operator, right)) = split_operator(value, &['+', '-']) {
+        return match (
+            evaluate_font_size_calc(left, inherited_size)?,
+            evaluate_font_size_calc(right, inherited_size)?,
+            operator,
+        ) {
+            (FontCalcValue::Length(a), FontCalcValue::Length(b), '+') => {
+                Some(FontCalcValue::Length(a + b))
+            }
+            (FontCalcValue::Length(a), FontCalcValue::Length(b), '-') => {
+                Some(FontCalcValue::Length(a - b))
+            }
+            (FontCalcValue::Number(a), FontCalcValue::Number(b), '+') => {
+                Some(FontCalcValue::Number(a + b))
+            }
+            (FontCalcValue::Number(a), FontCalcValue::Number(b), '-') => {
+                Some(FontCalcValue::Number(a - b))
+            }
+            _ => None,
+        };
+    }
+    if let Some((left, operator, right)) = split_operator(value, &['*', '/']) {
+        return match (
+            evaluate_font_size_calc(left, inherited_size)?,
+            evaluate_font_size_calc(right, inherited_size)?,
+            operator,
+        ) {
+            (FontCalcValue::Number(a), FontCalcValue::Length(b), '*')
+            | (FontCalcValue::Length(b), FontCalcValue::Number(a), '*') => {
+                Some(FontCalcValue::Length(a * b))
+            }
+            (FontCalcValue::Length(a), FontCalcValue::Number(b), '/') if b != 0.0 => {
+                Some(FontCalcValue::Length(a / b))
+            }
+            (FontCalcValue::Number(a), FontCalcValue::Number(b), '*') => {
+                Some(FontCalcValue::Number(a * b))
+            }
+            (FontCalcValue::Number(a), FontCalcValue::Number(b), '/') if b != 0.0 => {
+                Some(FontCalcValue::Number(a / b))
+            }
+            _ => None,
+        };
+    }
+    if let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return evaluate_font_size_calc(inner, inherited_size);
+    }
+    if let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return evaluate_font_size_calc(inner, inherited_size);
+    }
+    if let Ok(number) = value.parse::<f32>() {
+        return number.is_finite().then_some(FontCalcValue::Number(number));
+    }
+    parse_font_size(value, inherited_size).map(FontCalcValue::Length)
+}
+
+pub(crate) fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
+    let value = value.trim();
+    let ratio = if value.eq_ignore_ascii_case("normal") {
+        Some(1.2)
+    } else if let Some(number) = value.strip_suffix("rem") {
+        number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number * 16.0 / font_size.max(1.0))
+    } else if let Some(number) = value.strip_suffix("em") {
+        number.trim().parse::<f32>().ok()
+    } else if let Some(number) = value.strip_suffix("ex") {
+        number.trim().parse::<f32>().ok().map(|number| number * 0.5)
+    } else if let Some(number) = value.strip_suffix('%') {
+        number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number / 100.0)
+    } else if let Ok(number) = value.parse::<f32>() {
+        Some(number)
+    } else {
+        parse_px(value).map(|px| px / font_size.max(1.0))
+    };
+    ratio.filter(|number| number.is_finite() && *number >= 0.0)
+}
+
+pub(crate) fn computed_line_height_length(value: &str, font_size: f32, ratio: f32) -> Option<f32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("normal") || value.parse::<f32>().is_ok() {
+        None
+    } else {
+        Some(font_size * ratio)
+    }
 }
 
 fn parse_word_break(value: &str) -> w3cos_std::style::WordBreak {
@@ -2749,6 +3340,17 @@ mod font_family_validity_tests {
         declaration.set_property("font-family", "'Arial'");
         assert!(declaration.to_style().font_family.is_some());
     }
+
+    #[test]
+    fn unquoted_font_family_collapses_identifier_whitespace() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-family", "  White\t \n Space  ");
+        assert_eq!(declaration.to_style().font_family.as_deref(), Some("White Space"));
+        declaration.set_property("font-family", "White   Space, serif");
+        assert_eq!(declaration.to_style().font_family.as_deref(), Some("White Space, serif"));
+        declaration.set_property("font-family", "\"White   Space\", serif");
+        assert_eq!(declaration.to_style().font_family.as_deref(), Some("\"White   Space\", serif"));
+    }
 }
 
 #[cfg(test)]
@@ -2775,7 +3377,10 @@ mod font_shorthand_tests {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("line-height", "2");
         declaration.set_property("font", "20px Ahem");
-        assert_eq!(declaration.to_style().line_height, Style::default().line_height);
+        assert_eq!(
+            declaration.to_style().line_height,
+            Style::default().line_height
+        );
         declaration.set_property("font", "20px/1.5 Ahem");
         assert_eq!(declaration.to_style().line_height, 1.5);
     }
@@ -2788,6 +3393,19 @@ mod font_shorthand_tests {
         let style = declaration.to_style();
         assert_eq!(style.line_height, 1.25);
         assert_eq!(style.font_family.as_deref(), Some("serif"));
+    }
+
+    #[test]
+    fn small_caps_longhand_and_shorthand_preserve_font_variant() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-variant", "small-caps");
+        assert_eq!(declaration.get_property("font-variant"), "small-caps");
+        declaration.set_property("font-variant", "unsupported");
+        assert_eq!(declaration.get_property("font-variant"), "small-caps");
+        declaration.set_property("font", "small-caps 96px serif");
+        assert_eq!(declaration.get_property("font-variant"), "small-caps");
+        declaration.set_property("font", "16px serif");
+        assert_eq!(declaration.get_property("font-variant"), "normal");
     }
 
     #[test]
@@ -2841,11 +3459,58 @@ mod font_shorthand_tests {
         assert_eq!(declaration.to_style().font_size, 20.0);
     }
 
-    /// `font-148` puts a `calc()` where the size belongs. The shorthand cannot
-    /// resolve it, so the declaration is invalid rather than family-only.
     #[test]
-    fn font_shorthand_with_an_unresolvable_size_is_invalid() {
-        assert!(!is_valid_font_shorthand_value("calc(10 * 10px) sans-serif"));
+    fn negative_line_height_longhand_preserves_previous_valid_value() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("line-height", "2em");
+        declaration.set_property("line-height", "-1em");
+        assert_eq!(declaration.to_style().line_height, 2.0);
+        assert_eq!(declaration.to_style().line_height_computed_px, Some(40.0));
+        assert!(
+            !declaration
+                .inline_declarations
+                .iter()
+                .any(|(_, value)| value == "-1em")
+        );
+    }
+
+    #[test]
+    fn negative_zero_line_height_is_valid_but_negative_magnitude_is_not() {
+        for value in ["-0", "-0px", "-0pt", "-0em", "-0%"] {
+            assert_eq!(parse_font_line_height(value, 20.0), Some(0.0), "{value}");
+            assert!(is_valid_font_line_height_token(value), "{value}");
+        }
+        for value in ["-1", "-1px", "-1pt", "-1em", "-1%"] {
+            assert_eq!(parse_font_line_height(value, 20.0), None, "{value}");
+            assert!(!is_valid_font_line_height_token(value), "{value}");
+        }
+    }
+
+    /// `font-148` puts a length-valued `calc()` where the size belongs.
+    #[test]
+    fn font_shorthand_accepts_length_valued_calc_size() {
+        assert!(is_valid_font_shorthand_value("calc(10 * 10px) sans-serif"));
+        assert!(!is_valid_font_shorthand_value(
+            "calc(10px * 10px) sans-serif"
+        ));
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font", "calc(10 * 10px) sans-serif");
+        assert_eq!(declaration.to_style().font_size, 100.0);
+        assert_eq!(
+            declaration.to_style().font_family.as_deref(),
+            Some("sans-serif")
+        );
+
+        for (value, expected) in [
+            ("calc(10px + 5px * 2) serif", 20.0),
+            ("calc((10px + 5px) * 2) serif", 30.0),
+            ("calc(10px / 2) serif", 5.0),
+        ] {
+            assert!(is_valid_font_shorthand_value(value), "{value}");
+            declaration.set_property("font", value);
+            assert_eq!(declaration.to_style().font_size, expected, "{value}");
+        }
     }
 
     #[test]
@@ -2854,8 +3519,12 @@ mod font_shorthand_tests {
         assert!(!is_valid_font_shorthand_value("12px/1.2"));
         assert!(is_valid_font_shorthand_value("12px Ahem"));
         assert!(is_valid_font_shorthand_value("12px/1.2 Ahem"));
-        assert!(is_valid_font_shorthand_value("italic small-caps bold 12px/1.2 Ahem"));
-        assert!(is_valid_font_shorthand_value("12px/1.2 \"White Space\", serif"));
+        assert!(is_valid_font_shorthand_value(
+            "italic small-caps bold 12px/1.2 Ahem"
+        ));
+        assert!(is_valid_font_shorthand_value(
+            "12px/1.2 \"White Space\", serif"
+        ));
     }
 
     /// The keywords stand in for the whole value, and `var()` is substituted
@@ -2900,15 +3569,30 @@ mod font_shorthand_tests {
             );
         }
         for value in [
-            "0", "0px", "10px", "1cm", "1in", "1pt", "1pc", "1em", "1rem", "1ex", "1%",
-            "larger", "xx-small", "var(--size)", "calc(10 * 10px)",
+            "0",
+            "0px",
+            "10px",
+            "1cm",
+            "1in",
+            "1pt",
+            "1pc",
+            "1em",
+            "1rem",
+            "1ex",
+            "1%",
+            "larger",
+            "xx-small",
+            "var(--size)",
+            "calc(10 * 10px)",
         ] {
             assert!(
                 !is_negative_font_size_value(value),
                 "{value} should not be negative"
             );
         }
-        for value in ["-0", "-0px", "-0cm", "-0mm", "-0in", "-0pt", "-0pc", "-0em", "-0ex", "-0%"] {
+        for value in [
+            "-0", "-0px", "-0cm", "-0mm", "-0in", "-0pt", "-0pc", "-0em", "-0ex", "-0%",
+        ] {
             assert!(
                 !is_negative_font_size_value(value),
                 "{value} is a zero length, not a negative one"
@@ -3054,6 +3738,10 @@ fn parse_outline_style(value: &str) -> w3cos_std::style::OutlineStyle {
         "dashed" => OutlineStyle::Dashed,
         "dotted" => OutlineStyle::Dotted,
         "double" => OutlineStyle::Double,
+        "groove" => OutlineStyle::Groove,
+        "ridge" => OutlineStyle::Ridge,
+        "inset" => OutlineStyle::Inset,
+        "outset" => OutlineStyle::Outset,
         _ => OutlineStyle::None,
     }
 }
@@ -3302,6 +3990,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multicol_declarations_reach_the_typed_layout_style() {
+        for (name, value) in [
+            ("column-width", "100px"),
+            ("column-count", "3"),
+            ("column-fill", "auto"),
+            ("columns", "3 100px"),
+        ] {
+            let mut declaration = CSSStyleDeclaration::new();
+            let initial = declaration.inner.clone();
+            declaration.set_property(name, value);
+            assert_ne!(declaration.inner, initial,
+                "{name}:{value} must affect layout style, not just CSSOM source text");
+        }
+    }
+
+    #[test]
+    fn multicol_values_shorthand_resets_and_invalid_declarations() {
+        let mut declaration = CSSStyleDeclaration::new();
+        assert_eq!(declaration.inner.column_width, Dimension::Auto);
+        assert_eq!(declaration.inner.column_count, None);
+        assert_eq!(declaration.inner.column_fill, ColumnFill::Balance);
+        declaration.set_property("columns", "3 2em");
+        assert_eq!(declaration.inner.column_width, Dimension::Em(2.0));
+        assert_eq!(declaration.inner.column_count, Some(3));
+        assert_eq!(declaration.get_property("columns"), "2em 3");
+        for (name, value) in [
+            ("column-width", "-1px"), ("column-width", "20%"), ("column-width", "3"),
+            ("column-width", "NaNpx"), ("column-count", "0"), ("column-count", "2.5"),
+            ("column-count", "-3"), ("column-fill", "stretch"),
+            ("columns", "3 4"), ("columns", "10px 20px"), ("columns", "auto 2 10px"),
+            ("columns", "inherit 10px"), ("columns", "unset auto"),
+        ] {
+            let before = declaration.inner.clone();
+            let source_len = declaration.inline_declarations.len();
+            declaration.set_property(name, value);
+            assert_eq!(declaration.inner, before, "{name}:{value}");
+            assert_eq!(declaration.inline_declarations.len(), source_len, "invalid CSSOM declaration");
+        }
+        declaration.set_property("columns", "auto 120px");
+        assert_eq!(declaration.inner.column_width, Dimension::Px(120.0));
+        assert_eq!(declaration.inner.column_count, None);
+        declaration.set_property("column-fill", "BALANCE-ALL");
+        assert_eq!(declaration.get_property("column-fill"), "balance-all");
+        declaration.set_property("columns", "2");
+        assert_eq!(declaration.inner.column_width, Dimension::Auto);
+        assert_eq!(declaration.inner.column_count, Some(2));
+        assert_eq!(declaration.inner.column_fill, ColumnFill::BalanceAll, "columns excludes fill");
+        declaration.set_property("columns", "initial");
+        declaration.set_property("column-fill", "unset");
+        assert_eq!(declaration.inner.column_width, Dimension::Auto);
+        assert_eq!(declaration.inner.column_count, None);
+        assert_eq!(declaration.inner.column_fill, ColumnFill::Balance);
+    }
+
+    #[test]
     fn font_weight_out_of_range_is_an_invalid_declaration() {
         // `font-matching-rule-009`: `font-weight: 9000` has to be dropped so
         // the element keeps the inherited 400 instead of selecting a heavier
@@ -3392,13 +4135,25 @@ mod tests {
 
         for (value, expected) in [
             ("top", w3cos_std::style::AlignSelf::FlexStart),
+            ("text-top", w3cos_std::style::AlignSelf::FlexStart),
             ("middle", w3cos_std::style::AlignSelf::Center),
             ("bottom", w3cos_std::style::AlignSelf::FlexEnd),
+            ("text-bottom", w3cos_std::style::AlignSelf::FlexEnd),
             ("baseline", w3cos_std::style::AlignSelf::Baseline),
         ] {
             declaration.set_property("vertical-align", value);
             assert_eq!(declaration.inner.align_self, expected);
             assert_eq!(declaration.get_property("vertical-align"), value);
+            assert_eq!(
+                declaration
+                    .inner
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
+                    .map(String::as_str),
+                matches!(value, "top" | "text-top" | "bottom" | "text-bottom")
+                    .then_some(value),
+            );
         }
     }
 
@@ -3475,14 +4230,32 @@ mod tests {
 
     #[test]
     fn invalid_border_subproperty_duplicates_do_not_enter_the_cascade() {
-        for property in ["border", "border-top", "border-right", "border-bottom", "border-left",
-            "borderTop", "borderRight", "borderBottom", "borderLeft"] {
-            for value in ["red solid 16px red", "red 16px solid red", "red solid thick red",
-                "red thick solid red", "2px 3px solid red", "2px solid dashed red",
-                "6px sold green"] {
+        for property in [
+            "border",
+            "border-top",
+            "border-right",
+            "border-bottom",
+            "border-left",
+            "borderTop",
+            "borderRight",
+            "borderBottom",
+            "borderLeft",
+        ] {
+            for value in [
+                "red solid 16px red",
+                "red 16px solid red",
+                "red solid thick red",
+                "red thick solid red",
+                "2px 3px solid red",
+                "2px solid dashed red",
+                "6px sold green",
+            ] {
                 let mut empty = CSSStyleDeclaration::new();
                 empty.set_property(property, value);
-                assert!(empty.inline_declarations.is_empty(), "fresh {property}: {value}");
+                assert!(
+                    empty.inline_declarations.is_empty(),
+                    "fresh {property}: {value}"
+                );
                 assert_eq!(empty.to_style(), CSSStyleDeclaration::new().to_style());
                 let mut declaration = CSSStyleDeclaration::new();
                 declaration.set_property(property, "2px solid cyan");
@@ -3491,23 +4264,51 @@ mod tests {
                 let declarations_before = declaration.inline_declarations.clone();
                 declaration.set_property(property, value);
                 assert_eq!(declaration.inner, before, "{property}: {value}");
-                assert_eq!(declaration.to_style(), computed_before, "computed {property}: {value}");
-                assert_eq!(declaration.inline_declarations, declarations_before,
-                    "invalid declaration must not hide a valid one: {property}: {value}");
+                assert_eq!(
+                    declaration.to_style(),
+                    computed_before,
+                    "computed {property}: {value}"
+                );
+                assert_eq!(
+                    declaration.inline_declarations, declarations_before,
+                    "invalid declaration must not hide a valid one: {property}: {value}"
+                );
             }
         }
     }
 
     #[test]
     fn border_shorthand_validation_retains_valid_and_deferred_sources() {
-        for property in ["border", "border-top", "border-right", "border-bottom", "border-left"] {
-            for value in ["2px solid cyan", "solid 1em", "2ex solid currentColor", "medium solid",
-                "none", "hidden", "inherit", "initial", "unset", "revert", "revert-layer",
-                "2px solid cyan !important", "var(--border)", "calc(1em + 2px) solid red"] {
+        for property in [
+            "border",
+            "border-top",
+            "border-right",
+            "border-bottom",
+            "border-left",
+        ] {
+            for value in [
+                "2px solid cyan",
+                "solid 1em",
+                "2ex solid currentColor",
+                "medium solid",
+                "none",
+                "hidden",
+                "inherit",
+                "initial",
+                "unset",
+                "revert",
+                "revert-layer",
+                "2px solid cyan !important",
+                "var(--border)",
+                "calc(1em + 2px) solid red",
+            ] {
                 let mut declaration = CSSStyleDeclaration::new();
                 declaration.set_property(property, value);
-                assert_eq!(declaration.inline_declarations,
-                    vec![(property.to_string(), value.to_string())], "{property}: {value}");
+                assert_eq!(
+                    declaration.inline_declarations,
+                    vec![(property.to_string(), value.to_string())],
+                    "{property}: {value}"
+                );
             }
         }
     }
@@ -3551,7 +4352,9 @@ mod tests {
     #[test]
     fn numeric_native_borders_survive_css_declaration_wrapping() {
         let mut declaration = CSSStyleDeclaration::from_style(Style {
-            border_width: 6.0, border_color: Color::rgb(255, 0, 0), ..Style::default()
+            border_width: 6.0,
+            border_color: Color::rgb(255, 0, 0),
+            ..Style::default()
         });
         assert_eq!(declaration.to_style().border_width, 6.0);
         assert_eq!(declaration.to_style().border_top_width, None);
@@ -3562,24 +4365,39 @@ mod tests {
 
     #[test]
     fn border_shorthand_omitted_color_resets_to_final_current_color() {
-        for property in ["border", "border-top", "border-right", "border-bottom", "border-left"] {
+        for property in [
+            "border",
+            "border-top",
+            "border-right",
+            "border-bottom",
+            "border-left",
+        ] {
             let mut declaration = CSSStyleDeclaration::new();
             declaration.set_property("color", "blue");
             declaration.set_property("border-color", "red");
             declaration.set_property(property, "solid 16px");
             declaration.set_property("color", "green");
             let style = declaration.to_style();
-            let colors = [style.border_top_color, style.border_right_color,
-                style.border_bottom_color, style.border_left_color]
-                .map(|color| color.unwrap_or(style.border_color));
+            let colors = [
+                style.border_top_color,
+                style.border_right_color,
+                style.border_bottom_color,
+                style.border_left_color,
+            ]
+            .map(|color| color.unwrap_or(style.border_color));
             let target_edge = match property {
-                "border-top" => Some(0), "border-right" => Some(1),
-                "border-bottom" => Some(2), "border-left" => Some(3), _ => None,
+                "border-top" => Some(0),
+                "border-right" => Some(1),
+                "border-bottom" => Some(2),
+                "border-left" => Some(3),
+                _ => None,
             };
             for (edge, color) in colors.into_iter().enumerate() {
                 let expected = if target_edge.is_none_or(|target| target == edge) {
                     Color::rgb(0, 128, 0)
-                } else { Color::rgb(255, 0, 0) };
+                } else {
+                    Color::rgb(255, 0, 0)
+                };
                 assert_eq!(color, expected, "{property}, edge={edge}");
             }
         }
@@ -3592,22 +4410,38 @@ mod tests {
         declaration.set_property("border-left-style", "solid");
         declaration.set_property("border-width", "5px");
         let style = declaration.to_style();
-        assert_eq!([style.border_top_width, style.border_right_width,
-            style.border_bottom_width, style.border_left_width],
-            [Some(0.0), Some(0.0), Some(0.0), Some(5.0)]);
+        assert_eq!(
+            [
+                style.border_top_width,
+                style.border_right_width,
+                style.border_bottom_width,
+                style.border_left_width
+            ],
+            [Some(0.0), Some(0.0), Some(0.0), Some(5.0)]
+        );
         assert_eq!(style.border_left_color, Some(Color::rgb(0, 0, 255)));
     }
 
     #[test]
     fn hidden_border_style_retains_distinct_conflict_identity() {
-        for property in ["border-style", "border-top-style", "border-right-style",
-            "border-bottom-style", "border-left-style", "border", "border-top"] {
+        for property in [
+            "border-style",
+            "border-top-style",
+            "border-right-style",
+            "border-bottom-style",
+            "border-left-style",
+            "border",
+            "border-top",
+        ] {
             let mut hidden = CSSStyleDeclaration::new();
             let mut none = CSSStyleDeclaration::new();
             hidden.set_property(property, "hidden");
             none.set_property(property, "none");
-            assert_ne!(hidden.to_style(), none.to_style(),
-                "{property}: hidden suppresses conflicting collapsed edges; none does not");
+            assert_ne!(
+                hidden.to_style(),
+                none.to_style(),
+                "{property}: hidden suppresses conflicting collapsed edges; none does not"
+            );
         }
     }
 
@@ -3619,8 +4453,10 @@ mod tests {
         declaration.set_property("border-left-style", "hidden");
         declaration.set_property("border-left-width", "12px");
         declaration.set_property("border-left-style", "not-a-style");
-        assert_eq!(declaration.to_style().border_styles,
-            [Some(Hidden), Some(Solid), Some(NoLine), Some(Hidden)]);
+        assert_eq!(
+            declaration.to_style().border_styles,
+            [Some(Hidden), Some(Solid), Some(NoLine), Some(Hidden)]
+        );
         assert_eq!(declaration.to_style().border_left_width, Some(0.0));
         declaration.set_property("border-left", "3px solid red");
         assert_eq!(declaration.to_style().border_styles[3], Some(Solid));
@@ -3637,16 +4473,29 @@ mod tests {
         ] {
             for width_first in [true, false] {
                 let mut declaration = CSSStyleDeclaration::new();
-                if !width_first { declaration.set_property("border-style", "solid"); }
+                if !width_first {
+                    declaration.set_property("border-style", "solid");
+                }
                 declaration.set_property("border-width", value);
                 for line_style in ["solid", "none", "solid", "hidden", "solid"] {
                     declaration.set_property("border-style", line_style);
                     let style = declaration.to_style();
-                    let widths = [style.border_top_width, style.border_right_width,
-                        style.border_bottom_width, style.border_left_width]
-                        .map(|width| width.unwrap_or(style.border_width));
-                    assert_eq!(widths, if line_style == "solid" { expected } else { [0.0; 4] },
-                        "width={value}, style={line_style}, width_first={width_first}");
+                    let widths = [
+                        style.border_top_width,
+                        style.border_right_width,
+                        style.border_bottom_width,
+                        style.border_left_width,
+                    ]
+                    .map(|width| width.unwrap_or(style.border_width));
+                    assert_eq!(
+                        widths,
+                        if line_style == "solid" {
+                            expected
+                        } else {
+                            [0.0; 4]
+                        },
+                        "width={value}, style={line_style}, width_first={width_first}"
+                    );
                 }
             }
         }
@@ -3656,9 +4505,15 @@ mod tests {
         declaration.set_property("border-right-width", "7px");
         declaration.set_property("border-style", "solid");
         let style = declaration.to_style();
-        assert_eq!([style.border_top_width, style.border_right_width,
-            style.border_bottom_width, style.border_left_width],
-            [Some(0.0), Some(7.0), Some(25.0), Some(50.0)]);
+        assert_eq!(
+            [
+                style.border_top_width,
+                style.border_right_width,
+                style.border_bottom_width,
+                style.border_left_width
+            ],
+            [Some(0.0), Some(7.0), Some(25.0), Some(50.0)]
+        );
     }
 
     #[test]
@@ -3906,11 +4761,38 @@ mod tests {
     }
 
     #[test]
+    fn word_spacing_ex_resolves_against_the_computed_font_size() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "16px");
+        declaration.set_property("word-spacing", "12ex");
+        assert_eq!(declaration.to_style().word_spacing, 96.0);
+        declaration.set_property("word-spacing", "+12ex");
+        assert_eq!(declaration.to_style().word_spacing, 96.0);
+    }
+
+    #[test]
+    fn character_relative_spacing_does_not_alias_ch_to_em() {
+        assert_ne!(parse_spacing("1ch"), Some(Spacing::Em(1.0)),
+            "ch must retain zero-glyph units until the final font is known");
+        assert_eq!(parse_spacing("1ch"), Some(Spacing::Ch(1.0)));
+        assert_eq!(parse_spacing("-2ch"), Some(Spacing::Ch(-2.0)));
+        assert_eq!(parse_padding_spacing("-2ch"), None);
+    }
+
+    #[test]
     fn letter_spacing_em_resolves_against_the_computed_font_size() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("font-size", "20px");
         declaration.set_property("letter-spacing", "6em");
         assert_eq!(declaration.to_style().letter_spacing, 120.0);
+    }
+
+    #[test]
+    fn letter_spacing_percentage_resolves_against_the_computed_font_size() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "30px");
+        declaration.set_property("letter-spacing", "200%");
+        assert_eq!(declaration.to_style().letter_spacing, 60.0);
     }
 
     #[test]
@@ -3940,14 +4822,14 @@ mod tests {
         declaration.set_property("font-size", "10px");
         declaration.set_property("width", "4ch");
         declaration.set_property("margin", "0 -1ch");
-        assert_eq!(declaration.inner.width, Dimension::Em(4.0));
+        assert_eq!(declaration.inner.width, Dimension::Ch(4.0));
         assert_eq!(
             declaration.inner.margin,
             Edges {
                 top: Spacing::Px(0.0),
-                right: Spacing::Em(-1.0),
+                right: Spacing::Ch(-1.0),
                 bottom: Spacing::Px(0.0),
-                left: Spacing::Em(-1.0),
+                left: Spacing::Ch(-1.0),
             }
         );
     }

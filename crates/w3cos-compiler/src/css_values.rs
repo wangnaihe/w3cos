@@ -153,7 +153,7 @@ pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
     }
     for (suffix, constructor) in [
         ("rem", Spacing::Rem as fn(f32) -> Spacing),
-        ("ch", Spacing::Em),
+        ("ch", Spacing::Ch),
         ("em", Spacing::Em),
         ("vw", Spacing::Vw),
         ("dvh", Spacing::Vh),
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn character_relative_spacing_keeps_its_sign_and_local_font_scale() {
-        assert_eq!(css_parse_spacing_value("4ch"), Some(Spacing::Em(4.0)));
-        assert_eq!(css_parse_spacing_value("-1ch"), Some(Spacing::Em(-1.0)));
+        assert_eq!(css_parse_spacing_value("4ch"), Some(Spacing::Ch(4.0)));
+        assert_eq!(css_parse_spacing_value("-1ch"), Some(Spacing::Ch(-1.0)));
     }
 }

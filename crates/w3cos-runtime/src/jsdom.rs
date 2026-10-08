@@ -215,6 +215,8 @@ thread_local! {
     /// (node, key) → JS expando properties assigned through the set trap
     /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
     static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
+    // Navigation-owned origin decision, never a writable JS document URL.
+    static OBJECT_DOCUMENT_READABLE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     /// Processing-instruction attributes are projected from `data`, but values
     /// containing quotes must remain readable after standards serialization.
     static PROCESSING_INSTRUCTION_ATTRIBUTES: RefCell<HashMap<u32, (String, Vec<(String, String)>)>> = RefCell::new(HashMap::new());
@@ -2874,6 +2876,14 @@ fn build_element_value(node: u32) -> Value {
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
             }
+            if dom::tag_name(node) == "object" {
+                if key == "contentDocument" {
+                    return object_content_document(node);
+                }
+                if key == "contentWindow" {
+                    return Value::Undefined;
+                }
+            }
             // 1. JS expandos / bridge-cached sub-objects (style, classList).
             if let Some(v) = get_expando(node, key) {
                 return v;
@@ -3951,6 +3961,28 @@ pub(crate) fn set_document_encoding(document: &Value, encoding: &str) {
 }
 
 pub(crate) fn install_frame_document(node: u32, document: Value, url: &str) {
+    if let Some(root) = node_id_of(&document.get_property("documentElement")) {
+        if let Some(parent) = dom::parent_node(root) {
+            dom::with_document_mut(|dom| {
+                dom.remove_child(NodeId::from_u32(parent), NodeId::from_u32(root));
+            });
+        }
+    }
+    if dom::tag_name(node) == "object" {
+        let parent = get_expando(node, "ownerDocument").unwrap_or_else(document_value);
+        let parent_url = url::Url::parse(&parent.get_property("URL").to_js_string()).ok();
+        let child_url = url::Url::parse(url).ok();
+        let readable = match (parent_url, child_url) {
+            (Some(parent), Some(child)) => {
+                matches!(parent.origin(), url::Origin::Tuple(..))
+                    && parent.origin() == child.origin()
+            }
+            _ => false,
+        };
+        OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().insert(node, readable));
+        dom::with_document_mut(|dom| dom.set_embedded_document_host(NodeId::from_u32(node), true));
+        dom::mark_dom_dirty();
+    }
     let parent_window = window_value();
     let parsed_url = url::Url::parse(url).ok();
     let location = Value::object(HashMap::from([
@@ -4054,6 +4086,37 @@ pub(crate) fn install_frame_document(node: u32, document: Value, url: &str) {
     set_expando(node, "contentWindow", frame_window);
 }
 
+pub(crate) fn clear_object_document(node: u32) {
+    if dom::tag_name(node) != "object" {
+        return;
+    }
+    set_expando(node, "contentDocument", Value::Null);
+    set_expando(node, "contentWindow", Value::Null);
+    OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().remove(&node));
+    dom::with_document_mut(|dom| dom.set_embedded_document_host(NodeId::from_u32(node), false));
+    dom::mark_dom_dirty();
+}
+
+/// Internal rendering/loading access must not depend on the parent's script
+/// access to the child's origin. Public HTMLObjectElement access is separate.
+pub(crate) fn installed_frame_document(node: u32) -> Value {
+    get_expando(node, "contentDocument").unwrap_or(Value::Null)
+}
+
+pub(crate) fn installed_frame_window(node: u32) -> Value {
+    get_expando(node, "contentWindow").unwrap_or(Value::Null)
+}
+
+fn object_content_document(node: u32) -> Value {
+    if OBJECT_DOCUMENT_READABLE
+        .with(|origins| origins.borrow().get(&node).copied().unwrap_or(false))
+    {
+        installed_frame_document(node)
+    } else {
+        Value::Null
+    }
+}
+
 fn ensure_frame_browsing_context(node: u32) {
     if get_expando(node, "contentDocument").is_some() || !node_is_connected(node) {
         return;
@@ -4080,15 +4143,22 @@ pub(crate) fn graft_frame_component_subtrees(component: &mut w3cos_std::Componen
         w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
         _ => None,
     };
-    if let Some(frame_node) = host_node.filter(|node| dom::tag_name(*node) == "iframe") {
-        let frame_body = get_expando(frame_node, "contentDocument")
-            .map(|document| document.get_property("body"))
-            .and_then(|body| node_id_of(&body));
-        if let Some(frame_body) = frame_body {
+    if let Some(frame_node) =
+        host_node.filter(|node| matches!(dom::tag_name(*node).as_str(), "iframe" | "object"))
+    {
+        let frame_root = get_expando(frame_node, "contentDocument")
+            .map(|document| document.get_property("documentElement"))
+            .and_then(|root| node_id_of(&root));
+        if let Some(frame_root) = frame_root {
             let frame = dom::with_document(|document| {
-                document.to_component_subtree(NodeId::from_u32(frame_body))
+                document.to_component_subtree(NodeId::from_u32(frame_root))
             });
-            component.children = vec![frame];
+            let mut viewport = w3cos_std::style::Style::default();
+            viewport.display = w3cos_std::style::Display::Block;
+            viewport.width = w3cos_std::style::Dimension::Percent(100.0);
+            viewport.height = w3cos_std::style::Dimension::Percent(100.0);
+            viewport.overflow = w3cos_std::style::Overflow::Hidden;
+            component.children = vec![w3cos_std::Component::boxed(viewport, vec![frame])];
         }
     }
     for child in &mut component.children {
@@ -5774,6 +5844,9 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     if value.trim().is_empty() {
         return false;
     }
+    if matches!(property.as_str(), "columns" | "column-width" | "column-count" | "column-fill") {
+        return w3cos_dom::css_style::valid_multicol_declaration(&property, value);
+    }
     matches!(
         property.as_str(),
         "align-content"
@@ -6586,6 +6659,10 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
             Some((u32::try_from(*id).ok()?, *rect))
         })
         .collect::<HashMap<_, _>>();
+    let layout_rects = layouts
+        .iter()
+        .map(|(rect, index)| (*index, *rect))
+        .collect::<HashMap<_, _>>();
 
     let mut hits = layouts
         .into_iter()
@@ -6600,6 +6677,25 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
                 return None;
             }
             let entry = flat.get(index)?;
+            let mut ancestor = entry.parent;
+            while let Some(parent) = ancestor {
+                let parent_entry = flat.get(parent)?;
+                if let Some(clip) = layout_rects.get(&parent) {
+                    if parent_entry.style.resolved_overflow_x()
+                        != w3cos_std::style::Overflow::Visible
+                        && (x < clip.x || x >= clip.x + clip.width)
+                    {
+                        return None;
+                    }
+                    if parent_entry.style.resolved_overflow_y()
+                        != w3cos_std::style::Overflow::Visible
+                        && (y < clip.y || y >= clip.y + clip.height)
+                    {
+                        return None;
+                    }
+                }
+                ancestor = parent_entry.parent;
+            }
             if matches!(
                 entry.style.pointer_events,
                 w3cos_std::style::PointerEvents::None
@@ -6651,8 +6747,7 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
                     });
                     if matches!(
                         child_style.position,
-                        w3cos_std::style::Position::Absolute
-                            | w3cos_std::style::Position::Fixed
+                        w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
                     ) || !matches!(
                         child_style.display,
                         w3cos_std::style::Display::Block
@@ -6674,9 +6769,8 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
                 })
         });
     let promoted_negative_fragment_hosts = hits.iter().filter_map(|node| {
-        let style = dom::with_document(|document| {
-            document.computed_style_for(NodeId::from_u32(*node))
-        });
+        let style =
+            dom::with_document(|document| document.computed_style_for(NodeId::from_u32(*node)));
         if style.position != w3cos_std::style::Position::Relative || style.z_index >= 0 {
             return None;
         }
@@ -7485,8 +7579,7 @@ fn block_in_inline_host(node: u32) -> bool {
                     let child_style = document.computed_style_for(NodeId::from_u32(child));
                     !matches!(
                         child_style.position,
-                        w3cos_std::style::Position::Absolute
-                            | w3cos_std::style::Position::Fixed
+                        w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
                     ) && matches!(
                         child_style.display,
                         w3cos_std::style::Display::Block
@@ -7723,6 +7816,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }
             get_expando(node, key).unwrap_or(Value::Null)
         }
+        "contentDocument" if dom::tag_name(node) == "object" => Value::Null,
         "buffered" | "played" | "seekable"
             if matches!(dom::tag_name(node).as_str(), "audio" | "video") =>
         {
@@ -9435,6 +9529,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
 
 fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
     match key {
+        "contentDocument" | "contentWindow" if dom::tag_name(node) == "object" => return true,
         "textContent" if matches!(dom::node_type(node), 1 | 11) => {
             replace_all_children(node, || {
                 if !value.is_null() && !value.is_undefined() {
@@ -11656,18 +11751,19 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
     let (viewport_width, viewport_height, _) = viewport();
     let parent_rect = forced_bounding_rect(parent);
     let percentage_basis = parent_rect.width;
-    let resolve = |spacing: Spacing, font_size: f32| match spacing {
+    let resolve = |spacing: Spacing, font_style: &w3cos_std::style::Style| match spacing {
         Spacing::Px(value) => value,
         Spacing::Percent(value) => percentage_basis * value / 100.0,
         Spacing::Rem(value) => value * 16.0,
-        Spacing::Em(value) => value * font_size,
+        Spacing::Em(value) => value * font_style.font_size,
+        Spacing::Ch(value) => value * font_style.ch_advance(),
         Spacing::Vw(value) => viewport_width as f32 * value / 100.0,
         Spacing::Vh(value) => viewport_height as f32 * value / 100.0,
         Spacing::Auto => 0.0,
         other => other.resolve(&w3cos_std::safe_area::current()),
     };
     if !matches!(spacing, Spacing::Auto) {
-        return Some(format!("{}px", resolve(spacing, style.font_size)));
+        return Some(format!("{}px", resolve(spacing, &style)));
     }
 
     let rect = forced_bounding_rect(node);
@@ -11677,15 +11773,15 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
     let border_right = parent_style
         .border_right_width
         .unwrap_or(parent_style.border_width);
-    let padding_left = resolve(parent_style.padding.left, parent_style.font_size);
-    let padding_right = resolve(parent_style.padding.right, parent_style.font_size);
+    let padding_left = resolve(parent_style.padding.left, &parent_style);
+    let padding_right = resolve(parent_style.padding.right, &parent_style);
     let content_left = parent_rect.x + border_left + padding_left;
     let content_right = parent_rect.x + parent_rect.width - border_right - padding_right;
     let content_width = content_right - content_left;
     let left_auto = matches!(style.margin.left, Spacing::Auto);
     let right_auto = matches!(style.margin.right, Spacing::Auto);
-    let fixed_left = resolve(style.margin.left, style.font_size);
-    let fixed_right = resolve(style.margin.right, style.font_size);
+    let fixed_left = resolve(style.margin.left, &style);
+    let fixed_right = resolve(style.margin.right, &style);
     let mut left_float_intrusion = 0.0;
     let mut right_float_intrusion = 0.0;
     let siblings = dom::children(parent);
@@ -11694,9 +11790,8 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
         if dom::node_type(sibling) != 1 {
             continue;
         }
-        let sibling_style = dom::with_document(|document| {
-            document.computed_style_for(NodeId::from_u32(sibling))
-        });
+        let sibling_style =
+            dom::with_document(|document| document.computed_style_for(NodeId::from_u32(sibling)));
         if sibling_style.float == Float::None {
             continue;
         }
@@ -11726,20 +11821,20 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
             if intervening_style.float == Float::None {
                 let intervening_rect = forced_bounding_rect(intervening);
                 flow_distance += intervening_rect.height
-                    + resolve(intervening_style.margin.top, intervening_style.font_size)
-                    + resolve(intervening_style.margin.bottom, intervening_style.font_size);
+                    + resolve(intervening_style.margin.top, &intervening_style)
+                    + resolve(intervening_style.margin.bottom, &intervening_style);
             }
         }
         if cleared
             || flow_distance
                 >= sibling_rect.height
-                    + resolve(sibling_style.margin.bottom, sibling_style.font_size)
+                    + resolve(sibling_style.margin.bottom, &sibling_style)
         {
             continue;
         }
         let intrusion = sibling_rect.width
-            + resolve(sibling_style.margin.left, sibling_style.font_size)
-            + resolve(sibling_style.margin.right, sibling_style.font_size);
+            + resolve(sibling_style.margin.left, &sibling_style)
+            + resolve(sibling_style.margin.right, &sibling_style);
         match sibling_style.float {
             Float::Left => left_float_intrusion += intrusion,
             Float::Right => right_float_intrusion += intrusion,
@@ -11749,16 +11844,14 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
     let remaining = content_width - rect.width - fixed_left - fixed_right;
     let used = match (property, left_auto, right_auto) {
         ("margin-left", true, true) => {
-            left_float_intrusion
-                + (remaining - left_float_intrusion - right_float_intrusion) / 2.0
+            left_float_intrusion + (remaining - left_float_intrusion - right_float_intrusion) / 2.0
         }
         ("margin-right", true, true) => {
-            right_float_intrusion
-                + (remaining - left_float_intrusion - right_float_intrusion) / 2.0
+            right_float_intrusion + (remaining - left_float_intrusion - right_float_intrusion) / 2.0
         }
         ("margin-left", true, false) => remaining - right_float_intrusion,
         ("margin-right", false, true) => remaining - left_float_intrusion,
-        _ => resolve(spacing, style.font_size),
+        _ => resolve(spacing, &style),
     };
     let used = if used.abs() < 0.000_1 { 0.0 } else { used };
     Some(format!("{used}px"))
@@ -16749,6 +16842,14 @@ pub fn set_viewport(width: f64, height: f64) {
     crate::observers_web::refresh_intersection_observers();
 }
 
+/// Document scroll in CSS pixels, consumed by the viewport paint transform.
+pub(crate) fn window_scroll_offset() -> (f32, f32) {
+    WINDOW_SCROLL.with(|offset| {
+        let (x, y) = offset.get();
+        (x as f32, y as f32)
+    })
+}
+
 /// Set the devicePixelRatio reported by the window. Default 1.0.
 pub fn set_device_pixel_ratio(dpr: f64) {
     VIEWPORT.with(|v| {
@@ -17178,6 +17279,32 @@ fn build_window_value() -> Value {
     props.insert("String".to_string(), string_compat_class());
     props.insert("Number".to_string(), number_compat_class());
     props.insert("Boolean".to_string(), boolean_compat_class());
+    // The global numeric predicates coerce their argument. They are not the
+    // stricter Number.isFinite/Number.isNaN static methods above.
+    props.insert(
+        "isFinite".to_string(),
+        Value::function(|_, args| {
+            Value::Bool(
+                args.first()
+                    .cloned()
+                    .unwrap_or(Value::Undefined)
+                    .to_number()
+                    .is_finite(),
+            )
+        }),
+    );
+    props.insert(
+        "isNaN".to_string(),
+        Value::function(|_, args| {
+            Value::Bool(
+                args.first()
+                    .cloned()
+                    .unwrap_or(Value::Undefined)
+                    .to_number()
+                    .is_nan(),
+            )
+        }),
+    );
     props.insert("Promise".to_string(), promise_constructor_value());
     props.insert("BarProp".to_string(), bar_prop_class());
     for name in [
@@ -18973,6 +19100,9 @@ fn build_window_value() -> Value {
                     y += current_y;
                 }
                 WINDOW_SCROLL.with(|offset| offset.set((x, y)));
+                if (x, y) != (current_x, current_y) {
+                    dom::mark_dom_dirty();
+                }
                 if let Some(window) = WINDOW_VALUE.with(|value| value.borrow().clone()) {
                     let event = w3cos_core::class::construct(
                         &crate::web_events::event_class(),
@@ -19384,6 +19514,7 @@ pub fn reset_bridge() {
     w3cos_core::promise::advance_realm_generation();
     ELEMENT_VALUES.with(|c| c.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
+    OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().clear());
     PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| cache.borrow_mut().clear());
     ATTRIBUTE_VALUES.with(|cache| cache.borrow_mut().clear());
     SELECTOR_ID_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -19527,6 +19658,39 @@ pub fn reset_bridge() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_object_content_document_requires_same_origin_and_is_read_only() {
+        dom::reset_document();
+        reset_bridge();
+        let parent = document_value();
+        parent.set_property("URL", Value::string("https://example.test/index.html"));
+        let object = dom::create_element("object");
+        dom::append_child(dom::body_id(), object);
+        let host = element_value(object);
+        for (url, readable) in [
+            ("https://example.test/frame.html", true),
+            ("http://example.test/frame.html", false),
+            ("https://other.test/frame.html", false),
+            ("data:text/html,<p>child</p>", false),
+        ] {
+            let document =
+                parse_frame_document("<html><body><p>child</p></body></html>", "text/html", url);
+            install_frame_document(object, document.clone(), url);
+            let exposed = host.get_property("contentDocument");
+            if readable {
+                assert!(exposed.strict_eq(&document));
+            } else {
+                assert!(exposed.is_null(), "must not expose {url}");
+            }
+            assert!(installed_frame_document(object).strict_eq(&document));
+            assert!(host.get_property("contentWindow").is_undefined());
+            host.set_property("contentDocument", Value::string("forged"));
+            assert!(installed_frame_document(object).strict_eq(&document));
+            document.set_property("URL", Value::string("https://example.test/forged.html"));
+            assert_eq!(host.get_property("contentDocument").is_null(), !readable);
+        }
+    }
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -19546,6 +19710,39 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    #[test]
+    fn global_is_finite_coerces_numeric_strings_for_testharness() {
+        setup();
+        let window = window_value();
+        let is_finite = window.get_property("isFinite");
+        assert_eq!(
+            is_finite.call(Value::Undefined, vec![Value::string("44")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            is_finite.call(Value::Undefined, vec![Value::string("not a number")]),
+            Value::Bool(false)
+        );
+        assert_eq!(is_finite.call(Value::Undefined, vec![]), Value::Bool(false));
+        assert_eq!(
+            window
+                .get_property("Number")
+                .get_property("isFinite")
+                .call(Value::Undefined, vec![Value::string("44")]),
+            Value::Bool(false),
+            "Number.isFinite must retain its non-coercing semantics"
+        );
+        let is_nan = window.get_property("isNaN");
+        assert_eq!(
+            is_nan.call(Value::Undefined, vec![Value::string("44")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            is_nan.call(Value::Undefined, vec![Value::string("not a number")]),
+            Value::Bool(true)
+        );
     }
 
     #[test]
@@ -22432,6 +22629,37 @@ mod tests {
     }
 
     #[test]
+    fn move_before_contents_exposes_a_blockified_flex_item_to_layout() {
+        setup();
+        let document = document_value();
+        let source = create_in_body("div");
+        let target = create_in_body("div");
+        let moved = document.call_method("createElement", vec![Value::string("div")]);
+        let item = document.call_method("createElement", vec![Value::string("div")]);
+        for (node, css) in [
+            (&target, "width:100px;display:flex"),
+            (&moved, "display:contents"),
+            (&item, "display:inline;background:green;height:100px;flex-grow:1"),
+        ] {
+            node.call_method("setAttribute", vec![Value::string("style"), Value::string(css)]);
+        }
+        moved.call_method("appendChild", vec![item.clone()]);
+        source.call_method("appendChild", vec![moved.clone()]);
+        let _before = dom::to_component_tree();
+        target.call_method("moveBefore", vec![moved.clone(), Value::Null]);
+        assert!(moved.get_property("parentNode") == target);
+        assert!(item.get_property("parentNode") == moved);
+        let tree = dom::to_component_tree();
+        let flat = crate::layout::pre_flatten(&tree);
+        let index = flat.iter().position(|node|
+            node.style.background == w3cos_std::Color::rgb(0, 128, 0)).unwrap();
+        assert_eq!(flat[index].style.display, w3cos_std::style::Display::Block);
+        let layouts = crate::layout::compute(&tree, 800.0, 600.0).unwrap();
+        let rect = layouts.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!((rect.width, rect.height), (100.0, 100.0), "{layouts:?}");
+    }
+
+    #[test]
     fn parent_move_before_reparents_and_frame_body_projects_for_rendering() {
         setup();
         let document = document_value();
@@ -23204,6 +23432,41 @@ try {
     }
 
     #[test]
+    fn document_hit_testing_excludes_float_clipped_by_overflow_ancestor() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let target = create_in_body("div");
+        target
+            .get_property("style")
+            .set_property("height", Value::string("200px"));
+        let clipping = document.call_method("createElement", vec![Value::string("div")]);
+        target.call_method("appendChild", vec![clipping.clone()]);
+        let clipping_style = clipping.get_property("style");
+        clipping_style.set_property("overflow", Value::string("hidden"));
+        clipping_style.set_property("width", Value::string("100px"));
+        clipping_style.set_property("height", Value::string("100px"));
+        let floating = document.call_method("createElement", vec![Value::string("div")]);
+        clipping.call_method("appendChild", vec![floating.clone()]);
+        let float_style = floating.get_property("style");
+        float_style.set_property("cssFloat", Value::string("left"));
+        float_style.set_property("width", Value::string("100px"));
+        float_style.set_property("height", Value::string("200px"));
+        let bounds = target.call_method("getBoundingClientRect", Vec::new());
+        let hit = document.call_method(
+            "elementFromPoint",
+            vec![
+                Value::Number(bounds.get_property("x").to_number() + 50.0),
+                Value::Number(bounds.get_property("y").to_number() + 150.0),
+            ],
+        );
+        assert!(
+            hit.strict_eq(&target),
+            "clipped descendant must not receive the hit"
+        );
+    }
+
+    #[test]
     fn offset_coordinates_are_relative_to_the_positioned_offset_parent() {
         setup();
         set_viewport(320.0, 240.0);
@@ -23258,8 +23521,10 @@ try {
         let image_rect = image.call_method("getBoundingClientRect", vec![]);
         assert_eq!(outer_rect.get_property("height").to_number(), 102.0);
         assert_eq!(image_rect.get_property("height").to_number(), 15.0);
-        assert_eq!(image_rect.get_property("top").to_number()
-            - outer_rect.get_property("top").to_number(), 84.0);
+        assert_eq!(
+            image_rect.get_property("top").to_number() - outer_rect.get_property("top").to_number(),
+            84.0
+        );
     }
 
     #[test]
@@ -23375,7 +23640,7 @@ try {
     }
 
     #[test]
-    fn block_static_position_follows_a_decorated_dom_inline_fragment() {
+    fn block_static_position_ignores_empty_dom_decoration_but_keeps_text() {
         setup();
         set_viewport(800.0, 600.0);
         let document = document_value();
@@ -23411,7 +23676,18 @@ try {
             .call_method("getBoundingClientRect", Vec::new())
             .get_property("top")
             .to_number();
-        assert_eq!(target_top - wrapper_top, 100.0);
+        // Browser-priority acceptance: empty decoration is not a preceding
+        // line. The pinned WPT's opposite strict expectation remains in its
+        // independent pixel receipt, not in this browser geometry assertion.
+        assert_eq!(target_top - wrapper_top, 0.0);
+        let preceding = document.call_method("createTextNode", vec![Value::string("Y")]);
+        inline.call_method("insertBefore", vec![preceding, target.clone()]);
+        let with_text_top = target
+            .call_method("getBoundingClientRect", Vec::new())
+            .get_property("top")
+            .to_number();
+        assert_eq!(with_text_top - wrapper_top, 100.0,
+            "inserting real preceding text must restore the used line height");
     }
 
     #[test]
@@ -26313,6 +26589,31 @@ try {
             style.call_method("getPropertyValue", vec![Value::string("color")]),
             Value::string("rgb(3, 102, 255)")
         );
+    }
+
+    #[test]
+    fn multicol_cssom_and_supports_use_same_property_grammar() {
+        setup();
+        for (property, value) in [("columns", "3 100px"), ("column-width", "2em"),
+            ("column-count", "auto"), ("column-fill", "balance-all")] {
+            assert!(css_property_supported(property, value), "{property}:{value}");
+        }
+        for (property, value) in [("columns", "3 4"), ("column-width", "20%"),
+            ("column-count", "0"), ("column-fill", "stretch")] {
+            assert!(!css_property_supported(property, value), "{property}:{value}");
+        }
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("div")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+        parent.get_property("style").set_property("columns", Value::string("3 100px"));
+        let style = child.get_property("style");
+        style.set_property("columns", Value::string("inherit"));
+        style.set_property("columnWidth", Value::string("120px"));
+        style.set_property("columnWidth", Value::string("20%"));
+        let computed = window_value().call_method("getComputedStyle", vec![child]);
+        assert_eq!(computed.get_property("columnWidth"), Value::string("120px"));
+        assert_eq!(computed.get_property("columnCount"), Value::string("3"));
+        assert_eq!(computed.get_property("columnFill"), Value::string("balance"));
     }
 
     #[test]

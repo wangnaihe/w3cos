@@ -5,12 +5,23 @@ use w3cos_dom::node::NodeId;
 use w3cos_std::EventAction;
 
 thread_local! {
-    static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
+    static DOCUMENT: RefCell<Document> = RefCell::new(new_host_document());
     static DOM_DIRTY: RefCell<bool> = RefCell::new(false);
     static DOM_MUTATION_GENERATION: Cell<u64> = const { Cell::new(0) };
     static SCROLL_REQUESTS: RefCell<Vec<(u32, Option<f32>, Option<f32>)>> = const {
         RefCell::new(Vec::new())
     };
+}
+
+fn new_host_document() -> Document {
+    // Embedders may select browser-equivalent readability preferences without
+    // changing CSS keyword tables or baking a locale into the generic DOM.
+    let preference = |name| std::env::var(name).ok()
+        .and_then(|value| value.parse::<f32>().ok()).unwrap_or(0.0);
+    let mut document = Document::new();
+    document.set_font_size_minimums(preference("W3COS_MINIMUM_FONT_SIZE"),
+        preference("W3COS_MINIMUM_LOGICAL_FONT_SIZE"));
+    document
 }
 
 pub fn with_document<R>(f: impl FnOnce(&Document) -> R) -> R {
@@ -48,7 +59,7 @@ pub fn clear_document_dirty() {
 }
 
 pub fn reset_document() {
-    DOCUMENT.with(|d| *d.borrow_mut() = Document::new());
+    DOCUMENT.with(|d| *d.borrow_mut() = new_host_document());
     DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
@@ -186,6 +197,7 @@ pub fn set_attribute(node: u32, name: &str, value: &str) {
         if matches!(
             name.to_ascii_lowercase().as_str(),
             "src"
+                | "data"
                 | "href"
                 | "rel"
                 | "type"
@@ -701,18 +713,43 @@ pub fn bounding_rect(node: u32) -> w3cos_dom::DOMRect {
 
 /// Build Component tree from the current DOM state (for rendering).
 pub fn to_component_tree() -> w3cos_std::Component {
+    crate::layout::install_font_unit_provider();
     fn normal_line_height(style: &w3cos_std::style::Style) -> Option<f32> {
+        #[cfg(feature = "skia")]
+        if let Some(metrics) = crate::render_skia::resolved_font_geometry(style) {
+            return Some(metrics.line_spacing() / style.font_size);
+        }
         crate::font_face::FontRegistry::global().normal_line_height(style)
     }
     with_document_mut(|doc| {
         doc.set_normal_line_height_provider(
-            normal_line_height, crate::font_face::FontRegistry::global().revision(),
+            normal_line_height,
+            crate::font_face::FontRegistry::global().revision(),
         );
     });
     let mut tree = with_document(|doc| doc.to_component_tree());
     #[cfg(feature = "dynamic-js")]
     crate::jsdom::graft_shadow_component_subtrees(&mut tree);
     crate::jsdom::graft_frame_component_subtrees(&mut tree);
+    fn resolve_text_leading(component: &mut w3cos_std::Component) {
+        if let w3cos_std::ComponentKind::Text { content } = &component.kind
+            && component.style.line_height_is_normal
+        {
+            let registry = crate::font_face::FontRegistry::global();
+            if let Some(primary) = registry.resolve_style(&component.style)
+                && content
+                    .chars()
+                    .any(|ch| !ch.is_whitespace() && !primary.supports_character(ch))
+            {
+                component.style.line_height =
+                    registry.normal_line_height_for_text(&component.style, content);
+            }
+        }
+        for child in &mut component.children {
+            resolve_text_leading(child);
+        }
+    }
+    resolve_text_leading(&mut tree);
     tree
 }
 

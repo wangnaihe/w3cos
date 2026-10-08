@@ -298,6 +298,7 @@ pub fn build_reftest_report(
     expected: &HeadlessFrame,
     artifacts: &Path,
     failure_artifacts_only: bool,
+    no_reftest_artifacts: bool,
 ) -> Result<TestReport> {
     let reference = test
         .reference
@@ -311,7 +312,7 @@ pub fn build_reftest_report(
         ReferenceRelation::Match => diff.within_fuzzy,
         ReferenceRelation::Mismatch => !diff.within_fuzzy,
     };
-    if !failure_artifacts_only || !passed {
+    if !no_reftest_artifacts && (!failure_artifacts_only || !passed) {
         write_reftest_artifacts(test, actual, expected, &diff_rgba, artifacts)?;
     }
     Ok(TestReport {
@@ -357,7 +358,13 @@ fn write_reftest_artifacts(
     Ok(())
 }
 
-fn load_and_render(url: &str, timeout: Duration, width: u32, height: u32, user_stylesheet: Option<&str>) -> Result<HeadlessFrame> {
+fn load_and_render(
+    url: &str,
+    timeout: Duration,
+    width: u32,
+    height: u32,
+    user_stylesheet: Option<&str>,
+) -> Result<HeadlessFrame> {
     // Keep the navigation loader alive until the frame has been captured. Its
     // owned stylesheet/font/resource state is intentionally released on Drop.
     let _document = load_document(url, timeout, width, height, user_stylesheet)?;
@@ -377,7 +384,9 @@ fn wait_for_document_fonts(timeout: Duration) -> Result<()> {
         w3cos_runtime::jsdom::drain_microtasks();
         match status(&ready) {
             Some(PromiseStatus::Fulfilled(_)) => return Ok(()),
-            Some(PromiseStatus::Rejected(_)) => bail!("document.fonts.ready rejected before capture"),
+            Some(PromiseStatus::Rejected(_)) => {
+                bail!("document.fonts.ready rejected before capture")
+            }
             Some(PromiseStatus::Pending) => {}
             None => bail!("document.fonts.ready did not return a promise"),
         }
@@ -420,7 +429,13 @@ fn wait_for_reftest_ready(timeout: Duration) -> Result<()> {
     }
 }
 
-fn load_document(url: &str, timeout: Duration, width: u32, height: u32, user_stylesheet: Option<&str>) -> Result<DocumentLoader> {
+fn load_document(
+    url: &str,
+    timeout: Duration,
+    width: u32,
+    height: u32,
+    user_stylesheet: Option<&str>,
+) -> Result<DocumentLoader> {
     let mut script_policy = ScriptPolicy::default();
     // The runner's explicit per-case timeout is the authoritative budget.
     // Keeping the production VM's five-second / one-million-instruction
@@ -451,15 +466,23 @@ fn load_document(url: &str, timeout: Duration, width: u32, height: u32, user_sty
     // Navigation resets the document; install before polling can parse markup
     // or execute scripts. Keep the profile out of author CSSOM/stylesheet owners.
     if let Some(source) = user_stylesheet {
-        let parsed = w3cos_compiler::esm_css::parse_css_source(source, "WPT user stylesheet profile");
-        if !parsed.imports.is_empty() || !parsed.font_faces.is_empty() || !parsed.warnings.is_empty() {
-            bail!("WPT user stylesheet profiles require self-contained rules without parser warnings");
+        let parsed =
+            w3cos_compiler::esm_css::parse_css_source(source, "WPT user stylesheet profile");
+        if !parsed.imports.is_empty()
+            || !parsed.font_faces.is_empty()
+            || !parsed.warnings.is_empty()
+        {
+            bail!(
+                "WPT user stylesheet profiles require self-contained rules without parser warnings"
+            );
         }
         for rule in parsed.rules {
             if rule.media.is_some() {
                 bail!("WPT user stylesheet profiles currently require unconditional rules");
             }
-            let declarations = rule.declarations.iter()
+            let declarations = rule
+                .declarations
+                .iter()
                 .map(|(property, value)| (property.as_str(), value.as_str()))
                 .collect::<Vec<_>>();
             w3cos_dom::stylesheet::register_user_rule(&rule.selector, &declarations);
@@ -602,6 +625,7 @@ pub fn read_frame(path: &Path) -> Result<HeadlessFrame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::FuzzyAllowance;
 
     #[test]
     fn status_names_fail_closed_for_unknown_values() {
@@ -636,6 +660,35 @@ mod tests {
 
         std::fs::write(&path, [0_u8; 7]).unwrap();
         assert!(read_frame(&path).is_err());
+    }
+
+    #[test]
+    fn failed_reftest_can_keep_metrics_without_png_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let test = TestCase {
+            path: "css/failing.html".into(),
+            kind: TestKind::Reftest,
+            expected_subtests_min: None,
+            reference: Some("css/reference.html".into()),
+            relation: Some(ReferenceRelation::Match),
+            fuzzy: FuzzyAllowance::default(),
+        };
+        let actual = HeadlessFrame {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+        };
+        let expected = HeadlessFrame {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        };
+
+        let report =
+            build_reftest_report(&test, &actual, &expected, directory.path(), false, true).unwrap();
+        assert_eq!(report.status, CaseStatus::Fail);
+        assert_eq!(report.pixel_diff.unwrap().different_pixels, 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]

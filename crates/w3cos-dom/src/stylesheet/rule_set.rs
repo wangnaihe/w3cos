@@ -5,6 +5,7 @@ use super::{AttributeSelector, CompoundSelector, Document, NodeId, Rule, Selecto
 #[derive(Debug, Default)]
 pub(super) struct RuleSet {
     pub(super) rules: Vec<Rule>,
+    pub(super) document_roots: HashMap<NodeId, u64>,
     id_rules: HashMap<String, Vec<usize>>,
     class_rules: HashMap<String, Vec<usize>>,
     attribute_rules: HashMap<String, Vec<usize>>,
@@ -37,6 +38,24 @@ impl AttributeSelector {
 }
 
 impl RuleSet {
+    pub(super) fn document_scope_for_node(
+        &self,
+        document: &Document,
+        node: NodeId,
+    ) -> Option<NodeId> {
+        if self.document_roots.is_empty() {
+            return None;
+        }
+        let mut current = Some(node);
+        while let Some(node) = current {
+            if self.document_roots.contains_key(&node) {
+                return Some(node);
+            }
+            current = document.get_node(node).parent;
+        }
+        None
+    }
+
     pub(super) fn push(&mut self, rule: Rule) {
         let index = self.rules.len();
         self.rules.push(rule);

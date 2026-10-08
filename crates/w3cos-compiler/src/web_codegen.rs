@@ -323,6 +323,18 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     px!(s.gap, "gap");
     px!(s.row_gap, "row-gap");
     px!(s.column_gap, "column-gap");
+    if let Some(width) = s.column_width {
+        parts.push(format!("column-width:{}", w3cos_dom::css_style::dimension_to_css(&width)));
+    }
+    if let Some(count) = s.column_count {
+        let count = count.as_option();
+        parts.push(format!("column-count:{}", count.map_or_else(|| "auto".into(), |n| n.to_string())));
+    }
+    if let Some(fill) = s.column_fill {
+        let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
+        declaration.inner.column_fill = fill;
+        parts.push(format!("column-fill:{}", declaration.get_property("column-fill")));
+    }
     if let Some(x) = s.border_spacing_x {
         let y = s.border_spacing_y.unwrap_or(x);
         parts.push(format!("border-spacing:{x}px {y}px"));
@@ -528,6 +540,7 @@ fn spacing_css(s: Spacing) -> String {
         Spacing::Percent(v) => format!("{v}%"),
         Spacing::Rem(v) => format!("{v}rem"),
         Spacing::Em(v) => format!("{v}em"),
+        Spacing::Ch(v) => format!("{v}ch"),
         Spacing::Vw(v) => format!("{v}vw"),
         Spacing::Vh(v) => format!("{v}vh"),
         Spacing::Auto => "auto".to_string(),
@@ -667,6 +680,26 @@ fn css_flex_justify(v: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multicol_web_css_preserves_typed_values_and_auto_reset() {
+        let style = crate::parser::StyleDecl {
+            column_width: Some(w3cos_std::style::Dimension::Em(2.0)),
+            column_count: Some(crate::parser::ColumnCount::Auto),
+            column_fill: Some(w3cos_std::style::ColumnFill::BalanceAll),
+            ..crate::parser::StyleDecl::default()
+        };
+        let css = super::style_decl_to_css(&style, &[]);
+        assert!(css.contains("column-width:2em"), "{css}");
+        assert!(css.contains("column-count:auto"), "{css}");
+        assert!(css.contains("column-fill:balance-all"), "{css}");
+        let initial = w3cos_std::Style::default();
+        let mut old = serde_json::to_value(&initial).unwrap();
+        for name in ["column_width", "column_count", "column_fill"] {
+            old.as_object_mut().unwrap().remove(name);
+        }
+        let restored: w3cos_std::Style = serde_json::from_value(old).unwrap();
+        assert_eq!(restored, initial, "older serialized styles retain initial multicol values");
+    }
     use super::*;
     use crate::css_parser::Stylesheet;
     use crate::parser::parse;

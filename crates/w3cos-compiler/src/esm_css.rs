@@ -698,16 +698,19 @@ fn parse_import_prelude(prelude: &str) -> Option<StylesheetImport> {
         let end = quoted.find('\'')?;
         (quoted[..end].to_string(), &quoted[end + 1..])
     } else {
-        let after_url = prelude
+        prelude
             .get(..4)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("url("))
-            .map(|_| &prelude[4..])?;
-        let end = after_url.find(')')?;
-        let href = after_url[..end]
+            .filter(|prefix| prefix.eq_ignore_ascii_case("url("))?;
+        let end = css_url_token_end(prelude.as_bytes(), 4);
+        if end <= 4 || prelude.as_bytes().get(end - 1) != Some(&b')') {
+            return None;
+        }
+        let href = prelude[4..end - 1]
             .trim()
             .trim_matches(|character| character == '"' || character == '\'')
             .to_string();
-        (href, &after_url[end + 1..])
+        let href = w3cos_dom::stylesheet::css_unescape(&href)?;
+        (href, &prelude[end..])
     };
     if href.is_empty() {
         return None;
@@ -799,18 +802,11 @@ fn extract_brace_content(s: &str) -> (&str, usize, bool) {
     let bytes = s.as_bytes();
     let mut delimiters = vec![b'}'];
     let mut quote = None;
-    let mut escaped = false;
     let mut pos = 0;
     while pos < bytes.len() {
         let byte = bytes[pos];
-        if escaped {
-            escaped = false;
-            pos += 1;
-            continue;
-        }
         if byte == b'\\' {
-            escaped = true;
-            pos += 1;
+            pos = css_escape_end(bytes, pos);
             continue;
         }
         if let Some(active_quote) = quote {
@@ -844,6 +840,27 @@ fn extract_brace_content(s: &str) -> (&str, usize, bool) {
         pos += 1;
     }
     (s, s.len(), false)
+}
+
+fn css_escape_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start + 1;
+    if end >= bytes.len() {
+        return end;
+    }
+    if bytes[end].is_ascii_hexdigit() {
+        let limit = (end + 6).min(bytes.len());
+        while end < limit && bytes[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        if end < bytes.len() && matches!(bytes[end], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+            let crlf = bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n');
+            end += if crlf { 2 } else { 1 };
+        }
+    } else {
+        let crlf = bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n');
+        end += if crlf { 2 } else { 1 };
+    }
+    end
 }
 
 /// Strip `/* ... */` comments. (`//` is NOT a CSS comment — stripping it
@@ -962,6 +979,18 @@ fn parse_declarations_raw(block: &str) -> Vec<(String, String)> {
     for segment in segments {
         let segment = segment.trim();
         if segment.is_empty() {
+            continue;
+        }
+        // CSS2 treats an in-declaration @media block and the text up to the
+        // next top-level semicolon as one malformed declaration.
+        if segment
+            .get(..6)
+            .is_some_and(|name| name.eq_ignore_ascii_case("@media"))
+            && segment[6..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch.is_ascii_whitespace() || ch == '{')
+        {
             continue;
         }
         let mut delimiters = Vec::new();
@@ -1129,9 +1158,12 @@ fn contains_escaped_css_whitespace(value: &str) -> bool {
 }
 
 fn declaration_priority_is_valid(value: &str) -> bool {
-    value
-        .rfind('!')
-        .is_none_or(|marker| value[marker + 1..].trim().eq_ignore_ascii_case("important"))
+    let parts = split_top_level(value, b'!');
+    match parts.as_slice() {
+        [_] => true,
+        [_, priority] => priority.trim().eq_ignore_ascii_case("important"),
+        _ => false,
+    }
 }
 
 fn close_css_value_at_eof(value: &str) -> String {
@@ -1247,22 +1279,18 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
     let mut parts = Vec::new();
     let mut delimiters = Vec::new();
     let mut quote = None;
-    let mut escaped = false;
     let mut bad_string = false;
     let bytes = s.as_bytes();
     let mut start = 0usize;
     let mut pos = 0usize;
     while pos < bytes.len() {
         let ch = bytes[pos] as char;
-        if escaped {
-            escaped = false;
-            pos += 1;
+        if ch == '\\' {
+            pos = css_escape_end(bytes, pos);
             continue;
         }
         if let Some(active_quote) = quote {
-            if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
+            if ch == active_quote {
                 quote = None;
             } else if matches!(ch, '\n' | '\r' | '\u{000c}') {
                 quote = None;
@@ -1277,7 +1305,6 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
         }
         match ch {
             '\'' | '"' => quote = Some(ch),
-            '\\' => escaped = true,
             '(' => delimiters.push(')'),
             '[' => delimiters.push(']'),
             '{' => delimiters.push('}'),
@@ -1612,6 +1639,28 @@ mod tests {
     }
 
     #[test]
+    fn priority_markers_inside_css_values_are_not_declaration_priorities() {
+        for value in [
+            r#""FAIL!" "!!!" "" " work""#,
+            r#""!important""#,
+            "url(support/image!green.png)",
+            "func(!nested)",
+            r#""FAIL!" "!!!" ! important"#,
+        ] {
+            let sheet = parse_css_source(&format!("p {{ quotes: {value}; }}"), "priority.css");
+            assert_eq!(sheet.rules.len(), 1, "value was discarded: {value}");
+            assert_eq!(
+                sheet.rules[0].declarations,
+                [("quotes".into(), value.into())]
+            );
+        }
+        for value in ["red ! fail !important", "red !important !important"] {
+            let sheet = parse_css_source(&format!("p {{ color: {value}; }}"), "priority.css");
+            assert!(sheet.rules.is_empty(), "invalid priority accepted: {value}");
+        }
+    }
+
+    #[test]
     fn invalid_priority_tokens_discard_the_declaration() {
         let sheet = parse_css_source(
             "p { color: red ! fail; background: red ! important fail; width: 1px ! IMPORTANT; }",
@@ -1658,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_at_rule_declaration_recovers_after_a_balanced_block() {
+    fn malformed_media_at_rule_does_not_recover_a_trailing_declaration() {
         let sheet = parse_css_source(
             "#c { color: green; @media { #c { color: red !important } } color: red; }
              #d { color: red; @media { #d { color: red !important } }; color: green; }
@@ -1668,10 +1717,7 @@ mod tests {
         assert_eq!(sheet.rules.len(), 3);
         assert_eq!(
             sheet.rules[0].declarations,
-            vec![
-                ("color".into(), "green".into()),
-                ("color".into(), "red".into()),
-            ]
+            vec![("color".into(), "green".into())]
         );
         assert_eq!(
             sheet.rules[1].declarations.last(),
@@ -1688,10 +1734,11 @@ mod tests {
     fn unknown_at_rule_block_preserves_a_following_declaration_without_semicolon() {
         let sheet = parse_css_source(
             "#p3 { @foo { color: red } color: green }
-             #p6 { color: orange; 12 @page { color: red } color: green }",
+             #p6 { color: orange; 12 @page { color: red } color: green }
+             #p7 { @mediax { color: red } color: green }",
             "malformed-block-recovery.css",
         );
-        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules.len(), 3);
         for rule in &sheet.rules {
             assert_eq!(
                 rule.declarations.last(),
@@ -1755,6 +1802,31 @@ mod tests {
                 ("color".to_string(), "red".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn escaped_newline_inside_generated_content_string_survives_parsing() {
+        let sheet = parse_css_source(
+            "div:before { content: \"Filler\\\n                                   Text\\00000a\n                                                Filler Text\"; }",
+            "escaped-newline.css",
+        );
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector, "div:before");
+        assert_eq!(sheet.rules[0].declarations.len(), 1);
+        assert_eq!(sheet.rules[0].declarations[0].0, "content");
+    }
+
+    #[test]
+    fn hex_escape_consumes_optional_crlf_but_plain_newline_invalidates_string() {
+        let valid = parse_css_source(
+            "div::before { content: \"A\\00000a\r\n B\"; }",
+            "hex-crlf.css",
+        );
+        assert_eq!(valid.rules.len(), 1);
+        assert_eq!(valid.rules[0].declarations.len(), 1);
+
+        let invalid = parse_css_source("div::before { content: \"A\n B\"; }", "plain-newline.css");
+        assert!(invalid.rules.is_empty());
     }
 
     #[test]
@@ -2178,6 +2250,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn import_url_keeps_escaped_parentheses_inside_a_data_url() {
+        let sheet = parse_css_source(
+            r"@import url(data:text/css,@import%20url\(data:text/css,.test%2520%257B%2520background:%2520maroon;%2520color:%2520white;%2520%257D\);%0D%0A.test.test%20%7B%20background:%20green;%20color:%20white;%20%7D);",
+            "data-import.css",
+        );
+        assert_eq!(sheet.imports.len(), 1);
+        assert!(
+            sheet.imports[0]
+                .href
+                .starts_with("data:text/css,@import%20url(data:text/css,")
+        );
+        assert!(sheet.imports[0].href.ends_with("%20%7D"));
+        assert_eq!(sheet.imports[0].media, None);
     }
 
     #[test]

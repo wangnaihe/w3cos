@@ -21,6 +21,10 @@ pub struct DecodedImage {
     /// Missing and percentage root dimensions must not be replaced by usvg's
     /// fallback pixel size when resolving `background-size: auto`.
     pub(crate) svg_intrinsic_size: Option<SvgIntrinsicSize>,
+    /// SVG image documents resolve viewBox in their CSS-used viewport, not
+    /// by stretching the intrinsic fallback raster. Shared Arc avoids copying
+    /// source when the resource cache or paint layers clone this image.
+    pub(crate) svg_source: Option<Arc<str>>,
     pub data: Arc<Vec<u8>>,
 }
 
@@ -29,6 +33,14 @@ pub(crate) struct SvgIntrinsicSize {
     pub width: SvgIntrinsicLength,
     pub height: SvgIntrinsicLength,
     pub ratio: Option<f32>,
+    pub preserve_aspect_ratio_none: bool,
+}
+
+impl SvgIntrinsicSize {
+    pub(crate) fn uses_default_image_size(self) -> bool {
+        self.preserve_aspect_ratio_none
+            && !matches!((self.width, self.height), (SvgIntrinsicLength::Px(_), SvgIntrinsicLength::Px(_)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +51,10 @@ pub(crate) enum SvgIntrinsicLength {
 }
 
 impl DecodedImage {
+    pub(crate) fn svg_viewport(&self, width: f32, height: f32) -> Option<Self> {
+        crate::svg_renderer::get_or_render_image(self.svg_source.as_deref()?, width, height)
+    }
+
     /// Identity of the decoded pixel buffer. GPU/Skia texture caches key off
     /// this so a reused `Arc` keeps a stable Vello blob id / Skia image.
     pub(crate) fn pixels_id(&self) -> usize {
@@ -163,6 +179,7 @@ pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage
             intrinsic_width: width,
             intrinsic_height: height,
             svg_intrinsic_size: None,
+            svg_source: None,
             data: Arc::clone(&animation_frames[0].data),
         };
         ANIMATIONS.with(|animations| {
@@ -191,6 +208,7 @@ pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage
         intrinsic_width: rgba.width(),
         intrinsic_height: rgba.height(),
         svg_intrinsic_size: None,
+        svg_source: None,
         data: Arc::new(rgba.into_raw()),
     };
     install_decoded_bytes(src, decoded.clone(), fingerprint);
@@ -240,9 +258,10 @@ fn decode_svg(bytes: &[u8]) -> Result<DecodedImage, String> {
     Ok(DecodedImage {
         width,
         height,
-        intrinsic_width: width,
-        intrinsic_height: height,
+        intrinsic_width: if intrinsic_size.uses_default_image_size() { 300 } else { width },
+        intrinsic_height: if intrinsic_size.uses_default_image_size() { 150 } else { height },
         svg_intrinsic_size: Some(intrinsic_size),
+        svg_source: std::str::from_utf8(bytes).ok().map(Arc::from),
         data: Arc::new(rgba),
     })
 }
@@ -274,7 +293,7 @@ fn complete_svg_intrinsic_axis(bytes: &[u8], size: SvgIntrinsicSize) -> std::bor
     std::borrow::Cow::Owned(normalized.into_bytes())
 }
 
-fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
+pub(crate) fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
     let mut reader = quick_xml::Reader::from_reader(bytes);
     loop {
         match reader.read_event() {
@@ -285,6 +304,7 @@ fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
                 let mut width = SvgIntrinsicLength::Auto;
                 let mut height = SvgIntrinsicLength::Auto;
                 let mut ratio = None;
+                let mut preserve_aspect_ratio_none = false;
                 for attribute in element.attributes().flatten() {
                     let Ok(name) = std::str::from_utf8(attribute.key.as_ref()) else {
                         continue;
@@ -295,6 +315,10 @@ fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
                     match name {
                         "width" => width = parse_svg_intrinsic_length(&value),
                         "height" => height = parse_svg_intrinsic_length(&value),
+                        "preserveAspectRatio" => {
+                            preserve_aspect_ratio_none = value.split_ascii_whitespace()
+                                .find(|token| *token != "defer") == Some("none");
+                        }
                         "viewBox" => {
                             let values = value
                                 .split(|character: char| {
@@ -314,6 +338,7 @@ fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
                     width,
                     height,
                     ratio,
+                    preserve_aspect_ratio_none,
                 };
             }
             Ok(quick_xml::events::Event::Eof) | Err(_) => break,
@@ -324,6 +349,7 @@ fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
         width: SvgIntrinsicLength::Auto,
         height: SvgIntrinsicLength::Auto,
         ratio: None,
+        preserve_aspect_ratio_none: false,
     }
 }
 
@@ -388,6 +414,7 @@ fn current_animation_frame(src: &str) -> Option<DecodedImage> {
             intrinsic_width: animation.width,
             intrinsic_height: animation.height,
             svg_intrinsic_size: None,
+            svg_source: None,
             data: Arc::clone(&frame.data),
         })
     })

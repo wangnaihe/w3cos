@@ -28,6 +28,7 @@ struct RasterKey {
     revision: u64,
     width: u32,
     height: u32,
+    image_document: bool,
 }
 
 struct ParsedEntry {
@@ -149,7 +150,96 @@ thread_local! {
     static CACHE: RefCell<SvgCache> = RefCell::new(SvgCache::default());
 }
 
+/// The same CSS content viewport is used by paint and pointer hit testing.
+pub(crate) fn content_box(rect: crate::layout::LayoutRect, style: &w3cos_std::Style)
+    -> crate::layout::LayoutRect {
+    let padding = style.padding_lengths();
+    let left = padding.left + style.border_left_width.unwrap_or(style.border_width);
+    let right = padding.right + style.border_right_width.unwrap_or(style.border_width);
+    let top = padding.top + style.border_top_width.unwrap_or(style.border_width);
+    let bottom = padding.bottom + style.border_bottom_width.unwrap_or(style.border_width);
+    crate::layout::LayoutRect { x: rect.x + left, y: rect.y + top,
+        width: (rect.width - left - right).max(0.0),
+        height: (rect.height - top - bottom).max(0.0) }
+}
+
+/// Resolve inline SVG in the CSS-used viewport, retaining it in the parse
+/// cache identity. Intrinsic raster dimensions are not its CSS viewport.
+fn inline_viewport_source(source: &str, width: u32, height: u32) -> Option<String> {
+    viewport_source(source, width.max(1) as f32, height.max(1) as f32)
+}
+
+fn viewport_source(source: &str, width: f32, height: f32) -> Option<String> {
+    use quick_xml::{Reader, Writer};
+    use quick_xml::events::{BytesStart, Event};
+    let mut reader = Reader::from_str(source);
+    let mut writer = Writer::new(Vec::new());
+    let mut found_root = false;
+    loop {
+        let event = reader.read_event().ok()?;
+        match event {
+            Event::Start(ref start) | Event::Empty(ref start) if !found_root => {
+                if start.local_name().as_ref() != b"svg" { return None; }
+                found_root = true;
+                let name = String::from_utf8(start.name().as_ref().to_vec()).ok()?;
+                let mut root = BytesStart::new(name);
+                for attribute in start.attributes() {
+                    let attribute = attribute.ok()?;
+                    if !matches!(attribute.key.as_ref(), b"width" | b"height") {
+                        root.push_attribute(attribute);
+                    }
+                }
+                let width = width.to_string();
+                let height = height.to_string();
+                root.push_attribute(("width", width.as_str()));
+                root.push_attribute(("height", height.as_str()));
+                writer.write_event(if matches!(event, Event::Empty(_)) {
+                    Event::Empty(root)
+                } else { Event::Start(root) }).ok()?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event).ok()?,
+        }
+    }
+    found_root.then(|| String::from_utf8(writer.into_inner()).ok()).flatten()
+}
+
+/// External SVG image documents use the fractional CSS viewport for viewBox
+/// alignment, while the cached physical raster has integer dimensions. Keep
+/// the viewport in the parse identity so equal ceil sizes cannot alias.
+pub(crate) fn get_or_render_image(source: &str, width: f32, height: f32) -> Option<DecodedImage> {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0
+        || width > 16_384.0 || height > 16_384.0
+    { return None; }
+    // Match the CSS subpixel coordinate grid used by the browser oracle. This
+    // is viewport geometry, not a pixel-color correction or outer-edge AA.
+    let width = ((width * 64.0).floor() / 64.0).max(1.0 / 64.0);
+    let height = ((height * 64.0).floor() / 64.0).max(1.0 / 64.0);
+    let source = viewport_source(source, width, height)?;
+    let raster_width = width.ceil() as u32;
+    let raster_height = height.ceil() as u32;
+    if u64::from(raster_width) * u64::from(raster_height) > 64 * 1024 * 1024 {
+        return None;
+    }
+    get_or_render_document(&source, raster_width, raster_height, true)
+}
+
+pub fn get_or_render_inline(source: &str, width: u32, height: u32) -> Option<DecodedImage> {
+    let source = inline_viewport_source(source, width, height)?;
+    get_or_render(&source, width, height)
+}
+
+pub fn hit_test_inline(source: &str, width: u32, height: u32,
+    targets: &[SvgEventTarget], x: f32, y: f32) -> Option<Vec<u64>> {
+    let source = inline_viewport_source(source, width, height)?;
+    hit_test(&source, width, height, targets, x, y)
+}
+
 pub fn get_or_render(source: &str, width: u32, height: u32) -> Option<DecodedImage> {
+    get_or_render_document(source, width, height, false)
+}
+
+fn get_or_render_document(source: &str, width: u32, height: u32, image_document: bool) -> Option<DecodedImage> {
     let width = width.max(1);
     let height = height.max(1);
     CACHE.with(|cache| {
@@ -161,6 +251,7 @@ pub fn get_or_render(source: &str, width: u32, height: u32) -> Option<DecodedIma
             revision,
             width,
             height,
+            image_document,
         };
         if let Some(entry) = cache.rasters.get_mut(&key) {
             entry.last_used = clock;
@@ -170,7 +261,11 @@ pub fn get_or_render(source: &str, width: u32, height: u32) -> Option<DecodedIma
         }
 
         cache.misses = cache.misses.wrapping_add(1);
-        let image = cache.rasterize_document(&tree, width, height, clock);
+        #[cfg(feature = "skia")]
+        let vector_image = image_document.then(|| rasterize_image_document(&tree, width, height)).flatten();
+        #[cfg(not(feature = "skia"))]
+        let vector_image = None;
+        let image = vector_image.or_else(|| cache.rasterize_document(&tree, width, height, clock));
         let bytes = image
             .as_ref()
             .map(|image| image.data.len())
@@ -186,6 +281,11 @@ pub fn get_or_render(source: &str, width: u32, height: u32) -> Option<DecodedIma
         cache.evict_to_budget();
         image
     })
+}
+
+#[cfg(feature = "skia")]
+fn rasterize_image_document(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<DecodedImage> {
+    crate::svg_image_document::rasterize(tree, width, height)
 }
 
 /// Returns the deepest SVG DOM target at raster-space coordinates.
@@ -1312,6 +1412,7 @@ fn compose_tiles(
         intrinsic_width: width,
         intrinsic_height: height,
         svg_intrinsic_size: None,
+        svg_source: None,
         data: Arc::new(rgba),
     })
 }
@@ -1512,7 +1613,58 @@ fn node_record(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "skia")]
+    #[test]
+    fn external_svg_fractional_viewport_keeps_alignment_and_cache_identity() {
+        clear_cache();
+        let source = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 6"><rect width="100%" height="100%" fill="green"/></svg>"#;
+        let first = get_or_render_image(source, 200.0 / 3.0, 100.0).unwrap();
+        let same = get_or_render_image(source, 66.65625, 100.0).unwrap();
+        assert!(Arc::ptr_eq(&first.data, &same.data));
+        assert_eq!(first.data[3], 253);
+        let narrower = get_or_render_image(source, 66.640625, 100.0).unwrap();
+        assert_eq!(first.width, narrower.width);
+        assert!(!Arc::ptr_eq(&first.data, &narrower.data));
+        assert_ne!(first.data[3], narrower.data[3]);
+        for aspect in ["none", "xMidYMid slice"] {
+            let source = source.replace("viewBox=", &format!("preserveAspectRatio=\"{aspect}\" viewBox="));
+            let image = get_or_render_image(&source, 200.0 / 3.0, 100.0).unwrap();
+            assert_eq!(image.data[3], 255, "{aspect}");
+        }
+        assert!(get_or_render_image(source, f32::NAN, 100.0).is_none());
+        assert!(get_or_render_image(source, 0.0, 100.0).is_none());
+        assert!(get_or_render_image(source, 16_384.0, 16_384.0).is_none());
+        clear_cache();
+    }
+
     use super::*;
+
+    #[test]
+    fn inline_svg_percentages_use_css_viewport_and_cache_dimensions() {
+        let source = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><rect width="100%" height="100%" fill="green"/></svg>"#;
+        for (width, height) in [(60,60), (120,30), (30,120)] {
+            let image = get_or_render_inline(source, width, height).unwrap();
+            assert_eq!((image.width, image.height), (width,height));
+            assert!(image.data.chunks_exact(4).all(|p| p == [0,128,0,255]));
+        }
+        let source = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 100 200"><rect width="100" height="200" fill="green"/></svg>"#;
+        let image = get_or_render_inline(source, 60,60).unwrap();
+        assert_eq!(pixel_at(&image, 0,30), [0,0,0,0]);
+        assert_eq!(pixel_at(&image, 15,30), [0,128,0,255]);
+        assert_eq!(pixel_at(&image, 44,30), [0,128,0,255]);
+        assert_eq!(pixel_at(&image, 59,30), [0,0,0,0]);
+    }
+
+    #[test]
+    fn inline_svg_content_viewport_respects_individual_border_edges() {
+        let style = w3cos_std::Style { border_width: 10.0,
+            border_top_width: Some(2.0), border_right_width: Some(3.0),
+            border_bottom_width: Some(4.0), border_left_width: Some(5.0),
+            ..w3cos_std::Style::default() };
+        let rect = crate::layout::LayoutRect { x: 7.0, y: 11.0, width: 60.0, height: 30.0 };
+        assert_eq!(content_box(rect, &style), crate::layout::LayoutRect {
+            x: 12.0, y: 13.0, width: 52.0, height: 24.0 });
+    }
 
     #[test]
     fn rasterizes_current_color_replacement_on_stroke_only_icons() {

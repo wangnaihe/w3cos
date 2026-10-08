@@ -1,5 +1,3319 @@
 # Raw Web Platform Tests
 
+## 2026-10-08 Clip-safe small blur accepted in focused browser regression
+
+V2368 records a genuine partial-output RED: the runtime image-filter wrapper's
+zero sampling radius discards required neighboring input (pixel10/10 differs
+229/181/202 versus202/105/148). Transparent output padding alone was insufficient.
+The unsafe implicit-input graph is replaced with complete RGBA8 input/halo
+materialization, two calibrated raster shader passes and final-image composition.
+Destination clipping now affects only that composition. The offscreen input
+also isolates and restores late glyph-clip recording so destination-tile
+visibility cannot discard required neighboring glyph coverage. No Skia fork,
+ABI trick, dependency upgrade, ignored test or fixture-specific production bound.
+
+V2379 passes10 focused tests, including interior/corner colored clip regions,
+kernel specialization limits and glyph-clip isolation. V2381 has533 unique
+runtime tests:520 pass, the same13 existing failures, no new failures. The
+final runner build took3m29s. V2382 preserves all four original blur comparisons
+at0 with unchanged browser oracle hashes; normal-flow is49/50 browser-exact,
+with video controls still9025/0. V2384 preserves white-space121/121 browser-exact.
+V2386 accepts the focused change with no pixel regressions, retains191 strict
+FAILED side entries across171 refreshed paths and links the prior outside-scope
+ledger. General transformed/fragmented, filtered-ancestor and larger-radius
+paths remain separate; the optimized small-blur backing is CPU-computed.
+
+This is not a fresh6548 census or full closure. Next address video-control paint
+order and the historical primary browser gap queue. Publication is explicitly
+authorized by the user's push request; it does not waive any failed gate or
+update the parent repository pin. Product Agent knowledge has no semantic impact.
+The6 existing outside-vendor file-size violations remain unchanged.
+
+## 2026-10-08 Original filtered inline WPT reaches browser pixel parity
+
+The main Skia effect replay now derives small-blur input bounds from logical
+painting descendants, rounds them outward and excludes empty nonpainting
+containers. The calibrated byte-backed shader is a four-tap specialization
+for sigma at most1; general Skia behavior remains for larger radii, transforms,
+fragmentation, shadows and outlines. Effects are screened once before bounds
+collection so frames without eligible blur avoid a second node traversal.
+
+V2359 and V2360 verify the filter graph at0 on raster and Metal. V2361 passes
+8 focused units; V2364 has531 unique runtime units,518 passed and the same13
+existing failures, with no new failures. Runner build took3m47s. V2362 remeasures
+the original block-in-inline-float-in-layer-001 actual/reference: all four
+comparisons are0 and original browser PNG hashes unchanged. Normal-flow goes
+from48/50 to49/50 browser-exact, with video-controls still9025/0. V2365 keeps
+white-space controls121/121 browser-exact. Neither scope gains pixel regressions.
+
+V2367 binds the source and RED/green receipts. Strict native/reference and
+browser/reference failures remain separately FAILED,191 side entries retained
+across171 refreshed paths and the prior outside-scope ledger. This is original
+WPT parity, not general filter acceptance: add clip/tile input-demand tests
+because the Rust runtime-filter wrapper exposes no sampling radius; nested
+filters and colored premultiplied input also need coverage. No fresh6548 census
+or current full remaining count, goal completion, commit or push. Product Agent
+knowledge has no semantic impact. Size gate retains6 outside-vendor violations.
+
+## 2026-10-08 Native shader reproduces browser blur on raster and Metal
+
+V2352 reproduces the bound stock-Metal RED at32 pixels. V2353 applies the
+calibrated byte-domain sampler in an actual Skia runtime shader and passes
+at0. V2354 establishes a cropped-input raster RED at38 pixels (distinct from
+the formal original-page41-pixel gap). V2355 and V2357 pass the calibrated
+raster and Metal diagnostics at0, with identical decoded RGBA output.
+V2356 keeps the7 focused inline-shaping tests green. Runtime test builds
+completed in28.73s and31.61s; git diff --check passes.
+
+V2358 binds source, binary, unchanged input/oracle hashes, explicit diagnostic
+bounds, backend selection and retained strict ledgers. This is a test-only,
+fixed-sigma shader bridge, not an accepted WPT repair. Production still uses
+stock blur: original actual/reference browser gaps remain41/41 until a fresh
+formal run. Browser pixels have priority; native/reference and browser/reference
+strict failures remain FAILED separately, without waivers. Next derive logical
+input bounds from painting descendants, integrate the sampler generically and
+remeasure original pages plus controls. No fresh6548 census, commit or push.
+Product Agent knowledge has no semantic impact. The6 existing outside-vendor
+size violations remain separate; no baseline increase.
+
+## 2026-10-08 Blur boundary proof reaches zero in diagnostic model
+
+V2348 reconstructs the same glyph coverage as a browser canvas. A full-frame
+input retains exactly the3 previous edge differences. Using the original
+Chromium logical layer bounds x8/y8/34x22 instead produces the exact original
+PNG hash and0 pixels. V2349 rejects an incorrect diagnostic assertion that
+cropping discards no coverage: two faint glyph-overhang samples at x7/y16..17
+have grayscale253/254. Its failed script is retained, with no acceptance
+receipt; the premature commentary claim is corrected.
+
+Those overhang samples are excluded by the original Chromium filtered layer
+input bounds, while present in the unfiltered text. V2350 combines those
+recorded bounds with the independently calibrated UNORM sampler: the original
+Chromium capture is reproduced at0 pixels. These explicit case coordinates
+are diagnostic inputs only, not proposed production constants.
+
+V2351 binds current tracked/untracked source, input coverage, browser captures,
+rejected assertion and exact model: ZERO_PIXEL_DIAGNOSTIC_PROOF_NOT_PRODUCTION_
+ACCEPTANCE. Next add a focused Rust raster RED, preserve paint-derived logical
+input bounds and implement calibrated small-blur sampling, then remeasure both
+original WPT sides and controls. Formal41/41 failure remains unchanged; strict
+ledgers are unwaived. No production source changes, full6548 census, accepted
+repair, commit or push in this batch. Product Agent knowledge has no semantic
+impact. Size gate retains6 outside-vendor violations, no baseline increase.
+
+## 2026-10-08 ANGLE sampler calibrated: three edge pixels remain in model
+
+V2339 records independent impulse/ramp/random-alpha browser probes. Their
+unfiltered input is exact; SVG horizontal blur and CSS blur center rows agree
+exactly. Ordinary Gaussian convolution differs at25 samples; the paired
+linear model differs at2. V2340's half/rounding combinations do not clear them.
+
+V2341 directly reads ANGLE Metal texture sample floats with lossless shader
+bit encoding. Using those samples reproduces the single-axis browser output
+at0 differences. V2347 additionally verifies an integer UNORM interpolation
+formula against all3200 captured values: byte-space fraction quantization at
+1/256 followed by a four-fractional-bit sampled result. This is a verified
+sampler calibration, not a production repair or WPT acceptance.
+
+V2342/2343 apply that sampling model to the original bound unfiltered WPT
+input. The best two-axis diagnostic leaves3 browser differences, not0.
+V2344/2345's FMA/final-rounding variants do not clear them. V2346 locates all
+three at x6/y16..18, outside the original filtered layer's left8 boundary.
+Next inspect strict source-rectangle/decal sampling in the expansion region;
+do not introduce a fixture offset or pixel-specific correction.
+
+V2347 binds current tracked/untracked source, original inputs and all probes:
+DIAGNOSTIC_PROGRESS_NOT_REPAIRED. Formal41/41-pixel failure remains unchanged,
+with strict ledgers unwaived. No production source changes, module rebuild,
+fresh6548 census, accepted repair, commit or push in this batch. Product Agent
+knowledge has no semantic impact. Size gate's6 outside-vendor violations remain
+separate with no baseline increase.
+
+## 2026-10-08 Native Metal blur RED: backend switch is not a repair
+
+V2330 records default Chromium's ANGLE Metal device (Apple M5), then probes
+Skia shader sample order and half uniforms/sample/accumulation. No combination
+is browser-exact. V2331's texture-return quantization probes also leave a gap.
+These are diagnostic numerical experiments, not accepted production changes.
+
+An explicitly ignored macOS diagnostic test uploads the previously bound,
+pixel-exact unfiltered glyph coverage to native Skia Metal. V2332/2333 retain
+34-pixel REDs. V2336 uses the original Chromium recorded layer bounds instead
+of a full-frame texture:32 pixels still differ. Thus switching to Metal or
+changing input bounds alone cannot be declared a repair. The ignored test
+requires explicit input/oracle paths; it does not silently replace WPT's
+formal raster backend, default Chromium or its41/41-pixel failure.
+
+V2335 fetches Chromium141's exact Skia pin5eefbe51d17d2e379fa2d7353827e0ccb1e1f601.
+Its blur shader source matches local Skia; blur-engine differences are only
+size_t casts. This does not justify a dependency upgrade/downgrade. V2337
+passes7 shaping controls on the current diagnostic source; the final unit
+build completes in25.38s. V2338 binds current source/untracked hashes, REDs,
+GPU outputs, numeric probes, pinned upstream sources and focused controls:
+DIAGNOSTIC_PROGRESS_NOT_REPAIRED. Production rendering remains unchanged;
+prior formal receipts retain their original source bindings, not refreshed.
+
+Next isolate default Chromium one-axis sampling with impulse/ramp probes,
+including ANGLE interpolation and framebuffer rounding. Strict failures remain
+unwaived; no full6548 census, accepted repair, commit or push. Product Agent
+knowledge has no semantic impact. Size gate retains6 unrelated outside-vendor
+violations; no baseline increase.
+
+## 2026-10-08 Small blur diagnosis: input exact, filter gap retained
+
+V2321 binds unchanged default Chromium screenshots and paint commands for
+float-in-layer001; both variants use x8/baseline25 and one filtered layer.
+V2322 binds current native frames. V2323/2324 preserve browser snapshot replay
+as a diagnostic, not an oracle replacement: replay differs substantially from
+both default screenshots and native frames, so it cannot prove acceptance.
+
+V2325 uses isolated temporary filter-disabled probes, restores browser filter
+state and verifies original screenshot hashes afterward. Canonical fixtures
+and acceptance user stylesheet remain unchanged. V2326 proves unfiltered
+native/browser input equality at0 pixels. Independent X-then-Y Gaussian
+convolution with byte-quantized intermediate pixels reproduces native output
+exactly, while retaining the41-pixel browser gap. No intermediate quantization
+gives75 browser differences; reversed axis order in V2327 gives93. Neither is
+a valid production repair.
+
+V2328 probes the paired-weight linear sampling path used by Skia blur shaders.
+At1/256 fraction resolution it leaves12 browser differences, not0. This is
+diagnostic evidence only, not an accepted improvement or pixel tolerance.
+V2329 binds the original RED and all probe hashes with current tracked and
+untracked source: DIAGNOSTIC_PROGRESS_NOT_REPAIRED. The formal41/41 browser gap
+and strict ledgers remain unchanged. Next reproduce shader half uniforms,
+texture interpolation and accumulation before proposing any production fix.
+No production source change, full6548 census, commit or push in this batch.
+Product Agent knowledge has no semantic impact.
+
+## 2026-10-08 Explicit no-image shaping: first-line001 gap cleared
+
+V2312 captures unchanged Chromium geometry and paint: actual and reference
+both draw the third first-line text at x8/baseline113. V2313 identifies the
+native reference's split words; only48 pixels in the word `in` differ. The
+background shorthand produces background-image:none, but the shared inline
+word classifier mistakenly treated any present image field as an image
+barrier. This discarded continuous authored glyph context for solid-color
+first-line fragments. Explicit single `none` now equals an absent image;
+actual images, edges and other shaping barriers remain unchanged.
+
+V2314 retains the minimal DOM-to-layout RED. V2315 passes7 shaping tests,
+including source views, generated quotes, decorations, bidi replay and whole
+fallback-font coverage. The new test also keeps real background images as
+barriers. V2316 has530 unique runtime tests,517 pass, the same13 old failures
+and0 new. Unit rebuild25.64s; final runner rebuild2m34s.
+
+V2317 remeasures50 normal-flow cases:48 browser-exact,2 gaps,0 unverified,
+0 pixel regressions against V2306. first-line001's actual/native-browser,
+reference/native-browser and both strict comparisons all reach0 pixels.
+V2318 keeps121 white-space controls browser-exact,0 gaps/unverified and no
+regressions against older V2298; that is not a pre-candidate full census.
+
+V2320 binds source/untracked hashes, original oracle, native diagnosis, RED
+and final receipts: ACCEPTED_FOCUSED_NOT_FULL_CORPUS. Its171-path scope retains
+191 strict FAILED side entries independently, without waiver. V2311's ledger
+remains retained outside this scope. Remaining normal-flow browser gaps:
+float-in-layer001:41/41 and video-controls:9025/0 (actual/reference pixels).
+Next isolate blur(1px) filter precision using unchanged browser paint evidence.
+No fresh6548 count, full closure, direct CPU/GPU acceptance, commit or push.
+Product Agent knowledge has no semantic change. Size gate retains6 unrelated
+outside-vendor violations with no baseline increase.
+
+## 2026-10-08 Cell image strut: inlines017 browser gap cleared
+
+Browser pixel equality remains the primary acceptance: actual/native-browser
+and reference/native-browser must both have0 differing pixels. Strict native
+and browser reference comparisons remain separate FAILED ledgers, unwaived.
+
+V2301's unchanged Chromium oracle and V2302's native layout identify25 images
+one pixel too low in the reference table. Row and cell geometry already match;
+cell centering measured20px image ink instead of its22px containing line strut.
+Shared cell alignment now reserves that strut for top/bottom inline images,
+preserving existing baseline behavior. No fixture, tolerance or renderer-only
+offset changes. Canvas/SVG and other alignment keywords are not claimed.
+
+V2303 retains RED. V2304 is INVALID_EMPTY_SELECTION, not a passing gate; its
+incorrect filter is corrected in V2310, which passes8 focused tests, including
+top/bottom images, middle/bottom cells and extra cell space. V2305 has529 unique
+runtime tests,516 pass, the same13 old failures and0 new. Runner build:2m35s.
+
+V2306 remeasures50 normal-flow cases:47 browser-exact,3 gaps,0 unverified.
+inlines017 actual and reference both reach0 browser pixels. Its native and
+browser strict comparisons both remain FAILED at13202 pixels. V2308's39 table
+height/row/vertical-align controls are all browser-exact; baseline009 retains
+both strict failures. No pixel-count regressions against V2295 normal flow or
+the older V1503 table baseline; the latter is not a pre-candidate census.
+
+V2311 binds source/untracked hashes, original evidence, RED, invalid selection
+and final receipts: ACCEPTED_FOCUSED_NOT_FULL_CORPUS. Its89-path scope retains
+10 strict FAILED side entries; V2300's ledger remains retained outside this
+scope. Remaining normal-flow browser gaps: first-line001:0/48,
+float-in-layer001:41/41 and video-controls:9025/0 (actual/reference pixels).
+Next isolate first-line001's reference glyph origin/shaping, without changing
+the browser oracle. No fresh6548 count, full closure, direct CPU/GPU acceptance,
+commit or push. Product Agent knowledge has no semantic change. The6 unrelated
+outside-vendor size violations remain separate with no baseline increase.
+
+## 2026-10-08 Explicit inline leading: min-height008 browser gap cleared
+
+V2279's unchanged Chromium paint commands put the Ahem glyph baseline at71
+over a red em background at y55. V2290 proves isolated integer Ahem raster
+covers that background. V2291, with the same font preference environment as
+pixel runs, identifies the actual native paint origin: y56/baseline72, despite
+the resolved font rect at y55. Renderer-side ancestor-strut centering added
+another pixel to an already projected explicit-height inline font box.
+
+V2292 reproduces exactly20 exposed pixels at y55 through the actual node
+painting path. Explicit line-height now keeps its resolved font-box origin;
+the legacy normal line-height branch remains unchanged. Temporary origin
+diagnostics are removed. V2293 retains the failed candidate gate where a
+legacy synthetic test expected re-centering for explicit height. That test
+now distinguishes explicit/normal and top/baseline cases rather than applying
+the normal-strut expectation to both. The original failed receipt is retained,
+not waived. V2296 passes7 focused tests, including integer Ahem coverage,
+normal font raster, short line heights, multiline and blockified half-leading.
+
+V2297 has528 unique runtime tests,515 pass, the same13 retained failures and
+0 new. The final runner rebuild completes in1m59s. V2295 remeasures50 historical
+normal-flow cases:46 browser-exact,4 gaps,0 unverified and0 pixel regressions
+against V2285. min-height008 clears actual/native-browser, reference/native-
+browser and both strict comparisons to0 pixels. V2298 keeps121 white-space-
+named controls browser-exact with0 gaps/unverified and no regression against
+V2266; that is an older control baseline, not a pre-candidate full census.
+
+V2300 binds current source/untracked hashes, original oracle, diagnostic,
+RED, failed candidate gate and final gates/receipts. Its171-path scope retains
+192 strict FAILED side entries independently and without waiver. V2288's
+ledger is retained for unrefreshed scopes. No current full6548 count or full
+closure is claimed. Remaining normal-flow browser gaps: first-line001:0/48,
+float-in-layer001:41/41, inlines017:0/1000 and video-controls:9025/0.
+
+V2301 captures unchanged original Chromium geometry/paint for inlines017,
+and V2302 binds native actual/reference layout. Next investigate the reference
+table's image origins; do not alter its genuine browser/reference strict gap.
+No commit/push, outer-code, reference or tolerance change. Product Agent
+knowledge has no semantic change. Size gate's6 outside-vendor violations
+remain separate, no baseline raise. Direct CPU/GPU pixels and earlier
+unrefreshed categories are not promoted as passed.
+
+## 2026-10-08 Relative and nested float exclusions: browser target cleared
+
+V2269 records the original Chromium geometry for float-between001. V2270 and
+V2281 show native text exclusions intersecting visual relative coordinates,
+then missing floats nested through ordinary anonymous/inline wrappers. V2271
+and V2282 retain both minimal RED stages. Shared float text resolution now
+computes exclusions in static-flow coordinates, restores the text owner's
+relative displacement, and indexes earlier floats by their BFC rather than
+only by direct parent. New BFC boundaries continue to isolate their floats.
+This changes shared layout/retained-paint geometry, not fixtures or tolerance.
+
+V2283 passes5 focused tests including wrapper/BFC isolation. V2284 has526
+unique runtime tests,513 pass and the same13 prior failures, with0 new.
+The formal runner rebuild completes in2m12s. V2285 repeats50 historical
+normal-flow candidates:45 browser-exact,5 gaps,0 unverified. float-between001
+now has0 pixels for actual/native-browser, reference/native-browser and both
+strict comparisons. V2286 retains matching actual/reference native frames.
+V2287 repeats249 floats-clear/relative-position-named controls:245 exact,
+4 gaps,0 unverified, no pixel-count regressions against pre-change V2276.
+
+V2288 binds source/untracked hashes, original oracle, REDs, gates and both
+browser receipts. Its299-path scope retains85 strict FAILED side entries
+without waiver; the earlier V2268 ledger remains retained outside this newly
+measured scope. These counts are not a full-corpus remaining-failure count.
+floats141's reference remains2015 pixels different and regressed from the old
+V1503 census, already present in V2276; that reference has no floats. It is
+unresolved, not a green control. Other control gaps remain relpos002:2/0,
+relative032:0/48 and relative033:1458/1458 (actual/reference pixels).
+
+Remaining normal-flow browser gaps: first-line001:0/48, float-in-layer001:41/41,
+inlines017:0/1000, min-height008:20/0, video-controls:9025/0. Next inspect the
+original min-height008 glyph paint origin against Chromium's baseline71;
+native layout/background geometry already agrees, but its first row retains
+red. Do not guess a box-model offset or modify the reference.
+
+No fresh6548 census, full closure, direct CPU/GPU pixel acceptance, commit or
+push. Forced-break float text is unchanged. Product Agent knowledge has no
+semantic change. Size gate still has6 outside-vendor violations, no baseline
+raise. All source changes stay within vendor/w3cos.
+
+## 2026-10-08 Inline-border foreground tree order: 33 browser gaps cleared
+
+V2259's unchanged original Chromium paint commands place the preceding Eight
+glyph run before the next inline fragment's top border, and Nine after it.
+V2260 binds native replay geometry. V2261 preserves a minimal paint-order RED:
+native promoted normal/split inline borders ahead of all block foreground.
+Inline decorations now share foreground tree order, still above block
+backgrounds and behind following text. Float/atomic/stacking-context branches
+are unchanged; this is a shared PaintArtifact ordering change, not a fixture
+or renderer-only pixel patch.
+
+V2262 passes63 unique paint-artifact tests, including the new preceding/following
+foreground ordering test. V2263 has524 unique runtime tests,511 pass, the same13
+retained failures and0 new. Formal runner rebuild completes in2m13s. V2264
+repeats50 historical normal-flow candidates:44 exact,6 gaps,0 unverified and
+no pixel-count regressions.33 paths clear on BOTH actual/native-browser and
+reference/native-browser, including append002, insertion001/003/004/009/010/011
+and their canonical reference paths. nested002's remaining2 pixels also clear.
+
+V2266 keeps121 white-space-named controls browser-exact,0 gaps/unverified.
+V2268 binds current source/untracked hashes, original oracle, RED, gates and
+both browser receipts;193 deduplicated strict FAILED side entries remain
+independent and unwaived. This is focused acceptance, not a fresh6548 census
+or all paint-order conformance. Earlier font/bidi/border controls were not
+refreshed on this source. No commit/push, outer-code or tolerance changes.
+Product Agent knowledge is unaffected. Size gate's6 outside-vendor violations
+remain separate; no baseline raise.
+
+Remaining normal-flow browser queue (actual/reference pixels):
+
+- block-in-inline-first-line001:0/48
+- block-in-inline-float-between001:363/363
+- block-in-inline-float-in-layer001:41/41
+- inlines017:0/1000
+- min-height-applies-to008:20/0
+- video-controls-paint-order:9025/0
+
+Next inspect original float/relative-position geometry for float-between001;
+strict native parity on that case is not browser parity and does not clear it.
+
+## 2026-10-08 Empty inline whitespace: partial browser repair, two pixels retained
+
+V2244 binds original actual/reference Chromium screenshots and geometry for
+block-in-inline-nested002. Empty decorated inline boxes do not retain the
+adjacent line-edge spaces; native had a5.34px displacement. V2245 preserves
+two DOM REDs. Local sibling boundary scanning now looks through empty inline
+boxes and recognizes in-flow block descendants, while retaining atomic boxes,
+direct element text and the ownership of an already collapsed separator.
+
+V2247/V2248/V2249 retain failed candidate regression evidence. V2250 is a
+candidate-off control: the target REDs remain, while three suspected regressions
+pass. The corrected candidate passes8 focused tests in V2251. V2252 has215
+unique DOM tests,205 pass, the same10 failures present in V2087 and0 new.
+V2253 has523 runtime tests,510 pass, the same13 failures and0 new. Runner rebuild
+completes in2m19s. V2254 repeats50 historical normal-flow candidates:11 exact,
+39 gaps and no regressions. Target actual AND reference gaps reduce1236->2;
+the target is NOT browser-exact, despite native/browser strict comparison0.
+
+V2256 replays121 canonical white-space-named controls:121 browser-exact,
+0 gaps/unverified. V2258 binds source/untracked hashes, RED/control stages,
+unit gates and browser receipts, retaining193 deduplicated strict FAILED side
+entries independently. This larger ledger includes the white-space control
+scope; it is not a current full-corpus failure count. No fresh6548 census.
+
+V2259 captures original browser paint commands for insert001a, while V2260
+binds native original-page replay/layout dumps. The remaining2-pixel nested002
+gap and repeated12-pixel insertion gaps occur where inline borders overlap
+preceding block text. Next verify their shared CSS paint-order key using a
+minimal RED before modifying it. No fixture/reference/tolerance change,
+outer-code change, commit or push. Size gate still has6 outside-vendor
+violations; no baseline raise. Product Agent knowledge is unaffected.
+
+## 2026-10-08 Square 3D border edges: three valign browser gaps cleared
+
+V2234 confirms original native table/cell layout coordinates match Chromium;
+fractional layout widths are not the cause. V2235 captures original browser
+paint commands with unchanged screenshot hashes: both actual and reference
+use integer local border endpoints despite fractional layout widths. V2236
+preserves a399-pixel inset unit RED. The shared border geometry helper now snaps
+square noncollapsed border endpoints in local CSS space before transforms;
+layout, colors, opacity, rounded borders and collapsed geometry are unchanged.
+
+V2237 passes8 focused runtime tests. V2238 has523 unique tests,510 pass and
+the same13 retained failures,0 new. Runner rebuild completes in2m01s. V2239
+remeasures50 historical normal-flow candidates:11 exact,39 gaps,0 unverified,
+no pixel-count regressions. inline-block-valign001/002 and inline-table-valign001
+now have0 pixels on BOTH actual/native-browser and reference/native-browser;
+their native/browser strict comparisons also have0 pixels.
+
+V2241 checks124 canonical3D-border/HTML-table-border and width controls:
+124 browser-exact,0 gaps/unverified. Regression comparison uses V2231 for its
+110 overlapping controls and historical V1503 only for the14 additional paths.
+V2243 binds current tracked/untracked source hashes, original geometry/paint
+evidence, RED, unit gates and browser receipts. Its31 deduplicated strict FAILED
+side entries remain independent failures; browser parity does not waive them.
+
+Focused acceptance only: no fresh6548 census and no full closure claim.
+CPU/GPU consume the common geometry helper, but their direct end-to-end pixel
+parity was not tested. Earlier outline/font/bidi receipts were not refreshed.
+No WPT fixture/reference/tolerance change, outer-code change, commit or push.
+Product Agent knowledge is unaffected (native border paint geometry only).
+Next inspect split-inline fragment positioning in block-in-inline-nested002;
+both its actual and reference retain1236-pixel browser gaps despite strict parity.
+
+## 2026-10-08 HTML border hints restore frames; fractional right edges remain
+
+V2222 binds unchanged original Chromium screenshots and computed geometry on
+three valign actual/reference pairs: table1px outset gray,border-box; cell1px
+inset gray with1px padding. The current
+[Blink UA stylesheet](https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/core/html/resources/html.css)
+corroborates table defaults only; acceptance is the original pinned browser
+capture, not a claim that Chromium main and the installed version are identical.
+V2223 preserves two DOM REDs for empty/numeric border hints and author overrides.
+HTML tables now use UA gray border color/border-box, section colors inherit, and
+table/cell border hints enter the existing cascade before author declarations.
+V2224 catches a further RED: an earlier border-color:inherit hint was still copied
+over a later border shorthand. The inheritance winner check now includes border.
+
+V2225 passes16 unique focused DOM tests. V2226 has168 unique DOM tests,166 pass,
+the same2 historical failures also present in V2087. V2227 has522 runtime tests,
+509 pass and the same13 retained failures,0 new; V2228 passes8 focused runtime
+controls. The runner rebuilt in2m16s. V2229 repeats50 historical normal-flow
+candidates:8 exact,42 gaps. The three valign gaps improve per side respectively
+1569->786,1293->586,1309->602, but NONE is cleared. Missing frames and displaced
+text are repaired; current differences occupy right-edge bands x59..63 and
+need original geometry/raster evidence before shared border snapping changes.
+Inline-block001/002 also now have786/586 native strict failures; these are retained,
+not waived merely because browser differences improved.
+
+V2231 keeps110 width controls browser-exact,0 gaps/unverified. V2233 binds source
+and untracked hashes, both RED stages, original oracle, unit gates, pixel evidence
+and29 deduplicated strict FAILED side entries. This is accepted partial evidence,
+not zero-pixel acceptance of the three target cases or a fresh6548 census.
+Directly authored table border attributes occur in these3 corpus reftests; dynamic
+attributes, frame/rules/bordercolor and all legacy numeric parsing remain unproven.
+Size gate retains6 outside-vendor violations; no baseline raise. Product Agent
+knowledge is unaffected (native HTML presentation/cascade only). No fixture,
+reference,tolerance,outer code,commit or push change. Next inspect right-edge
+layout and three-dimensional border coverage using the original pages.
+
+## 2026-10-08 Structural column preferred widths match original Chromium
+
+V2213 binds unchanged original screenshots and DOM geometry: max-width005/006
+columns use288px despite computed max-width96px, while min-width005/006 columns
+use96px. Their references remain96px. V2214 preserves a minimal RED: native
+preferred width was capped to96 instead of288; it also records the prior unit
+expectation that incorrectly encoded that cap. Structural column/group preferred
+width resolution now bypasses max-width only. Column min-width and table-wrapper
+max-width constraints remain intact. The old column-group unit is renamed and
+asserts precise288px tracks/table/cell widths from the original browser evidence;
+no WPT test/reference or tolerance was changed.
+
+V2215 passes5 unique focused tests; V2216 has522 unique runtime tests,509 pass,
+the same13 retained failures and0 new. Runner rebuild completed in2m17s. V2217
+repeats50 historical normal-flow candidates:8 exact,42 gaps,005/006 actual AND
+reference/native-browser comparisons now0, all remaining pixel counts unchanged.
+V2219 replays110 canonical table-width and min/max-width applicability controls:
+110 browser-exact,0 gaps,0 unverified. V2221 binds source/untracked hashes, RED,
+oracle, unit gates and both browser receipts, with deduplicated independent strict
+FAILED side entries. 005/006 now correctly retain both native and browser strict
+18432px reference failures; browser parity does not waive those failures.
+
+Focused acceptance only, not a fresh6548 census or all table layout conformance.
+Earlier outline/font/bidi pixel receipts were not refreshed. The size gate still
+reports6 outside-vendor violations; no baseline increase. Product Agent knowledge
+is unaffected: native structural-column layout only. No outer code, commit or
+push. Next inspect the legacy HTML table border/cell decorations shared by the
+inline-block/table valign failures; their screenshots show missing native frames
+and displaced text, so narrow green inline baseline tests do not establish closure.
+
+## 2026-10-08 Replaced column outlines and missing-resource image frames
+
+V2201 confirms original016 used image display remainsTableColumnGroup, while
+its reference isInlineBlock; both image rectangles are[8,54,96,96]. V2204 binds
+original Chromium geometry and unchanged screenshots on both016/017 sides.
+V2202 preserves the missing-frame pixel RED, and V2203 preserves the used-display
+RED. Replaced image column/group roles now lower toBlock without changing CSSOM;
+ordinary structural columns still do not paint outlines. Empty-source images
+paint the observed one-pixel#C0C0C0 content frame without changing layout size.
+
+V2205 passes5 focused runtime tests; V2206 passes3 DOM lowering tests. V2207 has
+521 unique runtime tests,508 pass, the same13 retained failures and0 new. Runner
+rebuild completed in2m15s. V2208 checks39 outline-named canonical cases:39 exact,
+0 browser gaps,0 unverified. Actual and reference independently match default
+Chromium at0 pixels. V2210 repeats50 historical normal-flow candidates:6 exact,
+44 gaps, no pixel-count regressions. V2212 binds both source hash sets, REDs,
+oracle, unit gates, browser evidence and remaining strict FAILED side entries.
+outline-width096 remains a strict browser reference failure despite browser
+pixel parity; it is not waived or silently marked passed.
+
+No fresh6548 census, full outline semantics claim, fixture/reference/tolerance
+change, outer-code change, commit or push. Static corpus inspection finds just
+016/017 with directly authored missing/empty img resources on either reftest side;
+this is not proof about dynamically mutated images or failed nonempty resources.
+The size gate retains6 outside-vendor violations, with no baseline increase.
+Product Agent knowledge is unaffected: native image used-box and paint behavior
+only. Next continue the44 normal-flow gaps while retaining all other categories
+and the independent strict reference ledger.
+
+## 2026-10-08 Outline parsing and painting: focused browser-priority acceptance
+
+The block-in-inline-margins-003 geometry was already correct; missing purple
+outline caused6336 pixels per side. V2181/V2182 preserve parser/painter REDs.
+The DOM shorthand now reaches outline style, the Skia box painter draws outlines
+without layout growth, and retained paint fingerprints include color/line style.
+Structural table columns remain non-painting. V2190 exposed six NEW zero-width
+regressions: signed0em/0ex longhands failed to override shorthand medium width.
+V2192 preserves that RED; common width parsing now accepts context-free relative
+zero lengths. These failed receipts remain unchanged, not waived or deleted.
+
+V2193 passes19 unique focused tests. V2194 has520 unique tests:507 pass and the
+same13 retained failures. The formal runner rebuild completed in2m24s. V2195
+checks39 outline-named canonical cases:37 browser-exact,2 gaps, all six newly
+introduced gaps cleared. Remaining outline-applies-to016/017 differ4388 actual
+and380 reference pixels each. V2197 repeats50 historical normal-flow cases:
+6 exact,44 gaps, no pixel-count regressions against V2188. The four outline-related
+normal-flow repairs and two earlier replaced-line repairs remain browser-exact.
+
+V2199 binds source/untracked hashes, REDs, both browser receipts and11 independent
+strict FAILED side entries. In particular outline-width096 is browser-exact but
+its browser strict reference failure remains FAILED. Acceptance always requires
+zero actual/native-browser AND zero reference/native-browser pixels; strict
+reference ledgers are separate, never used to waive a browser discrepancy.
+
+This is focused acceptance, not full outline conformance or a fresh6548 census.
+Outline offset, nonzero relative widths, currentColor ordering, descendant paint
+phase, fragmented inline unions and all style raster paths remain unproven.
+Earlier font/bidi receipts were not refreshed. No fixture/reference/tolerance,
+outer code, commit or push changes. Product Agent knowledge is unaffected: only
+native CSS parsing/paint/cache behavior changed. Next inspect the remaining
+outline table applicability pair, then resume normal-flow browser gaps.
+
+## 2026-10-08 Empty collapsed text no longer rejects replaced forced lines
+
+V2168 remeasures50 historical normal-flow candidates:0 exact,50 pixel gaps.
+The002/003 inline-block-replaced-width actual pages already match Chromium, but
+their image-based references differ15200/35200 pixels. V2170 dumps the100px
+reference: its second image incorrectly starts at96 instead of184. V2171 binds
+original Chromium DOM images to unchanged screenshots: image tops79/134 for50px
+and79/184 for100px, including the containing font descent after BR.
+
+V2172 records a minimal RED: collapsed whitespace survives lowering as an empty
+text leaf at the previous Taffy right edge; its cursor rejects the next image
+restarting at the line's content edge. The shared line collector now ignores
+zero-width empty text leaves without padding, borders or horizontal margins.
+Atomic boxes and decorated text remain participating items.
+
+V2173 has21 unique focused tests passing; V2174 has515 unique tests,502 passing,
+the same13 existing failures and0 new. The runner rebuilt in2m19s. V2175 clears
+both original cases: actual/native-browser, reference/native-browser and both
+strict comparisons are all0 pixels. V2177 repeats all50 historical candidates:
+2 exact,48 gaps; remaining pixel counts do not regress. V2179 binds RED, source
+and untracked hashes, original-page evidence and separate strict FAILED ledgers.
+The size gate still reports6 existing outside-vendor violations; no baseline
+raise. Product Agent knowledge is unaffected (anonymous inline metrics only).
+No fixture/reference/tolerance, outer code, commit/push or new6548 census.
+Previous font/bidi pixel receipts were not refreshed on this candidate. Next
+diagnose remaining block-in-inline continuation margin collapse failures.
+
+## 2026-10-08 Visual bidi fallback boundaries clear glyph-mirroring002
+
+V2153 refreshes18 historical bidi candidates on the current runtime:1 exact,
+17 gaps. V2155 captures original Chromium geometry/fonts with screenshot guards;
+V2157 dumps both native paths. The RTL source already becomes the same visual
+string as its LTR reference, but the painter reapplied the authored RTL base to
+that visual string when locating fallback-font LayoutUnit boundaries.
+
+V2158 adds a pixel RED reproducing exactly111 differing pixels. The visual-run
+boundary classifier now consumes its input in left-to-right paint order instead
+of reapplying paragraph direction. V2159 has12 unique focused tests passing;
+V2160 has514 unique tests,501 passing and the same13 existing failures,0 new.
+The formal runner rebuilt in2m35s. V2161 clears the original mirroring case to
+0 actual/native-browser,0 reference/native-browser,0 native strict and0 browser
+strict pixels; the other16 historical gaps are unchanged.
+
+V2163 replays160 font cases:159 exact, the original link endpoint2/2 gap unchanged,
+0 new pixel gaps. V2165 checks all105 canonical bidi cases:89 exact,16 gaps,
+0 new gaps among historical exact cases. V2167 binds RED, focused and module
+receipts, tracked/untracked hashes and independent strict FAILED side ledgers.
+This is accepted focused evidence, not a fresh6548 census or full closure.
+No fixture/reference/tolerance, outer code, commit or push changed. Product Agent
+knowledge is unaffected: this changes native visual-run precision only.
+Next remeasure the normal-flow historical queue while retaining the unresolved
+font endpoints and16 bidi gaps, then continue targeted fixes before the full loop.
+
+## 2026-10-08 Metal filled-rectangle probe does not reproduce original endpoints
+
+V2152 runs a diagnostic local Skia0.93.1 filled-rectangle mesh approximation on
+Metal in the observed832x256 target. Both fast-math settings and fragment-based
+hard difference clipping yield endpoint36/8, not original Chromium33/7.
+Tracked and untracked runtime source hashes match V2151. No production change
+is justified: original actual/reference gaps remain2/2 pixels, fonts159/160,
+and strict reference failures remain separate FAILED ledgers.
+
+This is not faithful original pipeline replay: Chromium primitive selection,
+clip-mask/atlas rendering and full render-pass blending remain unproven. Next
+identify the original Graphite render-step/clip path before deriving corrections.
+Probe source/binary hashes and four outcomes are bound in
+`target/wpt-targeted/baseline-font-position-20261003/link-rect-gpu-v2152.json`.
+The file-size gate still reports6 existing outside-vendor violations; no baseline
+was raised. No WPT fixture, tolerance, outer code, commit/push or new full census.
+
+## 2026-10-08 Original link raster context bound for faithful coverage replay
+
+V2148 replays the unchanged original layer paint snapshot offscreen: endpoints
+are36/8, not the original GPU screenshot33/7 (blue-channel packing also differs).
+Identical paint commands therefore do not establish identical raster acceptance.
+V2149 records GPU/Graphite and raster traces. V2150 repeats with page-scoped
+LayerTree snapshots: actual layer9 and reference layer12 each bind to resource
+tiles[0,0,832,256] and[0,254,832,256],scale1,translation0. Both original screenshots
+remain unchanged before/after capture. These layer IDs belong to this capture,
+not persistent identifiers for later browser sessions.
+
+V2151 binds receipts, trace hashes, replay endpoints and the per-side resource
+mapping. Next entry is Graphite filled-rectangle coverage replay in the observed
+832x256 target with faithful hard difference clipping, not viewport-based guesses
+or endpoint color compensation. No production algorithm was changed or accepted;
+the font case remains2/2 pixels and full6548 remains open. Strict reference
+failures are independent; no fixture/reference/tolerance, outer code, commit
+or push changes.
+
+## 2026-10-08 Remaining link endpoints: paint geometry proved, raster cause open
+
+V2143's simplified Canvas reproduces native36/8 endpoint red-channel values at
+the original fractional bounds, not original Chromium underline33/7. V2144
+captures the original page's layer paint log while both screenshots remain
+unchanged: the AA blue rectangle is exactly[410.140625,34,503.96875,35],color
+#FF0000EE, matching DOM geometry. Its hard difference skip-ink clip is also
+recorded. Generic area/color correction or changing underline bounds is therefore
+not justified by this evidence.
+
+V2145 adds simplified even-odd Canvas clipping and V2146 tests SVG rectangles;
+both still produce36/8. These do not faithfully prove equivalence to the original
+hard difference clip/raster context and do not identify the cause. V2147 binds
+all diagnostic evidence and keeps the original2/2 pixel gap open. Production
+renderer is unchanged this batch; fonts remain159/160 browser-exact. Strict
+reference failures and full6548 status remain independent and unclosed.
+Next: faithful original raster/clip replay rather than fitting endpoint colors.
+No fixture/reference/tolerance, outer code, commit or push changes.
+
+## 2026-10-08 Normal fallback leading clears fonts013; one font gap remains
+
+V2132 records the mixed-font RED: the original Courier/Ahem line projects74px
+instead of Chromium's72px. Its normal fallback estimate was being reapplied as
+primary-font leading after concrete fallback line metrics had already been
+combined. The inline collector now uses the concrete normal line's advance and
+baseline directly. Wrapping rejection still compares against the estimate used
+by the wrapping measure, without inflating the projected line. Fixed line-height
+and unresolved embedding estimates keep their existing behavior.
+
+V2133 passes24 unique focused tests. V2134 runs513 runtime tests:500 pass, the
+same13 failures remain and no new failures occur relative to V2123. After runner
+rebuild, V2135 confirms fonts013 at0/0 browser pixels. V2137 complete font-scope
+replay is159/160 exact (up from158/160), with no newly non-exact controls; V2139
+text30/30 remains exact. V2142 binds tracked and untracked source, RED, units and
+receipts, retaining strict reference FAILED entries independently.
+
+The remaining font case is family-rule002a,2/2 actual/reference pixels, at the
+blue link underline's endpoints (410,34) and (503,34). V2141 binds original-page
+Chromium geometry and unchanged screenshots: link x410.140625,width93.828125.
+Investigate fractional coverage/blending precision, not glyph replacement,
+fixture shifts or tolerance changes. This is font-scope closure progress only;
+full6548 remains unverified. No commit/push, outer code or product Agent
+knowledge/authority changes.
+
+## 2026-10-08 Registered primary baseline clears two font cases
+
+V2121 adds the painting-baseline RED: uncovered text in a registered Ahem stack
+uses an embedding ratio (51.2 at64px), not the registered primary font ascent51.
+The painter now keeps the registered primary strut even for uncovered text;
+coverage still selects the fallback glyph face. V2122 passes8 focused units;
+V2123 runs512 runtime tests,499 pass and the same13 failures remain. No new unit
+failures are introduced relative to V2114. The production runner was rebuilt.
+
+V2124's four historical font gaps now contain two exact cases. Independent
+V2126 complete font-scope replay confirms158/160 exact, up from156/160, with no
+new gaps. Family013 and fonts012 both have0/0 actual/reference browser pixels.
+V2128 text30/30 remains exact. V2131 binds source, RED, units and receipts and
+retains strict reference FAILED entries separately, without waiver.
+
+Two font gaps remain: family-rule002a at2/2 pixels and fonts013 at3767/0 pixels.
+V2130 diagnostic layout plus V2102 browser oracle narrow fonts013 to its third
+line: native74px vs browser72px, with both font boxes displaced2px. Next entry:
+normal text line geometry must not add a fallback estimate as primary leading
+again. Full6548 has not been replayed; these are focused improvements only.
+No fixture/reference/tolerance, outer code, knowledge/authority, commit or push
+changes.
+
+## 2026-10-08 Ahem fallback normal-line candidate awaits pixel acceptance
+
+V2112 records a runtime RED: a registered Ahem stack with uncovered accented
+text returns ascent/descent51/13 at64px instead of including the next family's
+58/16 normal-line metrics. Normal-line resolution previously returned early for
+every Ahem stack, bypassing its actual fallback runs. The candidate removes that
+early return while retaining fixed-line-height behavior and the primary strut.
+It does not alter text, glyph coverage, fixture fonts or references.
+
+V2113 passes8 focused tests. V2114 runs512 unique runtime tests:499 pass and the
+same13 failures remain, with no new failures compared with V2106. The production
+runner was rebuilt before V2115's canonical160-case font replay. It remains
+156/160 exact with no new gaps; family013's actual gap improves10000 to6306 pixels,
+with the control words now exact and remaining differences in Ahem-stack words.
+V2117 text30/30 remains exact. V2120 binds this focused partial improvement and
+independent strict FAILED ledger. Family013/fonts013 are not cleared. Next:
+registered primary strut versus embedding-ratio painting baseline. The full6548 goal remains open. Strict
+reference failures stay independent; no commit/push or outer code changes.
+
+## 2026-10-08 Numeric platform font weight clears the light-face browser gap
+
+V2104 records the RED: HTML standard text requested at weight100 resolves to
+weight400, whereas the page-bound Chromium oracle uses PingFangSC-Ultralight.
+Character fallback matching now receives the numeric CSS weight rather than
+normal/bold buckets; only default weight400 uses the existing primary coverage
+shortcut and canonical-decomposition shortcut. Measurement, font geometry and
+paint consume the same matched face. Registered font-stack selection is unchanged.
+
+V2105 passes8 focused tests, including light-face selection/metrics, installed
+italic, heavy sans metrics, missing-family context, canonical decomposition,
+bold normal metrics and small-caps. V2106 runs511 unique runtime tests:498 pass,
+the same13 failures remain, with no new failure relative to V2091. The production
+runner was rebuilt before pixel acceptance. V2107 fonts156/160 are双侧 exact:
+weight-rule007 improves1110/1110 actual/reference pixels to0/0, with no new font
+gaps. V2109 text30/30 remains exact. V2111 binds source and evidence and retains
+strict reference failures independently. This is focused acceptance only.
+
+Four font gaps remain: family013 and fonts013 (accented Ahem-stack line geometry),
+family-rule002a (2/2 pixels), and fonts012 (57/27 pixels). Original screenshots
+and V2102 platform-font evidence show the accented words use the intended next
+family in Chromium; their vertical placement differs from native. Investigate
+line metrics/baselines before replacing glyphs or changing font coverage.
+Full6548 has not been replayed. No fixture/reference/tolerance changes, commit,
+push, outer code or product Agent knowledge/authority changes.
+
+## 2026-10-08 HTML unresolved-family fallback clears three browser gaps
+
+Acceptance prioritizes DEFAULT Chromium pixel parity: both native actual/browser
+actual and native reference/browser reference require zero differing pixels.
+Strict native/reference and browser/reference failures remain independent FAILED
+entries, not waivers or passes. No fixture, reference, tolerance or browser
+backend changes are permitted by this acceptance split.
+
+V2089 records the missing-family RED (Times instead of the HTML standard face).
+The shared fallback now uses the language-aware standard face only for unresolved
+whole stacks in HTML standard-font context. Explicit generics, installed faces
+and non-HTML embedding fallback retain their existing paths. V2090 passes11
+focused units; V2091 runs511 unique runtime tests,498 pass and the same13 failures
+remain. The production runner was rebuilt before pixel comparison.
+
+V2092 fonts improves152/160 to155/160: invalid-characters001/003 and family-rule001
+are now exact, with no newly non-exact controls. Family-rule002a improves2192/2
+actual/reference pixels to2/2, but remains a browser gap. V2094 text30/30,
+V2096 anonymous tables154/154, V2098 table controls25/25 and V2100 interactive
+controls8/8 remain exact. These are focused scope results, not a new6548 census.
+
+V2103 binds current source, receipts, RED and runtime results, and saves166
+strict FAILED side entries independently (not166 unique cases). Five font cases
+remain: family013, family-rule002a, weight-rule007, fonts012 and fonts013.
+V2102 diagnostic browser evidence identifies PingFangSC-Ultralight for weight100;
+it is not evidence of a completed weight fix. Full6548 acceptance remains open.
+File-size checking retains the six outside-vendor violations; no outer code,
+product Agent knowledge, business authority or contract changes. No commit/push.
+
+## 2026-10-08 Small-caps clears37 browser gaps; strict failures remain independent
+
+Typed `font_variant` now survives CSS longhand/font shorthand, inheritance,
+anonymous/source merging, compiler native/DOM output, decoration-owner metadata
+and typography cache identity. Old styles default to normal; normal decoration
+metadata keeps its nine-field representation. Synthesis preserves original UTF8
+clusters, including uppercase expansions/combining marks, and applies spacing
+once per original cluster. Glyph-size ranges are shared by advance, paint,
+vector/raster ink bounds, clip culling and decoration intercepts. CSS font size
+and struts remain unchanged. Available script-default OpenType `smcp` is selected
+before synthesis; these receipts establish the exercised CSS2 paths, not every
+font/language/backend capability. `unicode-ccc`0.4.0 was already in Rustybuzz's
+closure and is now an optional direct Skia dependency, without a version upgrade.
+
+V2058 retains the original DOM RED; V2059 binds browser geometry and original
+page screenshots. Initial V2066/V2068 receipts establish the candidate improvement.
+After compiler-DOM/decoration propagation was completed, the final source was
+rebuilt and independently replayed: V2080 fonts152/160 browser-exact, V2082
+anonymous tables154/154 exact, V2084 text30/30 exact. Both native actual/browser
+actual and native reference/browser reference must have0 differing pixels.
+The45 historical font gaps become8:37 cleared,0 newly non-exact controls.
+The three target small-caps anchors are exact. This is336 exact cases in344
+focused cases, not full6548 acceptance or a current whole-corpus remaining count.
+
+Independent strict ledgers remain FAILED: fonts30 native/27 browser, anonymous
+tables45/45, text10/10. V2086 saves each failed relation separately, with no
+waiver/reference/tolerance/backend change. Final-source focused units pass:
+STD45,compiler93,DOM18,runtime12. Extended runtime510 retains exactly the13
+previous failures; DOM265 retains exactly the12 previous failures. The broader
+compiler substring selection V2063 also ran ESM tests and failed5; these are
+retained as unclassified here, not claimed green or proven preexisting. Direct
+CSS parser/style matcher/native-DOM codegen selection passes93 after rebuild.
+
+V2086 binds source, binaries, RED, initial/final browser receipts, strict ledgers
+and preserved unit failures: accepted focused improvement, not corpus closure.
+Parent file-size check still reports the same6 outside-vendor violations; no
+baseline raise or outer code change. No product Agent knowledge/authority or
+business contract semantics change. No commit/push/full parent gate.
+
+Next:8 font gaps (4 unresolved-family/default-context cases,2 accented Ahem
+fallback cases,one weight case,one dotted-I case). V2088 has page-bound browser
+geometry for the unresolved-family group: UnknownFont/test/White Space resolve
+to PingFang SC in this browser context; current unresolved native fallback selects
+serif rather than the HTML standard face. This identifies the next RED/candidate,
+not a completed repair. Keep the remaining bidi/normal-flow historical receipts
+separate; repair known failures before the fresh fixed-revision6548 gate.
+
+## 2026-10-08 Small-caps RED and page-bound browser oracle
+
+V2058 adds and executes one DOM regression: `font-variant:small-caps` is
+discarded (readback is empty); the shorthand also accepts the token without
+storing its semantics. This is a confirmed RED, not a promoted renderer fix.
+The initial test used a nonexistent accessor; that compilation error was
+corrected before V2058 and is not counted as the functional RED.
+
+V2059 captures three original font cases and their original references in
+DEFAULT Chromium141,800x600,DSF1. Before and after DOM/CDP geometry capture,
+all six screenshot hashes equal their V2052 browser receipts. The browser
+keeps computed CSS font sizes and line boxes: the96px Ahem small-caps glyph
+has67px advance while its line box remains96px. Times96px lowercase `e`
+has40.9375px advance. These are diagnostic geometry observations, not native
+pixel acceptance. Chromium141.0.7390.37 `SimpleFontData::CreateScaledFontData`
+uses `lroundf(ComputedSize()*0.7f)` for synthesized small-caps: scale and round
+the glyph font only, not the inherited CSS font size or parent strut.
+
+The three V2052 actual/reference browser gaps remain1628/5594/994 pixels
+respectively. Their strict native and browser reference comparisons each
+remain0; other strict failures retain their independent FAILED ledger.
+The current113 historical candidates contain112 freshly measured browser
+gaps (fonts45,bidi17,normal-flow50), not a new full6548 census.
+
+V2060 binds RED, browser oracle and unchanged production binary. No shaping
+candidate is accepted. Next entry: typed font-variant parsing/inheritance and
+merge/cache boundaries, then native OpenType/synthetic small-caps shared by
+measurement, paint and ink bounds, preserving original clusters and line
+metrics. Require focused pixel regression before promotion. No WPT fixture,
+reference, font, tolerance, commit or push changes; full6548 remains open.
+
+## 2026-10-07 Real GPU replay clears both synthetic bitmap corpora
+
+V846/V847 expand the attested832x256/254-stride real Metal mesh replay from
+sample points to complete360 and864 bitmap corpora. Both float and half byte
+stores match every browser pixel:0 failed cases/0 pixels in each corpus and
+store, including the colored opaque8x4 case357 that rejected V841. These are
+1224 unique synthetic bitmaps, not1224 original WPT cases. Production is unchanged.
+
+V848--V850 parameterize diagnostic GPU raster targets and capture DEFAULT-browser
+samples plus page-bound tile traces at four viewports. Actual targets are832x256,
+960x256,1024x256 and1600x320. All256 relocation samples match with fast math on/off
+and float/half stores. The800x600 browser control has0 drift from V808. Other
+viewports change6/6/8 browser samples:pixel precision really depends on context.
+The viewport-only formula predicts widths992/1056/1632 for resized contexts and
+is contradicted by their live traces. V827's explicitly limited assumptions
+must not be generalized to every live layer; actual raster context is required.
+
+V851 binds source, unchanged production binaries, bitmap/sample receipts and
+retained strict/unit failures. This establishes GPU diagnostic parity, not a
+production backend migration or a CPU fix. Runtime corpora still retain1+1
+pixels; Canvas-overlap and full6548 remain unaccepted. Next:actual mesh varying
+interpolation/raster context in the shared renderer with CPU fallback and full
+focused regressions. No WPT, browser backend, tolerance, commit or push changes.
+
+## 2026-10-07 Viewport reconstruction candidate rejected by complete focused corpora
+
+V829/V831 retain unsuccessful clip reconstruction/FMA arithmetic probes; the
+best64 relocation-sample outcome remains8 failures. V832--V837 capture actual
+Metal vertex clip positions and hardware barycentric coordinates. Decoding
+captured f32 values and separating viewport multiply/add before1/256 snapping
+reduces sampled failures to2; an independent CPU FMA roundtrip reproduces that
+diagnostic result. These are sample points, not new WPT failures or closure.
+V838/V839 screen/normalized-space varying-plane candidates do not clear them.
+Probe-only serialization, syntax, path and Y-sign errors were corrected before
+final receipts and are not renderer REDs.
+
+V840 establishes the360-case baseline using the same page/grid coordinates as
+the browser rather than isolated16x16 native canvases:still1 pixel at case319.
+V841--V844 test viewport-aware mesh reconstruction in independent native probes.
+The candidate fixes319 but introduces1 pixel at case357 (colored opaque8x4,
+blue17 versus browser16). The864-case candidate remains identical to current
+production at1 pixel/case221. This is a relocated failure, not improvement.
+The tile dimensions are diagnostic parameters only, never production constants.
+V845 rejects promotion, binds source/binaries/receipts, and preserves all prior
+strict-reference and unit failures. Current production remains V795. The
+Canvas-overlap counterexample and full6548 gate remain unresolved; no commit/push.
+
+## Acceptance priority: browser pixels; strict reference failures retained
+
+The acceptance target is zero differing pixels for native actual versus DEFAULT
+browser actual, and separately native reference versus DEFAULT browser reference.
+Strict native actual/reference failures stay FAILED in an independent ledger;
+browser parity does not waive or reclassify them. No reference/tolerance/backend
+changes are authorized. Focused diagnostic success is not full-corpus closure.
+
+V827 checks the tile calculator and default minimum height from the actual
+Chromium141.0.7390.37 tag. Under the explicitly recorded standard-GPU/DSF1/
+unclamped-texture assumptions, border padding and32-pixel alignment plus the
+default256 minimum height derive832x256 from800x600, matching the page-bound
+V823 trace. This is source-backed diagnostic evidence, not a production tile
+context implementation; the live settings of every layer are not inferred.
+Production CPU residuals1+1 and separate strict failures remain unresolved.
+
+## 2026-10-06 Actual browser tile context explains the GPU residual samples
+
+V812 snapshots the current mesh generator with diagnostic-only visibility;
+production APIs do not change. V813/V814 use real Metal triangle interpolation,
+capture edge-distance varyings and float color/coverage, and compare the64
+relocation samples:6 failures versus CPU8. The7x7 residual matches the browser
+under actual GPU interpolation, but8x4 still differs. Fast math on/off is
+unchanged. V815/V816 read actual RGBA8Unorm stores through both float and half
+fragment outputs:still6 failures, excluding store conversion alone. Initial
+probe-only function/half-constructor errors were repaired before these receipts.
+V817--V819 leave vertex snapping to the GPU:unchanged6 failures. V820/V821 use
+local rather than global edge attributes:16 failures, rejected as regression.
+
+V822 captures the DEFAULT-browser compositor/raster trace. V823 repeats with
+page-specific CDP LayerTree binding, layout metrics and fixture pixel capture:
+page root layer7 has800x600 bounds but raster content tiles832x256 at y0/254/508,
+scale1/translation0. The fixture still reproduces orange-edge green159 at
+origin0 versus158 at origins620/650. This distinguishes the actual test page
+from unrelated startup trace tasks. V824/V825 replay the same GPU geometry and
+attributes on832x256 instead of800x600:all64 samples match browser bytes, with
+both fast-math settings and both float/half output stores. No palette/origin
+correction, browser flag/backend change, tolerance change or WPT edit.
+
+V826 binds trace/page/tile evidence, source/binaries and unchanged V795 runtime
+state. These are exact diagnostic samples, NOT a production/backend migration,
+full bitmap corpus pass, or proof that the CPU path has been fixed. Runtime
+360/864 corpora still retain1+1 pixels; strict reference failures remain failed.
+Next:derive the raster context from rendering dimensions and model the relevant
+clip-space/interpolation precision, then rerun both full focused corpora and
+affected original cases. Do not hardcode the fixture's tile size into production
+or use origin tables. Only vendor diagnostics/docs changed; no commit/push.
+Parent size check retains6 unrelated violations; diff check passes.
+
+## 2026-10-06 Remaining oval precision is device-origin dependent
+
+V799/V800 preserve the actual Graphite final-coverage operation order instead
+of algebraically regrouping it: both diagnostic corpora still have1 pixel.
+V804/V805 evaluate plane-form barycentric interpolation instead of a weighted
+sum: unchanged1+1 pixels. Neither candidate is promoted. V807 records native
+RGBAF32 diagnostic storage before byte quantization: the7x7 green value is
+221.50006, but8x4 green is158.53627, so a universal store tie-breaking or epsilon
+adjustment cannot explain both. Float storage is not the acceptance backend.
+
+V808 DEFAULT-browser captures64 relocation samples at eight integer device
+origins/four quarter-pixel offsets for the two residual shapes. Bounds/CSS color
+and screenshot hashes are retained. The browser's same8x4 edge can be green158
+or159 after relocation (e.g.origin620 vs621 at y160);7x7 likewise221 or222.
+V809/V810 replay matching native coordinates on UNORM8 and diagnostic float
+surfaces:8/64 sampled positions differ. These are focused reproductions of the
+existing two residual classes, NOT eight new WPT failures or a full image suite.
+They support investigating actual GPU rasterizer/varying interpolation/device
+coordinates; the precise hardware mechanism is not yet established. No
+origin-specific correction table or browser-backend switch is introduced.
+V811 binds the new diagnostics to unchanged V795 production source, runner
+and unit hashes, retains strict reference failures and records the next check.
+No runtime changes this batch; only vendor diagnostics/documentation. Fixed
+WPT revision and prior focused acceptance remain unchanged, not refreshed full
+closure. Diff check passes; parent size check retains6 unrelated violations.
+
+## 2026-10-06 Complete oval mesh promoted; residual pixels still failed
+
+V773/V774 validate the complete36-vertex/69-index Skia strip, interpolating
+original edge distances over snapped device vertices. Runtime SkSL rejects
+array constructors, modulo and dynamic uniform indexing; the diagnostic uses
+constant-index triangle calls instead. These were probe compilation errors,
+not renderer RED. V775 expands DEFAULT-browser coverage to864 cases over12
+geometries (odd/small circles and thin ellipses), four offsets, three backdrops,
+two colors and three alphas. V778 records current142 failed cases/819 pixels
+versus the complete candidate1 failed case/1 pixel. V780 rejects the reduced
+eight-triangle shortcut:10 failed cases/67 pixels, including18x18 circles.
+
+Three new source-backed assertions record genuine RED inV781:6x6 translucent
+black/orange green116 vs117;8x8 colored/white green224 vs225;18x18 black/white
+gray31 vs32. The shared analytic_ellipse path now builds the full corner mesh,
+uses the vertex shader's literal rounded once to f32, and preserves unsnapped
+edge attributes. No palette/size lookup, epsilon coverage correction or source
+quantization workaround. Original fill/oval/effect/transform guards remain.
+V782 rebuilds the diagnostic unit binary and runs356 unique controls:349 pass,
+7 unchanged prior failures. All3 new assertions and retained layer controls
+pass. Ordinary optimized WPT runner build passes in2m04s with existing warnings.
+V787 mixed14, V789 lists10, V791 decoration14 and V793 justification4 remain
+browser-exact on actual AND reference. V795 binds current unit/runner/source
+hashes, RED and synthetic counterexamples, confirms40 unique original cases
+with0 case/side regressions againstV750/V752/V754/V756, and retains strict
+native reference failures independently. This is not the full corpus gate.
+
+Current-source independent binariesV783/V784 replay rather than infer promotion:
+V785 original360 cases207 ->1 pixel, V786 expanded864 cases819 ->1 pixel.
+The original residual remains8x4 black alpha128 on orange; the expanded one
+is7x7 colored alpha64 on white, pixel(7,3),native[208,222,246,255] versus
+browser[208,221,246,255]. Both remain FAILED. Earlier diagnostic-only status
+below is historical; it is not evidence of zero failure after promotion.
+Full6548, transformed geometry, performance and automatic Canvas-overlap
+surfaces remain unaccepted. Strict reference failures stay independent.
+Only vendor files changed; no WPT/reference/tolerance/backend changes or
+commit/push. Parent size check retains6 unrelated violations; no baseline
+increase. Renderer internals do not change Product Agent knowledge semantics.
+
+## 2026-10-06 Oval mesh interpolation diagnosis; production candidate not promoted
+
+V767 corrects odd-corner vertex ordering from the same Skia mesh: the8x4
+top-right/bottom-left triangles were reversed in the initial diagnostic.
+V768 reduces the360-case candidate from17 to1 differing pixel/1 failed case.
+V769 repeats at the actual800x600 page coordinates instead of local16x16
+coordinates; V770 still has the same1-pixel residual, so global coordinates
+alone do not explain it. Fresh DEFAULT-browser captureV771 repeatsV742 with
+zero pixel drift; source/binary/input-bound V772 independently replays baseline
+207 versus candidate1. The unchanged residual is case319,8x4,quarter-pixel
+offset,black alpha128 over orange: pixel(10,6),native[245,159,0,255] versus
+browser[245,158,0,255]. It remains FAILED, not a tolerance exemption. No runtime
+promotion has occurred; full mesh/transform and original-case proof remain open.
+
+V762 DEFAULT-browser grayscale captures constrain continuous edge coverage;
+the current formula exceeds several intervals by roughly0.0002--0.0004.
+V763 models Skia's real exterior triangle strip. V764 adds inner triangles,
+retains unsnapped varying attributes, and evaluates barycentric interpolation
+over snapped device vertices. Nearest1/256-pixel vertices reduce the360-case
+direct DOM diagnostic from207 to17 differing pixels, without color/size tables.
+This supports a mesh-interpolation mechanism; it is not full backend equivalence.
+
+V765 independently compiles a diagnostic Skia shader implementing that mesh.
+V766 replays both the prior source-bound binary and this candidate againstV742:
+baseline36 failed cases/207 pixels; candidate8 failed cases/17 pixels, all
+remaining cases8x4 ellipses on orange. Receipts retain complete native pixels,
+browser input/source/binary hashes and the fixed WPT revision. All new receipts
+use exclusive creation. This is a diagnostic-only candidate under ignored target,
+NOT a production fix, original-WPT regression pass, or full6548 acceptance.
+Its complete inter-corner mesh, transform behavior and remaining asymmetric
+edge precision still need verification before promotion. Existing strict
+reference failures and Canvas compositing counterexamples remain unresolved.
+No runtime code, WPT/reference bytes, browser backend or tolerance changed.
+Parent file-size check retains6 unrelated violations; no commit/push.
+
+## 2026-10-06 Explicit compositor surface boundary repaired; automatic overlap pending
+
+V745 DEFAULT Chromium141 / GraphiteDawnMetal independently captures90 cases
+in four scenes. Direct DOM background and a shared composited parent have
+identical pixels. A Canvas backdrop and individually composited oval have
+identical pixels; those two differ by724 pixels from direct DOM painting.
+CDP layer evidence reports Canvas + Overlap promotion for the Canvas scene,
+and WillChangeTransform for explicit oval/parent surfaces. Layer counts are
+4/6/94/94 respectively. This verifies that intermediate surface boundaries,
+not a universal color or geometry rule, account for the scene distinction.
+
+V746's initial unit fixture incorrectly put its orange backdrop on the document
+root, whose background is propagated; its white-background failure is retained
+as an INVALID fixture, not the renderer RED. Corrected V747 keeps a distinct
+document root and records the genuine independent-surface RED: native green68
+instead of browser69. V748 turns that unchanged edge assertion GREEN.
+`will-change` was already parsed into Style, but paint properties omitted its
+identity/opacity-one surface boundary. EffectNode now carries a surface-isolation
+flag; Skia both retained and baked paths allocate that surface, blend it using
+the normalized source-over path, and hash the flag for cache coherence.
+Ordinary opacity painting retains its prior paint and floating-point alpha.
+Shared parent/background painting is kept together; direct coverage precision
+is not globally quantized. No font, palette, case or coordinate workaround.
+
+The expanded unchanged sample assertions also cover cached picture replay and
+the non-retained baked path for all three owner placements. V749 executes353
+unique runtime controls:346 pass/7 unchanged prior failures, including all9
+retained-layer tests passing. Diagnostic CLI-only opt0/codegen-units16 is not
+the default optimized gate. Unit candidate builds pass; ordinary runner build
+passes in2m08s. Default-feature runtime cargo check passes in1m01s including
+runner lock wait, with existing warnings. V750 mixed14, V752 lists10, V754
+decoration14 and V756 justification4 remain browser-exact on actual AND
+reference. V758 binds source/untracked/runner/unit hashes and confirms40 unique
+original cases with0 regressions,0 previously-exact-side regressions and0
+unverified comparisons againstV732/V734/V736/V738. Mixed7 and decoration2 strict
+native reference failures remain independently failed; no WPT bytes changed.
+
+This does NOT implement automatic Canvas-overlap layerization, nor prove all
+multi-color scenes. Prior direct-scene207 pixels and Canvas counterexample1606
+remain unresolved evidence; they are not claimed repaired by one explicit-hint
+unit. Full6548 still not rerun/current accepted. Only vendor files changed;
+no commit/push. Diff check passes. Parent size check retains6 unrelated existing
+violations; baseline unchanged. Renderer property flags do not alter Product
+Agent business knowledge semantics. Next: remaining direct-scene precision
+cases and automatic overlap surfaces, then affected groups/full suite.
+
+## 2026-10-06 Tracked list gap browser-exact; compositing counterexamples retained
+
+V724 adds360 DEFAULT-browser DOM-background oval fixtures: five geometries,
+four offsets, three backgrounds (including orange), two colors and three
+alphas. It reproduces the original inside007 edge values106/68 and2/2.
+The240 overlapping cases differ by1606 pixels fromV605's Canvas-background
+scene. V742 independently repeats the new captures with identical pixels and
+attests Chromium141.0.7390.37 / GraphiteDawnMetal. Changing scene topology is
+not a browser-backend switch. This establishes a backdrop-dependent difference;
+offscreen/compositor quantization is a mechanism to investigate, not yet proved
+or implemented as a complete layer model.
+
+V728 compiles the current shared oval module and exact current color blender
+into an independent probe:208/360 cases have2865 differing pixels. The6x6 black
+oval over orange independently reproduces the same16 one-channel differences
+as the original WPT. Direct oval coverage now reaches destination blending
+without an intermediate source UNORM8 quantization. V730/V743 reduce the new
+scene to36 failing cases/207 pixels; orange6 becomes0. V741 half-color,
+half-coverage and half-product alternatives all worsen207 and are rejected.
+The old Canvas-background counterexample is explicitly retained: current
+probe differs by1606 pixels on its240 cases, versus the prior237. It is NOT
+waived, relabeled passing, or claimed equivalent to direct DOM painting.
+The candidate improves the actual WPT path, not all compositing contexts.
+
+Ordinary runner build passes in2m07s. Diagnostic unit build takes2m29s including
+runner lock wait. V731 runtime controls:352 unique/345 pass/7 unchanged prior
+failures, CLI-only opt0/codegen-units16, not the default optimized gate.
+Default-feature cargo check passes in6.37s with existing warnings.
+V732 mixed14, V734 lists10, V736 decoration14 and V738 justification4 all
+match DEFAULT browser actual AND reference at0 pixels. Root020 remains0/0;
+inside007 closes16/16 to0/0. These packets cover40 unique original tests;
+V740 records0 case regressions,0 previously-exact-side regressions and0
+unverified comparisons. Mixed7 and decoration2 native strict failures remain
+independent failures. References, WPT revision and tolerance remain unchanged.
+
+The previously tracked original browser gaps are closed only within this
+focused scope. Remaining evidence:207 direct-scene synthetic pixels,
+1606 old Canvas-background counterexample pixels, retained strict/unit
+failures, and the current-source full6548 sweep still not performed. No
+claim of corpus-wide zero or completed generic compositing. Diff check passes;
+no commit/push or outside-vendor edits. Size baseline and Product Agent business
+knowledge semantics remain unchanged. Next: backdrop/layer compositing and
+the remaining36 direct-scene cases, then affected-group and full-suite checks.
+
+## 2026-10-06 Root020 browser-exact; strict failures stay separate
+
+V711 DEFAULT Chromium141 geometry identifies the remaining root020 pixels as
+the `a` in fifth-line `equidistant`, not `approximately`'s terminal glyph.
+The original page uses PingFangSC. V712 records a genuine origin RED:
+native567.625244 floors to567.625, while the original browser Range starts
+at567.609375. The unchanged assertion turns GREEN inV713/V714 when justified
+glyph advances, including shaping/kerning adjustments, enter16.16 inline
+precision before accumulation. Non-justified measurement remains unchanged.
+No case-specific font, coordinate, palette or tolerance is introduced.
+
+This precision boundary follows Chromium141
+[ShapeResult glyph iteration](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/platform/fonts/shaping/shape_result.cc)
+and [InlineLayoutUnit](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/platform/geometry/layout_unit.h),
+not a replacement browser backend. V714 diagnostic runtime controls execute
+352 unique tests:345 pass/7 unchanged prior failures. CLI-only opt0 and
+codegen-units16 are not the default optimized gate. The ordinary runner builds
+in1m52s; diagnostic unit build in2m09s includes runner lock wait. Default-feature
+runtime cargo check passes in4.83s with existing warnings.
+
+V715/V716 mixed14:14 browser-exact; root020 closes58/58 to0/0.
+V719/V720 all four canonical justification cases:4 exact/0 regressions and
+0 previously-exact-side regressions againstV220. V721/V722 decoration14:
+14 exact. V717 lists10:9 exact/1 gap, unchanged16/16 in
+`list-style-position-applies-to-007.xht`. V723 binds current source, untracked
+files, runner/unit binary hashes, RED/GREEN and all four browser packets.
+Across these packets no case or previously-exact-side regression is introduced.
+Mixed7 and decoration2 native strict-reference failures remain independently
+listed as failures; WPT bytes, references and tolerance remain unchanged.
+
+The currently tracked browser gap is the list oval edge16/16, not a verified
+corpus-wide remaining count. Multi-color oval controls remain unresolved and
+full6548 has not been rerun on this source. White-space111 evidenceV708 remains
+historical, not relabeled current-source full proof. No commit/push or edits
+outside vendor. Diff check passes; parent size gate still has6 unrelated prior
+violations with baseline unchanged. Renderer-only precision changes do not
+affect Product Agent business knowledge semantics. Next: shared oval coverage
+and compositing, then current-source affected groups and the full sweep.
+
+## 2026-10-06 White-space111 browser-exact; strict86 retained separately
+
+V696 DEFAULT-browser diagnostics cover seven literal control pairs (RLO/LRO,
+RLE/LRE, RLI/LRI/FSI and their matching terminators), each as one or five DOM
+text nodes. All14 fixtures have280px advance at40px Ahem: three glyphs plus four
+spaces. Original WPT bytes and browser backend preferences remain unchanged.
+V697 records two real DOM REDs: single-node and cross-node lowering merge
+spaces across the controls. CSS whitespace collapse now treats literal format
+controls as non-whitespace boundaries; bidi shaping consumes their zero-advance
+characters later. No per-case, font, palette or tolerance workaround is used.
+
+DOM test build succeeds in22.48s. V698 executes37 unique controls:36 pass,
+1 fails. Both unchanged V697 assertions are GREEN. The prior strict assertion
+`css_whitespace_collapses_across_bidi_format_controls` still demands five cells;
+its fixture and expectation remain unchanged and FAILED, not ignored/waived.
+This browser-versus-strict conflict is separately listed, not hidden by the new
+browser-compatible assertions. V699 runtime diagnostics retain351 unique
+controls:344 pass/7 prior failures, using CLI-only opt0/codegen-units16 rather
+than the default optimized unit gate. Ordinary runner build succeeds in2m17s
+including lock wait; diagnostic build wall time2m07s includes runner lock wait.
+Default-feature runtime cargo check passes in4.95s with existing warnings.
+
+V707 original bidi001 layout now has280px Ahem text advance. V700/V701 original
+mixed14:13 browser-exact,1 root020 gap58/58; bidi001 closes actual0/reference0.
+Bidi002 remains0/0. Their native strict differences are20346 and11390 pixels,
+respectively, exactly equal to DEFAULT-browser actual/reference differences;
+both strict failures remain failed. V702 list10:9 exact/1 gap16/16. V704/V705
+decoration14:14 exact. All38 originals have0 case regressions,0 previously
+exact-side regressions and0 unverified comparisons againstV688/V690/V692.
+Mixed7 and decoration2 strict failures remain independently listed.
+
+V708/V709 expands the affected whitespace safety scope to all111 original
+canonical white-space reftests:111 browser-exact,0 gaps/0 regressions/0
+exact-side regressions/0 unverified. Baseline usesV457 with newerV688 overlapping
+cases, not an invented current full-suite result. Native strict failures86
+remain separately retained; DEFAULT browser also has86 strict failures, and
+all111 native/browser strict pixel counts agree. V457 already recorded86
+native strict failures in this group. Browser fidelity does not turn those
+references into passing tests. No reference, assertion, revision or tolerance
+is changed to obtain111 browser passes.
+
+V706 binds source/untracked/binary hashes, RED/GREEN, DOM strict failure,
+original layout and all four browser packets, including111 safety evidence.
+Two tracked browser cases remain: root02058/58 and list-position-applies00716/16.
+Full6548 and prior multi-color ellipse controls remain unverified/unresolved;
+these two are not asserted to be the corpus-wide remaining count. No commit,
+push or outside-vendor edits. Diff check passes; parent size gate retains6
+unrelated existing violations with baseline unchanged. Renderer-only changes
+do not affect Product Agent business knowledge semantics. Next: root020's
+remaining glyph pixels and the shared oval edge blend, then the full sweep.
+
+## 2026-10-06 Bidi002 browser-exact; failed intermediate candidates retained
+
+V670 records the resolved-level boundary RED: a Hebrew glyph and its closing
+LTR parenthesis share one lowered fragment. Bidi lowering now splits at resolved
+levels and retains their metadata. Compatible fragments may still share text
+storage, but retained UTF-8 boundaries preserve their used layout-unit origins.
+V671 DOM controls pass. V672 repeats351 runtime diagnostics:344 pass/7 fail.
+The ordinary runner builds in2m17s including lock wait. V674/V680 captures are
+NOT accepted: both bidi references become0 pixels, but bidi002 actual regresses
+from0 to5606. Case-level gap counts alone hid this actual-side regression;
+subsequent checkpoints additionally compare each previously exact side.
+
+V681's three-object coalescing assertion was an invalid structural oracle:
+shared text with preserved source boundaries can retain correct origins.
+It is corrected to verify retained UTF-8 boundaries, NOT counted as a renderer
+RED-to-GREEN. Prohibiting all cross-level coalescing causes existing bidi/RTL
+failures inV683/V684 and is reverted; neither failed receipt is overwritten.
+V682 separately reproduces a real embedding regression: three glyphs plus three
+spaces instead of two. V685's nonempty-fragment shortcut overcorrects this to
+one space and is rejected. Empty level-split whitespace fragments now recognize
+already-emitted synthetic NBSP boundary ownership; authored NBSP remains
+non-collapsible. Continuation ownership is limited to distinct source units.
+The unchanged five-character V682 assertion is GREEN inV686;35 unique DOM
+bidi/RTL/whitespace controls pass, including the original V670 boundary RED.
+
+The ordinary runner builds in1m56s; runtime diagnostic build wall time2m25s
+includes the runner lock wait. V687 retains the CLI-only opt0/codegen-units16
+profile distinction:351 unique controls,344 pass/7 prior failures. No default
+optimized unit gate is implied. Default-feature runtime cargo check passes in
+5.78s with existing warnings. V695 binds the original reference layout.
+
+V688/V689 mixed14:12 browser-exact/2 gaps; bidi002 closes actual0/reference0.
+Bidi001 remains actual9242/reference0; root020 remains58/58. V690 list10:9 exact,
+1 gap16/16. V692/V693 decoration14:14 exact. All38 originals have0 unverified
+comparisons,0 case regressions and0 previously exact-side regressions against
+V660/V662/V664. Mixed7 and decoration2 native strict-reference failures remain
+separately listed, never waived. These are packet-local counts, not full totals.
+V694 binds source/untracked/binaries, REDs, failed candidates, side-level deltas
+and current browser receipts. Three tracked browser cases remain, not proof that
+only three remain in6548. Full corpus is still unverified; no commit/push,
+outside-vendor edits or Product Agent business knowledge semantics changes.
+Diff check passes; parent size gate retains6 unrelated violations, baseline
+unchanged. Next: original bidi001 control-space browser mismatch and remaining
+root/list paint gaps, then the full fixed-revision sweep.
+
+## 2026-10-06 Bidi replay glyph-slice repair; browser and strict gates separated
+
+Replay can combine several source words under the first paint-client ID. The
+cached shared glyph slice for that ID still describes only its original word.
+The renderer now reuses a slice only when replay Text equals original Text;
+changed content is reshaped. V657 records a genuine black-on-white RED:239
+different pixels. Earlier white-on-white versions were false-green diagnostics,
+not proof of full text paint. Independent expected/actual renderers and a wide
+unwrapped expected rectangle remain in the unchanged zero-pixel assertion.
+
+V658 diagnostic units execute351 unique controls:344 pass,7 fail. The new replay
+RED is GREEN, and the seven prior failure names remain. These tests use CLI-only
+runtime opt-level0/codegen-units16: candidate build19.05s versus prior optimized
+builds around3m43s. This is not the default optimized unit gate. The ordinary
+WPT runner builds successfully in2m06s and supplies original pixel captures.
+
+V660/V661 mixed14:11 browser-exact,3 gaps. Bidi002 actual improves2328 to0;
+both bidi references improve2788 to45, confined to the closing parenthesis.
+Bidi001 actual improves11570 to9242 but remains failed. Root020 stays58/58.
+V662 list10:9 exact,1 gap16/16. V664/V665 decoration14:14 exact. All38 original
+cases have0 newly introduced browser gaps and0 unverified comparisons against
+their bound prior packets. Mixed7 and decoration2 strict-reference failures
+remain independently listed; these counts are packet-local, not corpus totals.
+
+V666 binds RED/GREEN, profile distinction, current source/untracked hashes,
+runner/unit binaries, browser captures and independent strict failures.
+Four tracked original cases still fail the two-sided browser pixel criterion;
+actual-only zero for bidi002 is not closure. Full6548 remains unverified.
+Diff check passes. Parent size check retains6 unrelated existing violations;
+baseline is unchanged. No commit/push or outside-vendor edits; renderer-only
+changes do not affect Product Agent business knowledge semantics.
+
+V667/V668 original layout diagnostics and V669 DEFAULT-browser character ranges
+separate the remaining reference gap from the fixed missing text. The actual
+pages use Times with one Times New Roman Hebrew glyph; the language-unspecified
+reference uses PingFang SC with one Lucida Grande Hebrew glyph. Browser reference
+closing-parenthesis range starts684.625. Native end-fragment starts674.28406
+while browser Hebrew range starts674.296875. This supports investigating used
+bidi-run origins rather than changing font family or tolerance. No rounding
+candidate is accepted yet. V669 initially missed CDP CSS.enable; enabling the
+read-only DOM/CSS agents fixes the diagnostic, not the renderer.
+
+## 2026-10-06 Edge arithmetic and unit-oracle audit; failures not waived
+
+V648 reuses the bound DEFAULT-browser240 ellipse captures and compares five
+coverage/color arithmetic paths. Current all-source UNORM8 retains237 differing
+pixels; unquantizing alpha only for opaque sources worsens this to333, and
+unquantizing their whole source worsens it to678. Quantizing color before
+coverage yields1718; removing source quantization entirely yields1606.
+No branch is accepted or changed in production. Original inside007 retains
+16/16 browser pixels, and prior multi-color controls remain failed.
+
+V649 independently reproduces Courier Canvas measurement:78 characters at10pt
+have width623.945068359375, while the precise per-character sum is623.9452514648438
+and naive sequential f32 sum is623.94482421875. Blink141 PlainTextNode uses cached
+words plus individual spaces with f32 item accumulation; this reproduces the
+Canvas width exactly. Crucially its source explicitly distinguishes Canvas word
+segmentation from LayoutNG whole-run shaping. Do not apply the Canvas scalar
+oracle to shared DOM shaping just to silence the existing precision assertion.
+The current Canvas DOM bridge still uses approximate measurement; that separate
+caller is not fixed or accepted by this diagnostic.
+Sources: [PlainTextNode](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/platform/fonts/plain_text_node.cc),
+[CachingWordShapeIterator](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/platform/fonts/shaping/caching_word_shape_iterator.h).
+
+V650 DEFAULT-browser fixtures expose two retained unit-oracle conflicts:
+`leading_float_margin_does_not_collapse_with_its_containing_block` native y8
+equals browser y8 for the ordinary following block; legacy assertion80 is the
+browser result only for a different fixture with clear:left. For the exact
+XHTML extracted from `first_child_margin_collapses_through_body_margin_at_document_root`,
+browser paragraph has normal Times height22 and following container y54,
+matching current native y54; legacy assertion51.2 assumes a different line strut.
+Assertions and fixtures remain unchanged. Seven unit failures are still counted,
+not converted to passes; these browser-aligned cases must not induce layout bugs.
+
+V651 binds current source/untracked hashes, the layout fixture source and all
+three diagnostic receipts. No production or assertion changes in this batch;
+REDs, strict-reference failures and full6548 unverified status remain retained.
+Diff check passes; parent size gate still has6 unrelated existing violations.
+No commit/push/outside-vendor changes or product Agent knowledge semantics change.
+Next: general Graphite edge blending or independently proven remaining browser
+layout failures, while maintaining the separate Canvas/DOM oracle boundary.
+
+## 2026-10-06 Inside geometry fixes float regression; edge blending remains
+
+V640 DEFAULT-browser diagnostic fixture places an inside disc beside the96px
+left float: marker ink is x104..109/y63..68. The initial diagnostic script's
+missing optional PNG decoder is corrected by browser Canvas decoding before
+capture; it is not renderer evidence. Original WPT bytes remain unchanged.
+V641 binds two unchanged runtime REDs after3m43s build: Ahem16 symbol advance
+is16 rather than6, and the preceding-float marker band starts103 rather than104.
+Generated symbol kind now drives shared font-derived reserved advance and
+relative ink geometry. Skia paints disc/circle/square geometrically rather than
+using their glyphs. Float bands retain the exclusion edge, while marker paint
+applies the inline margin separately. Ordinal markers retain their text path.
+
+Candidate unit build passes in3m43s. V642 repeats335 unique controls:328 pass,
+7 fail. Both V641 RED assertions are unchanged and GREEN; failure names match
+V623, removing V636's new float regression. The expanded gate remains FAIL.
+Runner build passes in2m07s. V643/V644 original list10 remains9 browser-exact,
+1 gap,0 unverified; strict-reference failures0. Original007 actual/reference
+differences reduce26/26 to16/16, maximum channel difference1, confined to disc
+edges x104..109/y63..68. Geometry is aligned but edge-color blending is NOT
+pixel-exact. No tolerance, palette-specific patch or reference change is used.
+
+V645/V646 mixed14 remains11 exact,3 gaps,0 regressions/0 unverified; seven
+strict-reference failures remain independently listed. V647 binds source,
+untracked modules, runner/unit hashes and explicitly compares list againstV638
+and mixed againstV625:0 regressions. The list's16 remaining pixels require
+general shared coverage/blending analysis, not another marker origin correction.
+Inside RTL, transformed/circle-stroke and broader corpus coverage are not proven
+by this narrow packet. Prior multi-color oval synthetic failures remain open.
+
+Four tracked original browser cases remain: root02058/58, bidi00111570/2788,
+bidi0022328/2788, list-position-applies00716/16. Full6548 is not currently
+verified and is not replaced by this smaller packet. Default-feature runtime
+`cargo check --profile wpt -p w3cos-runtime` passes in6.11s; diff check passes.
+An initially mis-profiled default dev check is explicitly cancelled, not counted
+as passing, after it began an unnecessary fresh Skia dependency build. Only that
+check's process subtree was stopped. Parent size gate retains6 unrelated existing
+violations with unchanged baseline. No commit/push/outside-vendor code changes;
+renderer-only work does not change product Agent knowledge semantics.
+
+## 2026-10-06 Inside spacing reduces browser gap; float regression retained
+
+Acceptance remains browser-first: original actual/native-browser and original
+reference/native-browser must independently reach zero pixels. Strict native
+actual/reference failures are listed separately, never waived or converted to
+passes. Runtime unit failures are another independent gate, not strict WPT
+reference failures. No WPT bytes, tolerances or browser backend settings change.
+
+Runtime unit build completes in4m00s. V636 repeats334 unique controls against
+the current source/binary:326 pass,8 fail. Compared with V623, the seven prior
+failure names remain and `inside_list_marker_uses_line_band_beside_preceding_float`
+newly fails: a -1px inline-start margin moves the first resolved float band from
+x104 to x103. Its original assertion remains unchanged. V636 is FAIL; the DOM
+spacing GREEN alone does not accept this candidate.
+
+Runner build completes in2m09s. V637 binds original list-position-applies007
+layout: table/row/cell/item now x104/y54/23x22, matching browser V633, rather
+than the prior8px width. Marker Text itself is x103/y54/8x22; geometric symbol
+paint and general font-derived reserved width are still unfinished.
+V638/V639 retain ten original list comparisons:9 browser-exact,1 browser gap,
+0 unverified and0 strict-reference failures. Against V629, the original007
+actual/reference browser differences reduce362/362 to26/26; the other nine
+remain0/0. The remaining26 pixels and new float regression are not hidden.
+
+Four tracked original browser cases remain: root02058/58, bidi00111570/2788,
+bidi0022328/2788, and list-position-applies00726/26. This is NOT the remaining
+count for full6548; the full corpus is not currently verified. Older broader
+strict failures remain separately retained. Next: separate marker placement
+from float exclusion geometry, preserve the failing assertion, then validate
+geometric marker paint against the unchanged original pages and controls.
+Diff check passes. Parent file-size check still reports6 unrelated existing
+violations; baseline is unchanged. No commit/push or outside-vendor edits;
+renderer-only evidence does not change product Agent business knowledge.
+
+## 2026-10-06 Inside marker spacing RED→GREEN; runtime verification pending
+
+Original list-position-applies007 remains362/362 browser pixels. V632 current
+native layout shows table/cell/list-item width8 and height22; marker is ordinary
+Text("•"). V633 captures original and reference browser DOM under the same USER
+stylesheet: both list-items x104/y54/23x22 and marker margins-1px/16px, font16px
+Times. No WPT bytes are modified. Blink141 `InlineMarginsForInside` reserves-1px
+before and1em after predefined symbol markers; ordinary glyph width alone is not
+the marker's inline advance.
+
+New unchanged spacing assertion V634 is RED (Px0 versus Px-1, exit101), after
+24.48s DOM build. Initial fixture used Dimension where margin requires Spacing;
+that compile error was corrected before RED and is not runtime failure evidence.
+DOM lowering now assigns these margins only to inside disc/circle/square and
+marks their internal symbol kind. Decimal suffix/outside lowering is unchanged.
+V635 DOM controls6/6 pass after24.41s build, including unchanged numbering,
+outside marker and counter controls. The unchanged spacing assertion is GREEN.
+Expanded runtime unit binary is now rebuilding; no pixel improvement claim yet.
+Symbol paint is still ordinary glyph paint, not yet fixed. Complete spacing,
+intrinsic symbol width, geometric paint and focused regression before closure.
+No commit/push/outside-vendor change; parent size gate retains6 unrelated violations.
+
+## 2026-10-06 Shared filled-oval candidate closes two original browser gaps
+
+V620 records exact runtime RED after3m42s unit build: shared circular background
+pixel(3,3), size4, is169 instead of DEFAULT-browser158; exit101. The unchanged
+test also covers4px side gray7 and8px edge gray205/77. Source/binary/WPT bindings
+are preserved. `analytic_ellipse.rs` now implements the source-derived Graphite
+corner-outset correction for ordinary solid filled oval RRects, called from
+shared `draw_rounded_rect`; it is not a marker-only or palette-specific override.
+Shader/filters/path effects/strokes/non-axis transforms retain their old path.
+Paint alpha is included exactly once, existing clips/blending are preserved,
+and the effect is cached per thread. Candidate runtime unit build passes in3m43s.
+V623 preserves the unchanged circle assertion GREEN and expands prior controls
+to334 unique tests:327 pass,7 fail; the failure names are unchanged fromV595.
+The expanded gate is still FAIL, not full acceptance. Runner build2m07s passes;
+default runtime check8.69s and diff check pass.
+
+V621 compiles the actual new module with the current color-paint blender source;
+V622 evaluates all240 DEFAULT-browser controls and binds both production files
+and probe binary. It reproduces the prototype's237 DOM pixels, including all120
+black-color configurations exact. Multi-color controls still fail and remain
+recorded; this partial candidate is NOT full oval compatibility or WPT closure.
+V625/V626 original mixed14 improves10→11 exact,3 gaps,0 regressions/0 unverified:
+`white-space-applies-to-003` actual/reference12/12→0/0. V627/V628 decoration14
+remains14 exact,0 regressions/0 unverified. V629/V630 list10 improves8→9 exact:
+`list-style-position-018` actual/reference60/60→0/0. V631 compares list coverage
+againstV587 explicitly:0 regressions. Strict failures remain independently7/2/0
+for mixed/decoration/list packets; they are not waived by browser pixel closure.
+`ellipse-checkpoint-v631.json` verifies source, runner, unit binary, untracked
+module and native-result hashes, and indexes RED/GREEN plus all three deltas.
+
+Four tracked original browser gaps remain (NOT full6548 remaining count):
+root02058/58; bidi00111570/2788; bidi0022328/2788; list-position-applies007362/362.
+Multi-color oval controls still have237 diagnostic pixels; seven unit failures
+remain. Expanded unit gate FAIL means these focused proofs do not supersede the
+last accepted broader packet, and full6548 has not been rerun or accepted.
+No WPT/tolerance/dependency/outside-vendor code/commit/push change. Product Agent
+knowledge semantics are unaffected by renderer-only coverage math.
+
+## 2026-10-06 Browser-first ellipse diagnostics; no paint replacement accepted
+
+Integration starts with exact runtime regression
+`render_skia::tests::filled_circle_edges_match_default_graphite_browser`:
+ordinary shared `draw_rounded_rect` must reproduce4x4 edge gray158/7 and8x8
+edge gray205/77. Assertions use the original DEFAULT browser values without
+tolerance. This test's RED is now recorded inV620 (see integrated candidate above).
+At the diagnostic-only stage the painter was unchanged until RED. Expanded regression and original
+actual/reference pixel checks still follow the candidate; not full-suite closure.
+
+V618/V619 additionally evaluates the Graphite-derived shader on native Metal
+with ordinary hardware SrcOver (rather than the compensated custom blender).
+DOM differences remain301 for RGB/alpha-quantized mode, versus CPU237;
+hardware SrcOver is not the missing fix. Source/binary/capture bindings and
+all240 configurations are retained. Multi-color failures remain separate from
+the completed black-color geometry controls.
+
+V613 DEFAULT-browser SystemInfo establishes `skiaBackendType=GraphiteDawnMetal`
+with GPU rasterization enabled (ANGLE Metal/Apple M5), NOT Ganesh. WebGL samples4
+is diagnostic context state, not assumed to be the DOM raster sample count.
+Earlier Ganesh operations and native Metal comparisons cannot identify the actual
+browser paint algorithm. Fixed-revision [Graphite analytic round-rectangle step](https://raw.githubusercontent.com/google/skia/5eefbe51d17d2e379fa2d7353827e0ccb1e1f601/src/gpu/graphite/render/AnalyticRRectRenderStep.cpp)
+and [fragment shader](https://raw.githubusercontent.com/google/skia/5eefbe51d17d2e379fa2d7353827e0ccb1e1f601/src/sksl/sksl_graphite_frag.sksl)
+explain the missing geometric term: exterior triangles interpolate base-shape
+coordinates plus a negative device-space outset distance. Evaluating only the
+ellipse equation at the final pixel coordinate loses this correction.
+
+V614's source-derived axis-aligned oval corner control closes all20 opaque
+black/white geometry configurations. Compiled CPU RuntimeEffect V615/V616 agrees
+with the arithmetic model: source RGB/alpha UNORM8 control reduces DOM differences
+to237, and all120 black-color configurations (both backgrounds/all3 alphas) are
+exact. Multi-color configurations still fail. V617 jointly tests half rounding
+with corrected geometry/UNORM8; best141 differences, still NOT closure or an
+accepted painter. No size-specific/palette-specific exception, browser flag,
+native acceptance backend or production source changed. Next complete multi-color
+and independent non-oval/transform/clip controls before generic paint integration.
+
+Backend isolation V609/V610 uses native Skia Metal surfaces, ordinary oval and
+oval RRect draws, and requested sample counts0/4/8. All240 configurations complete;
+DOM CSS differences are3696/6728/6728, respectively (oval/RRect match). Switching
+to GPU or MSAA is therefore NOT a fix and the native acceptance backend remains
+unchanged. V611/V612 runs the same analytic shaders and existing compensated
+blender on Metal: exact-bounds quadratic has2096 DOM differences versus CPU2048,
+also not closed. Receipts bind source, binary and the reused DEFAULT browser
+capture. No production renderer/backend source changed.
+
+Source investigations must bind the actual browser dependency, not assume that
+an evolving branch is identical: [Chromium141.0.7390.37 DEPS](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/DEPS)
+pins Skia `5eefbe51d17d2e379fa2d7353827e0ccb1e1f601`. Continue using that revision
+for browser algorithm analysis; do not upgrade dependencies as an unverified fix.
+
+Arithmetic isolation V607 tests16 combinations of binary16 color, coverage,
+source-product and final-blend rounding. It includes exact/subnormal/tie controls
+for the binary16 model; none closes the matrix (best2032/2000 variants versus2048
+unmodified diagnostic pixels), and black/white controls remain64–80 differences.
+V608 independently tests UNORM8 source RGB, source alpha and destination-product
+quantization. Quantizing source RGB+alpha reduces2048→896 differences, while
+black/white geometry controls remain64; all16 variants still fail. This is an
+arithmetic-model diagnostic, NOT proof of the browser backend implementation or
+native painter integration. Both receipts bind the complete V605 browser capture
+by SHA256 and retain case-level counts and failure samples. The next geometric
+investigation targets6x6 corners,8x8 corner-edge pixels and8x4 ellipse corners;
+do not encode these sizes or observed palette values as production exceptions.
+
+Follow-up V605 captures the same240 configurations with an additional SVG ellipse
+path. V606 evaluates all7 native modes and supersedes V605 aggregate counts:
+V605 accidentally evaluated only the first4 modes, so its zero columns4–6 are
+NOT pass evidence. V606 retains the original capture and its SHA256, marks this
+counting defect explicitly, and finds2048 DOM CSS oval vs5390 SVG ellipse
+differences for snapped/exact-bounds quadratic coverage. No production candidate
+is accepted. Color controls expose one-channel packing differences even where
+opaque black/white4x4 is exact; larger ellipse corners still differ geometrically.
+
+Acceptance remains exact native actual vs DEFAULT browser actual, with native
+reference vs browser reference checked separately. Strict native actual/reference
+failures remain an independent ledger; they are not waived or used as a substitute
+for browser fidelity. No WPT files, reference pages or tolerances were changed.
+
+V599/V600 records240 synthetic configurations (sizes, quarter-pixel positions,
+colors, backgrounds and alpha),256 complete RGBA pixels per case. Canvas ellipse
+and Canvas oval roundRect match each other but not DOM CSS oval rendering. None
+of the proposed coverage algorithms passed the complete synthetic matrix.
+V601/V602 bounds controls reduce quadratic-gradient DOM differences5520→4184
+pixels, while the opaque black/white integer4x4 control alone becomes exact.
+This single control is insufficient evidence for production integration.
+
+The captured DOM matrix additionally shows pixel snapping: quarter-pixel offsets
+match the integer location; half-pixel offsets move to the next pixel. Snapped
+bounds V603/V604 reduce the exact-bounds quadratic DOM matrix4184→2048 differing
+pixels, but worsen the Canvas comparison. These counts are synthetic diagnostic
+pixels, NOT original WPT cases or remaining full-suite failures. V602/V604 bind
+the reused DEFAULT Chromium141 V600 capture by SHA256, native source and binary,
+and preserve all cases/native RGBA samples. The tested geometric algorithm is
+informed by [Skia141 ellipse operations](https://raw.githubusercontent.com/google/skia/chrome/m141/src/gpu/ganesh/ops/GrOvalOpFactory.cpp);
+the separate [rounded rectangle operation](https://raw.githubusercontent.com/google/skia/chrome/m141/src/gpu/ganesh/ops/FillRRectOp.cpp)
+is not assumed to be the same browser drawing path.
+
+No production source changed in this diagnostic batch. Original marker12/12,
+six tracked browser-gap cases, seven runtime unit failures and unverified full6548
+status remain unchanged. Next isolate remaining geometry/clip/color differences
+with independent controls before any shared painter replacement. Parent size gate
+still has6 unrelated outside-vendor violations; baseline unchanged. No commit/push.
+
+## 2026-10-06 Outside marker geometry integrated; ellipse coverage still differs
+
+Outside markers were previously omitted in DOM lowering. V585 is an exact RED
+for the missing default symbol. Lowering now emits out-of-flow ordinary boxes
+for disc/circle/square and preserves ordinal text; shared layout derives symbol
+rectangles from font ascent, first in-flow text baseline, direction and content
+edges. Existing box painters consume the rectangle, not an Ahem bullet glyph.
+Geometry follows [Blink141 ListMarker](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/core/layout/list/list_marker.cc);
+its [symbol painter](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/core/paint/text_fragment_painter.cc)
+pixel-snaps the symbol and fills/strokes its ellipse.
+
+V586 exposed an additional real bug, not a failed numeric expectation: inserting
+a generated marker caused directly stored Element.textContent to disappear.
+V594's linked current-DOM probe shows only the marker and no content Text node.
+Lowering now retains that anonymous content run before generated marker insertion.
+The unchanged geometry/content-origin/112px-width assertion passes in V595;
+runtime controls326/333 pass with the7 earlier failures retained. DOM V5965/5
+passes, including unchanged inside numbering controls. First unit build3m58s,
+repaired build4m00s, runner2m08s, DOM26.31s; default check9.07s and diff check pass.
+
+V598 confirms original marker rectangle x17/y83/4x4 and unchanged text x32/y76/
+112x16. V589/V590 original actual AND reference gaps improve16→12 pixels; these
+are ellipse-edge gray differences, max32, within the same4x4 bounds. This is NOT
+pixel closure. Mixed14 stays10 exact/4 gaps with0 regressions/0 unverified;
+V591/V592 decoration14 stays14 exact. Strict mixed7/decoration2 remain independent.
+
+New original list coverage V587/V588 is8/10 browser exact and0 unverified; strict
+native/reference failures0. It is new coverage, not a pre-candidate regression
+proof. Remaining new gaps: list-style-position-01860/60 pixels (ellipse edges),
+list-style-position-applies-to-007362/362 pixels (inside/table geometry). These2
+plus4 mixed gaps form6 currently tracked cases, NOT a full6548 remaining count.
+Circle painting, image/custom markers, empty principal-line height, fixed-owner
+projection and broad multi-backend/device acceptance remain unverified; no
+whole list-marker or full-corpus closure claim is made. Further performance work
+should bound empty-item descendant scans to avoid quadratic traversal.
+
+Evidence/hashes: `outside-marker-checkpoint-v597.json`. Next isolate DEFAULT GPU
+ellipse coverage against ordinary Skia raster, with exact color/alpha controls;
+do not tune marker coordinates or widen pixel tolerance. Full6548 unverified.
+No dependencies, outside-vendor code, product knowledge semantics, commit or
+push changed. Parent size gate retains6 existing outside-vendor violations.
+
+## 2026-10-06 Explicit hyphen wrapping improves original list-item page
+
+Original `white-space-applies-to-003` actual AND reference browser gaps improve
+1162→16 pixels in V579/V580. The remaining pixels are the missing outside list
+marker; the case is still a browser gap, not closed. Native strict reference
+still passes, demonstrating why browser fidelity is tracked independently.
+V581/V582 canonical text-decoration14 stays14 exact. Mixed focus stays10 exact /
+4 gaps, with0 regressions/0 unverified; strict7/2 failures remain separately
+retained. Root020 and both bidi gaps remain unchanged. Full6548 unverified.
+
+Shared shaped-run wrapping now selects the latest space or explicit hyphen
+opportunity and retains the hyphen on the preceding painted line. It handles
+hyphen-minus and U+2010, not U+2011; existing pre/nowrap behavior remains.
+This is not a full Unicode line-break implementation claim. V576 captures50
+DEFAULT Chromium141 DOM controls; V577 records an unchanged implementation RED
+(`left-hand` did not split). V578 closes the new assertion and retains the7
+earlier unit failures:292/299 pass. V584 text-layout42/42 also passes. Browser
+oracle differences from current Unicode defaults are resolved by the measured
+DEFAULT browser, not by substituting software rendering or rewriting WPT.
+
+RED build mistakenly omitted the established dynamic-js feature and took3m25s;
+that skia-only binary provides the minimum failing assertion, not comparable
+expanded-gate proof. Candidate uses the established dynamic-js,skia feature set:
+unit build3m43s, runner build2m06s, default runtime check6.67s and diff check pass.
+No dependencies, outside-vendor source, product knowledge semantics, commit or
+push changed. Parent size gate retains6 existing outside-vendor violations.
+Bindings, unchanged RED, unit controls, pixel improvement and independent strict
+ledgers are indexed in `hyphen-break-checkpoint-v583.json`. Next handle outside
+list-marker geometry/painting without changing in-flow text or reference pages.
+
+## 2026-10-06 Browser-first precision regression verified; strict failures retained
+
+Acceptance follows the user's browser-first instruction: native actual vs
+DEFAULT browser actual and native reference vs DEFAULT browser reference must
+each have exactly0 differing pixels. Strict native actual/reference failures
+remain a separate ledger, even when both pages are browser-exact. No tolerance,
+software-browser substitution or authored reference rewriting is allowed.
+
+V566 is291/298 units, with7 existing failed assertions retained. The unchanged
+opaque color-packing RED now passes; device translation/scale, overline and
+DEFAULT GPU endpoint controls pass. V574 extracts the current production
+shader/blender and matches all768 configurations /3072 sampled pixels.
+V567/V568 mixed original focus is10 exact/4 gaps; V569/V570 canonical
+text-decoration14 is14 exact. Both packets have0 regressions/0 unverified;
+strict failures remain7 and2 respectively (overlapping scopes, not additive).
+These focused packets remain diagnostic because the unit gate is red, and do
+not supersede the broader accepted packet or establish full6548 closure.
+
+Unit build3m41s, runner build2m06s and default runtime check6.42s pass. The four
+tracked mixed-focus browser gaps remain root020, applies003 and bidi001/002.
+They are not the full-corpus remaining count. Evidence and hashes are bound in
+`decoration-coverage-checkpoint-v571.json`. No commit/push, outside-vendor code
+or product knowledge semantics changed; parent size gate retains6 existing
+outside-vendor violations. Continue browser gaps and independently resolve the
+7 unit failures using matching oracle layers, preserving all strict receipts.
+
+## 2026-10-06 Compensated precision integrated; runtime regression pending
+
+Analytic decoration blending now uses V563's compensated product/sum and
+UNORM conversion, with dynamic255 normalization to preserve division precision.
+No authored color, geometry, opacity, existing test assertion or case selector
+changed. V573 extracts shader/blender strings directly from the current
+production source; V574's fresh default-browser comparison covers768 cases /
+3072 sampled pixels with0 gaps (ordinary raster1712). This strengthens the
+prototype proof but does not replace full runtime/original-page regression.
+
+Unit build87441 is live. Planned V566 replays298 controls and must close the
+unchanged V551 color-packing RED. Then mixed original V567/V568 vsV552 and
+decoration original V569/V570 vsV554 retain strict ledgers and failed gate if
+the7 earlier unit failures remain. Full6548 unverified. Parent size gate still
+reports6 existing outside-vendor violations. No outside-vendor code, product
+knowledge semantics, commit or push changed.
+
+## 2026-10-06 Both original decoration endpoint cases browser-exact
+
+V552/V553 closes length001 and length002: BOTH original actual/reference pages
+have0 native/browser differing pixels. Mixed focus14 is now10 exact/4 gaps,
+0 regressions/0 unverified. V554/V555 canonical text-decoration14 is14 exact,
+0 gaps/regressions/unverified; all12 V549 controls stay exact. Strict failures
+are independently retained:7 mixed-focus and2 decoration-focus. Neither packet
+supersedes last accepted broaderV457/V458's100 strict failures or the full6548
+corpus. Remaining4 tracked mixed-focus gaps are root020, applies003 and both
+bidi cases; this is NOT the full corpus remaining count.
+
+V551 is290/298 units: the7 previous failures plus a NEW exact default-browser
+opaque color-packing RED. Device translation/scale and corrected DEFAULT GPU
+8/92 endpoints pass. Unit build3m40s, runner build2m04s; default runtime check
+and diff check pass. Unit gate remains red, so both pixel packets are diagnostic,
+not accepted broader closure. Production uses general analytic rectangle area
+with no case/color exception; its19 synthetic packing failures remain explicit.
+
+V557 mathematical float models isolate normalization, fused multiply-add and
+UNORM conversion without an intermediate float-product rounding. V558/V559's
+integer-bit ES3 alternative is rejected: initial ES2 uint/bitcast rejection,
+then mixed shift-type errors were corrected, but the resulting drawing still
+has2576 gaps. No production integration of that failed path occurred. V561/V562
+uses a float-only compensated product and improves19→1. V563/V564 adds
+error-free product/sum compensation for fused multiply-add: all768 configurations
+and3072 sampled pixels match DEFAULT browser with0 gaps. This is independent
+Skia raster proof, NOT yet the production algorithm or full WPT acceptance.
+Next integrate the compensated precision path, close the newly added color RED,
+and replay unit controls + both original packets without changing assertions.
+Full6548 unverified; no outside-vendor code, product knowledge changes, commit
+or push. Parent size gate retains6 outside-vendor violations.
+Evidence: `soft-wrap-units-v551.json`, `fractional-spacing-delta-v553.json`,
+`decoration-controls-delta-v555.json`, `decoration-coverage-controls-v564.json`,
+`decoration-coverage-checkpoint-v565.json`.
+
+## 2026-10-06 General analytic decoration coverage candidate; verification pending
+
+V549/V550 expands to all14 canonical text-decoration cases:12 browser exact,
+2 known endpoint gaps,0 unverified. The12 newly covered cases are exact, not
+pre-candidate regression proof; only the2 previously covered cases have a
+V544 comparison. Strict2 failures remain independent. The helper's first
+invocation failed from an escaped-regex syntax error before artifacts; a prefix
+selection retaining the same canonical14 scope then ran successfully.
+
+The production candidate now evaluates fractional rectangle pixel area in
+device coordinates, floating-point SrcOver then UNORM packing. It handles
+all authored colors/alpha and axis scale/translation, preserving device clips;
+non-axis/perspective transforms retain the previous geometry path. Runtime
+effects are cached per thread. This is NOT full GPU equivalence: V537 still has
+19 synthetic opaque color/background packing REDs. One exact default-browser
+color-packing RED is added as a runtime assertion, not waived. A device
+translation/scale control is also added. The previously mislabeled6/91 endpoint
+assertion is corrected to DEFAULT GPU8/92 using V525 and V528/V529's explicit
+GPU/software provenance, rather than loosening tolerance or removing the test.
+
+Default runtime check passes4.70s before the two added test bodies; diff check
+passes. Unit build45551 is live. Current candidate unit/original pixels remain
+unverified. Planned unitV551, original focusV552/V553 vsV544, and decoration
+V554/V555 vsV549 retain failed gate/strict ledgers. Full6548 unverified; no
+outside-vendor code, product knowledge semantics, commit or push changed.
+
+## 2026-10-06 Overline geometry fixed; original endpoint gaps retained
+
+Local/inherited overlines now use fragment TextTop minus floored thickness,
+not owner baseline-shift/ascent. V543 covers296 unique controls:289 pass,
+7 prior failures retained; the new fragment-position control passes and no
+existing assertion changed. Unit build3m44s, runner build2m05s, default runtime
+check5.90s and diff check pass. Parent size gate retains6 outside-vendor violations.
+
+V544/V545 compares14 original actual/reference WPT pages with V521 baseline:
+8 exact,6 gaps,0 regressions,0 unverified comparisons. Length001 improves
+from1968 to18 actual pixels and1956 to6 reference pixels. Its three vertical
+stripe positions now match the browser; remaining pixels are fractional
+endpoints. Length002 remains12/6, other tracked gaps unchanged. Strict7 focused
+failures remain separate. Because7 unit failures remain, this packet is
+DIAGNOSTIC_FAILED_UNIT_GATE_NOT_ACCEPTED, not broader/full acceptance.
+
+Coverage prototypes remain outside production: V537's explicit UNORM output
+quantization improves synthetic3072-sample differences35→19; V538 integer
+translation changes0 browser samples. V540 reordered blend worsens to25 and
+is rejected. Next resolve these19 blending/packing controls, and check other
+canonical text-decoration cases affected by the shared overline change. Full
+6548 has not run; do not treat6 focused gaps as the corpus remainder. No
+outside-vendor code/product knowledge semantics, commit or push changed.
+Evidence: `soft-wrap-units-v543.json`,
+`fractional-spacing-browser-v544/receipt.json`,
+`fractional-spacing-delta-v545.json`, `decoration-overline-checkpoint-v548.json`.
+
+## 2026-10-06 Overline fragment-local candidate; build pending
+
+V536/V537's explicit UNORM output quantization reduces analytic-control
+differences from35 to19. V538 integer translation changes0 browser samples,
+so position-dependent dithering is not observed in this packet. V539/V540's
+reordered blend expression worsens differences to25 and is rejected. None of
+these coverage prototypes is integrated into production.
+
+Separately, original length001 V521 RED (1968 actual/1956 reference pixels)
+and unchanged-browser V542 show fragment top positions69/81/93 with overline
+stripes63/75/87. Native V541 geometry agrees, but decoration was incorrectly
+undoing descendant vertical alignment and subtracting owner ascent. Chromium141
+TextDecorationInfo::SetOverlineLineData/ComputeUnderlineOffsetForUnder uses
+fragment-local TextTop offset minus floored thickness, unlike underline.
+The production candidate applies that distinction to local/inherited overlines
+and adds a stripe-position control without changing any prior assertion.
+Primary sources:
+https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/core/paint/text_decoration_info.cc
+https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/core/layout/text_decoration_offset.cc
+
+Unit build session76486 is live; candidate units and original-page pixels are
+not yet verified. Planned V543 replays V520's controls; V544/V545 compares the
+same14 original pages with V521 as baseline. Unit failures will remain explicit,
+strict native/reference failures independent, and full6548 unverified.
+Parent file-size gate still has6 outside-vendor violations; no baseline raised,
+outside-vendor edits, product/business knowledge changes, commit or push.
+
+## 2026-10-06 Analytic fractional coverage broad controls, not yet integrated
+
+V531/V532 tests768 synthetic configurations:64 fractional positions,2 colors,
+3 alpha values and2 backgrounds, sampling3072 pixels from the DEFAULT browser
+screenshot. Canvas is read only after painting/capture, avoiding readback-driven
+software fallback. Ordinary native raster has1712 differing sampled pixels.
+An independent runtime-shader prototype computes exact per-pixel horizontal
+area and floating-point SrcOver, without changing geometry/colors:35 differences
+remain. All384 translucent configurations agree; opaque colored/background
+rounding boundaries remain red. These are synthetic controls, not WPT closure.
+
+V533/V534's explicit half-precision quantization hypothesis increases differences
+to61 and is rejected. Its initial shader compilation failed because this SkSL
+version has no round(float); a floor-based diagnostic quantizer then ran. It
+does not claim full IEEE half rounding semantics. No production path or existing
+assertion was changed. Source bindings remain V521's tracked/untracked hashes.
+Next use the35 remaining controls to establish GPU output/blending precision
+before selecting a production rectangle-coverage implementation. Do not adopt
+the rejected quantizer, restrict to black solely for green tests or change the
+default browser oracle. Original WPT remains8/14 exact,6 gaps; strict7 separate,
+runtime units288/295; full6548 has not run. No commit/push.
+Evidence: `decoration-coverage-controls-v532.json`,
+`decoration-coverage-controls-v534.json`.
+
+## 2026-10-06 Decoration length002 GPU/CPU coverage difference isolated
+
+Original-page V524 reproduces V521's default browser PNG hash exactly and
+shows all three text ranges and wrapper boxes agree with native V523 geometry.
+V525 draws those same rectangles independently: default Chromium canvas and
+screenshot endpoints are8/92, whereas native raster rectangles yield6/91.
+V528's software-browser-only diagnostic gives6/91. V529 loads the unmodified
+original actual XHTML with GPU disabled:0 pixels against native,12 against the
+default browser. This isolates coverage/blending rather than layout or colors.
+
+The acceptance oracle remains the DEFAULT browser: length002 still has12
+actual/6 reference differences. The software-browser comparison is diagnostic,
+not a waiver or closure. V526's sRGB/F16 surface controls do not resolve this.
+V527's path/runtime-blender sample reaches8/92 but is not a production fix or
+full-page proof; Blink's solid decoration source uses rectangles, so switching
+primitives solely to fit two samples is not justified. Next investigate GPU
+analytic coverage/blending with broader fractional-edge/color/opacity controls.
+The first V527 probe compile failed on the removed Path::add_rect API, then
+passed after using Path::rect. No production source or assertions changed in
+this diagnostic batch. V521/V522 remains8/14 browser exact,6 gaps,7 strict
+failures separately retained; V520 remains288/295 units. Full6548 unverified.
+Evidence: `decoration-raster-checkpoint-v530.json` binds probes and V523–V529.
+
+## 2026-10-06 Registered Ahem skip-ink closes original browser pixels
+
+Acceptance prioritizes exact native/browser pixels independently for actual
+and reference pages. Strict native/reference failures remain a separate ledger;
+no tolerance, WPT rewrite or strict-failure waiver is introduced.
+
+V520 covers295 unique runtime controls:288 pass,7 fail. The new registered
+Ahem skip-ink eligibility test passes; the same Courier and6 layout failures
+remain. Unit build completes3m44s and runner build2m06s. Runtime default
+check and diff check pass; parent size gate retains6 outside-vendor violations.
+
+V521/V522 compares14 unmodified original WPT actual/reference pages against
+Chromium with the same14-page V505 baseline:8 exact,6 browser gaps,
+0 regressions and0 unverified comparisons. White-space-collapsing-003 closes
+from48 to0 pixels on BOTH actual and reference pages. This is original-page
+pixel evidence, not the synthetic registration unit alone. The registered
+Ahem path now uses glyph-outline skip-ink; the no-font cell fallback is retained.
+
+The focused packet separately retains7 strict native/reference failures.
+It remains DIAGNOSTIC_FAILED_UNIT_GATE_NOT_ACCEPTED because7 unit failures
+are unresolved. Last accepted broader V457/V458's100 strict failures are not
+replaced by this smaller packet. Remaining6 focused browser gaps are root020,
+white-space-applies-to-003, both bidi cases and both decoration-va-length cases;
+this is NOT the remaining count for the full6548 corpus. Full sweep has not run.
+No commit/push, outside-vendor edits or product/business knowledge changes.
+Evidence: `soft-wrap-units-v520.json`,
+`fractional-spacing-browser-v521/receipt.json`,
+`fractional-spacing-delta-v522.json`.
+
+## 2026-10-06 Registered Ahem skip-ink candidate; original pixels pending
+
+V514 reads the unmodified original XHTML page and reproducesV505's browser
+PNG hash exactly: CSS1Compat, skip-ink auto, underline on the block, no authored
+decoration on nested spans. V515's opt-in headless replay trace now exposes
+own/applied decoration styles: direct text has one local line, nested text has
+one ancestor line. Duplicate decoration is not the observed source of this RED.
+
+Important diagnostic correction: `browser-pixels-v99.mjs` compares buffers
+`[browser_actual, browser_reference, native_actual, native_reference]`, so sample
+`a` is browser and`b` is native. Counts and comparisons were correct, but the
+earlier endpoint-direction interpretation was reversed. Browser original
+endpoint is254/163 (blue1/92), native is255/180 (blue0/75). SyntheticV518 has the
+same original box/text geometry and reproduces these alternatives: skip-ink auto
+leaves glyph-only endpoints; explicit no-skip adds underline coverage. V512,
+V513,V516,V517 are preserved diagnostic controls, not original-page acceptance.
+
+The production candidate removes the blanket Ahem skip-ink exclusion when an
+Ahem font is registered: real glyphs and their fallback runs use font outlines;
+the no-font deterministic cell path retains its existing behavior. Both local
+and inherited decoration paths share this eligibility rule. A new portable unit
+checks registration/cleanup and the cell fallback without embedding WPT fonts.
+Default runtime cargo check passes4.91s and diff check passes. Unit build
+session30986 is live; no candidate unit or original-pixel closure is established.
+Parent file-size gate still reports6 existing outside-vendor violations.
+Full6548 remains unverified, prior seven unit failures retained, no commit/push,
+no outside-vendor edits or product/business knowledge semantic changes.
+Evidence: `white-space-style-oracle-v514.json`, `layout-diagnostic-v515.json`,
+`ahem-decoration-layer-oracle-v518.json`, `decoration-checkpoint-v511.json`.
+
+## 2026-10-06 Decoration endpoint unit fixed; original-page gaps retained
+
+Solid own/inherited decoration rectangles now use standard Skia SrcOver
+coverage rather than the runtime blender. Authored colors, opacity, geometry
+and all existing assertions are unchanged. V504 covers294 unique controls:
+287 pass and7 fail; V486/V500's adjacent endpoint RED now passes at6/91.
+The remaining Courier and6 layout failures are retained. Default runtime
+cargo check passes5.13s; unit build3m44s and runner build2m06s complete.
+
+V505/V506 compares14 original actual/reference pages:7 exact,7 gaps,
+0 regressions in the previously accepted overlap,0 unverified comparisons.
+The prior5 tracked browser gaps remain, including whitespace003's48 pixels
+and root020's58. The2 newly covered decoration pages are not closed:
+length001 has1968 actual/1956 reference differences, length002 has12/6.
+V508 preserves the pre-candidate runner by verifying its exact V495 binary
+hash; V509 independently compares its original PNGs with the same fresh
+browser captures. Both new cases have identical before/after differences:
+these are newly covered existing gaps, not new candidate regressions.
+They belong to the canonical6548 corpus but were outside broaderV457's269
+browser cases. Do not report5 as the complete corpus remaining failure count.
+
+The candidate is diagnostic only because its expanded unit gate is red.
+No broader acceptance/full6548 sweep has run. Strict-reference failures remain
+separate; last accepted broaderV457/V458 still records100. V507 synthetic
+Chromium geometry also confirms a32px computed table margin at32px font size,
+while the native unit expected16; parent margin collapse affects its relative
+position, so this does not justify changing that assertion or closing its RED.
+Next: diagnose original whitespace003 decoration overlap/end geometry, retain
+new decoration-page REDs, and reconcile the remaining unit failures against
+the appropriate browser paths without waivers. Parent size gate's6 existing
+outside-vendor violations are unchanged. No outside-vendor code, product
+knowledge semantics, commit or push changed.
+Evidence: `soft-wrap-units-v504.json`, `fractional-spacing-delta-v506.json`,
+`decoration-baseline-binding-v508.json`, `decoration-baseline-compare-v509.json`,
+`table-margin-oracle-v507.json`.
+
+## 2026-10-06 Fractional box spacing narrows whitespace003; expanded gate red
+
+Resolved margin/padding lengths now share1/64 CSS px truncation at the used
+box-value boundary. Taffy edges, root margins, containing-content-width bases
+and style-aware paint edges agree; computed spacing and glyph advances remain
+unchanged. External V483's2 REDs are runtime tests and pass in V494. Default
+runtime cargo check passes; unit build completes3m54s and runner build2m07s.
+V494 has189/191 unique controls passed with the same2 failures asV486.
+
+Diagnostic V495/V496 compares12 original actual/reference WPT pages:7 exact,
+5 gaps,0 regressions and0 unverified comparisons. Whitespace003 falls from440
+to48 actual/reference pixel differences; V501 confirms the first246.375×54.375
+box and all subsequent line origins match the original browser V470 geometry.
+The remaining48 pixels are decoration endpoints; neither this case nor the
+broader packet is accepted as closed. Root020 remains58 pixels.
+
+Expanded margin/padding V500 covers294 unique runtime controls:286 pass,
+8 fail. The6 newly covered layout failures each reproduce in isolationV502:
+table-cell inline padding, table-wrapper em margins, clearance separation,
+clear child enclosing BFC, leading-float margin and document-root child margin.
+They remain explicit failures; no before/after proof establishes whether they
+predate the current candidate. Do not silently remove them from the unit gate.
+V497/V498 independently reproduces decoration mixing: standard SrcOver rect
+coverage is6/91, current custom-blender rect7/91 (matchingV486's RED); line
+primitives do not match. This is diagnostic evidence, not an implemented fix.
+
+The last accepted broader V457/V458 remains264/269 browser exact with5 gaps
+and100 native strict-reference failures separately retained. Full6548 remains
+unverified. Parent file-size check reports6 existing outside-vendor violations;
+no baseline was raised, no outside-vendor code changed, no commit/push occurred,
+and no product/business knowledge semantics changed.
+Evidence: `soft-wrap-units-v494.json`, `fractional-spacing-delta-v496.json`,
+`layout-diagnostic-v501.json`, `soft-wrap-units-v500.json`,
+`soft-wrap-units-v502.json`, `decoration-blend-probe-binding-v498.json`.
+
+## 2026-10-06 Browser pixels remain primary; diagnostic candidate not accepted
+
+Acceptance keeps two independent ledgers: each original actual and reference
+page must match its corresponding browser image with zero differing pixels;
+native strict-reference failures remain listed separately, not waived. No WPT
+source, DOM, reference image, tolerance or color adjustment is used to close a gap.
+The last accepted broader V457/V458 remains264/269 browser exact,5 gaps,
+171/271 native strict passed and100 strict failures. This is not full6548 proof.
+
+Expanded V486 runs189 unique runtime controls:187 pass and2 fail. Both failures
+remain recorded: Courier whole-run advance623.94525 versus623.94507, and
+decoration adjacent-fragment coverage7 versus6 at x123. The new whole-line
+controls and previous179 controls pass, but the expanded gate does not.
+Runner build completes successfully. V487/V488 is explicitly
+`DIAGNOSTIC_FAILED_UNIT_GATE_NOT_ACCEPTED`:7 exact original-page controls,
+root020 still58 actual/reference pixels,0 regressions and0 unverified comparisons.
+Whole-line shaping does not close root020 and no broader acceptance was run.
+
+Fresh Chromium141 V492 confirms the Courier Canvas expected width623.945068.
+V493 explains its scope: Canvas word/single-space f32 aggregation reproduces
+that value, whereas the browser DOM range width is623.953125 (used LayoutUnit).
+Chromium141 `PlainTextNode::SegmentWord` and `AccumulateInlineSize` independently
+confirm the Canvas segmentation/float-aggregation path. This identifies an
+oracle-layer mismatch to investigate; neither failing assertion nor production
+glyph coordinates has been changed to make the gate green. Full6548 remains
+unverified; no commit/push or product knowledge semantics change.
+Evidence: `soft-wrap-units-v486.json`, `percentage-layout-delta-v488.json`,
+`courier-canvas-oracle-v492.json`, `courier-dom-oracle-v493.json`.
+Source: [Chromium141 PlainTextNode](https://raw.githubusercontent.com/chromium/chromium/141.0.7390.37/third_party/blink/renderer/platform/fonts/plain_text_node.cc).
+
+## 2026-10-06 Whole-line justification candidate; build-pending checkpoint
+
+The non-Ahem Skia justification path now preserves whole-line contextual
+shaping instead of independently repainting each word. Expansion is applied
+to the precise shaping cursor before f32 glyph points are emitted; fallback
+font runs carry byte offsets to the final-space residual. Own and inherited
+decoration intercepts use the same expanded glyph geometry. The Ahem cell
+path remains on its established word-position controls.
+Default-backend runtime cargo check passes after updating the line-painter
+and decoration callers. This is type checking, not pixel/device acceptance.
+New controls compare glyph positions and zero-tolerance raster output with
+contextual explicit word spacing. Unit build session38036 is live; units and
+original root020 pixels are not yet verified. V478's58-pixel RED is retained.
+The last accepted broader V457/V458 remains264 browser exact/5 gaps, with
+100 strict failures independently retained. Full6548 remains unverified;
+no commit/push or product knowledge semantics change.
+Evidence: `percentage-layout-delta-v478.json`, `justification-checkpoint-v491.json`.
+
+## 2026-10-06 Fixed-point controls pass; original root020 still58 pixels
+
+V476 passes179/179 unique runtime controls. Original V477/V478 still has
+7 exact controls and the identical58 actual/reference root020 differences,
+with0 regressions/unverified comparisons. Fixed-point expansion is not a
+root020 closure. Default-backend runtime cargo check passes (type checking,
+not CPU/GPU pixel/device acceptance). The remaining one-glyph difference
+requires checking whole-line shaping versus separately painted words before
+another spacing-only change. The last accepted broader V457/V458 remains
+264 browser exact/5 gaps, with100 native strict failures independently retained.
+For the next whitespace003 issue, V483 reproduces2 independent layout REDs:
+246.4 versus246.375 width and-3.2 versus-3.1875 negative margin. V484 binds
+probe source/runtime/std library/binary and original geometry evidence;
+no fractional-em implementation has changed. Full6548 remains unverified;
+no commit/push or product knowledge semantics change.
+Evidence: `soft-wrap-units-v476.json`, `percentage-layout-delta-v478.json`,
+`soft-wrap-units-v483.json`, `fractional-box-probe-binding-v484.json`.
+
+## 2026-10-06 Justification narrows to58 pixels; fixed-point candidate pending
+
+V465 passes178/178 unique runtime controls. V466/V467 original pages retain
+7 exact controls and reduce root020 from275 to58 actual/reference browser
+pixel differences, with0 regressions/unverified comparisons. It is not closed.
+V473 independently calls the updated production function: the new16.16
+residual-distribution RED fails (30.005207 versus30.005203), while3 controls
+pass. V474 binds source/library/binary and preserves this evidence.
+The candidate allocates16.16 ordinary expansions, leaves residual expansion
+to the final gap, and accumulates word origins at higher precision. Runtime
+unit build session28103 is live; this candidate has not yet passed units or
+original pixels. The last accepted broader V457/V458 remains264 exact/5 gaps,
+with100 native strict failures retained separately. Browser V470 and native
+V471 also locate the next whitespace003 geometry discrepancy (246.375 versus
+246.4 box width); no whitespace003 implementation has been changed.
+Full6548 remains unverified; no commit/push or product knowledge semantic change.
+Evidence: `soft-wrap-units-v465.json`, `percentage-layout-delta-v467.json`,
+`soft-wrap-units-v473.json`, `justification-probe-binding-v474.json`,
+`box-geometry-oracle-v470.json`, `layout-diagnostic-v471.json`.
+
+## 2026-10-06 Percentage broader accepted; five browser gaps remain
+
+V457/V458 completes271 native and269 browser cases:264 browser exact,
+5 gaps,0 regressions and0 unverified comparisons. Root013a is newly closed.
+Native strict results remain171 passed/100 failed and are retained separately.
+Root020 V459 matches all three original browser boxes from V450; remaining
+text differences are being investigated as justification precision, not boxes.
+V462 calls the existing production justification function from a hash-bound
+runtime library:2 precision/overflow REDs fail and1 integer control passes.
+V463 binds the external probe source/binary/library; it is not a pixel proof.
+Those REDs are now runtime tests. A candidate snaps only the completed line
+advance before allocating justification remainder, retaining glyph advances.
+Unit build session63217 is live; candidate unit and original pixels are not
+yet verified. Full6548 remains unverified; no commit/push or product knowledge
+semantics change. Evidence: `decorated-text-browser-v457/receipt.json`,
+`decorated-text-delta-v458.json`, `layout-diagnostic-v459.json`,
+`soft-wrap-units-v462.json`, `justification-probe-binding-v463.json`.
+
+## 2026-10-06 Percentage original pixels close; broader controls pending
+
+V454 passes174/174 unique runtime controls, including the nested percentage
+geometry RED. V455/V456 verifies7/7 original WPT cases browser exact:013a
+now has0 actual and0 reference pixel differences, while014a/014b/016 and
+SVG004/005/006 remain exact. Native strict SVG failures remain separately
+listed. Default-backend runtime cargo check passes; this is not device or
+CPU/GPU pixel acceptance. Broader271-native/269-browser V457 is live in
+session98831 against accepted V445, with source/unit/focus hashes bound.
+The last accepted broader result remains263 exact/6 gaps until it completes.
+Full6548 is unverified; no commit/push or product knowledge semantics change.
+Evidence: `soft-wrap-units-v454.json`,
+`percentage-layout-browser-v455/receipt.json`, `percentage-layout-delta-v456.json`.
+
+## 2026-10-06 Percentage box precision RED; candidate validation pending
+
+V452 reproduces nested percentage-margin geometry at93.1 instead of
+Chromium's93.09375. The containing-content-width and auto-edge controls pass.
+Original page V449/V450 binds native/browser geometry without rewriting DOM.
+The candidate truncates resolved percentage spacing to1/64 CSS px before
+Taffy edges and descendant content-width bases are calculated; root margins
+and shared spacing resolution use the same rule. Glyph shaping is unchanged.
+Candidate unit build session85112 is live; no candidate unit or original
+pixel acceptance has been established yet. The last accepted V445/V446
+remains263/269 browser exact,6 gaps,0 regressions, with100 strict-reference
+failures independently retained. Full6548 remains unverified; no commit/push.
+Evidence: `soft-wrap-units-v452.json`, `layout-diagnostic-v449.json`,
+`text-geometry-oracle-v450.json`, `percentage-layout-checkpoint-v453.json`.
+
+## 2026-10-06 Fixed background broader accepted; six browser gaps remain
+
+V441/V442 verifies6/6 original WPT cases browser exact:014a and014b now
+have0 actual and0 reference differences. Root016 and SVG004/005/006 stay exact.
+The SVG native strict failures remain independently listed; no references,
+DOM or tolerance were changed. V440 is156/156 runtime controls passed;
+V447 adds the complete background geometry module and passes171/171 unique
+controls. Default-backend `cargo check --profile wpt -p w3cos-runtime` passes;
+this is type checking, not CPU/GPU pixel or mobile device acceptance.
+Broader V445/V446 completes271 native and269 browser cases against accepted
+V433:263 browser exact,6 browser gaps,0 regressions and0 unverified comparisons.
+Both the original actual page and its reference must independently match the
+browser with zero differing pixels. Browser pixel parity is the primary repair
+criterion; strict-reference failures are retained separately, not waived.
+Native strict results remain171 passed/100 failed, with all100 failures listed
+in V446. The remaining browser gaps are background-root-013a,
+background-root-020, white-space-applies-to-003, white-space-collapsing-003,
+white-space-collapsing-bidi-001 and white-space-collapsing-bidi-002.
+Full6548 remains unverified; no commit/push or product knowledge semantics change.
+Evidence: `soft-wrap-units-v440.json`, `soft-wrap-units-v447.json`,
+`fixed-background-browser-v441/receipt.json`, `fixed-background-delta-v442.json`,
+`decorated-text-browser-v445/receipt.json`, `decorated-text-delta-v446.json`,
+`decorated-text-native-v445/results.json`.
+
+## 2026-10-06 Fixed background viewport RED reproduced; shared candidate pending
+
+V439 reproduces the artifact-viewport RED exactly:337.5/94.5 instead of
+391.5/291.5; the legacy fixed-origin control remains green. The candidate
+snapshots valid viewport dimensions and original CSS positions into private
+paint metadata before canvas propagation. Shared raster/gradient geometry uses
+that viewport only for fixed layers, preserving the element clip and scroll
+layers' positioning basis. Snapshot values are refreshed/cleared each artifact
+build; the decoded image and original DOM/reference files are not modified.
+Runtime unit build session32678 is live; candidate units and original014a/014b
+pixels are not yet verified. The last accepted broader packet remains V433:
+261/269 browser exact,8 gaps,0 regressions,171/100 native strict pass/fail.
+Full6548 is unverified; no commit/push or product knowledge semantics change.
+Evidence: `soft-wrap-units-v439.json`, `fixed-background-oracle-v438.json`,
+`layout-diagnostic-v436.json`, `layout-diagnostic-v437.json`.
+
+## 2026-10-06 Raster sampling broader accepted; eight browser gaps remain
+
+V433/V434 completes271 native and269 browser cases:261 browser exact,8 gaps,
+0 regressions and0 unverified comparisons. Root016 is newly closed. Native
+strict references remain171 passed/100 failed, independently retained; browser
+acceptance does not waive them. This is targeted coverage, not Full6548 closure.
+The next fixed-background batch has original geometry evidence V436/V437
+and unmodified Chromium141/DPR1 pages V438. Browser/native body rectangles
+agree (698x212 and698x168 at51,51), but fixed positioning currently keeps
+the element's padding-box extent after moving its origin to0,0. A centered
+17px tile therefore uses337.5/94.5 rather than viewport391.5/291.5 in014a.
+The new artifact-viewport RED is compiling in session15196; it has not been
+executed yet and no fixed-background implementation has changed. Original
+014a/014b browser failures remain open. No commit/push; Full6548 not rerun.
+Evidence: `decorated-text-browser-v433/receipt.json`,
+`decorated-text-delta-v434.json`, `layout-diagnostic-v436.json`,
+`layout-diagnostic-v437.json`, `fixed-background-oracle-v438.json`.
+
+## 2026-10-06 Root016 original browser pixels closed; broader controls pending
+
+V430/V431 verifies4/4 original WPT browser-exact cases: root016 now has0
+actual and0 reference differences, and SVG004/005/006 remain exact. Root016
+is a native strict pass; the SVG strict failures are retained independently.
+The raster fix combines premultiplied texture interpolation with destination
+snapping only along no-repeat axes. No page names, color biases, reference edits
+or tolerance changes are used. V429 runtime controls are154/154 passed.
+Default-backend `cargo check --profile wpt -p w3cos-runtime` also passes;
+this is not CPU/GPU pixel or device acceptance. Broader271-native/269-browser
+V433 is now running; its outcome is required before accepting this batch as
+regression-free. Full6548 is unverified. No commit/push or product knowledge
+semantics change. Evidence: `soft-wrap-units-v429.json`,
+`image-sampling-browser-v430/receipt.json`, `image-sampling-delta-v431.json`.
+
+## 2026-10-06 Raster sampling narrowed to thirty pixels; axis snapping candidate
+
+Original V426/V427 verifies the premultiplied candidate reduces root016 from
+1380 to30 actual and30 reference browser-difference pixels. The remaining
+pixels lie only on the no-repeat purple image; three SVG controls remain exact.
+V424's independent Chromium141/DPR1 probe distinguishes repeated subpixel
+sampling from no-repeat/replaced-image destination snapping. The next candidate
+carries per-axis no-repeat flags into raster painting and snaps only those axes,
+while preserving repeating phase, external SVG viewport coverage and transformed
+anti-aliased draws. V429 runtime controls are154/154 passed, including both
+no-repeat background and replaced-image sampling, alpha preservation and cache.
+V428 binds this state. Runner build session50842 is live; V430 original pixels
+and V433 broader271/269 regressions remain pending. This is not a browser gap
+closure yet. Strict references remain independent. Full6548 is unverified;
+no commit/push. Parent size gate retains6 pre-existing outside-vendor violations.
+
+## 2026-10-06 First raster candidate rejected; premultiplied texture candidate
+
+V416 preserves151 runtime controls but still fails the new fractional RED:
+linear sampling with straight-alpha textures returns192, versus Chromium191.
+Original WPT V421/V422 keeps the three SVG cases browser exact, but root016
+has1410 actual/reference differences (baseline1380); this is not accepted.
+An algorithm-only Skia probe V420 isolates191 with premultiplied image draws
+versus192 with straight-alpha draws. Shader draws still differ and are not
+claimed fixed by that probe. The next candidate uploads correctly premultiplied
+cache textures without mutating shared decoded pixels; it also adds a transparent
+pixel/source-preservation control. V423 is153/153 runtime units passed; both
+fractional sampling and transparent/source-preservation assertions are green.
+V425 binds this candidate; runner build session1594 remains live and the
+candidate's original WPT pixels are pending. This is not a root016 closure.
+V424 independently confirms browser repeat backgrounds preserve subpixel phase,
+whereas no-repeat backgrounds and replaced images snap their destination.
+This distinction remains to be implemented/verified; do not declare root016
+closed from the sampling unit alone. Full6548 is not rerun; no commit/push.
+Evidence remains in the existing targeted directory: `soft-wrap-units-v416.json`,
+`image-sampling-browser-v421/receipt.json`, `image-sampling-delta-v422.json`,
+`image-sampling-oracle-v424.json`. Failed receipts are retained unchanged.
+
+## 2026-10-06 Fractional raster sampling RED reproduced; candidate pending
+
+Original `background-root-016.xht` retains1380 actual and1380 reference
+browser-difference pixels in V411. The independent Chromium141/DPR1 V414
+two-texel probe produces191 from128/255 under a0.5px repeating background
+translation. Runtime V415 reproduces the RED with128 rather than191; crisp
+outer-edge clipping and integer shader tile phase controls both pass.
+The first candidate adds linear internal sampling to ordinary raster draws,
+without changing crisp outer-edge coverage or resolved SVG viewport draws.
+Candidate unit compilation is live in session34239; this is not a pixel fix
+claim. The repeat shader path is unchanged and still needs explicit coverage.
+Prepared V418 verifies the original case and the three SVG controls after a
+new runner build and unit gate. V417 binds this pending state to source hashes.
+Full6548 is unverified; no commit/push or product knowledge semantics change.
+Evidence: `image-sampling-oracle-v414.json`, `soft-wrap-units-v415.json`,
+`image-sampling-checkpoint-v417.json` in the existing targeted evidence directory.
+
+## 2026-10-06 SVG viewport broader controls accepted; nine browser gaps remain
+
+V407 turns both original browser-bound edge REDs green, with39 image/SVG
+controls passing. Combined runtime V410 is151/151. This candidate preserves
+SVG source and its fractional used viewport, resolves CSS through the shared
+parse tree, restores only geometrically equivalent un-stroked rectangle paths,
+and rasterizes external image documents with Skia vector coverage at2x when
+the temporary/returned pixel buffers fit the256 MiB bound. Premultiplied box
+sampling retains tiny transparent edges without page names or color offsets.
+Stroked/nonrectangular paths are not rewritten. Inline SVG's existing path
+and ordinary image edge coverage remain separate; cache identity includes
+fractional viewport and image-document backend. V407 also verifies none/slice,
+cache reuse/separation, geometry guards and existing SVG pointer controls.
+
+Failed packets remain immutable: V396 loses both edges; raw Skia SVG V399
+retains the wrong precision; normalized-path V403 fixes landscape but still
+fails portrait/cache. V404/V405 inspect normalized geometry and coverage;
+V406 is an algorithm-only buffer adapter diagnostic, not runtime/WPT proof.
+
+Original WPT V408/V409 is3/3 browser exact:004 and005 actual/reference0,
+006 remains exact. Their strict failures132/106 match Chromium's strict
+failures and remain independently listed. No original DOM, reference or
+tolerance changed. The broader271-native/269-browser V411/V412 packet has
+completed:260/269 browser exact,9 gaps,0 regressions and0 unverified comparisons.
+Native strict reference results are171 passed/100 failed; failures remain
+independently listed, including004,005 and the already exact006. Browser pixel
+acceptance does not rewrite strict reference failures. Full6548 is not rerun.
+
+Skia SVG native source build succeeds using the documented15.5 SDK environment.
+Runtime units now use `w3cos_runtime-93d795c162df5438`, explicitly hash-bound.
+`cargo check --profile wpt -p w3cos-runtime` passes for the default backends;
+this is type checking, not CPU/GPU pixel or mobile device acceptance.
+Rebuilt WPT runner is35,235,536 bytes against the previous23,501,408 bytes.
+This comparison also changes native SDK/source-build provenance, so it does
+not isolate the SVG feature's package cost; no size improvement is claimed.
+The new module alone is formatted; existing dirty source is not reformatted.
+Full6548 remains unverified; no commit/push. Product knowledge semantics are
+unchanged. Parent size gate still has6 pre-existing outside-vendor violations.
+
+Evidence in `target/wpt-targeted/baseline-font-position-20261003/`:
+`soft-wrap-units-v396.json`, `soft-wrap-units-v399.json`,
+`soft-wrap-units-v403.json`, `soft-wrap-units-v407.json`,
+`soft-wrap-units-v410.json`, `svg-viewport-browser-v408/receipt.json`,
+`svg-viewport-delta-v409.json`, `decorated-text-binding-v411.json`,
+`decorated-text-browser-v411/receipt.json`, `decorated-text-delta-v412.json`.
+
+## 2026-10-06 SVG viewport candidate and vector backend verification pending
+
+First candidate retains external SVG source and resolves the fractional used
+viewport in the shared SVG raster cache. CPU, GPU and Skia image/background
+callers consume it; ordinary raster resources retain their previous path.
+V396 still fails both browser-bound edge assertions: resvg's fallback scan
+converter loses these tiny edges even after viewport resolution. Its34
+image/SVG controls pass. This candidate is not accepted or counted closed.
+
+The next candidate enables the existing Skia SVG capability for external
+image-document vector coverage, preserving inline SVG's existing raster path
+and independently keying image-document rasters. New controls cover fractional
+viewport cache identity, preserveAspectRatio none/slice and raster safety limits.
+Its tests, original-page pixels and broader regressions are not yet verified.
+The source and runner must not be assumed matched until rebuilding completes.
+
+Skia0.93.1's metal+svg prebuilt download returned404. Local Ninja1.13.2 is
+installed only under ignored `target/wpt-tools`; SDK27 binding generation
+then failed on an unresolved `_Traits`. Verification now builds from source
+using the already-installed macOS15.5 SDK, without generated binding edits.
+Use this build environment consistently while testing the candidate:
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk \
+MACOSX_DEPLOYMENT_TARGET=15.0 FORCE_SKIA_BUILD=1 \
+SKIA_NINJA_COMMAND="$PWD/target/wpt-tools/bin/ninja" \
+cargo test --profile wpt -p w3cos-runtime --no-default-features \
+  --features dynamic-js,skia --lib --no-run
+```
+
+The SVG feature changes the runtime unit binary identity: select the executable
+reported by Cargo explicitly with `W3COS_RUNTIME_UNIT_BINARY`; never bind the
+old executable to new source. V396 remains an immutable failed receipt.
+Last accepted pixels remain V389:258/269 exact,11 gaps,98 retained strict
+failures. Full6548 is unverified; no commit/push or product knowledge change.
+
+## 2026-10-06 SVG fractional viewport diagnosis remains open
+
+V387 retains132 actual-browser pixels in `background-intrinsic-004.xht`
+and106 in `background-intrinsic-005.xht`; both reference comparisons are0.
+Maximum channel differences are2 and1 respectively. Strict native passes
+are not browser acceptance: Chromium itself retains those strict failures.
+
+Original browser V391 geometry agrees with native layout V390 for004;
+both original pages keep their untouched DOM and resources. Independent
+Chromium141 image controls prove66.666666px becomes66.65625px and
+53.333333px becomes53.328125px. The default SVG viewBox alignment leaves
+tiny transparent edges: green over red yields `[2,127,0,255]` for portrait
+and `[1,127,0,255]` for landscape, matching the original pixel packet.
+This identifies lost viewport/viewBox semantics, not a CSS box-position gap.
+The shared image loader currently rasterizes the intrinsic SVG document;
+Skia then stretches that raster without resolving the used SVG viewport.
+
+New portrait/landscape rendering assertions cover replaced-image and
+background callers. Their browser oracle is V391, not a color tolerance or
+page-name exception. Both are verified native RED in V393: replaced-image
+pixels are solid green instead of the browser edge colors. V394 retains3/3
+PNG crisp-coverage and SVG shared-cache controls. Source-bound V395 records
+`SVG_VIEWPORT_RED_NOT_REPAIRED`; no production repair or newly closed browser
+case is claimed. Next: preserve the SVG document
+and resolve its fractional CSS viewport before painting, with cache and
+non-SVG edge-coverage controls retained. Evidence is
+`target/wpt-targeted/baseline-font-position-20261003/layout-diagnostic-v390.json`
+and `svg-viewport-browser-v391.json`, `soft-wrap-units-v393.json`,
+`soft-wrap-units-v394.json`, `svg-viewport-red-v395.json` in the same directory.
+Last pixel-verified scope remains V389:258/269 exact,11 gaps and98 strict
+failures independently retained. Full6548 remains unverified; no commit/push.
+
+## 2026-10-06 mixed whitespace matches original browser pixels
+
+Acceptance prioritizes zero-pixel native/browser equality for the original
+actual and reference separately. Strict native/reference failures remain
+independently listed, including cases where Chromium itself fails the old
+reference. No original WPT source, reference or tolerance was changed.
+
+DOM lowering retains authored preserved spaces instead of synthesizing
+deferred advances. Passive collapsed normal-space owners carry a zero-width
+break opportunity. Layout keeps legal soft breaks, closes the correct forced
+line, and hangs preserved-space tails without adding a phantom blank line.
+The paint context resets its first-line cursor on a rewound later line.
+The new hanging-space projection is guarded to homogeneous, passive LTR
+inline runs; complex bidi, positioning, decoration and vertical-align cases
+are not claimed covered by this repair.
+
+V372 retains the failing candidate and browser-bound controls V365/V367
+justify the two updated mixed-space test expectations. Runtime V383 passes
+112 unique targeted tests; DOM V384 passes35. Original-page pixels progress
+from125715 (V359), through rejected127602 (V375) and6384 (V380), to0 actual
+and0 reference in V385/V386. Native strict125715 is identical to browser
+strict125715 and remains a failure, not an exception or waived comparison.
+
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`soft-wrap-units-v372.json`, `soft-wrap-units-v383.json`,
+`dom-units-v384.json`, `mixed-space-browser-v375/receipt.json`,
+`mixed-space-browser-v380/receipt.json`,
+`mixed-space-browser-v385/receipt.json`, `mixed-space-delta-v386.json`.
+The271-case native control packet V387 is173 pass/98 strict fail.
+Browser V387/V388 is258/269 exact,11 browser gaps,0 regressions and0
+resource/comparison unverified. Source-bound closeout V389 retains all98
+strict failures independently. Its remaining browser gaps are the seven
+background cases and four other whitespace cases, not full-corpus totals.
+Full6548 has not rerun; no full closure,
+commit or push. Parent size check still reports6 pre-existing outside-vendor
+violations; its baseline is unchanged. This renderer-only repair changes no
+product Agent concept, authority, knowledge source or tool semantics.
+
+## 2026-10-06 collapsed-space boundary RED and rejected candidate
+
+Synthetic original Chromium141 V365 isolates four100px/Ahem20px controls.
+Collapsed nowrap, empty nowrap plus normal-space, and normal-space-only
+boundaries each produce60px/three lines; directly adjacent preserved text
+produces40px/two lines. Native new regression
+`collapsed_inline_space_between_preserved_runs_keeps_soft_break` is RED
+V366: the first boundary produces40px instead of60px. This test remains
+active; it is not ignored or loosened to accept the old strict pattern.
+
+Candidate removed synthetic deferred advances and attempted to lower the
+collapsed normal-space boundary to a zero-width break marker. V368 still
+fails the new test, while the previous108 targeted controls pass. Expanded
+V369 also fails `empty_nowrap_fragments_advance_following_pre_text_without_an_extra_line`.
+A lowered Text still measures its original content, so putting the marker
+only into its children does not replace that space. V367 independently
+proves fitting-line whitespace and overflowing line-edge whitespace differ:
+the short suffix starts x331 with two authored spaces, while the long
+preserved suffix wraps to y31. Its old same-line assertion is not browser proof.
+
+Candidate original-page diagnostic V370 reaches first-block166px and
+second-block y274, but geometry alone is not zero-pixel acceptance and the
+expanded unit regressions prevent accepting it. V371 retains the rejected
+source patch, source hashes, original RED and both failed packets. Only this
+candidate's DOM edits were reverted. The restored source hash exactly matches
+V366 (`f70dc2e09a0812b4fcba6a3ab57cbd4853cd490e2dd53cb1962bb25b4e8d203c`),
+including the new RED test; unrelated dirty work and prior repairs remain.
+
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`nowrap-boundary-browser-v365.json`, `soft-wrap-units-v366.json`,
+`nowrap-controls-browser-v367.json`, `soft-wrap-units-v368.json`,
+`soft-wrap-units-v369.json`, `layout-diagnostic-v370.json`,
+`nowrap-candidate-rejected-v371.json`, `nowrap-rejected-source-v371.patch`.
+Next: retain source whitespace and its conditional line-edge advance while
+preserving the independent soft-break opportunity; handle lowered Text and
+Row owners explicitly. Current runner/unit binaries contain the rejected
+candidate and must be rebuilt before any new source-bound pixel claim.
+No new WPT gap closes in this batch. Latest verified production pixel scope
+remains V359/V361:257/269 exact,12 browser gaps,97 strict failures retained.
+Full6548 is unverified; no original WPT edits, tolerance changes or commit/push.
+
+## 2026-10-06 mixed whitespace retains browser/strict divergence as open RED
+
+Original Chromium141 geometry V363 confirms `white-space-mixed-001.xht`
+first block166px and second block y274. Current native V362 has146px and
+y254. V359 retains125715 actual/native-browser pixels,0 reference/native-
+browser pixels,125715 browser strict pixels and0 native strict pixels.
+The native strict pass is not browser acceptance. Repairing original browser
+actual may introduce a strict-reference failure; retain it independently.
+
+Browser text ranges retain the preserved suffix `  x x  x x  x x    x\n`
+at x11/y137/400px. Native lowers it into a seven-space prefix at
+x231/y117/500px. Browser's following nowrap run is780px; native is800px.
+Code inspection identifies fabricated `deferred_space_advances`, discarded
+empty-inline boundaries and continuation projection as the next investigation
+chain, not a proven complete repair. The original source's significant
+trailing whitespace, DOM, reference and tolerances remain unchanged.
+
+Source-bound V364 records `OPEN_BROWSER_GAP_NOT_REPAIRED`, the original-page
+RED and next entry: isolate this boundary with original browser synthetic
+geometry before changing lowering/projection or old synthetic expectations.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`layout-diagnostic-v362.json`, `mixed-wrap-browser-v363.json`,
+`mixed-wrap-diagnosis-v364.json`. No production code changed in this diagnostic.
+The latest verified control scope remains257/269 browser exact,12 gaps and
+97 independently retained native strict failures. Full6548 has not rerun;
+no full closure, commit or push. Diff check passes. Parent size check retains
+the same6 pre-existing outside-vendor violations; baseline is unchanged.
+
+## 2026-10-05 nested font-style runs use enclosing soft-wrap width
+
+Original-page RED V349/V350 shows `background-root-018.xht` native first
+run1102.125px against a592px IFC, while original Chromium splits it into
+540.96875/548.375px lines. Both engines measure the italic run348.234375px.
+V345 retains50910 differing pixels for both actual and reference, even
+though its native strict comparison is0. Strict green is not browser closure.
+
+DOM RED V352 isolates the font-style fragmentation barrier under a fixed
+width. Expanded V353 also exposes the missing IFC on an auto-width block
+with one nested passive inline. Lowering now treats that child as an inline
+formatting context, and existing painted-inline fragmentation permits leaf
+slant/weight changes while retaining authored fonts/backgrounds. Font size,
+family, alignment, decoration/group, position and event protections remain.
+No case name, page offset, font-width fudge or WPT change is introduced.
+
+DOM V354 passes30 unique targeted tests, including auto/fixed widths and
+italic/bold nested runs. Runtime V355 passes the same108 targeted controls,
+including iframe flow and forced-line baseline/centering. Rebuilt runner
+V356 then verifies the single failing original WPT case: actual/native and
+reference/native each change50910->0 pixels; browser/native strict are both0.
+V357 preserves the RED and focused before/after comparison. Original-page
+layout V358 now has HTML311px, body237px and paragraph167px, matching V350's
+five-line geometry, rather than masking paint overflow.
+
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`dom-units-v352.json`, `dom-units-v353.json`, `dom-units-v354.json`,
+`soft-wrap-units-v355.json`, `nested-wrap-binding-v356.json`,
+`nested-wrap-browser-v356/receipt.json`, `nested-wrap-delta-v357.json`,
+`layout-diagnostic-v358.json`. Wider control V359 now replays271 native cases
+(174 pass /97 strict fail) and269 browser reftests (257 exact /12 gaps).
+The original target is the only closed browser gap, with0 regressions among
+prior256 exact cases and0 resource/comparison-unverified cases. All97 strict
+failures remain independently listed by V360 and source-bound closeout V361.
+Evidence: `decorated-text-binding-v359.json`,
+`decorated-text-browser-v359/receipt.json`, `decorated-text-delta-v360.json`,
+`nested-wrap-closeout-v361.json`. Full6548 remains unverified; no
+commit/push, main-project edits, business knowledge semantic changes,
+original WPT edits or tolerance changes. Parent size gate still retains6
+pre-existing outside-vendor violations; baseline is not raised.
+
+## 2026-10-05 nested forced lines reserve atomic descent once
+
+Browser-first acceptance is unchanged. Original synthetic Chromium V342
+confirms iframe body181px, two-break body203px, and the following10px block
+at y189 with body191px. Native RED V343 retains body330px despite the frame's
+correct y30 and304x154 dimensions. The passive inline union is176px: adding
+its growth as a block-flow contribution double-counted the atomic extent.
+
+The block-flow propagation now excludes passive Inline visual rectangles.
+V344 deliberately retains the first candidate's failure: body176px and the
+following block y184 show the remaining missing final-line descent. Shared
+forced-line metrics now traverse nested baseline passive inlines, retaining
+each inline's strut across its containing IFC's breaks instead of treating
+the union rectangle as an atomic item. Parent font ascent/descent computes
+the final used advance; no iframe-specific constant or height is introduced.
+
+V348 replays108 unique targeted units, all pass, including the strengthened
+iframe height assertion, direct/nested/two-break/following-block controls,
+all prior107 controls and53 paint-artifact tests. This is a targeted unit
+packet, not the full runtime test suite or6548 WPT closure.
+
+Rebuilt-runner V345 replays271 native cases (174 pass /97 strict fail) and
+269 original browser comparisons (256 exact /13 gaps). Resource/comparison
+unverified counts are0 and there are0 regressions among prior256 exact
+controls. No WPT browser gap closes in this batch; all97 strict failures are
+independently retained by V346 and source-bound closeout V347. The verified
+repair is the iframe geometry/flow failure; it does not substitute for the
+remaining browser differences or a full6548 rerun.
+
+Next original-page diagnosis V349/V350 identifies the large remaining
+`background-root-018.xht` gap: parent content width592px, but native first
+passive text width1102.125px versus browser lines540.96875/548.375px. Both
+engines measure the italic fragment348.234375px; browser uses five27px
+lines, native three. Follow nested cross-style inline line-fitting, not a
+background offset or a font-width fudge. Original WPT DOM stays unchanged.
+
+Unit evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`forced-frame-browser-v342.json`, `soft-wrap-units-v343.json`,
+`soft-wrap-units-v344.json`, `soft-wrap-units-v348.json`.
+Pixel/next-entry evidence: `decorated-text-binding-v345.json`,
+`decorated-text-browser-v345/receipt.json`, `decorated-text-delta-v346.json`,
+`forced-frame-closeout-v347.json`, `root-wrap-diagnostic-v349.json`,
+`root-wrap-browser-v350.json`. Both builds and diff check pass with existing
+warnings; parent size gate retains6 pre-existing outside-vendor violations.
+V339 is an invalid synthetic WPT-tool diagnostic (canonical manifest
+validation rejected it before rendering); it provides no geometry/pixel
+proof and is not used as acceptance evidence. WPT validation is unchanged.
+No original WPT edits, tolerance changes, main-project edits, business
+knowledge semantic changes, commit or push. Full6548 closure remains open.
+
+## 2026-10-05 browser-pixel priority and forced-line regression
+
+Acceptance is browser-pixel-first: native actual and native reference must
+each match the corresponding original browser capture at zero differing
+pixels. Native strict-reference failures remain a separate, explicit list;
+browser agreement never rewrites them into passes or changes WPT tolerances.
+The fixed revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+
+V334 updates stale synthetic expectations only from original Chromium V333
+geometry, and strengthens assertions for the real1px atomic-box baseline
+error and iframe body330px/181px mismatch. The paint-order control now tests
+the semantic `paint_order_key` consumed by headless and retained painting,
+instead of an obsolete numeric z-order array.
+
+Shared forced-line metrics resolve each line's parent/child strut union and
+atomic margin-box baseline. V335 fixes the atomic first-box y9 and22px line
+steps, but records a new horizontal-centering regression (x0 instead of50).
+The correction aligns each forced line independently within its content box.
+V336 replays the same107 unique tests:106 pass /1 fail; the centering
+regression is closed and the original atomic baseline test stays green.
+The iframe body-height assertion still fails (native330px vs browser181px).
+Do not call this unit packet green or remove that failure from its receipt.
+
+Rebuilt-runner V337 executes271 native cases:174 pass /97 strict fail.
+Its269 browser comparisons remain256 exact /13 gaps, with zero resource or
+comparison-unverified cases and zero regressions among the prior256 exact
+controls. No additional WPT browser gap closes in this forced-line batch;
+its verified repair is the strengthened synthetic atomic baseline and the
+candidate's centering regression. V338 independently retains all97 strict
+failures and the remaining iframe unit failure. Full6548 is not rerun.
+
+Unit evidence: `soft-wrap-units-v334.json`, `soft-wrap-units-v335.json`,
+`soft-wrap-units-v336.json`, under
+`target/wpt-targeted/baseline-font-position-20261003/`.
+Pixel evidence: `decorated-text-binding-v337.json`,
+`decorated-text-browser-v337/receipt.json`, `decorated-text-delta-v338.json`.
+Runtime-unit build and runner build pass with existing warnings; diff check
+passes. Parent size gate still has6 pre-existing outside-vendor violations.
+Full6548 closure remains unverified; no WPT-page edits, tolerance changes,
+main-project edits, business-knowledge semantic changes, commit or push.
+
+## 2026-10-05 preserved multiline text shares containing strut metrics
+
+V325 is a real RED with pinned Ahem: the parent of two preserved lines is
+32px rather than the original browser's44px. The shared line-metrics module
+now resolves the union of parent-strut/text ascent and descent for a lone
+baseline-aligned multiline inline text leaf. Layout keeps its font box16px
+high and positions it4px below the containing line top. InlineLineContext
+carries the same used line advance for glyph and background continuation,
+instead of independently stepping by the child's16px authored font height.
+Original page diagnostic V332 confirms parent44px and first font-box y58,
+matching original Chromium V323. No Ahem/page-specific offset is introduced.
+
+Expanded V326 executes57 assertions,56 unique tests:53 pass /3 fail.
+V331 individually replays its53 passing tests, all green, including the new
+strut test, all10 shared line-metrics tests and multiline background controls.
+This selected green packet does not waive expanded failures. Independent
+V330 retains the paint-order control failure, giving4 open unit failures.
+The expanded packet is explicitlyFAIL; pre-candidate runtime attribution for
+its three newly observed controls has not been established.
+
+Rebuilt-runner V327 executes271 native cases:174 pass /97 strict fail.
+Its269 browser reftests are256 exact /13 gaps, with0 resource/comparison gaps
+and0 regressions among the previous253 exact cases. Processing016/017/018
+each change718->0 pixels for both actual-native/browser and
+reference-native/browser. Their browser/native strict comparisons remain0;
+all97 other strict failures are still independently listed. V329 binds
+current source, untracked modules, runner, unit outcomes and remaining cases.
+Full6548 completion remains unverified; no commit/push, original WPT edits,
+tolerance changes, business knowledge semantic changes, or main-repo edits.
+Diff check passes; parent size gate retains6 outside-vendor violations.
+
+Next unit findings from original synthetic fixtures in Chromium V333:
+iframe first line22px and frame y30 already match native (old18px assertion
+is stale), but native body330px vs browser181px is a separate height problem.
+Empty atomic lines advance22px with a110px parent in both engines (old20px /
+100px expectations are stale), but native first box y8 vs browser9 is still
+a real baseline error. Bottom-margin orange y123 already matches browser;
+its old4px descent assertion is stale. Update expectations only from this
+evidence and add the missing full-box/baseline assertions before repairs.
+The independent paint-order numeric z-order failure also stays open.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`soft-wrap-units-v325.json`, `soft-wrap-units-v326.json`,
+`decorated-text-binding-v327.json`, `decorated-text-browser-v327/receipt.json`,
+`decorated-text-delta-v328.json`, `pre-background-closeout-v329.json`,
+`soft-wrap-units-v330.json`, `soft-wrap-units-v331.json`,
+`pre-background-diagnostic-v332.json`, `forced-break-browser-v333.json`.
+
+## 2026-10-05 preserve source boundaries when trimming line-leading text
+
+V313 refreshes111 white-space cases after the wrapped font-boundary fix:
+102 browser exact /9 gaps,27 native strict passes /84 failures, no new
+browser regressions. Combined with V311, the matching source has269 distinct
+browser cases:252 exact /17 gaps and96 independent strict-reference failures.
+
+For generated-content-before001, original Chromium V316 shows the authored
+text after `::before` starting1/64px later than the equivalent single text
+node. Native V315 merges the text but its paint snapshot trims the leading
+space without rebasing the source-fragment offsets/fingerprint. The resulting
+stale metadata disables authored run-boundary snapping. V317 is the actual
+paint-artifact RED: expected byte ends[5,9], observedNone. A temporary DOM-only
+probe retained separate runs and did not reproduce the headless coalescing
+path; it was removed and is not claimed as renderer RED.
+
+The candidate rebases valid source byte ends and text fingerprint when
+trimming line-leading collapsible whitespace. V321 passes27 unique focused
+units. Broader V318 executes78 unique units,77 pass /1 fail: the
+`auto_positioned_subtree_paints_after_later_normal_flow_content` z-order
+assertion remains open. Its fixture contains only Column nodes, so it does
+not enter the modified text trim path; pre-candidate runtime attribution has
+not been verified. The broader packet is explicitlyFAIL, not green.
+
+Rebuilt-runner V319 executes271 native cases:174 pass /97 strict fail.
+Its269 browser reftests are253 exact /16 gaps, with0 resource/comparison gaps
+and0 regressions from the previous252 exact cases. Generated-content-before001
+now has0 pixels for both actual-native/browser and reference-native/browser.
+Its native strict reference changes0->46 pixels, exactly matching the original
+browser's46-pixel strict failure. This failure is retained independently,
+not waived or hidden; browser fidelity takes priority. Root017 remains exact.
+V324 binds current source, runner, units, failures and remaining cases.
+
+Next shared browser gap: processing016/017/018. Native V322 gives the
+two-line parent32px high; original browser V323 gives44px, with Ahem inline
+fragments at y58 and80 (each16px high). Investigate parent22px normal strut
+participation rather than enlarging the glyph/background height. No change
+to this next group yet. Full6548 verification remains open. No fixtures,
+tolerances, source outside vendor, business knowledge semantics, commit or
+push changed. Diff check passes; parent size gate retains6 outside-vendor
+violations without a baseline increase.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`decorated-whitespace-browser-v313/receipt.json`,
+`decorated-whitespace-delta-v314.json`, `generated-before-diagnostic-v315.json`,
+`generated-before-browser-v316.json`, `soft-wrap-units-v317.json`,
+`soft-wrap-units-v318.json`, `decorated-text-binding-v319.json`,
+`decorated-text-browser-v319/receipt.json`, `decorated-text-delta-v320.json`,
+`soft-wrap-units-v321.json`, `pre-background-diagnostic-v322.json`,
+`pre-background-browser-v323.json`, `generated-before-closeout-v324.json`.
+
+## 2026-10-05 browser-first wrapped font boundary: root017 pixel exact
+
+Acceptance follows browser-original pixels first. Native strict-reference
+failures remain an independent list; browser agreement never waives them.
+V308 reproduces a real wrapped-run RED: bold content starts59.093613px,
+not59.09375px. Synthetic Chromium V309 confirms59.09375px. The layout
+candidate uses the final soft-line slice at a font change, rather than
+rounding the whole unwrapped text run. Glyph positions and authored CSS
+remain unchanged. Width-aware handling shares the leading-separator packet
+eligibility guard; unsupported packets retain the previous behavior.
+
+V310 executes24 unique targeted unit tests, all passing. After rebuilding
+the headless runner, V311 executes165 native cases:149 pass /16 strict fail.
+Its163 browser reftests are155 exact /8 gaps, with zero resource/comparison
+gaps and no regressions among the prior154 exact controls. Root017's
+actual-native/browser, reference-native/browser, browser-strict and
+native-strict comparisons are all0 pixels /0 max difference; its prior53
+pixels are closed on the current bound source. V312 independently retains
+the16 strict-reference failures. No tolerances, masks, fixture changes,
+commit or push are introduced.
+
+The111 white-space cases were not rerun after this candidate; V301 remains
+prior-source evidence, not current closure. Neither the previous combined
+269-case count nor full6548 completion is refreshed by this focused batch.
+Next: refresh white-space safety and investigate the remaining browser gaps,
+keeping strict-reference failures separate. Business knowledge semantics are
+unchanged. Parent size check retains6 existing outside-vendor violations;
+no baseline increase. Diff check passes.
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/`
+`soft-wrap-units-v308.json`, `wrapped-font-browser-v309.json`,
+`soft-wrap-units-v310.json`, `decorated-text-binding-v311.json`,
+`decorated-text-browser-v311/receipt.json`, `decorated-text-delta-v312.json`.
+
+## 2026-10-05 persistent pre/normal continuation entrypoint aligned
+
+V304 reproduces a real persistent LayoutEngine RED after standalone layout
+already matches the browser: the four normal words start128/158/188/218,
+instead of98/128/158/188. The persistent projection sequence omitted
+`project_inline_continuation_after_wrapped_row`; it now invokes the same
+pass at the same relative stage as standalone layout. No renderer-only
+offset or authored CSS adjustment is introduced.
+
+V305 executes23 unique unit tests, all passing. The enhanced browser-word
+test checks first compute, unchanged-CSS display-style reapplication and
+same-size recompute, viewport shrink800->200 and restore200->800. This does
+not claim a real visibility toggle journey. The clean-height test still
+skips the second full Taffy layout on recompute. Pinned-Ahem synthetic
+Chromium V307 separately confirms the exact word coordinates at both800
+and200 viewport widths; no original WPT DOM is modified.
+
+Unit builds finish successfully (RED3m42s, GREEN3m44s) with existing warnings;
+diff check passes and the parent size gate retains6 outside-vendor violations.
+V306 binds the source diff, all untracked crate/tool files, actual unit binary
+and synthetic browser receipt. No headless runner rebuild or WPT pixel rerun
+this batch: prior V303's269-case pixel counts and root01753 pixels remain
+prior-source evidence, not a refreshed current-source full proof. Full6548
+completion and the remaining browser/strict failures stay open. No commit,
+push, upstream/fixture changes, or business knowledge semantics change.
+Next: reproduce wrapped-line font-boundary snapping with a long initial word,
+not a whole-unwrapped-source correction, then verify the remaining53 pixels.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`soft-wrap-units-v304.json`, `soft-wrap-units-v305.json`,
+`persistent-continuation-closeout-v306.json`,
+`persistent-mixed-pre-browser-v307.json`.
+
+## 2026-10-05 decorated text advances: root017 down to53 pixels
+
+Generated fragments of one source text now share contextual word advances
+even when their inline padding/margins differ at logical edges. Measurement
+normalizes those edges only for the shaping style; Taffy keeps the original
+box decorations and content-box/border-box sizing. The line-fitting packet
+adds those physical edges and margins exactly once. A decorated next font
+also retains the preceding shaping run's LayoutUnit boundary correction.
+
+V294 executes two real renderer REDs: a decorated font boundary keeps raw
+81.024 instead of81.03125, and generated padded words return no contextual
+advances. V292 is a fixture-construction failure, not renderer RED: its
+default test font had integral LayoutUnit widths. The revised macOS fixture
+uses the installed PingFang SC face matching the observed page typography.
+V293 documents the accumulating per-word x error from the prior bound trace.
+
+The pre-to-normal continuation pass also moves every subsequent fragment
+on the same line, not just its first word. Original synthetic Chromium with
+the pinned Ahem font in V300 places the four normal words at x98/128/158/188
+on y23; the previous native receipt placed the second at158. The old two
+unit tests now assert those browser word geometries, not a presumed merged
+leaf count. This tightens positional verification rather than waiving a
+rendering mismatch. All22 selected tests execute and pass in V295, including
+both font REDs, padding guards, mixed pre/normal, NBSP, forced breaks, source
+boundaries and the narrow-word wrap guard.
+
+Bound V296 repeats165 native cases (149 pass/16 strict fail) and163 original
+browser comparisons (154 exact/9 gaps), with0 resource/comparison gaps and
+no regressions among154 prior exact controls. Root017 actual/reference gaps
+improve1378->53 each, confined to bounds[273,154,281,163]. No tolerance is
+introduced. V298 still shows a small first-bold-run origin discrepancy:
+177.0891 versus original browser177.09375. The next investigation must
+account for the final wrapped normal line, not merely snap the complete
+unwrapped paragraph advance.
+
+Fresh white-space guard V301 measures111 original cases under the same
+current source/runner/font profile:27 native strict passes/84 strict failures,
+and102 browser-exact/9 browser gaps. Browser strict comparisons themselves
+fail86 cases; those failures are retained independently. Historical111/111
+native receipts do not prove this current profile's strict closure. The nine
+browser gaps need baseline attribution and focused repair; this fresh scope
+must not be called nine new regressions without an equivalent prior capture.
+V303 deduplicates five overlaps and checks agreement:269 distinct reftests,
+251 browser-exact/18 browser gaps,96 distinct native strict-reference failures.
+These are focused scope counts, not the full6548 remainder.
+
+The persistent LayoutEngine continuation path is not covered by these
+standalone geometry tests and remains an explicit next verification item.
+Unit/runner builds and diff check pass with existing warnings. Main size gate
+retains6 outside-vendor violations. No full run, upstream/fixture edits,
+commit or push. Product knowledge unchanged: generic text/layout mechanics,
+no business, authority, or tool-semantic change.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`soft-wrap-units-v292.json`, `decorated-advance-diagnostic-v293.json`,
+`soft-wrap-units-v294.json`, `soft-wrap-units-v295.json`,
+`decorated-text-browser-v296/receipt.json`, `decorated-text-delta-v297.json`,
+`decorated-text-diagnostic-v298.json`, `mixed-pre-browser-v300.json`,
+`decorated-whitespace-browser-v301/receipt.json`,
+`decorated-whitespace-delta-v302.json`, `decorated-text-closeout-v303.json`.
+
+## 2026-10-05 leading separator fit: root017 partial pixel improvement
+
+Fragmented LTR inline text now fits collapsible separators using the same
+contextual advances assigned to Taffy. A separator that would start a new
+soft-wrapped line is removed from the layout item widths; a context-free,
+zero-height row preserves that wrap so a narrow following word cannot move
+back to the preceding line. Authored flex, preserved whitespace, NBSP,
+negative margins and non-leaf mixed flows are not treated as this text packet.
+The original V284 RED becomes GREEN in V286; six selected controls pass.
+The final candidate additionally passes the narrow-word boundary test.
+
+V287 executes18 unique unit tests:16 pass and2 fail. The failures are
+`nested_normal_inline_wraps_with_outer_pre_line_width` (expects an unsplit
+text leaf) and `mixed_pre_and_normal_inline_preserves_pre_space_advance`
+(expects2 text rects but receives8). Their pre/normal mixing and legacy
+structural assumptions still need independent diagnosis; do not label the
+entire unit packet green or relax their assertions to hide the failures.
+
+Source-bound V288 runs165 native cases:149 pass/16 strict fail. Its163
+original browser comparisons remain154 exact/9 gaps,0 resource/comparison
+gaps, with no regressions among the154 prior exact controls. Root017 improves
+from10168 to1378 mismatched pixels for both actual and reference, not zero.
+Independent strict-reference failures remain listed in the receipt unchanged.
+V290 confirms `navy.` starts at x=102, matching the original browser;
+the decorated strong content starts177.088 versus browser177.09375.
+Remaining differences are confined to the bold glyph region and require
+shaping/advance/run-boundary investigation, not another leading-space shift.
+
+V287/V288/V290 bind tracked diffs and all untracked crate/tool sources;
+V291 checks their source binding agreement. Unit builds and runner build
+pass with existing warnings; diff check passes. Main size gate retains6
+outside-vendor violations. No full6548 run or closure, tolerance change,
+upstream/fixture edits, commit or push. Product knowledge unchanged: generic
+inline layout only, no business or authority semantics.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`soft-wrap-units-v286.json`, `soft-wrap-units-v287.json`,
+`soft-wrap-browser-v288/receipt.json`, `soft-wrap-delta-v289.json`,
+`soft-wrap-diagnostic-v290.json`, `soft-wrap-closeout-v291.json`.
+
+## 2026-10-05 soft-wrap leading separator: reproduced RED
+
+The minimal runtime test
+`soft_wrap_discards_leading_separator_before_decorated_inline_text`
+executes RED in V284. The host leaves only half a space after the first word;
+Taffy wraps the separator onto the next line and retains its 5.34375px
+advance. Consequently the following vertically padded text border box starts
+at x=5.34375 instead of x=0. Its content top belongs to the new line despite
+its border box top being shifted upward by 16px of vertical padding.
+
+An independent synthetic Chromium geometry diagnostic V285 confirms the
+expected CSS behavior: the line-edge space has zero width, the next decorated
+border box starts at x=0, and its text starts at its own 8px left padding.
+This diagnostic is not a WPT pixel comparison or an assertion that its font
+selection equals the native unit's font. Original WPT DOM remains unchanged.
+
+V284 binds tracked source diff, all untracked crate/tool sources, the actual
+unit binary and the fixed WPT revision. The earlier Cargo invocation used an
+unqualified name with `--exact` and selected zero tests; that is not a pass.
+The fully qualified V284 invocation executes exactly one test and fails101.
+The build finishes in3m57s with existing warnings. Diff check passes; the
+parent size gate retains6 preexisting outside-vendor violations.
+
+No production fix or new pixel closure yet. The next correction must remove
+the separator from line fitting, not merely shift painted glyphs, and must
+preserve decorated inline baselines, preserved whitespace/NBSP and resizing
+of persistent layout trees. The focused browser/strict census stays unchanged;
+full6548 completion is unproven. No commit/push or business knowledge change.
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/`
+`soft-wrap-unit-v284.json`, `soft-wrap-browser-v285.json`.
+
+## 2026-10-05 root017 diagnostic: leading whitespace, not missing glyphs
+
+The proposed merged-bidi/first-word-cache hypothesis does not reproduce:
+unitV275 passes before any cache change. It is not RED-to-GREEN evidence.
+Actual root017 replayV280 has separate original words, not bidi-merged Text.
+Glyph traceV281 shows nonempty first-line slices visible with white foreground.
+Raw native pixel inspection also finds text on the first line. The earlier
+visual inference of missing first-line glyphs is explicitly withdrawn.
+
+Original browser geometryV282 identifies the next concrete mismatch:
+the native third-line leading space index68 reserves5.328px, so `navy.` starts
+107.328 rather than102, and the strong content starts182.416 rather than
+177.09375. Native parent/line heights already match the browser. Investigate
+leading-space collapse across decorated inline boxes with different border
+box/content y coordinates; do not compensate fonts or remove cached glyphs.
+Browser original pages use PingFangSC-Regular/Semibold, despite computed Times.
+
+Headless replay and glyph trace extend the existing opt-in layout diagnostic;
+normal output remains unchanged. V281 native target binary matchesV274 byte
+for byte. Runner and unit builds pass with existing warnings; the main size
+gate still reports6 outside-vendor violations. Diagnostic construction errors
+were fixed before the unit executed and are not renderer REDs. V280/V282 bind
+tracked diffs only; V281 additionally binds all untracked crate/tool sources.
+No new pixel closure, full run, tolerance/fixture changes, commit or push.
+The last focused census remains154 exact/9 gaps and16 independent strict
+failures; it is not a current full-corpus proof. Product knowledge unchanged:
+generic diagnostics/guard test only, no business or authority semantics.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`bidi-glyph-unit-v275.json`, `bidi-glyph-diagnostic-v280.json`,
+`shared-glyph-diagnostic-v281.json`, `shared-word-browser-v282.json`,
+`shared-word-closeout-v283.json`.
+
+## 2026-10-05 authored inline vertical margins no longer block fragmentation
+
+Unbordered ordinary inline text with authored top/bottom margins was retained
+as one max-content leaf, preventing word wrapping inside the enclosing IFC.
+The split pass now ignores those non-applicable margins on generated text
+pieces while retaining logical horizontal edges. Synthetic vertical-align
+length margins keep the old guard and are not normalized into CSS margins.
+The new DOM test executes REDV269 (one leaf instead of9), then GREENV270.
+Twenty unique DOM controls pass, including fragmentation, borders, negative
+vertical-align, percent indentation, following text and11 font-size controls.
+V269's separate `font_size::tests::` filter selected0 tests; this is recorded
+as an empty selection, not a pass. V270 rejects empty filters and uses the
+actual `font_size_` selection. Initial test-construction type errors were
+repaired before executing RED; they are not renderer failure evidence.
+
+Bound candidateV271 improves original root017 actual/reference browser
+differences37025->10168 each, but does not close the case. V274 native layout
+shows root282px/body212px/paragraph142px heights, restored from260/190/120,
+and separate styled word fragments instead of the1185.7344px strong leaf.
+Remaining text paint/position differences stay open; root018 remains50910.
+All154 prior exact controls remain exact;163 comparisons remain154 exact/
+9 gaps, with0 resource/comparison gaps. Native165 strict results remain149
+pass/16 fail and every strict failure stays independently visible.
+No full run/recount, upstream edits, tolerance change, commit or push.
+Runner build and diff check pass with existing warnings; the main-repo size
+gate retains6 unrelated outside-vendor violations. Product Agent knowledge
+unchanged: generic CSS inline layout, no business/authority/tool changes.
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/`
+`mixed-inline-diagnostic-v268.json`, `mixed-inline-units-v269.json`,
+`mixed-inline-units-v270.json`, `mixed-inline-browser-v271/receipt.json`,
+`mixed-inline-delta-v273.json`, `mixed-inline-diagnostic-v274.json`.
+
+## 2026-10-05 SVG percentage roots are not intrinsic background dimensions
+
+SVG root percentage lengths remain preserved in decoded metadata, but they
+no longer become intrinsic lengths for CSS background sizing. With no
+absolute dimension or viewBox ratio, `background-size: auto` uses the
+positioning area. CSS background-size percentages retain their own parser.
+This matches [SVG2 intrinsic sizing](https://www.w3.org/TR/2018/CR-SVG2-20180807/single-page.html#IntrinsicSizing).
+
+Original browser REDV256 for background-intrinsic-006 is6080 actual pixels;
+candidateV264 closes it at0 actual/0 reference. Its163 original comparisons
+are154 exact/9 gaps, with0 resource/comparison gaps and no regressions among
+the153 previously exact controls. Native strict results are149 pass/16 fail
+across165 cases. The newly failed strict006 retains the same red region that
+Chromium renders; browser pixel acceptance does not waive that failure.
+Fresh background16 and SVG decoder3 unit tests pass. Runner/runtime unit
+builds and diff check pass with existing warnings; main-repo size check
+still has6 existing outside-vendor violations. No full-corpus rerun/recount,
+fixture/tolerance edits, commit or push. Product Agent knowledge unchanged:
+generic image sizing only, no business/authority/tool semantics affected.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`named-system-font-browser-v256/receipt.json`, `svg-percent-browser-v264/receipt.json`,
+`svg-percent-units-v266.json`, `svg-percent-delta-v267.json`.
+Remaining this batch: intrinsic004/005 and root013a/014a/014b/016/017/018/020.
+The separately measured font-family-013 and Canvas aggregate RED remain open.
+
+## 2026-10-05 named installed fonts: shared measurement and paint cascade
+
+Read-only installed-font lookup now resolves named CSS families by weight,
+style and glyph coverage without adding document registrations. Registered
+faces retain precedence, including unicode-range shadowing; generic names
+remain cascade boundaries. Installed face data and platform typefaces are
+shared by the resolved face, rather than duplicated for requested weights.
+The initial metrics-only candidateV248 improves root006/root007 but leaves
+37411/23702 browser pixels different. The new run-parity unitV254 executes
+RED: metrics resolve Verdana while paint runs resolve no registered face.
+The per-character render-run cascade now includes the same installed faces;
+the unit executes GREEN inV255.
+
+Bound candidateV256 closes root006 and root007 at0 actual/0 reference pixels.
+Its163 original browser comparisons are153 exact/10 gaps, with0 resource or
+comparison gaps. All151 previous exact controls remain exact. Native strict
+results remain150 pass/15 fail across165 cases; strict failures are retained
+separately and are not converted to passes by browser-pixel acceptance.
+The corrected-profile full6548 corpus has not been rerun or recounted.
+
+Additional original font-family-013 controlV261 remains open: actual/browser
+10000 pixels and reference/browser0; native strict29713 and browser strict
+29700. The older V220 census had32628/20226 browser pixels, but used the older
+profile/source and is not a same-source regression baseline. Its previous
+native strict pass does not certify browser parity. Preserve all receipts.
+V258 also retains the old Ahem fallback unit RED: its fixed1.2 assertion no
+longer represents resolved Times New Roman metrics. The assertion now checks
+that uncovered Ahem characters match the next family used alone, rather than
+hard-coding fallback leading. Canvas aggregate-advance RED remains separate.
+Fresh corrected unit receiptV260 passes28 unique controls (17 font-registry,
+11 generic/language/Ahem/synthetic controls); the separately repeated named
+stack check is not counted twice. Canvas aggregate RED remains executed and
+retained. Runner build, runtime unit builds and diff check pass with existing
+warnings; main-repo size check still reports6 existing outside-vendor violations.
+
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/`
+`named-system-font-browser-v248/receipt.json`, `render-run-unit-v254.json`,
+`render-run-unit-v255.json`, `named-system-font-browser-v256/receipt.json`,
+`named-system-font-units-v258.json`, `named-system-font-units-v260.json`,
+`named-font-delta-v259.json`, `named-system-font-browser-v261/receipt.json`.
+Only vendor runtime and evidence/documentation change. No WPT fixture,
+tolerance, waiver, commit or push. Product Agent knowledge/authority is
+unaffected by this platform font-resolution and regression-evidence change.
+
+## 2026-10-05 language-aware macOS default font selection
+
+Standard/serif/sans/fixed defaults now use inherited content language and
+script rather than universally selecting the host UI face. Named and
+registered font stacks retain their precedence; native embeddings without
+the HTML standard marker keep their primary font. Undeclared/empty language
+keeps the existing host defaults. A finite family cache shares resolved
+faces across geometry, advance measurement and glyph paint. This macOS
+default implementation does not change other platforms' font settings.
+The browser probeV238 records2 original pages and96 diagnostic variants per
+page, including zh regions, Japanese, Korean and explicit script overrides.
+Those mutations are diagnostic only, not original-WPT acceptance captures.
+Language edge cases and all-script glyph fallback remain separate audits.
+
+Bound corrected-profile REDV236 and candidateV240 close four original
+browser gaps: background-attachment-009, background-image-005 and
+background-root-102/103. Target background-image-005 falls1721/1721 actual/
+reference pixels to0/0. Candidate165 native cases are150 pass/15 fail;
+163 browser comparisons are151 exact/12 gaps with0 resource/comparison gaps.
+All139 previous browser controls remain exact; both harnesses still pass.
+The12 remaining pixel gaps stay in the primary queue. Root102/103 now fail
+strict references at9269 pixels in both native and Chromium, while each
+actual/reference capture independently matches its browser counterpart at0.
+Keep both strict failures; pixel acceptance does not rewrite strict status.
+
+Fresh runtime tests execute11 passes across language defaults, shared
+metrics/advances, old generics, named fallback, registered Ahem and synthetic
+styles. The separate Canvas aggregate-advance unit still executes RED;
+it is not waived. Runner build, runtime unit build and diff check pass with
+existing warnings. Main-repo size check retains6 preexisting violations
+outside vendor; no baseline changes. Product Agent authority/knowledge is
+unaffected by this platform font-only change. No commit or push.
+Evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`language-font-diagnostic-v238.json`, `language-font-browser-v240/receipt.json`,
+`language-font-units-v242.json`, `language-font-delta-v243.json`.
+This is targeted repair evidence, not a corrected-profile full-corpus census.
+Next target root006 has72298 browser pixels different. Original browser
+probe `language-font-diagnostic-v244.json` resolves Verdana-Bold28px and a
+260px paragraph box. Native `named-font-diagnostic-v245.json` retains the
+authored Verdana stack but has no resolved font metric, normal1.2 leading,
+and a224px paragraph box. `css_font_runs` currently consumes registered
+FontRegistry runs then the supplied primary fallback; the registry does not
+automatically resolve unregistered system-family names. Named system-font
+cascade and its shared metrics are the next concrete repair, not a root006
+fixture-specific size or leading override. Current default-font tests do
+not certify that separate named-family path.
+
+## 2026-10-05 content-language context prerequisite
+
+Content language now reaches principal computed styles before font-relative
+dimensions and normal line metrics, and is copied to anonymous inline text
+contexts. This no longer depends on `text-transform`. Empty declarations
+reset inherited language; real XML-namespace language precedes `lang`;
+HTML's literal unnamespaced `xml:lang` is ignored. Attribute mutations
+invalidate descendant styles through the existing selector invalidation.
+The new unit executes RED (missing `en-us` metadata), then GREEN, including
+provider timing, inherited/anonymous context, empty resets and mutations.
+Font-size21 and text-transform1 controls also pass. Receipts are
+`language-unit-red-v230.json` and `language-unit-green-v231.json` under
+`target/wpt-targeted/baseline-font-position-20261003/`.
+Additional namespace timing/precedence RED is preserved inV234 and the
+corrected unit plus22 controls pass in `language-unit-green-v235.json`.
+V231/V232 precede this namespace correction; they are historical receipts,
+not a current-source whole-renderer certification. The namespace rule follows
+[HTML language processing](https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes).
+
+This prerequisite is not the default-font selection repair. A fresh bound
+hard0/logical12 candidate on16 background pixel gaps and8 exact controls
+still records16 gaps/8 exact,0 resource or comparison verification gaps.
+`background-image-005` remains1721 actual and1721 reference browser pixels
+apart while both native/browser strict comparisons are0. Its missing
+language-aware standard face selection remains the next renderer fix.
+The24-case native strict result is23 pass/1 fail; that strict failure is
+retained independently. Runner build and diff check pass with existing
+warnings. Evidence: `language-context-closeout-v233.json`; this also fixes
+the V229 inventory diagnostic-path typo by referencing the immutable
+`language-font-diagnostic-v228.json`. No full-corpus closure is claimed.
+
+## 2026-10-05 browser-first acceptance and independent strict ledger
+
+The bound V220 full measurement has finished. Of6178 reftests,5309 are
+native/browser pixel-exact for both actual and reference captures,861 have
+pixel gaps,8 have resource/protocol verification gaps and0 have comparison
+errors. The primary repair queue is the861 browser gaps. Among them652
+passed native strict references: a native reftest pass alone is not browser
+parity. Conversely502 browser-exact cases still fail native strict
+references; retain them independently, never rewrite their strict status.
+The complete strict reftest ledger is711 failures (502 exact +209 gaps).
+
+`target/wpt-targeted/baseline-font-position-20261003/browser-priority-inventory-v229.json`
+keeps primary pixel gaps, all strict reference failures and resource gaps
+in separate queues, bound to the immutable original receipts. V220 used
+hard12/logical12 font minima; future candidates use the effectively measured
+hard0/logical12 configuration. The two harness corrections and139 focused
+pixel-exact controls inV225 are independent evidence, not a subtraction
+from or replacement for a corrected-profile full census. No fixtures,
+tolerances or suite membership changed; strict failures are not waivers.
+
+## 2026-10-05 browser-first font readability preferences
+
+Correction from the effective browser profile: `font121-browser-v224.json`
+probes4 original HTML/XHTML pages,3 font families and10 size tokens each.
+Explicit1/6/9/10/11px sizes remain authored sizes; logical keywords and
+default-relative50% resolve to12px. The observed profile therefore requires
+hard minimum0, logical minimum12, not both12. Locale source defaults alone
+were insufficient evidence of effective browser preferences. V219's139
+focused captures remain pixel-exact, but that did not cover the two10px
+testharness cases. Bound full v220 records5835 strict passes/713 failures,
+including2 harness failures (18 failing assertions); both harnesses pass in
+the browser in `browser-harness-failures-v223.json`. These are retained
+native/profile gaps, not reference failures waived as browser conflicts.
+V220 continues with its original bound configuration; do not mutate it
+mid-run. An independent V225 candidate reuses the same source/runner and
+sets hard0/logical12: both harnesses pass (19 subtests) and139/139 browser
+pixel controls remain exact. Its12 strict reference failures are unchanged
+and retained in `font-policy-closeout-v226.json`. This verifies the profile
+correction, not full-corpus acceptance; the live V220 configuration is not
+rewritten and its receipts remain intact.
+
+The browser-first focused set is139/139 pixel-exact in
+`target/wpt-targeted/baseline-font-position-20261003/root-scroll-browser-v219/receipt.json`.
+Strict native reftests remain127 pass/12 fail, retained independently; this
+is not a fresh6548 census or a claim that strict references are satisfied.
+
+`font-size-121` previously differed by804 actual pixels and857 reference
+pixels. Chromium141 macOS `zh-CN` defaults both hard and logical font
+minima to12px. The original fixture probe in `font121-browser-v214.json`
+confirms12px used sizes while relative descendants continue to derive from
+the unclamped specified9px chain. Font keyword tables and the1.2 relative
+factor are unchanged.
+
+Embedders can configure `Document::set_font_size_minimums(hard, logical)`.
+The runtime initializes and resets documents from optional
+`W3COS_MINIMUM_FONT_SIZE` and `W3COS_MINIMUM_LOGICAL_FONT_SIZE` preferences;
+absent/invalid values disable that minimum. Author zero remains invisible.
+Specified sizes are preserved separately for inheritance; used computed
+sizes feed line metrics and font-relative dimensions. Changing preferences
+invalidates the computed-style cache. This is a host setting, not a fixture
+exception or a universal12px CSS default.
+
+The native browser-comparison profile explicitly sets both minima to12 and
+records them in the source/runner binding. No WPT inputs, suite membership,
+viewport, user-origin CSS or pixel tolerances changed. Original actual and
+reference captures are each browser-exact in `font-minimum-browser-v217`.
+The new minimum/inheritance/cache/zero unit executes RED then GREEN;
+font-size controls21/21 and table-header inheritance1/1 pass in
+`font-minimum-controls-v216.json`. Separate Canvas aggregate-advance and
+historical table-flow unit REDs remain unwaived.
+
+Full fixed-revision measurement is the next audit, not implied by the139
+focused greens. Product Agent knowledge/authority is unaffected; this is
+renderer host-font configuration only. No commit or push is authorized.
+
+## 2026-10-02 float image ratio and later-word clearance
+
+`c5525-fltmrgn-000.xht` is RED at23814px. Chromium141 strictly matches
+the pinned reference at0px. Native `height:3em` images are15x45 instead of
+45x45: intrinsic measurement ignores the authored font-relative cross size
+while Taffy resolves the height. Resolving em/rem dimensions before applying
+the intrinsic ratio restores the auto width for inline and floated images.
+Unit `font_relative_image_cross_size_derives_auto_inline_and_float_width`
+executes RED (15x15 vs45x45 in intrinsic measurement), then green for both
+units and both outer displays. Candidate1 reduces the WPT diff to9504px.
+
+The remaining break is a later unbreakable word in a15px float band.
+The old greedy algorithm defers only the paragraph's first word. Its lines
+are `x/x/x/xx/x/x x` instead of `x/x/x/empty/empty/xx x x/x`. Every completed
+unbreakable word now searches subsequent available bands; when none fits,
+ordinary overflow remains unchanged. CJK breaking, preserved whitespace and
+nowrap/pre paths retain their existing controls. The new later-word unit
+executes RED, then green. Candidate2 and its neighbor window are4/4 exact0.
+Final native container126x561 at(8,50), and test3/test5 heights105px at
+y203/428, agree with Chromium, including geometry below the600px viewport.
+
+Receipts under `target/wpt-targeted/` use these prefixes:
+
+- `css1-float-margin-red-20261002`: original RED, image unit RED and browser
+  source-backed oracle (strict0px).
+- `css1-float-margin-image-size-v1-20261002`: partial candidate9504px and
+  later-word unit RED; not target closure.
+- `css1-float-margin-later-word-v2-20261002`:4/4 exact0 and unit regressions.
+- `known-failures-after-float-image-word-v2-20261002`:108/187 pass,79 fail;
+  exactly c5525-fltmrgn changes fail->pass, no pass->fail changes.
+- Supplement1/3, first-line22/22, white-space111/111 and linebox196/198 use
+  suffix `after-float-image-word-v2-20261002`; status lists are unchanged.
+
+Combined tracked190 is109 pass81 fail, not a fresh6548 census. Runtime
+text_layout35, float_text5, float_excl4 and forced_break23 pass. Expanded
+image filter is65/69 with four individually reproducible failures: two
+image load/decode assertions (2 vs1), ImageDecoder class identity after
+realm reset, and a manual top-alignment fixture (55.4 vs51.2). No pre-change
+binary comparison has classified these; they remain unwaived and separate
+from WPT counts and the previously recorded seven expanded-table failures.
+No full-unit module closure is claimed.
+
+Build, runtime check and diff check pass with existing warnings. Root size
+check retains six outside-vendor violations. Qualification binds exact
+source/runner/runtime-test hashes, pinned revision and detached dirty base.
+No reference/tolerance changes, product Agent authority/knowledge changes,
+commit or push. All batch processes are terminal. Next focused RED is
+`css1-float-width-red-20261002/results.json`: indices1324/1325,1/2 pass;
+`c5525-fltwidth-003.xht` remains4504px with an image adjacent to a right
+50%-width float. Preserve that baseline before modifying its line context.
+
+## 2026-10-02 forced-break lines share adjacent float exclusions
+
+`css/CSS2/css1/c5525-fltblck-000.xht` is RED at850px. Its right float
+already has the correct border box; three right-aligned white text leaves
+incorrectly paint atx777 instead ofx441 and overwrite the float's border.
+Chromium confirms three15px text runs atx441, y26/41/56, while the ordinary
+block's background retains its full784px width.
+
+The float resolver previously supported a single text leaf, not separate
+leaves around explicit breaks. Each complete, non-wrapping forced-break line
+now receives the existing shared BFC float margin-box band. Internal Flex
+rows carrying the inline-formatting-context marker are ordinary CSS blocks,
+not real flex BFCs. The first candidate omitted this lowering and remained
+850px despite a passing manual-block unit; candidate2 covers both forms.
+Real Flex/flow-root/inline-block/overflow BFCs, independent inline edges,
+nonzero indent, multi-run lines and lines requiring wrapping are excluded.
+No background masking, reference edit or tolerance change was used.
+
+Unit `adjacent_float_excludes_each_forced_break_text_line` executes RED
+(0 flows vs3), then passes with the lowering and BFC guards. Serial runtime
+filters float_text5, float_excl4, forced_break23 and anonymous25 pass; filters
+overlap and are not full-module proof. Previous seven expanded-table unit
+failures remain unwaived and separate from tracked WPT failures.
+
+Receipts under `target/wpt-targeted/`:
+
+- `css1-float-block-red-20261002/results.json`: target0/1,850px.
+- `css1-float-block-candidate-v1-20261002/results.json`: target still850px.
+- `css1-float-block-candidate-v2-20261002/results.json`: target exact0;
+  adjacent window3/4, remaining float-margin case23814px, unchanged.
+- `known-failures-after-forced-float-lines-v2-20261002/results.json`:107/187
+  passed,80 failed, exactly one fail->pass and no pass->fail changes.
+- `supplement-after-forced-float-lines-v2-20261002/results.json`:1/3 passed.
+- `first-line-after-forced-float-lines-v2-20261002/results.json`:22/22.
+- `white-space-after-forced-float-lines-v2-20261002/results.json`:111/111.
+- `linebox-after-forced-float-lines-v2-20261002/results.json`:196/198,
+  retaining the two existing strict sub/super failures.
+
+Combined tracked190 is108 pass82 fail, not a fresh6548 census. Runner build,
+runtime check and diff check pass with existing warnings. Root size check
+retains six outside-vendor violations. Qualification binds the pinned
+revision, detached dirty base and final source/runner/runtime-test hashes.
+All batch processes are terminal. Product Agent knowledge/authority is
+unaffected; no commit/push and no full-suite or full-unit closure is claimed.
+Next targeted RED is full index1322 `c5525-fltmrgn-000.xht`,23814px, retained
+in the candidate2 neighbor receipt; preserve that baseline before changing
+float margins, exclusion/wrapping or block-height propagation.
+
 > Status: first runnable baseline · 2026-08-22
 > Upstream: <https://github.com/web-platform-tests/wpt>
 > Pinned revision: `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`
@@ -13,6 +3327,28 @@ W3COS has two different kinds of conformance evidence:
   dynamic document, DOM, layout, paint, and Skia paths.
 
 Neither result is a claim that the full WPT repository passes.
+
+## 2026-09-27: invalid font shorthand is discarded as a whole
+
+`css/CSS2/css1/c71-fwd-parsing-003.xht` was RED at 5,963 differing pixels.
+The stylesheet contains `font: bold highlighted 100% ...`; the unknown
+`highlighted` token must invalidate the complete shorthand, rather than
+allowing the size/family suffix to apply. Font shorthand validation now checks
+all pre-size tokens against the supported CSS prefix grammar, and computed
+style application skips invalid declarations before they mutate the merged
+style. The case is GREEN at 1/1 with zero differing pixels.
+
+Receipts: `target/wpt-targeted/forward-parsing-red-20260927/results.json`
+(0/1) and `target/wpt-targeted/forward-parsing-fixed-20260927/results.json`
+(1/1). The WPT pin remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+
+The concurrent full diagnostic completed 6,548/6,548 at 6,411 passed and
+137 failed. Compared with `full-current-after-shrink-20260927`, four cases
+changed from fail to pass (`s-11-1-1b-005`, `inline-table-height-001`,
+`absolute-non-replaced-width-022`, and `inline-negative-margin-001`); no case
+changed from pass to fail. This full run predates the shorthand-validation
+change above, so its total does not include that fix. Receipt:
+`target/wpt-all/full-current-after-rtl-ch-20260927/results.json`.
 
 ## Normal line-height representation
 
@@ -7786,6 +11122,2046 @@ pixel-count changes. Two focused runtime tests passed; the smoke gate was 2/2
 and the documented ten-case baseline held at 9/10. No current full 6,548-case
 result is asserted here.
 
+### Split-inline border paint order against an in-flow block (2026-09-23)
+
+`css/CSS2/normal-flow/block-in-inline-nested-002.xht` had the same box
+geometry as its reference but differed at 30 pixels where the first blue
+split-inline edge covered the following block's text. The edge had the normal
+inline paint phase, which sorted after the block text even though its fragment
+precedes that block. Split-inline edge fragments now carry a separate paint
+marker, so their paint order follows the in-flow block phase and source order;
+the existing passive-fragment marker remains reserved for DOM flattening.
+
+The focused paint-order unit test was RED before the phase change and GREEN
+after it. At pinned WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`,
+strict 800x600 pixels, the target changed **30 → 0**. Directed 30-case
+`box-display` and 122-case `normal-flow` ranges changed only this one case
+against the `8988c8e` full-run report; neither range lost a previous PASS.
+Five further directed ranges (73 cases across nearby box-display, floats,
+generated-content, stacking-context and CSS1 paths) were unchanged against
+that report.
+This is directed evidence, not a new full 6,548-case result.
+
+### Testharness numeric globals and inline-block vertical alignment (2026-09-23)
+
+`css/CSS2/linebox/vertical-align-top-bottom-001.html` initially failed all
+20 subtests with `assert_equals` number-versus-string errors. Pinned
+`testharness.js` calls the coercing global `isFinite()` from
+`assert_approx_equals`; W3COS exposed `Number.isFinite` but omitted the
+global function. The window now exposes coercing `isFinite` and `isNaN`
+without changing the stricter `Number.*` methods. The focused unit test was
+RED (`undefined`) before the addition and GREEN after it.
+
+The numeric fix exposed 12 real geometry differences. The former mapping
+collapsed `text-top` into `top` and `text-bottom` into `bottom`, although the
+[CSS 2.2 vertical-align rules](https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align)
+use the parent's font content area for the former pair and the line box for
+the latter pair. Computed styles now retain the keyword. For one unwrapped
+inline-formatting row of empty atomic inline boxes, layout solves the parent
+strut, baseline-aligned boxes and top/bottom constraints together, then uses
+the resulting line height to move following block-flow siblings. A focused
+height/flow unit test was RED before the flow correction and GREEN after it.
+
+The real WPT case is now **20/20 subtests, PASS**. The 81-case
+`linebox/vertical-align`, 122-case normal-flow and 38-case visudet directed
+ranges changed no prior PASS or pixel count against the preceding candidate;
+the nine other `vertical-align` paths stayed 9/9. This is still directed
+evidence, not a fresh full-suite claim. The strut projection currently covers
+unwrapped rows of empty inline-blocks; mixed text, wrapped rows and atomic
+boxes with in-flow content need their own focused evidence before extending it.
+Final candidate evidence is under
+`target/wpt-targeted/vertical-align-strut-{target,smoke,baseline,prior-split}-final/`.
+
+### An intervening float stays in source order outside a split inline's relative offset (2026-09-23)
+
+`css/CSS2/normal-flow/block-in-inline-float-between-001.xht` differed by 322
+pixels: the two in-flow blocks were correctly shifted 100px, but the float
+between them inherited that offset and overlapped the second block. An early
+return retained the relative inline row before the existing float-detachment
+path could run. That path now runs only for a passive split inline with a direct
+float and no absolute/fixed positioned descendant. It preserves child source
+order while assigning the relative offset to the in-flow boxes, not the float.
+
+The component regression test was RED before the early-return change and GREEN
+after it. On pinned WPT, strict 800x600 pixels, the target changed **322 → 0**.
+The 122-case normal-flow directed range is **121 pass / 1 fail**; compared with
+the `8988c8e` full-run report, only this case and the independently fixed
+`block-in-inline-nested-002` changed fail→pass, with no lost PASS. A 16-case
+box-display neighbor range is **14/2** and lost no PASS;
+`block-in-inline-relpos-002` remains failing but improved **14,020 → 2,210**
+pixels. The two-case absolute-positioning prefix stayed 2/2, smoke stayed
+2/2, and the documented baseline stayed 9/10. Final artifacts are under
+`target/wpt-targeted/float-between-{final,normal-flow-final,box-display-final,abspos-final,smoke-final,baseline-final}/`.
+These are directed checks; no new 6,548-case full-suite result is asserted.
+
+### A split inline's sole-block filter and passive relative fragments (2026-09-23)
+
+`css/CSS2/normal-flow/block-in-inline-float-in-layer-001.html` had the right
+float location but differed by 460 pixels: the host inline's `blur(1px)` was
+left on empty split fragments, not on the block containing the float. When a
+passive static inline splits around exactly one in-flow block, has no other
+filter or opacity effect to compose, and has no absolute/fixed descendant,
+the filter now follows that single painted block. The component test was RED
+before this change and GREEN after it; the WPT case changed **460 → 0**.
+
+`css/CSS2/box-display/block-in-inline-relpos-001.xht` retained a positioned
+inline row around a split block even though the passive host had no absolute
+positioned descendant requiring that containing block. The relative offset
+can instead follow the in-flow fragments. With the one-row owner removed, this
+case changed **13,560 → 0**. Its companion `relpos-002` still fails at **2,210**
+pixels, concentrated in two float bands; that is not claimed as fixed.
+
+At the pinned WPT revision, strict 800x600 pixels, the latest directed
+normal-flow range is **122/122**, the 16-case box-display range is **15/16**,
+the two absolute-positioning prefix cases remain **2/2**, smoke is **2/2**,
+and the documented ten-case baseline remains **9/10**. Relative to the
+`8988c8e` full-run report, these directed ranges gained the target cases and
+lost no prior PASS. Eleven `split_` DOM tests passed. Reports are under
+`target/wpt-targeted/relpos-{v1,box-final,normal-flow-final,abspos-v1,smoke-final,baseline-final}/`
+and `target/wpt-targeted/float-layer-{v1,normal-flow-v1,box-v1,smoke-v1}/`.
+No current full 6,548-case result is asserted.
+
+### Restore an explicit block width after a text/float flex line break (2026-09-23)
+
+The remaining `css/CSS2/box-display/block-in-inline-relpos-002.xht` difference
+was partly a width error. The internal flex fallback gives an in-flow block a
+full-width basis to force a line break. Its paint-width projection handled a
+preceding empty decorated inline, but not a preceding text run when a float
+also shares the block container. The target's first block declared `width: 2em`
+with a `2em` left border; its observed border-box was **120px**, not **80px**.
+The projection now restores explicit width for that text/float structure while
+keeping the full-width layout basis. A focused layout test passes, and the
+pinned case improved **2,210 → 1,810** strict pixels; it is **still failing**.
+
+The final headless layout dump records the target block at `x=31, y=78.2,
+width=80, height=10`, while its two floats remain at `x=31` and `x=-9` on
+the following 10px band. The reference image requires those float colors 40px
+farther right. A blanket offset would contradict the already passing
+`block-in-inline-float-between-001`, so float-fragment positioning remains a
+separate unresolved issue, not a patched special case here.
+
+On the final candidate, the 16-case box-display range stayed **15/16** and
+the 122-case normal-flow range stayed **122/122** with no lost PASS or other
+pixel-count change; the two absolute-positioning prefix cases stayed **2/2**,
+smoke **2/2**, and the documented baseline **9/10**. Reports are under
+`target/wpt-targeted/relpos-width-optimized-{box,normal-flow,abspos,smoke,baseline}-final/`.
+No new full 6,548-case result is asserted.
+
+### Preserve atomic inline siblings across a dynamic float (2026-09-23)
+
+At pinned WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, case 1352
+(`css/CSS2/floats/block-in-inline-become-float.html`) was a 10,000-pixel
+failure. The live DOM and computed CSS contained both 50×100 green
+`inline-block` siblings and the dynamically floated middle element, but the
+component tree had only the float. The bidi cleanup's empty-inline predicate
+recursively treated childless atomic inline boxes as empty and pruned their
+parent `span`. A component regression test was RED before preserving atomic
+inline boxes and GREEN afterward.
+
+That correction reduced the WPT mismatch to 992 pixels. Float hoisting then
+left a 4px synthetic text strut between atomic siblings; limiting that strut
+to floats between actual in-flow block descendants reduced the mismatch to
+200 pixels. The remaining one-pixel top/bottom bands came from projecting
+`vertical-align: top` only for marked anonymous inline contexts, not an
+ordinary inline host containing two atomic boxes. A layout regression test
+was RED before that projection and GREEN afterward. The original WPT case is
+now **PASS, 0 different pixels**.
+
+The adjacent eight-case float range (1351–1358) is **4 pass / 4 fail**; its
+four failures have the same paths and exact pixel counts as the saved
+`target/wpt-fix20-full-20260923/results.json` baseline. The split-inline
+cases 3163–3164 are **2/2**, and the 122-case normal-flow range
+(3147–3268) remains **122/122**. Directed evidence is under
+`target/wpt-targeted/become-float-final-{nearby,split,normal-flow}/`. A serial
+`w3cos-dom --lib` run is **488 pass / 12 fail**; temporarily removing only
+the atomic-box correction produced the same 12 failures plus the new RED
+regression test (**487 pass / 13 fail**). These existing module failures are
+not claimed as repaired. No new full 6,548-case result is asserted.
+
+The next smallest neighboring failure is
+`css/CSS2/floats/adjoining-floats-dynamic.html` at 2,500 pixels. Its current
+headless layout places the right float at `(58, 51.2, 50×50)`, but the two
+inner left floats at `(8, 51.2, 50×50)` and `(8, 101.2, 50×50)`; their
+ancestor `clear: both` box is still at `y=51.2`. This is a separate clearance
+and nested float-band issue, not a regression from the atomic-inline change.
+
+### Clear nested boxes against earlier floats in their shared BFC (2026-09-23)
+
+`css/CSS2/floats/adjoining-floats-dynamic.html` was the next directed RED at
+**2,500 pixels**. Its `flow-root` contains a preceding right float, a
+static-positioned absolute sibling, and a nested `clear: both` box with two
+left floats. Direct-child clearance did not reach the nested box, and the
+float pass then pulled its parent back above the float. A second independent
+error made the absolute sibling's auto-inset static position follow the float
+because `flow-root` was omitted from the block static-position container
+check.
+
+The layout regression first failed on clearance, then on the absolute static
+position after clearance was fixed. Shared-BFC float bottoms are now collected
+in source order by side, so nested clearance avoids a per-clear backscan.
+The normal-flow pull-up retains an ancestor whose descendant clears an active
+float, while an absolute auto-inset box in `flow-root` uses the initial block
+static position. Both focused layout tests pass; the original WPT case is now
+**PASS, 0 different pixels**.
+
+On this candidate, the adjacent float range 1351–1358 is **5/8** (the other
+three have unchanged baseline pixel counts), normal-flow 3147–3268 is
+**122/122**, box-display 1010–1025 is **15/16** (remaining `relpos-002` at
+1,810 pixels), and abspos 0–1 is **2/2**. The exact reports are under
+`target/wpt-targeted/adjoining-final-{floats,normal,box,abs}/`. The complete
+6,548-case suite has not been rerun on this dirty candidate.
+
+### Floated table minimum grid size (2026-09-24)
+
+`floated-table-wider-than-specified.html` initially differed by **20,500
+pixels**. A parsed HTML fixture demonstrated that a floated CSS table with
+`width:50px` and a rigid 200px block child retained the 50px specified width
+and sat beside a preceding 200px float. For a table with no explicit row
+tracks, the minimum-content calculation now includes non-table descendants;
+the table's used minimum width is applied before float placement. That reduced
+the WPT difference to **18,000 pixels**, exposing a second error: Taffy's
+flex fallback shrank the 100px block child to the table's 10px declared
+height. Direct block children of a CSS table no longer flex-shrink, and the
+table's specified height acts as a floor beneath its contents. The same
+parser-backed fixture is green and the WPT reftest passes at **0 pixels**.
+
+`target/wpt-targeted/table-wide-final/results.json` records **6/8** for
+1375–1382. Only `floats-line-wrap-shifted-001.html` (2,156 pixels) and
+`floats-placement-005.html` (20,000 pixels) remain in this slice. The
+box-display 1010–1025, nearby floats 1351–1358, and normal-flow 3147–3268
+regressions are **16/16**, **8/8**, and **122/122** under
+`target/wpt-targeted/table-wide-final-{box,floats,normal}/`.
+The `cargo test -p w3cos-runtime table --lib` filter has **83 passed / 5
+failed**, with the same five failure names before and after this height
+correction; it is not a green module gate. A full 6,548-case rerun is still
+required before claiming suite completion.
+
+### Cleared float wrapper and cross-side overlap (2026-09-24)
+
+`floats-placement-005.html` remained **20,000 pixels** different even though
+its cyan inline row was already at the browser's y=58. Chromium's actual and
+reference DOM rectangles showed that the first right float may start at y=48
+and overlap the preceding left float vertically; W3COS started it at y=58.
+The parser-backed RED fixture traced this to an internal, cleared left-float
+Flex wrapper: its auto width stretched to the 150px parent while its actual
+float child was only 50px wide. The wrapper is now explicitly marked and
+shrink-wrapped to its intrinsic content width before float-band exclusion.
+Both a cross-side overlap fixture and the complete float-sequence fixture
+match the browser coordinates. The WPT case passes at **0 pixels** and the
+1375–1382 slice is **7/8** in
+`target/wpt-targeted/placement005-next/results.json`; only
+`floats-line-wrap-shifted-001.html` remains. Directed checks on that
+candidate are box-display **16/16**, nearby floats **8/8**, and normal-flow
+**122/122** under `target/wpt-targeted/placement005-{box,floats,normal}/`.
+
+### Preserve source order when hoisting floats out of inline wrappers (2026-09-23)
+
+The next directed RED was
+`css/CSS2/floats/float-in-inline-anonymous-block-with-overflow-hidden.html`
+at **5,000 pixels**. A float nested in an inline wrapper was hoisted ahead of
+an earlier in-flow block, so both painted in the same 50px band instead of
+successive bands. The DOM regression test reproduced the reordered component
+IDs before the fix. Newly extracted left floats now remain after the last
+completed in-flow block when that block precedes their inline wrapper; the
+layout regression independently checks the expected band placement.
+
+The rebuilt runner reports **8/8** for adjacent float cases 1351–1358,
+including this case at **0 different pixels** and the two previously failing
+`float-in-inline-001/002` cases. Normal-flow 3147–3268 remains **122/122**,
+box-display 1010–1025 remains **15/16** (the same `relpos-002` failure), and
+abspos 0–1 remains **2/2**. Reports are under
+`target/wpt-targeted/overflow-order-{floats,normal,box,abs}/`. These are
+directed results, not a new full 6,548-case suite result.
+
+### Relative inline fragments, floated descendants, and auto height (2026-09-24)
+
+`css/CSS2/box-display/block-in-inline-relpos-002.xht` was RED at **1,810
+pixels**. Its positioned inline has visible text fragments, a block, and two
+floats. The split-inline lowering moved the in-flow fragments but discarded
+the ancestor's visual offset for the floats. Keeping the positioned inline
+container instead made the mismatch **14,020 pixels**, so that trial was
+reverted. Propagating its fixed-length visual offset to floats reduced the
+case to **700 pixels**; the remaining difference was an ordinary block whose
+auto height ended above its last in-flow line after float pull-up. The latter
+is now settled from that final line's static margin edge, not only for BFCs.
+
+A neighboring normal-flow case then exposed the necessary boundary: a split
+relative inline with only block children and a float has no painted inline
+text fragment and must not visually move the float. Both DOM conditions have
+focused tests, and the ordinary-block height test failed before its correction
+and passes after it. On the final candidate, the original case and the
+neighboring regression both pass at **0 different pixels**. Directed WPT
+reports are `target/wpt-targeted/relpos-final-{box,floats,normal,abs}/`:
+box-display 1010–1025 **16/16**, floats 1351–1358 **8/8**, normal-flow
+3147–3268 **122/122**, and abspos 0–1 **2/2**.
+
+The visual-offset propagation currently resolves fixed px/em/rem/ch lengths
+in component lowering; percentage and viewport-relative offsets have not
+been demonstrated by these tests. The full 6,548-case suite remains unrun on
+this dirty candidate.
+
+The next eight-case float slice, 1375–1382, was run on the same compiled
+candidate and is **2/8**. Six failures remain in that slice: floated-table
+width (20,500 pixels), table-caption float (556), line-wrap shift (2,156),
+placement-001 (1,000), placement-003 (400), and placement-005 (20,000).
+The report and failing PNGs are under `target/wpt-targeted/next-floats-1375/`.
+In placement-003 the actual image exposes a 20×20 red patch at the left of
+the green square; no correction for this next slice is claimed yet.
+
+### Fresh atomic lines and zero-area float exclusions (2026-09-24)
+
+`floats-placement-003.html` failed by **400 pixels** because an inline-block
+starting a new line retained 20px of horizontal track width from a left float
+that had ended above that line. Its actual DOM/layout fixture failed with the
+inline-block at x=28 instead of x=8. A start-aligned atomic inline with no
+prior in-flow content on its line now uses the current float band's start
+edge; explicitly centered/auto-margin positions are left alone. The focused
+fixture and WPT case pass at **0 different pixels**.
+
+`floats-placement-001.html` then remained RED by **1,000 pixels**. A real
+runner layout trace showed a zero-height left float at y=51.2 and the next
+inline-block at y=51.199997. Floating-point rounding made the overlap scan
+treat the zero-area float as if it excluded 20px of width. A projection-level
+test using those exact coordinates failed at x=28 before the correction and
+passes at x=8 after zero-width/zero-height floats are excluded. This WPT case
+also now passes at **0 different pixels**.
+
+The current report `target/wpt-targeted/placement001-next/results.json` is
+**4/8** for 1375–1382; four failures remain: floated-table width (20,500
+pixels), table-caption float (556), line-wrap shift (2,156), and
+placement-005 (20,000). Repeated directed regressions are box-display
+1010–1025 **16/16**, floats 1351–1358 **8/8**, and normal-flow 3147–3268
+**122/122** under `target/wpt-targeted/placement001-{box,floats,normal}/`.
+These runs do not replace a complete 6,548-case result.
+
+### Table-caption float intrinsic width and line origin (2026-09-24)
+
+`floats-in-table-caption-001.html` exposed two independent anonymous-line
+errors. A floated auto-width child was lowered to a flex item whose used width
+collapsed to its 2px border, although its text needs a shrink-to-fit width.
+A parser-backed layout test reproduced that 2px box before the fix. Anonymous
+inline-formatting rows now give auto-width floats their intrinsic used width,
+without changing real flex items. The WPT mismatch dropped from **556** to
+**275 pixels**. The remaining glyphs were exactly 2px too low: table-caption
+text was inheriting a synthetic half-leading from the anonymous row. The same
+test was extended to assert the caption's text origin before correcting that
+projection. The WPT case now passes at **0 different pixels**.
+
+The current report `target/wpt-targeted/caption-final-next/results.json` is
+**5/8** for 1375–1382. The remaining failures are floated-table width (20,500
+pixels), line-wrap shift (2,156), and placement-005 (20,000). Directed
+regressions on this candidate remain box-display 1010–1025 **16/16**, floats
+1351–1358 **8/8**, and normal-flow 3147–3268 **122/122**, recorded under
+`target/wpt-targeted/caption-final-{box,floats,normal}/`. The complete
+6,548-case suite has not been rerun on this dirty candidate.
+
+### Deferred full-width inline float and forced-break sibling flow (2026-09-24)
+
+`floats-line-wrap-shifted-001.html` was the last failure in 1375–1382 at
+**2,156 pixels**. Its anonymous inline row treated a full-width float as an
+ordinary Flex item, placing text after the float on a third line. A parsed
+HTML RED fixture verifies that the flanking text fits together and the float
+follows their line. Removing only that synthetic Flex slot while retaining
+the float's source-order projection reduced the mismatch to **1,432 pixels**.
+
+The remaining mismatch was on the reference side. W3COS drew a normal block
+after `1111<br>2222 3333` at y=18, although the second text line ends at
+y=28; Chromium's reference DOM placed that block at y=28. The forced-break
+projection had expanded its anonymous text block from 10px to 20px without
+advancing later siblings. A second RED fixture now passes after the extra
+line height is propagated through normal block flow. The WPT case passes at
+**0 pixels** and `target/wpt-targeted/linewrap-final/results.json` records
+**8/8** for 1375–1382. The `forced_break` runtime filter is **15/15**;
+box-display 1010–1025 and nearby floats 1351–1358 are **16/16** and
+**8/8** under `target/wpt-targeted/linewrap-final-{box,floats}/`. This is a
+directed slice, not evidence that the complete 6,548-case suite is green.
+
+The normal-flow 3147–3268 regression also passed **122/122**, and the
+contiguous float span 1351–1382 passed **32/32** in
+`target/wpt-targeted/floats-1351-1382-final/results.json`. The next two
+16-case slices, 1383–1398 and 1399–1414, both passed **16/16**. The next
+slice 1415–1430 is **11/16** in
+`target/wpt-targeted/next-floats-1415/results.json`: the five remaining
+cases are `floats-wrap-bfc-with-margin-006` through `-010`, a BFC-versus-float
+margin placement family. This candidate has not been rerun over all 6,548
+cases; those five are the next focused failures to diagnose.
+
+The subsequent float/BFC margin pass resolves those five without regressing
+the earlier margin cases: `target/wpt-targeted/bfc-seventh-floats/results.json`
+records **80/80** for indices 1351–1430, including `001`, `001a`, `002`, and
+`006`–`010`, with no pixel mismatch. The focused BFC runtime filter passes
+**16/16**. The adjacent box-display 1010–1025 and normal-flow 3147–3268
+regressions pass **16/16** and **122/122** in `bfc-seventh-box` and
+`bfc-seventh-normal`. The first scan of the next float span 1431–1462 is
+**17/32**, with 15 failures recorded in `floats-next-1431`; this is the next
+targeted family, not a completed full-suite gate.
+
+The next focused candidate recognizes a nested float and an adjoining block
+BFC as sharing the same formatting context, allowing the BFC beside the float
+only when its border box fits. It also permits a trailing margin to overflow
+without forcing that border box below. The parser-backed BFC filter is
+**18/18**; `target/wpt-targeted/adjoining4-prior/results.json` retains
+**80/80** for 1351–1430, while `adjoining4-next/results.json` improves
+1431–1462 to **20/32**. Twelve cases remain in that next span. This is still
+focused evidence only, not a complete 6,548-case rerun.
+
+A further BFC reflow correction propagates the narrowed box's height change
+and float pull-up to a following relatively positioned block. The
+parser-backed BFC filter is **19/19**. `target/wpt-targeted/relayout-next/results.json`
+improves 1431–1462 to **21/32** by passing `new-fc-relayout` at zero pixels;
+`relayout-prior/results.json` retains **80/80** for 1351–1430. Eleven cases
+remain in 1431–1462, and no complete-suite claim follows from this slice.
+
+The negative-margin float placement case also passes at zero pixels after
+preserving the preceding float's unclipped margin edge for a negative-width
+margin box. `target/wpt-targeted/negative-float-next/results.json` is now
+**22/32** for 1431–1462, while `negative-float-prior/results.json` remains
+**80/80**. The broader `cargo test -p w3cos-runtime --lib float` filter is
+**92 pass / 1 fail** (`leading_float_margin_does_not_collapse_with_its_containing_block`);
+the origin of that failure has not yet been classified. Ten WPT cases remain
+in this float slice.
+
+The four `new-fc-separates-from-float` cases now pass at zero pixels. A
+non-fitting BFC's positive top margin no longer pulls its preceding float's
+branch down through a collapsed margin; the containing auto-height BFC is
+settled to the corrected branch extent. The parser-backed BFC filter is
+**20/20**. `target/wpt-targeted/separate-next/results.json` records
+**26/32** for 1431–1462, and `separate-prior/results.json` retains **80/80**
+for 1351–1430. Six cases remain in the next float span; the complete pinned
+suite still has not been rerun on this candidate.
+
+Hit-testing now excludes descendants outside an ancestor's resolved overflow
+clip; the parser-backed DOM hit test and `hit-test-floats-005` pass. A float
+whose negative top margin makes its margin-box height negative now still uses
+its border height for collision bands in both direct and shared-context float
+placement, passing `overhanging-float-paint-order` at zero pixels. The latest
+`target/wpt-targeted/overhang-next/results.json` is **28/32** for 1431–1462;
+`overhang-prior/results.json` remains **80/80**. Four cases remain: the two
+`floats-wrap-top-below-inline-003*` and two `floats-zero-height-wrap-*` cases.
+
+The two `floats-zero-height-wrap-*` cases now pass at zero pixels. Bottom-
+aligned inline-block lines that fit beside a float start at their containing
+line top; after that vertical correction, their horizontal float bands are
+resolved again. A zero-height float excludes only a line that strictly
+crosses its top, not one beginning on that top. `target/wpt-targeted/zero3-next/results.json`
+is **30/32** for 1431–1462, and `zero3-prior/results.json` remains **80/80**.
+Only the `floats-wrap-top-below-inline-003l/r` pair remains in this slice.
+
+That final pair now passes at zero pixels: two opposite-side floats occupy
+staggered vertical bands, so atomic inline boxes use the earliest band fitting
+their complete line height rather than the native fallback's stacked-float
+position. `target/wpt-targeted/staggered-next/results.json` records **32/32**
+for 1431–1462, and `staggered-prior/results.json` retains **80/80** for
+1351–1430. This closes the focused float span through index 1462 only; it is
+not evidence that the complete 6,548-case suite passes.
+
+The next focused span, indices 1463–1494, began at **15/32**. Correcting the
+layout applicability of `clear` on internal table boxes made all seven
+`clear-applies-to-001`–`007` reftests pixel-exact. Clear blocks after floats
+now start from normal flow rather than Taffy's accumulated float height, and
+nested clearance is re-evaluated after final float placement so auto-height
+ancestors contain the clearing edge. A last clearing block adjoining a float
+also no longer leaves its discarded top margin in a new formatting context's
+auto height. `target/wpt-targeted/adjoin-height-next/results.json` recorded
+**27/32**. Separating a clearing margin from its preceding float corrected the
+parent block's collapsed origin; the nested forced-clearance case additionally
+needed the first in-flow block to start at the matching float's clearance edge
+and its ancestor's auto height to follow the final in-flow border edge.
+`target/wpt-targeted/nested-forced-next/results.json` records **29/32**;
+`nested-forced-prior/results.json` and `nested-forced-earlier/results.json`
+retain **32/32** and **80/80** for the preceding float windows. The three
+remaining cases in 1463–1494 are `zero-width-floats`,
+`adjoining-float-nested-forced-clearance-003`, and `clear-applies-to-008`.
+These focused results do not update the complete-suite baseline.
+
+The adjacent indices 1495–1526 started at **18/32**. `clear` is now ignored
+for inline-level boxes and table captions as well as table-internal boxes,
+which made `clear-applies-to-012/014/015` exact. Right floats with a negative
+top margin now use their margin box, rather than their painted border box, for
+horizontal exclusion after clearance; this closed `clear-float-002/003`.
+Preserving the preceding normal-flow block's collapsed positive margin puts
+`clear-clearance-calculation-001` at the correct y coordinate; adjusting its
+auto-height ancestor after that pull-up removes the remaining background-image
+pixels. Distinguishing the clear block's own margin from its first in-flow
+descendant's margin also closes `clear-on-parent-with-margins-no-clearance`;
+a leading floated descendant cannot supply that margin group.
+`target/wpt-targeted/float-first-next/results.json` records **26/32** and
+`float-first-current/results.json` retains **29/32** for 1463–1494; the
+1431–1462 regression remains **32/32** in `float-first-prior/results.json`.
+Six cases remain in 1495–1526, principally nested clearance/margin-collapse
+combinations. The same candidate retains **80/80** in 1351–1430,
+**16/16** in the adjacent box-display span 1010–1025, and **122/122** in the
+normal-flow span 3147–3268 (`float-first-earlier`, `float-first-box`, and
+`float-first-normal` reports). No complete-suite rerun was made.
+
+The next targeted float window 1527–1558 initially passed **30/32**. The
+first left float's `auto` horizontal margin was still being centered by the
+underlying block layout; using its zero float used-value passes both
+`float-non-replaced-width-001/005`. The optimized-runner report
+`target/wpt-targeted/float-group-prior/results.json` is now **32/32**.
+The following 1559–1590 window began at **22/32**. Keeping the first normal
+block's positive top margin after a float closes four replaced-width cases
+and `floats-015`; starting an anonymous float group below its parent's top
+border closes `floats-014/024`. `target/wpt-targeted/float-group-replaced/results.json`
+is now **29/32**. Its three remaining failures are `float-replaced-width-009`,
+`floats-005`, and `floats-006`. `float-replaced-width-009` currently has the
+orange block at y=183 in the test image and y=173 in the rendered reference;
+the reference's image bottom margin needs separate investigation before this
+is attributed solely to the test layout. The same candidate retains **32/32**
+for 1527–1558 and 1431–1462, **29/32** for 1463–1494, and **26/32** for
+1495–1526 (`float-group-prior`, `float-group-earlier`, `float-group-current`,
+and `float-group-clear`). The parent auto height must also follow the
+projected extent of an anonymous float group: `float-height-replaced` is
+**30/32** after closing `floats-005`. The two open cases there are
+`float-replaced-width-009` (test/reference vertical-gap discrepancy) and
+`floats-006` (late floats must reflow preceding inline content onto the same
+line). The final candidate retains **80/80** in 1351–1430, **16/16** in
+1010–1025, and **122/122** in 3147–3268 (`float-height-earlier`,
+`float-height-box`, and `float-height-normal`). These are focused reports,
+not a full-suite rerun.
+
+The remaining two cases in 1559–1590 are now closed. A later anonymous left
+float group can share a preceding anonymous inline line when their combined
+width fits, moving that inline run right without promoting floats across an
+authored block. The forced-break projector must also count an atomic inline
+box's bottom margin in the line extent; otherwise the rendered reftest
+reference places its second image 10px early. The optimized-runner report
+`target/wpt-targeted/inline-margin-current/results.json` is **32/32**, with
+the adjacent 1527–1558 window still **32/32** and 1463–1494 still **29/32**
+(`inline-margin-prior` and `inline-margin-earlier`). The next 1591–1622
+window scans at **23/32** in `inline-margin-next`; nine named failures remain
+there. In `floats-038/039/040`, the rendered reference's inline images start
+at the parent's border top rather than its content top, so its reference
+rendering must be checked before attributing all pixels to test layout.
+No full-suite rerun or clean-SHA gate was performed.
+
+The 1591–1622 window has since improved from **23/32** to **27/32**.
+`vertical-align: top` now starts atomic inline images at the parent's content
+top, passing `floats-038/040`; a block-level replaced image now avoids a
+same-context float, passing `floats-039`. A float's positive top margin no
+longer collapses with the preceding in-flow block's positive bottom margin,
+passing `floats-101`. The current report is
+`target/wpt-targeted/noncollapse-next/results.json`; its five failures are
+`floats-030`, `floats-031`, `floats-114`, `floats-121`, and `floats-132`.
+Current-candidate regressions remain **80/80** (1351–1430), **32/32**
+(1431–1462), **29/32** (1463–1494), **26/32** (1495–1526), **32/32**
+(1527–1558), **32/32** (1559–1590), **16/16** (1010–1025), and
+**122/122** (3147–3268), with corresponding `noncollapse-*` focused reports.
+The parent repository's `pnpm files:size:check` is still red on six
+out-of-scope files; no parent file was edited. These results do not supersede
+the original complete-suite discovery baseline or prove 6,548-case closure.
+The current `cargo test -p w3cos-dom --lib image_component_tests` check is
+**126/128**: `float_fixup_preserves_static_line_and_block_order` and
+`rtl_inline_block_aligns_its_single_text_line_to_the_inline_end` fail;
+this focused WPT work has not established their causal relationship.
+
+The 1591–1622 span is now **29/32** in
+`target/wpt-targeted/empty-float-next/results.json`. A word wider than a
+float-narrowed first band but fitting a later full band now starts on that
+later line (`floats-132`); a floated child following zero-height ordinary
+blocks no longer enlarges the parent's auto height (`floats-121`). The three
+remaining cases in this span are `floats-030`, `floats-031`, and `floats-114`.
+`text_layout::tests` passes **29/29**, including the new unbreakable-word case.
+The current optimized-runner regressions retain **80/80** (1351–1430),
+**32/32** (1431–1462), **29/32** (1463–1494), **26/32** (1495–1526),
+**32/32** (1527–1558), **32/32** (1559–1590), **16/16** (1010–1025), and
+**122/122** (3147–3268). The evidence remains bounded to these ranges;
+the 6,548-case objective has not been rerun to completion.
+
+The next clearance-floor correction prevents a `clear: both` forced break's
+line strut from being counted again when placing following direct floats or
+anonymous float groups. Both focused `clearing_break` layout tests now pass.
+The broader `cargo test -p w3cos-runtime --lib float` check is **113/114**;
+`leading_float_margin_does_not_collapse_with_its_containing_block` still
+fails (actual following block y=8, asserted y=80) and has not been attributed
+to this change. With the rebuilt optimized runner, 1591–1622 remains **29/32**
+in `target/wpt-targeted/clear-floor-next/results.json`, with only
+`floats-030`, `floats-031`, and `floats-114` failing; 1559–1590 is **32/32**
+and 1431–1462 is **32/32** in the matching `clear-floor-*` reports. The
+runner uses upstream WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+These are focused regression results, not complete-suite closure.
+
+Generated pseudo-element text was also being coalesced across a floated
+principal-box boundary. The focused `generated_text_coalescing_never_absorbs_a_float`
+test failed before the guard and passes after it. Floated `::before` and
+`::after` boxes now retain their source order and follow the same computed
+display blockification as authored floats. In the rebuilt runner,
+`floats-114` is pixel-exact: its differential count fell from 11,880 to
+151 after preserving the float boundary and then to zero after pseudo-box
+blockification. The 1591–1622 report is now **30/32** at
+`target/wpt-targeted/pseudo-float-block/results.json`; only `floats-030` and
+`floats-031` remain in that window. The adjacent 1559–1590 and 1431–1462
+reports remain **32/32**. `cargo test -p w3cos-dom --lib image_component_tests`
+is **128/130**, with the same two earlier failures; the broader `generated_`
+filter is **31/33** because two `lib.rs` generated-content tests fail; their
+causal relationship to this focused patch is not established.
+No complete 6,548-case run was made from this dirty candidate.
+
+The following 1463–1526 current-candidate scan is **56/64** in
+`target/wpt-targeted/font-kern-precedence-clear/results.json`, up from
+**55/64**. `clear-applies-to-008` is now pixel-exact: its test/ref split
+`P` + `ASS` versus `PASS`, and both explicitly disable OpenType `kern`.
+The font style now carries inherited `font-kerning` and a separate
+`font-feature-settings` `kern` override, preserving the low-level feature's
+specified precedence even when declarations arrive in reverse order. The
+other eight failures in that window remain open. The companion 1591–1630
+scan is **36/40** in `font-kern-precedence-floats/results.json`:
+`floats-030`, `floats-031`, `floats-141`, and `floats-143` fail, while
+`floats-036` and the newly closed `floats-114` pass. This is not a
+before/after claim for 1623–1630; those additional cases had not been
+included in the preceding 1591–1622 check. DOM font-kerning tests pass
+**2/2** and `cargo test -p w3cos-dom --lib image_component_tests` is
+**129/131** (the same two unresolved failures). The full suite is still open.
+
+The next nested-float case `floats-143` is now pixel-exact. Its float-only
+list-item containers were still zero-width and zero-height at float placement
+time, despite their floated text children having nonzero boxes; both children
+therefore occupied the same left edge and their red parent backgrounds covered
+green text. A focused layout test failed before projecting the sole child's
+margin-box extent into each auto-sized floated container and passes afterward.
+The rebuilt 1591–1630 report is **37/40** in
+`target/wpt-targeted/nested-float-window/results.json`, up from **36/40**;
+`floats-030`, `floats-031`, and `floats-141` remain. The 1463–1526 report
+stays **56/64** in `nested-float-clear-window/results.json`, and the float
+unit family is **114/115** with its same earlier margin-collapse failure.
+An exploratory next 1631–1662 window is **19/32** in
+`nested-float-following/results.json`; its 13 failures include multicolumn,
+margin-collapse, and `floats-153`. This added window had no pre-change
+current-candidate report, so it is not a regression claim. The fixed WPT
+checkout remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`; no full
+suite result or 6,548-case closure is implied.
+
+The subsequent `floats-153` investigation found that passive inline text
+coalescing discarded a `position:relative; left:82px; top:34px` owner in its
+reference page. A new DOM regression test failed before retaining that owner
+and passes after the fix; a separate runtime test confirms the relative text
+offset itself. The optimized runner now reports `floats-153` pixel-exact in
+`relative-inline-153/results.json`. The 1631–1662 focused window improves
+from **19/32** to **20/32** in `relative-inline-following/results.json`; its
+remaining 12 failures are four multicolumn float cases and eight
+margin-collapse cases. The preceding 1591–1630 window remains **37/40** in
+`relative-inline-prior/results.json`. These are scoped reftest results, not
+full-suite acceptance.
+
+`margin-collapse-122` then exposed an auto-height table row retaining its
+provisional 150px height after a cleared block settled at 128px. A matching
+runtime regression test failed before the post-clearance row projection and
+passes afterward. On the rebuilt optimized runner, `margin-collapse-122` and
+`margin-collapse-142` are pixel-exact; the 1631–1662 window is now **22/32**
+in `auto-table-clear-following/results.json`, with ten failures remaining.
+`margin-collapse-157` is still failing but its pixel difference fell from
+63,632 to 26,096. The 1591–1630 and 1463–1526 windows remain **37/40** and
+**56/64** in `auto-table-clear-prior/results.json` and
+`auto-table-clear-earlier/results.json`. The runtime float unit family remains
+**114/115** with its earlier leading-float-margin assertion. A separate
+table-filtered unit run is **86/91**, with five untriaged failures; none has
+yet been established as caused by this change. Full-suite closure remains open.
+
+The next targeted `margin-collapse-157` pass found a zero-height child margin
+incorrectly adding 16px inside a cleared box with a bottom border. A RED
+runtime test became green after settling that border box; the existing
+no-clearance margin test stayed green. The remaining first-row offset exposed
+a second omission: adjoining clearance propagated an auto-height ancestor
+without its bottom border. Another RED/green runtime test covered that edge.
+`margin-collapse-157` is now pixel-exact in `clear-bottom-157/results.json`.
+The 1631–1662 window is **23/32** in `clear-bottom-following/results.json`;
+the other nine failures are unchanged. The 1591–1630 and 1463–1526 windows
+remain **37/40** and **56/64** in `clear-bottom-prior/results.json` and
+`clear-bottom-earlier/results.json`. This is still focused evidence, not a
+6,548-case all-green run.
+
+`margin-collapse-125` isolated a self-collapsing cleared block whose 2em
+margins incorrectly delayed the following bordered block by 32px. A focused
+runtime test failed with a 128px parent and a following block at y=96px;
+after margin settlement it passes with a 96px parent and the block at y=64px.
+The original case is pixel-exact in `clear-through-125/results.json`. The
+1631–1662 window advances to **24/32** in
+`clear-through-following/results.json`; its remaining failures are four
+multicolumn float cases, `margin-collapse-033/034/035`, and
+`margin-collapse-123`. The adjacent 1591–1630 and 1463–1526 windows remain
+**37/40** and **56/64** in `clear-through-prior/results.json` and
+`clear-through-earlier/results.json`. No full-suite result is implied.
+
+`margin-collapse-123` exposed the reverse sibling order: a self-collapsing
+empty block with 2em margins precedes a bordered clearing block. Without a
+bordered parent the reduced component already passed; adding the authored
+3px parent border reproduced the 32px delay and turned the regression test
+RED. Settling the empty margin group at the float bottom makes that test and
+the original WPT reference pixel-exact in
+`clear-prior-empty-123/results.json`. The 1631–1662 window is now **25/32**
+in `clear-prior-empty-following/results.json`; only four multicolumn float
+cases and `margin-collapse-033/034/035` remain in that window. The adjacent
+1591–1630 and 1463–1526 windows stay **37/40** and **56/64** in
+`clear-prior-empty-prior/results.json` and
+`clear-prior-empty-earlier/results.json`. The full suite remains unverified.
+
+`margin-collapse-033/034/035` exposed two separate gaps. A self-collapsing
+cleared box with an adjoining float must keep the following sibling's
+collapsed 99px top margin inside its auto-height parent; this now yields the
+expected 100px green square. In `035`, two empty `width:auto` DOM floats also
+revealed that the leaf-node path skipped shrink-to-fit and stretched each
+float to the 100px containing width, wrapping the second float to another
+line. Parsed-DOM and direct-component regression tests now keep both empty
+floats at zero width on the same line. All three raw reftests are pixel-exact
+in `clear-margin-contained-033-035-fixed/results.json`. The 1631–1662 window
+is **28/32** in `clear-margin-contained-following/results.json`; its four
+remaining failures are `floats-clear-multicol-000/001` and
+`floats-clear-multicol-balancing-000/001`. Adjacent windows stay **37/40**
+and **56/64** in `clear-margin-contained-prior/results.json` and
+`clear-margin-contained-earlier/results.json`. No full-suite result is implied.
+
+`float-003` had a reference-rendering failure rather than a float-position
+failure: after an inline image and `<br>`, a fixed-width block's final text
+run kept its max-content width and painted on one line. A parsed-DOM runtime
+regression reproduced the 500px block with a 1,690px text leaf. The forced
+break continuation now gives that final run its containing line width, and
+the layout collection and line-box projection retain its measured multi-line
+height. The raw reftest is pixel-exact in
+`break-wrap-guard-float003/results.json`. An initial height change shifted
+the single-line green `PASS` in `floats-153` by one pixel; limiting the
+extension to genuinely multi-line runs restored that reftest to pixel-exact
+in `break-wrap-guard-float153/results.json`. The 1463–1526 window is now
+**57/64** in `break-wrap-guard-earlier/results.json`; neighboring 1591–1630
+and 1631–1662 windows remain **37/40** and **28/32** in
+`break-wrap-guard-prior/results.json` and
+`break-wrap-guard-following/results.json`. The full suite is unverified.
+
+`clear-clearance-calculation-005` exposed a normal-flow continuation error:
+the orange float and green block already matched the reference exactly, but
+the following paragraph retained a 175px gap from Taffy's provisional float
+placement after the green block was pulled back to its collapsed-margin
+position. A parsed-DOM runtime regression first reproduced that gap, then
+passed when later in-flow block siblings continued from the corrected border
+edge. The raw reftest is pixel-exact in
+`float-following-flow-005/results.json`. The 1463–1526 window advances to
+**58/64** in `float-following-flow-earlier/results.json`; adjacent 1591–1630
+and 1631–1662 windows remain **37/40** and **28/32** in
+`float-following-flow-prior/results.json` and
+`float-following-flow-following/results.json`. No full-suite pass is implied.
+
+`clear-clearance-calculation-003` exposed a separate empty-clear margin group:
+after a 20px in-flow block and a 20px float, an empty `clear:left` block with
+80px top / 100px bottom margins placed the following 20px block 40px too low.
+A four-box runtime regression reproduced the gap without Ahem or background
+fixtures, then passed when the nonnegative adjoining margins collapsed from
+the preceding in-flow border edge after the float had already ended. The raw
+reftest is pixel-exact in `clear-margin-group-003/results.json`. The 1463–1526
+window advances to **59/64** in `clear-margin-group-earlier/results.json`;
+1591–1630 and 1631–1662 remain **37/40** and **28/32** in
+`clear-margin-group-prior/results.json` and
+`clear-margin-group-following/results.json`. The full suite is unverified.
+
+The two `clear-on-child-with-margins` reftests exposed nested clearance in a
+shared float formatting context. In the first case, Taffy's fallback placed an
+ordinary wrapper below a preceding float and added collapsed margins again;
+the corrected wrapper/clearance positions and auto-height containment make
+`clear-on-child-with-margins.html` pixel-exact. In the second, a right float
+had pushed the following ordinary wrapper down, preventing its left float
+from sharing the top band; after rebasing that wrapper, auto-height repair also
+had to run from children to parents so the outer overflow BFC did not retain
+96px of stale red background. Both original reftests are pixel-exact in
+`nested-clear-both-1517-1518/results.json`. The 1463–1526 window is now
+**61/64** in `nested-clear-both-earlier/results.json`; the remaining three are
+`zero-width-floats`, `adjoining-float-nested-forced-clearance-003`, and
+`clear-on-parent-and-child`. Adjacent 1591–1630 and 1631–1662 windows remain
+**37/40** and **28/32** in `nested-clear-both-prior/results.json` and
+`nested-clear-both-following/results.json`. Focused `clear` unit tests pass
+**36/36**; broader `layout::tests` remains red at **411 pass / 11 fail**,
+including an independently reproduced leading-float-margin failure. The full
+6,548-case suite is unverified and no clean SHA is formed.
+
+`adjoining-float-nested-forced-clearance-003` then exposed a collapsed leading
+margin group and a line-box exclusion crossing ordinary wrappers in the same
+float BFC. A parsed-DOM regression first observed the cleared block 5px too
+low, its inline-block below rather than beside the second float, and a 145px
+outer box instead of 100px. The cleared block now uses the collapsed
+descendant margin group; a fitting inline atom takes the shared float band,
+and auto heights are recalculated from the corrected descendants. Two
+absolutely positioned strips are finally resolved against their positioned
+ancestor's corrected containing block rather than the provisional box. The
+original reftest is pixel-exact in `adjoining-float-final-1474/results.json`.
+The 1463–1526 window is **62/64** in `adjoining-float-final-earlier/results.json`;
+its remaining failures are `zero-width-floats` and `clear-on-parent-and-child`.
+The two previously fixed nested-clear reftests remain **2/2** in
+`adjoining-float-final-pair/results.json`; neighboring 1591–1630 and
+1631–1662 windows remain **37/40** and **28/32** in
+`adjoining-float-final-prior/results.json` and
+`adjoining-float-final-following/results.json`. Focused `clear` tests are
+**37/37** and `absolute` tests **30/30**. Broader layout and full-suite gates
+remain unverified at this candidate; these focused results do not certify
+6,548-case conformance.
+
+`clear-on-parent-and-child` separated two faults: nested `clear:left` had
+incorrectly pulled an ancestor with its own `clear:right` back to the shorter
+float's bottom, and the headless renderer ignored scripted scrolling on an
+`overflow:hidden` container. The first is covered by a parsed-DOM parent/child
+clearance regression. The second is covered by a headless red-to-green pixel
+test: hidden overflow participates in the scroll property tree, its stationary
+background paints separately from moving contents, and the scrollport clip
+is applied after retained-layer translation so offscreen content is not
+discarded during recording. Headless keeps the existing one-shot layout path
+while retaining its scroll ancestry; using the persistent `LayoutEngine` path
+had regressed `floats-147`, which is again pixel-exact in
+`scroll-layout-parity-float147/results.json`. The original scripted reftest is
+pixel-exact in `scroll-layout-parity-parent/results.json`; the earlier nested
+pair remains **2/2** in `scroll-layout-parity-pair/results.json`. The 1463–1526
+window reaches **63/64** in `scroll-layout-parity-earlier/results.json`, with
+only `zero-width-floats` failing. Neighboring windows remain **37/40** and
+**28/32** in `scroll-layout-parity-prior/results.json` and
+`scroll-layout-parity-following/results.json`. `clear` tests pass **38/38**,
+headless **4/4**, retained layers **9/9**; a broader paint-artifact test run
+remains red at **41/43** on two non-scroll assertions. No full-suite claim or
+clean candidate SHA follows from these focused results.
+
+`zero-width-floats` showed that a float with a zero-width margin box still
+contributes to `clear` vertically but excludes no horizontal space. The
+shared-BFC collision pass had treated its zero-width x coordinate as an
+overlap and pushed a negatively margined BFC to the float bottom. A parsed-DOM
+regression records both green boxes' 200px widths and 100px vertical
+continuation; the collision pass now ignores zero-width horizontal overlap,
+while the negative-margin BFC keeps its authored x and a following relative
+`clear:both` uses the nested floats' bottom without re-adding the preceding
+block's height. The original reftest is pixel-exact in
+`zero-width-final-zero/results.json`. The 1463–1526 window is now **64/64** in
+`zero-width-final-earlier/results.json`; adjacent 1591–1630 and 1631–1662
+remain **37/40** and **28/32** in `zero-width-final-prior/results.json` and
+`zero-width-final-following/results.json`. This does not replace a complete
+6,548-case rerun or a clean candidate SHA.
+
+The next focused correction aligns baseline text with a tall replaced inline
+image and applies positive `vertical-align` lengths to the painted inline
+fragment after the line box has reserved its ascent. In particular, text
+leaves retain the descent and half-leading that Taffy's baseline fallback
+already included; replaced images receive the full authored lift. The fixed
+WPT `floats-030` test/reference pair now matches at **0 pixels**, up from
+4,748 differing pixels, in
+`target/wpt-targeted/vertical-align-text-tuned-030/results.json`.
+`target/wpt-targeted/vertical-align-text-tuned-prior-window/results.json`
+records **38/40** for indices 1591–1630; the remaining cases are
+`floats-031` and `floats-141`. The nearby linebox `vertical-align` window
+2191–2225 remains **35/35**, and the earlier float window 1463–1526 remains
+**64/64**, in `vertical-align-text-tuned-linebox-window/results.json` and
+`vertical-align-text-tuned-earlier-window/results.json` respectively.
+`floats-031` needed nested inline fragmentation: a transparent inline host
+contained a full-width 550px atomic box before later text, image and float.
+Splitting that host at the full-width atom and preserving the subsequent float
+line band now gives a pixel-exact match in
+`target/wpt-targeted/passive-inline-031-qualified/results.json`. The focused
+1591–1630 window before the latest inline-block correction reached **39/40**
+in `target/wpt-targeted/passive-inline-031-prior-window/results.json`.
+For `floats-141`, fresh local Chrome headless renders of *both* pinned test
+and pinned reference are pixel-identical: Chrome places C beside B on both.
+The earlier test/reference-compatibility interpretation was wrong. W3COS
+instead gave the reference's auto-width inline-block a column layout for its
+block child followed by two inline-block children. The mixed block/inline
+fallback now keeps B/C on the same row without stretching A's specified
+width. A focused regression locks both properties, and the original WPT is
+pixel-exact in `inline-block-mixed-141-preserve-width/results.json`. The
+1591–1630 window is now **40/40** in
+`inline-block-mixed-final-prior/results.json`; the following 1631–1662 window
+remains **28/32** in `inline-block-mixed-final-following/results.json`, with
+four multicol cases still failing. A subsequent 54-case box-display probe
+exposed a regression in `block-in-inline-relpos-002`: the mixed-flow flex
+fallback still needs a full-width layout basis for an explicitly sized block
+in a regular block container, whereas applying it inside a shrink-wrapped
+inline-block stretches that block's painted width. The width exception is now
+limited to inline-block parents. On the final optimized build,
+`inline-block-width-scoped-box-wpt/results.json` records box-display
+1010–1025 **16/16** and `inline-block-width-scoped-float-wpt/results.json`
+records floats-clear 1591–1630 **40/40**. The focused regression test and
+16 forced-break unit tests also pass. The broader `inline_block` unit group
+is **21/22**; `auto_width_inline_block_wraps_inline_text_to_its_used_width`
+still fails its text-height assertion and is not counted as green. No full
+6,548-case rerun or clean candidate SHA is claimed.
+
+The next focused case, `box-display/containing-block-003.xht`, exposed a
+separate fixed-height inline-block defect: its 100px in-flow relative block
+was vertically shrunk to the parent's 60px content height by the internal
+column Flex model, leaving 40px of red background uncovered. A new layout
+regression was RED at child height 60px and is GREEN at 100px after disabling
+Flex shrink for in-flow block children in that column-only fallback. The
+pinned original case is pixel-exact in
+`target/wpt-targeted/inline-block-child-shrink-003-wpt/results.json`.
+Optimized directed reports retain box-display 1010–1025 **16/16** and
+floats-clear 1591–1630 **40/40** in
+`inline-block-child-shrink-relpos-wpt/results.json` and
+`inline-block-child-shrink-float-wpt/results.json`; the 1028–1040 window is
+**10/13** in `inline-block-child-shrink-box-wpt/results.json`, with only
+`box-generation-002` and `containing-block-007/010` still failing there.
+The two new layout regressions and 16 forced-break tests pass. The broader
+`inline_block` unit subset is **22/23**, retaining the distinct auto-width
+text-height failure. No complete 6,548-case rerun or clean candidate SHA is
+claimed.
+
+The next box-display batch isolates `box-generation-001`. In the parsed XHTML
+layout, Taffy's mixed inline/block fallback stretched the first explicit
+96px block to the parent's available width when an inline sibling and float
+followed it. A RED/GREEN regression now checks that block's 96px painted
+width and that the float starts after its line. The remaining 260-pixel
+difference was a border-free inline background painted at the 16px glyph em
+height instead of the surrounding 19.2px line band; bordered fragments keep
+their original geometry to preserve `linebox/inline-box-001`. The optimized
+`target/wpt-targeted/box-generation-first-block-final-wpt/results.json`
+records **11/14** for box-display indices 1027–1040: `box-generation-001`
+and `containing-block-003` are pixel-exact, while `box-generation-002`
+(2,749 pixels) and `containing-block-007/010` (5,952/12,259 pixels) remain
+failed. The adjacent optimized
+`target/wpt-targeted/inline-box-border-guard-final-wpt/results.json`
+preserves `inline-box-001` at 0 pixels; `inline-box-002` remains failed.
+`box-generation-002` still places the following yellow block about 1.6px
+above the reference's first anonymous-line bottom. This batch does not claim
+the full 6,548-case suite or a clean candidate SHA.
+
+The following fixed-revision batch supersedes that 11/14 snapshot. A parsed
+XHTML regression first showed `box-generation-002` starting its following
+block at 68.8px while the anonymous inline line ended at 70.4px; projecting
+normal-flow continuation to that line bottom made both `box-generation`
+reftests pixel-exact. `containing-block-007` then exposed two ways an
+out-of-flow image incorrectly raised an inline line: baseline projection and
+the baseline-replaced minimum height. A RED/GREEN regression now keeps both
+the text baseline and paragraph height unchanged. For
+`containing-block-010`, fixed positioning had ignored `margin-top` with
+`top:0`; the viewport-containing-block path now shares the absolute-position
+constraint solver, with a RED/GREEN fixed-margin assertion. The optimized
+`target/wpt-targeted/box-generation-containing-block-final-wpt/results.json`
+records box-display 1027–1040 **14/14**. Adjacent debug reports keep
+box-display 1010–1025 **16/16**, floats-clear 1591–1630 **40/40**,
+fixed-position 4290–4291 **2/2**, and static-fixed-inside-abspos **1/1**.
+
+The next box-display failures `display-008/009` were the same 399-pixel
+background extent: a plain borderless inline container painted only its 16px
+em box while the equivalent table row group painted the 19.2px line band. A
+paint regression first failed and now passes; positioned fragmented inline
+wrappers retain their previous paint geometry. `display-018` was caused by
+the HTML `<th>` default bold weight missing and then being overwritten by
+generic text inheritance even after the UA default was added. Direct and
+computed-style RED/GREEN tests now retain that default while allowing an
+author `font-weight: normal` override. The original three reftests are
+pixel-exact, and the final optimized
+`target/wpt-targeted/box-display-1027-1080-th-final-wpt/results.json`
+records box-display 1027–1080 **54/54** at pinned WPT revision
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+`target/wpt-targeted/table-header-5569-5583-th-debug/results.json` is
+**15/15**; the final float regression
+`target/wpt-targeted/floats-clear-1591-1630-th-regression-debug/results.json`
+remains **40/40**. The following box-display window 1081–1100 is **20/20** in
+`box-display-1081-1100-next-debug/results.json`; 1101–1120 is **18/20** in
+`box-display-1101-1120-next-debug/results.json`, leaving `root-box-002`
+(4,452 pixels) and `root-canvas-001` (25,600 pixels). Neither those two
+cases nor the complete 6,548-case suite is claimed as fixed; no clean
+candidate SHA, commit, or push was made.
+
+The next focused correction keeps the same pinned WPT revision. The table
+caption in `root-box-002` had been laid inside the root table's top border;
+moving its subtree above that border exposed a separate table-grid paint
+inset that had followed the caption height instead of the first row. Two
+RED/GREEN unit regressions now cover the caption placement and border paint
+geometry. `root-box-002` is pixel-exact; the adjacent caption window
+5268–5284 remains **17/17** in optimized
+`target/wpt-targeted/caption-side-5268-5284-current-wpt/results.json`.
+
+The adjacent cascade test `specificity-011` exposed a selector boundary:
+`div :after` had incorrectly become `div:after` when the terminal
+pseudo-element was stripped. After preserving its implicit descendant
+subject, its top/bottom border was still lost because generated text-run
+coalescing checked only the aggregate border width, not physical edge widths.
+Both defects have RED/GREEN unit regressions. The optimized
+`target/wpt-targeted/box-cascade-1101-1148-current-wpt/results.json` records
+1101–1148 **42/48**: `root-box-002` and `specificity-011` each have zero
+different pixels. The earlier box-display 1027–1080 window remains **54/54**
+in `target/wpt-targeted/box-display-1027-1080-current-wpt/results.json`.
+The six remaining failures are `root-canvas-001` (embedded
+HTML `<object>` still renders its fallback), `html-precedence-004`,
+`inherit-computed-001`, and the three `cascade-import-001` variants. This
+targeted report is not a rerun or acceptance of the complete 6,548-case
+suite; the worktree is dirty and no candidate SHA, commit, or push exists.
+The new DOM regression tests pass individually, but the supplemental
+`cargo test -p w3cos-dom --lib` run is red (**498 passed, 12 failed**),
+including individually reproducible generated-content, margin-unit and
+float-fixup tests. Their attribution remains open in this already-dirty
+checkout; the focused WPT results do not imply a green module gate.
+
+The following cascade-import batch fixes three further reftests at the same
+WPT revision. XHTML parsing now checkpoints at parser-inserted script and
+style completion, preserving DOM/stylesheet order before later XML tokens;
+the parser retains its event position across a blocking script, including an
+empty `<script/>`. The shared CSS parser now recognizes escaped parentheses
+inside `@import url(...)`, and the stylesheet graph loads bounded `data:` CSS
+imports synchronously (also when network loading is disabled). Focused
+RED/GREEN tests cover parser order, pause/resume, data imports and the CSS URL
+token. `xml_tree_builder::tests` is **11/11**, `esm_css::tests` is **36/36**,
+and the existing HTTP import-graph regression passes. The optimized
+`target/wpt-targeted/box-cascade-1101-1148-data-parser-final-wpt/results.json`
+is **46/48**; `cascade-import-001` and both dynamic variants have zero
+different pixels. The required CSS2 user-style fixture was explicitly passed
+as `--user-stylesheet tests/wpt/profiles/css2-userstyle.css`, making
+`html-precedence-004` pixel-exact without a path-specific runtime rule.
+Only `root-canvas-001` and `inherit-computed-001` remain failed in this
+48-case window. The optimized neighboring windows remain **54/54**
+(`box-display-1027-1080-data-parser-final-wpt`) and **17/17**
+(`caption-side-5268-5284-data-parser-final-wpt`). These are focused reports,
+not a new complete-suite result or clean candidate SHA.
+
+The next debug scan is not yet fixed: CSS1 float-fit 1188–1197 is **6/10**
+(`css1-float-fit-1188-1197-current-debug`), and inline 1198–1208 is **4/11**
+(`css1-inline-1198-1208-current-debug`). In `c43-rpl-ibx-000`, the
+`vertical-align: top` Ahem square is four pixels too high while the paired image
+is aligned, giving 120 differing pixels; float-fit 000 has reordered float
+numbers. These observations select the next focused repair, not an accepted
+fix. The prior 12 `w3cos-dom --lib` failures also remain unclosed.
+
+The next focused CSS1 inline repair is `c43-rpl-ibx-000`. In a mixed
+inline line, Taffy's flex row origin placed a smaller `vertical-align: top`
+text fragment above a baseline-aligned replaced image even though the
+image established the effective line top. The projection now aligns that
+text with the image only when the two fragments overlap the same row and
+the image is at least as tall; a taller top-aligned fragment retains its
+own line top. The new unit regression was RED before the change and is
+GREEN afterward, including the taller-fragment guard. The pinned WPT
+`css1-inline-1198-1208-top-align-debug/results.json` is **5/11** (prior
+**4/11**): `c43-rpl-ibx-000` has **0** different pixels (prior **120**),
+and the other ten outcomes are unchanged. Six failures remain in that
+window: `c42-ibx-ht-000`, `c42-ibx-pad-000`, and `c44-ln-box-000` through
+`003`. This is not a full-suite rerun or a clean candidate SHA.
+
+The CSS2 cascade `inherit-computed-001` follow-up fixes inherited border
+color. Per CSS 2.2 [border-color computed values](https://www.w3.org/TR/CSS22/box.html#border-color-properties)
+and [inherit semantics](https://www.w3.org/TR/CSS22/cascade.html#value-def-inherit),
+an omitted border color is computed from the parent's text color on that
+parent; `border: inherit` then copies that computed color rather than
+re-resolving a `currentColor` marker against a differently colored child.
+The new DOM test reproduced the red child border before the fix and passes
+afterward. Two earlier tests that required re-resolution of inherited
+border color now assert the parent's computed color instead; focused
+`border_color` and `border_inherit` DOM tests pass. The pinned WPT
+`box-cascade-1101-1148-inherit-computed-debug/results.json` is **47/48**
+(prior **46/48**): `inherit-computed-001` is pixel-exact, and the other 47
+outcomes are unchanged. `root-canvas-001` remains the sole failure in this
+window at **25,600** different pixels. This is focused evidence only, not
+the complete 6,548-case gate.
+
+The subsequent `root-canvas-001` inspection confirms a larger embedded-
+document gap: HTML `<object data=...>` still lowers its fallback children,
+while the existing iframe path creates a replaced box without painting its
+independent document. The test needs a child viewport and document render,
+not merely a canvas-background color adjustment. No object-specific shortcut
+was added.
+
+The next CSS1 float-fit case `c414-flt-fit-000` exposed a shared anonymous-
+wrapper boundary. Consecutive left floats are grouped into an implementation
+row, while the following breakable text is wrapped in a separate row, so
+float-band calculation previously saw neither as part of one formatting
+context. The resolver now recognizes that pair, computes line bands against
+the group's real float margin boxes, and passes the bands to both layout and
+retained paint without changing DOM ownership. A focused unit test was RED
+before the change and is GREEN afterward; the existing companion test also
+passes. Pinned WPT `css1-float-fit-1188-1197-anonymous-band-debug/results.json`
+is **7/10** (prior **6/10**): `c414-flt-fit-000` is pixel-exact (prior
+**1,929** different pixels), and the other nine outcomes are unchanged.
+The independent float-group regression window
+`float-group-1527-1558-anonymous-band-debug/results.json` remains **32/32**.
+The neighboring `css1-inline-1198-1208-anonymous-band-regression/results.json`
+also remains **5/11**, preserving the preceding top-alignment repair.
+The remaining `c414-flt-fit-001/002/004` failures require separate work.
+
+The next replaced-inline float-fit repair closes `c414-flt-fit-001`. Three
+100×100 images inside left-floated paragraphs already occupy the correct
+two-row cells; the fourth, non-floated image was incorrectly laid out below
+the entire anonymous float group. A post-layout projection now searches
+the same block's float exclusion bands for a following single image,
+positions its anonymous row in the first band that fits, and recomputes
+auto-height through its containing ancestors. A focused unit asserts the
+fourth image moves to the second row's right band and the parent's box
+shrinks to its used content height. Pinned WPT
+`css1-float-fit-1188-1197-image-band-debug/results.json` is **8/10**
+(prior **7/10**): `c414-flt-fit-001` is pixel-exact (prior **9,843**
+different pixels), with all other outcomes unchanged. The independent
+`float-group-1527-1558-image-band-regression/results.json` remains **32/32**.
+`c414-flt-fit-002/004` are still failed and were not reclassified as fixed.
+
+The mixed left/right float-only follow-up closes both remaining cases in
+this window. After importing an anonymous group of left floats, the
+direct-left-float projection previously stopped searching the shared
+exclusion bands. In a container whose children are only floats and such
+groups, the direct float now searches those bands; opposite-side direct
+floats and later groups continue to use their existing source-order
+placement. The focused geometry unit checks that a direct left float
+following a grouped-left/right pair rises into the next available row.
+Pinned WPT `css1-float-fit-1188-1197-float-only-debug/results.json` is
+**10/10** (prior **8/10**): `c414-flt-fit-002` and `004` each have zero
+different pixels (prior **27,381** and **50,251**). The independent
+`float-group-1527-1558-float-only-regression/results.json` stays **32/32**;
+`css1-inline-1198-1208-float-only-regression/results.json` stays **5/11**.
+This is focused evidence, not a fresh complete-suite result. The auto
+height of float-only containers remains a separate general CSS-layout
+question and is not established by these pixel-exact reftests.
+
+The next small failure cluster is `font-family-applies-to-001/017` in the
+fixed `fonts` suite. Both initially differed by 64 pixels: a 16×16 Ahem
+square was painted two pixels below its `vertical-align: top` reference.
+The authored alignment reached computed style, but transparent inline-wrapper
+coalescing discarded the wrapper and its non-inherited alignment marker.
+Coalescing now retains a principal inline box with non-auto `align-self`;
+a focused DOM unit checks this boundary. Pinned WPT
+`font-family-1718-1740-preserve-inline/results.json` is **19/23** (prior
+**17/23**): both cases are pixel-exact, with the other 21 outcomes unchanged.
+`css1-inline-1198-1208-font-wrapper-regression/results.json` stays **5/11**.
+The four remaining failures in the `fonts` window concern invalid-family
+parsing and unavailable/unknown font faces; this receipt does not claim a
+new complete-suite count.
+
+The follow-up corrected the paint fallback for a family absent from both
+registered web fonts and installed system fonts: its glyphs now use the same
+UA default serif face as text with no authored family. A macOS unit covers
+the missing-family fallback. Pinned WPT
+`font-family-1718-1740-default-serif/results.json` is **22/23** (prior
+**19/23**): `font-family-invalid-characters-001/003` and
+`font-family-rule-001` are now pixel-exact. The isolated 1733–1735 window is
+**3/3**. Only `font-family-rule-002a` remains red in this window; it explicitly
+requires an installed `White Space` test font that is absent from this
+checkout. This is focused evidence, not a new full-suite result.
+
+The next current-worktree scan found the old negative `font-size` queue
+already closed: indices 1745–1788 are **44/44** without another patch.
+`font-148` still failed by 5,241 pixels because the `font` shorthand rejected
+a length-valued `calc()` size. A changed unit first reproduced this RED;
+the shorthand now evaluates typed length/number arithmetic and keeps spaces
+inside functions while separating size from family. Pinned WPT
+`font-1699-1703-calc-shorthand/results.json` is **5/5** (prior **4/5**),
+and `font-1688-1706-calc-regression/results.json` is **19/19**;
+the shorthand unit group is **14/14**.
+
+The `fonts-013` reference compares a font stack whose first Ahem face does
+not cover the text with its fallback face alone. Its three first words were
+6.4 px too low because the used `normal` leading and paint baseline still
+came from Ahem. Text leaves now use glyph-covering font metrics when the
+registered primary misses a character, and paint chooses a baseline from
+the covering face. Pinned WPT `fonts-1830-1841-leading-final/results.json`
+is **12/12** (prior **11/12**). Focused regressions remain
+`font-size-1745-1788-leading-final` **44/44**,
+`font-family-1718-1740-leading-final` **22/23** (the known external-font
+prerequisite is unchanged), and `css1-inline-1198-1208-leading-final`
+**5/11**. None of these receipts substitutes for a fresh 6,548-case run.
+After the per-text leading pass was narrowed to registered primary faces with
+missing glyphs, `font-1688-1706-leading-final/results.json` stayed **19/19**.
+
+An additional current-worktree scan of `background-applies-to-006/012`
+remains **9/11** over indices 140–150. Each failed case differs by one
+low-opacity fringe pixel at the edge of a fully black square (respectively
+RGB 5 against black and RGB 252 against white), rather than by missing box
+geometry. No rasterization change was made from this observation alone.
+
+The current `margin-collapse-004` failure was 28 pixels of orange block
+background painted over antialiased text from an earlier transparent block.
+An unadorned block text node now participates in the inline-content paint
+phase, leaving its later in-flow sibling's background behind the glyphs.
+Pinned WPT `margin-collapse-2520-2525-paint-phase/results.json` is **6/6**
+(prior **5/6**). The float regression window
+`float-group-1527-1558-paint-regression/results.json` remains **32/32**;
+the unrelated inline-table window
+`normal-inline-table-3467-3478-paint-regression/results.json` remains
+**5/12**. A focused paint-order unit passes. The broader paint-artifact
+unit filter has two outstanding failures in clipping and positioned
+`z_order` assertions (**43/45**); this work does not claim that filter or
+the full WPT suite is green.
+
+The next focused `inline-table` window (indices 3467–3478) moved from
+**5/12** to **12/12** at the same WPT revision. Auto table-height settlement
+had contracted a direct inline text child to the bottom of its painted em
+box, omitting the trailing half-leading; a nested block retained the full
+line strut. Preserving that trailing half-leading made the table height,
+width, and `zorder-005` references agree. The remaining `zorder-003`
+showed a separate paint error: `vertical-align: top` implicitly clipped a
+decorated inline's 24 px border box to its 19.2 px line-height, leaving the
+table background exposed. Ordinary vertical alignment no longer creates a
+clip; explicit inline-fragment clips remain. The pinned receipt is
+`normal-inline-table-3467-3478-line-clip/results.json` (**12/12**).
+Focused regressions are `inline_table` Rust units **9/9** and paint-artifact
+units **45/46** (the remaining positioned-subtree `z_order` assertion is
+unrelated to inline clipping),
+`vertical-align-2191-2242-line-clip` **46/52** (the same six failures as
+the prior full report), `table-inline-height-5376-5381-line-clip` **6/6**,
+`table-height-valign-5575-5589-line-clip` **15/15**,
+`float-group-1527-1558-inline-table-regression` **32/32**,
+`margin-collapse-2520-2525-inline-table-regression` **6/6**, and
+`css1-inline-1198-1208-inline-table-regression` **5/11** (unchanged).
+These are subset results, not a new 6,548-case count.
+
+The next paired `vertical-align-103/104` failures each exposed 320 red
+pixels above an absolutely positioned black covering square. An internal
+unbroken-word inline-flex had already reserved the percentage alignment's
+ascent through its text margin; the generic post-layout pass then lifted
+that text another 16 px. It now omits the duplicate lift only inside that
+generated word group. Pinned WPT
+`vertical-align-2191-2242-grouped-word/results.json` is **48/52** (prior
+**46/52**), with `103/104` both pixel-exact and the other 50 statuses
+unchanged. `normal-inline-table-3467-3478-grouped-word/results.json`
+remains **12/12**. A grouped-word unit and the ordinary vertical-align
+length unit both pass; the four remaining cases in this window are
+`117a`, `118a`, `121`, and `122`.
+
+The next `vertical-align` batch closed `121`, `117a`, and `118a` without
+changing the earlier passing statuses. In `121`, the internal unbroken-word
+row top-aligned two 30 px Ahem glyphs with a 60 px `bottom`-aligned glyph;
+the ordinary glyphs now settle against that row's bottom. In `117a/118a`,
+`text-bottom`/`text-top` on a 40 px font with a 130 px line height requires
+one 45 px half-leading extension to the line box; the correct glyph group
+moves with that extension. Pinned WPT
+`vertical-align-2191-2242-text-edge/results.json` is **51/52** (prior
+**48/52**), and `normal-inline-table-3467-3478-text-edge/results.json`
+remains **12/12**. The focused `vertical_align` Rust unit filter is **4/4**.
+The CSS1 inline regression `css1-inline-1198-1208-text-edge/results.json`
+also remains **5/11** with no status change.
+Only `vertical-align-122` remains open in this 52-case window. Its current
+layout has first-line inline-blocks at y=48–128 and second-line wrappers
+already at y=88–168 despite the intervening forced break, so this is a
+separate line-fragment/inline-block placement investigation, not evidence
+that the preceding three alignment fixes failed. No fresh full-suite count
+is inferred from these subset receipts.
+
+The `vertical-align-122` follow-up traced the overlap to
+`align_inline_block_last_line_baselines`: after the forced-break projection
+placed the first wrappers at y=8 and the second wrappers at y=88, a single
+reference baseline from both lines moved the first wrappers down by 40–60 px.
+The pass now leaves a parent containing inline-blocks on both sides of a
+forced break to the line breaker's positions instead of aligning those two
+lines together. A focused Rust regression passes, and pinned WPT
+`vertical-align-2191-2242-break-guard/results.json` remains **51/52** with
+no previously passing status changed. For the remaining case, different
+pixels fell from **45,120** to **32,000** in
+`vertical-align-122-break-guard/results.json`; it is still a failure. The
+inline-block content line is 80 px high where the reference needs 84 px,
+and the following line starts at y=88 where the reference torso begins at
+y=102. Those intrinsic-size and line-box placement gaps remain open. The
+follow-up does not establish a fresh full-suite count.
+
+The remaining `vertical-align-122` case is now pixel-exact. A browser
+measurement of the pinned source established the two line-local wrapper rows
+at y=8/18 and y=102/112, each 84 px high. The runtime now reserves the
+atomic inline's font-strut descent inside auto-height inline-blocks, aligns
+their text to the atomic baseline, resolves `top`/`middle`/`bottom` per
+forced-break-delimited line, and advances the continuation by the resulting
+line-box extent. Pinned WPT
+`vertical-align-2191-2242-line-local-final/results.json` is **52/52** (prior
+**51/52**); `vertical-align-122-line-local-final/results.json` is **1/1**
+with zero different pixels. The nearby
+`normal-inline-table-3467-3478-line-local-final/results.json` remains
+**12/12**. The 34-case `inline-block-3401-3434-line-local-final` window is
+**33/34**, with only `inline-block-non-replaced-width-004` still failing at
+the same 10,800 pixels as the earlier full receipt. The 13-case
+`inline-block-baseline-6092-6104-line-local-final` window is **6/13**;
+`010`–`014` match their pre-change binary's failure pixel counts exactly.
+`css1-inline-1198-1208-line-local-final/results.json` remains **5/11**
+with no status change. The focused atomic-descent and two-line placement
+Rust tests pass; the `forced_break` filter passes **18/18**, and the
+`vertical_align` filter passes **4/4**. These are targeted receipts, not
+a fresh 6,548-case result. The next baseline family (`010`–`014`) exposes
+another line-box issue: the empty inline-block source keeps its text near
+y=45, while the image reference is pushed to y=78; the five cases matched
+the pre-change binary at the same pixel counts, so this is a separate
+baseline-alignment repair, not a regression from the 122 closure.
+
+The next baseline batch closed `inline-block-baseline-010`–`014`: in a
+`white-space: nowrap` line with a large passive line-height, the empty
+inline-block and its replaced-image reference now align their bottom margin
+edges to the surrounding text baseline, including the negative
+`vertical-align` variant. Pinned WPT
+`inline-block-baseline-6098-6102-tall-strut/results.json` is **5/5**
+(prior **0/5**), and
+`inline-block-baseline-6092-6104-tall-strut-final/results.json` is
+**11/13** (prior **6/13**). The new tall-strut Rust regression passes.
+`vertical-align-2191-2242-tall-strut-final/results.json` remains **52/52**,
+`normal-inline-table-3467-3478-tall-strut/results.json` remains **12/12**,
+and `inline-block-3401-3434-tall-strut/results.json` remains **33/34**
+with its one existing width failure. Cases `005/006` remain at 217
+different pixels each: their `words` continuation is present in the text
+paint layout but absent from the final image under `overflow:auto/hidden`.
+The text leaf itself reports visible overflow and no direct paint clip, so
+the remaining investigation is the retained/composited overflow path.
+The `inline_block` Rust filter is **25/26**: its lone
+`auto_width_inline_block_wraps_inline_text_to_its_used_width` text-height
+failure was already recorded before this batch (then **21/22**), and is
+kept separate from the new focused tests. `cargo fmt --all -- --check`
+continues to fail on broad existing formatting drift; the parent
+`pnpm files:size:check` continues to report six violations outside the
+W3COS files. `git diff --check` passes. No fresh full-suite count is
+inferred from these subset receipts.
+
+The `inline-block-baseline-005/006` overflow continuation now passes.
+Their text line was laid out and submitted to Skia, but the compositor
+applied a scrollport clip at y=60–97.5 after the inline-block's final box
+had moved to y=30–67.5. Scroll and clip-only owners were discovered during
+the initial Taffy walk; their rectangles now refresh from the final
+post-projection layout before descendant scroll extents and painting.
+Pinned WPT `inline-block-baseline-6092-6104-final-scrollclip/results.json`
+is **13/13** (prior **11/13**), while
+`vertical-align-2191-2242-final-scrollclip/results.json` remains **52/52**
+and `normal-inline-table-3467-3478-final-scrollclip/results.json` remains
+**12/12**. The CSS2 overflow-applies window
+`overflow-applies-6045-6057-final-scrollclip/results.json` is **3/13**,
+with identical statuses and pixel counts to the pre-change binary; its ten
+failures are a separate existing table/overflow family. The focused
+scroll-owner unit passes and the `scroll` Rust filter is **89/89**. These
+receipts still do not establish a current result for all 6,548 cases.
+
+The separate CSS2 overflow-applies window is now **13/13** on the pinned WPT
+(`overflow-applies-6045-6057-padding-clip/results.json`, prior **3/13**).
+Layout and retained painting now share the block-container applicability
+rule: inline and non-cell internal table boxes do not become overflow clip
+or scroll owners. The remaining five cases exposed a second mismatch:
+PaintArtifact clipped to the padding box but compositor scroll info used the
+border box, leaking a 5×20 px red strip. Compositor visual clips now use the
+same padding-box geometry for both scrollable and clip-only owners, while
+layout keeps border boxes for hit testing and scroll extent. Both new focused
+Rust regressions pass; the `scroll` filter is **91/91**. Neighbor windows
+remain `inline-block-baseline` **13/13**, `vertical-align` **52/52**,
+`normal-inline-table` **12/12**, and `inline-block` **33/34** with the same
+pre-existing `inline-block-non-replaced-width-004` failure. No full-suite
+result is inferred from these focused receipts.
+
+The remaining `inline-block-non-replaced-width-004` case now passes. The
+outer auto-width inline-block already shrink-fit to its constrained child at
+120 px, but the nested inline-block itself had a 0 px layout width: the
+non-leaf shrink-to-fit branch omitted inline-block containing blocks. Its
+green background therefore painted no pixels while its black text overflowed
+onto the red parent. A DOM-to-layout Rust regression first reproduced the
+0 px child, then passed after enabling the nested inline-block case. Pinned
+WPT `inline-block-3401-3434-nested-shrinkfit/results.json` is **34/34**
+(prior **33/34**). This remains a focused-family result, not a current
+6,548-case full-suite count.
+
+A fresh current-tree `box-display` window (`box-display-997-1050-after-overflow-inline/results.json`)
+is **54/54**; the older 48/54 receipt is stale, but the six status changes
+cannot be attributed to the immediately preceding inline-block patch without
+an intermediate matching run. The pinned CSS2 `white-space` family was
+**78/111** at `white-space-5826-5936-current/results.json`. Two fixed-space
+cases now pass: Ahem's uncovered U+2000 en quad advances by half an em, and
+U+FEFF remains in the CSS whitespace stream but has zero glyph advance/ink.
+The first follow-up was **80/111** with precisely `processing-054/055`
+fixed. The next `pre-line` fragment-edge change initially fixed four
+adjacent-inline cases but regressed `processing-024/027/045`; DOM lowering
+now preserves edge space only when an adjoining inline actually continues
+the line and removes a duplicate leading space when the prior inline owns
+it. The final focused receipt
+`white-space-5826-5936-context-trim/results.json` is **84/111**, with
+`processing-028/029/035/036` newly passing and no status regressions versus
+the 80/111 receipt. The 22-case edge window is **22/22**. Twenty-seven
+white-space cases remain failing; no full-suite result is inferred.
+After the contextual pre-line change, final cross-window receipts remain
+`overflow-applies-6045-6057-preline-final` **13/13**,
+`inline-block-3401-3434-preline-final` **34/34**, and
+`box-display-997-1050-preline-final` **54/54**.
+
+The next pinned CSS2 `white-space` receipt,
+`white-space-5826-5936-prewrap-min-content/results.json`, is **87/111**
+(prior **84/111**). `white-space-004`, `white-space-processing-013` and
+`white-space-processing-052` newly pass with no status regression. A
+`pre-wrap` text fragment in the generated flex-backed inline context had
+used its entire preserved-space run as its automatic minimum width: the
+5em `processing-013` box consequently painted at 112px instead of 80px.
+The minimum contribution now uses the longest unbreakable segment while
+the preferred width retains the full text advance; the run-width wrapper
+also retains spaces at the soft break after their sequence. The focused
+`processing-013` reftest has zero different pixels. Neighbor receipts
+`inline-block-3401-3434-prewrap-min-content` **34/34**,
+`box-display-997-1050-prewrap-min-content` **54/54**, and
+`overflow-applies-6045-6057-prewrap-min-content` **13/13** remain green.
+Twenty-four white-space cases remain failing; no current 6,548-case
+full-suite result is inferred from these windows.
+
+The pinned `white-space-5826-5936-nowrap-attribute/results.json` receipt
+is **88/111**, up from **87/111** with only
+`white-space-nowrap-attribute-001` newly passing. The XHTML `<td nowrap>`
+attribute now enters the computed-style cascade as a table-cell
+presentational hint; an authored `white-space` declaration still wins.
+The focused reftest has zero different pixels and the DOM cascade regression
+passes. Twenty-three white-space cases remain failing. This is a targeted
+window, not a current full-suite result.
+
+The next two pinned white-space receipts are
+`white-space-5826-5936-coalesced-text/results.json` **89/111** and
+`white-space-5826-5936-inline-br/results.json` **92/111**. The first
+fixes `white-space-processing-015`: an XHTML linefeed entity had split
+an otherwise identical `nowrap` text run into multiple DOM text nodes,
+leaving an extra inline Row and shifting the painted baseline by 1.6px.
+The second fixes `white-space-processing-016/017/018`: the reference
+`<span>XX<br/>XX</span>` had painted one 64px-wide principal background
+instead of two 32px inline line fragments. A passive direct text/BR
+sequence now lowers to one decorated text leaf with a forced-break marker;
+styled/eventful child boxes and generated content retain their separate
+structure. Each receipt adds only the named passes, with no status
+regressions. The DOM `forced_break` filter passes **5/5** and runtime
+`forced_break` filter passes **18/18**. Nineteen white-space cases remain;
+the 6,548-case full suite has not been rerun on this worktree.
+
+The pinned `white-space-5826-5936-preline-join/results.json` receipt is
+**93/111**, up from **92/111** with only
+`white-space-generated-content-before-001` newly passing (zero different
+pixels). A generated `pre-line` fragment without a preserved line break can
+join adjacent `normal` text so their inter-fragment spaces collapse in one
+run; fragments containing a line break remain separate. The focused DOM
+regression passes **1/1** after an observed RED. With the rebuilt runner,
+`linebox-2100-2119-preline-join` remains **13/20** and
+`normal-flow-3435-3436-preline-join` remains **2/2**. Eighteen white-space
+cases remain failing; the 6,548-case full suite has not been rerun on this
+dirty worktree.
+
+The next pinned receipt, `white-space-5826-5936-zwsp/results.json`, is
+**99/111**, up from **93/111**. `white-space-normal-005/006`,
+`white-space-nowrap-005/006`, and `white-space-pre-005/006` newly pass with
+zero different pixels and no status regressions. U+200B remains in the CSS
+text for line breaking but now contributes no glyph or advance during font
+measurement and painting. The runtime regression was observed RED and then
+passed **1/1**. The adjacent `word-spacing-characters-5996-6000-zwsp` window
+is **4/5**; its U+200B case `word-spacing-characters-003` passes, while
+`word-spacing-characters-001` remains failing. Twelve white-space cases
+remain; this targeted evidence does not establish a current full-suite result.
+
+The pinned `white-space-5826-5936-inline-space/results.json` receipt stays
+**99/111** against the previous 99/111 report, with no status regression.
+`white-space-normal-008` improves from 3,600 to 800 different pixels;
+`normal-007` stays at 4,800. An empty nested inline between decorated text
+runs no longer causes a later anonymous whitespace node to duplicate a
+space already retained by an earlier run. The focused DOM regression was
+observed RED (`"X  X"` instead of `"X X"`) and now passes; two decorated
+inline tests pass **2/2**. In `normal-008`, the last two 20px Ahem cells still
+paint green/lime instead of lime/green despite the correct overall bar width;
+the text-only DOM tail regression passes, so the remaining issue needs
+inline-fragment paint/width ownership diagnosis. Adjacent receipts
+`linebox-2100-2119-inline-space` **13/20** and
+`normal-flow-3435-3436-inline-space` **2/2** have no status changes. The
+broader DOM `whitespace` filter is **12/13**: the document-root edge-space
+test also fails with the new branch temporarily removed, so it is not
+attributed to this change. Twelve white-space WPT failures remain, and the
+6,548-case suite has not been rerun on this dirty worktree.
+
+The follow-up `white-space-5826-5936-line-origin/results.json` receipt is
+**100/111**: `white-space-normal-008` now matches with zero differing pixels,
+and the other 110 statuses are unchanged. Its final nested inline starts at
+x=208 inside a line whose content starts at x=28. PaintArtifact had trimmed
+the text's leading space against the immediate inline parent's x=208 rather
+than the containing line start, reversing the final lime/green cells. A
+focused regression was observed RED and then GREEN; the existing soft-line
+start trim regression also passes. Adjacent linebox and normal-flow windows
+remain **13/20** and **2/2**. Eleven white-space cases remain failing; no
+current 6,548-case full-suite receipt or clean candidate SHA exists.
+The next focused candidate is `white-space-normal-007`: both raw-text and
+character-reference bars flatten to `"X X XX "` plus `"X"`, `" "`, `"X"`,
+while their reference is six alternating 20px cells. That mismatch already
+exists before paint and needs a source/inline whitespace-collapse RED, not a
+paint offset adjustment.
+
+The subsequent `white-space-5826-5936-table-boundary/results.json` receipt is
+**101/111** at pinned WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`:
+`white-space-normal-007` now matches with zero differing pixels, with no
+other status change in the 111-case window. A nested inline's empty white-space
+box is retained until its preceding inline content is known, and preserved
+`pre` whitespace no longer counts as a collapsible space. The subsequent
+`white-space-5826-5936-forced-break/results.json` was mistakenly run with
+the older `target/wpt/w3cos-wpt` binary (4,072 different pixels in
+`white-space-mixed-003`) and is **not** current-code validation. With
+`CARGO_TARGET_DIR=target/wpt`, the freshly built executable is
+`target/wpt/debug/w3cos-wpt`.
+
+The current-code `white-space-5826-5936-float-extent-final/results.json` is
+**102/111**: only `white-space-mixed-003` changed status, from fail to pass
+with zero pixel difference. Its focused layout test was RED with two inline
+text leaves at the same y coordinate, then GREEN after a preserved trailing
+newline projected the following leaf to the next line and recomputed the
+auto-sized float's width and border-inclusive height. The DOM regression
+covering a `pre` newline followed by a `normal` inline's leading space was
+also RED (`" x"`) then GREEN (`"x"`) through the final component tree.
+Adjacent `linebox-2100-2119-float-extent/results.json` is **13/20** with no
+status change; `normal-flow-3435-3436-float-extent/results.json` is **2/2**.
+The focused runtime forced-break filter is **18/18**. Nine cases in this
+white-space window and the current-code 6,548-case full-suite replay remain
+open. No clean candidate SHA or full-suite acceptance is claimed.
+
+The next `white-space-5826-5936-bdo-visual-space/results.json` receipt is
+**103/111** on the same pinned WPT checkout. Only
+`white-space-bidirectionality-001` changed status, from 292 differing pixels
+to a zero-difference pass. The actual failure was not just text ordering:
+HTML `bdo` fell through the UA default to `display:block`, and `dir` supplied
+direction without the element's default bidi override. After restoring inline
+`bdo`/`bdi` defaults and retaining the override boundary through passive
+coalescing, the visual-order edge merger still collapsed two distinct spaces
+into one. The new DOM-to-layout regression was RED for both the three-line
+layout and `"A BC"`; it now checks one line and the two visual spaces, with
+the second represented as NBSP so the later `white-space:normal` pass cannot
+collapse it again. DOM bidi tests are **13/13** and runtime bidi tests are
+**6/6**. Eight cases in this window remain failing.
+
+The `white-space-pre-001/002` and `white-space-normal-003/004` reference
+images share a separate inline image-flow failure: a trailing NBSP run after
+an image wraps as an independent flex item and shifts subsequent image rows.
+For example, the `pre-001` reference currently places its 54 image leaves
+across six y positions instead of the five source rows. This is diagnostic
+evidence, not a fix or a pass for those four cases. The current-code 6,548-case
+full-suite replay and a clean candidate SHA remain outstanding.
+
+The next `white-space-5826-5936-empty-inline-refined/results.json` receipt is
+**104/111**. `white-space-collapsing-002` moved from 8,000 differing pixels to
+zero: a transparent, undecorated inline containing only collapsible whitespace
+no longer makes adjacent source whitespace count as content before the first
+visible glyph. The focused DOM regression was RED (`" X"`) and is now GREEN
+(`"X"`), while an earlier visible `A` still preserves `"A X"`. An initially
+broader predicate regressed `white-space-normal-007` (3,600 pixels); excluding
+inline boxes with painted backgrounds restored that pass. Ordered comparison
+of all 111 test objects against the 103/111 receipt shows only
+`white-space-collapsing-002` changed. Seven cases remain failing; the current
+code still has no clean SHA or full 6,548-case replay.
+The exact-name DOM regression passes. The broader `w3cos-dom --lib` run is
+509/522 both with default scheduling and with `--test-threads=1`; these 13
+failures are not attributed to this change without a clean baseline. The
+parent `pnpm files:size:check` remains red on six out-of-scope main-repository
+files, and the W3COS `git diff --check` passes.
+
+The pinned `white-space-5826-5936-bidi-isolate/results.json` receipt is
+**106/111**. Only `white-space-collapsing-bidi-001` and `-002` changed against
+the 104/111 receipt, both from failure to zero pixel difference. XHTML entity
+boundaries split a single text sequence into adjacent nodes; whitespace
+collapsing now treats bidi formatting controls as transparent across both the
+single-node and merged-node paths, keeping the logical space before the
+control so visual reordering paints the right Ahem cells. HTML `dir=ltr/rtl`
+also supplies the browser's `unicode-bidi:isolate` computed default, while
+author CSS can override it and `bdi`/`bdo` retain their own UA behavior.
+The visual-order merger preserves two distinct spaces when an RTL isolate
+reverses one beside an external space. Focused DOM bidi tests pass 14/14,
+Runtime bidi tests pass 6/6, and the three targeted WPT bidi cases pass 3/3.
+Five cases in this window and the clean-SHA full 6,548-case replay remain open.
+
+The next pinned `white-space-5826-5936-inline-image-line-space/results.json`
+receipt remains **106/111**, with no old pass lost. A fixed-width anonymous
+inline line filled by replaced images and whitespace now discards the next
+collapsible separator instead of giving it a new flex line. Its focused Runtime
+layout regression was RED (the following image at x=20) and is GREEN at x=0.
+The four image-based cases improved without changing status:
+`normal-003/004` from 18,240 to 12,320 differing pixels each, and
+`pre-001/002` from 16,800 to 12,000 each. The next concrete break is a
+mixed `NBSP*3 + collapsible space` text item whose trailing ordinary space
+forces the whole item onto the next line, although the NBSP prefix fits the
+remaining line width. The five failures and clean-SHA full replay remain open.
+
+The pinned `white-space-5826-5936-line-fill-v5/results.json` receipt is
+**110/111**, up from **106/111** with no prior pass regressed. The four
+`white-space-normal-003/004` and `white-space-pre-001/002` image cases now
+match their references at zero different pixels. A collapsible space after a
+nonbreaking-space run is independently breakable; NBSP itself must not enter
+line-end whitespace trimming. Full-line separator suppression now measures
+each inline line, including lines after the first, rather than summing the
+entire container. Focused DOM and Runtime regressions were RED then GREEN.
+`white-space-mixed-001` remains at 157,820 differing pixels: an outer `pre`
+line with nested `normal`/`nowrap` fragments still overflows horizontally
+instead of honoring the nested wrap opportunities. The current dirty worktree
+has no clean-SHA 6,548-case replay; this window is not full-suite acceptance.
+
+The follow-up pinned `white-space-5826-5936-mixed-wrap-v2/results.json`
+remains **110/111**, with no status regression against the preceding window.
+`white-space-mixed-001` improves from 157,820 to 51,578 differing pixels.
+An outer `pre` inline context with an explicitly wrappable nested run now
+permits that run to advance to another line; a pure `pre` context still does
+not soft-wrap, and adjacent ASCII text without any break opportunity remains
+one unbroken inline item across a style boundary. Both focused mixed-context
+layout regressions were observed RED then GREEN. The remaining mismatch is
+not solved by container wrapping: a passive nested `normal` inline still
+occupies an atomic flex item, while its leading collapsible space is removed
+only during paint and continues to consume layout width. The next fix needs
+line-level whitespace measurement and non-atomic inline-fragment flow; no
+current-code 6,548-case full-suite receipt or clean candidate SHA exists.
+
+The subsequent `white-space-5826-5936-line-start-final/results.json` remains
+**110/111**. The first collapsible space of a `normal` inline after a filled
+`pre` line no longer consumes layout width; its focused layout regression was
+RED at 40px and GREEN at 20px. `white-space-mixed-001` is unchanged at 51,578
+different pixels. A further RED showed that a multiword `normal` text leaf
+was fixed at 140px inside an 80px line. The full-line-space branch now caps
+only breakable continuations at the available width and uses their min-content
+floor, while the collected inline text box retains its measured multi-line
+height. The new regression is GREEN at 80x40px, and the existing unbroken-word
+regression remains GREEN. The freshly rebuilt runner's
+`white-space-5826-5936-multiline-leaf-v1/results.json` is also **110/111**;
+all 111 individual statuses and pixel counts match the preceding receipt.
+The remaining test's first nested `normal` span is still an atomic 380px Row
+containing multiple styled descendants. It needs a line-fragment flow that
+preserves soft-break semantics across descendants; flattening the Row without
+word-boundary grouping previously worsened this case. No clean candidate SHA
+or current-code 6,548-case full-suite receipt exists. The broader runtime
+`layout::tests` filter is **453 passed / 9 failed** on this dirty worktree;
+those failures are not attributed to this change without a clean baseline.
+`cargo fmt --check -p w3cos-runtime` also fails across existing files, so no
+repository-wide formatter pass was applied.
+
+The next pinned `white-space-5826-5936-inline-continuation-v1/results.json`
+receipt is again **110/111** on the clean upstream WPT
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. All 111 statuses and pixel
+counts are unchanged from `multiline-leaf-v1`; `white-space-mixed-001` remains
+RED at 51,578 different pixels. The narrowly scoped continuation projection
+passes its Ahem layout regression but does not improve this WPT case. A direct
+`W3COS_DUMP_HEADLESS_LAYOUT=1` render of case 5859 shows the outer `pre` box
+at 386x143px, while later `nowrap`/`pre` text fragments are still placed at
+x=811px and x=1591px instead of continuing inside its 380px content width.
+The seven-line container height therefore does not imply seven correctly
+fragmented paint lines. The remaining work is shared line-fragment flow across
+nested `normal`/`nowrap`/`pre` inline boundaries, including legal soft breaks
+and preserved forced breaks; another parent-height or line-top adjustment
+alone would not address those out-of-line coordinates. No current-code full
+6,548-case receipt or clean candidate SHA exists.
+
+The follow-up `white-space-5826-5936-intra-row-v1/results.json` is still
+**110/111**, but `white-space-mixed-001` improves from 51,578 to 45,978
+different pixels; all other 110 statuses and pixel counts are unchanged.
+The RED/GREEN `pre_text_continues_after_a_wrapped_nested_inline_fragment`
+regression covers an inner row whose last text begins mid-line followed by
+outer preserved whitespace text that may legally overflow the line. The
+continuation now uses the full advance of that mid-line fragment; only a
+fragment at the line start drops its leading collapsible space. The adjacent
+`nested_normal_inline` 2/2 and forced-break 1/1 tests pass. The broader
+`layout::tests` result is **456 passed / 9 failed**, the same nine named
+failures as the prior run plus one newly passing test. This is partial pixel
+improvement, not case closure: later `nowrap` and preserved-newline fragments
+still require shared line-fragment flow. The current dirty worktree has no
+clean-SHA 6,548-case replay.
+
+The next pinned `white-space-5826-5936-text-row-v1/results.json` remains
+**110/111**. Only `white-space-mixed-001` changes against `intra-row-v1`,
+improving from 45,978 to 43,578 different pixels; the other 110 statuses and
+pixel counts remain identical. The RED/GREEN
+`unbroken_pre_text_and_nested_normal_inline_share_the_overflowing_line`
+regression covers a `pre` text leaf overflowing a narrow line with no soft
+break before a passive nested `normal` inline row. The row now continues on
+that line instead of moving wholly to the next one. The broader
+`layout::tests` filter is **457 passed / 9 failed**, with the same nine named
+failures as before and one added passing test. A separate preserved-break
+experiment made the focused WPT case worse (114,724 differing pixels) and was
+removed; its negative receipt is `white-space-mixed-001-preserved-break-v1`.
+The remaining issue is not just a text coordinate: in the reduced overflowing
+inline example, Chromium's block auto-height is 20px, while the current
+projection retains a 40px layout box. Proper line fragmentation must own
+soft/forced-break placement and line-box height together. This case and the
+full 6,548-case replay are not closed on a clean candidate SHA.
+
+The current source-order continuation candidate was replayed against pinned
+WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0` in
+`white-space-5826-5936-source-order-current-v1/results.json`: **110/111**.
+Only `white-space-mixed-001` differs from `text-row-v1`, regressing slightly
+from 43,578 to **43,758** different pixels. A reduced DOM regression,
+`nested_normal_edge_spaces_leave_room_for_following_pre_text`, was an ignored
+RED: after a full 19-character Ahem line, the nested `normal` text
+uses 380px instead of the browser's 360px and forces the following `pre` text
+onto another line. Two experimental fixes that
+subtracted the leading space from the Taffy text leaf passed this local
+position assertion but made the WPT image worse: both broad and narrowed
+versions produced **111,295** different pixels. They were removed. Image
+inspection showed a whole line of container height disappearing, moving the
+following paragraph and reference block. A future fix must preserve correct
+line count/auto-height as well as the local 360px advance; this receipt does
+not close the case or authorize a full-suite claim.
+
+The next `white-space-5826-5936-fragment-height-v1/results.json` replay is
+**110/111** on the same pinned WPT revision. Only `white-space-mixed-001`
+changes from the preceding source-order receipt, improving from 43,758 to
+**39,578** different pixels; the other 110 statuses and pixel counts match.
+The former ignored RED `nested_normal_edge_spaces_leave_room_for_following_pre_text`
+is now enabled and GREEN. A browser-measured reduced case requires the nested
+`normal` text to occupy 360px, the following `pre` character to share that
+line, and the auto-height to be 60px. Instead of changing Taffy's line count
+globally, the continuation pass corrects the three text fragments, shifts
+subsequent same-line siblings, and reduces auto-height only when that nested
+row is the final content. `layout::tests` is **458 passed / 9 failed**; the
+nine names match the prior baseline, while the new regression passes. This is
+a partial image improvement, not `mixed-001` closure. The remaining WPT image
+still has later `pre` and `nowrap` fragments outside the 380px content width.
+No current-code 6,548-case full-suite receipt or clean candidate SHA exists.
+
+The next `white-space-5826-5936-nested-nowrap-v1/results.json` replay is
+**110/111**. Only `white-space-mixed-001` changes against `fragment-height-v1`,
+improving from 39,578 to **37,978** different pixels; all other 110 statuses
+and pixel counts match. The RED/GREEN
+`outer_pre_text_after_nested_nowrap_wraps_to_next_line` regression mirrors the
+next source segment: an overflowed nested `normal`/`nowrap` row had placed the
+following outer `pre` text at `(168,108)` instead of the browser's `(8,68)`
+in the reduced 380px Ahem case. Its line-start projection now corrects that
+fragment and source-order followers. `layout::tests` is **459 passed / 9 failed**
+with the same nine existing failures. The current-code single-case confirmation
+is `white-space-mixed-001-nested-nowrap-confirm-v1/results.json` at 37,978
+different pixels.
+
+The next preserved-newline experiment passed a reduced Chromium coordinate
+check but regressed the WPT reference image from 37,978 to **51,978** pixels
+(`white-space-mixed-001-preserved-following-v1/results.json`), so it was
+removed. This old mixed-whitespace test currently occupies eight lines in
+Chromium while its fixed reference has seven; a browser Range coordinate alone
+cannot decide the full reftest. The remaining work is a shared source-order
+line-fragment model for the later `pre`/`nowrap`/`normal` run and its height,
+then a fresh 111-case and 6,548-case replay on a clean candidate.
+
+The subsequent block-terminal-newline and preserved-space lowering changes
+have a `white-space-5826-5936-preserved-space-v1/results.json` receipt of
+**110/111**; only `white-space-mixed-001` remains RED at **22,020** differing
+pixels. That receipt used a runner binary older than the latest source edit.
+After rebuilding the pinned WPT runner, the current-source single-case
+`white-space-mixed-001-rebuilt-current-v1/results.json` independently confirms
+the same 22,020 pixels. After withdrawing the experiment below and rebuilding
+again, `white-space-5826-5936-rebuilt-preserved-v1/results.json` confirms
+**110/111** on current source: all 111 statuses and pixel counts match the
+older preserved-space receipt. The lowered
+first block is 146px high with seven lines, matching the reference height;
+later `pre`/`nowrap` fragments still overflow the 380px content width.
+
+A reduced DOM/layout case with a `pre` text node ending in a preserved newline
+after mixed inline spaces places the following `nowrap` run on the same layout
+row. Resetting the forced-break line origin when the preceding flow box ends
+turns that reduced case green, but the rebuilt WPT image regresses to
+**110,999** differing pixels (`white-space-mixed-001-forced-line-v1/results.json`):
+the test block gains an eighth line and shifts the following paragraph and
+reference block. The production change was removed. The reduced case remains
+an ignored RED until the seven-line pinned reference and modern Chromium's
+eight-line result are reconciled through a shared line-fragment model. The
+111-case window still has one failure; no current-source 6,548-case suite
+receipt exists.
+
+The rebuilt `white-space-5826-5936-pre-continue-v1/results.json` receipt is
+**110/111**, with `white-space-mixed-001` at 20,820 differing pixels. Accounting
+for the bottom border in forced-break auto height reduced that case to 3,200,
+but the first 111-case replay (`white-space-5826-5936-bottom-inset-v1/results.json`)
+fell to **109/111**: the auto-width floated `white-space-mixed-003` gained 138
+pixels because its bottom inset was counted twice. The redundant float-specific
+addition was removed. The rebuilt three-case receipt
+`white-space-mixed-001-003-inset-dedupe-v1/results.json` is 2/3, with mixed-002
+and mixed-003 at zero pixels; the current-source 111-case receipt
+`white-space-5826-5936-inset-dedupe-v1/results.json` is again **110/111**.
+Only mixed-001 differs from the pre-continue window, improving from 20,820 to
+3,200 pixels. Its direct layout dump places the fourth-line preserved `pre`
+fragment at x=231 and its first visible glyph at x=331; the reference glyph
+starts at x=371. The remaining 40px is two Ahem space advances across the
+preceding `normal`/`pre`/`nowrap` fragments. Restoring those spaces as ordinary
+flex items previously introduced an eighth line, so this requires a line
+fragment/advance fix rather than another text-node insertion. The 6,548-case
+suite has not been rerun on this source.
+
+The source-order fixture `empty_nowrap_fragments_advance_following_pre_text_without_an_extra_line`
+was RED at x=231 plus six Ahem spaces instead of seven, while retaining the
+46px two-line block height. Deferring the advances of the two discarded
+whitespace-only `nowrap` fragments into the following `pre` text makes that
+regression GREEN. An initial one-fragment version worsened mixed-001 from
+3,200 to 5,600 differing pixels (`white-space-mixed-001-003-deferred-advance-v1/results.json`).
+The source also has a trailing collapsible text node after the inner `nowrap`;
+skipping that node when finding the fragment gives the current rebuilt receipts:
+`white-space-mixed-001-003-deferred-advance-v2/results.json` is **3/3** and
+`white-space-5826-5936-deferred-advance-v2/results.json` is **111/111**, all at
+zero differing pixels.
+
+The complete current-source replay used clean WPT
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the 6,548-entry discovered
+manifest, six isolated workers, `--failure-artifacts-only`, and `--report-only`.
+`target/wpt-all/current-deferred-advance-v2-jobs6/results.json` records
+**6,325 passed, 223 failed, 0 worker errors** at 800x600. The remaining
+failures include 50 under `css/CSS2/css1`, 30 under `linebox`, 18 each under
+`normal-flow` and `floats-clear`, and 17 under `visudet`. Nineteen reftests
+against filled-square references differ by one low-amplitude edge pixel; the
+actual/reference colors and layout coordinates implicate glyph antialiasing
+around adjacent cells or inline-block content, but that cause is not yet
+proven by a focused paint regression. The next round must use targeted REDs
+from the 223-case report, not another complete replay until source changes
+justify it. This dirty worktree has no clean candidate SHA or release claim.
+
+The next targeted change resolved `word-spacing: 12ex` and `+12ex` against the
+computed font size, including the final Ahem face. The 5972–5983 window is
+**12/12** with zero differing pixels in
+`target/wpt-targeted/word-spacing-5972-5983-visible-inline-guard-v1/results.json`.
+A separate guard prevents deferred whitespace from crossing visible inline
+text. On the runner rebuilt after both changes, the 5826–5936 white-space
+window remains **111/111** with zero differing pixels in
+`target/wpt-targeted/white-space-5826-5936-visible-inline-guard-v1/results.json`.
+The 6,325/223 full-suite receipt above predates both changes; no updated
+full-suite count or clean-SHA acceptance is claimed.
+
+The next CSS1 spacing RED was `c542-letter-sp-001`: percentage
+`letter-spacing: 200%` was ignored and the reftest differed by 3,600 pixels.
+The parser now resolves percentage spacing against font size, and computed
+style re-resolves it against the final cascaded font before inheritance.
+Both direct and inherited computed-style tests went RED to GREEN. The rebuilt
+`css1-spacing-1226-1229-letter-percent-v1/results.json` is **4/4**, including
+the formerly failed `c541-word-sp-000` and `c542-letter-sp-001`, both at zero
+differing pixels. On that same runner,
+`word-spacing-5972-5983-letter-percent-v1/results.json` is **12/12** and
+`white-space-5826-5936-letter-percent-v1/results.json` is **111/111**.
+All three receipts are under `target/wpt-targeted/`.
+
+The next isolated RED is the table-column filled-square cluster at indices
+144–147: `table-column-square-144-147-current-v1/results.json` is **2/4**.
+`background-applies-to-006` differs only at `(103,54)`, actual RGB `(5,5,5)`
+versus black; `background-applies-to-012` differs only at `(7,102)`, actual
+RGB `(252,252,252)` versus white. This suggests edge text rasterization but
+does not yet prove the paint cause. No tolerance was relaxed. The 6,325/223
+full-suite count still predates the subsequent spacing changes and must not
+be silently revised from these focused receipts.
+
+The next `line-height: ex` batch was RED at indices 2149–2153:
+`line-height-ex-2149-2153-current-red-v1/results.json` is **2/5**, with
+240, 720 and 720 differing pixels in `line-height-080`, `-083` and `-084`.
+The parser's half-em estimate was reaching computed style even when the final
+Ahem font has a different x-height. Resolving the winning `line-height: ex`
+longhand against the final font made the direct computed-style test GREEN
+(`6ex` at 20px Ahem now gives a 4.8 line-height multiplier), and the rebuilt
+`line-height-ex-2149-2153-font-metric-v1/results.json` is **5/5**, all with
+zero differing pixels. Both receipts are under `target/wpt-targeted/` on the
+same pinned clean WPT revision. No new full-suite result is claimed.
+
+The adjacent `line-height: inherit` test at index 2165 was separately RED:
+`line-height-inherit-2165-current-red-v1/results.json` showed a 20px stripe
+where the reference needs 96px. A later explicit `line-height: inherit` had
+not copied the parent's computed value when the same element also declared a
+`font` shorthand. The computed-style regression went RED to GREEN, and the
+rebuilt `line-height-inherit-2165-explicit-v1/results.json` is **1/1** at zero
+differing pixels. The 2149–2153 `ex` window remains **5/5** in
+`line-height-ex-2149-2153-explicit-inherit-v1/results.json`; all `line-height`
+DOM unit tests are **14/14**. These receipts are under `target/wpt-targeted/`.
+
+The next related RED remains `line-height-125` at index 2167:
+`line-height-em-inheritance-2167-current-v1/results.json` is **0/1**. It tests
+inheritance of a computed length across a font-size change. The current style
+stores only a line-height ratio, so a shared computed-length representation
+must be evaluated before changing this behavior; no case-specific exception
+has been added.
+
+The subsequent bounded fix adds an optional computed-pixel length to `Style`
+while retaining the existing ratio for layout and old serialized styles.
+`1em`, `100%` and `10px` on a 10px parent now inherit as a fixed 10px length
+on a 50px child; unitless `1` still inherits as a multiplier. That
+computed-style regression went RED to GREEN. The first rebuilt WPT receipt,
+`line-height-em-inheritance-2167-computed-px-v1/results.json`, reduced
+`line-height-125` from 11,906 to 4,128 differing pixels but remained RED.
+The layout dump showed the wrapped `PASS` inline at 50px font size with 10px
+line-height; its border-free background was painted only at line-height size,
+leaving the red `FAIL` visible. A focused raster test went RED to GREEN after
+preserving at least the font-em background box under short line-height.
+`line-height-em-inheritance-2167-em-background-v1/results.json` is then
+**1/1**, zero differing pixels. With the same runner, the 2149–2168
+line-height window is **20/20**, the 5826–5936 white-space window is
+**111/111**, and the 5972–5983 word-spacing window is **12/12**, all zero
+different pixels; their receipts are respectively
+`line-height-2149-2168-computed-px-v1/results.json`,
+`white-space-5826-5936-computed-line-height-v1/results.json`, and
+`word-spacing-5972-5983-computed-line-height-v1/results.json` under
+`target/wpt-targeted/`.
+
+The neighboring `line-height-127` at index 2169 remains a separate RED:
+`line-height-127-computed-px-v1/results.json` is **0/1** with 7,680 differing
+pixels. It exercises a 1px inline image on a zero-height Ahem line and needs
+baseline/replaced-element geometry analysis; the length-inheritance fix does
+not claim to solve it. No current 6,548-case full-suite result exists after
+these changes, and this dirty checkout is not a clean release candidate.
+
+The wider `w3cos-dom --lib` test run on this dirty source is **not green**:
+521 passed, 13 failed and one ignored, both with default parallelism and
+`--test-threads=1`. One failure reproduced alone as
+`negative_margin_and_character_relative_lengths_remain_valid` (`Ch(4.0)`
+versus expected `Em(4.0)`); the other failures span DOM inline/table/SVG and
+pseudo-content behavior. Their relationship to earlier dirty work remains
+unverified, so neither a clean module pass nor a baseline attribution is
+claimed. The focused computed-length and inline-background tests and WPT
+receipts above remain the bounded evidence for this batch.
+
+The following zero-line-height replaced-image batch closed `line-height-127`
+at index 2169. Its original receipt
+`line-height-127-computed-px-v1/results.json` was **0/1**, with 7,680
+differing pixels: a 1px image and its green parent were incorrectly assigned
+a 1px line box, exposing the red table-cell background. A geometry regression
+first went RED at 1px versus the expected 48px Ahem baseline strut. Reserving
+the font ascent plus negative half-leading reduced the rebuilt pixel diff to
+320 (`line-height-127-baseline-strut-v1/results.json`); the remaining pixels
+were exactly the first and last 160px rows, because the image was still
+top-aligned. A second RED asserted its baseline y position (47px below the
+block top). Projecting a sole static baseline-aligned replaced image to that
+baseline made the test GREEN, and
+`line-height-127-image-baseline-v1/results.json` is **1/1**, zero differing
+pixels. On the same runner, `line-height-2149-2170-image-baseline-v1/results.json`
+is **22/22** and `white-space-5826-5936-image-baseline-v1/results.json` is
+**111/111**. Related baseline runtime unit tests are **12/12**. All named WPT
+receipts live under `target/wpt-targeted/` at the pinned WPT revision; this
+still does not constitute a current 6,548-case full-suite result.
+
+The final source after restricting that image-baseline projection to static
+positioning was rebuilt and replayed: `line-height-2149-2170-static-image-v2`
+is **22/22**, and `white-space-5826-5936-static-image-v2` is **111/111**.
+Both reports use the clean pinned WPT revision and have zero differing pixels.
+The adjacent next-case RED, `line-height-oof-2188-current-v1`, is **0/1** with
+4,687 differing pixels. A minimal runtime reproduction showed an empty
+absolutely positioned inline sibling changing a zero-line-height paragraph's
+height from 0px to 10px; constraining Taffy's declared height did not change
+the collected layout, so that ineffective experiment was removed. The nearby
+`inline-context-2100-2105-current-v1` is **0/6** (five pixel failures and one
+four-subtest harness failure). These are discovery receipts, not a new full
+6,548-case result or a clean-candidate gate.
+
+The next bounded fix closes `line-height-oof-descendants-001` at index 2188.
+The RED above had 4,687 differing pixels. A parsed-DOM regression reproduced
+the actual four-paragraph flow: the zero-height line with an empty float was
+lowered to an internal flex row, stopping the adjacent zero-height paragraphs'
+margin collapse. For this single-text, zero-line-height shape with only empty
+out-of-flow siblings, layout now uses a block formatting box and keeps the
+empty float out of Taffy's in-flow slots. The parsed-DOM test went RED to
+GREEN; the rebuilt `line-height-oof-2188-margin-collapse-v2` receipt is **1/1**
+with zero differing pixels. The wider `line-height-2149-2188-margin-collapse-v2`
+receipt is **40/40**, and `white-space-5826-5936-margin-collapse-v2` remains
+**111/111**, all zero-difference on the clean pinned WPT revision. The
+`inline-context-2100-2105-margin-collapse-v2` discovery replay is still
+**0/6**, with each of its five pixel counts unchanged from the prior receipt;
+its harness case still fails. No current full 6,548-case result is inferred.
+
+The following inline-formatting batch closed indices 2100 and 2101 without
+pixel allowances. `inline-formatting-context-012` was RED by 756 pixels: two
+overwide `white-space: nowrap` siblings were separated by a collapsible text
+node that incorrectly occupied a third 19.2px line. A parsed-DOM runtime test
+went RED (38.4px between baselines) to GREEN (19.2px) after dropping that
+separator at a filled-line boundary. The first WPT receipt,
+`inline-context-2100-2104-nowrap-space-v1`, was **1/5** with index 2100 at zero
+pixels; the 5826–5936 white-space window remained **111/111**.
+
+`inline-formatting-context-013` stayed RED by 8,000 pixels after that first
+change. Its direct five-word layout had already collected correct 20px rows;
+the later baseline alignment used `floor((y - content_top) / line_height)` and
+misclassified floating-point values just below an integer boundary. A
+fractional-origin unit test went RED to GREEN when near-integer row positions
+were rounded only within 0.01px. With the diagnostic code removed, the rebuilt
+`inline-context-2100-2104-fractional-rows-v3` receipt is **2/5**: indices 2100
+and 2101 are zero-difference, while 2102–2104 remain independent failures at
+2,884 / 5,300 / 1,067 pixels. On the same runner, the white-space window is
+**111/111**, line-height 2149–2188 is **40/40**, and word-spacing 5972–5983 is
+**12/12**; receipts carry the `fractional-rows-v3` suffix under
+`target/wpt-targeted/`. This is still focused evidence, not a current full
+6,548-case result.
+
+The next focused pass investigated index 2102,
+`css/CSS2/linebox/inline-formatting-context-015.xht`. Its ordinary block
+background correctly spans behind the preceding left float, but the single
+text run had not inherited that block formatting context's float exclusion.
+The direct `float_excludes_text_inside_following_ordinary_block` test was RED
+at zero resolved flows and is now GREEN with the first text band at x=118,
+90px wide. The rebuilt `inline-context-2100-2104-ordinary-block-v1` receipt
+remains **2/5**; 2102 falls from 2,884 to 2,467 differing pixels. Its actual
+page now shows two `Filler Text` lines to the right of the float, matching a
+local Chrome headless render of the raw test document. The WPT reference uses
+a table and shows the phrase on one line, so the pinned reference still does
+not match Chrome's rendering of its test page. This reference discrepancy is
+not waived or counted as a pass. The same runner keeps
+`white-space-5826-5936-ordinary-block-v1` at **111/111**; related float-text
+runtime tests are **2/2**. Neither receipt is a current full-suite result.
+
+Index 2104, `inline-formatting-context-023.xht`, was separately RED by 1,067
+pixels: the equal-sized glyph runs inside one inline container inherited 25px
+and 30px line heights but did not share a baseline. The new
+`nested_inline_runs_share_the_tallest_line_baseline` runtime test went RED to
+GREEN. Its single-line inline-run projection now uses the containing block's
+line top and the tallest run's line height without shifting the inline box's
+decoration. The rebuilt `inline-context-2104-nested-baseline-v1` receipt is
+**1/1**, zero differing pixels; `inline-context-2100-2104-nested-baseline-v2`
+is **3/5**, with indices 2100, 2101 and 2104 passing. The current source also
+keeps `line-height-2149-2188-nested-baseline-v2` at **40/40** and
+`white-space-5826-5936-nested-baseline-v2` at **111/111**. Indices 2102 and
+2103 remain red; no current full 6,548-case result is claimed.
+
+Index 2103, `inline-formatting-context-022.xht`, was RED by 5,300 pixels.
+The first unbreakable Ahem word fit the available first-line space, but the
+paint wrapping calculation prematurely subtracted the trailing inline
+padding and border, creating an empty decorated fragment before that word.
+The first fragment now considers that trailing edge only when it actually
+ends; its `wrapped_inline_first_word_uses_space_before_trailing_edges` Skia
+raster regression and the rebuilt `inline-context-2103-trailing-edge-v1`
+reftest both pass, the latter with zero differing pixels. The current
+`inline-context-2100-2104-trailing-edge-v2` receipt is **4/5**: 2100, 2101,
+2103 and 2104 pass, while 2102 remains RED against the discrepant reference
+at 2,467 pixels. Related `line-height-2149-2188-trailing-edge-v2` is
+**40/40** and `white-space-5826-5936-trailing-edge-v2` is **111/111**. These
+focused receipts do not replace a current full-corpus run.
+
+The current-source full replay is now recorded at
+`target/wpt-all/current-inline-trailing-edge-v1-jobs6/results.json` against
+the clean pinned WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`,
+800x600, six isolated workers, failure-only PNG artifacts, and `--report-only`.
+It executed all **6,548** runnable cases: **6,348 passed, 200 failed, 0 worker
+errors**. Against the earlier 6,325/223 receipt, exactly 23 former failures
+now pass and no former pass has regressed. The remaining 200 include 43 in
+`css/CSS2/css1`, 18 each in `linebox` and `floats-clear`, 17 each in `visudet`
+and `normal-flow`, and 15 in `generated-content`. This is a dirty-source
+discovery receipt, not a clean-SHA conformance gate or a 6,548/6,548 claim.
+
+The next bounded batch targets the nine consecutive
+`css/CSS2/visudet/replaced-elements-*` reftests at indices 6111–6119. All
+nine were RED in the 6,348/200 report: the SVG boxes matched their references,
+but punctuation on the first line was incorrectly re-aligned to a later
+image row or moved 4.8px below an already correct baseline. The minimal
+`later_replaced_row_does_not_realign_earlier_punctuation` runtime test went
+RED to GREEN. Baseline projection now only adjusts text still at a replaced
+box's line top, within its half-leading, rather than every text fragment
+within a full line-height of that box. The first rebuild was only **2/9**;
+after tightening the condition, `replaced-elements-6111-6119-row-baseline-v2`
+is **9/9** with zero differing pixels. The adjacent 6090–6129 window improves
+from **29/40** in the full report to **38/40** without a new failure. On this
+newer source, `line-height-2149-2188-row-baseline-v2` is **40/40**,
+`inline-context-2100-2104-row-baseline-v2` is **4/5** with the same 2102 RED,
+and `white-space-5826-5936-row-baseline-v2` is **111/111**. The 6,348/200
+full report predates this batch; these focused results do not establish a
+new current full-suite count.
+
+The one-pixel `background-applies-to-006.xht` candidate was inspected without
+changing paint behavior. At viewport pixel `(103,54)` actual RGBA is
+`(5,5,5,255)` versus reference `(0,0,0,255)`; the adjacent table cell and its
+white `b` text begin at x=104. This supports a Skia glyph-edge bleed
+hypothesis, but does not establish the browser-correct clipping rule for
+general inline text. The related cross-directory one-pixel failures remain
+RED and need a shared paint regression before any engine change.
+
+The next focused batch corrected percentage padding in the shared paint
+snapshot. `css/CSS2/css1/c5507-padn-r-000.xht` was RED by 200 pixels:
+`45.3%` of its 106px containing block was parsed and laid out as 48.018px,
+but the leaf text painter read the unresolved percentage as zero. The
+`paint_snapshot_resolves_percentage_padding_from_containing_block` test went
+RED to GREEN; an additional test keeps the containing-block basis across an
+inline ancestor. PaintArtifact now resolves percentage padding against the
+laid-out containing block before any raster backend consumes its style, with
+no extra rectangle pass when a page has no percentage padding.
+
+On the final source, `css1-padding-1270-1295-final-v1` is **17/26**: five
+cases that failed in the older full report now pass (`c5506-padn-t-000`,
+`c5507-padn-r-000`, `c5509-padn-l-000`, `c5509-padn-l-003`, and
+`c5510-padn-000`), with no former pass regressing in that window. The
+adjacent receipts are `line-height-2149-2188-padding-final-v1` **40/40**,
+`white-space-5826-5936-padding-final-v1` **111/111**,
+`visudet-6090-6129-padding-final-v1` **38/40**, and
+`inline-2100-2104-padding-final-v1` **4/5** with the same index 2102 RED.
+The paint-artifact unit group ran **48/49**; its sole failure is the already
+recorded, unrelated `auto_positioned_subtree_paints_after_later_normal_flow_content`
+z-order baseline. An exploratory `block-in-inline-append-002` triplet at
+indices 3152-3154 remains **0/3**, with the same six overlapping glyph/border
+pixels in each; no paint-order rule was inferred from those references.
+The 6,348/200 full report predates both this and the replaced-element batch;
+these focused results do not establish a new full-suite count.
+
+The next batch addressed an inline word broken at a styled padding boundary.
+`css/CSS2/css1/c5509-ipadn-l-002.xht` was RED by 450 pixels: the lime glyph
+painted at x=83 while the reference has it at x=113, leaving the red swatch
+visible. The component trace showed plain text `"xx xx"` as one 75px flex
+item and the adjacent padded `"x"` as a second item, although no whitespace
+separates their final letters. The existing unbroken ASCII inline-word
+lowering now splits the preceding plain text at its last whitespace and
+groups its trailing word with the following inline text, preserving that
+text's authored padding. The new
+`inline_padding_does_not_break_a_word_after_a_space` DOM test went RED to
+GREEN; the WPT case now has zero differing pixels.
+
+On this source, `css1-padding-1270-1295-inline-word-v1` is **18/26**, one
+more pass and no regression against the preceding 17/26 receipt. The broader
+`css1-1200-1360-inline-word-v1` is **115/161**: six old full-report failures
+now pass, with no old pass regressing in that range. The white-space window
+remains **111/111**, line-height **40/40**, and inline-context **4/5** with
+the same index 2102 RED. The DOM module ran **522 passed, 13 failed, 1
+ignored**; temporarily removing this batch's lowering change and excluding
+its new test produced the same 13 failures (**521 passed, 13 failed, 1
+ignored**), so none of those module failures was introduced here. This is
+still a dirty-source focused receipt, not a current 6,548-case result.
+
 ## Prepare the pinned upstream checkout
 
 Keep WPT outside this repository. The runner rejects a checkout whose `HEAD`
@@ -7947,3 +13323,8915 @@ multi-reference graphs, or the full upstream selection system.
 ECMAScript language conformance belongs to a separately pinned Test262 runner.
 It is the next corpus milestone; WPT results must not be relabeled as Test262
 coverage.
+
+## 2026-09-25 CSS2 table overflow follow-up
+
+At fixed WPT `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the initial
+`s-11-1-1b-001..009` receipt was `1/9` in
+`target/wpt-targeted/css21-overflow-table-1339-1347-red-v1/results.json`.
+The current source maps table `overflow:auto|scroll` to used `visible`, clips
+`overflow:hidden` to the table grid rather than the caption-bearing wrapper,
+and carries that clip through Skia layer composition. That brought the focused
+window to `4/9` in
+`target/wpt-targeted/css21-overflow-table-1339-1347-viewport-guard-v1/results.json`.
+The next fix groups consecutive improper children of `display:table` with
+adjacent cells in one anonymous row. Both viewport-overflow cases `005/006`
+then reached zero differing pixels. The current focused result is `6/9` in
+`target/wpt-targeted/css21-overflow-table-1339-1347-anonymous-row-v1/results.json`:
+`001`, `005`-`009` pass. CSS2 anonymous-table cases are `12/12` in
+`target/wpt-targeted/css2-table-anonymous-5401-5412-after-row-v1/results.json`,
+neighboring `overflow-applies-to` cases are `13/13` in
+`target/wpt-targeted/css21-overflow-applies-6045-6057-anonymous-row-v1/results.json`,
+and the nearby 1325-1360 window moved from `23/36` to `25/36` in
+`target/wpt-targeted/css21-neighbor-1325-1360-anonymous-row-v1/results.json`.
+The CSS2 white-space 5826-5936 window was rerun with this source and remains
+`111/111` in
+`target/wpt-targeted/css21-white-space-5826-5936-after-table-row-v1/results.json`.
+The next CSS1 padding window, 1270-1295, is still `18/26` with this source in
+`target/wpt-targeted/css1-padding-1270-1295-after-table-row-v1/results.json`.
+Its eight failures are `c5507-ipadn-r-001..003`, `c5507-padn-r-001`,
+`c5509-ipadn-l-001`, `c5509-ipadn-l-003`, `c5509-padn-l-001`, and
+`c5510-ipadn-000`; inspect the inline wrapping and padding edge positions
+before changing shared line layout.
+
+Still red: `002` has 1,000 differing pixels; `003` and `004` each have 800.
+Chrome 154 at the same 800x600 viewport places the `003` black child at y=39
+while its WPT reference places it near y=61; the local renderer places it near
+y=36.2. Chrome also places `002` table content near y=54 while its reference
+uses a table near y=98. Do not shift table layout to the references without
+resolving those browser/reference discrepancies. This is focused evidence
+only; the earlier full-suite count predates these edits and is not a current
+6,548-case result. Related Rust unit checks pass. The broader
+`paint_artifact::tests` run is `49/50` due to a separate positioned paint-order
+assertion; `image_component_tests` is `153/157` with one ignored. Its inline
+anonymous-table whitespace failure reproduces unchanged when this follow-up's
+table grouping hunk is temporarily removed, so it is not introduced by that
+hunk.
+
+## 2026-09-25 CSS1 inline padding intrinsic-width follow-up
+
+The CSS1 padding window 1270-1295 moved from `18/26` to `19/26` at the same
+fixed WPT revision. An inline text component's max/min-content width counted
+its own padding twice; the inflated predecessor width incorrectly removed the
+following collapsed space's advance. A layout RED captured a 15px following
+box where 30px was required. After correcting the intrinsic content width,
+`c5510-ipadn-000` has zero differing pixels. Receipts:
+
+- `target/wpt-targeted/css1-padding-c5510-content-width-v1/results.json`: `1/1`.
+- `target/wpt-targeted/css1-padding-1270-1295-content-width-v1/results.json`: `19/26`.
+- `target/wpt-targeted/css2-white-space-5826-5936-after-content-width-v1/results.json`: `111/111`.
+- `target/wpt-targeted/css2-table-anonymous-5401-5412-after-content-width-v1/results.json`: `12/12`.
+- `target/wpt-targeted/css21-overflow-applies-6045-6057-after-content-width-v1/results.json`: `13/13`.
+- `target/wpt-targeted/css21-overflow-table-1339-1347-after-content-width-v1/results.json`: unchanged `6/9`.
+
+Seven padding cases remain red: `c5507-ipadn-r-001..003`,
+`c5507-padn-r-001`, `c5509-ipadn-l-001`, `c5509-ipadn-l-003`, and
+`c5509-padn-l-001`. `c5507-ipadn-r-003` currently paints an `HF`-like shape
+where its reference says `HI`; its inline wrapping and end-edge padding need
+separate investigation. No current-source 6,548-case full-suite result exists.
+
+## 2026-09-25 CSS1 inline fragment and collapsed-space follow-up
+
+The same fixed 1270-1295 window is now `22/26` in
+`target/wpt-targeted/css1-padding-1270-1295-contextual-text-wrap-v1/results.json`.
+The RED for `c5507-ipadn-r-001` showed a padded inline text leaf treated as
+one unbreakable flex item, leaving a 45px paragraph where two 15px lines were
+required. The DOM inline-formatting pass now exposes separate words and
+collapsible spaces, retaining horizontal padding only on the first/last
+fragment. Plain surrounding text is split only in a context with a padded
+inline; an unrestricted version regressed already-green block-padding cases
+and was not retained. A line-full check now discards an interword space after
+ordinary static text as well as after the older special cases. Focused Rust
+layout/structure checks pass.
+
+`c5507-ipadn-r-001..002` and `c5509-ipadn-l-001` joined the earlier passes.
+The remaining four failures are `c5507-ipadn-r-003` (150 pixels),
+`c5509-ipadn-l-003` (150 pixels), `c5507-padn-r-001` (5,600 pixels), and
+`c5509-padn-l-001` (7,200 pixels). The `-003` native diff is one 75px vertical
+stripe displaced horizontally by 1px. At 800x600, a fresh headless Chrome
+render of `c5507-ipadn-r-003.xht` and its reference also differs (527 pixels),
+including the `I` stripe; this is a reference-compatibility question, not
+license to offset native layout to the reference. The two block-padding
+failures are reference-page nested border/background differences and need a
+separate box-model RED.
+
+Current-source neighboring receipts:
+
+- `target/wpt-targeted/css2-white-space-5826-5936-after-contextual-wrap-v1/results.json`: `111/111`.
+- `target/wpt-targeted/css2-table-anonymous-5401-5412-after-contextual-wrap-v1/results.json`: `12/12`.
+- `target/wpt-targeted/css21-overflow-applies-6045-6057-after-contextual-wrap-v1/results.json`: `13/13`.
+- `target/wpt-targeted/css21-overflow-table-1339-1347-after-contextual-wrap-v1/results.json`: unchanged `6/9`.
+
+The current dirty source has not run the full 6,548-case suite; no full-suite
+count or release conformance is inferred from these focused receipts.
+
+## 2026-09-25 CSS1 four-value relative border width follow-up
+
+The 1270-1295 padding window is now `24/26` in
+`target/wpt-targeted/css1-padding-1270-1295-relative-border-width-used-v1/results.json`.
+The two block-padding failures (`c5507-padn-r-001` and
+`c5509-padn-l-001`) came from the test page's `border-width: 0 2.5em 0
+8.75em`: each physical side incorrectly received the first relative width
+(`2.5em` = 40px). The reference page declares the sides separately. The
+computed-style RED observed `[40, 40, 40, 40]` instead of
+`[0, 40, 0, 140]`; per-edge shorthand resolution and non-visible-side
+zeroing now pass that test and the 48 focused `w3cos-dom` border tests.
+
+Only the two `-003` inline cases remain in this window, each at 150 differing
+pixels. A local Chrome 800x600 render of the right-hand test and reference
+also differs, including the `I` stripe position. Preserve this distinction
+between an engine failure and a reference mismatch; neither is currently
+recorded as passing.
+
+Current-source neighboring receipts are `111/111` white-space in
+`target/wpt-targeted/css2-white-space-5826-5936-after-border-width-v1/results.json`,
+`12/12` anonymous table in
+`target/wpt-targeted/css2-table-anonymous-5401-5412-after-border-width-v1/results.json`,
+and `13/13` overflow-applies in
+`target/wpt-targeted/css21-overflow-applies-6045-6057-after-border-width-v1/results.json`.
+The additional CSS2 border-width 959-980 probe is `19/22` in
+`target/wpt-targeted/css2-border-width-959-980-relative-edges-v1/results.json`;
+its `border-width-011/012` inheritance failures and one pixel in
+`border-width-applies-to-012` have no same-source-before-fix comparison and
+are not attributed to this patch. No current-source 6,548-case full run has
+been performed.
+
+## 2026-09-25 CSS2 hidden-border computed-width inheritance follow-up
+
+The CSS2 border-width 959-980 window moved from `19/22` to `21/22` in
+`target/wpt-targeted/css2-border-width-959-980-computed-inherit-v1/results.json`
+at fixed WPT revision `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+`border-width-011/012` now pass: a `none` or `hidden` parent uses a 0px
+border width for layout/paint but retains the computed `2em` (32px) width
+for a visible child's explicit `border-width: inherit`. The new Rust RED
+also covers `medium` and a grandchild's per-edge inheritance; focused
+`w3cos-dom` border tests pass `49/49`.
+
+The remaining `border-width-applies-to-012` differs by one pixel at the
+inline-block black frame's inner edge. It has not been attributed to the
+inheritance fix and remains a separate failure. Current-source adjacent
+receipts are CSS1 padding `24/26` in
+`target/wpt-targeted/css1-padding-1270-1295-computed-inherit-v1/results.json`,
+CSS2 white-space `111/111` in
+`target/wpt-targeted/css2-white-space-5826-5936-computed-inherit-v1/results.json`,
+anonymous table `12/12` in
+`target/wpt-targeted/css2-table-anonymous-5401-5412-computed-inherit-v1/results.json`,
+and overflow-applies `13/13` in
+`target/wpt-targeted/css21-overflow-applies-6045-6057-computed-inherit-v1/results.json`.
+The two padding `-003` cases remain red; no current-source 6,548-case full
+suite result exists.
+After retaining 0px used width through a hidden intermediate, the rebuilt
+runner still reports border-width `21/22` and padding `24/26` in
+`target/wpt-targeted/css2-border-width-959-980-computed-inherit-final-v1/results.json`
+and `target/wpt-targeted/css1-padding-1270-1295-computed-inherit-final-v1/results.json`.
+The extra hidden-intermediate Rust regression passes separately from the
+`49/49` border-name-filtered tests.
+The per-edge relative-width variant now also retains its computed length
+while a hidden side uses 0px. The final focused border test group is `50/50`;
+the rebuilt runner remains `21/22` border-width and `24/26` padding in
+`target/wpt-targeted/css2-border-width-959-980-computed-inherit-longhand-v1/results.json`
+and `target/wpt-targeted/css1-padding-1270-1295-computed-inherit-longhand-v1/results.json`.
+
+## 2026-09-25 CSS2 981-1200 sequential probes
+
+Current-source, fixed-revision windows 981-1100 pass `120/120` across five
+25-case-or-smaller receipts under `target/wpt-targeted/css2-border-box-*`.
+The 1101-1125 window passes `24/25`; its sole failure,
+`box-display/root-canvas-001.xht`, requires a nested HTML document inside
+`<object type="text/html">`. The current renderer instead paints the fallback
+`FAIL` text over the red parent background (`25,600` differing pixels). This
+is an embedded-browsing-context capability gap, not a local border offset.
+
+The initial 1126-1150 probe passed `24/25` because it omitted the existing
+`--user-stylesheet tests/wpt/profiles/css2-userstyle.css` fixture required by
+`cascade/html-precedence-004.xht` (`flags=userstyle`). With that fixture,
+`target/wpt-targeted/css2-box-display-1126-1150-userstyle-fixture-v1/results.json`
+passes `25/25`; this is not a renderer capability gap. Cases 1151-1175 pass
+`25/25`. Cases 1176-1200 pass `23/25`; `css1/c42-ibx-ht-000.xht` differs
+by 8,150 pixels and `css1/c42-ibx-pad-000.xht` by 6,720. Both exercise
+multi-line padded/bordered inline formatting with Ahem. The `ht` actual
+image exposes red glyphs and misses reference content at the bottom of the
+viewport; these remain uncorrected, targeted layout/paint failures.
+
+Receipts: `target/wpt-targeted/css2-border-box-981-1000-red-v1/`,
+`css2-box-display-1001-1025-red-v1/`, `css2-box-display-1026-1050-red-v1/`,
+`css2-box-display-1051-1075-red-v1/`, `css2-box-display-1076-1100-red-v1/`,
+`css2-box-display-1101-1125-red-v1/`, `css2-box-display-1126-1150-red-v1/`,
+`css2-box-display-1151-1175-red-v1/`, and
+`css2-box-display-1176-1200-red-v1/`, each with `results.json`. These
+focused windows are not a current-source full-suite result.
+
+## 2026-09-25 CSS1 one-pixel raster background repetition
+
+`css1/c533-bgimage-000.xht` (case 1214) failed by 21,005 pixels because a
+1x1 lime raster repeated over an approximately 784x18px paragraph exhausted
+the 4,096-tile background layer cap after only a few rows. A Skia pixel RED
+at (127,39) in a 128x40px fixture was white instead of green. Raster layers
+whose two repeating axes reach the cap now use one repeated image shader with
+the same tile size, phase and clip. A separate 2x2 multicolor fixture checks
+phase and clipping beyond the cap; the existing smaller layers keep their
+tile path. Both new tests and the focused background test group pass `42/42`.
+
+`target/wpt-targeted/css1-c533-bgimage-repeat-shader-v1/results.json` is
+strict `1/1` with zero different pixels. The 1201-1225 window improves from
+`20/25` to `21/25` in
+`target/wpt-targeted/css2-css1-inline-1201-1225-repeat-shader-v1/results.json`;
+only the same four `c44-ln-box-000..003` cases remain red. The adjacent
+1226-1250 probe is `17/25` in
+`target/wpt-targeted/css1-background-1226-1250-repeat-shader-v1/results.json`.
+Its eight failures concern vertical alignment, indent, line height and inline
+margins; no same-source pre-fix receipt exists, so they are not classified as
+regressions. One-axis repeat beyond the tile cap and gradient layers remain
+separate, unverified boundaries. This is focused evidence only.
+
+## 2026-09-25 decorated inline fragments and collapsed spaces
+
+`css1/c42-ibx-pad-000.xht` started at 6,720 differing pixels. Headless
+layout showed its 200px block contained one 410px bordered text leaf, so
+the text had no internal flex break opportunity. A DOM structure RED captured
+that leaf. Static decorated text in an inline formatting row now exposes word
+and collapsible-space fragments, retaining horizontal border, padding and
+margin only on logical first/last fragments. This reduced the case to 300
+pixels: three 10x10 blue top-border squares at zero-width, collapsed trailing
+spaces. A Skia pixel RED reproduced painting from a zero-width intermediate
+space; paint now omits that fragment only when it has no logical horizontal
+edge. The companion right-border assertion confirms the terminal edge still
+paints. Both focused Rust tests pass.
+
+The rebuilt runner reports `c42-ibx-pad-000` at strict zero diff in
+`target/wpt-targeted/css1-c42-decorated-collapsed-space-v1/results.json`.
+The neighboring 1176-1200 window moves from `23/25` to `24/25` in
+`target/wpt-targeted/css1-inline-1176-1200-decorated-space-v1/results.json`;
+`c42-ibx-ht-000` remains at 8,150 pixels because its nested `<em>` content
+uses another fragmentation path. The 1201-1225 window remains `21/25` in
+`target/wpt-targeted/css1-inline-1201-1225-decorated-space-v1/results.json`;
+its four `c44-ln-box-000..003` cases remain red. CSS1 padding stays `24/26`
+in `target/wpt-targeted/css1-padding-1270-1295-decorated-space-v1/results.json`,
+and CSS2 white-space stays `111/111` in
+`target/wpt-targeted/css2-white-space-5826-5936-decorated-space-v1/results.json`.
+
+The wider module filters are not green: `w3cos-dom --lib inline` is `86/92`
+and `w3cos-runtime --lib inline` is `176/180`. Their failures include
+anonymous-table whitespace, inline-block ownership, generated line boxes,
+negative margins and a separate ordinary ASCII fragmentation comparison.
+This batch did not prove those failures were newly introduced or resolve
+them. No current-source 6,548-case full-suite receipt exists.
+
+For the next `c42-ibx-ht-000` repair, direct `W3COS_DUMP_HEADLESS_LAYOUT`
+on case 1199 shows the decorated `<span>` lowered as a 290px `Row` at
+index 29 inside a 200px block, with its nested `<em>` still a 260px text
+leaf at index 30 and following `y` text at index 31. The 8,150-pixel failure
+is therefore a cross-descendant inline fragmentation problem, unlike the
+single painted text leaf fixed above. Do not offset its red glyphs as a
+paint-only correction.
+
+## 2026-09-25 inline background half-leading
+
+An experimental flattening of the nested `c42-ibx-ht-000` span made its
+pixel difference worse, from 8,150 to 8,430. The experiment and its
+structure-only assertion were removed. A fresh rebuilt-runner receipt at
+`target/wpt-targeted/css1-c42-nested-inline-reverted-v1/results.json`
+confirms the prior boundary: `c42-ibx-ht-000` still differs by 8,150 pixels,
+while `c42-ibx-pad-000` remains strict zero.
+
+For `css1/c548-leadin-000.xht` (case 1234), the prior renderer painted a
+borderless inline background through the 51px line-height strut, covering
+the parent's green half-leading with red. The fixed-revision RED was 3,900
+different pixels in `target/wpt-targeted/css1-c548-leadin-red-v1/results.json`;
+the new raster regression also failed on its top half-leading pixel. Inline
+text decoration now uses the 25px font em box for its background, independent
+of long or short line-height. The rebuilt WPT receipt
+`target/wpt-targeted/css1-c548-leadin-font-em-v1/results.json` passes `1/1`
+with zero differing pixels. The focused runtime inline-background tests pass
+`3/3`.
+
+The neighboring 1226-1250 window improves from `17/25` to `18/25` in
+`target/wpt-targeted/css1-background-1226-1250-font-em-v1/results.json`;
+its other seven failures and pixel counts are unchanged. Cases 1176-1225
+remain `45/50` in `target/wpt-targeted/css1-inline-1176-1225-font-em-v1/results.json`,
+and CSS2 white-space remains `111/111` in
+`target/wpt-targeted/css2-white-space-5826-5936-font-em-v1/results.json`.
+These are focused receipts, not a current-source 6,548-case result.
+The broader `w3cos-runtime --lib render_skia::tests::` filter is `56/57`;
+`default_ascii_text_is_pixel_invariant_across_inline_fragments` remains red
+in the previously recorded ordinary ASCII fragmentation path. That failure
+was not established as a regression of this half-leading change.
+
+## 2026-09-25 invalid line-height and negative zero
+
+`css1/c548-ln-ht-002.xht` (case 1237) was RED at 9,580 different pixels:
+the final `line-height: -1em` incorrectly clamped to zero and hid the earlier
+valid `2em`, collapsing one paragraph's two line boxes. A new direct
+declaration regression failed at `0.0` instead of `2.0`. CSS line-height
+validation now discards truly negative values before they enter the inline
+declaration list, and computed-style re-resolution selects the last valid
+font/line-height declaration. Both direct and stylesheet cascade regressions
+pass. The rebuilt fixed-revision receipt
+`target/wpt-targeted/css1-c548-line-height-validity-final-v1/results.json`
+passes `1/1` with zero different pixels.
+
+The initial sign-only guard caused five CSS2 `line-height: -0<unit>` cases
+to regress: the 2110-2134 window fell to `20/25`, with 800 different pixels
+in each negative-zero case. Numeric validation now accepts finite zero,
+including negative zero, while rejecting negative magnitude. The final
+`target/wpt-targeted/css2-line-height-2110-2134-negative-zero-v1/results.json`
+passes `25/25`; `w3cos-dom --lib line_height` passes `18/18` and
+`font_shorthand` passes `19/19`.
+
+Final neighboring receipts: 1226-1250 rises from `18/25` to `19/25` in
+`target/wpt-targeted/css1-background-1226-1250-line-height-final-v1/results.json`,
+with its other six failures unchanged; CSS2 white-space remains `111/111` in
+`target/wpt-targeted/css2-white-space-5826-5936-line-height-final-v1/results.json`,
+and `font-146/148` pass `2/2` in
+`target/wpt-targeted/css2-font-negative-line-height-final-v1/results.json`.
+The two CSS1 padding `-003` cases remain at 150 pixels each: only the I
+stripe's left and right 1px columns differ. The final adjacent receipts are
+`45/50` for 1176-1225 in
+`target/wpt-targeted/css1-inline-1176-1225-line-height-final-v1/results.json`
+and `24/26` for padding 1270-1295 in
+`target/wpt-targeted/css1-padding-1270-1295-line-height-final-v1/results.json`.
+This is not a current-source 6,548-case full-suite receipt.
+
+## 2026-09-25 horizontal inline margin fragmentation
+
+The CSS1 `margin-right` cases 1243-1245 were RED at 3,150, 2,250 and
+2,340 differing pixels. A 75px parent still held `xx xx` inside a single
+text leaf with `margin-right: 60px`, so the inline could not break between
+its words. The new DOM regression was RED with one `"xx xx"` leaf; exposing
+word and space fragments while retaining the right margin only on the last
+fragment turned it GREEN. The first rebuilt runner passed `-001/-002` at
+strict zero and reduced `-003` to 1,665 pixels.
+
+The `-003` image then showed a second boundary: ordinary text after the
+margined inline remained a 450px leaf and did not share the row's break
+opportunities. An expanded sibling-fragment RED caught that, and treating
+horizontal margin as an inline formatting edge reduced `-003` to 150 pixels.
+The same final 150px pattern appears in padding-right `-003`, padding-left
+`-003`, and margin-left `-003`: only the I stripe's left and right 1px columns
+disagree. No case-specific text offset was added.
+
+The adjacent margin-left `-002` case (1256) started at 450 differing pixels.
+Its `xx<span>x</span>` has no intervening whitespace, but the span's left
+margin kept the two parts outside one unbreakable word. A focused RED now
+requires the generated inline-flex word to retain both text pieces and the
+span's margin. This passes, and the rebuilt case 1256 passes with zero
+different pixels in
+`target/wpt-targeted/css1-inline-margin-left-1256-unbroken-v1/results.json`.
+
+Final fixed-revision receipts: cases 1226-1270 are `39/45` in
+`target/wpt-targeted/css1-inline-margin-1226-1270-unbroken-final-v1/results.json`,
+up from `36/45` before this batch. The six remaining failures are
+`c544-valgn-001`, `c547-indent-001`, `c5501-mrgn-t-000`,
+`c5503-mrgn-b-000`, and the two 150px `imrgn-*-003` cases. Cases 1176-1225
+remain `45/50`, padding 1270-1295 remains `24/26`, and CSS2 white-space
+remains `111/111` in the corresponding `*-unbroken-final-v1/results.json`
+receipts. `w3cos-dom --lib inline` is `88/94`, with the same six pre-existing
+failures; `w3cos-runtime --lib inline` is `177/181`, with the same four
+previously recorded failures. The two new margin regressions pass. No
+current-source 6,548-case full-suite receipt exists.
+
+## 2026-09-26 CSS1 text-indent continuation
+
+Case 1233 (`c547-indent-001.xht`) started this continuation at 17,409
+different pixels after the prior split-leaf width correction. The reference
+page's 50%-width `::before` inline-block was followed by an indivisible text
+leaf; a focused `atomic_inline_sibling_exposes_following_text_word_breaks`
+RED established the missing word-break opportunity. Splitting only when an
+actual inline-block sibling is present reduced the case to 9,266 pixels.
+An initial broader condition included generated inline-flex word groups and
+regressed two negative-margin cases; narrowing it restored the 1226-1270
+window to its previous `39/45`.
+
+The test paragraph with explicit `<br>` still painted the `5em` indent in
+each later text leaf. A stylesheet-backed DOM RED now verifies that the first
+leaf uses the containing line width and subsequent inline fragments carry
+zero indent. Those corrections reduced the case to 3,796 pixels. Its final
+block then painted four text lines over a three-line background: Skia's
+wrapped-height measurement used the full first-line width while paint
+subtracted the percentage indent. A runtime RED checks the differing wrapped
+heights, and the measurement now uses the first-line width and distinguishes
+indent values in the retained measurement cache.
+
+The rebuilt fixed-revision receipt
+`target/wpt-targeted/css1-inline-1226-1270-indent-height-v1/results.json`
+remains `39/45`; case 1233 is down to **123 different pixels**, confined to
+glyph placement near `The first` in the final block. It is still **FAIL**, not
+pixel-complete. Adjacent receipts are `45/50` for 1176-1225,
+`24/26` for padding 1270-1295, and `111/111` for CSS2 white-space in the
+corresponding `*-indent-height-v1/results.json` reports. The two focused DOM
+regressions and the Skia wrapped-height regression pass. No current-source
+6,548-case full-suite receipt exists; other recorded red cases remain open.
+
+## 2026-09-26 CSS1 percent-indent fragment closure
+
+The final 123 differing pixels in `c547-indent-001.xht` were limited to
+first-line glyph placement. Its test page painted one percent-indented text
+leaf while the reference painted word fragments after an inline start edge.
+The focused `percent_indented_text_line_uses_first_fragment_edge` regression
+was RED before the change. A generated line-width leaf with positive percent
+`text-indent` now breaks into word fragments, transfers the indent to the
+first fragment's left padding, and clears each fragment's repeated indent.
+The scope excludes generated inline-flex word groups and unrelated line runs.
+
+The rebuilt fixed-revision case receipt
+`target/wpt-targeted/css1-c547-percent-fragment-v1/results.json` passes
+`1/1` with **zero different pixels**. Adjacent
+`target/wpt-targeted/inline-neighbor-percent-fragment-v1/results.json`
+improves cases 1226-1270 from `39/45` to `40/45`, with five remaining
+failures: `c544-valgn-001`, `c5501-mrgn-t-000`, the 150px
+`c5502-imrgn-r-003` and `c5504-imrgn-l-003`, and `c5503-mrgn-b-000`.
+The other focused windows remain `45/50` for 1176-1225, `24/26` for
+padding 1270-1295, and `111/111` for CSS2 white-space in their
+`*-percent-fragment-v1/results.json` receipts. No current-source
+6,548-case full-suite receipt exists; the remaining failures are not closed.
+
+## 2026-09-26 table-cell auto text width
+
+The CSS1 `c5501-mrgn-t-000.xht` and `c5503-mrgn-b-000.xht` reftests were
+RED at 15,950 and 18,300 differing pixels. Their 100px table-cell content
+boxes held 120px single-line block text leaves instead of wrapping each
+`xxxxxxx xxxx` run to two 10px lines. The resulting line-height and
+background geometry diverged from the reference; the margin values were
+already resolved correctly. In the Taffy leaf-width path, an auto-width text
+block now treats a table cell like another containing block, alongside block
+and grid parents, so its automatic minimum no longer forces max-content
+width past the cell content box.
+
+The rebuilt fixed-revision receipt
+`target/wpt-targeted/css1-inline-table-cell-auto-final-v1/results.json`
+passes `42/45`, up from `40/45`; both named margin cases now have zero
+different pixels. Its three remaining failures are `c544-valgn-001` (2,370)
+and the two 150px `imrgn-*-003` cases. The focused runtime `table_cell`
+filter passes `6/6`. Neighboring receipts remain `12/12` for table anonymous
+objects, `15/15` for table height/vertical alignment, `111/111` for CSS2
+white-space, `45/50` for preceding CSS1 inline, and `24/26` for padding.
+Overflow-table remains `6/9`.
+
+The broader inline-table window is `9/12` on the final code. To test whether
+this was a regression, the table-cell condition was temporarily removed and
+the same current source rebuilt: `inline-table-before-cell-fix-v1` was also
+`9/12`, with the same failures, while `css1-inline-before-cell-fix-v1`
+returned to `40/45`. Restoring the condition gave the final `42/45` and
+`9/12` receipts. The inline-table failures (`inline-table-height-001` and
+`inline-table-zorder-004/005`) are current baseline red items, not closed or
+attributed to this change. There is still no current-source 6,548-case
+full-suite receipt.
+
+## 2026-09-26 next CSS1 inline RED triage
+
+The unchanged runner and pinned WPT checkout report `c42-ibx-ht-000` (case
+1199) at 7,950 differing pixels in
+`target/wpt-targeted/css1-c42-current-red-v1/results.json`. This is a fresh
+current-source result, not a pass or an attribution for the earlier 8,150-pixel
+receipt. The actual image keeps the nested red `<em>` on the first line inside
+an overwide decorated `<span>`; the reference has several short lines. The
+existing component path only fragments direct text children of an inline
+formatting row, so the nested inline boundary still needs a shared line-box
+repair and a minimum failing regression before changing layout.
+
+Cases 1245-1257 report 11/13 in
+`target/wpt-targeted/css1-inline-margin-current-red-v1/results.json`; only
+`c5502-imrgn-r-003` and `c5504-imrgn-l-003` fail, each by 150 pixels. Their
+actual and reference images differ only at the final 15x75px `I`: its actual
+left edge is x=143, reference x=142. Direct worker layout on the right-margin
+case places the actual Ahem fragment at x=143; the reference places a serif
+space of width 4px after the preceding image, followed by the image's 25px
+left padding. Whether the one-pixel mismatch is the inline layout or the
+reference font metric remains unproven; no compensating pixel offset was
+applied. The four `c44-ln-box-000..003` failures and the 6,548-case gate remain
+open.
+
+## 2026-09-26 direct inline text and table separator spaces
+
+The existing `inline_anonymous_table_run_preserves_collapsed_spaces_at_its_edges`
+DOM test was RED: `a bc d` lowered as `abcd`. `render_child_ids` treated
+inline elements with direct `Element::set_text_content` as empty because its
+whitespace-only predicate checked only child nodes; such elements have no
+child nodes, so the empty `all` check succeeded even when their own text was
+non-whitespace. That dropped the spaces before and after an anonymous
+table-cell run. The predicate now checks the element's direct text as well.
+The focused test passes, and the `w3cos-dom --lib inline` filter moves from
+90/96 to 91/96; its other five failures remain open.
+
+The rebuilt runner at the same pinned WPT revision reports 12/12 anonymous
+table cases (5401-5412), 111/111 CSS2 white-space cases (5826-5936),
+45/50 CSS1 inline cases (1176-1225), and 42/45 neighboring CSS1 cases
+(1226-1270) in the four `*-direct-text-v1/results.json` receipts. Both CSS1
+failure lists and pixel counts match the pre-fix receipts, including
+`c42-ibx-ht-000` at 7,950 pixels. This is a DOM regression repair with
+focused pixel non-regression evidence, not closure of those CSS1 failures or
+the 6,548-case gate.
+
+## 2026-09-26 generated empty attr table cell
+
+`before-after-table-whitespace-001.xht` (case 1879) was RED by 469 pixels:
+the row with `::before { content: attr(missing) }` put `Cell0` in the first
+column, while the reference has an empty first cell. Content resolution already
+produced `Text("")`, but pseudo lowering discarded it because it contained no
+nonempty text or image. Only an empty resolved item list is now omitted;
+an explicit empty text item keeps its zero-length pseudo box and participates
+in anonymous table-cell fixup. The new direct pseudo regression was RED then
+GREEN. The older DOM assertion that equated no line box with no pseudo box was
+updated to check the empty principal box; Chromium reports computed
+`content: ""` for a missing `attr()` while an otherwise empty host stays 0px
+high.
+
+The rebuilt runner reports strict zero pixels for case 1879 at
+`target/wpt-targeted/generated-table-missing-attr-v1/results.json`.
+Generated-content cases 1850-1899 are 45/50 in
+`target/wpt-targeted/generated-content-1850-1899-missing-attr-v1/results.json`;
+the five remaining failures are display types, dynamic restyle, float,
+positioned and table parts. The adjacent CSS2 white-space 5826-5936 and
+anonymous table 5401-5412 receipts are 111/111 and 12/12. The DOM `generated`
+filter is 33/35; its two other assertions fail outside the changed empty-item
+branch. This is one WPT failure repaired, not a current-source full-suite
+count.
+
+The separate table-overflow 1339-1347 probe is 6/9. For cases 1342 and 1343
+(`s-11-1-1b-003/004`), current Chromium positions the negative-margin child
+at y=35 relative to a y=50 table; their shared reference page instead puts
+the black cell at y=60 after a caption. W3COS places the test child at y=36.2
+relative to a y=51.2 table. Those strict reftest failures cannot be assigned
+to W3COS table overflow from the current images alone; no compensating layout
+offset or corpus edit was made.
+
+## 2026-09-26 inherited pseudo border style
+
+`before-after-dynamic-restyle-001.xht` (case 1871) was RED by 650 pixels:
+after `onload` adds a green 2px border to the body, `body::before` with
+`border: inherit` painted `Before` without its inherited frame. Pseudo
+lowering copied border widths and colors but left every border style at
+`none`, so the inherited border could not paint. The new DOM regression was
+RED with pseudo styles `[none; 4]` versus parent `[solid; 4]`; shorthand
+inheritance now copies the computed border styles and widths together with
+the existing edge widths and colors.
+
+The rebuilt runner reports case 1871 at strict zero pixels in
+`target/wpt-targeted/generated-dynamic-border-inherit-v1/results.json`.
+The generated-content window 1850-1899 improves from 45/50 to 46/50 in
+`target/wpt-targeted/generated-content-1850-1899-border-inherit-v1/results.json`;
+the four remaining failures and their pixel counts are unchanged. Focused
+`w3cos-dom --lib border` passes 51/51, CSS2 border-width 959-980 stays 21/22
+with its pre-existing one-pixel edge failure, and CSS2 white-space 5826-5936
+stays 111/111. This remains a focused dirty-source receipt, not the final
+6,548-case gate.
+
+## 2026-09-26 nested generated inline baseline
+
+`before-after-positioned-001.xht` (case 1874) was RED by 888 pixels: in
+the last block, the outer `Begin` and `End` text sat 25.6px below `Inner`.
+The DOM lowerer converted the authored block's anonymous inline formatting
+context to a `Flex` component. Its baseline alignment then used a nested,
+relatively positioned pseudo-element's 32px image to align the outer text.
+For an inline child containing a relative fragment, the outer component now
+retains its authored `Block` display, allowing the layout inline-row path to
+keep the outer font baseline. A DOM regression protects this lowering rule.
+
+The rebuilt runner reports case 1874 at strict zero pixels in
+`target/wpt-targeted/generated-positioned-narrow-v1/results.json`.
+Generated-content cases 1850-1899 are 47/50 in
+`target/wpt-targeted/generated-content-1850-1899-positioned-v1/results.json`;
+the remaining failures are display types (12,786 pixels), floated (7,546),
+and table parts (11,448). CSS2 white-space 5826-5936 remains 111/111 in
+`target/wpt-targeted/css2-white-space-positioned-v1/results.json`, and CSS1
+inline 1176-1225 remains 45/50 with its prior five failures in
+`target/wpt-targeted/css1-inline-positioned-v1/results.json`. An earlier
+overbroad `Block` retention trial regressed two `white-space: pre` cases by
+12,000 pixels each; narrowing the condition restored both. This is focused
+dirty-source evidence, not a current-source 6,548-case full-suite receipt.
+
+The `w3cos-dom --lib generated` filter is 34/36: the new case passes, while
+`generated_pseudo_content_lowers_strings_and_attributes_in_tree_order` and
+`hidden_elements_and_ungenerated_pseudos_do_not_modify_counters` remain the
+same two existing failures. For the next floated case (1872), direct test and
+reference layout dumps agree on the right float box and image positions, but
+the generated right-float text is 4.8px above the reference's authored span
+text; the case remains 7,546 pixels different. The cause is not yet assigned
+to pseudo lowering or inline baseline projection, so no paint offset was made.
+
+## 2026-09-26 floated generated inline image baseline
+
+`before-after-floated-001.xht` (case 1872) was RED by 7,546 pixels. A
+minimal runtime test also failed: identical left/right floated inline boxes
+with a 32px image placed their text 14.4px and 19.2px below the image top.
+Chrome measures equal text-to-image offsets for both float sides. The DOM
+lowerer had turned an authored left floated inline box into `Flex` while the
+right counterpart stayed blockified. An image-bearing floated line now keeps
+its `Block` outer box; floated generated multi-item pseudo content marks its
+inner anonymous inline row for the existing baseline projection. The runtime RED
+test and the preceding generated-inline DOM test both pass.
+
+The rebuilt runner reports case 1872 at strict zero pixels in
+`target/wpt-targeted/generated-content-1850-1899-float-final-source-v1/results.json`.
+The final-source generated-content window 1850-1899 is 48/50 in
+the same receipt;
+display types (12,786 pixels) and table parts (11,448) remain. CSS2
+white-space 5826-5936 stays 111/111 and CSS1 inline 1176-1225 stays 45/50
+in the adjacent `*-float-final-source-v1` receipts. CSS1 float 1320-1323 is 2/4:
+`c5525-fltblck-000` differs by 850 pixels and `c5525-fltmrgn-000` by
+28,908. A same-source control with only the new floated-Block condition
+disabled produced the identical 2/4 failure list and pixel counts; the old
+4/4 receipt is not a current-source baseline. An overbroad inner-row marker
+temporarily increased the two remaining generated-content diffs to 19,442
+and 33,048 pixels; restricting it to floated pseudo content restored the
+original pixel counts. No current-source 6,548-case
+full-suite receipt exists, and this dirty-source batch is not full closure.
+
+## 2026-09-26 generated table display anonymous-cell grouping
+
+WPT remains pinned to clean `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+Case 1869 (`before-after-display-types-001.xht`) was RED by 12,786 pixels.
+The reference page's authored `display:table` span lowered consecutive text,
+image, and text into three anonymous cells; its third cell landed at x=795 with
+zero width, while Chrome keeps the run in one cell. A minimal DOM test first
+failed with three cells, then passed after grouping consecutive improper table
+children into one anonymous cell while retaining adjacent proper cells.
+
+The rebuilt final-source runner reports case 1869 at strict zero pixels and
+generated-content 1850-1899 at 49/50 in
+`target/wpt-targeted/generated-final-anonymous-cell-final-v1/results.json`.
+The sole remaining generated case is table parts (1878), unchanged at 11,448
+pixels. CSS2 white-space 5826-5936 is 111/111, CSS1 inline 1176-1225 is
+45/50 with the same five failures and pixel counts, and CSS1 float 1320-1323
+is 2/4 with the same two failures and pixel counts; corresponding receipts are
+`target/wpt-targeted/css2-white-space-final-anonymous-cell-final-v1/`,
+`target/wpt-targeted/css1-inline-final-anonymous-cell-final-v1/`, and
+`target/wpt-targeted/css1-float-final-anonymous-cell-final-v1/`. Adjacent CSS2
+tables 5230-5279 is 48/50 in
+`target/wpt-targeted/css2-tables-5230-5279-anonymous-cell-final-v1/`;
+`border-collapse-offset-001/002` remain open without a preceding same-window
+baseline. A generated-inline text fragmentation trial worsened case 1878 to
+12,711 pixels and was withdrawn. The wider DOM `table_` filter is 46/48 and
+`image_component_tests` is 166/169 with one ignored; their failures are not
+claimed as resolved or attributed to this patch. No current-source 6,548-case
+full-suite receipt exists. This remains a dirty, uncommitted local batch.
+
+## 2026-09-26 generated table-cell word-break follow-up
+
+Case 1878 (`before-after-table-parts-001.xht`) was RED by 11,448 pixels on
+the preceding final source. Intrinsic-width tracing found that a generated
+table-cell's `1 + image + multiword text` anonymous line had min-content
+108.42px, versus 68.42px for the reference's authored inline run. Its text
+was one unsplit leaf despite normal white-space. A minimal DOM test first
+observed `["1", "Before gen varyheight"]`; marking only generated table-cell
+anonymous rows as wrappable inline formatting contexts changed it to separate
+word and space fragments. The test now passes.
+
+The rebuilt final-source generated-content window 1850-1899 is 49/50 in
+`target/wpt-targeted/generated-cell-final-v1/results.json`: case 1869 stays
+at zero pixels, and case 1878 falls to 1,599 pixels. The remainder is mainly
+right-column text and a subpixel table-column origin difference. Chrome's raw
+test/reference pair itself differs by 651 pixels at 800x600, so browser
+evidence is used to diagnose box geometry, not to waive W3COS's strict WPT
+failure. A broader generated block-in-table-row fragmentation trial reduced
+the right column's min-content too far and worsened 1878 to 12,711 pixels; it
+and its temporary diagnostic instrumentation were removed.
+
+Final-source adjacent receipts: CSS2 white-space 5826-5936 is 111/111 in
+`target/wpt-targeted/white-space-cell-final-v1/`; CSS1 inline 1176-1225 is
+45/50 in `target/wpt-targeted/inline-cell-final-v1/`; CSS1 float 1320-1323 is
+2/4 in `target/wpt-targeted/float-cell-final-v1/`; CSS2 tables 5230-5279 is
+48/50 in `target/wpt-targeted/tables-cell-final-v1/`. Their failed case lists
+and pixel counts match the preceding local receipts. `git diff --check` passes.
+No current-source 6,548-case full-suite receipt exists; this dirty worktree
+remains uncommitted and unpublished.
+
+## 2026-09-26 generated inline min-content and low-disk WPT reporting
+
+An inline line containing text immediately before a replaced image now includes
+both contributions in its min-content width. The minimal runtime regression was
+RED at 66px instead of 104.416px and passed after the correction. With the
+rebuilt WPT runner, case 1878 (`before-after-table-parts-001.xht`) moved from
+1,599 differing pixels to zero; the 1850-1899 generated-content window passed
+50/50 in `target/wpt-targeted/generated-inline-min-v1/results.json`.
+
+The runner now accepts `--no-reftest-artifacts` for disk-constrained full-suite
+runs. It preserves each reftest's status and pixel-difference metrics in
+`results.json` while omitting actual, expected and diff PNGs, including for
+failures. This is mutually exclusive with `--failure-artifacts-only`; focused
+failure diagnosis should still use the PNG-producing mode. A failed-frame unit
+test checks that metrics remain and no PNG is written. An independent 1850-1899
+replay with the new option passed 50/50 and wrote only a 24 KiB `results.json`
+at `target/wpt-targeted/generated-inline-min-report-only-v1/`.
+
+Current-source adjacent receipts remain 111/111 for CSS2 white-space in
+`target/wpt-targeted/white-space-inline-min-v1/`, 45/50 for CSS1 inline in
+`target/wpt-targeted/css1-inline-inline-min-v1/`, 2/4 for CSS1 float in
+`target/wpt-targeted/css1-float-inline-min-v1/`, and 48/50 for CSS2 tables in
+`target/wpt-targeted/css2-tables-inline-min-v1/`. Their failed cases are not
+claimed as fixed. This dirty worktree remains uncommitted and unpublished.
+
+The first complete current-source run used the pinned clean WPT revision
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, 800x600 viewport, eight
+isolated workers and `--no-reftest-artifacts`. Its structured receipt is
+`target/wpt-targeted/full-current-no-png-8jobs-v1/results.json`: **6,368 passed,
+180 failed, 6,548 total**. All 180 failures have `fail` status; none are worker
+errors. The receipt directory is 5.3 MiB. Case 1878 passes. The existing table
+border-collapse-offset failures remain at 831 and 1,846 differing pixels
+(indices 5256 and 5257). These 180 failures are the open current-source WPT
+scope, not a claim that the whole upstream WPT repository was executed.
+
+## 2026-09-26 collapsed cell padding and top caption offsets
+
+On the preceding full-run source, indices 5256/5257 were independently RED
+at 831/1,846 differing pixels in
+`target/wpt-targeted/border-collapse-offset-red-v1/results.json`. A DOM layout
+regression first reproduced the shared geometry error: the collapsed table was
+38px high where its separate-border reference was 40px. With a top caption,
+the caption and grid were also inset by the collapsed top border's 2px half.
+
+Definite-height collapsed cells now retain their UA vertical padding instead
+of absorbing it into the separate-border normalization. Top captions project
+outside the resolved collapsed grid edge using the existing border-conflict
+width. The layout regression passes; the rebuilt runner reports both WPT cases
+at zero differing pixels in
+`target/wpt-targeted/border-collapse-offset-padding-caption-v1/results.json`.
+The adjacent 5230-5279 table window passed 50/50; generated content 1850-1899
+passed 50/50; CSS2 white-space 5826-5936 passed 111/111. Their receipts carry
+the `border-offset-v1` suffix under `target/wpt-targeted/`.
+
+The complete CSS2 tables directory, indices 5230-5595, passed 363/366 in
+`target/wpt-targeted/css2-tables-5230-5595-border-offset-v1/results.json`.
+Comparison with the preceding 6,548-case report found exactly two status
+changes, both failures to passes at 5256/5257. The other three table failures
+remain open. Focused runtime `collapsed_` tests passed 47/47. This is not yet a
+new 6,548-case full-suite receipt; the previously reported 180-failure count
+belongs to the source before this change.
+
+The next CSS2 tables triage leaves three failures in indices 5230-5595:
+`column-visibility-004.xht` (5297) and the DOM-driven anonymous-table cases
+5500/5501. Case 5297 currently paints no green square where the reference
+paints a 96px square; its failure is isolated in
+`target/wpt-targeted/column-visibility-red-v1/results.json` with PNG evidence.
+These remain RED and were not changed by the collapsed-border fix.
+
+After the collapsed-cell/caption change, the rebuilt source was rerun across
+all 6,548 cases with the same pinned WPT revision, viewport, eight workers and
+`--no-reftest-artifacts`. The current authoritative receipt is
+`target/wpt-targeted/full-current-no-png-8jobs-v2/results.json`: **6,370
+passed, 178 failed, 6,548 total**. Comparison with v1 shows exactly two
+failure-to-pass transitions, 5256 and 5257; no other status changed. Case 5297
+and anonymous-table cases 5500/5501 remain RED. The prior 6,368/180 receipt is
+historical for the pre-fix source and is retained only for this comparison.
+
+Post-v2 verification remains green for the focused implementation surface:
+`cargo test -p w3cos-runtime collapsed_ --lib` passed 47/47,
+`cargo test -p w3cos-wpt-runner --no-default-features` passed 18/18, and
+`git diff --check` passed. The current full-suite receipt is still 178
+failures, so no conformance-complete claim is made.
+
+### 2026-09-26: clearance regression and withdrawn inline-background experiment
+
+Local continuation only; base `bc6063b068923eab2695ea3a087dd21653af0efb`,
+existing dirty changes retained. No commit, push, or parent repository edit.
+WPT revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+
+- `full-current-after-three-fixes-v1/results.json`: actual full run,
+  6,383 passed / 165 failed. This supersedes the merged 6,384/164 prediction;
+  `margin-collapse-027` was the extra regression.
+- Its RED receipt is `focused-margin-collapse-027-red-v1/results.json`.
+  Preserve the parent's own bottom margin when positioning the following
+  sibling after clearance, collapsing it with that sibling's top margin.
+  `focused-margin-collapse-1648-1652-after-fix-v1/results.json` is 5/5;
+  `focused-margin-collapse-clear-1668-1674-after-fix-v1/results.json` is 2/7,
+  retaining zero-pixel PASS for 014 and the existing five failures.
+- An experiment expanded inline text backgrounds for `line-height: normal`.
+  The focused box-generation and table-display cases became 4/4, and
+  `focused-box-display-1000-1139-normal-line-v1/results.json` was 137/140
+  with no new failures in that window. This was insufficient coverage.
+- `full-current-after-normal-inline-background-v1/results.json` is the
+  full experiment run: 6,346 passed / 202 failed. It exposed regressions
+  in inline splits, box/linebox, and content-height cases, plus worker
+  errors that must not be silently counted as rendering passes.
+- The background experiment was withdrawn completely. The clearance fix
+  remains. The rebuilt `target/wpt/debug/w3cos-wpt` passed 3/3 in
+  `normal-background-withdrawal-3205-3207/results.json`. No full run after
+  withdrawal has been performed; neither full receipt describes current
+  source exactly. Do not claim the four experimental fixes remain fixed.
+
+All receipts above are under `target/wpt-targeted/`. Current runner rebuild:
+`CARGO_TARGET_DIR=target/wpt cargo build -p w3cos-wpt-runner --bin w3cos-wpt`.
+Use `target/wpt/debug/w3cos-wpt`, not the older top-level runner copy.
+Focused runtime suites also expose unresolved failures: paint_artifact 50/51
+(`auto_positioned_subtree_paints_after_later_normal_flow_content`) and
+render_skia 56/57 (`default_ascii_text_is_pixel_invariant_across_inline_fragments`).
+The latter has no decorated background and does not enter the changed branch;
+its failure was reproduced individually. Neither suite is reported green.
+`git diff --check` passed; parent file-size check retains six existing
+out-of-scope violations. Product Agent knowledge is unaffected by these
+internal CSS rendering changes. Continue from focused RED cases, including
+the inline-split regression constraints; no zero-failure claim is made.
+
+### 2026-09-26: anonymous inline text baseline under vertical-align
+
+`anonymous-inline-inherit-001.html` was RED in
+`target/wpt-targeted/anonymous-inline-inherit-2076-red/results.json` (0/1,
+86 differing pixels). The authored outer inline has `vertical-align: top`,
+but its anonymous text child must retain its initial baseline alignment.
+When that inline is lowered to a flex row, its `align_self` still positions
+the principal box while its internal `align_items` now uses `Baseline`.
+The direct DOM structure regression
+`top_aligned_inline_keeps_anonymous_text_on_its_internal_baseline` passes.
+
+After rebuilding `target/wpt/debug/w3cos-wpt`, the focused receipt
+`anonymous-inline-inherit-2076-after-baseline/results.json` is 1/1 with
+zero differing pixels. The neighboring linebox window
+`linebox-neighbors-2060-2109-after-baseline/results.json` is 34/50; exactly
+this case changed status, with no old pass regressing. The vertical-align
+window `vertical-align-2258-2269-after-baseline/results.json` is 5/12,
+unchanged from the prior full receipt. The independent split-inline window
+`split-inline-neighbors-3190-3234-after-baseline/results.json` is 45/45.
+The six `inline-formatting-context-002` through `007` cases remain RED in
+`inline-formatting-context-2091-2096-after-baseline/results.json` (0/6).
+Their line-background-height mismatch must not be addressed by the withdrawn
+global normal-line-height experiment. No full suite after this edit has run.
+
+### 2026-09-26: inherited border currentColor keyword
+
+`border-color-011/012` were RED in
+`target/wpt-targeted/border-color-inherit-605-606-red/results.json` (0/2).
+The initial `border-color: currentColor` remains a computed keyword even when
+the parent has `border: none`; `inherit` must carry the keyword to the child
+and resolve against that child's `color`. `document.rs` now propagates the
+parent's per-side `border_current_color` bit for inherited border colors,
+while explicitly authored concrete colors still inherit as color values.
+The direct DOM regression was RED before the fix and GREEN afterward;
+`cargo test -p w3cos-dom border_color --lib` passed 4/4. The separate
+`border: inherit` regression passed after updating its obsolete fixed-black
+expectation to the inherited keyword. The concrete per-edge inheritance test
+now declares its red top edge explicitly and remains green.
+
+Fresh runner `target/wpt/debug/w3cos-wpt` passed 2/2 at
+`border-color-inherit-605-606-green/results.json`. The wider
+`border-inherit-neighbors-580-644/results.json` was 62/65: only the two
+existing one-pixel table-part failures and `border-conflict-style-107`
+remain; no old pass regressed. The whole `w3cos-dom --lib` suite ran at
+542 passed / 13 failed before the obsolete `border: inherit` assertion was
+updated; the other 12 failures were not worked on here. No full 6,548-case
+run after this change has been performed, so remaining full-suite count is
+unverified. Parent file-size check still reports six out-of-scope violations.
+
+### 2026-09-26: CSS1 mixed pre/normal line continuation
+
+Pinned case 1328, `css/CSS2/css1/c562-white-sp-000.xht`, was RED on the
+current runner at `focused-1328-current-red-v1/results.json`: 225 differing
+pixels, one uncovered 15px Ahem glyph in the final line. The DOM kept both
+text fragments, but layout placed the normal inline after the preceding
+`white-space: pre` fragment's maximum line width (120px), instead of after
+its final line's 90px advance. A layout regression recorded the wrong 128px
+coordinate against the required 98px coordinate before the fix.
+
+`project_inline_continuation_after_wrapped_row` now uses that final preserved
+line's measured advance when a fitting normal/pre-line text fragment follows
+on the next line. The DOM and layout regressions pass. The rebuilt runner's
+`focused-1328-pre-continuation-fix-v1/results.json` is 1/1 with zero pixel
+difference. `css1-1280-1343-pre-continuation-v1/results.json` is 53/64;
+against `full-current-after-three-fixes-v1` in that exact window, only case
+1328 changed from fail to pass and the prior 11 failures remain.
+`css2-white-space-pre-continuation-v1/results.json` remains 111/111. No
+current-source full 6,548-case run has been performed; the remaining total
+is unverified. No commit, push, or parent repository code change was made.
+
+The next focused RED is `focused-1327-list-red-v1/results.json`:
+`c561-list-displ-000.xht` differs by 517 pixels because its authored
+`display: list-item` is on a `div`, while marker insertion currently requires
+the literal `li` tag and supports only bullet types. A general decimal
+list-item counter, including non-`li` elements, is needed; no marker patch
+was made in this batch. `c5509-ipadn-l-003.xht` was also reconfirmed RED by
+150 pixels in `focused-1288-padding-red-v1/results.json`; the earlier
+same-viewport Chrome/reference 1px stripe mismatch remains unresolved, so
+no native offset was added to match that reference alone.
+
+### 2026-09-26: full snapshot, list-item counters, and shorthand markers
+
+The frozen runner completed `full-current-after-pre-continuation-v1/results.json`
+before the list edits: 6,375 pass, 162 assertion/pixel fail, and 11 worker
+errors among 6,548 cases. This is a pre-list snapshot, not a current-source
+full-suite result. The six `NodeList-static-length-getter-tampered*` cases
+were rerun in `full-errors-rerun-6404-6409-v1/results.json`; all six still
+end in document-load timeouts. They are worker errors, not rendering fails.
+
+`focused-1327-list-red-v1` had 517 differing pixels because an authored
+`display: list-item` on a `div` lacked its decimal inside marker. The HTML
+UA now gives `li` list-item display, the implicit `list-item` counter advances
+for all list-item boxes, and explicit increments retain precedence. The DOM
+regressions cover non-`li` numbering and a negative counter reset. After a
+runner rebuild, `focused-1327-1328-list-after-edit-v1` passed 2/2, with zero
+pixel difference for both cases. The final shorthand build also passed 2/2 in
+`list-1327-1328-shorthand-fix-v1/results.json`.
+
+The first `list-2340-2375-after-edit-v1` window passed 35/36: case 2354
+became pixel-exact, but case 2359 regressed by 38 pixels. Its stylesheet used
+`list-style: decimal inside`, while marker construction only read longhands.
+The new shorthand regression failed before the fix and passed afterward.
+`list-2354-2359-shorthand-fix-v1` passed 6/6 and the rebuilt runner's
+`list-2340-2375-shorthand-fix-v1` passed 36/36. Compared with the pre-list
+full snapshot, only case 2354 changed status in this 36-case window, from
+fail to pass. `cargo test -p w3cos-dom inside_list_marker --lib` passed 2/2;
+`cargo test -p w3cos-dom list_item_counter --lib` passed 1/1.
+
+The current runner still fails `first-line-pseudo-015/016` at 1,600 pixels
+each in `first-line-4922-4923-current-red-v1`; this is separate from list
+markers and remains open. `inherit-computed-001` retains the documented CSS
+Color 3/currentColor reference conflict above. No post-list 6,548-case run
+has been made. `git diff --check` passes; the parent `pnpm files:size:check`
+still reports six pre-existing out-of-scope violations. No commit, push, or
+parent repository code change was made.
+
+### 2026-09-26: full snapshot after inline alignment and list-item box follow-up
+
+`full-current-after-inline-align-v1/results.json` is a pinned-revision,
+800x600, 6,548-case receipt from before the final list-item used-display
+change: 6,379 pass, 159 assertion/pixel fail, 10 worker errors. Six worker
+errors at 6404-6409 are repeatable document-load timeouts and are not pixel
+failures. Relative to the earlier 6,375/162/11 full receipt, 1327, 2354,
+4922, and 4923 turned green, while 1250 and 1278 regressed. A profile-free
+rerun still failed 1250, so the regression was not merely the CSS2 user
+stylesheet setting.
+
+For `li`, marker construction now precedes lowering the used principal box
+from `list-item` to `block`; computed display and list-item counter behavior
+stay intact. The rebuilt runner passed 1250 and 1278 separately, 1327-1328
+at 2/2, 2354-2359 at 6/6, and
+`list-2340-2375-used-block-v1/results.json` at 36/36. The latter window was
+also 36/36 in the pre-fix full receipt and serves as a regression guard. A
+simplified markerless-alignment unit test passed even before the fix and was
+removed; the WPT 1250/1278 RED/GREEN receipts are the relevant evidence.
+No full 6,548-case run has been made after the used-display change, so a
+current-source total and zero-failure claim remain open.
+
+### 2026-09-26: list UA spacing, inherited markers, and counter scopes
+
+Case 1329 (`c563-list-type-000.xht`) was RED at 3,010 differing pixels.
+`ul/ol` lacked the HTML UA's 1em vertical margins and 2.5em start padding;
+the new UA-default unit test failed on zero margins before the change and
+passed after it. The rebuilt runner made 1329 pixel-exact. The CSS1
+1280-1343 window passed 55/64, with 1329 the only status change versus the
+pre-edit full receipt; cases 1250 and 1278 remained 1/1 each. The CSS2 lists
+2273-2428 window was 153/156, with only 2377 additionally turning green.
+
+Case 2297 (`counter-increment-054.xht`) was RED at 349 pixels because
+`counter-increment: inherit` was treated as a counter name rather than the
+parent's computed declaration. A direct parent/child counter test failed at
+5 instead of 10, then passed after CSS-wide counter value resolution. The
+counter window `counters-2273-2340-inherit-v1/results.json` passed 68/68;
+2297 was its only status change versus the preceding list receipt.
+
+Cases 2396/2397 (`list-style-position-023/024`) were RED at 60,263/60,192
+pixels: nested `ol` items with `inside` position inherited no decimal marker.
+A DOM marker test failed before list-style inheritance and passed after it;
+the WPT differences fell to 121/318 pixels. A separate nested-list counter
+test failed with inner value 2 instead of 1. The default `ol/ul` counter
+scope reset made that test pass and case 2396 pixel-exact. Case 2397 still
+differs by 280 pixels in the RTL rendering of `1.` versus `.1`.
+
+The post-reset CSS2 lists window
+`css2-lists-2273-2428-nested-reset-v1/results.json` passed 154/156. Against
+the pre-counter list receipt, 2297 and 2396 turned green, but 2413
+(`list-style-position-applies-to-017.html`) changed from pass to fail by 54
+pixels. Marker generation exposed a real float-sibling positioning defect:
+the actual dot is at x=8 while the reference dot is displaced by the 96px
+float. The prior green result rendered neither dot and was a false match.
+Do not suppress the marker to regain a green status. No full 6,548-case run
+has been made after these edits; the current-source total remains unknown.
+
+The 2413 follow-up reproduced the layout failure with a preceding paragraph,
+then a 96px float, then an inside list marker. The existing float-text line
+resolver accepted only a block preceded exclusively by floats; it ignored a
+trailing float group if any earlier ordinary sibling existed. The direct
+geometry/paint-band test failed with no resolved flow, then passed when the
+resolver selected the immediately preceding float suffix. The rebuilt runner
+passed 2413 at zero differing pixels in
+`focused-2413-trailing-floats-v1/results.json`. Four `w3cos-runtime float_text`
+unit tests passed; the 1515-1530 float window stayed 14/16 with no status
+changes versus the pre-edit full receipt. The current CSS2 lists window
+`css2-lists-2273-2428-trailing-floats-v1/results.json` passed **155/156**;
+2413 alone changed from fail to pass versus the post-reset receipt. Case
+2397 remains RED at 280 pixels. This is still a focused receipt, not a new
+6,548-case total or a zero-failure claim.
+
+### 2026-09-26: current CSS2 white-space confirmation
+
+The current dirty source and rebuilt `target/wpt/debug/w3cos-wpt` were rerun
+against WPT revision `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0` for the complete
+CSS2 white-space window (cases 5826-5936, 800x600, the standard CSS2 user
+stylesheet). `target/wpt-targeted/css2-white-space-5826-5936-current-v2/results.json`
+is **111/111**, with zero failed cases and zero differing pixels. This closes
+the previously documented 110/111 historical checkpoint for the current source;
+it does not alter the remaining full-suite failures or imply a zero-failure
+6,548-case result.
+
+### 2026-09-26: `units-002` inline replaced baseline
+
+With the pinned WPT revision and the rebuilt `target/wpt/wpt/w3cos-wpt`
+(`--profile wpt`), `css/CSS2/values/units-002.xht` changed from 20,000
+differing pixels to pixel-exact. The 200px image had been placed 50px below
+the adjacent 250px Ahem text. The inline baseline projection now moves a
+lower, overlapping replaced image to the text baseline once per image, even
+when text appears on both sides. The final `values` window (cases 6068-6083)
+is 16/16 and the nearby `vertical-align` window (2191-2210) is 20/20:
+`target/wpt-targeted/units-neighbor-final-20260926/results.json` and
+`target/wpt-targeted/vertical-align-final-20260926/results.json`. These are
+focused receipts; the 6,548-case total has not been rerun after this change.
+
+### 2026-09-27: escaped newline in generated content
+
+`css/CSS2/syntax/escaped-newline-001.xht` was RED at 800 differing pixels:
+its entire `::before` text was missing. The CSS source parser treated the
+newline after a six-digit `\00000a` escape as a bad string and discarded the
+declaration. Rule-block and declaration scanning now consume the complete
+hex escape plus its optional trailing whitespace, leaving the authored value
+for the existing CSS unescaper. The equivalent compiler test went RED (zero
+rules) then GREEN; `esm_css::tests` passed 38/38, including plain-newline
+rejection and hex-escape CRLF consumption. Rebuilt `--profile wpt`
+runner receipt `target/wpt-targeted/syntax-5120-5135-escaped-fix-20260927/results.json`
+is 16/16, all zero-difference; case 5130 is the status change. This is a
+focused result, not a new full-suite total.
+
+Case 5110 (`declarations-009.xht`) remains RED at 1,066 pixels: the `#c`
+paragraph is red because the parser recovers a trailing `color: red` after an
+invalid in-declaration `@media` block without a semicolon. A pre-existing
+compiler test currently expects that recovery, so this needs a separate
+CSS2/error-recovery decision and regression before changing the shared parser.
+
+### 2026-09-27: in-declaration media recovery
+
+The compiler regression for `declarations-009.xht` was changed to expect only
+`color: green` for `#c` and confirmed RED: the parser still produced a second
+`color: red`. A declaration segment beginning with the complete `@media`
+keyword is now discarded through its next top-level semicolon. Unknown block
+at-rules keep their balanced-block recovery, including the newly tested
+`@mediax` spelling. `esm_css::tests` passed 38/38. The rebuilt `--profile wpt`
+runner passed cases 5105-5120 at 16/16 and 5185-5192 at 8/8, with zero
+pixel differences for both `declarations-009.xht` and
+`malformed-decl-block-001.xht`. Receipts:
+`target/wpt-targeted/syntax-5105-5120-media-recovery-20260927/results.json`
+and `target/wpt-targeted/syntax-5185-5192-media-recovery-20260927/results.json`.
+This resolves the pinned WPT reference, not a claim of Chromium parity:
+the earlier read-only Chromium 141 comparison showed `#c` red. The final
+6,548-case suite has not been rerun after this fix.
+
+### 2026-09-27: current full-suite baseline and top-aligned replaced image
+
+An initial diagnostic run of the pinned 6,548-case manifest used eight
+workers, 800x600, `--report-only`, and no retained reftest PNGs, but omitted
+the required `--user-stylesheet tests/wpt/profiles/css2-userstyle.css`.
+`target/wpt-all/full-current-20260927/results.json` records **6,395 passed,
+153 failed, 0 worker errors** under that incomplete configuration; it is not
+the standard-profile conformance baseline. The CSS2 white-space window was
+independently **111/111** in
+`target/wpt-targeted/white-space-5826-5936-current-20260927/results.json`.
+The apparent `html-precedence-004` regression was caused by the omitted
+profile: its strict single-case rerun with the prescribed stylesheet passed
+at zero pixels. `c43-rpl-ibx-000` and `table-anonymous-objects-211` were
+separately reproduced as pixel failures.
+
+The `c43-rpl-ibx-000` RED differed by 120 pixels: its 15px Ahem span was
+4px below an adjacent replaced image despite `vertical-align: top`. A new
+HTML-to-layout regression reproduced image y=15.4 and text y=20.2. The
+replaced-image baseline projection moved the image before the top-alignment
+pass, which still used its pre-shift rectangle. Re-reading the image rectangle
+and aligning the smaller top-aligned text in either direction made both the
+component and parsed-HTML regressions green. The rebuilt WPT runner now
+passes case 1202 at zero pixels in
+`target/wpt-targeted/c43-rpl-ibx-000-stale-image-rect-20260927/results.json`.
+The neighboring 1198-1206 window is 4/9: this is its only status change
+against the full receipt, and the other five failures retain their pixel
+counts. `units-002` remains pixel-exact and CSS2 white-space remains 111/111
+in their `after-top-align-20260927` receipts.
+
+The subsequent full run used the prescribed CSS2 user stylesheet and the
+source after the top-alignment fix. Its
+`target/wpt-all/full-current-profile-20260927/results.json` reports
+**6,397 passed, 151 failed, 0 worker errors**, with 6,548 distinct paths and
+no white-space failures. Compared by path with the 2026-09-26 full receipt,
+`declarations-009`, `escaped-newline-001`, and `units-002` became green;
+ten former worker errors became passes, one became a pixel failure, and
+`table-anonymous-objects-211` is the only former pass now failing (300
+pixels). This is a complete current-source diagnostic result, not zero-failure
+acceptance or a clean candidate SHA. The table case is the next focused RED.
+
+### 2026-09-27: anonymous table-cell inline style inheritance
+
+Case 5552 (`table-anonymous-objects-211.xht`) was reproduced with the pinned
+WPT and prescribed user stylesheet at 300 differing pixels. Headless layout
+showed its generated second-row cell used an internal Flex row with
+`white-space: normal`; the explicit-cell reference inherited `pre`. The first
+two images consequently started at y=74.6 rather than y=69.8. Extending the
+existing `anonymous_replaced_cell_run_has_no_phantom_columns` regression
+confirmed RED (`Normal` versus `Pre`). The generated inline row now inherits
+its parent text style, retains the internal inline-formatting marker, and
+uses the same width and white-space wrap mode as an authored table cell.
+The regression and `w3cos-dom` anonymous test group passed 35/35. Rebuilt
+WPT case 5552 is pixel-exact in
+`target/wpt-targeted/table-anonymous-211-inherited-line-20260927/results.json`;
+the 5497-5560 table window passed 64/64 and the 5826-5936 white-space
+window passed 111/111 with the standard profile. The 6,397/151 full-suite
+receipt above predates this repair; no new full-suite total is claimed.
+
+### 2026-09-27: RTL ASCII paragraph shaping
+
+Local continuation remains on detached `bc6063b` with the existing dirty
+changes preserved; this batch changes only runtime text shaping and its
+regression in `crates/w3cos-runtime/src/text_layout.rs`, plus this record.
+The pinned WPT checkout is clean at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+
+Case 2397 (`list-style-position-024.xht`) had a strict 280-pixel RED in
+`target/wpt-targeted/list-style-position-024-red-20260927/results.json`.
+The font shaping helper incorrectly returned every ASCII string unchanged,
+including RTL paragraphs: the minimal regression
+`ascii_numbers_and_punctuation_respect_rtl_paragraph_direction` failed with
+`"1."` instead of `".1"`. ASCII is now a fast path only for LTR paragraphs;
+RTL uses the existing Unicode bidi algorithm, not a marker-specific rewrite.
+The same test also covers multiple digits, trailing whitespace, LTR, and
+an ASCII sentence with final punctuation. Runtime text-layout tests passed
+34/34 using `cargo test -p w3cos-runtime --lib --no-default-features
+--features dynamic-js,skia text_layout::tests::`.
+
+`cargo build -p w3cos-wpt-runner --bin w3cos-wpt` produced the tested
+`target/debug/w3cos-wpt` (SHA-256
+`61280e10858f5cd5e336089f2d9fb83e04f9506e3ff8e790275da476ec6e0aad`).
+With `--user-stylesheet tests/wpt/profiles/css2-userstyle.css`, case 2397
+has zero differing pixels and zero maximum difference in
+`target/wpt-targeted/list-style-position-024-ascii-rtl-v1-20260927/results.json`.
+Both actual and reference had used the defective helper, so the repair
+corrects the reference rendering as well as the test rendering.
+The same binary and profile passed the CSS2 lists 2273-2428 window 156/156
+(`css2-lists-ascii-rtl-20260927/results.json`) and white-space 5826-5936
+111/111 (`css2-white-space-ascii-rtl-20260927/results.json`), both under
+`target/wpt-targeted/`. Bidi-text 373-477 remains 103/105 in
+`target/wpt-targeted/css2-bidi-ascii-rtl-20260927/results.json`; every
+result object matches the previous full receipt, including the existing
+`bidi-003` (997 pixels) and `bidi-004` (1,806 pixels) failures.
+The next focused target is `bidi-003`: the current diff isolates the final
+decorated runs, with an approximately one-space displacement. Its earlier
+boundary-whitespace repair history above must be preserved when reducing
+the new RED; this observation is not yet a root-cause or repair claim.
+`git diff --check` passed. The parent repository's required
+`pnpm files:size:check` reported six pre-existing violations outside W3COS;
+no parent source or baseline was changed. No commit or push was made.
+The optimized runner rebuild (`CARGO_TARGET_DIR=target/wpt cargo build
+--profile wpt -p w3cos-wpt-runner --bin w3cos-wpt`) completed in 4m58s;
+`target/wpt/wpt/w3cos-wpt` independently passed case 2397 at zero pixels in
+`target/wpt-targeted/list-style-position-024-ascii-rtl-opt-20260927/results.json`.
+The previous full-suite receipt predates this repair; no new global total
+or full acceptance is claimed. Product Agent knowledge is unaffected:
+this changes generic text rendering, not product concepts or authority.
+
+### 2026-09-27: generated-content principal display boundary
+
+The `bidi-003` follow-up localized the native difference to the second
+paragraph's `jjj kkk lll` run: width 77.671875 versus reference 81.671875.
+An independent Chromium 141.0.7390.37 check of the unchanged local XHTML
+at 800x600/DPR1 also did not match its reference. Without injected styles,
+its second navy fragment has width 85.671875 versus reference 81.671875;
+the final orange fragment starts at x=383.359375 versus 379.359375.
+Diagnostic browser PNGs are under
+`target/wpt-targeted/css2-bidi-ascii-rtl-20260927/chrome-bidi-003*.png`
+(those PNGs also inject the profile as author CSS, not user-origin CSS).
+This does not prove native/browser equivalence or authorize a waiver;
+`bidi-003/004` remain failing. No bidi or whitespace rule was altered in
+this batch merely to force a reference match.
+
+The next strict RED, case 2029 (`content-counter-004.xht`), had 550 differing
+pixels in `target/wpt-targeted/content-counter-004-red-20260927/results.json`.
+Its twelve `span { display:block }` generated counters incorrectly shared
+one horizontal line. The generated-inline text merge checked the HTML tag
+and undecorated styles but not the principal display; it replaced a block
+host with its inline pseudo text. The merge now requires `display:inline`,
+preserving block, inline-block, and flex principal boxes. The exact DOM
+test `generated_content_preserves_non_inline_principal_boxes` was RED
+(`Inline` versus `Block`) and now passes all three display variants.
+
+`cargo test -p w3cos-dom --lib document::image_component_tests::generated
+-- --test-threads=1` passes 8/8. The broader `generated` group is 39/41;
+temporarily removing only this batch's one-line guard reproduced the same
+two existing failures plus the new regression (38/41). The guard was
+restored. Existing failures are
+`generated_pseudo_content_lowers_strings_and_attributes_in_tree_order` and
+`hidden_elements_and_ungenerated_pseudos_do_not_modify_counters`; the group
+is not claimed wholly green.
+
+The rebuilt debug runner SHA-256 is
+`0b7d40f63b6e5e6ed3797341242cd3d34a4fa07ee0b16ab021002964441fd92d`.
+Using the clean pinned WPT and prescribed user stylesheet, case 2029 is
+pixel-exact in
+`target/wpt-targeted/content-counter-004-block-host-20260927/results.json`.
+This remains local uncommitted work on detached `bc6063b`; no main-repo
+source, WPT fixtures, tolerances, commit, or push was changed. The required
+parent file-size check still reports six existing out-of-scope violations.
+Product Agent knowledge is unaffected by this internal display-boundary fix.
+
+Generated-content coverage is 225 distinct paths across three disjoint
+receipts under `target/wpt-targeted/`: `generated-content-block-host-20260927`
+(1846-2017, 167/172), `generated-counters-block-host-20260927`
+(2018-2048, 28/31), and `generated-quotes-block-host-20260927`
+(2049-2070, 19/22). Total: 214 passed / 11 failed. The runner's full-suite
+merge command correctly refused this partial 225-path set (expects 6,548);
+no combined full-suite receipt was produced. The counts above were checked
+by reading the three JSON reports and verifying 225 unique paths.
+
+Against the prior full receipt, only case 2029 turns green and case 1878
+(`before-after-table-parts-001.xht`) changes from pass to fail (26,900 pixels).
+The latter is not caused by this batch: the preceding optimized runner,
+built before the principal-display guard, independently reproduces the
+same failure in `table-parts-1878-before-block-host-20260927/results.json`.
+It is the next regression-investigation target, including the earlier
+anonymous-table-cell row changes; causality for those changes is not yet
+proven. Do not report the old full-suite pass as its current state.
+White-space remains 111/111 in `white-space-block-host-20260927/results.json`.
+All runs retain the standard user stylesheet and strict zero tolerances.
+`git diff --check` passes; the global current-source total remains unverified.
+
+### 2026-09-27: generated mixed-content inline formatting parity
+
+Case 1878 remains the starting strict RED (26,900 pixels), using the prior
+batch's `table-parts-1878-before-block-host-20260927/results.json` receipt.
+Anonymous table-cell content already honored inherited white-space, but
+generated mixed text/image content in table groups still used an unmarked
+nowrap flex row. Generated inline pseudos had a second, similarly nowrap
+row path. These differences changed min-content contributions and column
+distribution versus the authored-reference inline formatting contexts.
+
+The generated mixed-content rows now carry the existing IFC marker and
+derive wrapping from white-space, including the inline pseudo path. Actual
+`pre`/`nowrap` rows remain unwrapped. The new DOM regression was first RED
+(`normal`: NoWrap instead of Wrap), then extended to both table-row-group
+and inline display with normal/pre. Final name:
+`generated_mixed_content_row_obeys_white_space`.
+
+Fixing only the inner block/table-group row was insufficient: receipt
+`table-parts-1878-generated-ifc-20260927/results.json` still had 27,973
+differing pixels. After aligning the inline pseudo path as well, case 1878
+has zero differing pixels in
+`target/wpt-targeted/table-parts-1878-inline-ifc-20260927/results.json`.
+No fixture, tolerance, font, or pixel-specific branch changed.
+
+DOM generated image-component tests pass 9/9, anonymous tests pass 35/35.
+The broader generated group is 40/42, retaining the same two previously
+isolated failures documented above. The tested debug runner SHA-256 is
+`ae9fe2050880b6ad8deb9829049d59ba5cf7c380d2784f2d1df3220dcc4584c3`.
+The pinned WPT remains clean. This batch changes only `document.rs` and
+this evidence record; existing dirty changes remain preserved. The parent
+file-size check still reports six out-of-scope violations. No commit/push
+or product Agent knowledge update is implied by this internal renderer fix.
+
+Final scoped receipts under `target/wpt-targeted/`:
+`generated-content-unified-ifc-20260927/results.json` is 215/225,
+`anonymous-tables-unified-ifc-20260927/results.json` is 64/64, and
+`white-space-unified-ifc-20260927/results.json` is 111/111. Comparing all
+225 generated-content paths with the preceding three disjoint receipts
+changes only case 1878 from 26,900 pixels to zero; no other status or pixel
+count changed. `git diff --check` passes. No new global total is claimed.
+
+Next focused evidence: case 1966 (`content-085.xht`) does render the expected
+generated text, so document-root filtering is not its cause. Its native
+layout dump has an empty `attr(http-equiv)` result in the first meta box,
+lowered as an InlineBlock empty Text at height 19.2. That empty line puts
+the following `PASS PASS` block at y=19.2 instead of zero. The raw diagnostic
+frame is `generated-content-unified-ifc-20260927/content-085-layout.bin`;
+the actual/reference PNG pair is in the same directory. Investigate empty
+generated-inline line participation without breaking intentional decorated
+empty boxes or the existing empty-string shrink-to-fit regression.
+
+### 2026-09-27: empty generated inline line participation
+
+The empty generated-content branch no longer promotes an inline pseudo to
+InlineBlock. It retains an empty non-replaced inline Box, allowing the
+existing inline participation rules to distinguish zero-width decoration
+from horizontal edges. This removes the invented 19.2px line in case 1966
+without suppressing an intentional horizontal border.
+
+The runtime regression
+`empty_generated_inline_only_establishes_a_line_with_horizontal_edges`
+was RED with an unexpected 19.2px parent height, then GREEN for color-only,
+background-only, and border-left variants. The initial private NodeId field
+compile error was corrected with `as_u32()` and is not the semantic RED.
+Runtime `empty_inline` tests pass 5/5. Two DOM tests previously asserting
+the incorrect InlineBlock representation now assert empty-inline border
+preservation and no painted area for a background-only empty inline.
+DOM `generated` is 40/42, retaining the same two established failures:
+`generated_pseudo_content_lowers_strings_and_attributes_in_tree_order` and
+`hidden_elements_and_ungenerated_pseudos_do_not_modify_counters`.
+
+The debug runner builds successfully; SHA-256:
+`1a974fd0788e6d45e8caa7a34ae8831dce94ea059e3a21b6e8efc38f752d1930`.
+The clean WPT checkout remains
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. All runs use
+`tests/wpt/profiles/css2-userstyle.css` and the existing discovered suite.
+Receipts under `target/wpt-targeted/`:
+
+- `content-085-empty-inline-20260927/results.json`: case 1966 is pixel-exact.
+- `generated-content-empty-inline-20260927/results.json`: 218/225 pass.
+  Against `generated-content-unified-ifc-20260927`, only content-085,
+  content-096, and content-131 change: respectively 5,848, 4,136, and 5,848
+  differing pixels become zero, with zero allowed tolerance in each case.
+  Every other result is unchanged; no passing match has nonzero pixels.
+- `white-space-empty-inline-20260927/results.json`: 111/111 pass, all zero
+  pixels and every result identical to `white-space-unified-ifc-20260927`.
+
+Remaining generated-content failures and differing pixels: content-172
+(1,106), content-173 (3,815), content-175 (304), content-177 (22,875),
+quotes-035 (1,847), quotes-035a (1,847), and quotes-036 (1,840).
+Correction to earlier blanket strict-tolerance wording: the existing
+discovery code supplies content-177 with a legacy 55-channel/5,000-pixel
+allowance. This batch did not add or change that allowance, and the case
+still fails. Do not count a future fuzzy pass as pixel-exact acceptance.
+The three newly fixed cases and all passing matches above are exact.
+
+`git diff --check` passes. The parent file-size check still reports six
+existing out-of-scope violations. Work remains local on detached bc6063b;
+no fixtures, main-repo sources/pin, commit, or push changed. Product Agent
+knowledge is unaffected by this internal renderer correction. No current
+full-suite total is inferred from these scoped receipts. Next investigate
+content-175's inline background geometry and the remaining generated text
+and quote cases using their current RED receipts.
+
+### 2026-09-27: preserved newline inline content-box height
+
+Case 2020, content-175, starts RED at 304 differing pixels in the preceding
+empty-inline receipt. Actual/reference native layout dumps have identical
+text positions and inline width (152.41406px), but the actual inline height
+is 17.600006px versus 16px. The forced-break projection included the line
+strut's bottom half-leading in a passive non-replaced inline content box.
+That also selected different background painting geometry.
+
+`project_forced_break_lines` now uses descendant content bounds for a
+passive inline; containing blocks and atomic/float boxes retain their line
+strut calculation. The new regression
+`trailing_preserved_newline_keeps_inline_content_box_height` was RED at
+17.6px, then GREEN at both 1.2 and 2.0 line heights, also asserting that the
+containing block retains its strut. Runtime `forced_break` passes 19/19;
+`pre_newline` passes 2/2. The debug runner rebuild succeeds.
+
+Runner SHA-256:
+`2c70a1b083c8c544518eb0e6bbf4e195d664faeede4ebf0d9dc93dd38d718be9`.
+Same clean pinned WPT and prescribed user stylesheet; receipts under
+`target/wpt-targeted/`:
+
+- `content-175-inline-leading-20260927/results.json`: 1/1, zero pixels
+  with zero tolerance.
+- `generated-tail-inline-leading-20260927/results.json`: indices 2017-2070,
+  48/54. Path-by-path comparison to the preceding 225-case receipt changes
+  only content-175 from fail to pass. The six remaining failures are
+  unchanged. This is a 54-case rerun, not a new complete 225-case receipt.
+- `white-space-inline-leading-20260927/results.json`: 111/111, every result
+  identical to the previous receipt and all zero pixels.
+
+Only layout.rs and this record are changed in this batch. Existing dirty
+work is preserved; no commit, push, fixture change, or main-repo pin update.
+The parent size gate retains its six unrelated violations. Product Agent
+knowledge is unaffected. No current global total is claimed.
+
+Next diagnostic: quotes-035 native text is a sequence of default quote
+characters, not the authored string. `esm_css.rs` currently validates
+declaration priority with `rfind('!')` without token/quote context, so
+authored quote pairs containing `"FAIL!"` can be rejected as malformed
+priority suffixes. Add a focused parser RED before changing this logic;
+the quote fixtures themselves remain untouched.
+
+### 2026-09-27: CSS priority markers respect value token boundaries
+
+The parser regression
+`priority_markers_inside_css_values_are_not_declaration_priorities` was
+RED: a quotes declaration containing `"FAIL!" "!!!" "" " work"` produced
+no rule. `declaration_priority_is_valid` now reuses `split_top_level` rather
+than `rfind`, preserving bangs inside strings, URLs and nested functions.
+It accepts a single actual important suffix and rejects duplicate or
+malformed top-level suffixes. No new parser or dependency was introduced.
+The full `esm_css::tests` group passes 39/39; runner build succeeds.
+
+Runner SHA-256:
+`fefd3e38eae67b34de774f7025c59694069b8588eca98b5ac1d7638d93e19d02`.
+Using the same clean pinned WPT and user stylesheet, receipts under
+`target/wpt-targeted/` are:
+
+- `quotes-priority-tokens-20260927/results.json`: 21/22. quotes-035 and
+  quotes-035a each change from 1,847 pixels to zero with zero tolerance;
+  all passing matches are exact. quotes-036 remains FAIL and changes from
+  1,840 to 2,559 pixels; all other quote results are unchanged.
+- `important-priority-tokens-20260927/results.json`: case 1187, 1/1,
+  zero pixels and zero tolerance.
+- `generated-content-priority-tokens-20260927/results.json`: indices
+  2017-2026, 7/10, identical to the preceding inline-leading receipt.
+
+The quotes-036 screenshot now contains authored text but has unwanted
+breaks and omits generated text on br. The br lowering in document.rs
+returns a forced-break marker before the regular generated-content path.
+This is the next investigation point, not a verified fix; do not claim
+quotes-036 green or classify its increased pixel count as unchanged.
+
+Only esm_css.rs and this record change in this batch. `git diff --check`
+passes; the parent size gate still reports six unrelated violations.
+No WPT fixture/tolerance, main-repo source/pin, commit or push changed.
+Product Agent knowledge is unaffected by this generic parser correction.
+White-space was not rerun for this parser-only batch; its prior 111/111
+receipt remains prior-version evidence. No new full-suite total is claimed.
+
+### 2026-09-27: explicit inherited pseudo text properties
+
+The content-172 native dump proves the host is white-space Pre while its
+generated text is Normal despite authored `white-space: inherit`.
+`generated_pseudo_component` treated any property declaration as blocking
+inheritance. Its inherited-text predicate now inspects the winning value
+and lets inherit/unset inherit from the originating element.
+
+`generated_pseudo_explicit_inheritance_preserves_white_space` was RED
+(Normal instead of Pre), then GREEN for inherit, unset and explicit normal.
+DOM `generated` tests are 41/43, retaining the two previously documented
+failures. Runner build and `git diff --check` pass. Runner SHA-256:
+`9a2d708adbaec571c1e8982caf48afe63451c35a0414c56dd9e532bdcc832588`.
+Same pinned WPT and prescribed user stylesheet:
+`target/wpt-targeted/generated-pseudo-inherit-20260927/results.json`
+is 8/10 (indices 2017-2026); content-172 alone changes from 1,106 pixels
+to zero with zero tolerance. All nine other results are unchanged.
+`target/wpt-targeted/white-space-pseudo-inherit-20260927/results.json`
+is 111/111 with zero pixels, identical path-by-path to the inline-leading
+white-space receipt.
+
+Browser diagnostic, not a waiver: Chromium 141.0.7390.37 also renders the
+unaltered quotes-036 fixture on multiple lines, unlike quotes-035-ref.
+Raw file-URL screenshots without an injected stylesheet are retained at
+`target/wpt-targeted/quotes-priority-tokens-20260927/chrome-quotes-036.png`
+and `chrome-quotes-035-ref.png`. This does not establish native/browser
+parity (their generated text also differs), but rules out blindly deleting
+br breaks to satisfy that reference. quotes-036 remains FAIL.
+
+Next content-173 diagnostic is retained as
+`target/wpt-targeted/generated-pseudo-inherit-20260927/content-173-layout.bin`.
+The generated multiline text is Pre, but its block height is 16px versus
+192px for the authored control; cell middle alignment shifts it down by
+88px. Investigate the forced-break projection's treatment of a multiline
+text leaf ending in a preserved newline before altering table alignment.
+
+This batch changes document.rs and this evidence record only; unrelated
+dirty work is preserved. No fixtures, tolerances, main-repo sources/pin,
+commit or push changed. The parent size gate retains six unrelated
+violations. Product Agent knowledge is unaffected. No global total is
+inferred from the focused results.
+
+### 2026-09-27: preserved multiline text retains its line struts
+
+content-173 is RED at 3,815 pixels in the pseudo-inherit receipt. The new
+runtime regression `preserved_multiline_text_ending_in_break_keeps_all_line_struts`
+reproduces the loss with `A\nB\n`: the block is 16px rather than 32px high.
+The forced-break projection treated every inline text leaf as one line,
+including already-shaped multiline text ending in a preserved newline.
+
+Its inline text-height helper now uses the existing whitespace line
+splitting and `used_text_line_count` rules to recover the occupied struts,
+excluding only the final synthetic empty fragment. The preserved-break
+branch uses that occupied height too. No table alignment special case was
+added. The regression passes Pre, PreWrap and PreLine with one or two
+terminal breaks. Runtime `forced_break` passes 19/19, `pre_newline` 2/2,
+and `trailing_preserved_newline` 1/1. Runner build succeeds.
+
+Runner SHA-256:
+`721b0bccdd33cde423fc02f3399bc1bc33643f500409f2042e4e2b3fbca551bb`.
+With the same clean pinned WPT and prescribed user stylesheet,
+`target/wpt-targeted/generated-multiline-strut-20260927/results.json`
+is 9/10 (indices 2017-2026). Only content-173 changes: 3,815 pixels become
+zero with zero tolerance; all other results match the preceding receipt.
+
+This batch changes layout.rs and this evidence record only. Existing dirty
+work is preserved; no WPT fixture/tolerance, main-repo source/pin, commit
+or push changed. Parent size gate still has six unrelated violations.
+Product Agent knowledge is unaffected by the internal layout correction.
+No current full-suite count is claimed. content-177 remains failed, and
+quotes-036 retains the native/reference/browser diagnostic boundary above.
+
+`white-space-multiline-strut-20260927/results.json` is 110/111. The only
+failure is `white-space-mixed-001.xht` (77,618 pixels); all other 110 cases
+are unchanged and exact. Its actual first generated pattern is painted
+correctly, but the following paragraph starts 18px too low because the
+projected multiline flex/inline block height is counted once in the child
+and once again in the parent block-flow adjustment. This is the next
+white-space-specific RED. The receipt is retained; no tolerance was changed.
+
+### 2026-09-27: avoid recounting flex-backed multiline struts
+
+The preceding `white-space-mixed-001` RED is 77,618 differing pixels, with
+its source/reference pattern correct but later content shifted. In the
+forced-break projection, a Flex-backed inline formatting context already
+contains its multiline height; recomputing the full text line count at this
+level duplicates that height in the parent flow adjustment. The projection
+now applies the existing multiline text count only outside that Flex
+container, while preserving it for block/table-cell contexts such as
+content-173. The focused `white-space-mixed-001` and `content-173` reruns
+both pass with zero pixels. Runtime `preserved_multiline_text_ending` and
+`forced_break` tests pass (1/1 and 19/19 respectively).
+
+Runner SHA-256 is
+`b52a79109da77c8a2bca62544ca56f598d2c01e8d8a1e7e0c6974bb74998080d`.
+The WPT checkout is clean at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`; both scoped runs use the
+required CSS2 user stylesheet. Receipts under `target/wpt-targeted/`:
+
+- `white-space-parent-count-20260927/results.json`: 111/111, all match
+  reftests pixel-exact. Against `white-space-multiline-strut-20260927`,
+  only `white-space-mixed-001` changes from 77,618 pixels to zero.
+- `generated-parent-count-20260927/results.json`: 223/225, with all passing
+  matches pixel-exact. Remaining FAILs are content-177 (22,875 pixels;
+  existing 55-channel/5,000-pixel legacy allowance is still exceeded) and
+  quotes-036 (2,559 pixels; zero tolerance). No current full-suite count
+  follows from these two scoped runs.
+
+`git diff --check` passes. This batch changes only layout.rs and this
+record, preserving all unrelated dirty work. No fixture, tolerance,
+main-repo pin/source, commit, or push changed. Product Agent knowledge is
+unaffected by the internal layout correction.
+
+### 2026-09-27: absolute text shrink-to-fit uses available width
+
+content-177 is RED at 22,875 pixels in the preceding full generated-content
+window. Its native layout assigned each positioned text leaf 873.164px,
+although the containing block offers 784px and the min-content width is
+738.984px. `positioned_inline_text_shrink_fits_to_available_line_width`
+reproduced that exact width (and one-line height) before the fix.
+
+The text leaf's auto-width branch now uses min-content as the lower bound
+and the existing shrink-to-fit helper for its assigned width when it is
+breakable and absolutely/fixed positioned. The existing wrapped-text
+second pass supplies its multiline height. Explicit widths and nowrap
+text keep their existing path. The new regression is GREEN; the three
+`absolute_inline` runtime tests pass. WPT case 2021 now reports PASS at
+4,817 differing pixels / max channel 55, within its pre-existing
+55-channel/5,000-pixel legacy allowance. This is **not pixel-exact** and
+remains an explicit pixel residual; the allowance was neither added nor
+changed here.
+
+Runner SHA-256:
+`f1c6a7e180c1dafc65b97719b7ea2d152c11e48f300809a84767d7906e4d3731`.
+Same clean pinned WPT and CSS2 user stylesheet, receipts under
+`target/wpt-targeted/`:
+
+- `content-177-absolute-shrink-20260927/results.json`: 1/1 under the
+  existing allowance, 4,817 nonzero pixels.
+- `generated-absolute-shrink-20260927/results.json`: 224/225. Only
+  content-177 changes versus `generated-parent-count-20260927`; the
+  remaining FAIL is quotes-036 (2,559 pixels). The other 223 passing
+  matches are zero-pixel exact.
+- `white-space-absolute-shrink-20260927/results.json`: 111/111, all
+  zero-pixel exact.
+- `absolute-positioning-shrink-20260927/results.json`: 132/133 on CSS2
+  positioning indices 3938-4070. Its only FAIL is the existing
+  `absolute-non-replaced-width-022` (3,840 pixels); every result matches
+  the earlier full receipt path-by-path, and passing matches are exact.
+
+`git diff --check` passes. This batch changes layout.rs and this record
+only; user dirty work is preserved. Parent size gate retains six unrelated
+violations. No fixture, tolerance, main-repo pin/source, commit or push
+changed. Product Agent knowledge is unaffected by this platform layout
+correction. The current full 6,548-case result still requires a new run.
+
+### 2026-09-27: full pinned-suite diagnostic after white-space and shrink-to-fit fixes
+
+The optimized runner was rebuilt from the dirty W3COS checkout before the
+suite and then held fixed at SHA-256
+`1c8861a371896b646edc2ed39a04731f4dfcff8c465384e5c10ae9c782456ce3`.
+The WPT checkout was clean at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. Command:
+
+```bash
+target/wpt/w3cos-wpt --wpt-root ../wpt \
+  --suite target/wpt-all/discovered-suite.json \
+  --artifacts target/wpt-all/full-current-after-shrink-20260927 \
+  --user-stylesheet tests/wpt/profiles/css2-userstyle.css \
+  --jobs 8 --failure-artifacts-only --report-only
+```
+
+`results.json` contains 6,548 unique paths at 800x600: **6,407 pass,
+141 fail, 0 error/timeout**. Against `full-current-profile-20260927`,
+12 paths become PASS (ten generated-content cases plus
+`list-style-position-024` and `table-anonymous-objects-211`) while two
+become FAIL: `s-11-1-1b-005` (2,792 pixels) and
+`inline-table-height-001` (3,007 pixels). CSS2 white-space remains 111/111.
+The 141 failures are diagnostic current-source status, not clean-SHA
+conformance acceptance. `content-177` is PASS only under its existing
+5,000-pixel allowance and still differs by 4,817 pixels. Nine other PASS
+reftests have nonzero pixel differences, including mismatch references;
+their status must not be conflated with pixel-exact matches.
+
+Both new failures reproduce alone with the same profile in
+`target/wpt-targeted/regression-errata-20260927/results.json` and
+`target/wpt-targeted/regression-inline-table-20260927/results.json`.
+The inline-table actual image grows the green box to two text lines while
+its reference retains one; the errata case constrains absolute paragraph
+text to the 20px table cell. A diagnostic removal of direct table-text
+trailing half-leading left `inline-table-height-001` at 3,007 pixels
+(`inline-table-height-no-trailing-leading-20260927/results.json`), so that
+experiment was restored. No fixture or tolerance changed. `git diff --check`
+passes; the parent `pnpm files:size:check` retains six unrelated violations.
+Product Agent knowledge is unaffected by this internal renderer diagnosis.
+
+### 2026-09-27: full pinned-suite diagnostic after font shorthand validation
+
+The optimized WPT runner was rebuilt after invalid CSS `font` shorthand
+declarations were made atomic. With WPT pinned at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the 800x600 full suite completed
+6,548/6,548: **6,412 passed, 136 failed, 0 errors/timeouts**. Compared with
+`full-current-after-rtl-ch-20260927`, only
+`css/CSS2/css1/c71-fwd-parsing-003.xht` changed from fail to pass (5,963
+pixels to zero); no passing path regressed. CSS2 white-space remains free of
+failures. Receipt:
+`target/wpt-all/full-current-after-font-validation-20260927/results.json`.
+
+This is a dirty-source diagnostic, not a clean-SHA conformance claim. No WPT
+fixture, tolerance, main-repo source/pin, commit, or push changed.
+
+### 2026-09-27: preserve Ahem PDF boundary space in wrapped bidi text
+
+The next RED was `css/CSS2/bidi-text/bidi-004.xht` at 1,806 differing pixels.
+The source unit contains an explicit PDF followed by a collapsed whitespace
+boundary; the whitespace was removed before visual bidi fragment construction,
+shortening the final decorated run. Ahem-only synthetic boundary whitespace is
+now inserted while building the wrapped bidi logical run, and the path is
+restricted to a wrapping inline formatting context. The targeted result moved
+from 1,806 to **96 differing pixels**; `bidi-003.xht` stayed pixel-exact.
+
+Receipts:
+`target/wpt-targeted/bidi-003-004-after-pdf-space-v6-20260927/results.json`,
+`target/wpt-targeted/white-space-after-bidi-pdf-space-v6-20260927/results.json`
+(111/111), and
+`target/wpt-targeted/html-precedence-004-after-pdf-space-v6-20260927/results.json`
+(1/1, regression guard). The current full diagnostic before the final scope
+restriction was 6,412/6,548; it regressed `html-precedence-004`, and that
+scope restriction is now green in the focused guard. A fresh full run is still
+required before claiming a new suite total. No fixture, tolerance, main-repo
+source/pin, commit, or push changed.
+
+### 2026-09-27: preserve source inline boundary spaces during bidi splitting
+
+`css/CSS2/bidi-text/bidi-003.xht` was independently RED at 997 differing
+pixels; `bidi-004.xht` was RED at 1,806 pixels. The inline bidi splitter only
+consulted the visual fragment's leading/trailing whitespace, so a whitespace
+boundary hidden by RLO/PDF controls could disappear after visual reordering.
+It now also checks the source logical unit boundary, but only when the source
+text itself contains explicit RLO/PDF-style controls; synthetic controls from
+`bdo`/`dir` do not alter ordinary white-space collapse. Existing explicit-bidi
+unit tests remain green. Focused receipts are
+`target/wpt-targeted/bidi-inline-source-control-gated-20260927/results.json`
+(`bidi-003` 1/1 pixel-exact; `bidi-004` RED at 1,806 pixels) and
+`target/wpt-targeted/white-space-bidi-source-control-gated-20260927/results.json`
+(8/8, including the two previously regressed white-space cases).
+
+No fixture, tolerance, main-repo source/pin, commit, or push changed. The
+remaining `bidi-004` failure is kept as the next RED rather than claimed
+complete.
+
+### 2026-09-27: absolute shrink-to-fit uses its positioned containing block
+
+The new `root_table_does_not_constrain_absolute_paragraph_to_its_cell`
+runtime regression was RED: the absolute paragraph beneath a static
+`html{display:table}` / 20px cell received a 42.0625px width and wrapped
+into multiple lines. The existing body-table test did not reproduce this
+root-element shape. Tree construction now carries the nearest positioned
+ancestor's available width through static descendants; an absolute child
+uses that width for shrink-to-fit and descendant sizing, while fixed boxes
+use the viewport. The regression is GREEN, and the `absolute` runtime group
+passes 32/32.
+
+The rebuilt optimized runner SHA-256 is
+`2c228e7b1972735f3dcc16ba9dba7c1290f9306116118567f707215ce041b827`.
+With the clean pinned WPT checkout, CSS2 user stylesheet and 800x600
+viewport, targeted receipts under `target/wpt-targeted/` are:
+
+- `root-table-absolute-containing-20260927/results.json`: case 1343,
+  `s-11-1-1b-005`, changes from 2,792 differing pixels to zero.
+- `absolute-containing-width-regression-20260927/results.json`:
+  positioning indices 3938-4070 remain 132/133; the only failure is
+  `absolute-non-replaced-width-022` at the unchanged 3,840 pixels.
+- `generated-absolute-containing-width-20260927/results.json`:
+  indices 1846-2070 remain 224/225; only `quotes-036` fails at 2,559
+  pixels. `content-177` stays a non-exact PASS at 4,817 pixels under its
+  pre-existing 5,000-pixel allowance.
+- `inline-table-containing-width-check-20260927/results.json`:
+  `inline-table-height-001` remains FAIL at 3,007 pixels. This separate
+  issue is not resolved by the absolute containing-block change.
+
+An initial generated-content check accidentally started at index 1945
+(`generated-containing-width-regression-20260927/results.json`); it covered
+an overlapping, different window and is not the 225-case generated-content
+regression receipt. The corrected 1846-2070 run above is authoritative.
+No fixture/tolerance, main-repo source/pin, commit or push changed.
+`git diff --check` passes. This focused repair is not a fresh full-suite
+count or clean-SHA acceptance; the previous complete diagnostic remains
+6,407/6,548 before this repair. Product Agent knowledge is unaffected by
+this generic CSS layout correction.
+
+The next `inline-table-height-001` investigation compared the untouched WPT
+test and `inline-table-height-001-ref.xht` in local headless Chrome at
+800x600. Both browser images paint two `Test` lines and an equally tall green
+box (`/tmp/w3cos-inline-table-{test,ref}-20260927.png`). W3COS paints the
+test's two lines but paints only the first line in its ordinary
+`display:table` reference. The remaining 3,007-pixel failure is therefore
+on W3COS's table-reference rendering path, not permission to suppress the
+authored `<br>` or change the WPT reference. These browser screenshots are
+diagnostic and do not replace pinned WPT acceptance.
+
+### 2026-09-27: table height includes anonymous grid row beneath inline wrapper
+
+`inline-table-height-001` was RED at 3,007 pixels. Local Chrome paints both
+the test and reference as two lines. The parsed W3COS regression
+`parsed_table_and_inline_table_preserve_both_lines_around_br` was also RED:
+the ordinary table was 19.2px high while the inline table was 38.4px.
+Inspection showed that both text lines and the 38.4px anonymous table row
+already existed in the ordinary table component/layout tree. Its direct
+internal Flex wrapper was only 19.2px high, however, and the table's
+auto-height projection used that wrapper bottom instead of the row bottom.
+
+For an internal inline-formatting wrapper directly below a table, the
+auto-height projection now includes its table row/group's actual bottom.
+The parsed and direct-DOM regressions are GREEN (2/2). The optimized runner
+SHA-256 is
+`29665d4dff4e9d1952077d6b0ce5bfca0a994e801b3bdfb60b2d4e54c58b6686`.
+All WPT runs below use clean WPT
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the CSS2 user stylesheet
+and 800x600 viewport; receipts are under `target/wpt-targeted/`:
+
+- `inline-table-reference-row-bottom-20260927/results.json`: case 3467
+  changes from 3,007 pixels to PASS at zero pixels.
+- `inline-table-row-bottom-window-20260927/results.json`: indices
+  3464-3478 are 12/15, up from 11/15 in the last full diagnostic. The
+  other three failures retain their exact prior pixel counts.
+- `table-height-row-bottom-window-20260927/results.json`: 13/13.
+- `anonymous-table-row-bottom-window-20260927/results.json`: 151/151,
+  including `table-anonymous-objects-211`.
+
+The broader runtime `table` filter is 95/101, with six existing failures.
+A diagnostic run with only this new row-bottom branch disabled was 94/101:
+the same six failures remained and only the new parsed regression turned
+RED. The branch was restored and the two new regressions rerun GREEN.
+These six red runtime cases remain separate work, not a pass claim. No WPT
+fixture/tolerance, main-repo source/pin, commit or push changed.
+`git diff --check` passes. The most recent complete 6,548-case run predates
+this and the absolute containing-block repair, so no new full-suite count
+is claimed. Product Agent knowledge is unaffected by this generic layout
+correction.
+
+### 2026-09-27: RTL inline overflow paints from the logical start
+
+`absolute-non-replaced-width-022` was RED at 3,840 differing pixels: the
+120px green inline-block was correctly positioned, but its 240px Ahem text
+overflowed right instead of left. The new raster regression
+`rtl_inline_text_overflow_paints_toward_the_left` was verified RED with black
+text and the old paint branch: black pixels began at x=80 and extended beyond
+x=160 for a box at x=80..120. The inline text painter now anchors an
+unbreakable, over-wide RTL line at the right content edge when alignment is
+the default logical `start`; explicit alignment and parent inline line
+contexts keep their existing behavior. The regression is GREEN.
+
+The rebuilt `--profile wpt` runner SHA-256 is
+`f5955631b9486841ed8536a74651a8ed8e1fe99b1e5e6a9f49f65b18be2dc030`.
+All runs use the clean pinned WPT
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the CSS2 user stylesheet,
+and the 800x600 viewport. Receipts under `target/wpt-targeted/`:
+
+- `rtl-inline-overflow-20260927/results.json`: case 3984 changes from 3,840
+  differing pixels to PASS at zero pixels.
+- `absolute-rtl-overflow-20260927/results.json`: CSS2 positioning indices
+  3938-4070 pass 133/133, all pixel-exact; the previous receipt was 132/133.
+- `white-space-rtl-overflow-20260927/results.json`: indices 5826-5936 remain
+  111/111, all pixel-exact.
+- `bidi-rtl-overflow-20260927/results.json`: indices 367-477 remain 109/111.
+  Only `bidi-003` (997 pixels) and `bidi-004` (1,806 pixels) fail, with
+  unchanged counts against `css2-bidi-ascii-rtl-20260927`.
+
+The broader `render_skia::tests::` run is 57/58. Its only failure,
+`default_ascii_text_is_pixel_invariant_across_inline_fragments`, uses LTR
+text and still fails when this RTL branch is temporarily removed; it is a
+separate existing regression, not a green runtime suite claim.
+
+The most recent complete 6,548-case diagnostic predates the absolute
+containing-block, table-height, and this RTL paint repair, so 6,407/6,548
+is not a current total. No fixture, tolerance, main-repo source/pin,
+commit, or push changed. The parent size gate still has six unrelated
+violations; workspace-wide `cargo fmt --check` reports existing formatting
+differences in dirty files and was not applied. This generic paint correction
+does not change Product Agent knowledge semantics.
+
+### 2026-09-27: Ahem `ch` sizing and zero-width negative-margin inline pair
+
+`css/CSS2/linebox/inline-negative-margin-001.html` was RED on the current
+WPT runner: 4 of 13 height assertions failed, each expecting a 10px line
+but receiving 20px. A parsed runtime regression reproducing its Ahem
+`4ch` line with a `4ch` image followed by `1ch - 1ch` was also RED at
+20px; its positive-width `2ch - 1ch` control must remain 20px.
+
+The layout `ch` resolver now uses Ahem's actual one-em zero-glyph advance
+instead of the fallback font's roughly 0.6em advance. The same conversion
+feeds intrinsic, replaced-image and Taffy width/min/max paths. Anonymous
+inline line fitting now accounts for the negative margin on the wrapped
+child: a zero-net-width second item can remain after a full-width first
+item, while a positive-net-width item wraps. The new runtime control and
+the existing negative-margin control both pass; the latter now declares
+Ahem explicitly, matching its 40px/20px/10px assertion premise.
+
+The rebuilt `--profile wpt` runner SHA-256 is
+`79c168af3bdcd7dcb08581c9ff6c3a6f749d5c5bfab8c08ca34aebd7729d90e7`.
+All runs use the clean pinned WPT
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the CSS2 user stylesheet,
+and 800x600. Receipts under `target/wpt-targeted/`:
+
+- `inline-negative-margin-red-20260927/results.json`: 0/1, four failing
+  subtests before the fix.
+- `inline-negative-margin-ahem-ch-20260927/results.json`: 1/1, all 13
+  subtests pass after the fix.
+- `linebox-ahem-ch-20260927/results.json`: 179/198. Against the previous
+  full-suite receipt, only the target case changes from FAIL to PASS;
+  no path changes pixel count otherwise.
+- `normal-flow-ch-20260927/results.json`: 12/15; `floats-ch-20260927`:
+  16/17; `positioning-ch-20260927`: 1/2;
+  `inline-static-position-ch-20260927`: 1/1; `table-ch-20260927`: 1/1.
+  Every path retains its old status and pixel count.
+
+These are focused receipts, not a fresh 6,548-case total. No WPT fixture,
+tolerance, main-repo source/pin, commit, or push changed. The parent size
+gate still reports six unrelated violations. Product Agent knowledge is
+unaffected by this internal CSS unit and line-fitting correction.
+
+### 2026-09-27: complete diagnostic after explicit bidi source-boundary repair
+
+The current dirty renderer was rerun against the pinned WPT checkout at
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. The 800x600 suite completed all
+6,548 cases: **6,413 passed, 135 failed, 0 errors/timeouts**. Compared with
+the preceding 6,412/136 diagnostic, `css/CSS2/bidi-text/bidi-003.xht` moved
+from 997 differing pixels to zero; no previously passing case regressed.
+`bidi-004.xht` remains RED at 1,806 differing pixels and is the next focused
+repair target.
+
+Receipt: `target/wpt-all/full-current-after-bidi-source-control-gated-20260927/results.json`.
+The runner SHA-256 is
+`2373645dd38a84f89698cc948794c6589e2ba69bd02d567e985391d8ae8b29d1`.
+This is a dirty-source diagnostic, not a clean-SHA conformance claim. No WPT
+fixture, tolerance, main-repo source/pin, commit, or push changed.
+
+### 2026-09-27: complete diagnostic after RLO continuation repair
+
+The same pinned, clean WPT checkout and CSS2 user stylesheet were used for a
+new 800x600 full diagnostic. All 6,548 cases completed: **6,414 passed, 134
+failed, 0 errors/timeouts**. Compared by path with the preceding 6,413/135
+receipt, only `css/CSS2/bidi-text/bidi-004.xht` changed from FAIL to PASS;
+there were no new failures. The focused `bidi-003`/`bidi-004` receipt is 2/2
+at zero differing pixels; the 111-case bidi and 111-case white-space windows
+also pass. The full receipt is
+`target/wpt-all/full-current-bidi-rlo-continuation-profile-v8-20260927/results.json`.
+The runner SHA-256 is
+`6690be42d000aa1e3b8edb3146b290cc592f311ad8dca7591c4c2e36391ff62e`.
+
+This remains a dirty-source diagnostic, not a clean-SHA conformance claim. A
+read-only triage of the remaining failures found 19 reftests differing by
+exactly one pixel. Several `*-applies-to-006` cases differ at the table-column
+edge, where an otherwise black pixel is a near-black antialias blend; several
+`*-applies-to-012` cases differ just outside the inline-block edge. This is
+not evidence to change WPT fixtures or pixel tolerances. A focused RED receipt
+at `target/wpt-targeted/background-table-column-edge-red-20260927/results.json`
+reproduces `background-applies-to-006.xht` at 0/1: its only differing pixel is
+`(103,54)`, actual `(5,5,5)` versus expected `(0,0,0)`. This establishes the
+paint edge to investigate without changing the background box dimensions. No
+WPT fixture, tolerance, main-repo source/pin, commit, or push changed.
+
+The next focused hypothesis was that Skia's fractional glyph origin caused
+the float-adjacent text shift. Rounding the generic glyph origin (first only
+for inline text, then globally) was rebuilt and rerun against exact indices
+1515 (`clear-inline-001.xht`) and 1592 (`floats-029.xht`); both remained
+0/1. That candidate was removed. The remaining 1-pixel text shift therefore
+does not yet have a verified paint-layer fix.
+
+### 2026-09-28: float-adjacent spaces and right-float text ownership
+
+The last *completed* 6,548-case run is
+`target/wpt-all/full-current-float-clear-aware-v9-20260927/results.json`:
+6,413 passed, 135 failed. Against the preceding 6,414/134 receipt, it fixed
+`clear-inline-001.xht` and `floats-029.xht` but regressed
+`float-nowrap-5.html`, `inlines-013.xht`, and `positioning-float-001.xht`.
+Those regressions were repaired and each exact case plus adjacent windows
+passed. A subsequent full v10 run was stopped after 2,500/6,548 when the
+workflow changed to focused failure batches; it has no completed result and
+must not be used as a new total.
+
+The next RED case, `floats-146.xht`, had 196 different pixels: its right-float
+border box was on the correct second line, while its `C` text painted beside
+the first float. The anonymous-float-group resolver had classified the
+right-floated row as an ordinary following text line and attached a false
+258px line band. It now requires the following row to be in flow; the
+right-float text box also follows its projected parent geometry. Focused
+`float-followup-red-float146-20260928` is 0/1; the current
+`right-float-text-v2-float146-20260928` is 1/1 at zero different pixels.
+Two runtime regressions for the classification and geometry pass within a
+9/9 `right_float_` unit window.
+
+The current `float-clear-cluster-v2-1500-1689-20260928` receipt is 174/190.
+Compared by path with v9, only `floats-146.xht` moved FAIL to PASS; no new
+failure appeared. Exact reruns of the three earlier regressions and
+`clear-inline-001`, `floats-029`, `floats-036` are 6/6. The runner SHA-256 is
+`43d2b79de0b36e4705e18a6f4ea5754291c68a394f50d3def422f25e379dc009`.
+All receipts use the clean WPT revision
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, 800x600 and
+`tests/wpt/profiles/css2-userstyle.css`. Current full-suite failure count is
+unverified; zero-failure conformance is not claimed. No fixture, tolerance,
+main-repo source/pin, commit, or push changed.
+
+### 2026-09-28: inline-block text-indent intrinsic width
+
+The current dirty runner was rebuilt against clean WPT revision
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. The CSS2 white-space window
+(indices 5826-5936) remains 111/111 before and after this change. A focused
+RED for `text-indent-applies-to-005.xht` had 5,120 differing pixels: the
+inline-block measured only its five Ahem glyphs, so its 160px first-line
+indent forced the text onto a second line. A runtime unit test reproduced a
+48.789px intrinsic width instead of 208.789px. Inline-block text leaf
+shrink-to-fit sizing now includes a positive first-line indent; the unit test
+passes and the raw reftest is pixel-exact in
+`target/wpt-targeted/text-indent-inline-block-green-20260928/results.json`.
+
+The 120-case text-neighbor receipt
+`target/wpt-targeted/text-indent-neighbor-5680-5799-20260928/results.json`
+is 116/120. Compared path-by-path with completed v9, only the target changed
+from FAIL to PASS; no passing case regressed. The 111-case white-space receipt
+is `target/wpt-targeted/white-space-after-inline-indent-20260928/results.json`
+(111/111). The separate table-anonymous text-indent case (index 5556) also
+passes in `target/wpt-targeted/table-anonymous-text-indent-after-inline-block-20260928/results.json`.
+These are focused dirty-source receipts, not a new 6,548-case total. No WPT
+fixture, tolerance, main-repo source/pin, commit, or push changed.
+
+The next text-indent RED remains `text-indent-014.xht` at 15,600 differing
+pixels (`target/wpt-targeted/text-indent-014-red-20260928/results.json`). Its
+failure is a nested anonymous-block/generated-content vertical composition
+case; no unverified workaround was retained. The fixed `text-indent-012.xht`
+receipt was rebuilt after the projection early-return cleanup as
+`target/wpt-targeted/text-indent-012-float-green-v2-20260928/results.json`
+(1/1, zero differing pixels). The fixed 012 and 005 cases, float-clear and
+float-neighbor windows, and the 111-case white-space window remain the
+previously recorded focused green results. Full-suite status remains the last
+completed 6,413/135 receipt, not a new total.
+
+### 2026-09-28: inherited text-indent on a nested single inline leaf
+
+The RED `text-indent-014.xht` was traced to a nested block whose sole inline
+text leaf retained the inherited `text-indent` after the block's own first-line
+indent was lowered. That made the same 6em indent participate twice and added
+one 20px line, exposing the red control block. A narrow DOM-lowering
+normalization now converts only this one-leaf block shape to one inline-start
+margin and clears the leaf's duplicate indent. The focused unit test
+`inherited_indent_on_single_inline_text_is_applied_once` passes, and the raw
+reftest is pixel-exact in
+`target/wpt-targeted/text-indent-014-green-20260928/results.json` (1/1).
+
+The current 120-case text-neighbor rerun
+`target/wpt-targeted/text-indent-neighbor-after-single-indent-normalize-20260928/results.json`
+was **118/120** at that checkpoint: `text-indent-012.xht` and `text-indent-014.xht`
+were green; the two remaining failures were `text-indent-wrap-002.html`
+(35,867 pixels) and `text-decoration-va-length-002.xht` (279 pixels). The
+later flex-indent rerun supersedes that count. The 111-case white-space
+rerun `target/wpt-targeted/white-space-after-text-indent-normalize-20260928/results.json`
+remains **111/111**. The failed justify/background candidate for
+`text-indent-wrap-002` was removed after a no-change rerun. No WPT fixture,
+tolerance, pin, commit, or push changed; the latest complete full-suite
+receipt remains 6,413 passed / 135 failed.
+
+### 2026-09-28: single-leaf flex indent normalization follow-up
+
+The one-leaf indent normalization now also covers the internal flex lowering
+used for justified inline formatting contexts, but only when the context is
+`text-align: justify`. This converts the inherited indent to the first inline
+fragment's start margin and clears the duplicate paint-time indent. The
+focused `text-indent-wrap-002.html` case is now exact (0 differing pixels),
+and `text-indent-wrap-001.xht` remains exact after restricting the flex path
+to justification. The rerun
+`target/wpt-targeted/text-indent-neighbor-after-flex-indent-v2-20260928/results.json`
+is **119/120**; only `text-decoration-va-length-002.xht` remains at 279
+different pixels. The white-space 111-case receipt remains green. No fixture,
+tolerance, suite pin, commit, or push changed.
+
+### 2026-09-28: vertical-align text-only coalescing
+
+The remaining `text-decoration-va-length-002.xht` mismatch was traced to the
+test paragraph being overpainted by only the first of three white inline text
+fragments. The other two fragments retained their synthetic vertical-align
+margins, while the reference keeps the same text as one lifted inline run. A
+narrow coalescing predicate now permits only text-only inline subtrees whose
+extra declarations are passive plus `vertical-align`; backgrounds, borders,
+images, listeners and other authored layout remain excluded. The focused case
+is exact in `target/wpt-targeted/text-decoration-va-length-002-va-coalesce-20260928/results.json`.
+The complete 120-case text-neighbor window is now **120/120**, and the
+111-case white-space regression window is **111/111** in
+`target/wpt-targeted/white-space-after-va-coalesce-20260928/results.json`.
+The refreshed historical-failure batch is **9/135 passed, 126 failed**; this
+is a targeted diagnostic, not a full-suite result. No fixture, tolerance, pin,
+commit, or push changed.
+
+### 2026-09-30: preserve float and authored widths inside table cells
+
+At revision `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, the 16-case
+`floats-wrap-bfc-001` through `007` RED window (indices 1400-1415) was 0/16
+in `target/wpt-targeted/floats-wrap-bfc-red-20260930/results.json`.
+Headless geometry showed that table-cell track normalization replaced a
+100px float with the entire 300px cell width. Excluding floats fixed 14
+cases; preserving non-auto block widths also fixed the percentage-width
+005 and definite-width 007 cases. Inline fragment track sizing remains
+unchanged, and ordinary auto-width blocks still fill their cell tracks.
+
+The final receipt
+`target/wpt-targeted/floats-wrap-bfc-width-green-20260930/results.json`
+is **16/16**, with zero pixel differences and no tolerance changes. The
+120-case floats window is **119/120**, a path-by-path gain of 16 with no
+regressions against the current full-suite baseline, in
+`target/wpt-targeted/floats-after-cell-width-20260930/results.json`.
+`floated-table-wider-than-specified.html` remains failing; its expanded
+200px width is correct, but its table/anonymous row height remains 10px
+despite a 100px content block. Its focused RED is
+`target/wpt-targeted/floated-wide-table-red-20260930/results.json`.
+The table window remains **364/366** in
+`target/wpt-targeted/tables-after-cell-width-20260930/results.json`.
+The floats-clear window improves from 201/215 to **203/215** without
+regressions: `margin-collapse-123.xht` and `margin-collapse-158.xht` now
+pass in `target/wpt-targeted/float-clear-after-cell-width-20260930/results.json`.
+Linebox remains **195/198**, with the same three failing paths and pixel
+counts, in `target/wpt-targeted/linebox-after-cell-width-20260930/results.json`.
+White-space remains **111/111** in
+`target/wpt-targeted/white-space-after-cell-width-20260930/results.json`.
+This batch therefore contributes 18 newly passing paths in the focused
+windows. The runner build, runtime check and `git diff --check` pass.
+The main repository's file-size check reports six existing violations
+outside W3COS; none were edited or added by this batch.
+
+These are dirty-source focused receipts, not full-suite closure. The latest
+completed full-suite baseline is still **6,234 passed / 314 failed** in
+`target/wpt-targeted/full-current-dirty-20260930-merged.json`; subsequent
+focused improvements must not be presented as a newly executed full run.
+No fixture, WPT revision, main-repository source, commit, or push changed.
+
+### 2026-09-30: floated table content-height minimum
+
+The current focused RED for `floated-table-wider-than-specified.html`
+(index 1375) is
+`target/wpt-targeted/floated-wide-table-height-red-current-20260930/results.json`:
+18,000 differing pixels at the same pinned WPT revision. Its 200px used
+width was already correct, but a 10px declared table height propagated into
+an anonymous row and clipped the painted table background despite 100px
+cell content. Transferring that height as a row minimum alone did not fix
+the case (`floated-wide-table-height-v1-20260930/results.json`): the internal
+flex fallback still shrank the row to the table's declared height.
+
+Anonymous rows now preserve transferred heights as minima, and rows under
+a definite table-height basis do not flex-shrink below content. The v2
+receipt `target/wpt-targeted/floated-wide-table-height-v2-20260930/results.json`
+is **1/1, zero differing pixels**. Headless geometry confirms the table,
+row and cell are all 100px tall. The floats directory is now **120/120** in
+`target/wpt-targeted/floats-after-table-height-20260930/results.json`;
+linebox remains **195/198** in
+`target/wpt-targeted/linebox-after-table-height-20260930/results.json`.
+The tables window remains **364/366**, with unchanged failing paths and
+pixel counts, in `target/wpt-targeted/tables-after-table-height-20260930/results.json`.
+This is a focused dirty-source improvement, not a new full-suite total or
+release. Runtime/DOM compilation checks and `git diff --check` pass. No
+fixture, tolerance, pin, main-repository code, commit, or push changed.
+
+### 2026-10-01: preserve normal top-aligned inline decoration geometry
+
+`table-anonymous-objects-213.xht` has 118 differing pixels in the focused
+RED `target/wpt-targeted/table213-decoration-red-20261001/results.json`.
+Its test and reference have the same 61.539px by 22px principal inline
+box at y=6.6. The test retains a wrapper after text coalescing; its paint
+union snapped this box to the parent block at y=8, while the text-only
+reference retained its own em/edge geometry. Normal, top-aligned inline
+decoration now keeps the measured principal box instead of absorbing the
+parent or line-height strut. Height-only normalization had no effect
+(`table213-decoration-v1-20261001/results.json`); preserving both geometry
+stages is exact in `table213-decoration-v2-20261001/results.json` (1/1).
+
+The fresh floats and white-space windows remain **120/120** and **111/111**
+in `target/wpt-targeted/floats-after-top-inline-decoration-20261001/results.json`
+and `target/wpt-targeted/white-space-after-top-inline-decoration-20261001/results.json`.
+Tables improve to **365/366**, with no passing path regressed, in
+`target/wpt-targeted/tables-after-top-inline-decoration-20261001/results.json`.
+Linebox remains **195/198**, with the same failures, in
+`target/wpt-targeted/linebox-after-top-inline-decoration-20261001/results.json`.
+The remaining border-conflict test's images are byte-identical between
+test/reference paths; its 1,400 differing pixels occur on fourteen rows
+in the first grid, not in the second grid. This is diagnostic evidence for
+the next batch, not a repair. No fixture, tolerance, revision, commit,
+push, or main-repository code changed; full-suite closure remains unproven.
+
+The next-batch diagnostic worklist is
+`target/wpt-targeted/current-known-failures-20261001-merged.json`.
+It replaces matching paths in the 6,548-case full baseline with the recorded
+block-in-inline, positioning, floats-clear, floats, tables, linebox and
+white-space focused receipts: **241 recorded failures remain**. Its 6,307
+passing entries are mixed checkpoint evidence, not 6,307 freshly executed
+passes on current code. This merge did not run the full suite. The largest
+remaining groups are normal-flow (74), margin-padding-clear (26), css1 (23)
+and visuren (15). The next table RED is
+`target/wpt-targeted/border-conflict-001d-red-20261001/results.json` (1,400
+pixels). Runtime compilation and `git diff --check` pass; the main file-size
+gate still has six pre-existing non-W3COS violations. These renderer-only
+changes do not alter product concepts, contracts or Agent knowledge.
+
+### 2026-10-01: table-cell vertical alignment uses generated line bounds
+
+The 1,400-pixel RED for `border-conflict-element-001d.xht` is retained in
+`target/wpt-targeted/border-conflict-001d-red-20261001/results.json`.
+The mismatch was in the reference's image-backed first grid: its generated
+inline context was at y=69.2 inside a cell starting at y=71.2. Middle
+alignment counted shifted text em boxes again inside the 20px line box,
+making the content extent 24px and moving the entire context up by 2px.
+Cell middle/bottom alignment now takes the generated inline-context box
+as the owner of that line's extent instead of re-counting its descendants.
+The focused receipt
+`target/wpt-targeted/border-conflict-001d-cell-line-box-v1-20261001/results.json`
+is **1/1, zero differing pixels**.
+
+The fresh windows are **tables 366/366**, **floats 120/120**,
+**linebox 195/198**, **floats-clear 203/215**, and **white-space 111/111**.
+Receipts are the respective `*-after-cell-line-box-20261001/results.json`
+directories under `target/wpt-targeted`; the floats-clear prefix is
+`float-clear-after-cell-line-box`. Path-by-path comparisons show no newly
+failing previously passing case. Runtime build/check and `git diff --check`
+pass. Main-repository file-size checking still reports the same six
+pre-existing violations outside this modification scope.
+
+The updated mixed-checkpoint worklist is
+`target/wpt-targeted/current-known-failures-after-cell-line-box-20261001-merged.json`:
+**240 recorded failures**, not a new full-suite result. The next focused
+RED is `block-inline-insert001-red-20261001/results.json` (indices 3171-3184,
+11/14 passed). The three failures each have 42 differing pixels on rows 65
+and 68 across x=8..28. Test/reference layout geometry for the `Six` inline
+box agrees (y=64.2, height=22); investigate normal inline decoration union
+snapping versus split-fragment paint origin, not text shaping or fixture
+changes. No fixture, tolerance, revision, commit, push, product contract or
+Agent knowledge changed. Full-suite closure remains unproven.
+
+### 2026-10-01: non-empty normal inline border pixel origins
+
+The 14-case `block-inline-insert001-red-20261001/results.json` RED had
+three 42-pixel failures. Bypassing all normal-inline decoration unions
+did not fix them and enlarged the differences to 776 pixels; that
+candidate was reverted (`block-inline-insert001-normal-union-v1-20261001`).
+Aligning normal-inline decoration origins with split fragments passed
+14/14 in `block-inline-insert001-border-snap-v2-20261001/results.json`,
+but the broader windows exposed four empty-inline regressions and a
+`vertical-align: top` table regression. The retained rule therefore
+applies the new pixel-origin alignment only to non-empty normal inlines
+with vertical edges, excluding top-aligned principal boxes. Empty and
+top-aligned boxes retain their existing paint behavior.
+
+Fresh final receipts under `target/wpt-targeted`, named
+`<group>-after-nonempty-border-snap-20261001/results.json`, are:
+
+- `block-inline`: **82/117**, up from 61/117, with **21 fixed paths**.
+- `tables`: **366/366**.
+- `floats`: **120/120**.
+- `white-space`: **111/111**.
+- `linebox`: **195/198**, the same three failures and pixel counts.
+
+Path-by-path comparison finds no previously passing case newly failing
+in these five windows. This does not mean all residual differences
+improved: the three append-002 failures grew from 79 to 306 pixels and
+are a next-batch diagnostic target. The block-in-inline window still has
+35 failures; its insert-011 family is now down to 3 pixels per failure.
+
+The diagnostic merge
+`current-known-failures-after-nonempty-border-snap-20261001-merged.json`
+records **219 failures / 6,548 entries**, replacing the matching paths in
+the preceding mixed-checkpoint worklist with these five receipts. Its
+6,329 passing entries are mixed historical checkpoints, not a fresh
+full-suite pass. No full-suite execution occurred in this batch.
+Runner build, runtime check, and `git diff --check` pass. File-size
+checking still reports the six pre-existing non-W3COS violations.
+No fixtures, tolerances, revision, product contracts, Agent knowledge,
+main-repository code, commits or pushes changed.
+
+### 2026-10-01: equivalent inline wrappers and merged decorated text
+
+The append-002 RED is
+`target/wpt-targeted/block-inline-append002-red-20261001/results.json`
+(0/3, 306 differing pixels each). Test/reference principal boxes agreed,
+but one representation retained inline wrappers while the other merged
+decoration into text leaves. Aligning only wrapper origins shifted their
+yellow border rows relative to decorated text. Applying the same normal
+inline pixel-origin rule to vertically decorated text reduced each case
+to 14 pixels in `block-inline-append002-unified-origin-v1-20261001`.
+
+The retained changes additionally distinguish an empty inline subtree
+from a wrapper merely having children. Empty generated split fragments
+use empty-fragment rounding even when their marker is not `empty`.
+Normal non-text inline borders use the existing split-border paint phase,
+below block foreground text and above block backgrounds. This resolves
+the remaining empty-edge and preceding-glyph overlap differences.
+`block-inline-append002-unified-origin-v2-20261001/results.json` is
+**3/3, zero pixels**; insert-001 remains **14/14** in its matching v2
+receipt. Fixtures, tolerance and upstream revision are unchanged.
+
+Fresh receipts named
+`<group>-after-unified-inline-decoration-20261001/results.json` are:
+
+- `block-inline`: **85/117**, three additional fixed paths.
+- `tables`: **366/366**.
+- `floats`: **120/120**.
+- `white-space`: **111/111**.
+- `linebox`: **195/198**, unchanged failures and pixel counts.
+
+No previously passing path newly fails in these five windows. Residual
+remove-003 through remove-006 differences grew (57 to 171, 184 to 426,
+204 to 318, and 120 to 234 pixels respectively); these are not repairs.
+The next RED, `block-inline-remove003-red-20261001/results.json`, is
+0/3 at 171 pixels each. Its normal merged text and split wrapper both
+start at y=6.6 with height=22, but wrapper union geometry can still snap
+to its y=8 containing line. Investigate that geometry normalization
+before changing text metrics or fixtures.
+
+`current-known-failures-after-unified-inline-decoration-20261001-merged.json`
+records **216 failures / 6,548 entries**, with 6,332 mixed-checkpoint
+passing entries. This diagnostic merge is not a fresh full-suite run.
+Runner build, runtime check and diff checking pass; file-size checking
+still reports six pre-existing violations outside W3COS. No main-repo
+code, product contracts, Agent knowledge, commits or pushes changed.
+
+### 2026-10-01: preserve normal inline vertical-edge principal geometry
+
+The retained remove-003 RED was 0/3 at 171 pixels each. Its merged text
+leaf and split wrapper both had a measured y=6.6, height=22 principal
+box, but wrapper decoration union snapped its origin to the y=8 parent
+strut. With unified fragment pixel rounding already in place, preserving
+normal inline principal geometry passed remove-003 through remove-006
+**12/12** in `block-inline-remove003-006-principal-box-v1-20261001`.
+Append-002 and insert-001 remained **3/3** and **14/14** in their matching
+principal-box v1 receipts.
+
+The broad normal-inline union bypass improved block-in-inline to 114/117
+but regressed linebox 004-007 (795, 795, 668, 668 pixels); those candidate
+receipts are `*-after-normal-inline-principal-box-20261001`. These tests
+have only horizontal border/padding edges or plain backgrounds. The
+retained bypass is therefore restricted to normal inline vertical
+border/padding edges, while keeping the previously verified top-aligned
+principal-box rule. Horizontal-only decoration/background union remains
+unchanged. `linebox004-007-vertical-edge-principal-box-v2-20261001` is
+**4/4**, and `remove003-006-vertical-edge-principal-box-v2-20261001` is
+**12/12**, both at zero differing pixels.
+
+Fresh final receipts, named
+`<group>-after-vertical-edge-principal-box-20261001/results.json`, are:
+
+- `block-inline`: **114/117**, **29 fixed paths**, no newly failing path.
+- `tables`: **366/366**.
+- `floats`: **120/120**.
+- `white-space`: **111/111**.
+- `linebox`: **195/198**, unchanged residual paths and pixel counts.
+
+Path comparisons across these five windows find no new failures. The
+block-in-inline residuals are first-line-001 (4,066 pixels),
+float-between-001 (322), and nested-002 (1,025). Independent next-batch
+RED receipts are `block-inline-first-line-red-20261001/results.json`
+and `block-inline-float-between-red-20261001/results.json`, each 0/1.
+The latter's dump places the test float at x=8 and the reference float
+at x=108; inspect split-inline relative-position propagation and the
+existing DOM normalization tests before assuming which representation
+is correct. First-line styling through generated split groups is a
+separate pending issue, not covered by this repair.
+
+The mixed-checkpoint diagnostic worklist
+`current-known-failures-after-vertical-edge-principal-box-20261001-merged.json`
+records **187 failures / 6,548 entries**. Its 6,361 passing entries are
+not a fresh full-suite execution. The WPT checkout HEAD and all five
+receipt revisions match `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`;
+the checked normal-flow/linebox fixture paths have no tracked edits.
+Runner build, runtime check and diff checking pass. File-size checking
+still reports six pre-existing non-W3COS violations. Fixtures, tolerance,
+product contracts, Agent knowledge, main-repository code, commits and
+pushes are unchanged; full-suite zero-failure closure remains unproven.
+
+### 2026-10-01: only a bare nested break marker opens an extra line
+
+`block-inline-first-line-red-20261001/results.json` retained the
+4,066-pixel RED. Pixel differences were confined to the final two text
+lines, shifted down one 19.2px strut; earlier first-line backgrounds and
+text agreed. Changing the zero-height break marker's flex alignment had
+no effect (`block-inline-first-line-break-align-v1-20261001/results.json`)
+and was reverted.
+
+Temporary projection tracing confirmed correct initial block positions
+at y=8, 46.4, 84.8 and 123.2. `project_forced_break_lines` then treated
+every Flex container containing any break as the special zero-height
+line whose only child is a break marker, appending 19.2px after each
+complete text block. The retained fix requires exactly one child in
+that nested-break shape. Temporary trace statements were removed.
+`block-inline-first-line-single-break-v2-20261001/results.json` is
+**1/1 at zero differing pixels**; no pseudo-element, font or fixture
+change was necessary.
+
+The 187 recorded failing definitions were copied without alteration
+from the pinned full manifest into `known-failures-187-suite-20261001.json`.
+An exact per-definition comparison verifies that paths, references,
+assertion requirements and tolerances match the original manifest.
+`known-failures-after-single-break-20261001/results.json` freshly executes
+all 187: **30 passed, 157 failed**. These 30 confirmations include earlier
+repairs whose old mixed-checkpoint entries remained failing; they are
+not all attributed to this one-line fix.
+
+Fresh receipts named `<group>-after-single-break-20261001/results.json`
+are **block-inline 115/117**, **tables 366/366**, **linebox 195/198**,
+**white-space 111/111**, and **float-clear 203/215**. Path comparisons
+against the preceding diagnostic worklist find no newly failing passing
+case in these five windows. Plain floats were not rerun in this batch.
+The block-in-inline residuals are float-between and nested-002;
+first-line is cleared.
+
+`current-known-failures-after-single-break-20261001-merged.json` records
+**157 failures / 6,548 entries**. Its 6,391 passing entries remain mixed
+checkpoint evidence, not a freshly executed full-suite result. The
+largest freshly checked failure groups are css1 (21), normal-flow (19),
+margin-padding-clear (17), floats-clear (12) and visudet (11).
+WPT HEAD and receipt revisions match the fixed revision. Runner build,
+runtime check and diff checking pass; file-size checking still reports
+the same six pre-existing non-W3COS violations. No product contracts,
+Agent knowledge, main-repository code, fixtures, commits or pushes
+changed. Full-suite zero-failure closure remains unproven.
+
+### 2026-10-01: non-replaced inline min/max-height must not constrain its line
+
+`normal-flow/min-height-applies-to-008.xht` freshly failed by 1,600 pixels
+(`inline-min-height-red-20261001/results.json`). Its inline wrapper has
+20px text but `min-height:100px` enlarged the containing anonymous line
+to 100px, exposing 80px of red background. Clear vertical min/max sizes
+in the existing passive non-replaced inline sizing branch, and do not
+restore authored min-height while building a text leaf. Replaced and
+absolute/fixed boxes retain their existing constraint paths.
+
+The initial candidate passed; the final correction reuses the existing
+replacement/position guards. A new unit test compares constrained and
+unconstrained layout for both text leaves and inline wrappers, covering
+`min-height:100px` and `max-height:0px`. It passes with the runner's
+`--no-default-features --features dynamic-js,skia` feature set.
+An initial default-feature test build was deliberately stopped because
+it enabled unrelated GPU/media dependencies; it is not a passing check.
+
+Fresh final receipts under `target/wpt-targeted/`, all dated `20261001`:
+
+- `inline-min-height-final`: 2/2; `inline-max-height-final`: 2/2.
+- `replaced-elements-after-inline-height`: 9/9.
+- `linebox-after-inline-height`: 195/198 (same three failures).
+- `block-inline-after-inline-height`: 115/117 (same two failures).
+- `white-space-after-inline-height`: 111/111.
+- `tables-after-inline-height`: 366/366.
+- `known-failures-after-inline-height`: 31/187 passed, 156 failed;
+  compared with the previous fresh 187-case receipt, exactly one fail
+  becomes pass and no pass becomes fail.
+
+`current-known-failures-after-inline-height-20261001-merged.json`
+contains 6,392 pass / 156 fail entries. This is a mixed historical
+checkpoint worklist, NOT a fresh 6,548-case all-suite execution.
+WPT revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+Runner build, matching-feature runtime check, focused unit test and
+`git diff --check` pass. File-size checking still reports the same six
+pre-existing main-repository violations, outside the allowed vendor scope.
+
+Also freshly reproduced `replaced-intrinsic-001/002` (both fail); their
+150px-width references conflict with the previously recorded no-ratio
+SVG 300px default-size family. No filename-based sizing exception or
+reference edit was made. Next targeted lead: `min-height-106` has its
+green clear-left relative box at y=305.6 rather than preserving the
+`top:-200px` displacement back over the float at y=105.6. This is a
+layout-dump lead, not yet a repaired or accepted case.
+
+No product contract/Agent knowledge change, commit or push was made.
+
+### 2026-10-01: relative clear/BFC placement uses normal-flow coordinates
+
+Fresh RED: `normal-flow/min-height-106.xht` differs by 80,000 pixels
+(`clear-relative-red-20261001/results.json`). Its red float starts at
+y=105.6 with height 200px; the green `clear:left;top:-200px` BFC should
+visually cover it, but ended at y=305.6. The initial collected rect was
+already correct (y=105.6).
+
+There were two successive coordinate-space errors. The nested clearance
+pass across body (a non-BFC wrapper) compared the float bottom against
+the relatively displaced border box. After restoring the static box
+there, the shared-BFC collision pass still compared the visual box with
+float exclusions and pushed it down again. Both passes now remove the
+relative offset before normal-flow decisions. Clearance keeps that
+visual offset when moving the subtree; the shared collision pass uses
+the unshifted x/y rectangle for exclusion checks. `relative_flow_offset`
+shares top/bottom, direction precedence and percentage-height handling.
+
+Candidate history is retained:
+
+- An early no-clear float-loop hypothesis was reverted before validation;
+  that branch excludes this case's `clear:left` and is not a fix.
+- `clear-relative-candidate-v1-20261001`: relaxing the direct-child
+  margin guard alone gave 3/4, with the target still 80,000 pixels;
+  the relaxed guard was reverted.
+- `clear-relative-static-box-v2-20261001`: nested clearance alone also
+  gave 3/4 with 80,000 pixels; the shared collision pass was the second
+  blocker.
+- `clear-relative-static-collision-v3-20261001`: 4/4, including the
+  target at zero differing pixels.
+
+Temporary `CLEAR_STAGE` / `W3COS_TRACE_CLEAR_RELATIVE` diagnostics were
+removed. The parsed HTML regression uses inline styles: its initial
+style-element fixture was not loaded by the inert parser test host,
+so its missing-float failure was a test setup error, not renderer RED.
+The corrected parsed body/paragraph/text/overflow-BFC test passes;
+the existing direct-child clearance test and the preceding inline
+min/max-height regression also pass on the current compiled test binary.
+
+Fresh regression receipts under `target/wpt-targeted/`, dated `20261001`:
+
+- `floats-after-relative-clear`: 120/120.
+- `float-clear-after-relative-clear`: 203/215 (same 12 failures).
+- `linebox-after-relative-clear`: 195/198 (same three failures).
+- `block-inline-after-relative-clear`: 115/117 (same two failures).
+- `margin-padding-after-relative-clear`: 665/682 (same 17 failures).
+- `known-failures-after-relative-clear`: 32/187 pass, 155 fail;
+  exactly `min-height-106` changes from fail to pass.
+
+`current-known-failures-after-relative-clear-20261001-merged.json` has
+6,393 pass / 155 fail entries; a path-status comparison against the
+preceding mixed checkpoint finds only that one fail-to-pass change.
+This is NOT a fresh full 6,548-case run. WPT revision remains
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+Runner build, matching-feature runtime check and `git diff --check`
+pass; file-size check still has six pre-existing non-vendor violations.
+The unit-test build took 12m55s (including a build-directory wait and
+concurrent WPT runs); its execution took 0.08s. WPT profile inherits
+release opt-level 3, Thin LTO and one codegen unit. No build-profile
+change was made in this rendering batch.
+
+Next diagnostic lead is `normal-flow/inlines-017.xht` (existing 8,000
+pixels): its Ahem split text/whitespace boxes have incorrect vertical
+placement relative to the reference's 40px dot-grid pitch. A layout
+dump is saved with this batch; no repair or acceptance is claimed yet.
+Only vendor renderer/tests/evidence changed; no product contract or
+Agent knowledge impact, no fixtures changed, and no commit/push.
+
+### 2026-10-01: wrapped inline text must not be centered as one line
+
+`normal-flow/inlines-017.xht` freshly fails with 8,000 differing pixels
+(`inlines-017-red-20261001/results.json`). Its Ahem span has 20px font,
+40px line-height, left border/padding and five wrapped lines. The block
+is correctly 200px tall, but every text fragment ends at y=141.2.
+`align_inline_block_last_line_baselines` applied a single-line centering
+correction against the whole multi-line height, discarding each row's
+vertical origin before the equal-font baseline correction.
+
+The centering branch now checks adjacent fragment rectangles for a
+downward transition with a horizontal restart. Such content is wrapped
+and retains its separate line origins. Horizontal restart respects LTR
+and RTL progression. No font, CSS fixture, reference, tolerance or
+general table/float-sizing rule was changed.
+
+`inlines-017-wrap-guard-v1-20261001/results.json` passes at zero pixel
+differences. The saved post-fix dump has row tops 61.2, 101.2, 141.2,
+181.2 and 221.2 (40px pitch), rather than five copies of 141.2. A pure
+layout regression covers both LTR and RTL with two rows and confirms
+that baseline projection leaves the complete rectangles unchanged.
+It passes on the current matching-feature unit-test binary. Existing
+forced-break cross-line and parsed relative-clear regressions also pass.
+
+Fresh regression receipts under `target/wpt-targeted/`, dated `20261001`:
+
+- `normal-flow-after-inline-wrap-guard`: 794/810, 16 remaining failures.
+- `linebox-after-inline-wrap-guard`: 195/198 (same three failures).
+- `white-space-after-inline-wrap-guard`: 111/111.
+- `tables-after-inline-wrap-guard`: 366/366.
+- `known-failures-after-inline-wrap-guard`: 33/187 pass, 154 fail.
+
+`current-known-failures-after-inline-wrap-guard-20261001-merged.json`
+has 6,394 pass / 154 fail entries. Compared by path against the previous
+mixed checkpoint, exactly `inlines-017` becomes pass; no pass becomes
+fail. This is a checkpoint worklist, NOT a newly executed full 6,548
+suite. All WPT receipts and checkout use revision
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+Runner build, matching-feature runtime check, focused unit tests and
+`git diff --check` pass. The file-size check retains the six existing
+non-vendor violations. No commit/push or product Agent knowledge change.
+
+Next evidence-backed lead: `inline-table-width-001b` test has a 160px
+table and 160px cell with four lines (height 76.8px). Its reference's
+auto table is also 160px, but its row/cell are 491.48px and one line
+(height 19.2px). Actual/reference dumps are saved in this batch's
+focused artifact directory. Investigate available-width propagation
+into auto-table track sizing, not an exception for the test path or an
+artificial expansion of the explicit-width inline table. This next
+case is not repaired or accepted yet.
+
+## 2026-10-01: preserve shared tracks for text-only table cells
+
+Retained scope: `layout.rs` table-cell leaf sizing and wrapped-inline
+cell alignment, plus two focused unit regressions. Checkout remains
+detached at `bc6063b068923eab2695ea3a087dd21653af0efb`; prior dirty
+changes are preserved. No commit or push.
+
+The earlier known-failure receipt has
+`css/CSS2/linebox/vertical-align-baseline-003.xht` RED at 2,716 pixels.
+`table-cell-track-width-baseline-v1-20261001/results.json` freshly
+passes it at zero pixels. A text-only table cell previously replaced
+the allocated track with its intrinsic text minimum while constructing
+the leaf style. It now retains the same track width as a cell containing
+a separate inline child. The 80px authored-column unit compares both
+representations and checks equal cell widths and wrapped heights.
+
+Wrapped inline text retains its full measured line-box height but has
+an em-box paint origin shifted by half-leading. Cell middle/bottom
+alignment now measures the unshifted line-box extent, preventing it
+from cancelling that half-leading. A pure layout regression covers
+both middle and bottom alignment. Matching-feature `table_cell` unit
+tests pass 8/8; existing auto-track contraction and wrapped LTR/RTL
+baseline regressions also pass on the freshly compiled test binary.
+
+Rejected candidates are retained as evidence, not merged as successes:
+
+- `auto-table-track-width-v1` made the target inline-table width pass
+  but introduced 100 failures in the 366-case tables window.
+- `auto-table-track-width-v4` combined available-width contraction,
+  text-cell track sizing and half-leading alignment. Its tables window
+  still introduced 16 failures (anonymous objects 079–092 and 155–156).
+  The available-width contraction and its absolute-inset compensation
+  were therefore removed. `inline-table-width-001b` remains unresolved
+  on the retained version. Do not reuse the rejected candidate's
+  152-failure count as the current worklist.
+
+Fresh retained-version receipts under `target/wpt-targeted/`, dated
+`20261001`, suffix `after-table-cell-track-width`:
+
+- tables: 366/366.
+- linebox: 196/198; remaining 015 = 291 pixels, 022 = 6,800 pixels.
+- white-space: 111/111.
+- normal-flow: 794/810; same 16 failures.
+- known-failures: 34/187 pass, 153 fail.
+
+`current-known-failures-after-table-cell-track-width-20261001-merged.json`
+contains 6,395 pass / 153 fail entries. Compared by path with the prior
+mixed checkpoint, exactly linebox `vertical-align-baseline-003` becomes
+pass, with no pass-to-fail changes. This remains a mixed checkpoint
+worklist, NOT a freshly executed full 6,548-case acceptance run. Every
+receipt is pinned to `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+Runner build, matching-feature runtime check, focused unit tests and
+`git diff --check` pass. The root file-size gate retains its six existing
+non-vendor violations; none are modified. Product Agent knowledge is
+unaffected by renderer-internal geometry changes.
+
+Next narrowed lead for linebox 015: the retained-version reference dump
+has table width 200, first cell width 110, but its auto-width bordered
+block at index 6 has width 120. The test's float border box is correctly
+110px. Actual/reference text already has the same two lines. Inspect
+the table-cell child sizing override in `build_taffy_tree`: assigning
+the cell's full content width to a content-box child adds that child's
+10px horizontal border again. Start with this box-model RED instead
+of assuming the remaining 291 pixels are caused by float wrapping.
+
+## 2026-10-01: auto block children fit the table-cell margin box
+
+Fresh RED `table-cell-auto-box-red-20261001/results.json` reproduces
+linebox `inline-formatting-context-015` at 291 pixels. The reference's
+110px cell previously allocated 110px of content width to its child,
+then added that child's 10px border, yielding a 120px border box.
+The table-cell child override now budgets margins and, for content-box
+children, horizontal padding and borders before assigning the auto
+width. Border-box children do not subtract those inner edges twice.
+The existing explicit-width and float paths are unchanged.
+
+`table-cell-auto-box-v1-20261001/results.json` passes 015 at zero
+pixels. Matching-feature `table_cell` unit tests pass 9/9, including
+a new content-box/border-box regression with padding, borders and
+margins: a 110px track contains a 90px child border box plus two 10px
+margins. Runner build, runtime check and `git diff --check` pass.
+
+Fresh receipts under `target/wpt-targeted/`, dated `20261001`, suffix
+`after-table-cell-auto-box`:
+
+- tables: 366/366; no pass-to-fail changes.
+- linebox: 197/198; only 022 remains, at 6,800 pixels.
+- white-space: 111/111.
+- margin-padding: 674/682, up from 665/682; nine fewer failures.
+- known-failures: 44/187 pass, 143 fail, up from 34/187 pass.
+- inline-table: 2/3, the same unresolved auto-track width case.
+
+The same box-model correction also clears `padding-right-applies-to`
+cases 001–007, 013 and 014. Comparison by path against the previous
+mixed checkpoint finds exactly these nine cases plus linebox 015
+changing from fail to pass, with no pass-to-fail changes.
+
+`current-known-failures-after-table-cell-auto-box-20261001-merged.json`
+has 6,405 pass / 143 fail entries. This is still a mixed worklist,
+NOT freshly executed full-suite closure. Revision remains
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`; HEAD and the 28-file dirty
+scope are preserved, with no commit/push. The root file-size gate
+still reports the same six non-vendor violations; none are modified.
+Product Agent knowledge is unaffected by this internal layout fix.
+
+Next linebox 022 lead, not yet a proven cause: current dump places
+the three decorated inline fragments at y=45.2, 65.2 and 85.2;
+the middle fragment is whitespace with width zero, but retains an
+80px decorated height. The screenshot's second Ahem text run is
+one line lower than the reference. `build_taffy_tree` already has a
+branch for discarding collapsible separators after a full inline row,
+but requires all padding/margins and the uniform border to be zero.
+Investigate whether that wrongly excludes a split fragment with only
+vertical decoration and zero horizontal edges. Begin with fresh RED
+and verify white-space/linebox windows; do not guess at background
+image placement or suppress parent backgrounds.
+
+## 2026-10-01: decorated collapsed separators do not create a line
+
+Fresh RED `decorated-wrap-space-red-20261001/results.json` reproduces
+linebox `inline-formatting-context-022` at 6,800 pixels. The existing
+full-line separator suppression required every padding/margin/border
+edge to be zero. That incorrectly retained a split inline whitespace
+fragment with zero horizontal edges but vertical decorations. The
+suppression now treats those vertical edges as non-advancing only for
+ordinary inline text; non-inline flex items keep the vertical-edge
+guards. Background, shadow, outline, transform and opacity guards
+remain intact.
+
+The first candidate made the WPT case pass, but the new image-based
+unit regression exposed a second defect: Taffy hid the separator,
+while rectangle collection recreated its decorated em box from the
+source CSS. That hidden box moved the following image to y=-34
+instead of the control's y=20, despite both parent heights being 40.
+The first candidate is therefore not the retained acceptance version.
+Rectangle collection now skips nodes whose actual Taffy display is
+None, so suppressed source nodes cannot paint or affect baseline
+projection. `decorated-wrap-space-v2-20261001/results.json` freshly
+passes at zero pixels.
+
+The freshly compiled unit
+`inline_wrap_discards_separator_with_only_vertical_decoration`
+passes: two fixed-size images with a vertical-only decorated separator
+match the separator-free control, while a separator with horizontal
+padding still retains inline advance. Existing `table_cell` tests
+pass 9/9; inline padding/space advance and wrapped LTR/RTL baseline
+regressions also pass on the same new unit-test binary. Runner build,
+matching-feature runtime check and `git diff --check` pass.
+
+Fresh retained-version receipts under `target/wpt-targeted/`, dated
+`20261001`, suffix `after-hidden-wrap-space`:
+
+- linebox: 198/198; this focused window is now clear.
+- white-space: 111/111; still clear.
+- tables: 366/366.
+- normal-flow: 794/810; the same 16 failures.
+- known-failures: 45/187 pass, 142 fail.
+
+`current-known-failures-after-hidden-wrap-space-20261001-merged.json`
+has 6,406 pass / 142 fail entries. Compared by path against the prior
+mixed checkpoint, exactly linebox 022 becomes pass and no pass becomes
+fail. This is a mixed checkpoint worklist, NOT a newly executed full
+6,548-case acceptance run. Continue clearing known failures before
+the next full run; do not declare the overall goal complete because
+white-space and linebox focused windows are green.
+
+Revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`, detached
+HEAD remains `bc6063b068923eab2695ea3a087dd21653af0efb`, and the
+28-file dirty scope is preserved. No commit/push. The root file-size
+gate retains its six existing non-vendor violations; no baseline is
+raised and no outside-vendor file is changed. Product Agent knowledge
+is unaffected by these renderer-internal changes.
+
+A next focused pair is `margin-left-applies-to-008` and
+`padding-left-applies-to-008`, both still at 581 pixels in the latest
+known-failure receipt. Their reference uses empty nested inline spans
+followed by text; compare decorated inline geometry and text baselines
+against the content-containing nested inline test before editing.
+No cause for this pair has been proven yet.
+
+### 2026-10-01: nested inline side-edge candidate — acceptance still pending
+
+Fresh RED receipts `nested-inline-left-red-2632-20261001/results.json`
+and `nested-inline-left-red-2944-20261001/results.json` reproduce
+`margin-left-applies-to-008` and `padding-left-applies-to-008` at
+581 pixels each. Empty nested inline reference boxes initially export
+a zero-height flex baseline and are restored to font-size paint boxes
+too late. Reserving the normal font strut during leaf construction
+aligns those reference boxes with adjacent text; the first candidate
+reduces both failures to 221 pixels, but does not pass them.
+
+The renderer also manufactured top/bottom border caps for a side-only
+border when nested inline decoration context was present. Removing
+those undeclared borders reduces both failures to 20 pixels. Keeping
+normal side-only inline decoration on its measured em box rather than
+unioning/expanding it to the anonymous strut makes both target cases
+pass at zero pixels in `nested-inline-left-v3-{2632,2944}-20261001`.
+No WPT fixture, reference or tolerance was edited.
+
+The candidate is NOT accepted as a completed batch: fresh linebox
+regression exposes `inline-formatting-context-004` and `005`, each at
+501 pixels. Their references paint a float's black background over
+the line strut while its white inline child covers only the em box,
+leaving black strips above and below the text. Restoring the invented
+side-border caps would hide this mismatch, not fix it. A fresh local
+Chromium check of 004 and its 002 reference reports the nested inline,
+float and white span all at y=50, height=18; their browser geometry
+does not contain those black strips. Browser PNGs are retained as
+`target/wpt-targeted/browser-inline-formatting-context-{004,002-ref}.xht-20261001.png`.
+These browser observations are diagnostic, not native acceptance.
+
+All candidate windows completed, suffix
+`after-empty-inline-side-border-20261001` under `target/wpt-targeted/`:
+
+- known-failures: 47/187 pass, 140 fail; exactly the two target paths
+  change from fail to pass against the prior 187-case receipt.
+- margin-padding: 676/682 pass, 6 fail.
+- linebox: 196/198 pass, 2 fail (004/005).
+- white-space: 111/111 pass.
+- tables: 366/366 pass.
+- normal-flow: 794/810 pass, unchanged 16 failures.
+
+Thus current known outstanding paths total 142 (140 retained failures
+plus the two exposed linebox failures), not 140 and not zero. Do not
+promote this candidate into a fresh accepted merged checkpoint while
+004/005 remain unresolved. The previous mixed checkpoint remains the
+last retained acceptance worklist; neither checkpoint is a fresh
+6,548-case full run.
+
+Freshly compiled unit tests pass:
+`normal_inline_side_border_does_not_add_horizontal_caps_or_absorb_strut`
+and `empty_painted_inline_boxes_use_the_surrounding_line_height`.
+The old compiled layout test's line-origin assertion was independently
+RED before this candidate; its updated assertions require empty
+nested em boxes to match adjacent text while preserving the parent
+19.2px strut. Matching-feature runtime cargo check and
+`git diff --check` pass. Existing compiler warnings are not cleanups
+authorized by this batch.
+
+Next entry: reconcile normal-font inline painted extent, half-leading,
+and auto-height float content consistently, using 004/005 plus the
+two nested-inline targets and 006/007 as the minimal regression set.
+Do not restore synthetic borders, add color-specific geometry, or
+change WPT references/tolerances to recover historical green results.
+Only after this regression is resolved may this batch be retained and
+the outstanding worklist refreshed. Keep clearing known failures
+before the next full suite run.
+
+Pinned revision and detached HEAD are unchanged; the 28-file dirty
+scope is protected. No commit/push and no outside-vendor edit.
+The root size gate retains its six existing non-vendor violations,
+with no baseline increase. Product Agent knowledge is unaffected:
+these are generic renderer-internal geometry changes.
+
+### 2026-10-01: explicit-line-height top-aligned inline — regression pending
+
+Fresh `inline-table-padding-red-20261001/results.json` reproduces
+`padding-applies-to-017` at 699 pixels. Its table cell and text are
+correctly 16px high; the reference's `vertical-align: top` inline
+background incorrectly absorbs its parent 19.2px line strut.
+The principal top-alignment guard was limited to normal line-height,
+despite explicit `line-height: 1` requiring the same top-alignment
+geometry. The guard now applies to both normal and explicit line-height,
+and decoration centering does not move an already top-aligned box.
+
+Runner build succeeds (1m53s). `inline-table-padding-v1-20261001`
+passes at zero pixels at the pinned revision. Minimal regression
+`inline-height-minimal-v1-20261001` preserves 006/007 as pass and
+004/005 as fail; `nested-left-{margin,padding}-top-align-v1-20261001`
+both remain zero-pixel passes. No new semantic fix for 004/005 is
+claimed. Broad regression must finish before this additional target
+is accepted into an outstanding-count checkpoint.
+
+New unit `top_aligned_inline_decoration_keeps_its_own_box_for_explicit_line_height`
+checks both normal/explicit styles against a foreign taller line box:
+paint starts at the authored top, retains the measured 16px extent,
+and does not center or fill the parent's 40px strut. Its optimized
+test compilation is still live; a source test is not a passed test.
+
+Pending current-run handles (re-poll these; do not rebuild/restart
+while existing runner workers are live):
+
+- unit compile/run: session 33500.
+- matching-feature runtime check, waiting on Cargo lock: 12996.
+- white-space 111: 13337.
+- linebox 198: 13890.
+- known-failures 187: 4034.
+- tables 366: 43810.
+- margin-padding 682: 50074.
+- normal-flow 810: 3048.
+
+Window artifacts use suffix `after-explicit-top-inline-20261001`.
+All six WPT parent processes were freshly observed live and their
+session handles polled; margin-padding and normal-flow report at
+least 100 completed cases. They are not stopped or restarted because
+a bounded observation yielded no additional output.
+
+`git diff --check` passes. Root `pnpm files:size:check` again reports
+the same six existing outside-vendor violations; no baseline or
+outside-vendor source is changed. Last verified outstanding total
+is still 142 until the current candidate's regression receipts finish.
+Overall 6,548-case completion remains unproven; goal stays active.
+
+### 2026-10-01: next margin-collapse candidate staged behind active workers
+
+Fresh `collapsed-clear-child-red-20261001/results.json` reproduces
+`margin-collapse-039` at 10,000 pixels. Layout dump places the float
+at y=51.2 with height=50, but its cleared sibling and that sibling's
+50px-margin first child both start at y=151.2 instead of y=101.2.
+The child's authored block is lowered to an internal Flex inline
+formatting context. `leading_margin_group` skipped its outer margin
+because it accepted only Block/ListItem/Table descendants.
+
+Fresh Chromium diagnostic variants confirm that first children with
+`display: block`, `flex`, `grid`, or `flow-root` all have their 50px
+outer top margin collapse with a normal cleared parent's top before
+clearance: float y=0 height=50; parent and child y=50 height=50.
+A BFC isolates its contents, not its own outer margin from an ordinary
+block parent. Therefore the candidate includes Flex/Grid/FlowRoot
+outer margins, but stops traversing into those formatting contexts.
+It does not globally disable the actual flex/grid BFC boundary.
+
+New layout unit
+`cleared_parent_collapses_block_level_bfc_child_outer_margin_before_clearance`
+uses an actual HTML-to-component path and tests all four display
+variants, including preceding in-flow content. It requires both the
+cleared parent's and its child's top to equal the float bottom and
+the parent's height to remain 50px. This new test and candidate are
+NOT yet compiled or accepted.
+
+Existing `after-explicit-top-inline` WPT workers continue using the
+unchanged previously built runner; no rebuild was attempted while
+they were live. The pending unit session 33500 began before this
+layout candidate and cannot prove the new layout test or candidate.
+Do not describe its eventual result as coverage for this new change.
+After every existing WPT worker is terminal, build the runner, run
+the new 2544 directed candidate and float/clearance focused regression,
+and compile the new unit before promoting this candidate.
+
+Latest actual progress: white-space session 13337 is terminal
+111/111 pass. Known-failures and linebox completed at least 100 cases,
+tables at least 100, margin-padding at least 400, normal-flow at
+least 500; sessions 4034, 13890, 43810, 50074 and 3048 remain live.
+Unit 33500 and runtime check 12996 remain live too. Preserve their
+handles and observe their terminal receipts instead of restarting.
+No full-suite completion, commit, push or outside-vendor edit.
+
+Subsequent terminal receipt: session 4034 completes known-failures
+at 50/187 pass, 137 fail. Path comparison against
+`known-failures-after-empty-inline-side-border-20261001/results.json`
+shows exactly `floats-124`, `generated-content/content-174`, and
+`padding-applies-to-017` changing fail to pass, all at zero pixels;
+no pass-to-fail transition within this 187-case subset. This receipt
+proves the explicit-top-inline build, NOT the newly staged
+margin-collapse candidate. Other window and unit handles remain
+pending, so the last accepted mixed checkpoint is not promoted yet.
+The separate two linebox failures also remain outstanding; 137 is
+the subset's failed count, not an overall remaining-count claim.
+
+### 2026-10-01: explicit-top-inline windows terminal; next build queued
+
+All `after-explicit-top-inline-20261001` WPT windows are now terminal:
+known-failures 50/187 (137 fail), margin-padding 677/682 (5 fail),
+linebox 196/198 (004/005 each 501px), white-space 111/111,
+tables 366/366, normal-flow 794/810. Path comparison confirms the
+normal-flow failing set is unchanged from the previous window.
+The executed build therefore has 139 distinct known outstanding
+paths: the 137 failed subset paths plus 004/005. This is an executed
+focused-worklist count, not a newly executed 6,548-case result and
+not proof about the unbuilt margin-collapse candidate.
+
+Session 33500 is terminal: newly compiled explicit-top-inline pixel
+unit passes. It predates the layout candidate and is not that
+candidate's unit proof. Runtime check 12996 also exits successfully;
+`git diff --check` remains green. Tables session 43810 exits 366/366;
+a fresh process inspection finds no remaining WPT workers. Only
+then was the next runner build queued.
+
+Next active handles:
+
+- new layout tests `cleared_parent_`, serialized HTML/DOM tests:
+  session 42661, compiling the margin-collapse candidate.
+- new runner build: session 89045, waiting on Cargo artifact lock
+  held by that test compilation.
+
+Do not restart either process or infer termination from the lock.
+When they finish, inspect both results, then run case 2544 into a
+fresh `collapsed-clear-child-v1-20261001` receipt. Run the existing
+large-child-margin/no-clearance, float-clear, and margin-padding
+regressions before accepting the candidate. The last RED remains
+10,000 pixels; no candidate green result exists yet.
+
+Separately diagnosed but NOT fixed: `background-applies-to-006`
+differs at (103,54), actual RGB5 versus expected black; 012 differs
+at (7,102), actual RGB252 versus expected white. The shared black96
+reference image is uniformly black. These are glyph-edge/paint
+differences, not defects to hide with a tolerance or reference edit.
+Retain them for a future focused font-rasterization investigation.
+No commit/push, full-suite claim or outside-vendor edit.
+
+### 2026-10-01: collapsed clear-child v1 passes WPT but fails FlowRoot unit
+
+Runner build 89045 exits successfully. Fresh
+`collapsed-clear-child-v1-20261001/results.json` passes case 2544 at
+zero pixels (RED was 10,000). This first candidate remains unaccepted:
+new serialized `cleared_parent_` unit run 42661 exits with two pass
+and one fail. The four-display regression passes Block/Flex/Grid but
+fails FlowRoot: child x=108,y=51.2 while the cleared ancestor and
+float bottom are y=101.2. This is a second real boundary defect,
+not a reason to remove the FlowRoot variant or weaken its assertions.
+
+The shared-BFC float collision projection finds a fitting earlier
+band at the float's top, moving the FlowRoot back above the already
+cleared ancestor. Candidate v2 bounds this automatic backtracking
+by cleared ordinary ancestors' content-top edges within the current
+float owner. It does not force an authored negative margin back
+inside the ancestor and does not disable genuine BFC isolation.
+The unit's expectations remain unchanged.
+
+Correction to the earlier compilation-start-time assumption: a
+direct inspection/run of the existing unit executable also found
+the new four-display test already present and failing FlowRoot.
+Therefore a process's start time alone does not establish which
+source edits its eventual unit executable contains. Use the actual
+test inventory/results and completed build instead; do not infer
+test coverage or exclude coverage from start time alone. The
+explicit 42661 terminal result above is the authoritative v1 RED.
+
+Current v2 handles: runner build 71913 is live; fresh serialized
+`cleared_parent_` test compile/run 74547 waits on its Cargo lock.
+No WPT worker is active while this runner is rebuilt. After build
+terminal, run case 2544 into `collapsed-clear-child-v2-20261001`,
+then focused float/clear, margin-padding, normal-flow and known-failure
+regressions. v2 is not yet verified green. Overall goal stays active,
+and 139 remains the preceding executed-build known count.
+
+Subsequent v2 evidence: runner 71913 finishes in 2m11s; directed
+`collapsed-clear-child-v2-20261001/results.json` passes at zero
+pixels. Runner SHA256 is
+`109eb0f72ba0ef6aacd700b19dee192f8d8d3d21e77449cbc49ace77a6380f53`.
+The source and new four-display unit assertions are unchanged after
+this build. The new unit run 74547 remains live, so its green status
+is still unproven.
+
+Active v2 focused-window handles, artifact suffix
+`after-collapsed-clear-bfc-v2-20261001`:
+
+- known-failures 187: 71377.
+- floats 120: 98976.
+- float-clear 215: 49639.
+- margin-padding 682: 64807.
+- normal-flow 810: 82714.
+
+No runner rebuild while these workers are active. Poll terminal
+receipts and compare failing paths against the preceding build;
+do not count the single green case as accepted batch closure.
+Root file-size check still reports the same six outside-vendor
+violations, without baseline increase; `git diff --check` passes.
+Renderer-internal changes have no Product Agent knowledge impact.
+
+Future 004/005 investigation entry: computed normal line-height
+already has a shared DOM provider (`dom.rs::to_component_tree`,
+`Document::set_normal_line_height_provider`). It currently calls
+`FontRegistry::normal_line_height`; unregistered generic serif
+returns None and falls back to 1.2, while paint's generic serif is
+resolved to the concrete system Times face on macOS. Inline paint
+rectangles are independently projected to font-size by layout.
+Use the same resolved face for normal strut and inline font-box
+metrics rather than expanding white backgrounds or restoring caps.
+No font-metric change has been implemented or verified in this batch.
+
+### 2026-10-01: font-metric investigation resolves the Times 18px discrepancy
+
+Floats session 98976 is terminal: 120/120 pass for the v2 clearance
+build. Other handles 74547, 71377, 49639, 64807 and 82714 remain
+live. Known-failures/float-clear completed at least 100 cases;
+margin-padding and normal-flow at least 400. Do not rebuild the
+runner or promote the candidate before their terminal results.
+
+Fresh read-only browser CDP `CSS.getPlatformFontsForNode` reports
+actual family `Times`, PostScript `Times-Roman`, for both the
+paragraph and nested inline in 004. Thus the observed 18px browser
+font box is not a substitution to Times New Roman. Local font-table
+inspection and CoreText report Times 16px ascent=12, descent=4,
+leading=0. CoreText's separate Times New Roman face instead reports
+ascent=14.2578125, descent=3.4609375, leading=0.6796875.
+
+The missing browser adaptation is documented in current primary
+Chromium sources:
+
+- https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/platform/fonts/font_metrics.cc
+- https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/platform/fonts/simple_font_data.cc
+
+On macOS Blink rounds ascent/descent and adds a rounded 15% of
+their sum to ascent for Times/Helvetica/Courier. SimpleFontData uses
+the resulting ascent/descent and rounded line-gap for line spacing.
+For Times 16px this yields ascent 14, descent 4, line spacing 18,
+matching the freshly observed browser geometry. This is a platform
+font-metric adaptation, not justification to invent border caps or
+expand backgrounds by color. No upstream source text is copied into
+the implementation and no metric change is implemented yet.
+
+Concrete next implementation entry for 004/005: resolve one shared
+backend font-geometry value (ascent/descent/line-gap) from the same
+registered/system face already used for glyph painting, including
+the supported platform adaptation. Wire the DOM normal-line-height
+provider to it for generic/system faces; use its font-box height in
+inline rectangle projection and fragment decoration, and its ascent
+in glyph baselines. Preserve explicit line-height as the line strut,
+distribute half-leading relative to the resolved font box, and keep
+registered Ahem/fallback coverage behavior. Use 004..007, the two
+nested-left-edge targets and padding017 for the first RED/candidate
+set, then focused font/linebox/white-space regressions. Do not alter
+font_size or rely on a global 1.2 fallback to reproduce this metric.
+Goal remains active and full-suite closure unproven.
+
+### 2026-10-01: clearance v2 terminal; shared resolved-font geometry candidate
+
+All v2 clearance windows are terminal: floats 120/120,
+float-clear 204/215, margin-padding 678/682, normal-flow 794/810,
+known-failures 51/187 (136 fail). Serialized new `cleared_parent_`
+unit session 74547 is terminal 3/3 pass, including FlowRoot and
+the existing no-clearance/empty-child controls. The executed-build
+known count is now 138 including the two separate 004/005 failures;
+this still is not a fresh full-suite result. Path comparison against
+the preceding mixed worklist finds no new margin-padding failure.
+Normal-flow count remains unchanged.
+
+Shared geometry candidate is now implemented in render_skia.rs,
+dom.rs and inline rectangle collection in layout.rs. It resolves
+the same registered or generic-serif face as the existing glyph
+painter, rounds browser-compatible ascent/descent, applies macOS
+Times/Helvetica/Courier adaptation, and retains a bounded 256-entry
+face-ID/font-size cache. The value is shared by DOM normal-line-height,
+inline painted font-box extent, fragment background extent, glyph
+baseline and block text half-leading. Explicit line-height remains
+the independently authored strut. Missing embedding primary-face
+information is not guessed from an unrelated font; existing fallback
+continues when no shared CSS face can be resolved.
+
+New macOS metric unit requires Times 16px ascent=14, descent=4,
+font-box height=18 and normal spacing=18, independently of authored
+line-height 1, 1.2 or 2; zero-size fonts must not resolve an invalid
+ratio. It is not yet proven green. No new machine/wire field or
+public contract is introduced; Product Agent knowledge unaffected.
+
+Matching-feature runtime cargo check exits successfully (5.53s),
+and `git diff --check` passes. Fresh pre-candidate runner RED
+`system-font-geometry-red-20261001/results.json` reproduces 004/005
+and preserves 006/007: 2/4 pass. No WPT source/reference/tolerance
+has changed. The font candidate has no pixel acceptance evidence yet.
+
+Current active handles:
+
+- font candidate runner build: 91182.
+- new metric unit compile/run: 99476, waiting on build lock.
+
+After runner build completes, run 2093..2096 into a fresh
+`system-font-geometry-v1-20261001` receipt, plus directed cases
+2632, 2944 and 2791. Inspect geometry/pixels before any further
+candidate. Then focused font/linebox/white-space and outstanding-set
+regressions must verify the shared public geometry change. Do not
+use an older runner result as proof of this new source. No full-suite
+claim, commit/push or outside-vendor edit. Root size check remains
+the same six non-vendor violations with no baseline increase.
+
+### 2026-10-01: shared font geometry v1/v2 rejected; remaining row projection isolated
+
+Metric unit 99476 is terminal pass (Times 16px font box 18px), and
+runner build 91182 is terminal. Candidate v1 receipts show 004..007
+all failing at 464 pixels; both nested left-edge cases remain green,
+but padding-applies-to-017 regresses to 1869 pixels. This candidate
+is not accepted. The reference float has an 18px box at y=50 while
+its text is projected to y=51: obsolete half-leading still subtracts
+font_size rather than the shared resolved font-box height.
+
+Candidate v2 uses the shared height in float, table-cell and inline
+projection consumers and preserves negative half-leading for table
+cell inline padding. Build 44144 exits successfully. Receipts under
+`system-font-*-v2-20261001` show margin-left-008, padding-left-008 and
+padding017 passing at zero pixels. All four 004..007 still fail at
+464 pixels, so v2 is not accepted either. Fresh reference layout
+confirms its text remains y=51 despite the float's y=50/height=18.
+
+The equal-sized inline text row normalization subsequently rewrites
+that origin using `(line_height - font_size)/2`. It now uses the
+resolved font-box height instead. Runner build 23315 and serialized
+new layout unit 6336 are pending. The unit exercises actual HTML
+lowering for a floated generic-serif text box and requires equal
+float/text top and 18px height; its result is not yet proven. No new
+full-suite result or updated remaining-count claim is made from these
+unaccepted candidates. No WPT fixture/reference/tolerance changed.
+
+### 2026-10-01: shared font geometry v3 minimal pixel acceptance
+
+Runner build 23315 is terminal successful (2m15s). Its SHA256 is
+`fb58f62895aea56aa8e42400d0ae32b291949876c216f52cf5c54dfc3cd58cd8`.
+Fresh `system-font-geometry-v3-20261001/results.json` passes all four
+004..007 with exactly zero differing pixels. Fresh
+`system-font-table-padding-v3-20261001/results.json` passes padding017
+at zero pixels. The previous 464px common offset was indeed the
+equal-font inline row origin overwrite, not a border cap or a
+test-specific background correction. `git diff --check` passes.
+
+Broader directed regressions are now running against that same runner:
+linebox 198 cases (21504), white-space 111 (8029), fonts 160 (31197),
+and the fixed 187-case known-failure subset (33015), artifact suffix
+`after-system-font-v3-20261001`. Serialized new layout unit 6336 is
+still compiling. These broader windows have not yet supplied terminal
+acceptance; the minimal green result is not full-suite closure.
+
+### 2026-10-01: shared font v3 terminal regressions, not accepted
+
+All four WPT windows are terminal: linebox 195/198, white-space
+110/111, fonts 153/160, fixed known subset 61/187 (126 fail). Fonts
+path/status comparison against the retained historical mixed worklist
+has no changes; seven preexisting failures remain. Known subset
+comparison against clearance v2 finds twelve fail-to-pass and two
+pass-to-fail paths, not an unconditional ten-case accepted reduction.
+
+Newly exposed pass-to-fail paths are:
+
+- linebox/empty-inline-003.xht: 91 pixels.
+- linebox/inline-formatting-context-002.xht: 464 pixels.
+- linebox/inline-formatting-context-003.xht: 464 pixels.
+- text/white-space-008.xht: 784 pixels.
+- normal-flow/block-in-inline-first-line-001.html.
+- visuren/anonymous-boxes-001b.xht.
+
+All paths above are beneath css/CSS2. V3 does fix 004..007 and the
+minimal padding/left-edge controls, but must not be promoted while
+these regressions remain. For white-space-008, fresh dumps show the
+pre block correctly 54px tall while the two-BR reference is 55px:
+forced-break descendant-bottom reconstruction still subtracts
+half-leading relative to font_size. Its text_half_leading helper is
+now switched to the same resolved font height; this source change
+has no rebuilt receipt yet. For 002, nested authored 16px struts put
+the 18px font box at y=49 despite the parent's normal 18px strut at
+y=50. Parent-strut baseline sharing is the next focused entry.
+
+No WPT worker remains active. Layout unit 6336 is still compiling;
+no terminal unit or candidate-v4 result is claimed. No new full run,
+commit, push, outside-vendor modification or tolerance change.
+
+Follow-up runner build 71788 is queued behind layout unit 6336.
+After both finish, validate white-space-008 at full-suite index 5833
+before broader retesting; do not replace the runner during workers.
+
+### 2026-10-01: forced-break half-leading regression repaired
+
+Layout unit 6336 is terminal pass, one HTML-lowered float/font-box
+test (8m30s build, 0.04s run). Follow-up runner 71788 is terminal
+successful (2m26s). Fresh `system-font-white-space008-v4-20261001`
+passes index 5833 at zero pixels: forced-break reconstruction now
+subtracts half-leading relative to the shared font box. Runtime
+check 68917 exits successfully; this check covers the next baseline
+projection source but is not its pixel acceptance.
+
+Next candidate corrects empty-inline-expanded text centering to use
+font-box height and normalizes one unwrapped equal-face baseline
+inline subtree against its owning block strut. It excludes vertical
+edges, positioned/atomic boxes, vertical-align overrides, linebreaks,
+different weight/style/family and descendants with taller struts.
+This restores the CSS parent-strut contribution, not a per-case
+color/border adjustment. Runner build 88518 is pending; no workers
+are active and no broader acceptance is claimed yet.
+
+### 2026-10-01: linebox and white-space zero in full directed windows
+
+Runner 88518 is terminal successful (2m10s), SHA256
+`1ecde3513f6a44d5629029b1111e1b93abc20256b3231570a0b9e13808ad76c7`.
+Fresh v5 receipts pass 002..007 6/6, empty-inline-003 1/1 and
+block-in-inline-first-line-001 1/1 at zero pixels. Full directed
+`linebox-after-system-font-v5-20261001/results.json` is 198/198,
+and `white-space-after-system-font-v5-20261001/results.json` is
+111/111. These complete their directed windows, not the 6548 goal.
+
+Anonymous-boxes-001b v5 still fails at 784 pixels: both test and
+reference position the green block at y=121 instead of the test's
+absolute red block bottom y=222. Their shared two-line paragraph
+has final height 40 at y=16; the following normal-flow block is
+one pixel too high. Temporary env-gated stage diagnostics are now
+present in layout.rs to isolate the stale block-flow height. They
+must be removed after diagnosis, before clean candidate acceptance.
+No WPT worker remains active. New serialized nested-strut/float
+unit filter 19806 is compiling; diagnostic runner build 96494 is
+queued behind it. No total remaining-count recalculation yet.
+Fresh root files:size:check again reports the same six non-vendor
+violations, without changing those files or the baseline.
+
+### 2026-10-01: anonymous-block regression root cause isolated
+
+Serialized unit build 19806 is terminal pass: normal_system_font_
+filter 2/2, including the new nested short-strut/empty-inline cases.
+The resulting unit executable separately passes resolved system
+geometry 1/1, side-border 1/1, explicit top alignment 1/1 and cleared
+parent controls 3/3. Those results precede the next production edit.
+
+Diagnostic builds 96494 and 62538 are terminal. The second trace
+shows collected paragraph height 40 and following block y=122.
+Before forced-break line reconstruction, paragraph height becomes
+41 without moving the block; reconstruction then shrinks it to 40
+and propagates -1 to that block (y=121). Static inspection identifies
+project_forced_break_inline_block_alignment's unconditional child
+bottom union: it inflates a text-only BR paragraph even when no
+atomic line was projected. The candidate now performs that union
+only after actually aligning eligible atomic boxes. All temporary
+stage/flow diagnostics have been removed; git diff --check passes.
+
+The equal-font row normalizer also now removes a child's authored
+half-leading before identifying its row, preventing a short-strut
+second-line bold run from being mistaken for the preceding row.
+Runner build 91504 is pending. First validate index 6172 plus the
+prior minimal controls, then fresh linebox/white-space and fixed
+187-case subset. No full-suite or new remaining-count claim yet.
+
+### 2026-10-01: v6 repairs the remaining anonymous-block regression
+
+Clean diagnostic-free runner build 91504 is terminal successful
+(2m06s), SHA256
+`37e2760a34799c0835b679fb1f3253b89486ff5731e57d37f65cb4ab7f2cdb8a`.
+Fresh v6 minimal receipts pass anonymous-boxes-001b (6172), all
+002..007 (2091..2096), empty-inline-003 (2083) and white-space-008
+(5833), each at zero pixels. All six newly exposed v3 regressions
+have now been repaired in minimal runs; broader acceptance remains
+pending. New unit forced_break_atomic_alignment_leaves_text_font_
+overflow_outside_strut explicitly ensures a text-only BR paragraph
+cannot be enlarged merely by passive font-box overflow. Unit build
+77044 is compiling; do not claim it green yet.
+
+Fresh v6 broader windows now running against the same runner:
+linebox 198 (82931), white-space 111 (73466), known subset 187
+(85793), fonts 160. Artifact suffix after-system-font-v6-20261001.
+Do not rebuild that executable until all workers are terminal.
+No full 6548 rerun, total remaining-count promotion, commit/push or
+outside-vendor change has occurred. git diff --check remains clean.
+
+### 2026-10-01: v6 terminal core receipts and twelve repaired known failures
+
+Same-runner v6 receipts are terminal: linebox 198/198, white-space
+111/111, fonts 153/160, known subset 63/187 (124 fail). Fonts retain
+the seven preexisting failed paths. Known subset comparison against
+clearance v2 shows exactly twelve fail-to-pass paths and no
+pass-to-fail path:
+
+- box-display/display-008, 009, 012, 013, 018.xht.
+- css1/c5509-padn-l-003.xht.
+- floats-clear/floats-153.xht.
+- normal-flow/block-in-inline-nested-002.xht.
+- positioning/abspos-block-level-001.html.
+- text/bidi-span-003.html.
+- visudet/content-height-004.html.
+- visuren/split-inner-inline-2.html.
+
+All are beneath css/CSS2. The two separate formerly exposed linebox
+004/005 cases also pass in the full directed 198 window. The count
+124 describes the verified known subset, not a fresh full 6548 run;
+do not derive a global acceptance ratio from this receipt. Product
+Agent knowledge unaffected: this is font/layout correctness without
+a new machine contract, authority path or business concept.
+
+Broader affected-area regressions margin-padding 682 and normal-flow
+810 are now running against the v6 runner (suffix
+after-system-font-v6-20261001). Do not rebuild while these workers
+are active. Unit 77044 remains compiling and unproven. Preserve all
+28 dirty files and detached HEAD; no commit/push authorization.
+
+### 2026-10-01: v6 unit terminal and next top-aligned glyph RED
+
+Unit 77044 is terminal pass: forced-break atomic alignment leaves
+text font overflow outside the strut (7m54s build, 0.00s run).
+Margin-padding 99082 and normal-flow 71774 are still running the
+v6 executable. Preserve that executable until both are terminal.
+
+Fresh top-inline-font-inline-red and top-inline-font-nested-red
+receipts reproduce font-family-applies-to-001 (1720) and 017 (1732)
+at 32 differing pixels each. Native dump for 001 has wrapper and
+text at y=50 with height16; parent strut is18. Paint's inherited
+inline_text_leading pass then centers the text an extra pixel in
+that strut, despite the wrapper's vertical-align:top. The candidate
+suppresses that extra leading when any traversed inline ancestor
+is already top-aligned, and for a directly top-aligned text leaf.
+No CSS font-name, fixture or tolerance special-case is added.
+
+New pixel unit tests top-aligned vs ordinary inline glyph positions
+with a taller ancestor strut. Unit build 23204 is pending; candidate
+runner is not built yet. git diff --check passes. Fresh root size
+check again has six unchanged outside-vendor violations only.
+
+### 2026-10-01: v6 affected-area regression exposes three additional failures
+
+Both larger windows are terminal: margin-padding 676/682 and
+normal-flow 794/810. Against clearance v2, new failures are
+margin-em-inherit-001 (2572,392px), padding-em-inherit-001 (2870,400px)
+and inline-table-valign-001 (3469,114px). Normal-flow also repairs
+block-in-inline-nested-002; its equal count does not mean identical
+failed paths. None of these three new failures occurs in the fixed
+187 subset. Thus the currently observed known set is 127 (124 from
+that subset plus three), still not a fresh full-suite census. V6 is
+not accepted as regression-free despite linebox/white-space zero.
+
+Top-aligned glyph unit 23204 is terminal 1/1 pass (4m58s build).
+Em inheritance dumps confirm correct computed margins/paddings and
+image positions (174px/168px). Their parent's auto height is short
+by0.8px because atomic-line descent uses 20% of line height: Times
+40px normal46 reserves9.2 instead of resolved descent10. Candidate
+uses the same resolved ascent plus half-leading in font-strut
+baseline construction and atomic descent, retaining the prior
+fallback when no shared face resolves. New system-font strut unit
+requires baselines14/36/25 and descents4/10/15 for three struts.
+Runner build81276 and that unit build are pending; no candidate
+pixel acceptance yet. All WPT workers are terminal, diagnostics
+remain removed, and git diff --check passes.
+
+### 2026-10-01: v7 top-aligned glyph acceptance; replaced-line minimum still stale
+
+Runner81276 is terminal successful (2m14s). Fresh v7 receipts pass
+both Ahem top-aligned cases at zero pixels. All three new regressions
+remain unchanged: em392/400 and inline-table114. No accepted total
+reduction is claimed from this partially validated candidate.
+
+Reference inline-table leaf text paints at y61, while its adjacent
+a/e are projected to y62; the multi-child test paints all at y61.
+align_inline_table_first_row_baselines still calculates a leaf cell's
+half-leading from font_size instead of the resolved font box. It
+now uses the shared font height, preserving signed half-leading.
+
+Em dumps still show child height109.2. Taffy construction has two
+additional minimum-size calculations retaining line_height*0.2,
+so changing the later projection alone does not repair that input.
+Both now derive descent from line_height minus the shared baseline.
+Unit21823 is compiling; runner56170 is queued and will include the
+inline-table and replaced minimum fixes. No WPT workers active;
+first validate 2572/2870/3469 plus1720/1732 after that build. Preserve
+the earlier RED receipts and do not accept new geometry without
+fresh pixel and affected-window regression evidence.
+
+### 2026-10-01: v8 clears all three exposed regressions in focused pixels
+
+Unit21823 is terminal 1/1 pass for resolved strut ascent and
+half-leading (4m47s build); this proves the baseline primitive, not
+the subsequent replaced-minimum/table consumers. Runner56170 is
+terminal successful, SHA256
+`ce41040e3102256e7dcc78b7aa6b2a8571361e2d0191c62cc2ece1be74c73534`.
+Fresh system-font-*-v8 receipts pass2572/2870/3469 and1720/1732,
+all at zero pixels. Both stale replaced minimum computations and
+the table-cell half-leading consumer are exercised by these pixels.
+All temporary diagnostics remain absent; git diff --check passes.
+
+Core windows now running on that same v8 executable: linebox198
+(13651), white-space111 (49159), fonts160 (51723), known187 subset
+(92599), suffix after-system-font-v8-20261001. Do not rebuild until
+all are terminal. Margin-padding/normal-flow still need fresh v8
+affected-window regression after the minimal fixes; do not use v6
+counts as proof of v8 acceptance. No new full6548 run or accepted
+global remaining count is claimed yet.
+
+Read-only next font investigation: font-weight-applies-to-017 has
+correct native text line origins50/68, but the second glyph paints
+one further18px strut down. inline_text_leading currently centers
+it in an anonymous block rect spanning54px, not the actual18px
+line. Investigate line-scoped leading/context rather than changing
+fixture coordinates, glyph tolerances or font-specific branches.
+
+### 2026-10-01: v8 core terminal; larger affected windows pending
+
+All v8 core receipts are terminal: linebox198/198, white-space111/111,
+fonts155/160 and fixed known subset65/187 (122 fail). Known-subset
+path comparison against v6 shows only the two Ahem fail-to-pass
+paths, no pass-to-fail. Five font failures remain: font-applies-to-017,
+font-family-rule-002a, font-variant-applies-to-017,
+font-weight-applies-to-017 and fonts-012. This is directed evidence,
+not a fresh global census or full6548 closure.
+
+Fresh larger v8 windows now running: margin-padding682 (29909),
+normal-flow810 (52075), tables366 (27668). Preserve the executable
+until all workers are terminal. A fresh serialized baseline unit
+filter is also compiling the latest consumers; lib-test compilation
+does not replace the running WPT executable. No unit result is
+claimed from that pending build. Root size check remains the same
+six preexisting non-vendor violations; no baseline increase, commit,
+push, outside-vendor edit or WPT fixture/tolerance change.
+
+### 2026-10-01: v8 margin/table terminal; continuation-leading candidate prepared
+
+Margin-padding v8 is terminal678/682; comparison against clearance
+v2 has no path/status changes. Tables v8 is terminal366/366.
+Normal-flow52075 and baseline unit41444 remain live; do not replace
+the WPT runner while52075 workers run. These successes do not close
+the known122 set or the full6548 objective.
+
+Fresh continuation-leading-font/variant/weight-red receipts reproduce
+font-applies-to-017 (1714), font-variant-applies-to-017 (1816) and
+font-weight-applies-to-017 (1829). The new renderer candidate stops
+adding anonymous-block leading to glyphs already positioned past
+the owner strut onto a continuation. It compares existing layout
+coordinates in constant time; no family/case branch, tree scan or
+new wire field. A private geometry unit covers initial vs subsequent
+struts and retains the zero-strut fallback. Candidate is not built
+or pixel accepted yet. git diff --check passes. Fresh root size
+check still reports the six outside-vendor preexisting violations.
+
+### 2026-10-01: v8 affected windows all terminal and regression paths restored
+
+Normal-flow v8 is terminal795/810. Against clearance v2 its only
+path/status change is block-in-inline-nested-002 fail-to-pass;
+inline-table-valign-001 is restored. Margin-padding678/682 preserves
+all clearance-v2 statuses, and tables366/366 is terminal green.
+All WPT workers are now terminal. Baseline unit41444 remains live
+in rustc optimized compilation (observed9m08s,97.8%CPU,~3GiBRSS),
+not a hung/stopped job. Continuation runner build36347 is queued
+behind that artifact lock. Do not restart either solely for the
+observation timeout. Candidate helper unit exists but is not yet
+compiled/tested; current baseline unit predates that renderer edit.
+Preserve the full6548 goal, dirty checkout and fixed revision.
+
+### 2026-10-01: continuation v1 and baseline unit RED
+
+Runner build36347 terminated successfully. Continuation v1 receipts:
+font-variant-applies-to-017 and font-weight-applies-to-017 pass (800
+and1026 pixels respectively to zero); font-applies-to-017 still906.
+Receipts: continuation-leading-{font,variant,weight}-v1-20261001.
+The first two are focused acceptance only, not a refreshed known-set count.
+
+Baseline unit41444 terminated20/24; direct executable rerun reproduced
+all four failures: tall image strut descent, middle cell image line box,
+lowered no-wrap atomic text origin, block/inline descender raster equality.
+Candidates replace the remaining cell descent approximation with shared
+strut metrics, correct two unspecified-font fixture descents (0.3em at
+line-height1.2), and derive the passive raster fixture from actual font
+height. A lowered atomic's alignment baseline must include its authored
+vertical-align offset, otherwise the final alignment pass shifts text
+again. Unit3710 is compiling those changes; no green result claimed yet.
+
+Font-applies017 layout shows the second text still on the first row:
+the break was coalesced into a trailing U+2028 inside the first Text.
+Candidate extends forced-break projection to that terminal separator,
+subtracting the first text's half-leading before finding the next strut.
+A synthetic layout regression asserts continuation x8,y70.8 and owner
+height38.4. This later edit is not covered by unit3710's compile snapshot.
+No tolerance, WPT fixture, outside-vendor change, commit or push.
+
+### 2026-10-01: baseline candidates unit green; fonts v1 terminal
+
+Unit3710 is terminal24/24 (4m30s build,0.61s tests), restoring all
+four baseline regressions. The same executable's direct
+continuation_inline_text_preserves_its_projected_line_origin filter
+also passes1/1. This executable predates the later embedded-break
+layout edit; do not claim that new synthetic unit was run.
+
+fonts-after-continuation-v1-20261001 is terminal157/160. Remaining:
+font-applies-to-017906px, font-family-rule-002a8976px (missing
+OS-installed prerequisite face), fonts-012117px. This is a full
+fonts window receipt, not a fresh full6548/known187 census.
+WPT workers terminal before queued runner24644 began compilation;
+it now includes the cell descent, atomic offset and embedded-break
+layout changes. Broader pixel regression still pending on that build.
+
+### 2026-10-01: continuation v2 RED-to-green; affected receipts live
+
+Runner24644 terminated successfully (5m10s including lock wait).
+SHA25617210d58312ebdf76229ae599c182fd9e6d8ee12cd1cb211ecabc26ea6787be5.
+continuation-leading-{font,variant,weight}-v2-20261001 each passes1/1:
+the previously906/800/1026 pixels are all zero. Fixed revision unchanged.
+No claim is made yet about the remaining fonts window or known-set total.
+
+Live same-runner affected windows: fonts160(26941), linebox198(75199),
+white-space111(25794), tables366(78156), fixed known187(12193), jobs3
+each. Preserve runner until all workers terminal. New embedded-break
+unit76691 compiles independently; it does not replace the WPT runner.
+
+### 2026-10-01: continuation v2 known subset terminal70/187
+
+known-failures-after-continuation-v2-20261001 is terminal70 passed,
+117 failed; comparison to system-font-v8 has five fail-to-pass and
+no pass-to-fail paths: font-applies-to-017, font-variant-applies-to-017,
+font-weight-applies-to-017, inline-block-baseline-011 and-014.
+The117 count is only this fixed historical187 subset; it is not a
+fresh full6548 census. Keep the full objective and old mixed worklist
+distinct; do not silently treat that worklist as current acceptance.
+
+Same runner fonts158/160, linebox198/198, white-space111/111 terminal.
+Remaining fonts: font-family-rule-002a8976px; fonts-012117px.
+The named White Space prerequisite TTF is confirmed absent locally.
+fonts012 layout dump shows reference top-aligned Ahem fallback text
+y82 versus image y74; test block y74. Preserve as next-batch evidence,
+not as an accepted repair. Tables78156 and embedded unit76691 remain
+live. Static git diff --check passes; detached base and28 dirty files
+preserved. CSS layout/paint corrections add no product authority or
+Agent tool semantics, hence no derived product knowledge change.
+
+### 2026-10-01: continuation v2 affected windows and embedded unit terminal
+
+Tables78156 is terminal366/366. All five v2 WPT jobs are terminal;
+runner SHA256 unchanged at17210d58312ebdf76229ae599c182fd9e6d8ee12cd1cb211ecabc26ea6787be5.
+Final windows: fonts158/160, linebox198/198, white-space111/111,
+tables366/366; historical known187 is70/187 with117 remaining.
+No pass-to-fail path in that fixed subset against v8. Do not equate
+these affected windows with fresh full6548 acceptance.
+
+Embedded-break unit76691 terminated1/1 (9m19s including lock wait
+and concurrent WPT contention). The optimized lib-test build includes
+the trailing U+2028 projection and its new synthetic regression.
+No workers or queued runner rebuild remain. Continue the known117
+small-batch repair; next evidence includes fonts012's reference text
+top/image origin mismatch and shared table style one-pixel residues.
+
+The latest lib-test executable also directly reran baseline24/24
+(0.59s) and continuation-origin1/1, both green after the embedded-break
+edit. git diff --check passes. Existing root file-size gate debt remains
+outside vendor; no baseline increase or outside-scope remediation.
+
+### 2026-10-01: fonts012 fresh RED and duplicate baseline projection
+
+fonts012-top-origin-red-20261001 reproduces117 pixels at pinned
+revision. Diagnostic runner79921 built2m10s. Temporary per-image
+trace proves text index6 is correctly at y74 during top alignment,
+then finishes at y82. The same function later accepts every visible
+inline text as its reference baseline and shifts every text sibling,
+including vertical-align:top. Candidate limits both operations to
+Auto/Baseline text. No constant offset or Ahem-specific condition.
+Temporary W3COS_DEBUG_TOP_ORIGIN logging has been removed from source.
+
+Existing direct unit RED: top_aligned_inline_text_shares_replaced_image_line_top
+fails (text58.4,image55.4). The parsed-span unit also fails; its test
+uses unregistered Ahem, now correctly falling through to Times with
+17px font box at15px, not an installed15px Ahem box. Its fixture uses
+generic monospace instead to isolate parsing/line alignment without
+assuming that missing test font. Installed Ahem behavior remains
+covered by real fonts012 WPT; no WPT fixture or tolerance change.
+Runner candidate89764 is compiling; top_aligned unit65465 is queued.
+Root size gate remains the same six non-vendor preexisting violations.
+
+### 2026-10-01: fonts012 baseline-participants candidate pixel green
+
+Runner89764 terminated2m04s. SHA256:
+42545bb4d0bce72e417319b2ecf605322dbf9d41927e3d1bc6289e43a5f51ba8.
+fonts012-baseline-participants-v1-20261001 passes1/1,117 pixels to0.
+No family/character branch, WPT fixture/tolerance or outside-vendor edit.
+Temporary trace is absent in current source. top_aligned unit65465
+is compiling. Broader fonts160, linebox198, white-space111 and
+fixed known187 receipts are now running against the same executable;
+preserve it until all workers terminal. This single case is not full
+fonts, historical known-set, or full6548 acceptance.
+
+### 2026-10-01: baseline participants v1 core receipts terminal
+
+Fixed known187 is71 passed116 failed; comparison to continuation-v2
+has only fonts012 fail-to-pass, no pass-to-fail. Fonts159/160, with
+font-family-rule-002a's absent White Space prerequisite still failed.
+linebox198/198 and white-space111/111 remain green. Count116 applies
+only to that historical subset, not a fresh full6548 census.
+
+Fresh font-content-height/font-explicit-baseline/font-fallback-strut
+RED receipts reproduce cases6086,6107,6110 as mismatch failures:
+zero difference is a failure for these relations. Font203 native
+dump shows differently sized deep/high font boxes139/115px but the
+same empty atomic baseline y150 (texty70 + hard-coded0.8em). Preserve
+the primary/font-strut evidence for the next batch; no claim of
+repair. Tables366 and top_aligned unit remain live. No WPT fixture,
+tolerance, outside-vendor edit, commit, push or full gate invocation.
+
+### 2026-10-01: baseline participants v1 affected regression terminal
+
+Tables65033 is terminal366/366; top_aligned unit65465 is terminal6/6
+(8m24s including artifact lock and concurrent WPT contention,0.44s tests).
+The two reproduced RED top-alignment units now pass without changing
+their coordinate assertions. The parsed fixture uses explicit generic
+monospace, not a presumed OS-installed Ahem. Real Ahem fonts012 pixel
+receipt is also green. Temporary diagnostic logging removed.
+
+Final same-runner windows: fonts159/160, linebox198/198,
+white-space111/111, tables366/366; fixed known187 is71/187 with116
+failed and no new pass-to-fail versus continuation-v2. Runner SHA256
+42545bb4d0bce72e417319b2ecf605322dbf9d41927e3d1bc6289e43a5f51ba8.
+All WPT workers and compilation handles are terminal. Full6548 goal
+remains active and unverified; no commit/push. Next batch has fresh
+RED for font content area, primary baseline and fallback strut.
+
+Latest lib-test direct baseline24/24 and embedded forced-break1/1
+also pass after the participation fix. git diff --check passes.
+This generic CSS correction does not change product Agent concepts,
+authority bindings or tools; no product knowledge update needed.
+
+### 2026-10-01: font content-ascent export candidate
+
+Existing fresh RED6107 proves explicit-size primary-font baselines
+incorrectly coincide. The inline-block alignment pass still exports
+last text, no-wrap anchors and image/text baselines with fixed0.8em,
+although the shared glyph painter resolves each face's ascent. Candidate
+exports content-box ascent through the existing resolved font geometry;
+the font box is already positioned after half-leading, so no new leading
+is added. Unspecified embedding fonts retain the existing0.8em fallback.
+No font-family/case branch. A macOS Times16 layout unit asserts text y56
+and shared baseline70 with an empty20px atomic, independently of its
+resolved14px ascent helper. Runner54265 is compiling, baseline unit is
+queued; no pixel or unit green claim yet. Same six root file-size gate
+violations are outside vendor; no baseline increase or out-of-scope edit.
+
+### 2026-10-01: content ascent v1 unit green but WPT still RED; strut v2 candidate
+
+Runner54265 terminated2m06s; content-ascent v1 SHA256:
+f7a32be7a4cfd80bcb62b8ea2de42dc2d77b118f3798a9c0f61ce97009268f00.
+Unit66525 is terminal25/25 (4m49s,0.64s tests), including the new
+font content baseline unit. However cases6086/6107/6110 remain RED
+and inline-block baselines6093..6097 remain0/5. These focused results
+do not accept v1 broadly. Native6107 shows font-content text origins
+now differ51/60 but both empty atomics still export raw Taffy bottom150.
+
+V2 candidate resolves an already-sized unwrapped baseline line from
+the owner's strut ascent/descent and empty atomic margin-box heights.
+Eligibility uses static same-face text, empty atomics, no vertical-align
+length, fitting width and exact reserved line height; wrapped, decorated,
+mixed-font and nonempty atomic cases retain the existing solver. No
+font/case branch. Added independent Times100 unit asserts text42.5 and
+short atomic112.5 rather than the displaced Taffy bottom150.
+Initial cargo check caught an EdgeLengths-vs-Edges comparison; the
+candidate now checks physical padding sides instead. Runner28776 and
+fresh baseline unit are building; latest static/pixel acceptance pending.
+
+### 2026-10-01: font strut v2 explicit baseline RED-to-green
+
+Runner28776 terminated2m14s; SHA256:
+b4e5c59f4764d19fcfa7721772210012665f7effe97f0f2cb62a4b2e50304a9a.
+font-explicit-baseline-after-font-strut-v2-20261001 passes1/1.
+Native6107 confirms text origins30.5/42.5 and empty atomic origins
+109.5/112.5 for the distinct deep/high struts, instead of both atomics130.
+The mismatch relation is now satisfied by the real font geometry.
+Fresh cargo check --profile wpt -p w3cos-runtime passes after the
+padding type correction; git diff --check passes. Unit88862 still
+compiles v2. Same-runner linebox198,fonts160,white-space111,known187
+windows are live; no broader green claim yet, no executable replacement
+until all workers terminal. No fixture/tolerance or outside-vendor edits.
+
+### 2026-10-01: font strut v2 known subset terminal72/187
+
+Known187 is terminal72 passed115 failed. Against baseline-participants-v1
+its sole path/status change is line-height-203 fail-to-pass; no new
+pass-to-fail paths. Fonts159/160 and white-space111/111 remain green.
+This115 is the historical subset count, not a fresh full6548 census.
+linebox22606, tables366 and baseline unit88862 remain live; preserve
+same runner. The new strut solver is not yet covered by a terminal
+lib-test result (v1 unit25/25 predates it).
+
+Next font-fallback-strut RED6110 remains unresolved. Source inspection
+finds FontRegistry::normal_line_height_for_text reducing only painted
+fallback runs, while dom::resolve_text_leading replaces the text leaf's
+normal height with that value. An unused first available font's strut
+must remain represented. Retain the pinned mismatch receipt and do not
+stack an unvalidated second change on these running regressions.
+
+### 2026-10-01: font strut v2 affected windows and units terminal
+
+All v2 jobs terminal: linebox198/198,fonts159/160,white-space111/111,
+tables366/366,known18772/187 with115 remaining. Baseline unit88862
+passes26/26 (8m35s including lock/concurrent WPT,0.61s tests), including
+both independent font-content/short-empty-atomic units. Latest lib-test
+direct top_aligned6/6 and embedded-break1/1 also pass. Cargo check and
+git diff --check pass; runner SHA256 unchanged at
+b4e5c59f4764d19fcfa7721772210012665f7effe97f0f2cb62a4b2e50304a9a.
+No broad full6548 acceptance claim, commit, push or outside-vendor edit.
+Generic CSS metrics do not alter product Agent authority/tool concepts.
+
+Additional next-batch evidence: content-height005's empty deep/high
+spans both resolve to fallback59px content fonts, with registry metrics
+None. line-height206's unused deep-b-only primary resolves instead to
+high-a-only0.8613281, and both normal struts become124px. FontRegistry
+resolve_style_runs requests stylesheet fonts only for actual text;
+dynamic_script::request_stylesheet_fonts_for_text delegates to the
+document loader. Investigate demand for font struts/empty decorated
+inlines before merely maxing cached metrics: missing primary font demand
+can precede the normal-height reduction. Retain RED6086/6110 receipts.
+
+### 2026-10-01: primary metrics demand candidate
+
+Fresh font-metric-demand-{content-height,fallback-strut}-red receipts
+reproduce6086/6110. CSS Fonts3 §5.2 defines first available metrics
+font by U+0020 matching (https://www.w3.org/TR/css-fonts-3/#font-style-matching).
+Candidate requests that character once before glyph demand, retaining
+unicode-range/style/weight/media/cache selection. Document demand now
+also includes decorated non-replaced inlines with no text; their border
+or padding still needs a font content box. No family/case branch, no
+invented glyph rendering and no eager load of all declared faces.
+
+New bounded HTTP integration test checks whether an empty decorated span requests
+its metrics font and registers it; existing font subset/media tests are
+included in the queued stylesheet_font_face_ filter. Runner94875 is
+compiling, new unit build queued. No pixel/unit green claimed yet.
+Same six root size violations remain outside vendor, no baseline increase.
+
+### 2026-10-01: metrics demand v1 focused pixel windows terminal
+
+Runner94875 built in2m11s; SHA256
+5a884bd8faa48023e76fc95f798e441236b2d9c2e2603b422af96841c6ee002e.
+Both pinned RED6086/6110 now pass their mismatch relation. Same-runner
+fonts159/160,linebox198/198,white-space111/111 and known18774/187
+are terminal. Path comparison against font-strut-v2 shows exactly those
+two fail-to-pass changes, no pass-to-fail. Remaining113 refers only to
+the fixed historical187 subset, not a fresh full6548 census.
+tables89528 is live; no executable replacement while workers run.
+
+First HTTP unit run4811 returned2/3: existing subset/media tests passed,
+new empty-inline test failed because navigation polling alone did not
+observe the document.fonts.ready demand boundary used by WPT. The test
+now reads that public readiness property while polling; rerun97273 is
+compiling, no unit acceptance yet. No production source workaround was
+added for the fixture. Generic CSS metrics do not affect product Agent
+knowledge/authority/tool concepts. No commit/push or outside-vendor edit.
+
+Next batch inline-block-baseline002..006 has fresh RED0/5 in
+inline-block-baseline-red-20261001.002 native outer text y74 vs reference
+y44; atomic y60,last text y59 plus15px forced-line offset. Existing
+baseline alignment chooses the displaced deepest atomic edge as anchor,
+instead of resolving ascent/descent from the containing75px strut.
+Investigate extending the canonical unwrapped line solver to nonempty
+atomics with an exported last-line baseline; preserve overflow margin-edge
+semantics and wrapped/mixed-font exclusion.
+
+### 2026-10-01: metrics demand v1 accepted; next atomic baseline candidate
+
+tables89528 terminal366/366. Readiness-aware HTTP filter97273 terminal
+3/3 (5m11s compilation,0.26s tests): empty decorated inline font loading,
+unicode subsets and inactive media. Thus metrics-demand-v1 affected
+windows are accepted at fonts159/160,linebox198/198,white-space111/111,
+tables366/366,known18774/187 with113 remaining in that fixed subset.
+Not a fresh full6548 acceptance.
+
+Next candidate extends the existing canonical unwrapped line solver to
+nowrap atomics containing plain in-flow text leaves (including retained
+forced breaks). Exported offset comes from the last visible in-flow line
+or the bottom margin edge for non-visible overflow. The line uses maxima
+of strut/atomic ascent and descent; only already-matching reserved height
+and unwrapped horizontal order qualify. Nested/wrapped/positioned atomics,
+mixed outer fonts and vertical-align offsets remain excluded.
+The forced-break unit gains an independent no-atomic paragraph anchor;
+mere sibling agreement no longer masks whole-line displacement.
+No executable replacement occurred before prior workers were terminal.
+
+### 2026-10-01: atomic strut v1 focused result and conflicting references
+
+Runner82487 built in2m09s; SHA256
+9e8e020a30cbef097c35e3fdecb8394f8806e972fc909bfb411417433b4693bb.
+Focused002..006 improves0/5 to1/5:002 passes,003..006 remain failures.
+These four are not automatically implementation debt or accepted green.
+Fresh Chromium141.0.7390.37 at800x600,awaiting document.fonts.ready,
+has0 differing pixels for002 versus001-ref, but428 differing pixels
+for each003..006 versus that same reference. Browser screenshots and
+chromium-oracle.json live in inline-block-baseline-red-20261001.
+
+The pinned003..006 assertion uses an obsolete higher-of-last-line-or-edge
+rule. Current CSS22 §10.8.1 explicitly requires the bottom margin edge
+for overflow other than visible:
+https://www.w3.org/TR/CSS22/visudet.html#leading
+Chromium outer text y44,atomic y24 (003/004) or16.5 (005/006) obeys this
+rule; native003 also has outer y44,atomic y24. Do not alter the runtime
+to force those reference matches, modify the pinned fixtures, skip them,
+or count them as passes. Preserve them as oracle conflicts pending final
+full-run classification. Native/browser pixel equality itself has not
+been measured here; only browser-to-reference pixel counts and native003
+key layout coordinates are proven.
+
+Canonical solver check93564 passes; strengthened baseline unit97857 and
+same-runner known187,linebox198,fonts160,white-space111 remain live.
+No full6548 acceptance, commit/push or outside-vendor edits.
+
+### 2026-10-01: atomic strut v1 unit rejects absolute-position closure
+
+Baseline unit97857 terminal25/26 after8m10s compilation,0.75s tests.
+The strengthened independent forced-break test fails with outer baseline65
+versus no-atomic reference35: a direct Document construction still displaces
+the entire line by30px, despite native WPT002 passing. Do not weaken the
+absolute assertion or accept this candidate as complete. Next inspect the
+direct Document component tree versus parser/runtime tree, including
+single-text-leaf InlineBlock representation and normal-metric providers.
+All other25 baseline tests, including both empty-atomic strut units, pass.
+
+Same-runner known187 terminal75/187,112 remaining; path comparison with
+metrics-demand-v1 shows only002 fail-to-pass, no pass-to-fail. linebox198/198,
+fonts159/160,white-space111/111 terminal unchanged. tables63429 is now terminal
+366/366. All WPT workers ended; candidate not yet unit-accepted.
+
+The sole font failure font-family-rule002a explicitly requires a preinstalled
+White Space font from support/AHEM_whitespace.ttf. That path is absent in the
+current WPT checkout. A case-insensitive rg --files search instead locates
+fonts/ahem-extra/AHEM_WhiteSpace.TTF. Diagnostic Chromium @font-face loading
+from the obsolete support path raises NetworkError; loading bytes from the
+real ahem-extra file succeeds. No font was installed into the host and no
+fixture was edited. Investigate supplying this explicit harness prerequisite
+before calling this a CSS font-name parsing defect. Browser-before/loaded/ref
+PNGs are retained in fonts-after-atomic-strut-v1-20261001; runtime acceptance
+still pending.
+
+Chromium White Space diagnostic pixels: before9030, after explicitly loading
+the real font732, versus unmodified reference. This proves the font demand
+matters but does not prove the remaining discrepancy is solely environmental
+or that the fixture passes Chromium. Do not relabel this native failure.
+All current workers terminal; no rebuild is blocked by live WPT processes.
+Next priority remains direct-Document forced-break absolute baseline RED
+(25/26 units), not full6548 yet. Keep the strengthened assertion intact.
+
+### 2026-10-01: atomic strut v1 baseline units accepted after coordinate audit
+
+Independent exact replay confirms25/26 was not test-order residue. Temporary
+baseline_probe prints direct Document actual paragraph line y23,h75,inline
+content y53,h15; reference is a single Block Text y23,h75. The asserted
+reference baseline35 omitted its30px half-leading, unlike inline content
+rectangles. Renderer line_box_half_leading expressly adds that leading for
+Block Text. Normalize both to rendered font baselines using shared metrics;
+retain the independent no-atomic paragraph and0.5px tolerance.
+Unit10152 terminal26/26 (3m39s compilation,0.65s tests). No production
+layout patch was needed for this coordinate audit. Diagnostic example removed.
+Atomic-strut-v1 is accepted at known18775/187,112 failures; affected windows
+linebox198/198,fonts159/160,white-space111/111,tables366/366 from same runner.
+
+Next fresh RED626 border-conflict-style107 still55000 differing pixels.
+Native sixteen50px floated tables share y50/68 instead of four cleared rows.
+DOM already retains clear on BR, but runtime clear excludes Inline display.
+Candidate marks actual clearing BRs at lowering, prevents clear BR merging
+into ordinary text, and tracks a BFC-scoped clearance floor across anonymous
+float groups. Plain inline clear, opposite-side clear and independent BFCs
+must remain unaffected. New direct shared-BFC unit includes all three clear
+sides plus an unmarked-inline control. Check66333 passes; runner44880,
+DOM82204 and new unit are queued/running; no acceptance yet.
+Root size check still has six existing outside-vendor violations, no baseline
+increase. No product Agent knowledge/authority concepts change, no commit/push.
+
+### 2026-10-01: clearing BR focused pixels green, regressions live
+
+Runner44880 terminal2m32s; SHA256
+d26ee01ecaa35fb75496ba16a8d9133e79738e70ff7a6c5c894ca75392b972c5.
+Fresh626 clears55000 differing pixels to0 with unchanged zero allowances.
+Sixteen50x50 table frames now form four rows y50,100,150,200, four columns
+x8,58,108,158. Receipt collapsed-table-float-after-clear-break-v1-20261001.
+DOM82204 terminal1/1, verifies three clearing BR identities and16 floats.
+Runtime unit84673 still compiling; its synthetic root is explicitly Block
+(native Style default is Flex, which would intentionally isolate its items).
+Controls include Left/Both clear, opposite-side Right and unmarked inline
+clear. No empty glyph-content guessing or all-inline-clear relaxation.
+Same-runner known18725299,tables36696802,linebox19859969,floats120 live;
+do not replace runner or call this broad acceptance before results.
+
+### 2026-10-01: clearing BR batch terminal; bidi decoration advance RED
+
+Clearing BR units terminal: DOM1/1, new runtime1/1 (8m07s compilation),
+same current exe shared_bfc3/3 and baseline26/26. WPT linebox198/198,
+tables366/366; floats116/120 (no same-version pre-change floats-window
+baseline, so not an unchanged120-case claim). known18776/187 with111
+remaining, only626 fail-to-pass versus atomic-strut-v1, no pass-to-fail.
+All WPT workers terminal; runner may now be rebuilt.
+
+Next bidi986..993 fresh RED4/8. Native actual986 retains One/Two merged
+with parent paragraph h36; reference split leaves start at y6/y24.
+Glyph pixels align, first-line decorations match; actual second border
+starts y42 while reference y24. Renderer background/border loop uses
+InlineLineContext.line_box.height36 as line advance, but the glyph loop
+uses authored18px line spacing. Context documents available paragraph
+geometry, not individual line spacing. Candidate uses the same18px
+advance for decorations and glyphs. No metrics, bidi-edge sizing,
+reference fixtures or allowances change. New independent raster unit
+samples the second yellow fragment at y26 and forbids phantom paint at
+y44 for paragraph heights36 and72. Build and inline_background unit
+filter live; no candidate acceptance yet. No commit/push, outside-vendor
+edit or product knowledge/authority change.
+
+### 2026-10-01: decoration advance v1 targeted pixels green
+
+Runner53084 builds2m12s; SHA256
+1fb0180377340ff38b0910b09317a3b5d012da33ab9e9fb923a20deea7bc8cee.
+Bidi986..993 improves4/8 to8/8; all four formerly failing ltr/rtl
+basic/span-only references now exactly zero pixels. No fixture, tolerance,
+font-face mapping or forced edge clipping change. Same-runner known187,
+linebox198,white-space111,tables366 live; unit90889 compiles the independent
+two-paragraph-height raster check and existing inline_background tests.
+Do not replace the executable during these workers or declare full closure.
+
+### 2026-10-01: decoration advance historical subset terminal107
+
+known187 terminal80 passed107 failed. Path comparison with clear-break-v1
+finds exactly four ltr/rtl basic/span-only fail-to-pass transitions, no
+pass-to-fail. linebox198/198 and white-space111/111 terminal unchanged;
+tables366 and unit90889 remain live. This107 is the historical subset,
+not a current full6548 census. No broad candidate acceptance yet.
+
+Same-binary1132 html-precedence004 is fresh RED0/1 without the prescribed
+user stylesheet, then GREEN1/1 with existing
+--user-stylesheet tests/wpt/profiles/css2-userstyle.css. Upstream explicitly
+requires this exact userstyle configuration. Receipts retain separate
+userstyle-prerequisite-{red,with-profile}-20261001 artifacts and the applied
+CSS copy. No engine/test fixture edit is made for this prerequisite. A whole
+known187 replay with that explicitly scoped profile is live18436; do not
+silently merge different environment settings or call the prerequisite a
+runtime code repair.
+
+### 2026-10-01: decoration/profile windows terminal; HTTP fixture backpressure
+
+Decoration unit90889 terminal4/4 after8m29s compilation,0.54s tests, including
+the independent36/72px paragraph raster control. Same fresh exe baseline26/26,
+shared_bfc3/3 and clearing-line-break1/1 pass. tables366/366 also terminal.
+All affected WPT workers terminal at bidi8/8,linebox198/198,white-space111/111,
+tables366/366,known18780/187 without userstyle. The explicitly configured
+known187 replay18436 is81/187 with106 remaining: only html-precedence004
+changes fail-to-pass versus the no-userstyle replay. Retained user-stylesheet
+copy binds the environment. Not a full6548 count or zero-failure acceptance.
+
+Additional fresh stylesheet_font_face_ filter gives2/3: the empty metrics
+HTTP fixture's accepted socket write_all returns macOS WouldBlock (code35),
+then loader observes Peer disconnected. This is socket backpressure, not a
+font demand timeout/regression. The listener polls accept nonblocking with
+its5sec deadline; accepted socket now explicitly blocking with5sec read/write
+timeouts. No loader source workaround or relaxed assertion is added.
+Fresh three-test rebuild queued; do not claim final HTTP unit acceptance yet.
+
+Next entry after fixture validation: root-canvas001 has an existing embedded
+HTML object gap (25600 pixels in known187), not merely a root-background
+offset. Current prepare_pending_frames_for_node iterates iframe tags and
+src attributes only; jsdom::graft_frame_component_subtrees likewise gates
+on iframe, while upstream object uses type=text/html,data=... and body/p
+100% height. Reuse shared browsing-context loading/rendering where valid,
+preserving MIME, origin, fallback and independent document styles; do not
+just recolor the red host or substitute a screenshot. No object code edit
+has been made in this batch. Frame lifecycle/caller checks and RED receipt
+remain required before implementation.
+
+### 2026-10-01: decoration/clear batches accepted, font fixture stabilized
+
+HTTP fixture unit43711 terminal3/3 after3m31s compilation,0.27s tests.
+Ten additional independent-process exact empty-metrics runs pass10/10;
+blocking accepted-socket I/O retains5sec bounds and all font assertions.
+Fresh same lib-test exe also baseline26/26,shared_bfc3/3,inline_background4/4.
+No production loader change for the fixture's socket backpressure.
+
+qualification.json in known-failures-after-decoration-advance-userstyle-v1
+binds pinned revision,dirty base SHA,source diff hash,runner/lib-test hashes,
+explicit userstyle setting and the actual focused receipts. From prior112
+remaining: five actual implementation failures repaired plus one required
+userstyle prerequisite supplied; configured known187 now81/187,106 failures.
+Unconfigured same runner remains80/187,107 failures. No reference conflict
+was waived, threshold relaxed or full6548 result inferred. All jobs terminal;
+goal remains active. git diff --check passes; no commit/push/outside-vendor
+change or product Agent knowledge/authority change.
+
+### 2026-10-01: HTML object root-canvas focused repair accepted
+
+Pinned revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`;
+detached dirty base remains `bc6063b068923eab2695ea3a087dd21653af0efb`.
+The existing runtime/renderer worktree was preserved. This batch changes
+DOM stylesheet/document/user-agent lowering and the runtime DOM/frame loader
+and bridge, not the layout solver or paint algorithms.
+
+RED: `html-object-root-canvas-red-20261001/results.json` records
+`root-canvas-001.xht` failing at 25,600 pixels. A separate stylesheet unit
+reproduced the isolation gap: globally registered child author CSS added
+`color:green` to the outer paragraph. Owner ids previously controlled cleanup,
+not document membership. Scoped registration now establishes a document-root
+boundary (including children without author CSS), excludes host author rules
+from it, and isolates regular, pseudo and container-property cascades.
+User-origin rules remain applicable in each document. Flattened selector
+contexts cannot accidentally consume a child-scoped rule. Clearing an owner
+removes both its rules and its document boundaries.
+
+HTML/XHTML objects with an explicit supported type reuse the frame fetch/data
+URL, policy, decoding, lifecycle and script-loading paths using `data` rather
+than `src`. Data/HTTP representations are MIME gated; image objects keep the
+image path. A successfully installed object is lowered as a replaced host,
+with its fallback excluded before text coalescing or IFC construction.
+Empty/unsupported loads retain fallback; data/type changes invalidate the
+previous document and restore fallback before loading its replacement.
+Objects are not added to `window.frames`.
+
+The installed child html root is detached from its parser container. Its
+inline author sheets are registered against that root, and the frame graft
+retains html + body under a host-sized, clipped viewport rather than borrowing
+only body. Root/body percentage heights thus resolve in the embedded box,
+without repainting the red parent or leaking child rules into the parent.
+Public object contentDocument access is read-only and uses a navigation-time
+same-origin snapshot; cross-origin/opaque data documents remain renderable
+internally but return null to parent script. Mutating document.URL cannot
+change that decision, and no object contentWindow surface is exposed.
+
+Focused runtime validation found an additional real RED: the loaded host
+still became Flex from its fallback text. The final DOM lowering removes the
+fallback before that transformation; HTML object UA display is inline, while
+a successfully replaced inline host uses the atomic inline-block IR.
+The final loaded/fallback DOM unit and image-object control pass 2/2.
+DOM stylesheet filter passes 42/42; iframe sizing controls pass 2/2.
+Fresh runtime html_object filter passes 2/2, covering MIME fallback, source
+replacement, cascade isolation, host shape, same-origin scheme/host boundaries,
+read-only access and attempted document.URL forgery. The four existing frame
+closure/observer/post-insertion/document-surface controls pass 4/4. Baseline
+26/26, inline_background 4/4 and stylesheet_font_face_ 3/3 remain green.
+Compilation-only fixture mistakes (body vs body_id and a missing qualified
+Component test type) were corrected before these successful runs.
+
+Final current-code WPT receipts, all with the explicitly prescribed userstyle:
+
+| receipt suffix `-20261001/results.json` | passed | failed |
+|---|---:|---:|
+| `html-object-root-canvas-after-origin-snapshot-v1` | 1 | 0 |
+| `linebox-after-html-object-v1` | 198 | 0 |
+| `box-display-after-html-object-v1` | 117 | 3 |
+| `known-failures-after-html-object-userstyle-v1` | 82 | 105 |
+
+The dedicated final root-canvas receipt is exact zero pixels and zero maximum
+difference with unchanged zero tolerance. The known187 status comparison has
+exactly one transition, root-canvas fail -> pass, and no pass -> fail.
+The three current box-display failures match the previous known187 paths and
+pixel counts: block-in-inline-margin-with-multi-line-text-before (6,400),
+box-generation-001 and -002 (313 each). This is not a fresh full6548 census.
+
+`qualification.json` beside the final known187 receipt binds the pinned
+revision, dirty base, code-diff hash, runner/lib-test hashes, explicit userstyle,
+RED and accepted receipts, unit filters and remaining focused failures.
+Final runner SHA256 is
+`93703534a5c8ee28532b6cc6b5b64fd7a9adb35f60b6fb0fbfe9fca1ab597991`.
+All workers/builds are terminal. cargo build wpt runner, focused tests and
+git diff --check pass. Root files:size:check retains the same six preexisting
+outside-vendor violations; neither those files nor the size baseline changed.
+No commit/push, reference edit, threshold relaxation or product Agent knowledge
+change was made; this is generic native HTML/CSS loading/rendering only.
+
+Not accepted here: child linked sheets/assets, viewport-relative CSS/media
+evaluation, nested navigation and objects without an explicit HTML/XHTML type.
+These require further frame/document integration, not special-case WPT fixes.
+Next implementation-failure entry is the current known187
+`positioning/abspos-negative-margin-001.html` (index4109), currently 26 pixels;
+keep its RED and static-position/inline-fragment reference independent of this
+accepted object batch. Goal remains active with 105 failures in the configured
+known187 subset, not zero-failure closure for the 6,548-case suite.
+
+### 2026-10-01: bottom-aligned atomic font-strut focused repair accepted
+
+Pinned revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`,
+with detached dirty base `bc6063b068923eab2695ea3a087dd21653af0efb`.
+Only layout.rs implementation and focused tests changed in this batch;
+existing dirty work was preserved. No commit/push or parent-project edit.
+
+`abspos-negative-margin-red-20261001/results.json` records 26 differing
+pixels. Both blue absolute rectangles already matched the reference:
+(13,8,10,10) and (8,28,10,10). The first reference glyph was incorrectly
+at y=8 rather than y=6.5. The independent unit RED is preserved in
+`abspos-negative-margin-red-20261001/unit-red.json` with executable and
+source hashes. This is a font-strut/vertical-align issue, not a reason to
+change absolute static-position coordinates.
+
+The guarded unwrapped equal-face IFC solver now includes bottom-aligned
+atomics. Their margin-box height constrains line height without substituting
+their bottom edge for the baseline. Font-strut descent is preserved; extra
+height enlarges ascent. Atomic bottom margins align to the line bottom.
+The existing width, reserved-height and single-line guards remain, and
+text-bottom is excluded from the new bottom path.
+
+The new unit covers five height/margin combinations (5/10/20px, margins
+0/+2/-2), verifying both text baseline and atomic margin edge. A preexisting
+Ahem-dependent bottom-alignment unit initially failed because it declared
+Ahem without loading its font: system fallback heights were 23/115 instead
+of 20/100. It now explicitly loads the pinned Ahem.ttf under an isolated
+test-only family and owner, cleaned up on drop. Original geometry assertions
+were retained; no font installation, global Ahem override or tolerance change.
+Font SHA256: `b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448`.
+
+Final runtime filters pass: bottom_aligned 6/6, baseline 27/27,
+static_position 6/6, auto_inset_absolute 5/5, inline_background 4/4,
+html_object 2/2, stylesheet_font_face_ 3/3. Filters overlap, so these
+counts are not a unique-test census. cargo check/runtime test/runner build
+and git diff --check pass.
+
+Final receipts use the prescribed CSS2 user stylesheet:
+
+| receipt suffix `-20261001/results.json` | passed | failed |
+|---|---:|---:|
+| `abspos-negative-margin-after-bottom-strut-v2` | 1 | 0 |
+| `linebox-after-bottom-strut-v2` | 198 | 0 |
+| `fonts-after-bottom-strut-v2` | 159 | 1 |
+| `known-failures-after-bottom-strut-v2` | 83 | 104 |
+
+The target is exactly zero pixels at unchanged zero thresholds. Comparing
+against known-failures-after-html-object-userstyle-v1 yields exactly one
+fail -> pass (abspos-negative-margin-001), with no pass -> fail. The font
+failure remains font-family-rule-002a (8,976 pixels); missing-resource and
+reference prerequisites remain strict failures, not waivers.
+
+Qualification beside known187 binds runner SHA256
+`cfb66e479c1646b7dd7f05b6400b68172697ebb78c6760ef0a4ff5c8ebaf7d2e`,
+runtime test SHA256
+`9ec6ce5ab74938ce9997ff40d362b49cef8ba2bf448f6cd72a6f133046e13fde`,
+and crates/tools diff SHA256
+`58b07f247299ac5d0bf01bd027d9c3f01271a0dfb5f7dc1d6b74e00b28d7c45d`.
+All WPT workers are terminal. No full6548 rerun was performed; the goal
+remains active with 104 strict failures in the configured known187 subset.
+Product Agent knowledge is unaffected by this generic CSS geometry change.
+
+Next focused entry: abspos-011/012, indices 4076/4077. Current-code RED
+`abspos-overlap-red-20261001/results.json` is 0/2, 1,645 pixels each.
+Actual layout places all absolute paragraphs at (8,40), 32px high, so
+static-position overlap itself is already present; investigate glyph/paint
+and reference geometry before changing positioning algorithms.
+Follow-up inspection confirms the current replay helper
+`absolute_text_is_fully_occluded` treats equal sibling text rectangles with
+opaque foreground color as opaque covers. The actual screenshot contains
+only the last paragraph's "#   SS", whereas the reference retains overlapping
+glyphs from earlier paragraphs. Text rectangle equality cannot prove glyph
+coverage; whitespace remains transparent. Next batch must independently
+RED-test this optimization and remove/restrict it without changing layout.
+
+### 2026-10-01: absolute-text rectangle occlusion removed; strict open failures retained
+
+Scope, fixed revision and dirty detached base remain unchanged. The preceding
+turn made concrete progress (bottom strut repair accepted). This batch changes
+only the Skia display-list replay and adds a focused renderer unit. No parent
+edit, reference change, threshold relaxation, commit or push.
+
+`abspos-overlap-red-20261001/results.json` is 0/2, 1,645 pixels each for
+positioning/abspos-011 and -012. Equal-sized absolute text siblings were
+incorrectly treated as full opaque rectangle covers just because their
+foreground alpha was 255. Actual screenshot retained only the final
+paragraph's "#   SS". Transparent whitespace and uncovered earlier glyphs
+must still paint. The helper and its call were removed; the now-unused
+enumeration ordinal was removed too. Normal display-list order remains.
+This also removes a per-absolute-text scan of later nodes.
+
+Independent RED `abspos-overlap-red-20261001/unit-red.json` records earlier
+ink at (0,10) changing from [222,222,222,255] to white when an equal-sized
+blank sibling is added. Source/test/runner hashes bind that RED. The final
+unit covers blank overlays and a later glyph separated by whitespace.
+A fixture borrow-checker error was corrected before executable RED. The
+first candidate passed the blank case but the gap case accidentally used
+normal whitespace collapse; final fixture explicitly uses pre, preserving
+the same pixel-equality assertions and intended non-overlapping glyph gap.
+
+Final target unit 1/1, baseline 27/27 and static_position 6/6 pass. Expanded
+Skia module run is **62/65**, not all green. Three failures independently
+reproduce: block_and_inline_text_share_the_same_glyph_origin,
+borderless_inline_container_background_covers_the_line_band, and
+default_ascii_text_is_pixel_invariant_across_inline_fragments. Their code
+directly calls draw_text_in_rect/render_node, not changed display-list
+occlusion; previous-code test evidence was not retained, so no historical
+module census is claimed. Details live in the final target's
+`unit-regressions.json`; keep these REDs for subsequent focused work.
+
+Final fixed-revision WPT receipts with prescribed CSS2 userstyle:
+
+| receipt suffix `-20261001/results.json` | passed | failed |
+|---|---:|---:|
+| `abspos-overlap-final-v2` | 2 | 0 |
+| `abspos-neighborhood-after-text-overlap-v2` | 37 | 2 |
+| `known-failures-after-text-overlap-v2` | 85 | 102 |
+| `linebox-after-text-overlap-v2` | 196 | 2 |
+
+Target pixels are precisely zero, unchanged zero tolerance. Known187 versus
+after-bottom-strut-v2 has exactly two fail -> pass transitions (011/012),
+no pass -> fail within that subset. Nearby abspos-inline-007 remains 1,852
+pixels. abspos-float-with-inline-container is now 200 pixels, outside
+known187; full-chunk-4000-4499-20260930 had recorded it passing. This is a
+real later regression requiring focused repair, not a fresh full-suite count.
+Its DOM has no absolute text, so removing text-only culling is not its cause.
+
+Removing the invalid culling also exposes two previously false-green
+linebox tests: vertical-align-sub-001 and -super-001, 2,199 pixels each,
+maximum difference 55. Their red/green identical glyphs paint twice but
+reference paints only green once. Browser oracle **Chromium141.0.7390.37**
+at 800x600, awaiting fonts.ready, independently fails both: 2,175 pixels,
+maximum difference 55. Both browser span rects are identical
+(8,50,399.515625,110), font96px Times; sub/super do not move the absolute
+box. Antialias edge compositing is the reference mismatch, not a reason
+to reinstate rectangle culling. Keep them as strict failures, with browser
+PNGs, script and chromium-oracle.json beside the linebox receipt.
+
+`known-failures-supplement-20261001.json` adds the three strict WPT paths
+outside original known187. The observed combined tracked list is now 190
+cases with 105 strict failures (102 original + 3 supplemental), not a full
+6548 census. Renderer unit failures are separate, not added to WPT counts.
+No full6548 run and no zero-failure closure claim. Correct rendering is
+retained even where old green receipts relied on invalid suppression.
+
+Final runner SHA256:
+`b4b3866869473501d5f27ba9198f5ffa6ed1157371808882ab1824d9fccda3db`;
+runtime test SHA256:
+`45b1e29a1c046d15d6beeede0dc25a783c7d4f513d5875ac800edbc320196905`;
+crates/tools diff SHA256:
+`315442034c8c447c853c45d4419a501798c63ab04c8774c64d7fe8890d7337c5`.
+cargo check and runner build pass; git diff --check passes. Root size check
+still reports the six preexisting outside-vendor violations without baseline
+changes. Product Agent knowledge/authority semantics are unaffected.
+Goal remains active. Next implementation entry is the 200-pixel float/inline
+containing-block regression at full manifest index4105, followed by the
+separately recorded renderer-unit REDs. Do not call this batch regression-free
+or the linebox module fully green.
+
+### 2026-10-01: empty positioned inline uses resolved font height for its strut
+
+The previous turn was concrete progress: two overlapping-text WPT cases
+fixed and invalid false-green receipts exposed. This turn repairs the
+newly recorded abspos-float-with-inline-container regression, full index4105.
+Fixed checkout `../wpt` HEAD was rechecked as
+`fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`. Detached dirty base remains
+`bc6063b068923eab2695ea3a087dd21653af0efb`; other work was preserved.
+Only layout.rs implementation/test and vendor receipts/docs changed.
+
+RED `float-inline-font-strut-red-20261001/results.json`: 200 pixels.
+Native green absolute box was (8,49,100,100), reference/browser (8,50,100,100).
+The empty positioned inline containing-block path undid half-leading using
+CSS font-size16, whereas collect_layouts_fast had projected that inline
+using actual Times font height18. The inconsistent inverse introduced -1px.
+Use the same inline_font_height helper in both directions. Non-Skia fallback
+retains font-size behavior. No positioning constants, fixture names or
+pixel tolerances were added.
+
+The existing font-strut unit retains its default-font case and adds serif
+line-height1.125 and1.5. Independent executable RED records y=-1 instead of0
+for serif1.125, in unit-red.json with source/test/runner hashes. Final target
+unit passes all three variants. Positioned_inline6/6, baseline27/27,
+static_position6/6 and overlapping_absolute_text1/1 pass. These filters
+overlap and are not a unique-test census.
+
+Expanded containing_block is20/21, not green. The remaining old
+leading_float_margin_does_not_collapse_with_its_containing_block assertion
+expects the uncleared ordinary following block at y80; current native is y8.
+An equivalent browser fixture independently gives container(8,8,784,96),
+float(8,24,0,40), following(8,8,784,96). [CSS2.2 floats §9.5](https://www.w3.org/TR/CSS22/visuren.html#floats)
+also keeps ordinary in-flow blocks vertically independent of a float unless
+clearance/BFC constraints intervene. The float's y24 assertion already
+passes. Do not change correct normal flow to manufacture y80. The old
+assertion was not edited here; browser fixture/output and open status are
+preserved in the final target unit-regressions.json. The three earlier Skia
+module unit failures were not rerun or declared cleared.
+
+Final explicit-userstyle fixed-revision receipts:
+
+| receipt suffix `-20261001/results.json` | passed | failed |
+|---|---:|---:|
+| `float-inline-font-strut-final-v1` | 1 | 0 |
+| `abspos-neighborhood-after-font-strut-v1` | 38 | 1 |
+| `supplement-after-font-strut-v1` | 1 | 2 |
+| `known-failures-after-empty-inline-font-strut-v1` | 85 | 102 |
+| `linebox-after-empty-inline-font-strut-v1` | 196 | 2 |
+
+Target pixels are exactly0. Native absolute rect is now(8,50,100,100),
+matching the browser. Known187 status comparison against after-text-overlap-v2
+has no transitions. Nearby sole failure remains abspos-inline-0071852px.
+Linebox sub/super remain strict2199px each, same as prior; no invalid text
+suppression reinstated. Supplemental list gains exactly the repaired float
+case. Combined tracked190 now86 pass104 fail, not a fresh full6548 census.
+
+Current dedicated next RED:
+`abspos-inline-descendant-after-empty-strut-red-20261001/results.json`,
+index4106, 0/1,1852px. Keep this as the next inline descendant containing-block
+entry, without merging it with this accepted empty-inline correction.
+Separate open geometry: zero-width floated child's x is108 native vs8
+browser in4105. It does not contribute the visible target pixels and is not
+claimed fixed by this vertical-strut batch.
+
+Final runner SHA256:
+`152fc679dbf9c4edfc263576a10fc1acb5e559c6b9da0df65cfe12481aa85c90`;
+runtime test SHA256:
+`c042b09aa3cc064f2089f21b43d1110526b6942267d964e62df95908ed44a986`;
+crates/tools diff SHA256:
+`4544f2f6f7e49981963153945a62074b13f06f1fcda20066a49c48182b42aab8`.
+cargo check, runner build and git diff --check pass. All processes are
+terminal. Root size gate remains red on the same six preexisting
+outside-vendor files; neither files nor baseline changed. No full6548 run,
+commit/push, product Agent knowledge/authority or external service change.
+Goal remains active; do not promote focused receipts into overall closure.
+
+### 2026-10-01: nested inline atomics align to the strut without moving external anchors
+
+Previous turn was concrete progress: fixed index4105's 200px empty-inline
+font-strut displacement. This batch repairs positioning/abspos-inline-007,
+index4106. Fixed revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`,
+dirty detached base remains `bc6063b068923eab2695ea3a087dd21653af0efb`.
+Other dirty files were preserved; only layout.rs implementation/tests and
+vendor-local receipts/docs were changed, without commit/push.
+
+RED `abspos-inline-descendant-after-empty-strut-red-20261001/results.json`
+records1852px. Native passive inline text was at y12 and its empty atomics
+at y18, while browser text origin/atomic geometry uses y8/y14. Explicit
+top-left and bottom-right green boxes were already correct (y8/y18); only
+the automatic static-position green box was incorrectly at y18 instead14.
+Native reference inline-blocks were also misaligned, so this was not merely
+an inset error in the test tree.
+
+Browser oracle uses Chromium141.0.7390.37, viewport800x600, routing the local
+pinned WPT files through http://wpt.local with XHTML/CSS/font MIME types.
+document.fonts.ready was awaited and Ahem checked loaded in both pages.
+Test/reference browser screenshot difference is exactly0. Script, browser
+PNGs and chromium-oracle.json are preserved beside the RED. Inline container
+rects are (48,7,162,22), (250,7,162,22), (452,7,222,22); atomic y14 and
+absolute y8/y18/y14 establish the independent geometry oracle.
+
+Independent unit RED in unit-red.json reproduces a serif equal-face line
+with a static atomic containing only absolute descendants: texty14 rather
+than expected8. The new unit covers both Inline and InlineBlock parent
+displays, a direct out-of-flow child, an externally anchored top inset and
+an auto-inset static-position descendant. All assertions remain unchanged.
+
+Implementation changes:
+
+- The guarded canonical equal-face single-line baseline solver also applies
+  to authored passive Inline/InlineBlock containers, not only anonymous IFC
+  lowering markers. Real Flex remains excluded unless marked as an IFC.
+- Direct absolute/fixed/none children do not participate in line metrics.
+  Floats remain in the eligibility list so float-band layouts are rejected.
+- An atomic with no in-flow children exports its margin-bottom edge even
+  when it owns absolute/fixed/floating descendants. Out-of-flow subtrees do
+  not export descendant text as an in-flow last-line baseline.
+- Baseline shifts walk the subtree with positioned-containing-block
+  ownership. Externally anchored explicit vertical insets and viewport-fixed
+  nodes remain stationary; auto vertical insets follow static-position
+  displacement, and anchors captured by a moved positioned ancestor move
+  with that ancestor. Existing width/height/single-line guards remain.
+
+Target unit passes1/1 (two display variants). Focused final unit filters:
+baseline28/28, static_position6/6, positioned_inline6/6,
+auto_inset_absolute5/5, layout::tests::absolute15/15,
+genuine_flex_baseline1/1, inline_background4/4, bottom_aligned6/6.
+Filters overlap. Prior Skia module failures and old containing-block float
+assertion were not rerun or declared cleared. No full unit-module claim.
+
+Final current-code receipts with the prescribed userstyle:
+
+| receipt suffix `-20261001/results.json` | passed | failed |
+|---|---:|---:|
+| `abspos-inline-descendant-candidate-v1` | 1 | 0 |
+| `abspos-neighborhood-after-inline-baseline-v1` | 39 | 0 |
+| `white-space-after-inline-baseline-v1` | 111 | 0 |
+| `known-failures-after-inline-baseline-v1` | 86 | 101 |
+| `supplement-after-inline-baseline-v1` | 1 | 2 |
+| `linebox-after-inline-baseline-v1` | 196 | 2 |
+
+The candidate-v1 target receipt is qualified by the unchanged final runner
+and subsequent regression receipts: exact0 pixels, no tolerance change.
+Native final geometry matches browser: texty8, atomic y14; explicit top/
+bottom anchors remain y8/y18; auto static-position green box moves to y14.
+Known187 comparison against after-empty-inline-font-strut-v1 has exactly
+abspos-inline-007 fail->pass, no pass->fail. Linebox sub/super retain strict
+2199px each, unchanged. The combined tracked190 is87 pass103 fail (was104),
+not a full6548 census. No blanket reference-conflict waiver or false-green
+text suppression was introduced.
+
+Final runner SHA256:
+`16f7a3823dbf88b35bfae2382dede2a148b1a7bff301ec77a1e280c1e5ed1cef`;
+runtime test SHA256:
+`07542bb8c2cd6dad5419bac90258db36fbaa3a8bf5d46dc47946cafb6ed6cab1`;
+crates/tools diff SHA256:
+`bf598816e6aca04c947e88ef8c0b8c5defb2343d13f71457e0db3695269a4520`.
+cargo check, runner build and git diff --check pass. Root size check retains
+the same six preexisting outside-vendor violations; baseline unchanged.
+All processes are terminal. Generic CSS layout work has no product Agent
+knowledge/authority impact. No full6548 run or overall-completion claim.
+
+Next family RED is preserved as
+`first-line-vertical-after-inline-baseline-red-20261001/results.json`:
+indices4919..4923, first-line-pseudo-012..016, 0/5, pixels8000/2820/2820/1600/1600.
+Read earlier first-line scope evidence before changing magnitude or painting;
+do not mistake old green receipts for current proof. Goal remains active.
+
+### 2026-10-01 mixed-font inline decoration boundary (focused accepted)
+
+Fixed revision and detached base remain unchanged. Scope is vendor/w3cos only;
+dirty changes are preserved, with no commit or push. The five-case RED above
+is the before-state, not a newly generated full-suite census.
+
+The ordinary control inline in first-line-pseudo-015/016 painted an extra
+20x80 red strip above its correct20px background. Its100px descendant was
+treated as a background continuation, with the ancestor20px font advance
+and the descendant100px height. Both the inline background union and extra
+continuation collector now exclude different-font-size descendant em boxes.
+The descendant's own text/background remains paintable; same-size wrapped
+continuations retain their existing handling. No text clipping or opaque
+rectangle occlusion was added.
+
+New unit `inline_background_does_not_expand_to_larger_descendant_font` has
+an independent RED: expected y80,height20, actual y0,height100. After the
+production candidate it passes1/1. Additional filters pass inline_background
+5/5, bottom_aligned6/6, top_aligned_inline3/3, overlapping_absolute_text1/1.
+Filters overlap; this is not full unit-module closure. Previously unresolved
+Skia-module/containing-block unit assertions are not declared cleared.
+
+Receipts in target/wpt-targeted, all suffixes below end `-20261001/results.json`:
+
+| receipt prefix | passed | failed |
+|---|---:|---:|
+| first-line-after-mixed-font-decoration-v1 | 2 | 3 |
+| first-line-neighborhood-after-mixed-font-decoration-v1 | 19 | 3 |
+| white-space-after-mixed-font-decoration-v1 | 111 | 0 |
+| linebox-after-mixed-font-decoration-v1 | 196 | 2 |
+| known-failures-after-mixed-font-decoration-v1 | 88 | 99 |
+| supplement-after-mixed-font-decoration-v1 | 1 | 2 |
+
+015/016 are each exact0 pixels (RED1600). Known187 has only these two
+fail-to-pass changes and no pass-to-fail. 013/014 each improve2820->1920;
+012 remains8000. Combined tracked190 is89 pass101 fail, down from103;
+6548 has not been rerun. Strict sub/super each remain2199px, unchanged.
+
+Chromium141.0.7390.37 with loaded Ahem is independently preserved beside
+the RED as chromium-oracle.json plus PNGs. Raw reference diffs are
+012=22110,013=9848,014=634,015=364,016=7530. These are whole-page strict
+diffs, not automatic semantic waivers; the may-marked optional first-line
+vertical alignment cases must not be globally exempted or forced green
+through clipped glyphs. Native acceptance above remains zero tolerance.
+
+Qualification and unit-regressions.json bind current binaries/source diff.
+Runner SHA256263dfea653e22788f0d49f526fb44baf840ae8ed2300f33281e57a442acb3287;
+runtime test SHA25673f4b16f7ca43b15d9defcca25c39161ac6cf76d14962ca41b2f4f3fcf56b6f6;
+crates/tools diff SHA25639c229f06b03dacada541065959df42c6a3582d3fa970dfb782acb42a0c8443c.
+Cargo check, runner build and git diff --check pass, with existing compiler
+warnings. Root size check still has six preexisting outside-vendor violations;
+baseline unchanged. Generic renderer changes have no product Agent knowledge
+or authority impact. All batch workers/builds are terminal.
+
+Next: use current012/013/014 artifacts as RED. In013/014 the control's
+spurious red decoration is gone; pseudo-line short glyphs remain at
+y132.5 instead of line-top125 while the75px middle glyph starts125.
+Inspect the inline text/line-height projection and first-line alignment
+lowering, preserving independently paintable glyphs and optional behavior.
+012 remains a separate lifted-first-line/continuation scope investigation.
+
+### 2026-10-01 explicit vertical alignment excludes passive centering (accepted)
+
+Fixed revision/base and vendor-only dirty-worktree scope remain unchanged.
+Current first-line013/014 RED is1920px each in the preceding accepted receipt.
+The remaining short pseudo-line glyphs started132.5 instead of125: the
+mixed-font passive-text centering fallback overrode their explicit top
+alignment after the line-edge solver. It now excludes explicit align-self
+and internal vertical-align keyword/length markers. Passive text retains
+the fallback; independently positioned text and glyph ink remain paintable.
+
+Unit `mixed_font_inline_centering_preserves_explicit_line_edge_alignment`
+uses a60px generic-serif top-aligned pair around a75px bottom-aligned run,
+with the same anonymous IFC marker and explicit line-height1 as the failure.
+Its authoritative RED is `alignment-unit-metrics-red.json` alongside the
+preceding receipt: expected top content y-4.5 (font half-leading), actual3,
+an unwanted7.5px displacement. Candidate then passes1/1 with unchanged
+assertions, including the bottom-aligned middle run's own half-leading.
+
+Fixture audit: the initial version named Ahem without loading it and asserted
+y0. That assertion was invalid with its fallback font. The initial candidate
+failed y-4.5 against0; this was not called a successful regression. The fixture
+was corrected to explicit generic serif and actual font geometry, the candidate
+was removed, and the corrected RED was executed again before reapplying it.
+The original trial is retained but superseded, not used as the accepted RED.
+
+Additional unit filters pass baseline28/28, vertical_align4/4,
+inline_background5/5, bottom_aligned6/6, top_aligned_inline3/3. Filters overlap;
+the four previously unresolved module assertions are not declared cleared.
+No full unit-module suite or full6548 WPT run was executed.
+
+Final receipts in target/wpt-targeted, suffix `-20261001/results.json`:
+
+| receipt prefix | passed | failed |
+|---|---:|---:|
+| first-line-after-explicit-alignment-v1 | 21 | 1 |
+| white-space-after-explicit-alignment-v1 | 111 | 0 |
+| linebox-after-explicit-alignment-v1 | 196 | 2 |
+| known-failures-after-explicit-alignment-v1 | 90 | 97 |
+| supplement-after-explicit-alignment-v1 | 1 | 2 |
+
+013/014 are exact0 pixels;015/016 remain exact0. Known187 has precisely these
+two fail-to-pass changes, no pass-to-fail. Strict sub/super retain2199px each.
+Combined tracked190 is91 pass99 fail, down from101; not a fresh6548 census.
+The candidate-v1 five-case trial is superseded by the final22-case receipt.
+No threshold, reference, or browser-conflict waiver was changed.
+
+Qualification and unit-regressions.json bind final artifacts. Runner SHA256:
+205fd8e1bc642a9bfda0de65011a6ce4785e15e0ad1cd09793a234eac87a0a44;
+runtime test SHA2565ee2982dd0fb652fe67b9b262d6519d081f5472e276282c2fbf7e37aeda742a5;
+crates/tools diff SHA256e29c3f50d090a6a7ac353068ff746c9b95596c1c4dc92573c5e0e5025a1463de.
+Cargo check, runner build and git diff --check pass with existing warnings.
+Root size check retains the same six outside-vendor violations, no baseline
+change. No product Agent knowledge/authority change, commit, or push.
+All listed build and WPT sessions are terminal; goal remains active.
+
+Next RED is012 alone,8000px, in the final22-case receipt. Native geometry:
+test parent y84,height146, promoted InlineFlex text y57,height90;
+control parent y280,height146, promoted wrapper y243,height90. The content
+origins should be investigated relative to their parent content tops87/283,
+not patched by reference-specific offsets. `promote_vertical_align_line_box_extension`
+already reserves abs(offset) in an InlineFlex height and attaches a50px clip;
+`apply_inline_vertical_align_length` then applies another30px text/40px wrapper
+lift. Inspect reservation ownership before changing either solver. Preserve
+ordinary positive/negative authored length alignment and wrapped-line scoping.
+
+### 2026-10-01 promoted line owns its reserved positive lift (accepted)
+
+Fixed revision/base, detached HEAD and vendor-only dirty scope are unchanged.
+The preceding final receipt is012's RED,8000px. A focused unit independently
+reproduces its extra30px text lift: expected fragment y87,height90; actual57.
+The root line remains y84,height146, so this is not a block-position patch.
+
+DOM promotion now emits `--w3cos-internal-reserved-line-lift` for positive
+offsets and removes stale ownership before assigning it. The synthetic
+InlineFlex's reserved line height already positions its content at the raised
+line origin. Runtime skips a second lift only for an InlineFlex with a positive
+offset and matching ownership value. It still visits descendants normally;
+this is not a subtree-wide exemption. Negative offsets, ordinary unmarked
+inlines and mismatched values retain the authored displacement. Existing clip
+geometry is unchanged; no new clipping/occlusion, reference offsets or tolerance
+adjustments were introduced. This is private layout metadata, not public wire
+or product authority vocabulary.
+
+`promoted_inline_line_does_not_repeat_its_reserved_positive_lift` passes1/1:
+text and row-with-descendant preserve their rects; unmarked positive and
+mismatched positive retain y57, negative retains y127. The DOM lowering test
+`first_line_length_stops_at_width_and_keeps_explicit_inline_wrapper` passes1/1
+and verifies ownership40 on both90px synthetic text and wrapper. Other filters
+pass vertical_align4/4, reserved_vertical_lift1/1, baseline28/28,
+inline_background5/5, mixed_font_inline_centering1/1. Filters overlap and do
+not clear the four previously unresolved module assertions.
+
+Current receipts in target/wpt-targeted, suffix `-20261001/results.json`:
+
+| receipt prefix | passed | failed |
+|---|---:|---:|
+| first-line-reserved-lift-candidate-v1 | 1 | 0 |
+| first-line-after-reserved-lift-v1 | 22 | 0 |
+| white-space-after-reserved-lift-v1 | 111 | 0 |
+| linebox-after-reserved-lift-v1 | 196 | 2 |
+| known-failures-after-reserved-lift-v1 | 91 | 96 |
+| supplement-after-reserved-lift-v1 | 1 | 2 |
+
+012 reaches exact0 pixels, and the selector first-line neighborhood is22/22.
+Known187 changes only012 fail->pass, with no pass->fail. Strict sub/super
+remain2199px each. Combined tracked190 is92 pass98 fail, down from99. This
+does not establish fresh6548 coverage; no full run or full-module unit run.
+
+Qualification binds final unchanged runner/source and subsequent regressions.
+Runner SHA2562d028ad3ceab9b49126108db177adc838cd7a386928b1cbb7bc32b4aaef02b63;
+runtime test SHA25678bbef5ae4b31c03fcde3ea3fffffbc793f714b86c8589ba5391aef7d0bab18d;
+DOM test SHA2568e659f71e1965d32aa4683a8235d3114128d4eb0b21abc3f27c25db2bc07c915;
+crates/tools diff SHA25626490c317eb5f9860fafe0836265f34097dc0ab74db71d392f373e2fddfe3c93.
+Cargo check, runner build and git diff --check pass with existing warnings.
+Root size check still reports six preexisting outside-vendor violations;
+baseline unchanged. No product Agent knowledge/authority impact, commit or push.
+All batch processes are terminal and the goal remains active.
+
+Next batch RED: `css1-linebox-after-reserved-lift-red-20261001/results.json`,
+full indices1203..1206, c44-ln-box-000..003,0/4. Current known families include
+css1=20, normal-flow=15, floats-clear=10, backgrounds=9. Continue with the
+four related CSS1 text-top/text-bottom/replaced line-box cases; use their
+current actual/expected PNGs and sources rather than merging unrelated fixes.
+
+### 2026-10-01 CSS1 mixed replaced/text line-box RED investigation
+
+No production candidate or failure-count reduction is claimed in this step.
+The four-case RED and pinned revision remain unchanged. New Chromium oracle
+in `css1-linebox-after-reserved-lift-red-20261001/chromium-oracle.json` and
+its PNGs verifies loaded Ahem and exact reference matches for all4 cases.
+This family has no observed browser/reference conflict.
+
+000 native div height130 vs browser160. Native text-bottom and text-top40px
+images both start118; browser starts105 and135. With font10/line20 Ahem,
+strut baseline13 includes half-leading5. Text-bottom constrains ascent38,
+text-top constrains descent32, so the mixed line is70px, not the max single
+40px image. Three ordinary20px lines plus that line and30px vertical edges
+give160. In001,90px image margin boxes produce opposite80px border-box
+separation: images100/180 and container240. In002/003, negative margins
+leave40px line struts: container260, image130 in both middle and -0.7em
+forms. These are measured browser facts, not reference-specific offsets.
+
+New `forced_break_mixed_replaced_text_edges_reserve_full_line_extents` is
+an executed unit RED. It uses loaded generic-serif metrics (height13 at10px)
+and a finite four-line text/image fixture, so expected opposite-edge image
+separation is27. Actual images are both55, separation0; parent stays130
+instead of required157. The first bare-image variant fails; a positive-margin
+variant is included but not reached before that assertion. Compilation
+completed in3m30, test exits101. `unit-red.json` preserves this distinction.
+
+Shared break: `project_forced_break_inline_block_alignment` only accepts
+pure atomic/whitespace rows, supports baseline/top/middle/bottom, and requires
+a baseline atomic. It skips mixed normal text with text-top/text-bottom
+images. `project_forced_break_lines` only accumulates max individual occupied
+height, so independently constrained ascent/descent are lost. Later global
+image/baseline heuristics can also overwrite a signed-offset image using a
+reference baseline from another forced line; this must not be fixed through
+painting masks or hardcoded coordinates.
+
+Next implementation should construct uniform-font, finite forced-line packets
+for leaf text and replaced images, reject unproven natural wrapping/nesting/
+floating/styled text paths, and solve each line's margin-box interval against
+the actual font strut. Middle and signed-length forms must use the same
+baseline, and resolved line packets must own alignment against subsequent
+single-line fallback passes. Retain existing pure-atomic and ordinary paths.
+Existing recursive forced-line height propagation should carry deltas through
+following blocks. Do not merely grow the outer container or hide red pixels.
+
+Only this test was added to source in the investigation. Production behavior,
+references and tolerances are unchanged since the accepted reserved-lift batch.
+No module check or current full-suite run is claimed. git diff --check passes;
+root size check still has six unrelated outside-vendor violations, no baseline
+change. Last accepted tracked failure count remains98, not a fresh6548 census.
+No commit/push or product Agent knowledge/authority change. Goal remains active.
+
+### 2026-10-01 natural mixed-image lines: c44-000/001 accepted
+
+This supersedes the preceding investigation's assumption that these four
+pages use forced breaks. The actual DOM has ordinary collapsed whitespace
+and natural wrapping. Candidate v1 passed the synthetic unit but remained
+0/4 in pixels: its forced-break-only eligibility rejected the real pages.
+The missing layout indices11/19/25 in000 are collapsed spaces, not BR nodes.
+
+`uniform_image_text_lines` now recognizes finite LTR leaf text/image line
+packets by their actual content-start wrap positions, skipping only missing
+collapsed normal/nowrap whitespace. Uniform font/line-height, passive text,
+no floats, static positioning, leaf shape and available-width guards remain.
+Per-line ascent/descent includes each image's full signed margin box against
+font text-top/text-bottom, middle or baseline/length constraints. The strut
+and independent image intervals determine line height; following lines and
+auto parent height use those resolved heights. The later global baseline
+fallback leaves these resolved packets alone. No paint masks, reference
+coordinates, glyph suppression, reference edits or tolerance changes.
+
+The final source fixture covers both forced breaks and natural collapsed
+whitespace, with bare images and positive vertical margins. It passes1/1;
+forced_break22/22, baseline28/28, vertical_align4/4, inline_background5/5,
+promoted_inline_line1/1 and mixed_font_inline_centering1/1 pass. Filters
+overlap; no full-unit-module closure or waiver of earlier module failures.
+
+Current receipts in target/wpt-targeted, suffix `-20261001/results.json`:
+
+| receipt prefix | passed | failed |
+|---|---:|---:|
+| css1-linebox-natural-final-v3 | 2 | 2 |
+| known-failures-after-natural-image-lines-v3 | 93 | 94 |
+| supplement-after-natural-image-lines-v3 | 1 | 2 |
+| first-line-after-natural-image-lines-v3 | 22 | 0 |
+| white-space-after-natural-image-lines-v3 | 111 | 0 |
+| linebox-after-natural-image-lines-v3 | 196 | 2 |
+
+000/001 reach exact0px from6520/12820. The known187 comparison has exactly
+these two fail->pass changes and zero pass->fail. Combined tracked190 is
+94 pass96 fail, down from98; it is not a fresh6548 census. Strict linebox
+sub/super failures remain unwaived. Qualification and unit receipts bind
+the fixed revision, dirty detached base and final source/runner identities.
+
+Final runner SHA256a73fc20548db1d5b5ed9f63288dedc7c61a85c74bb09a28f15e0754d33074d9e;
+crates/tools diff SHA256326af93b6645ddd6befe3bd16c79734d72adb483ae3fb015fa2f7d690c6b7b7d;
+runtime test SHA2568838083660e0bab100cc0820fd8aee58b3e0b57ff29063f2785a2545480dad8c.
+Runner build, runtime cargo check and git diff --check pass. Root size check
+still fails on six preexisting outside-vendor files; baseline unchanged.
+Temporary tree diagnostics were removed. No commit/push or product Agent
+knowledge/authority impact; all batch processes are terminal, goal active.
+
+Next RED remains002/003:23600/26400px. Their distinct negative-horizontal-
+margin path creates nested strut wrappers, outside the accepted leaf packet
+scope. In002 the two unsplit text leaves are700px wide inside280px; the
+image wrapper uses20px (40px content minus20px margins), omitting padding
+and border from its100px painted border box. Current parent height180
+and image x38/y92 disagree with browser height260 and image x138/y130.
+Fix wrapping and border-box line fitting in that lowering path first; do
+not merely relax the leaf guard or apply new vertical coordinates.
+
+### 2026-10-01 negative-margin replaced lines: c44-002/003 accepted
+
+The previous final receipt is002/003's RED:23600/26400px. New DOM RED
+`negative_margin_image_line_items_include_edges_and_text_breaks` proves
+the80px margin-box advance was20px (`Em(1)` at20px). Pre-wrapper word
+splitting and content-box padding/border accounting correct the finite
+px/em strut widths. Border-box widths do not get those edges added again.
+Plain edge-free text stays non-atomic so whitespace can collapse; later
+word splitting recognizes inline-flex and inline-table atomic siblings.
+
+Candidatev1 remained2/4, worsening002/003 to25600/41600px: wrapping spaces
+made six lines. Candidatev2 still2/4 (22800/41200); cumulative line fitting
+stopped recognizing images after their transparent strut wrapper. Runtime
+now accepts that internal sole-image wrapper in full-line space collapse
+and uniform text/image metric packets. Existing leaf/static/float/font/width
+guards remain. Candidatev3 reaches3/4;002 is0px,003 still26400px.
+
+003 exposes another executed DOM RED: authored `margin-top:-1.5em` at20px
+becomes `Px(10)` when `vertical-align:-0.7em` writes a synthetic line
+extension. CSSStyle and final computed-style lowering now preserve authored
+margins for atomic inline-block/flex/table boxes; baseline-offset metadata
+remains separate. Ordinary text's existing line extension is retained.
+`negative_vertical_align_keeps_atomic_authored_margins` becomes green.
+
+Finalv4 c44-000..003 is4/4, each exact0px. Current receipts in
+target/wpt-targeted, suffix `-20261001/results.json`:
+
+| receipt prefix | passed | failed |
+|---|---:|---:|
+| css1-negative-margin-final-v4 | 4 | 0 |
+| known-failures-after-negative-margin-v4 | 95 | 92 |
+| supplement-after-negative-margin-v4 | 1 | 2 |
+| first-line-after-negative-margin-v4 | 22 | 0 |
+| white-space-after-negative-margin-v4 | 111 | 0 |
+| linebox-after-negative-margin-v4 | 196 | 2 |
+
+Known187 changes exactly002/003 fail->pass, zero pass->fail. Combined
+tracked190 is96 pass94 fail, down from96 failures. This is not a fresh6548
+census; the strict linebox sub/super failures remain unwaived.
+
+DOM targeted filters pass vertical_align4, document negative_margin2,
+atomic_inline_sibling2, split_inline_words1, inline_padding_does_not_break1,
+inline_start_margin1. The expanded `negative_margin` filter found one
+separate CSSStyle assertion expecting `Em(4)` where the current character
+relative parser returns `Ch(4)`; it remains reported/unwaived, not module
+closure. Runtime forced_break22, baseline28, vertical_align4,
+inline_background5, promoted_inline_line1, mixed_font_inline_centering1,
+full_inline_image_line2 and each_full_inline_image_line1 pass. Filters
+overlap; earlier expanded runtime module failures are not waived.
+
+Qualification binds unchanged fixed revision/base, dirty vendor scope and
+the final runner/source identities. Runner build, runtime cargo check and
+git diff --check pass with existing warnings. Root size check still reports
+six outside-vendor violations, baseline unchanged. No reference/tolerance
+changes, clipping masks, product Agent knowledge/authority changes, commit
+or push. All batch processes are terminal; goal remains active.
+
+Next focused RED is `css1-replaced-inline-after-negative-margin-red-20261001`:
+index1202, c43-rpl-ibx-000,0/1 and1052px. Its current actual/reference PNGs
+and pinned source compare baseline replaced images with top-aligned Ahem
+text squares, including a larger-font variant. Continue from those current
+artifacts rather than the preceding c44 receipts.
+
+### 2026-10-02 mixed-font image/text line struts: c43 accepted
+
+Executed RED c43-rpl-ibx-000 is1052px. New unit
+`mixed_font_top_text_keeps_replaced_baseline_strut_descent` loads the pinned
+Ahem fixture and exercises15/60px replaced images with top-aligned text.
+The15px image plus parent font descent requires19px, not the previous18px.
+Finite image/text packets now account for each baseline text's own font
+strut, top-aligned text and image margin-box constraints. Pure image-only
+rows remain outside this path. Later fallback alignment is skipped only
+when actual projected text/image baselines agree, not by eligibility alone.
+
+Candidatev1 reached exact pixels but regressed two direct runtime callers.
+Both original assertions are preserved and restored in finalv2. Runtime
+baseline29, forced_break22, full_inline_image_line2, vertical_align4,
+inline_background5, promoted_inline_line1 and mixed_font_inline_centering1
+pass; filters overlap and are not full module closure.
+
+Finalv2 c43 plus c44-000..003 is5/5, all exact0px. Known187 is102/85;
+supplement3 is1/2. Seven fail->pass changes and no pass->fail changes:
+c43, c5502-mrgn-r, c5504-mrgn-l, c5505-mrgn, clear-inline-001,
+before-after-floated-001 and units-003. Combined tracked190 is103 pass87
+fail, down from94 failures. First-line22/22, white-space111/111 and
+linebox196/198 remain unchanged; strict sub/super failures are unwaived.
+
+Receipts use suffix `after-mixed-image-strut-v2-20261002`; target receipt
+is `css1-replaced-inline-final-v2-20261002/results.json`. Qualification
+binds the fixed revision, dirty detached base and source/runner/test hashes.
+Chromium141 corroborates geometry but test/reference has229 strict pixels
+of glyph-edge differences; this conflict is recorded, not waived or used
+to relax native exact0 acceptance. Runtime check, build and diff check
+pass with existing warnings. Root size check has the same six outside-vendor
+violations. No full6548 rerun, tolerance/reference edits, commit/push or
+product Agent knowledge/authority changes; all batch processes terminal.
+
+Next RED is c42-ibx-ht-000 at verified full-suite index1199,8160px, receipt
+`css1-inline-height-1199-red-20261002/results.json`. The earlier index1201
+probe was c43-rpl-bbx-002 (pass), not this RED. Actual c42 retains a290px
+inline span inside200px, while surrounding text is already word-fragmented;
+inspect nested decorated-inline fragmentation and line fitting next.
+Chromium141 oracle records both test/reference parent height60px; native
+test is70px and reference528px. Browser decorated span has three fragments
+150/190/110px, native keeps290px. `diagnosis.json` records both native
+geometry errors and the next shared lowering/line-fitting investigation;
+this next case remains RED, not repaired or waived.
+
+### 2026-10-02 nested inline text fragments: c42 accepted
+
+c42-ibx-ht-000's executed RED is8160px; the new painted-inline and bordered-
+inline DOM units both fail before their fixes. Static equal-font text with
+compatible painting now participates in the enclosing line. Edge-free
+background is retained on compatible leaves; bordered hosts retain only
+logical first/last horizontal edges and ignore vertical inline margins.
+Descendant line-height remains authored. Independent decoration, positioning,
+font metrics, group effects, rounded borders and explicit alignment remain
+guarded. A removed bordered host's strut must already be owned by the outer
+context. Seven guard variants pass alongside the new units.
+
+Candidatev1 fixes reference height528->60 but remains7900px. Candidatev2
+adds border fragmentation but an overbroad current-color guard prevents
+borderless reference flattening, so it remains6560px and is not accepted.
+Finalv3 applies that guard only to bordered hosts and aligns equal-font
+decorated text content baselines after accounting for top padding/border.
+Vertical decoration paints outside the line box instead of moving glyphs.
+Both native parents are60px, matching the Chromium oracle, and c42 is0px.
+
+Final target window1199..1206 is8/8 exact0; it also protects c42 padding,
+c43 and all four c44 cases. Known187 is103/84, supplement3 is1/2: exactly
+c42 fail->pass, no pass->fail. Combined tracked190 is104 pass86 fail.
+First-line22/22, white-space111/111 and linebox196/198 are unchanged.
+Strict sub/super failures and earlier expanded unit failures remain unwaived.
+
+Receipts have suffix `after-inline-fragments-v3-20261002`; target is
+`css1-inline-height-candidate-v3-20261002/results.json`, accepted by the
+known-suite qualification. DOM nested_inline5, split_inline5, background16,
+vertical_align4 and inline_padding1 pass. Runtime baseline29, forced_break22,
+inline_background5, full_inline_image_line2, vertical_align4,
+promoted_inline_line1 and mixed_font_inline_centering1 pass. Filters overlap;
+this is not a full unit-module run or a fresh6548 census.
+
+The fixed WPT checkout is clean at the pinned revision. Qualification binds
+dirty detached base and final source/runner/test hashes. Build, runtime check
+and diff check pass with existing warnings. Root size check still reports
+the same six outside-vendor violations. No upstream references, tolerances,
+product Agent knowledge/authority changes, commit or push.
+
+Next focused window is verified indices1238/1239, c548-ln-ht-003/004,
+`css1-inherited-line-height-red-20261002/results.json`: percentage/length
+line-height inheritance through a larger-font in-flow block between inline
+runs. Preserve the current RED before altering its lowering or metrics.
+
+### 2026-10-02 anonymous text wrapping: c548-003/004 accepted
+
+RED is10320/12320px. Computed inheritance is already correct: the larger
+font keeps40px for percentage line-height but becomes80px for unitless2.
+The actual break is an unconditional max-content/min-content width override
+for anonymous-block text, justified by a table-specific comment but applied
+to all anonymous blocks. The140px text does not wrap inside80px, leaving
+each before/after anonymous run40px high instead of80px.
+
+New pinned-font unit `anonymous_block_text_wraps_before_and_after_a_larger_font_block`
+executes RED (40 vs80) then green for both middle-line-height variants.
+Removing that override restores normal available-width measurement. No
+line-height parser or inheritance rule was changed. Chromium141 records
+test/reference outer heights246/326px and the middle block beginningy129;
+native geometry and target exact0 now agree.
+
+Target receipt `css1-inherited-line-height-candidate-v1-20261002/results.json`
+is2/2. Known187 becomes106/81, supplement3 stays1/2. Exactly three fail->pass
+changes: c548-003/004 and block-in-inline-margin-with-multi-line-text-before
+(6400->0px). No pass->fail changes. Combined tracked190 is107 pass83 fail,
+not a fresh6548 census. First-line22/22, white-space111/111 and linebox196/198
+remain unchanged; strict sub/super failures are not waived.
+
+Runtime anonymous25, baseline29, forced_break22, inline_background5 and
+vertical_align4 pass. Expanded `table` filter is99/106, with the same seven
+failures in a serial repeat. There is no pre-change binary comparison yet;
+these failures are explicitly recorded in `unit-regression-v1.json`, not
+classified as introduced/preexisting or waived. They are separate from83
+tracked WPT failures. No unit-module closure is claimed.
+
+Receipts use suffix `after-anonymous-wrap-v1-20261002`; qualification binds
+fixed revision, dirty detached base and final source/runner/test hashes.
+Build, runtime check and diff check pass with existing warnings. Root size
+check retains six outside-vendor violations. No tolerance/reference changes,
+product Agent knowledge/authority changes, commit or push. All batch processes
+are terminal and the full goal remains active.
+
+Next focused RED is `css1-inline-horizontal-edges-red-20261002/results.json`,
+four cases at verified full-suite indices1245/1257/1275/1288,150px each.
+Current actual/reference PNGs isolate a1px horizontal shift of the75px-tall
+I bar, not the margins/padding as a whole. Reference serif whitespace is4px
+plus25px image padding; test Ahem leaves a30px gap. Verify the same pinned
+sources in Chromium before changing spacing or claiming this is an engine
+bug. Do not mask the difference or change references/tolerances.
+Chromium141 verification now records527 strict differing pixels for each
+of these four test/reference pairs. Reference image geometry is identical
+to native:4px serif space plus25px padding puts the I atx142, while the test
+isx143. `diagnosis.json` records the observed strict-reference conflict;
+additional Chromium differences are glyph edges. The four remain in83
+tracked failures, unwaived. No spacing hack, tolerance or upstream edit was
+made. Continue renderer failures independently of this reference conflict.
+
+### 2026-10-02 marked Block image/text lines: partial float-width repair
+
+The authoritative tracked190 receipt before this batch is
+`known-failures-after-float-image-word-v2-20261002/results.json` plus its
+supplement:109 pass81 fail. This is not a fresh6548 census.
+
+For c5525-fltwidth-003, marked Block inline contexts now expose word breaks
+beside replaced content without changing their principal display. The DOM
+unit executes RED (2 children rather than5), then green with unmarked and
+nowrap guards. Pixel differences4504->2633 remain a failure.
+
+The shared image/text line solver also wrongly required Flex despite the
+same internal inline-context marker on retained Block boxes. New runtime
+unit `marked_block_image_text_wrap_uses_shared_line_struts` executes RED
+for Block, then green for both Block/Flex with an unmarked-box guard.
+Extending eligibility restores the shared strut on wrapped image/text
+lines; target differences2633->748. No fixed coordinate compensation is used.
+
+`css1-float-width-shared-strut-v2-20261002/results.json` is5/6; all five
+neighbors remain exact0. Known187 remains108/79 and supplement3 remains1/2,
+with zero status changes or pass->fail changes. Combined tracked190 remains
+109/81. First-line22/22, white-space111/111 and linebox196/198 are unchanged.
+The sub/super strict failures remain2199px each, unwaived.
+
+Runtime baseline29 and forced_break23 pass. Expanded image filter66/70 has
+the same four failure names as the prior batch; no pre-change binary
+counterfactual establishes their earlier origin. DOM image180/184 includes
+three failures and one ignored test; inline103/108 has five failures.
+The seven distinct DOM failures reproduce after reverting only this batch's
+Block guard and rebuilding. This proves no new failure from that guard,
+not their historical origin or module closure. No assertions were waived.
+
+The target remains748px RED. Next verify contextual glyph advances across
+split space/word boundaries, with fallback fonts and line-edge collapse.
+Chromium's paragraph height42px versus native36px remains unclosed too;
+native reference equality cannot by itself prove browser raster parity.
+Qualification and counterfactual receipts bind the dirty detached base,
+pinned revision and source/runner/unit hashes. No full6548 run, reference or
+tolerance edit, product knowledge/authority change, commit or push.
+
+### 2026-10-02 shared word shaping: three strict WPT failures cleared
+
+For c5525-fltwidth-003, independent space/word shaping loses contextual
+kerning. Sharing cluster advances before line fitting reduces748->120px,
+but advances alone omit the glyph offsets allocated by the shaping engine.
+The new `inline_shaping` module distributes complete per-line font-stack
+glyph slices to the existing clients, retaining their paint order, clips,
+scroll delta and original run coordinates. Only compatible plain LTR word
+fragments participate; authored edges, font/style changes, transforms,
+cluster cuts and the deterministic Ahem/monospace paths retain their
+existing handling. No fixed coordinate correction or glyph suppression.
+
+The original total-width-minus-isolated-word assertion conflated logical
+advance origin and glyph offset. Its log is retained but explicitly
+superseded, not used as a valid box-origin oracle. The corrected integration
+test checks cluster advances with kerning normal/none. A separate nonblank
+RGBA test proves whole-run versus sliced-glyph equality for both kerning
+settings, integer/fractional origins and two separately shaped lines.
+Its first fixture used the native default white text on white canvas and
+failed the nonblank guard; explicit black fixes the fixture without relaxing
+that guard. Both integration/boundary tests and the final raster test pass.
+
+Target `css1-float-width-shared-glyphs-v4-20261002/results.json` is6/6 exact0.
+Known187 becomes111 pass76 fail; supplement3 stays1/2. Three fail->pass:
+c5525-fltwidth-003, float-003 (9562->0), position-static-001 (65->0).
+The two collateral passes also have standalone focused green receipts.
+Combined tracked190 is112 pass78 fail, not a fresh6548 census.
+
+There are no pass->fail changes, but existing floats-029 worsens96->161px
+and is not waived. Chromium141 still produces strict0 for its pinned pair.
+Fresh native dump places its96px float aty=-1 and text atx96,y0. Next
+investigate the float font-strut origin and the existing internal float-text
+0.25px spacing adjustment before moving to c5526-fltclr-000 (25015px RED).
+Do not describe this batch as universally regression-free.
+
+White-space111/111, first-line22/22, linebox196/198, runtime baseline29 and
+forced_break23 remain unchanged. Runtime image66/70 retains the same four
+unwaived failures; earlier DOM/table failures also remain unwaived. No full
+unit-module or6548 run. Build/check/diff checks pass with existing warnings;
+root size check retains six outside-vendor violations.
+
+Qualification records tracked source diff plus the new untracked module's
+own SHA256, final runner/unit hashes and all stage receipts. Native reference
+equality does not close the earlier Chromium paragraph-height gap or prove
+browser-wide raster parity. Renderer-only work changes no product Agent
+knowledge/authority semantics. No upstream/tolerance edit, commit or push;
+the full goal remains active.
+
+### 2026-10-02: float strut origin and solid-background fragment shaping
+
+Pinned revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+`floats-029` now passes strict native reference comparison: 161 → 0 pixels.
+Internal float markers no longer add an unauthored 0.25px word advance;
+late same-line floats use resolved font height when calculating half-leading.
+Compatible solid-background word fragments share contextual shaping while
+retaining their individual background paint. Authored edges/images remain
+shaping barriers. The intermediate `clear-inline-001` regression (65 pixels)
+and missing-background candidate (1120 pixels) were rejected; final strict
+comparison is 0 pixels. No reference or tolerance changes were made.
+
+Final known batch is 114/187 passed, supplement 1/3 passed: **75 failed of
+190 tracked cases**, not a fresh 6548-case census. Three failures turned green
+(`box-generation-001`, `box-generation-002`, `floats-029`), no pass turned red
+and no existing failure worsened. `floats-030` improved 1100 → 908 but remains
+failed. Guards retain first-line 22/22, white-space 111/111, linebox 196/198
+(two unwaived failures), float-width neighbors 6/6.
+
+Final runtime checks: shaping 2/2, internal-float 2/2, authored-boundary 1/1,
+baseline 29/29, forced-break 23/23. Expanded `inline_` filter is 207/224 and
+image filter 66/70; their failures are unwaived, with origin not established
+by a pre-change binary comparison. Module/full-suite completion is not
+claimed. The inert-parser fixture was corrected to assert relative block
+origin rather than an assumed zero page margin; original RED logs remain.
+
+Qualification and exact source/binary identities:
+`target/wpt-targeted/floats029-strut-spacing-candidate-20261002/qualification.json`.
+Final WPT receipt folders end in `after-colored-background-v3-20261002`.
+Both runner and runtime unit builds passed with existing warnings; diff
+check passed. Root size check retains the same six outside-vendor violations.
+No product Agent knowledge/authority change, commit or push. Next existing
+RED is `c5526-fltclr-000` (25015 pixels); full 6548 rerun remains pending.
+
+### 2026-10-02: block text leaves share sibling float bands
+
+`c5526-fltclr-000` passes strict native comparison: **25015 → 0 pixels**.
+Text-only Block leaves were missing from the shared float line solver. They
+now use preceding sibling float exclusions without replacing their border
+box or resolving margins twice. First/last paragraphs are 90/135px and the
+container is 651px, matching Chromium geometry. Float children are preindexed
+so each text leaf does not rescan all ordinary siblings; no measured speedup
+is claimed. New unit RED→GREEN proves line widths/height and overflow-BFC
+isolation.
+
+Final tracked batch: 115/187 plus supplement 1/3, **74 failures of 190**.
+Only this target changed status/pixels, with no pass→fail or pixel worsening.
+The indexed and initial candidates have identical case statuses/pixels.
+Guards: first-line 22/22, white-space 111/111, linebox 196/198 (two unwaived),
+CSS1 float/clear neighbors 16/16. Runtime: new unit 1/1, internal-float 2/2,
+shaping 2/2, authored-boundary 1/1, baseline 29/29, forced-break 23/23.
+Float filter 106/109, inline filter 207/224 and image filter 66/70 remain
+unwaived; inline/image failure names match the previous batch. No historical
+origin or full-module pass is claimed for those failures.
+
+Chromium test/reference still differs by 277 edge pixels; it is a geometry
+oracle, not a raster pass. Native root/body heights remain 969/945 versus
+reference 709/685 outside the 600px viewport, also unclosed. Target WPT green
+does not establish whole-page browser parity. Neither reference nor tolerance
+was changed. Final qualification:
+`target/wpt-targeted/css1-clear-indexed-block-text-20261002/qualification.json`.
+Final WPT receipt folders end in `after-indexed-block-text-float-20261002`.
+Builds and diff check passed; root size retains six outside-vendor violations.
+No product Agent knowledge/authority change, commit or push. Full 6548 rerun
+remains pending; next RED is `floats-030` (908 pixels).
+
+### 2026-10-02: shared image/text packets retain authored baseline offsets
+
+`floats-030` passes strict native comparison: **908 → 0 pixels**. Its
+reference's numeric vertical-align text was rejected by the shared line
+solver, then a fallback baseline pass lost its 20px lift. Compatible text now
+participates with its computed baseline offset, including ascent/descent and
+the baseline-equivalence check. Images use the same offset helper. Authored
+padding/border and multiline barriers remain unchanged.
+
+New unit RED→GREEN covers ±20px and ±80px shifts, image/text baseline
+equivalence and line-box expansion. Native test/reference text is now at
+y=173, matching both Chromium pages; Chromium test/reference diff is 0.
+This is not a browser-wide or cross-engine raster parity claim.
+
+Final tracked batch: 116/187 plus supplement 1/3, **73 failures of 190**.
+Only this target changed status/pixels; no pass→fail or failed-pixel worsening.
+First-line 22/22, white-space 111/111, float neighbors 7/7 pass. Linebox remains
+196/198 with identical statuses/pixels and two unwaived failures. Runtime
+baseline 30/30 includes the new unit, forced-break 23/23, internal-float 2/2,
+block-text leaf 1/1, shaping 2/2, authored-boundary 1/1, image-text filter 2/2.
+Float 106/109, inline 207/224 and image 67/71 remain unwaived with the same
+failure names as the previous batch; image also includes the new passing unit.
+No full module or full 6548 suite pass is claimed.
+
+Qualification:
+`target/wpt-targeted/floats030-baseline-offset-candidate-20261002/qualification.json`.
+Final WPT receipt folders end in `after-packet-baseline-offset-20261002`.
+Builds and diff check passed; root size retains six outside-vendor violations.
+The previous clear-case outer root/body geometry gap remains unclosed. No
+product Agent knowledge/authority change, upstream/tolerance edit, commit or
+push. Next RED is `c544-valgn-001` (2235 pixels); the full goal remains active.
+
+### 2026-10-02: retain alignment boundaries inside unbroken words (partial)
+
+`c544-valgn-001` remains **failed**, improved **2235 → 1890 pixels**.
+Paint-equivalent DOM text merging no longer discards differing vertical-align
+keywords/lengths. The DOM unit has a valid RED→GREEN and a same-alignment merge
+control. A DOM-only intermediate worsened to 2280 pixels and was rejected:
+restored fragments were still baseline-aligned inside a synthetic unbroken
+word wrapper. Shared image/text packets now consume its styled text leaves,
+retaining the word wrapper and horizontal fitting. First-row text positions
+are y=50/68, last-row percentage/baseline positions y=265/275, matching Chromium.
+
+New runtime unit passes, but no pre-change unit RED was run. Its initial Ahem
+fixture used an unregistered font and assumed zero half-leading; that invalid
+oracle was replaced with host-serif resolved metrics and the original log is
+retained. Only test code changed after the final runner build; production code
+is unchanged. Chromium test/reference retains 17 unwaived pixels. None of this
+closes nested large-font alignment or establishes browser-wide raster parity.
+
+Tracked batch remains 116/187 plus supplement 1/3: **73 failures of 190**.
+No statuses changed, no other failure's pixels changed/worsened. Guards:
+first-line 22/22, white-space 111/111, linebox 196/198 (two unwaived), CSS1
+neighbors 5/6 (only the target fails). DOM fragment 16/16; inline 104/109 and
+image 186 passed/4 failed/1 ignored remain unwaived. Runtime baseline 30/30,
+forced-break 23/23, image-text 3/3, internal-float 2/2, block text 1/1, shaping
+2/2 and authored-boundary 1/1 pass. Float 106/109, inline 207/224 and image
+68/72 retain the previous failure names, unwaived. No module/full-suite closure.
+
+Partial-stage receipt:
+`target/wpt-targeted/css1-vertical-align-word-candidate-20261002/qualification.json`.
+Final WPT receipt folders end in `after-word-alignment-boundaries-20261002`.
+Builds/diff check passed; size check retains six outside-vendor violations.
+No product Agent knowledge/authority change, reference/tolerance edit, commit
+or push. Continue this target's nested 30px inline strut and parent-font
+baseline semantics; full 6548 rerun remains pending.
+
+### 2026-10-02 nested inline parent-font struts: c544 accepted
+
+`css/CSS2/css1/c544-valgn-001.xht` now passes strict native pixels:
+fresh RED 1890 pixels, candidate 0 pixels. The new bounded single-line
+`inline_line_metrics` path includes authored nested inline font struts and
+uses the direct parent's font metrics for text-top/text-bottom/middle;
+synthetic word wrappers remain transparent. Unsupported, wrapped, decorated
+or independent formatting contexts retain their previous path. No reference,
+tolerance or paint mask was changed. Target row geometry now matches the
+previously recorded Chromium geometry; Chromium's own 17-pixel reference
+difference is still unwaived and is not a browser-wide acceptance claim.
+
+Runtime new unit passed (six alignment keywords times three nested baseline
+offsets); image_text 3/3, baseline 30/30, forced_break 23/23 passed.
+Neighbors 6/6, firstline 22/22 and whitespace 111/111 passed.
+Linebox raw sweep was 195/198: two existing sub/super pixel failures and one
+document-load timeout. The timeout case inline-negative-margin-001 passed
+in a separate jobs=1 retry after compilation finished. Both receipts remain;
+this is not a claim that the original sweep was green.
+
+Known187 is now 117 passed /70 failed; supplement remains 1 passed /2 failed.
+Combined tracked190 is 118 passed /72 failed, with only c544 changing status.
+This is a focused census, not a new full6548 result. Earlier module failures
+and off-viewport height gaps remain unwaived. Build passed; diff check passed;
+root size check has six pre-existing outside-vendor violations, unchanged.
+Renderer-only work does not alter product Agent knowledge or authority.
+No commit or push. Continue remaining known failures before full6548.
+
+Receipt: `target/wpt-targeted/css1-nested-inline-strut-candidate-20261002/qualification.json`.
+
+### 2026-10-02 inline SVG CSS viewport: three strict failures closed
+
+Inline SVG layout already resolved percentage dimensions to the CSS-used
+content box, but painting rasterized the retained document at its intrinsic
+dimensions before stretching it. Root percentages and viewBox therefore
+resolved against the wrong viewport. Paint now normalizes only root SVG
+width/height to the CSS content viewport, preserving viewBox, descendants,
+event IDs and other attributes. The normalized source includes viewport
+dimensions in the existing parse/raster cache identity. External SVG image
+decoding retains its separate intrinsic sizing path.
+
+Skia, CPU and GPU use a shared content-box helper with all four independent
+border edges. Pointer hit testing uses the same normalized viewport and
+content-box origin; no continuous native click journey was run this batch.
+
+Fresh percentage RED was 1800/1200 pixels. The margin/padding/border case's
+prior bound known receipt was 2800 pixels. All three are now strict zero;
+five neighboring cases passed, and all 19 SVG-path cases selected from the
+fixed full6548 manifest passed. SVG module units passed 24/24, including
+viewport dimension/cache and independent border-edge regressions. Nested
+inline strut unit 1/1, image_text 3/3 and baseline 30/30 passed.
+Runner build and explicit Skia/CPU/GPU cargo check passed.
+
+Known187 is 120 passed /67 failed; supplement remains 1 passed /2 failed.
+Combined tracked190 is 121 passed /69 failed. Status comparison found only
+the three SVG cases improving, no regressions. This is not full6548 closure;
+earlier module failures and off-viewport height gaps remain unwaived.
+
+This batch also retained fresh nonzero RED/browser-oracle artifacts without
+changing semantics: vertical-align-sub native2199 /Chromium2175 pixels;
+inherit-computed native144 /Chromium168; c5502-imrgn-r-003 native150
+/Chromium527. Browser nonzero is not a waiver or proof of native parity.
+Do not suppress overlapping glyphs, change inherited currentColor semantics,
+or add one-pixel offsets merely to force those old references green.
+
+Receipt: `target/wpt-targeted/svg-percent-candidate-20261002/qualification.json`.
+Diff check passed; root size gate still reports six existing outside-vendor
+violations. Renderer-only work does not change product Agent knowledge or
+authority. No reference/tolerance modification, full6548 run, commit or push.
+
+### 2026-10-02 contained clear margins and settled border-box heights
+
+Fresh RED: margin-collapse-165/166 each 2922 pixels. Chromium141 is strict
+zero for 165. The first in-flow clearing block after floats must preserve
+its normal-flow top margin when the parent's border/padding or independent
+BFC prevents parent/child margin collapse. Clearance compares that position
+with the matching float bottom; it must not discard the contained margin.
+
+The first candidate corrected positioning but worsened both WPTs to 22763
+pixels and is explicitly not qualified. Its new unit exposed a second defect:
+float/clear automatic-height settlement omitted the parent's bottom border.
+Ordinary single-child wrappers also retained the discarded provisional
+floated-stack height, inflating table rows. The final path includes resolved
+bottom edges and propagates settled heights through eligible wrappers before
+table row/cell reconciliation. Both WPTs are now strict zero, including the
+script-driven border mutation in 166. No fixture or reference offset was used.
+
+New unit checks margins16/32/64 and automatic border-box height: final pass;
+its recorded first-candidate failure was 45px vs48px for margin16. Baseline
+30/30 and image_text3/3 pass. Wider runtime guards are NOT all green:
+clear43/45 (two font-position assertions unwaived), float107/110 (three
+retained failure names unwaived), table99/106 (seven unwaived). Their earlier
+origin is not asserted solely from a prior binary or old green receipt.
+
+The pinned float-clear/margin subset is78/82; only the four existing multicol
+float fragmentation cases fail, unchanged1710/2850 pixels. Fresh multicol
+window is4/8 and remains open; CSS column parsing/fragmentation is not yet
+implemented, and no coordinate-only substitute was added. Table overflow
+window remains5/9; its 003 native/browser reference differences are both800
+pixels, with the existing negative-margin unit passing. That comparison is
+diagnostic evidence, not a waiver or closure of the four table failures.
+
+Known187 is122 passed /65 failed; supplement remains1 passed /2 failed.
+Combined tracked190 is123 passed /67 failed. Only165/166 changed status;
+all still-failed known pixel counts are unchanged. Full6548 remains pending,
+as do wider module failures and the earlier off-viewport height gaps.
+
+Receipt: `target/wpt-targeted/table-cleared-margin-v2-20261002/qualification.json`.
+Build/diff checks passed. Root size gate retains six existing outside-vendor
+violations. No product Agent knowledge/authority impact, reference/tolerance
+change, commit or push. Continue known failures, including real Multicol
+capability, before the final full6548 census.
+
+### 2026-10-02 positioned split-inline stacking ownership
+
+Fresh RED for zindex-affects-block-in-inline was10000 pixels. The passive
+relative-inline lowering transferred offsets to the split block children and
+dissolved the inline, discarding its authored stacking context. An explicit
+z-index (including0) now prevents this offset-distribution optimization;
+the positioned inline retains its semantic owner and child ancestry. This
+does not copy the host z-index to each descendant or alter paint ordering.
+
+New DOM unit RED demonstrated loss of the negative-z host; final variants
+-1/0/2 retain their owner. Split-relative4/4 and split_inline5/5 pass. Broader
+DOM inline is105/110, with the same five failure names as the preceding
+batch, unwaived. Runner build passed. Original WPT is strict zero; Chromium
+is also strict zero. Fixed stacking-context subset7/7 passed.
+
+Known187 is123 passed /64 failed; supplement1 passed /2 failed. Combined
+tracked190 is124 passed /66 failed, with only this z-index case improving
+and no changed pixel counts among still-failed known cases. Full6548 and
+whole-module closure remain pending. Root size gate has six unchanged
+outside-vendor violations; diff check passed. No product Agent knowledge or
+authority impact, reference/tolerance modification, commit or push.
+
+Receipt: `target/wpt-targeted/block-in-inline-stacking-candidate-20261002/qualification.json`.
+
+Next entry already reproduced: anonymous-boxes-001a remains10000 pixels in
+`target/wpt-targeted/anonymous-percentage-image-red-20261002/results.json`.
+Its authored containing block is200px high, but the image with height50%
+under a synthetic anonymous block line is0x0. Inspect DOM marker
+`--w3cos-internal-anonymous-block-line` and build_taffy_tree's definite-height
+basis handoff; anonymous boxes must not replace the CSS percentage containing
+block. No fix to that path has been applied in this batch. Separately, fresh
+position-relative-035 RED still1600 pixels and retains its previously recorded
+browser/font wrapping mismatch; no compensating coordinate change was made.
+
+### 2026-10-02 anonymous block percentage containing-block resolution
+
+Fresh anonymous-boxes-001a RED was10000 pixels: its height50% image became0x0
+under a synthetic anonymous line, although the authored containing block has
+height200px. build_taffy_tree now forwards the definite height basis through
+only `--w3cos-internal-anonymous-block-line` wrappers and resolves a qualifying
+child's percentage size against that CSS containing block. The anonymous
+wrapper itself remains automatic. Ordinary authored auto-height wrappers
+still break the definite-height chain; non-replaced inline and absolute/fixed
+children do not acquire this anonymous-row size override.
+
+New unit covers one/two anonymous wrappers and an authored auto-height control.
+Original WPT RED preceded the change; the new unit was not run before the fix.
+Unit passes; anonymous26/26, baseline30/30, non-replaced inline-height1/1 pass.
+Percentage23/24 retains the previously recorded fixed table percentage column
+unit failure, unwaived. Both adjacent original WPT cases pass strictly at0.
+
+Known187 is124 passed /63 failed; supplement1 passed /2 failed. Combined tracked
+190 is125 passed /65 failed. Only anonymous-boxes-001a improved; there are no
+status regressions or pixel changes among still-failed known cases. This is
+not a new full6548 census or whole-module closure. Runner/test builds and diff
+check passed. Root size gate retains six existing outside-vendor violations.
+No reference/tolerance changes, product Agent knowledge/authority impact,
+commit or push. Receipt:
+`target/wpt-targeted/anonymous-percentage-image-final-20261002/qualification.json`.
+
+Next focused RED: inline-replaced-width-001 remains768 pixels in
+`target/wpt-targeted/inline-replaced-auto-margin-red-20261002/results.json`.
+Its96x96 image at11,71 agrees with the reference. The following orange block
+starts at171, versus the reference image at167. Check linebox/br baseline
+handling before changing the already correct intrinsic size or auto margins.
+
+### 2026-10-02 replaced baseline strut at a forced break
+
+Fresh inline-replaced-width-001 RED was768 pixels. The source image/auto
+margin geometry was already correct. Native reference continuation after br
+started at167 instead of Chromium's171: the completed replaced baseline line
+lost its parent strut descent. project_forced_break_lines now includes that
+font-derived descent below a baseline-aligned replaced bottom margin edge.
+Top/middle/bottom alignment and explicit vertical-align lengths retain their
+existing paths; there is no fixed4px coordinate compensation.
+
+Original WPT is now strict0, as is Chromium141. New unit covers two font sizes,
+two line heights and baseline/top controls (eight variants). Its first run
+was after the fix; original pinned WPT RED and browser/native geometry are
+the pre-change failure proof. Runtime forced_break24/24, baseline31/31 and
+image_text3/3 pass. White-space111/111 passes.
+
+Known187 is125 passed /62 failed; supplement1 passed /2 failed. Combined
+tracked190 is126 passed /64 failed, only inline-replaced-width-001 improves,
+and still-failed known pixel counts are unchanged. This does not cover the
+full6548. Linebox raw is195/198: unchanged sub/super2199-pixel failures plus
+an inline-negative-margin-001 document-load worker error. A separate jobs1
+retry also timed out. Both raw receipts are retained; this execution error
+remains unresolved and unwaived, not an inferred196/198 or passing sweep.
+
+Runner/test builds and diff check pass. Root size gate retains six existing
+outside-vendor violations. No product Agent knowledge/authority changes,
+reference/tolerance changes, commit or push. Receipt:
+`target/wpt-targeted/replaced-forced-break-strut-candidate-20261002/qualification.json`.
+
+Next pixel entry has fresh native322 / Chromium0 evidence:
+`target/wpt-targeted/block-inline-relative-float-red-20261002/results.json`.
+It covers a relative inline with a float between split block children.
+Also investigate the repeatable inline-negative-margin worker load error.
+Separately quotes-036 retains native2559 and Chromium2968 reference pixels;
+that browser diagnostic is not a waiver or authorization to alter references.
+
+### 2026-10-02 relative split-inline floating fragment visual offset
+
+Fresh block-in-inline-float-between-001 RED was322 pixels, Chromium141 strict0.
+The float stayed at x8 while the relative ancestor's paint should place it
+at108. Passive split-inline lowering incorrectly required ordinary inline
+text before forwarding that offset to a floating fragment. It now always
+forwards the ancestor's fixed visual offset, retaining the float's flow
+coordinates and its own authored relative positioning. This preserves the
+explicit-z stacking-owner guard from the earlier batch.
+
+New DOM unit had valid RED (translate_x0 vs expected40) and now passes for
+with/without ordinary inline text, checking y12 and preserved authored left7.
+A prior unit encoded the incorrect zero visual translation. Browser/original
+WPT evidence justifies correcting it to100, while its static-flow assertion
+and source-order checks remain. Split-relative5/5 and split_inline5/5 pass.
+Broader DOM inline106/111 retains the same five recorded failure names,
+unwaived. Native target is strict0; stacking-context7/7 passes.
+
+Known187 is127 passed /60 failed; supplement1 passed /2 failed. Combined
+tracked190 is128 passed /62 failed. Both block-in-inline-float-between-001
+and float-inside-inline-between-blocks-1 improve, no tracked status regresses,
+and still-failed pixel counts are unchanged. No new full6548 or whole-module
+closure is claimed. Runner build and diff check pass; root size gate retains
+six existing outside-vendor violations. No product Agent knowledge/authority
+impact, WPT reference/tolerance changes, commit or push.
+
+The previous inline-negative-margin document-load error passed in two idle
+jobs1 runs: once before the DOM fix with the prior executable and once after
+the runner build with the final executable. Earlier failing retries overlapped
+other compilation/test work. This suggests load sensitivity but does not prove
+its exact cause; no loader fix or deadline relaxation was made. Raw sweep and
+both previous error receipts remain, and execution stability is not closed.
+
+Receipt: `target/wpt-targeted/block-inline-relative-float-candidate-20261002/qualification.json`.
+Next focused RED is text-align-justify-with-overflow native612 / Chromium0:
+`target/wpt-targeted/justify-zero-width-overflow-red-20261002/results.json`.
+Native zero-width/indent DOM lowering splits the justified second block into
+word leaves but leaves the reference as one constrained text leaf. Inspect
+the text-indent/justify lowering and overflow line constraints before changing
+font metrics or drawing coordinates.
+
+### 2026-10-02 finite narrow text widths and justify first-line indent
+
+Fresh text-align-justify-with-overflow RED was612 pixels, browser reference0.
+The justify-only normalization converted a flex-backed paragraph's first-line
+indent into a child margin and thereby changed subsequent word splitting.
+It now keeps the inherited paragraph indent like the non-justified path.
+Public text wrapping also no longer treats finite widths0 through1 as an
+unbounded/no-wrap sentinel. Unbreakable NBSP words overflow intact while
+ordinary spaces still break; the narrow character-estimation pre-wrap path
+explicitly retains preserved spaces. No arbitrary positional compensation.
+
+Final original WPT passes strictly at0. Both zero-width block boxes are36px
+high at8,8 and8,44, matching browser geometry and its first-line-only50px
+indent. New unit covers widths0/0.5/1, measured/character/first-line/banded
+paths, normal/pre-line/pre-wrap controls, nowrap/pre and infinite-width
+controls. Unit first ran after the fix; original WPT RED is pre-change proof.
+Final runtime text_layout36/36, baseline31/31, forced_break24/24, indent4/4,
+image_text3/3 pass. Unchanged DOM source indent5/5 passes. The text_indent
+runtime filter matched0 and is not counted as test coverage. Explicit
+dynamic-js/skia/gpu/cpu-render compile check passes.
+
+Final known187 is128 passed /59 failed; supplement1 passed /2 failed. Combined
+tracked190 is129 passed /61 failed. Only this target improves, with no tracked
+status regressions or changed still-failed pixel counts. White-space111/111.
+Final sequential jobs1 linebox196/198 has only the unchanged sub/super2199-pixel
+failures and no worker error. The earlier candidate jobs2 sweep195/198 still
+includes the repeated inline-negative-margin document-load timeout; preserve
+that raw receipt. No loader patch or timeout-budget increase was made, and
+parallel execution stability is not closed. All builds finished before final
+WPT execution, and final suites did not overlap each other.
+
+Additional direct native-versus-Chromium141 fullRGBA comparison still gives
+928 differing pixels for this target, despite correct block geometry and0
+native/reference plus0 browser/reference results. This is separate unresolved
+evidence, not a browser-pixel-identity claim or permission to relax tolerance.
+Investigate actual font/glyph paint metrics and raster differences without
+masking or shifting the now-correct containing-block geometry.
+
+Receipt: `target/wpt-targeted/justify-zero-width-overflow-final-20261002/qualification.json`.
+Next WPT entry is inlines-002 native2337 / Chromium0 in
+`target/wpt-targeted/nested-inline-font-inherit-red-20261002/results.json`.
+Check explicit font:inherit against strong's UA font weight, then nested
+inline painting; that source hypothesis is not yet a verified fix.
+No full6548/whole-module closure, reference/tolerance change, product Agent
+knowledge/authority impact, commit or push. Root size gate retains six
+existing outside-vendor violations; diff check passes.
+
+### 2026-10-02 explicit font inheritance over UA defaults
+
+Original inlines-002 RED2337 / Chromium141 reference0 is now strict WPT0.
+The explicit author font:inherit previously retained strong's UA weight700
+instead of inheriting its parent's weight. Computed styling now honors the
+winning valid font/longhand inherit or unset declaration over UA defaults,
+without overriding a later winning longhand. Inherited absolute line height
+is preserved when a later font-size changes the child's ratio denominator.
+No nested-decoration coordinate compensation was necessary for this target.
+
+New unit ran RED (strong700 vs parent300), then passed; covers strong/em/h1/pre,
+inherit/unset, later weight600 and parent40px line height with child30px font.
+Current DOM font50/50 and line_height18/18 pass. Broader inherit56/57 retains
+stroke_only_svg_inherits_color_and_explicit_size_through_button_host failing
+with lib.rs232 empty-child indexing; this name also exists in the historical
+failure inventory above, but it is not waived or reported green.
+
+Runner build passes in112s. Fresh sequential jobs1 known187 is129/58 and
+supplement3 is1/2: combined tracked190 is130 passed /60 failed. Only inlines-002
+changes status, with no other status or still-failed pixel-count changes.
+No full6548 census, white-space/linebox replay or rebuilt runtime-unit proof
+is claimed for this batch. Build and WPT workers did not overlap.
+
+Direct native actual versus preserved pinned-revision Chromium actual remains
+835 strict RGBA pixels different despite native/reference0 and browser/reference0.
+This is unwaived; browser pixel identity remains unproven, independently of
+the earlier zero-width target's928-pixel discrepancy. Preserve both artifacts.
+
+Receipt: `target/wpt-targeted/nested-inline-font-inherit-candidate-20261002/qualification.json`.
+Next fresh RED: inline-block-valign-001 native514 / Chromium0 at
+`target/wpt-targeted/inline-block-valign-red-20261002/results.json`.
+Investigate last in-flow line baseline through a hidden block child and table
+bottom alignment; the source hypothesis is not yet a verified fix.
+No reference/tolerance change, product Agent knowledge/authority impact,
+commit or push. Size gate retains six existing outside-vendor violations.
+
+### 2026-10-02 table row-group height and margin-box vertical alignment
+
+Fresh inline-block-valign-001 RED514 / Chromium141 reference0 is now strict
+WPT0. The outside text and last inline-block line already shared a baseline;
+the containing table was the actual discontinuity. Definite grid height now
+reaches automatic tbody/thead/tfoot and their rows. Cell valign attributes
+participate as author presentational hints below authored vertical-align.
+Height/hint-only candidate still failed514: its cell stretched to200px but
+paragraph content remained at the top. The final cell alignment projects
+direct block child margin boxes instead of skipping cells with margins.
+No fixed text-coordinate adjustment, reference change or tolerance relaxation.
+
+Height unit ran RED (table96px, row group/row/cell19.2px), then passed six
+Table/InlineTable and row/header/footer-group variants. Cell hint unit ran RED
+(bottom remained Center), then passed keyword/case/author-override controls.
+Margin unit passes middle/bottom, margin0/16px and repeated-pass idempotency;
+it was added after the candidate fix, with original and intermediate WPT RED
+as pre-change failure proof. Only new-test whitespace was formatted after
+unit builds; production logic did not change thereafter. Final runner uses
+the final source and builds in123s before any final WPT workers start.
+
+Runtime baseline31/31 passes; runtime table101/108 retains seven failures,
+same names as the height/hint candidate. DOM font50/50 passes; DOM table50/53
+retains three failures. These module failures are unwaived and fully listed
+in the receipt, not counted as green module closure. Relevant pinned WPT
+table-height/vertical-align guards pass25/25 both before and after the fix.
+Fresh sequential jobs1 known187 is130 passed /57 failed; supplement3 is1/2:
+combined tracked190 is131 passed /59 failed, with no status regressions.
+Only inline-block-valign-001 closes. Still-failed s-11-1-1b-002 improves1000
+to800 pixels but remains failed. All other still-failed pixel counts match.
+
+Direct native actual versus preserved Chromium actual still differs1408
+strict RGBA pixels. Native table height204/cell x10 remains different from
+browser height200/cell x11; browser pixel identity is not proven or waived.
+Final actual/reference layout dumps and the comparison artifact are retained.
+No fresh full6548 census or white-space/linebox replay is claimed here.
+
+Receipt: `target/wpt-targeted/inline-block-valign-final-20261002/qualification.json`.
+Next fresh RED and Chromium reference0: inline-table-002a at
+`target/wpt-targeted/inline-table-first-row-red-20261002/results.json`.
+Investigate export of the first table-row baseline when its cell contains
+visible first-line text followed by a hidden block; this is not yet fixed.
+No product Agent knowledge/authority impact, commit or push. Size gate
+retains six existing outside-vendor violations; diff check passes.
+
+### 2026-10-02 inline-table first-row baseline export
+
+inline-table-002a RED196 / Chromium141 reference0 now passes strict WPT0.
+Unadorned in-flow inline-tables export their first row's first in-flow text
+baseline, including hidden content; decoration is no longer a prerequisite.
+Baseline sibling correction uses font ascent and overlapping vertical bands,
+not a fixed pixel adjustment. Floats and positioned tables are excluded.
+
+Original unit RED y34 versus16 is retained. Final portable embedded-Inter unit
+passes eight font-size/line-count/hidden-child combinations and idempotency.
+Expanded variants were added after the initial RED. Earlier unloaded-Ahem
+fixture failure and interrupted compilation logs are preserved; the resumed
+portable build passed in215s. Existing padded-cell fixture heights were
+corrected from zero to realistic18/90px without changing expected baselines.
+Runtime baseline31/31 passes; table102/109 retains the same seven unwaived
+failure names as the preceding batch. Runner build passes in127s.
+
+Sequential jobs1 inline-table guards improve11/15 to12/15; table-height guards
+remain25/25. Known187 is131/56 and supplement3 is1/2: tracked190 now132 passed
+/58 failed. Only inline-table-002a changes status; no regressions or other
+still-failed pixel changes. Builds and final WPT suites did not overlap.
+
+Direct native versus Chromium actual remains113 strict RGBA pixels different,
+unwaived. This is not browser pixel identity or fresh full6548 closure.
+Receipt: `target/wpt-targeted/inline-table-first-row-final-20261002/qualification.json`.
+Next RED inline-table-width-001b is8437 pixels, Chromium reference0.
+No reference/tolerance/mask change, product Agent knowledge/authority impact,
+commit or push. Size gate retains six outside-vendor violations.
+
+### 2026-10-02 automatic table tracks respect available width
+
+inline-table-width-001b RED8437 / Chromium141 reference0 now passes strict
+WPT0. Its native actual already used160px and four text lines; the native
+reference's auto table incorrectly kept a491px max-content cell and one line.
+Automatic tracks now contract to available width, after inline margins and
+table edges, without crossing the existing min-content floor or growing
+beyond max-content. Fixed-layout behavior is not changed by this fallback.
+
+Extended track unit ran RED:305.33594px instead of200px, then passed. Covers
+200px available,100px below150px minimum, and400px retaining measured maximum.
+The wide-space assertion uses measured intrinsic width rather than assuming
+two150px blocks have no intervening shaped space. Runtime baseline31/31 and
+table102/109 retain the same seven unwaived table failures. Unit build212s,
+runner build128s; final source stayed unchanged through WPT execution.
+
+Sequential jobs1 inline-table guards improve12/15 to13/15, leaving zorder004
+and005 at280/408 pixels. Table-height guards remain25/25. Known187 is132/55;
+supplement3 is1/2: tracked190 now133 passed /57 failed. No status regressions,
+but still-failed before-after-table-parts-001 worsens13231 to14852 pixels.
+That pixel deterioration is explicitly unwaived and the next diagnostic
+entry; do not describe this batch as regression-free. Other failure counts
+are unchanged. No full6548 run or whole-module closure is claimed.
+
+Direct native actual versus pinned Chromium actual still differs1046 strict
+RGBA pixels, unwaived. Native/reference0 and browser/reference0 are not proof
+of browser pixel identity. Receipt:
+`target/wpt-targeted/inline-table-width-candidate-20261002/qualification.json`.
+No reference/tolerance/mask change, product Agent knowledge/authority impact,
+commit or push. Root size gate retains six existing outside-vendor violations;
+diff check passes. Builds and WPT suites ran sequentially without overlap.
+
+### 2026-10-03 generated table parts: missing brown background
+
+Fresh generated-content/before-after-table-parts-001 RED is14852 pixels;
+Chromium141 actual/reference comparison is0. The preceding auto-track change
+contracts the reference's overflowing491px/max-content tracks toward available
+space, but does not close this complex table case. Its13231-to14852 native
+reference deterioration remains unwaived; do not restore overflowing tracks
+merely to reduce that number.
+
+One separate source-backed defect is fixed: Color::from_named did not accept
+brown, so both native actual and reference omitted their brown backgrounds.
+The universal color parser now resolves brown to sRGB165,42,42, per
+https://www.w3.org/TR/css-color-4/#named-colors. New unit ran RED (None versus
+that color), then passed including upper-case, whitespace and invalid controls.
+All37 w3cos-std unit tests pass; runner rebuild passes129s before WPT workers.
+This is a brown-specific parser correction, not complete named-color support.
+
+Strict native/reference WPT remains14852, still failed. Direct native actual
+versus preserved pinned Chromium actual improves121522 to110908 strict RGBA
+pixels as the missing paint is restored. Browser pixel identity is unproven.
+Fresh sequential jobs1 known187 is132/55, supplement3 is1/2: tracked190 stays
+133 passed /57 failed. All known statuses and native/reference pixel counts
+are unchanged from the auto-track batch. No whole-runtime, full6548 or
+additional inline-table/table-height replay is claimed for this color batch.
+
+Receipt: `target/wpt-targeted/generated-table-parts-after-brown-20261003/qualification.json`.
+Next diagnostic: nested generated inline row height36 versus enclosing table
+row/cell height32; investigate intrinsic strut-descent height propagation and
+cell alignment, without hard-coded offsets. This height hypothesis is not
+yet a tested fix. No product Agent knowledge/authority impact, reference or
+tolerance change, commit or push. Diff check passes; root size gate retains
+six outside-vendor violations. No source edits overlapped builds or WPT.
+
+### 2026-10-03 anonymous inline image descent reaches table rows
+
+The generated-table-parts height hypothesis is now verified and partially
+fixed. A minimum component unit ran RED: flagged anonymous IFC containing
+a32px baseline image exported32px table height instead of36.2px. The existing
+anonymous-line intrinsic floor handled empty inline-blocks but omitted inline
+images. It now includes baseline-aligned inline images, using the shared used
+image height (including intrinsic auto height) plus the line strut descent.
+No new table-coordinate compensation or broad authored-flex behavior change.
+
+The unit passes both flagged-IFC and authored-Flex controls, checking line,
+cell, row and table heights. Runtime baseline31/31 passes; table102/109 retains
+the same seven failures. Broader image69/73 retains four unwaived failures:
+browser_image_decode_failure_rejects_decode_dispatches_error_and_releases_load,
+browser_image_loads_into_shared_cache_exposes_intrinsics_and_blocks_document_load,
+decoder_classes_methods_and_decoded_frames_are_realm_owned,
+top_aligned_inline_text_shares_replaced_image_line_top. The last has historical
+RED evidence; the other three were not rerun on a pre-change binary, so do not
+claim their before/after provenance or whole-module green. Unit build232s,
+runner build147s; source remained fixed through sequential jobs1 WPT execution.
+
+generated-content/before-after-table-parts-001 improves14852 to7746 strict WPT
+pixels, still failed. This is below its pre-auto-track13231 count, reversing
+the observed deterioration without restoring overflowing tracks. Direct native
+actual versus preserved pinned Chromium actual improves110908 to60928 strict
+RGBA pixels; browser pixel identity remains unproven and differences unwaived.
+Known187 stays132/55, supplement3 stays1/2: tracked190 is133 passed /57 failed.
+No status regressions; only this target's still-failed pixel count changes.
+
+Receipt: `target/wpt-targeted/generated-table-parts-after-line-descent-20261003/qualification.json`.
+Remaining screenshot differences concentrate in generated display:inline
+content containing an image and a long text item: native actual keeps the text
+as one item while the ordinary reference has word fragments. Next entry is
+generated_pseudo_component and its shared inline-word lowering, not a fixed
+line offset. This fragmentation hypothesis is not yet a verified fix.
+No full6548, extra table-height/inline-table replay, product Agent knowledge
+impact, tolerance/reference/mask change, commit or push. Diff check passes;
+size gate retains six outside-vendor violations. Runtime modules are not closed.
+
+### 2026-10-03 generated inline mixed content exposes word breaks
+
+Shared inline text fragmentation previously accepted only Block/Flex owners,
+skipping flagged Inline pseudo-element rows. It now accepts flagged Inline
+owners too, preserving all existing wrap/white-space/decoration checks. No
+separate pseudo-specific tokenizer or fixed text position is introduced.
+New unit RED retained one `two words` item instead of word/space fragments;
+it now passes normal/pre-line and unchanged nowrap/pre controls.
+
+DOM fragment16/16 and word25/25 pass. Generated42/44 retains the two historical
+failures generated_pseudo_content_lowers_strings_and_attributes_in_tree_order
+and hidden_elements_and_ungenerated_pseudos_do_not_modify_counters; they remain
+unwaived. Candidate DOM unit build21.18s and runner build124s pass. Source
+stayed fixed through final sequential jobs1 WPT runs and layout dumps.
+
+Target before-after-table-parts-001 improves7746 to7089 strict WPT pixels but
+remains failed. Direct native actual versus preserved pinned Chromium actual
+worsens60928 to61177 pixels (+249), explicitly unwaived; do not call this
+regression-free or browser pixel identity. Known187 stays132/55, supplement3
+stays1/2: tracked190 is133 passed /57 failed. No status regressions; only the
+target's native/reference pixel count changes. No full6548 or whole-module
+closure, reference/tolerance/mask change, product Agent knowledge impact,
+commit or push. Root size gate retains six outside-vendor violations.
+
+Receipt: `target/wpt-targeted/generated-table-parts-after-word-fragments-20261003/qualification.json`.
+Fresh actual/reference layout dumps show the same word fragments and x
+coordinates but remaining y/baseline differences: lower geninline Before at
+native y498 versus reference502, After554 versus558. Next entry is intrinsic
+and painted line baseline ownership for flagged Inline versus anonymous Flex
+owners, not a hard-coded4px compensation. Target remains open.
+
+### 2026-10-03 marked Inline image/text shared baselines
+
+The shared image/text line-packet path accepted flagged Block/Flex owners but
+rejected flagged Inline owners. Eligibility now includes Inline, retaining
+the internal IFC marker and all existing child/width/alignment checks. The
+existing wrapped image/text strut unit now covers all three representations
+and unmarked-owner rejection. Its corrected RED rejects Inline; the candidate
+and final rebuilt unit pass. No fixed y offset, reference, tolerance or mask
+change is used.
+
+An earlier coverage edit accidentally added Inline to the unrelated unmarked
+text-only equal-font unit, rather than the target unit. Its original Block/Flex
+scope is restored. The observed Inline y4-versus-y2 failure remains in the
+initial baseline log, is not claimed fixed, and is distinct from this marked
+image/text path. Final rebuilt baseline31/31 and image-text3/3 pass; table102/109
+retains seven failures, unwaived. RED build208s, candidate250s, runner132s,
+final runtime test build204s. Only this test-scope restoration occurred after
+the runner build; production sources remained fixed during sequential jobs1
+WPT execution.
+
+before-after-table-parts-001 now passes strict WPT comparison:7089 to0 pixels.
+Direct native actual versus preserved pinned Chromium actual changes61177 to
+61105, still not identical and unwaived. Known187 is133/54; supplement3 stays
+1/2. Tracked190 is134 passed /56 failed. Only the target changes status/pixels;
+all other tracked results are unchanged. This is not a current full6548 census
+or whole-module closure. No product Agent knowledge impact, commit or push.
+Diff check passes; size gate retains six outside-vendor violations.
+
+Receipt: `target/wpt-targeted/generated-table-parts-after-inline-packets-20261003/qualification.json`.
+Next focused entry: generated-content/content-175 (72 pixels) and quotes-036
+(2559 pixels); inspect forced newline/inline decoration and quote-depth
+evidence before making new changes. Browser identity remains a separate open
+acceptance requirement.
+
+### 2026-10-03 fresh reference-conflict audit and multicol RED
+
+Before modifying remaining generated-content decoration, content-175 was
+rerun on the current runner: native/reference72 pixels, Chromium141/reference
+576. Chromium places the preserved-newline continuation and right padding on
+another line, unlike the declared single-stripe reference. This forbids using
+an arbitrary width/height compensation merely to make both native pages match.
+Fresh additional strict browser/reference observations: pseudo-00737833 pixels
+(native37689), inline-block-baseline-003428 (native434), inherit-computed-001168
+(native144). pseudo-007 declares a blue-border/different-text reference for a
+green-first-child test. Baseline and border inheritance discrepancies require
+normative adjudication, not reference-specific renderer behavior. No test,
+reference, mask, tolerance or suite membership is changed; none is waived.
+Raw browser oracle pages have no injected user stylesheet; the prescribed
+stylesheet's hixie-cascade-tests-only selectors do not apply to these fixtures.
+These are renderer-local test/reference counts, not native/browser identity.
+
+Audit: `target/wpt-targeted/content-175-red-20261003/reference-conflict-audit.json`.
+This conflict is not a reason to stop independent fixes or declare the original
+6548 goal complete. Exact-zero fixed-revision acceptance and browser identity
+remain open requirements; their observed conflict must eventually be resolved
+explicitly rather than silently changing the desired end state.
+
+floats-clear-multicol-000 has a current native1710-pixel RED and Chromium
+test/reference0. Native screenshots and layout dumps show that both native
+pages lack column fragmentation: tall aqua edges overflow below one300px-wide
+box instead of continuing through100px columns. Only column-gap is represented;
+column-width/count/fill have no typed style/parser implementation. Moving clear
+to the unfragmented float bottom would improve the native reftest but preserve
+the wrong browser result, so that shortcut is not implemented.
+
+New `multicol_declarations_reach_the_typed_layout_style` is RED:
+column-width:100px leaves the layout Style unchanged. Build23.61s; first assertion
+fails, so its later count/fill/shorthand assertions are not reported executed.
+Receipt: `target/wpt-targeted/floats-clear-multicol-000-red-20261003/qualification.json`.
+Implementation sequence for this missing shared capability, not a separate
+fixture-specific path:
+
+1. Typed column-width/count/fill with defaults/serialization/style equality;
+   DOM and compiler parsing, shorthand/invalid/reset/inheritance controls,
+   codegen and dynamic CSSOM parity. Keep CSS.supports truthful.
+2. Used column count/width from container content width and gap; establish
+   column-local containing blocks and float positioning, not flex tracks.
+3. Shared flow fragments and paint/hit-test geometry across fixed-height and
+   balanced columns, carrying clear position across split floats, border and
+   background fragments. Retain principal-node identity and abspos boundaries.
+4. Rerun the four failing multicol cases and ordinary float/layout guards;
+   compare browser identity as well as WPT strict references, then tracked190.
+
+Normative entry: [CSS Multi-column Level1](https://www.w3.org/TR/css-multicol-1/),
+sections2,3.4 and7.1. No multicol implementation or passing claim yet. Production
+source is unchanged since the previous runner; only the new RED test and this
+record are added. Latest tracked190 remains134/56, not a current full6548 census.
+Diff check passes; root size gate retains six outside-vendor violations. No
+product Agent knowledge effect, commit or push.
+
+### 2026-10-03 typed multicol style/compiler bridge, fragmentation still RED
+
+Standard Style now carries column_width (Dimension, initial Auto), column_count
+(optional positive integer, initial auto), and column_fill (Auto/Balance/BalanceAll,
+initial Balance). Serialization defaults preserve older Style payloads and
+eq_except_display includes all three properties. Shared DOM parsing handles
+longhands, columns shorthand reset, literal invalid values, and initial/unset.
+Document explicit inheritance replays declarations in cascade order; properties
+do not inherit implicitly. The replay is gated to column declarations and uses
+variable resolution. Variable-based inheritance and computed relative-length
+inheritance are not yet verified controls; this is not all-value CSS closure.
+Canonical column-family dispatch does not allocate normalized names for ordinary
+CSS declarations; no measured performance improvement is claimed.
+
+Static CSS and JSX parsing, style merge, native Rust generation, DOM style calls,
+and Web CSS generation use the same typed grammar. Compiler column_count must
+preserve absent versus explicit auto across JSON: an additional RED demonstrated
+that Option<Option<u32>> serializes Some(None) as null and deserializes it as None.
+It now uses Option<ColumnCount>, with Auto/Count(u32), while runtime Style retains
+None for CSS auto. The JSON roundtrip and both generation paths pass.
+
+Final DOM multicol3/3, compiler multicol5/5, compiler CSS parser56/56, and standard
+library38/38 pass. DOM CSS style56/57 retains the documented Ch(4.0)-versus-Em(4.0)
+negative-margin/character-relative assertion, unwaived. Initial inheritance test
+setup used raw mutation without cache invalidation, then an attribute setter that
+does not parse style in this layer. Both failure logs remain; the final test uses
+the runtime host's setter plus explicit dirty marking and passes. No unrelated
+cache behavior or character-relative test expectation is changed.
+
+CSSOM/getComputedStyle/CSS.supports multicol1/1 passed before the final DOM property
+gate adjustment. The final same-source rerun also passes1/1, terminal exit0,
+build229s, log runtime-column-cssom-final.log; its binary hash is in the receipt.
+Runtime check8.29s passed before that adjustment; final runner build134s passes.
+Production source stayed fixed through the runner and sequential jobs1 WPT.
+
+Fresh multicol window1639-1646 remains4/8: ordinary000/0011710 pixels each,
+balancing000/0012850 each; 002/003 variants are native/reference0. No column
+fragmentation is implemented yet, so passing references do not establish browser
+identity. The original6548 objective remains open. Tracked190 was last134/56 on
+the previous source, not rerun on this candidate; no current full-suite count.
+
+Receipt: `target/wpt-targeted/multicol-style-candidate-20261003/qualification.json`.
+Next: used column width/count, column-local
+logical flow and physical paint fragments shared by float/clear/border/background.
+Do not move only the orange clear line on an unfragmented300px box. No reference,
+tolerance, mask or suite change, product Agent knowledge impact, commit or push.
+Diff check passes; root size gate retains six outside-vendor violations.
+
+### 2026-10-03: multicol logical column width reaches actual layout
+
+Receipt: `target/wpt-targeted/multicol-logical-flow-20261003/qualification.json`.
+The integrated RED retained the correct300x100 principal box but laid its100%
+child out at300px instead of100px. Used column width now follows
+[CSS Multicol section3.4](https://www.w3.org/TR/css-multicol-1/#pseudo-algorithm)
+and feeds recursive sizing plus a context-free anonymous Taffy flow. Principal
+node identity is unchanged. Direct absolute/fixed children remain under the
+principal box, and absolute containing width propagation retains that basis.
+
+RED0/1 became1/1; final multicol group3/3 includes two layout controls and CSSOM.
+Controls cover count-only, combined width/count, explicit/default gap, em width,
+percentage padding, authored flex/grid exclusion and principal abspos width.
+Baseline guard31/31 passes. Absolute guard34/35 retains the root-table paragraph
+width42.0625/height144 failure, also present with identical geometry in
+`table-cleared-margin-v2-20261002/runtime-table.log`; it remains unwaived.
+
+Same-source runner build114s passes. Fixed-revision WPT window1639-1646 remains
+4/8, with ordinary000/0011710→510 and balancing000/0012850→850 pixels each.
+The actual fixture's logical child is100px wide and its right float is nowx112
+instead ofx312. Floats still extend250px vertically: physical column fragments,
+column-local clear and balancing are not implemented or browser-accepted.
+Native/reference passing variants are not proof of browser identity.
+
+Remaining controls include synthetic flex-backed inline flow eligibility,
+computed relative-length inheritance and nested/auto/min-max constrained widths.
+Next: shared physical fragments consumed by paint and hit-test paths, then
+float/clear and balanced heights. Original6548 objective remains open; neither
+tracked190 nor full6548 was replayed. No source changes overlapped builds/WPT,
+reference/tolerance/mask/suite changes, outside-vendor edits, commit or push.
+Diff check passes; six existing outside-vendor root size violations remain.
+Product Agent knowledge has no impact from this generic vendor layout change.
+
+### 2026-10-03: fixed-height auto columns acquire physical paint/hit slices
+
+Receipt: `target/wpt-targeted/multicol-physical-fragments-20261003/qualification.json`.
+Artifact RED emitted one250px display item instead of100/100/50px slices. Shared
+ColumnFragment now retains physical bounds, translation and vertical slice limits
+without duplicating source nodes or replacing logical rectangles. Display items
+and chunk bounds expose physical slices to retained layers/tiles. Skia replays
+whole logical boxes clipped per slice, preserving a final bottom border rather
+than repeating it. Window hit regions use the same slices and retain source
+identity across repeated layouts. No-column pages skip ancestor fragmentation
+walks and per-node slice allocation; no performance benchmark is claimed.
+
+Candidate3/3 and final multicol6/6 pass. Controls include three-column pixels,
+final-only border, no paint/hit below the column, a second retained replay and
+source-preserving spatial-grid hits. These are unit proofs, not real app pointer
+acceptance. Baseline31/31 passes. Artifact51/52 retains the previously documented
+auto-positioned z-order assertion, unwaived. Initial candidate compilation failed
+on new pixel-test i32 slice indices; explicit usize fixed it and the log remains.
+
+Same-source runner build116s passes. Window1639-1646 remains4/8: ordinary000/001
+510 pixels, balancing000/001850 each. Native images now actually show three sliced
+aqua columns, but the orange clear line remains in the first instead of third.
+An all-RGBA comparison of current native000 with the earlier pinned Chromium141
+oracle PNG yields3592 pixels, max255, without masks. This is NOT fresh browser
+fixture execution and NOT510-pixel browser acceptance. Extra browser differences
+remain unclassified and unwaived; native/reference convergence cannot hide them.
+
+Only fixed-height column-fill:auto slicing is connected to Skia and hit regions.
+Balancing, auto height, nested fragmentation, text-line break decisions, CPU/GPU
+raster replay, scroll/transform/DPI controls, DOM physical client rects and real
+pointer journeys remain open. Next RED: clearing BR appears excluded by the
+outer display guard around its dedicated clearance branch; reproduce before
+changing it. Original6548 goal is open; no current190/full6548 replay, fixture,
+tolerance, mask, suite, outside-vendor edit, commit or push. Diff check passes;
+root size gate retains six outside-vendor violations. No product knowledge impact.
+
+### 2026-10-03: HTML clear hints and cross-wrapper block clearance
+
+Receipt: `target/wpt-targeted/multicol-html-clear-v2-20261003/qualification.json`.
+HTML BR clear attributes now contribute case-insensitive presentational hints
+before author CSS. `all`/`both`, `left` and `right` reach computed clear and the
+existing clearing-break marker; invalid and whitespace-padded values do not.
+DOM RED0/1 becomes clear-filter9/9, including user/author cascade controls.
+The parsed HTML-to-layout test checks BR identity, side, line end and wrapper
+bottom. Its first candidate had a fixture setup failure: InertParserScriptHost
+does not load style elements; equivalent inline CSS made this consumer test
+valid. Real WPT still exercises stylesheet loading separately.
+
+HTML-hint candidate runtime multicol9/9, baseline31/31 and clear45/47. The two
+historical clear guard failures remain unwaived. Runner build120s, pinned window
+1639-1646 becomes2/8 from the preceding0/8 receipt, not full-suite closure.
+Fresh Chromium141 actual/reference comparison is0 for auto000 and balancing000.
+Direct native/browser auto000 still differs3082 pixels, max148, entirely within
+paragraph bbox[17,18,666,33]. Orange/column geometry converged, not full pixel
+identity. Balancing000 native/reference passes but differs13713 pixels, max255,
+from Chromium: native floats remain unsliced below the column. No masks used.
+
+A second RED reproduces ordinary-block clear:left at y0 instead of250 with
+preceding floats inside a non-BFC wrapper. Nested clearance used to skip all
+direct children of the owner. It now skips only when no preceding owned nested
+float exists; side-specific floors and ownership remain unchanged. Six controls
+cover ordinary/multicol roots and left/right/both. Final multicol10/10 and
+baseline31/31 pass; clear46/48 retains the same two failures. Runner build120s.
+Latest pinned window is6/8; remaining001 variants differ510/850 pixels. Latest
+source/runner hashes and separate old/new receipts are retained. The browser
+comparisons above predate the second fix, not current-source browser acceptance.
+
+Next: trace clearing BR identity/ownership inside its synthetic inline wrapper
+for001, then balanced physical fragments with browser proof. Paragraph raster,
+CPU/GPU replay, nested fragmentation, transforms/DPI and prior guard failures
+remain open. No tracked190 or full6548 replay, reference/tolerance/mask/suite
+changes, outside-vendor edits, commit or push. No source edits overlapped builds
+or WPT. Diff check passes; root size gate retains six outside-vendor violations.
+Generic HTML/CSS engine behavior has no product Agent knowledge impact.
+
+### 2026-10-03: inner clearing BR survives later float-text projection
+
+Receipt: `target/wpt-targeted/multicol-inner-br-v4-20261003/qualification.json`.
+Parsed RED0/1 preserves the BR clear:both and internal marker, but its final line
+end is26 instead of258 when placed inside the floats' ordinary wrapper. The
+later shared float-text resolver treated the line-ending event as a glyph run,
+resetting the cleared BR rectangle and wrapper height. It now leaves marked
+clearing BRs to the existing shared BFC clearance path. This also prevents the
+paint artifact's same resolver from introducing invalid float line bands.
+
+Candidate multicol10/10 includes both inside/outside parsed BR positions, line
+end and subsequent orange bottom edge. Float-text5/5 and baseline31/31 pass.
+Clear46/48 retains the same two unwaived historical failures. Runner build134s
+passes. Fixed revision window1639-1646 becomes8/8 from6/8:001's510/850 pixels
+are zero. This proves only the scoped native/reference window, not browser or
+full-suite closure.
+
+Same-source fresh Chromium141 actual/reference oracles are0 for auto000 and
+balancing000. Direct native/browser auto000 still differs3082 pixels, max148,
+within paragraph bbox[17,18,666,33]. Balancing000 differs13713 pixels, max255,
+bbox[17,18,591,307]; native/reference still share missing balanced slicing. All
+RGBA pixels compared without masks/tolerances. Balancing remains the next RED,
+requiring shared layout fragmentation decisions rather than painter heuristics.
+Prior backend, nested/auto-height, text-break and pointer gaps remain open.
+
+No current190/full6548 replay, fixture/reference/tolerance/mask/suite changes,
+outside-vendor edits, commit or push. Source stayed frozen during builds/WPT.
+Diff check passes; six existing outside-vendor size violations remain. Generic
+line/float semantics have no product Agent knowledge impact. Original goal open.
+
+### 2026-10-03: fixed-height continuous-flow balancing shares fragment heights
+
+Receipt: `target/wpt-targeted/multicol-balancing-20261003/qualification.json`.
+Artifact RED0/1 emits one255px item instead of three85px slices while an explicit
+100px principal height must stay100. Layout now resolves fragmentainer heights
+from final logical flow ends and fitted column counts before shared paint/hit
+data is built. Hidden/positioned subtrees are excluded, nearest fixed-height
+column ownership collects flow extent, auto fill keeps available height and
+balance uses an upward layout-unit-rounded lower bound capped by explicit
+height. Artifact feeds these heights to its existing ColumnFragment consumers.
+
+This is continuous-flow progress, not the complete solver required by
+[CSS Multicol section7](https://www.w3.org/TR/css-multicol-1/#cf). Forced breaks,
+widows/orphans, unbreakable boxes, text-line placement, auto-height and nested
+fragmentation remain open. Further parameter/ownership controls are needed.
+No-column pages do not invoke the height resolver; no benchmark is claimed.
+
+Candidate11/11 passes after correcting a production reference to test-only
+WDisp to module WDisplay; initial compile log remains, no assertion ran there.
+Baseline31/31 passes. Artifact52/53 and clear46/48 retain the same unwaived
+z-order and two clearance guard failures. Runner build119s. Pinned window
+1639-1646 stays8/8, still not full-suite closure.
+
+Fresh same-source Chromium141 actual/reference oracles are0. Entire800x600 RGBA
+native/browser balancing000 improves13713→2813 pixels, max148, with remaining
+bbox[17,18,591,33] entirely in paragraph text. Aqua columns and final orange edge
+now converge geometrically. Auto000 stays3082 pixels, max148, paragraph-only
+bbox[17,18,666,33]. Neither image is pixel-identical; no mask/tolerance used.
+
+Next: height-plan controls and break placement, paragraph shaping/raster, then
+existing tracked failures. No current190/full6548 replay, fixture/reference/
+tolerance/mask/suite changes, outside-vendor edits, commit or push. Source frozen
+during builds/WPT; diff check passes. Six outside-vendor size violations remain.
+Generic column layout data has no product Agent knowledge impact. Goal open.
+
+### 2026-10-03: flex-item blockification follows the box-tree parent after moveBefore
+
+Receipt: `target/wpt-targeted/flex-contents-blockification-20261003/qualification.json`.
+DOM RED0/1 preserves the missing blockification through zero, one and two
+display:contents ancestors. Computed style now finds the effective formatting
+parent across contents without changing selector/inheritance ancestry or
+creating a wrapper box. In-flow inline children of flex/inline-flex/grid are
+blockified, and existing subtree cache invalidation restores inline display
+when moved back. Absolute/fixed handling remains separate.
+
+DOM candidate1/1, runtime flex19/19, moveBefore10/10, style-cache54/54 and
+baseline31/31 pass. The actual script mutation reaches a100x100 flex item.
+Runner build116s passes. Pinned WPT6507 improves10000 to zero pixels,1/1.
+The same original56 failing cases now give5 passes/51 failures, versus4/52
+before this fix; all other failure pixel counts are unchanged. The previously
+passing134 tracked cases and full6548 were not rerun, so no current whole-suite
+remaining count or completion is claimed.
+
+Fresh Chromium141 original moveBefore actual/reference differs10000 pixels
+under both HTTP and HTTPS. A separately labelled in-memory appendChild control
+gives zero, consistent with ordinary flex-item blockification; it does not
+waive or replace the original browser failure. Original fixtures, references,
+suite membership, tolerances and masks remain unchanged.
+
+Diff check passes. Root size check retains six existing outside-vendor
+violations; no baseline changed. No outside-vendor edits, commit or push.
+Generic computed display semantics have no product Agent knowledge impact.
+Goal remains open; the next native failure group needs its own RED and oracle.
+
+### 2026-10-03: loaded SVG oracle correction and next word-spacing RED
+
+Audit: `target/wpt-targeted/focused-reference-audit-20261003/qualification.json`.
+The generic browser oracle omitted SVG MIME and served SVG as octet-stream.
+Its replaced-intrinsic-002 zero-pixel result was a false pass with no painted
+SVG; both initial receipts are invalidated, not deleted. Correct image/svg+xml
+and network-idle waiting produce22500 Chromium/reference pixels, matching the
+native failure count. Both object boxes are300x150; shrinking native object
+width to150 just to match the reference is not a justified repair. SVG2's
+intrinsic sizing rules also exclude auto/percent axes from intrinsic lengths:
+https://www.w3.org/TR/SVG/coords.html#IntrinsicSizing
+
+Fresh position-relative-035 browser/reference1600 matches native1600.
+Letter-spacing-080 browser/reference1804 vs native1600 includes the authored
+120px test spacing versus96px reference margins; raster differences remain
+separate. Table overflow errata002 differs1000 in browser vs800 native, which
+does not prove the native implementation correct. All remain unwaived failures;
+no fixtures, references, tolerances or suite membership changed.
+
+Word-spacing-characters-001 is a real next native RED: Chromium/reference0,
+native/reference5748. Current layout and screenshots are retained. Preserved
+Tab expansion loses provenance before paint adds word-spacing to generated
+spaces; current tabs also reset by per-run character columns rather than a
+shared line coordinate. This is a repair lead, not a completed fix; nested
+inline decorations/geometry need independent regression evidence. No production
+source change, current190 or full6548 replay, commit or push in this audit.
+The previous failing subset remains51. Generic audit has no product Agent
+knowledge impact. Goal open.
+
+### 2026-10-03: preserved-tab shifts share advance, ink and glyph paint
+
+Receipt: `target/wpt-targeted/preserved-tab-stops-20261003/qualification.json`.
+Minimal RED0/1 measures A-tab-B-tab-C as100px instead of340px with20px Ahem.
+Skia now partitions standalone LTR preserved-tab runs before shaping, placing
+them at default eight-space stops and skipping a stop when the gap is below
+half a ch. Tab shifts have no glyph or ink. Advance, ink bounds and glyph
+painting consume the same positioned runs rather than independent estimates.
+The applicable block font/spacing and content-origin requirements come from
+https://www.w3.org/TR/css-text-3/#white-space-phase-2 and
+https://www.w3.org/TR/css-text-3/#tab-size-property.
+
+Candidate1/1 checks Ahem/monospace/serif with word-spacing0/12, full RGBA equality
+against manually positioned glyphs, advances and ink extents. Text-layout36/36
+and baseline31/31 pass. Expanded Skia65/68 retains three unwaived failures;
+single-thread replay also gives65/68. The same three names were independently
+recorded in earlier display-list evidence, not newly declared passed here.
+Runner build132s passes. Source stayed frozen during builds and WPT.
+
+Pinned seven-case window5993-5999 gives6/7; word-spacing-characters-001 improves
+5748 to4839 pixels but is still failed. Original56 failing-case replay gives
+5/56 passes,51 failures: this target's pixel count is the only change relative
+to the prior flex-blockification replay. Previously passing134 tracked cases
+and full6548 were not replayed. No whole-suite remaining count is asserted.
+
+Next required work is the nearest block-container tab context, line-relative
+offsets across inline fragments and preservation of tab provenance through
+preprocessing. RTL, authored tab-size, non-Skia consumers and nested decoration
+geometry are not closed. This batch does not substitute standalone-line
+support for the original WPT or full-suite goal. Diff check passes; six existing
+outside-vendor size violations remain, no baseline changed. No fixture,
+reference, mask, tolerance, suite, outside-vendor edit, commit or push. Generic
+text rendering has no product Agent knowledge impact. Goal open.
+
+### 2026-10-03: terminal inline tabs consume block stops; decoration RED remains
+
+Receipt: `target/wpt-targeted/inline-tab-context-20261003/qualification.json`.
+Parsed RED0/1 gives530px instead of140px after a40px inline prefix and30px
+padding with40px inline word-spacing. Both layout entry points now project
+terminal single-line LTR preformatted tab widths using the block font/spacing
+and actual content-start offset. Inline ancestors' terminal extents follow the
+delta. A linear last-in-flow-child index replaces repeated subtree searches;
+pages without preserved tabs skip the rectangle maps. No benchmark is claimed.
+
+Paint receives typed block tab stops in InlineLineContext. Single preserved
+lines retain raw tabs instead of expanding them to synthetic spaces before
+positioning. Measurement, ink and glyphs consume the contextual runs. Candidate
+1/1 verifies compute and LayoutEngine.compute widths140, plus real headless
+black ink at x168..187 and white at167/188. Fresh Chromium141 with loaded Ahem
+independently gives span width140 and B x168, no page errors. This is boundary
+and geometry evidence, not a full native/browser screenshot identity claim.
+
+Initial candidate compilation E0521 is retained; a lifetime-generic named
+helper repairs the escaping closure borrow. Final target1/1, tabs2/2,
+text-layout36/36, baseline31/31 pass. Skia65/68 retains the same three named
+unwaived guards. Pinned white-space111/111 stays green. Runner build117s.
+The original56-failure subset stays5 passes/51 failures, but the target WPT
+regresses4839 to5202 pixels; all other statuses/pixel counts are unchanged.
+The seven-case word-spacing window stays6/7. This regression is not waived,
+and this batch is not claimed as a WPT repair completion.
+
+Next concrete breakpoint: parent inline background fragments remeasure raw
+tab strings without the resolved block context, extending past layout's width.
+Also investigate the generic-monospace layout host face versus headless bundled
+face; it is a source-backed lead, not a newly executed font RED. Nonterminal,
+multiline, RTL, authored tab-size and non-Skia rendering remain open.
+
+After the frozen-source WPT run, the headless-dependent test received a Skia
+feature gate only; production code and enabled test body stayed unchanged.
+Receipt distinguishes tested/current diff hashes. Final Skia lib+tests check
+passes7.12s and non-Skia library check passes7.67s. No final-source WPT replay
+after that test-only gate, current190 or full6548 replay is claimed. Diff check
+passes; six existing outside-vendor size violations remain. No fixtures,
+references, masks, tolerances, original suite membership, outside-vendor files,
+commit or push changed. Product Agent knowledge has no semantic impact from
+these generic text-layout changes. Original goal remains open.
+
+### 2026-10-03: preserved-tab fragment width and nested paint origin
+
+Receipt: `target/wpt-targeted/tab-fragment-background-20261003/qualification.json`.
+Two REDs reproduce decoration past the supplied fragment boundary and missing
+nested B ink at x328 despite correct layout. Single-line LTR preformatted tab
+backgrounds now consume resolved fragment width, rather than remeasure raw tabs
+from zero. Contextual text paint uses its actual content x, preserving the
+paragraph's available end instead of resetting to the outer inline origin.
+Fresh loaded-Ahem Chromium141 geometry independently gives B x328, width20;
+this is geometry/boundary evidence, not whole-image identity.
+
+Background1/1 and tabs3/3 pass; text-layout36/36 and baseline31/31 pass.
+Skia66/69 retains the same three named unwaived failures. Pinned white-space
+111/111 passes. Original seven-case word-spacing window remains6/7, with
+word-spacing-characters-001 improving5202 to4636 differing pixels. The same
+original56 subset remains5 passes/51 failures; every other status and pixel
+count is unchanged. White-space and old56 runs overlapped in separate artifact
+roots, each jobs1; no timing/performance claim is made. Source stayed frozen
+through builds and runs. Runtime test build217s; runner build125s.
+
+Next investigate nested inline background heights and generic-monospace font
+metrics with a new browser-backed RED. Nonterminal layout, multiline, RTL,
+authored tab-size and non-Skia rendering remain open. No current190/full6548
+replay, reference/fixture/mask/tolerance changes, commit or push is claimed.
+Product Agent knowledge is unaffected by these generic text painting changes.
+Original zero-failure goal remains open.
+
+### 2026-10-03: plain inline background excludes leading, preserves internal gaps
+
+Receipt: `target/wpt-targeted/inline-background-height-20261003/qualification.json`.
+Fresh loaded-Ahem Chromium141 produces identical nested and flat screenshots
+for a60px inline in a40px line: background y18..37, height20. Native RED differs
+800 pixels. Removing color-dependent plain-background height/parent unions
+reduces the RED to460 pixels, still failing. Test-only row diagnostics locate
+a missing20px internal gap over23 rows. The first-descendant width had replaced
+the parent's single-line extent, and unresolved Ahem decoration metrics fell
+back to another font although glyph paint uses deterministic Ahem em cells.
+
+Single plain-line background keeps its parent extent; unresolved Ahem geometry
+now shares the existing deterministic painter's0.8em ascent/0.2em descent.
+Candidate RED1/1 passes with identical native images and exact Chromium-derived
+vertical boundaries. Tabs3/3, baseline31/31 and text-layout36/36 pass. Skia66/69
+retains the same three unwaived failures. Pinned white-space111/111 passes.
+Original seven-case word-spacing window remains6/7; target improves4636 to3712
+pixels but stays failing. Same original56 subset remains5 passes/51 failures;
+all other statuses and pixel counts are unchanged. Runner build123s. Source
+is frozen and WPT runs sequentially, jobs1. Diff check passes.
+
+A custom diagnostic runner attempt was rejected by the revision gate; its log
+is retained and no gate bypass occurred. Original WPT membership, fixtures,
+references, masks and tolerances are unchanged. No current190/full6548 replay
+or commit/push is claimed. Six outside-vendor size violations remain; baseline
+is unchanged. Generic rendering changes do not affect Product Agent knowledge.
+Next inspect the remaining original word-spacing geometry. Goal remains open.
+
+### 2026-10-03: horizontal-padding inline backgrounds keep their own height
+
+Receipt: `target/wpt-targeted/inline-double-leading-20261003/qualification.json`.
+Initial half-leading hypothesis is not confirmed: the undecorated empty-spacer
+case already passes1/1, retained in red.log, and no text-origin formula changed.
+Matching the original selector by giving the empty padding span a blue
+background reproduces a96-pixel RED. Fresh Chromium141 screenshots remain
+identical between nested padding and flat word-spacing forms, with no errors.
+
+Horizontal padding no longer disqualifies an inline background from preserving
+its own em height; vertical padding and border handling are unchanged. RED1/1
+turns green. Earlier inline-height1/1, tabs3/3, baseline31/31 and text-layout36/36
+pass. Skia66/69 retains the same three unwaived guards. Pinned white-space
+111/111 passes. Original word-spacing window7/7 passes; target3712 to0 pixels.
+Same original56-failure subset improves5/51 to7/49: content-175 also72 to0
+pixels. All other statuses and pixel counts are unchanged. Source frozen,
+WPT sequential/jobs1; runtime test build214s, runner118s. Diff check passes.
+
+Current190/full6548 remain unrun; no all-suite closure is claimed. Original
+membership, fixtures, references, masks and tolerances are untouched. No
+commit/push or outside-vendor change; size baseline unchanged. Product Agent
+knowledge has no semantic impact from this generic decoration correction.
+Continue the49 remaining failures; original zero-failure goal remains open.
+
+### 2026-10-03: text-only CSS inline-table retains its principal box
+
+Receipt: `target/wpt-targeted/inline-table-zorder-audit-20261003/qualification.json`.
+Fresh Chromium141 gives zero pixels for inline-table-zorder-004. Native layout
+instead had an InlineTable Text leaf, width0/height26; background and borders
+were absent. RED0/1 asserts principal box retention and anonymous TableCell.
+Candidate v1 remains0/1: actual HTML text children hit an earlier tag text
+fast path before the direct-text fallback. That failed attempt is retained.
+
+CSS Table/InlineTable now skip the text-tag fast path. Both actual text children
+and direct element text enter existing table row/cell fixup, with inherited
+text-only style on the anonymous content. Candidate v2 passes1/1, including
+nonzero intrinsic width and green background/border pixels. Original z-order
+004/005 pass2/2 at0 pixels, previously280/408. Same original56 subset improves
+7/49 to9/47; all other statuses and pixel counts are unchanged.
+
+Table guard103/110 retains seven recorded failures; baseline31/31, recent
+height1/1, horizontal-padding1/1 and tabs3/3 pass. Pinned white-space111/111
+passes. Expanded nested filter49/51 fails outer_pre_text_after_nested_nowrap
+(y68 versus88) and host_timeline_entries_preserve_inheritance_and_nested_identities
+(0 versus200). Their previous-binary baseline is not established; retain both
+unwaived, do not report that filter as green. Runner build132s, candidate v2
+236s. Source frozen during builds and sequential/jobs1 WPT. Diff check passes.
+
+Fresh margin/reference and decoration-length audits are also retained in the
+receipt: browser527 and18 pixels respectively, not blanket waivers. No current
+tracked190/full6548 replay, original fixture/reference/mask/tolerance changes,
+commit or push. Renderer/IR correction does not affect Product Agent knowledge.
+Continue47 remaining old-subset failures; full zero-failure goal remains open.
+
+### 2026-10-03: definite block width survives a fixed table track
+
+Receipt: `target/wpt-targeted/explicit-table-block-width-20261003/qualification.json`.
+Fresh Chromium141 compares original overflow-applies-to-001 at zero pixels;
+native previously leaked19 solid red pixels at x327. A 320px content-width
+block with16px right border and -16px right margin inside a padded cell had
+a334px border box instead of336px. Parsed minimal RED fails0/1 at334px.
+
+The inherited table-track cap was applied unconditionally, including authored
+block widths. Restrict that synthetic cap to automatic sizing/non-replaced
+inline sizing. Definite descendants retain CSS width and ancestor overflow
+owns clipping. Candidate passes1/1 at336px. Original overflow case19->0,
+adjacent window5/5. Same original56 replay improves9/47 to10/46; only that
+case changes, all other statuses and pixel counts remain identical.
+
+Table guard104/111 retains the same seven failures; baseline31/31, recent
+height1/1, horizontal-padding1/1, preserved tabs3/3 and white-space111/111
+pass. A broader `tab` filter115/123 additionally hits IndexedDB request error
+propagation (0 versus1); its prior-binary baseline is not established and it
+remains unwaived, not reported as a renderer regression or green check.
+RED compile216s, candidate212s, runner135s. Source frozen during builds and
+sequential/jobs1 WPT; diff check passes. Root size check retains six unrelated
+outside-vendor violations. Product Agent knowledge unaffected: generic CSS
+sizing correction, no product concepts or authority changes.
+
+Tracked190/full6548 remain unrun. No original membership, fixture, reference,
+mask or tolerance changes; no commit/push. Continue46 remaining old-subset
+failures; the original zero-failure objective remains open.
+
+### 2026-10-03: refresh tracked190 and audit strict one-pixel references
+
+Frozen prior qualified source/runner replayed original known187 and three
+supplement cases sequentially, jobs1. Fresh total144 passed/46 failed,
+190 unique original paths, no pass-to-fail regressions or changed still-failed
+pixel counts. Receipt:
+`target/wpt-targeted/tracked190-after-explicit-table-block-width-20261003/qualification.json`.
+This is the registered problem set, not the complete6548 corpus.
+
+Fresh Chromium141 audits19 one-pixel non-SVG failures. All19 also fail their
+original references by one pixel;17 have exactly the same coordinates and
+RGBA as native. Column-border006 cases489/612 instead place identical RGBA
+at native111,55 versus browser111,57. Their first row text tops are native
+54/52 versus browser54/54, establishing a separate default-cell baseline
+discrepancy. No clipping hack, fixture edit or tolerance waiver was introduced.
+Family evidence:
+`target/wpt-targeted/one-pixel-oracle-144-20261003/family-qualification.json`.
+SVG3840 is separate: a proper SVG MIME/networkidle audit still has browser
+22501 reference pixels; it is not included in the19 one-pixel family.
+
+Do not inflate matching strict-reference signatures into native/browser image
+identity. FullRGBA actual comparisons144/3929 differ1315 pixels,489/612 differ
+1253; these include instruction text and remain unresolved. Sub/super also
+retain browser2175 reference pixels versus native2199, with native/browser
+actual2505 pixels each. These observations are not blanket waivers.
+
+The first column-border unit RED was invalid as baseline proof: an inert
+parser host does not run style elements, and its alleged table parts were all
+Block. A candidate using Auto cell baseline participation and font ascent
+passed the valid mixed-font control but could not fix that invalid fixture;
+production candidate was reverted. Tree diagnostic0/2 retained that cause.
+The corrected test uses inline declarations and asserts four actual TableCells.
+Valid baseline-source RED0/2 reproduces first-row text12/10 (the original2px
+defect), with a separate mixed-font baseline control also failing. Candidatev2
+passes2/2: default Auto table cells participate in row baseline alignment,
+using actual first-line font ascent rather than text-box top. Table guard
+106/113 retains the same seven failures; baseline33/33, tabs3/3, preceding
+explicit-width1/1 and recent inline background2/2 pass. Original489/612 now
+have first-row text54/54, matching Chromium. Diagnostic content region
+width800/y50..599 compares at0 pixels for both; this is not a WPT mask or
+full-page identity claim. Full actual native/browser still differs1251 pixels.
+Strict reference still differs1 pixel each at111,57, exactly as browser; no
+strict failures are counted as cleared by this baseline correction.
+
+Sequential registered190 v2 remains144 pass/46 fail, no status/different-pixel
+count changes. Membership and revision validated by collect.mjs; combined
+receipt is `target/wpt-targeted/tracked190-after-default-cell-baseline-20261003/results.json`.
+White-space111/111 passes. Valid RED compile218s, candidate215s, runner121s.
+Source diff hash848773504443057acf41f848503ce0ebb2378db965e776466bf75bbd23f75e1f;
+runner a0690cc80a6fb7c28cd70af1cd6022ba1a2b5a23d3261f79cdaa546e098e827c.
+Receipt:
+`target/wpt-targeted/default-cell-baseline-20261003/qualification.json` and
+`candidate-v2.log` therein. Frozen source during builds; root size baseline
+retains six outside-vendor violations. No Product Agent semantic impact,
+commit/push, reference/mask/tolerance change or full6548 completion claim.
+
+### 2026-10-03: nested text-only struts and authored block IFC entry
+
+Original5684 `text-decoration-va-length-002.xht` retains279 strict pixels in
+the RED runner. Its nested24px text is incorrectly lifted into the preceding
+paragraph because the shared single-line solver only accepts nested image/text
+and marked anonymous IFCs. The synthetic nested-text unit RED fails projection.
+Candidatev2 passes3 units but original still279: authored Block has no anonymous
+IFC marker. Candidatev3 admits authored blocks with exclusively supported inline
+descendants, retains each24/12/0 vertical-align offset and ignores non-replaced
+inline vertical margins in line metrics. Parsed inline-style integration plus
+strut guard29/29 pass; original and neighbors5/5 pass, original279 to0.
+
+Do not mistake this first green candidate for acceptance: white-space109/111
+introduces `white-space-004`1600 and `white-space-processing-052`512 pixels.
+Existing em-box projection can hide soft-wrapped text's multiline height.
+Candidatev4 reuses cached/shaped `wrapped_text_height` at the actual used width
+before taking single-line ownership, with a focused soft-wrap rejection unit.
+Final strut30/30 and baseline34/34 pass; both soft-wrap REDs now0, original
+neighbors5/5 remain green, white-space111/111 restored.
+
+Frozen candidatev4 registered190 replay validates pinned revision and exact
+original membership:145 passed/45 failed, only5684 changes279 to0, no other
+status or failure-pixel-count changes. Receipt:
+`target/wpt-targeted/nested-text-strut-20261003/qualification.json`;
+combined registered receipt:
+`target/wpt-targeted/tracked190-after-nested-text-strut-v4-20261003/results.json`.
+The qualifier hashes tracked source diff AND the preexisting untracked shared
+inline modules separately, as well as runner and runtime test binary. Failed
+compile and regression candidates remain in the batch artifacts.
+
+Root size check retains six outside-vendor violations; diff check passes.
+No Product Agent knowledge impact: shared CSS line metrics, no product concept,
+authority or tool semantics changed. No fixture/reference/mask/tolerance edit,
+commit/push or full6548 rerun. The original zero-failure objective remains open;
+45 failures remain in the registered problem set, not a full-corpus recount.
+
+### 2026-10-03: macOS fractional glyph raster policy and fresh oracle audit
+
+Fresh original sub/super REDs remain strict2199 each; native actual and reference
+each differ2505 full-page pixels from corresponding Chromium141 images
+(807 instruction pixels,1698 content pixels). Layout coordinates/font geometry
+already match. A controlled Times test isolates the raster font policy with
+identical rustybuzz glyphs/positions: RED252 pixels at16px/x8. The control uses
+Chromium141 macOS `FontPlatformData::CreateSkFont` default subpixel positioning,
+linear metrics, disabled embedded bitmaps and subpixel-AA edging:
+https://chromium.googlesource.com/chromium/src/+/refs/tags/141.0.7390.37/third_party/blink/renderer/platform/fonts/mac/font_platform_data_mac.mm
+
+Shared `skia_text_run::css_font` applies that macOS policy to normal glyph paint,
+shared inline glyph slices and ink/advance/metric measurement. Other platforms
+retain their existing policy; no other-platform runtime acceptance claimed.
+The controlled test now passes all9 size/origin combinations. Candidate first
+compile had one missing borrow (retained log); the final source removes a new
+unused import and avoids non-macOS unused-mut without changing raster behavior.
+
+Final sub AND super actual-vs-browser and reference-vs-browser full800x600
+comparisons are0 pixels each, down from2505. Strict native2199 to2175 now exactly
+matches browser's2175 for both. These strict failures remain unwaived: overlapping
+red/green antialiased text differs from the one-pass green reference; painting
+order, glyph clipping and original references were not changed to force green.
+
+Skia module67/70 retains the same three named known failures; added raster test
+passes. Strut30/30, baseline34/34, shared inline shaping2/2, previous original
+strut neighborhood5/5 and white-space111/111 pass. `skia_text_run::tests` selects
+zero tests and is explicitly NOT reported as a passing guard. Registered190
+remains145 pass/45 fail, no status changes. Ten still-failed pixel counts change;
+the receipt retains increases as well as decreases, not just improved numbers.
+
+Fresh audits of eight changed still-failed originals refine prior classification:
+- `s-11-1-1b-005.html`: browser strict0/native2860 and reference-vs-browser0,
+  proving a pending native defect rather than treating it as a reference conflict.
+- `pseudo-007`: actual and reference both match browser at0; strict37833 remains.
+- `inline-block-baseline-003/004`: strict428 matches browser but each actual and
+  reference still differ165 pixels from browser; no whole-image parity claim.
+- `inline-block-baseline-005/006`: strict native3200 versus browser428; actual
+  native/browser3187 and reference/browser165 remain pending genuine differences.
+- `font-family-rule-002a`: strict9030 matches browser but actual/browser2231,
+  reference/browser629 remain; the absent White Space font prerequisite is not
+  waived or counted as renderer completion.
+- `quotes-036`: strict native2648/browser2968; actual/browser1223 and reference/
+  browser0 remain pending. Nonzero browser reference mismatch is not a waiver.
+
+Receipt: `target/wpt-targeted/absolute-text-font-origin-20261003/qualification.json`;
+final image comparison: `pixel-comparison-v3.json`; changed-case evidence:
+`changed-pixel-comparison.json` therein. Original190 membership and fixed revision
+validated; source diff, untracked inline modules and both binary hashes retained.
+Root size check retains six outside-vendor violations; diff check passes. Generic
+font raster policy does not change product Agent concepts, authority or tool
+semantics. No fixture/reference/mask/tolerance change, commit/push or full6548
+rerun. Continue the real errata005/inline-block defects; zero-failure goal remains
+open with45 registered strict failures and the three unwaived Skia unit failures.
+
+### 2026-10-03: root-table absolute text keeps its real containing width
+
+Original1343 `s-11-1-1b-005.html` fresh RED2860 pixels matches a valid existing
+root-table unit RED: absolute paragraph x8/y16/width42.0625/height144 instead of
+Chromium x8/y16/width277.3125/height18. The table cell's normal-flow auto-size cap
+overwrites the absolute child's shrink-to-fit width despite an800px initial
+containing block. Table-cell auto stretch/capping now excludes Absolute/Fixed;
+normal-flow children still fill tracks and positioned cells still establish the
+absolute containing width. No paragraph-specific or root-table pixel offset.
+
+The added parsed control covers static and relative160px cells, absolute text,
+fixed viewport text and normal-flow principal width. First candidate control
+incorrectly checked an8px inline glyph fragment rather than its retained160px
+div principal; that assertion was corrected without weakening the principal
+width requirement. Valid original root unit and corrected new control pass.
+Final table guard108/114 retains six other known failures, down from seven.
+Rejected local diagnostic manifests are not WPT evidence or original membership;
+their error logs are retained separately from valid unit/WPT REDs.
+
+Final original1343 strict2860 to0; actual-vs-browser and reference-vs-browser
+full800x600 comparisons0 with a fresh Chromium141 oracle. Original1340..1344
+window2/5:005 and006 pass,002..004 retain800 pixels each. No claim that this
+neighbor window is wholly green. Sequential registered190 is146 pass/44 fail;
+only005 changes status/pixel count and all other results remain unchanged.
+Original6548 unique membership and pinned revision validated, not replayed.
+White-space111/111, baseline34/34, strut30/30, shared inline shaping2/2 and previous
+macOS raster control1/1 pass. Builds/source frozen during Cargo and jobs1 WPT.
+
+Receipt: `target/wpt-targeted/root-table-absolute-width-20261003/qualification.json`;
+combined registered receipt:
+`target/wpt-targeted/tracked190-after-root-table-absolute-width-20261003/results.json`.
+Root size gate retains six outside-vendor violations; diff check passes. Generic
+CSS containing-width repair has no Product Agent concept, authority or tool
+semantics impact. No fixture/reference/mask/tolerance modification, commit/push
+or full6548 completion claim. Continue inline-block005/006 real discrepancies;
+44 registered strict failures and the remaining module failures stay unwaived.
+
+### 2026-10-03 clipped multiline atomic line — partial layout repair
+
+Pinned revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+Original6094..6097 RED is428/428/3200/3200 pixels. A new parsed inline-style
+regression confirms the005/006 outer line incorrectly grows from75px to85.5px.
+The first candidate did not take ownership because DOM lowering retains the
+75px font strut as a pixel min-height. The second candidate resolves the
+eligible single line from font/atomic ascent and descent, recognizes that
+minimum as a floor, excludes soft-wrapped text, and propagates size changes
+through ordinary block-flow ancestors and later siblings. The parsed regression
+also checks the following block position; baseline35/35, strut31/31,
+inline-block30/30, inline shaping2/2 and macOS raster1/1 pass. Table108/114 retains
+the same six existing failures, not waived.
+
+Fresh Chromium141 oracles report strict428 pixels for each of these four
+test/reference pairs. The pinned assertion's higher-of-baselines text is not
+the current CSS22 rule: non-visible overflow exports the bottom margin edge.
+No higher-of rule or screenshot coordinate compensation was introduced.
+005/006 native-versus-browser actual comparison drops3187 to165 pixels each;
+native strict comparison drops3200 to428. Both actual and reference still differ
+from their browser counterparts by165 pixels at x152..186,y46..57. This is not
+pixel parity or a strict pass; further font/run-position diagnosis is pending.
+
+Registered190 remains146 pass/44 fail, with only the005/006 pixel reductions and
+no new status/pixel regressions. White-space111/111 stays green. Full6548 unique
+membership and revision are validated, not replayed. Source review additionally
+flags the content-box versus border-box minimum-height floor when vertical edges
+are nonzero; a targeted RED/control is the next step before broader closure.
+
+Receipt: `target/wpt-targeted/inline-block-baseline-higher-edge-20261003/qualification.json`.
+Combined receipt: `target/wpt-targeted/tracked190-after-clipped-atomic-line-20261003/results.json`.
+The root size check retains six outside-vendor violations; diff check passes.
+This generic CSS layout work changes no Product Agent concepts, authority,
+machine fields or tool semantics. Existing dirty changes are preserved. No
+fixture/reference/mask/tolerance changes, commit/push or full6548 completion.
+
+### 2026-10-03 atomic line min/max height — box-sizing control closed
+
+The preceding batch's pending content-box floor control is now a valid RED:
+`inline_atomic_line_min_height_uses_the_authored_box_sizing` reports85px for a
+content-box whose80px minimum plus two5px borders requires90px. The production
+solver now separates natural line ascent/descent from constrained border-box
+height. Pixel min/max constraints respect content-box/border-box sizing, and
+min takes precedence over a smaller max; max-height does not squeeze the
+font/atomic line baseline. Constraints requiring a containing-height/unit
+resolution remain with the existing layout resolver rather than being guessed.
+
+Six native controls and fresh Chromium141 diagnostic controls agree on used
+heights90/85/70/60/90/80px. These are controls, not original WPT membership.
+Baseline35/35, strut31/31, inline-block30/30, inline shaping2/2 and macOS raster1/1
+pass. Table108/114 retains the same six unwaived existing module failures.
+Original6092..6104 neighborhood remains9/13; its26 actual/reference images are
+pixel-identical before/after. White-space111/111 and registered190146 pass/44
+fail remain unchanged. No claim that the baseline003..006 strict428 failures or
+their165 native-versus-Chromium residual pixels are cleared.
+
+Receipt: `target/wpt-targeted/atomic-line-height-limits-20261003/qualification.json`.
+Combined receipt: `target/wpt-targeted/tracked190-after-atomic-height-limits-20261003/results.json`.
+Pinned WPT revision and original6548 unique paths are validated; full6548 is
+not replayed. Root size gate retains the same six outside-vendor violations;
+diff check and original WPT clean-check pass. This generic CSS repair changes
+no Product Agent concepts, authority, machine fields or tool semantics. No
+fixture/reference/mask/tolerance modification, commit or push. Continue actual
+font/run-position discrepancies; zero-failure objective remains open.
+
+### 2026-10-04 authored text advances and generated Inline IFC — focused repair
+
+The residual165 pixels on baseline003..006 came from CSS layout-unit advances
+and erased authored text boundaries, not font raster policy. Intrinsic layout
+advances now ceil to1/64px before padding; raw shaping and Canvas measurements
+remain unsnapped. Anonymous text coalescing retains content-checked UTF-8 source
+ends, maps them through whitespace preparation and line cuts, and applies
+cluster-safe offsets to the original contextual glyph run. Synthetic word/space
+pieces carry source-run identity so rejoining them does not invent boundaries.
+Cluster-crossing ligatures/reordered runs retain the existing unsplit fallback;
+soft-line fitting/source-boundary coverage remains unfinished, not universal
+CSS compatibility. The source controls are recorded as RED/GREEN, not original
+WPT membership.
+
+The first partial candidate added165 pixels to baseline002 and left the
+reference165 pixels behind Chromium. Boundary preservation restores the
+original6092..6104 neighborhood to9/13, with003..006 actual and reference each
+pixel-identical to Chromium141. Their strict428 pixels remain unwaived; current
+Chromium also reports428 for each pinned test/reference pair.
+
+Registered190 then exposed a new1038-pixel regression in
+`generated-content/before-after-table-parts-001.xht`. Source identity alone did
+not reduce it. Both contextual advance measurement and shared glyph replay
+excluded `display:inline` generated rows despite their internal IFC marker.
+Two valid RED controls report missing advances and0/6 shared fragments. The
+producer change admits IFC-marked Inline rows alongside Block/Flex, retaining
+the existing plain-word/LTR/style/cluster guards and excluding unmarked Inline.
+Both controls pass, and original1878 drops1038 to0 strict pixels.
+
+Current pinned revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+White-space111/111, baseline35/35, strut31/31, inline-block30/30, shared shaping2/2,
+macOS raster1/1 and the authored paint/normalization controls pass. Table108/114
+retains the same six unwaived module failures. Registered190 returns146 pass/44
+fail with no status/pixel changes versus the last qualified height-limits batch.
+The earlier broad `authored_` filter also reported a color serialization
+assertion (`rgb(255, 0, 255)` versus `#ff00ff`); it is not waived or represented
+as a green runtime-module suite.
+
+Fresh Chromium evidence reveals that generated-table actual and reference each
+still differ from their browser counterpart by55717 pixels. Both strict pairs
+are0, which does not establish browser parity. This discrepancy is retained for
+table/layout investigation; no fixture, reference, mask or tolerance is changed.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/inline-ifc-qualification-v4.json`.
+Combined190: `target/wpt-targeted/baseline-font-position-20261003/tracked190-v4/results.json`.
+Browser discrepancy: `target/wpt-targeted/baseline-font-position-20261003/generated-browser-comparison-v4.json`.
+Full6548 unique membership/revision is validated, not replayed. Existing dirty
+work is preserved; no commit/push or zero-failure completion. This generic CSS
+repair changes no Product Agent concepts, authority, wire fields or tool
+semantics, so no product knowledge update is required.
+
+### 2026-10-04 auto table surplus allocation — focused V5
+
+Chromium141 controls show that a 600px automatic table with unconstrained
+max-content columns100/200 uses200/400, not250/350. A valid runtime RED
+captures the latter result. Surplus now preserves recipient-column proportions,
+with equal distribution only when all recipients have zero intrinsic width.
+Unconstrained columns receive surplus before definite-width columns; percentage
+columns resolve their declared grid share. Controls also cover zero columns,
+equal columns,100px/auto,100px/200px and25%/auto. Spanning cell declarations
+are not incorrectly promoted to independent per-column surplus categories;
+general spanning/overconstrained allocation is not claimed complete.
+
+Runtime auto-table13/13 and baseline35/35 pass. Table109/115 retains exactly the
+same six unwaived failures from V4. Current fixed-revision registered190 remains
+146 pass/44 fail, with no status or pixel-count changes. White-space111/111 and
+original1878 paired reftest0 pixels remain green. The original6548 membership
+and revision are validated, but the full suite is not replayed or closed.
+
+The generated-table page uses contraction, not surplus allocation. Current
+native actual/reference each still differ from the reused pinned Chromium141
+oracle by55717 pixels. Browser diagnostics record used column widths
+437.15625/340.84375, max-content599.75/457.171875 and
+min-content203.140625/173.375. Native first-column440.99036 versus browser
+437.15625 remains a separate intrinsic/contraction investigation, not a root
+cause claim or a repaired pixel discrepancy.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/table-expansion-qualification-v5.json`.
+RED/GREEN and browser controls are linked in that receipt; combined failures:
+`target/wpt-targeted/baseline-font-position-20261003/tracked190-v5/results.json`.
+No reference, fuzzy tolerance, product code, WPT source, commit or push changes.
+Existing dirty work is retained. Generic table sizing changes no product Agent
+concepts, authority, wire fields or tool semantics; product knowledge unchanged.
+
+### 2026-10-04 nested table min-content aggregation — focused V6
+
+The existing headless layout diagnostic now records automatic-table intrinsic
+tracks only under `W3COS_DUMP_HEADLESS_LAYOUT`. On original1878, native outer
+column minima98.953125/78.078125 disagree with Chromium203.140625/173.375,
+while maxima differ by only0.03125/0.046875. Nested tables were taking the
+largest descendant minimum instead of summing the column grid.
+
+A three-column60/40/70 control with separated spacing and borders reports
+72 versus expected180 in RED, then180 in GREEN. Minimum contributions now
+aggregate table/section column grids, separated outer spacing and collapsed
+outer border halves. Empty/non-table fallbacks remain intact; generalized
+caption, spanning and constrained allocation are not declared complete.
+
+Candidate native minima are203.14063/173.39063; outer first-column width falls
+from440.99036 to437.15405 versus Chromium437.15625. Original1878 strict pair
+remains0 pixels. Actual and reference each improve from55717 to43909 pixels
+against the unchanged pinned Chromium141 oracle; browser parity is not closed.
+Runtime focused1/1 and baseline35/35 pass. Table110/116 retains the same six
+unwaived failures. Registered190 remains146 pass/44 fail with no status/pixel
+changes from V5; white-space111/111 passes.
+
+Next evidence: the first three right-column wrappers are each4px shorter than
+the browser, causing a cumulative12px upward displacement. The first cell/row/
+table remain50px while their resolved IFC is54px. This supports a next height
+propagation investigation, not a verified fix or full root-cause closure.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/table-min-content-qualification-v6.json`.
+Browser comparison: `target/wpt-targeted/baseline-font-position-20261003/generated-browser-comparison-v6.json`.
+Next producer evidence: `target/wpt-targeted/baseline-font-position-20261003/table-row-height-evidence-v6.json`.
+Full6548 membership/revision validated, not replayed. No WPT/reference/tolerance,
+outside-vendor code, commit or push changes. Dirty work is retained. This generic
+layout repair changes no product concepts, authority, wire fields or tool
+semantics; no Product Agent knowledge update is required.
+
+### 2026-10-04 settled table row height — focused V7
+
+A focused RED reports cell/row/table50px despite a settled54px principal IFC.
+Row settlement now exports in-flow content growth, preserves declared height
+floors, subtracts relative-position offsets and propagates row-group extent.
+Relative offsets0/+20/-20 and direct/grouped rows are covered by the focused
+GREEN. Inline text and decorated inline paint rectangles do not contribute
+their vertical decoration extent as line-box height.
+
+Rejected candidates are retained: text-only cells gained1.6px half-leading,
+and original2791 (`padding-applies-to-017.xht`) regressed from0 to37280 pixels
+when10em inline bottom padding expanded the row. The repaired candidate's
+padding unit guard passes and original2791 returns to0 pixels. Its rejected
+receipt remains `table-row-growth-qualification-v7.json`, not replaced by GREEN.
+
+Current registered190 is146 pass/44 fail with no status/pixel changes from V6.
+White-space111/111, baseline35/35 and both focused row/padding guards pass.
+Table112/118 retains six existing unwaived failures. Original1878 strict pair
+remains0 pixels; against the reused pinned Chromium141 oracle, actual and
+reference each improve from43909 to43252 pixels. This is not browser parity.
+
+Fresh headless geometry confirms cell/row/table54px and matching wrapper
+heights, but later right-column wrappers remain up to12px too high. Parent
+propagation stops at TableCell; relocating its following flow siblings without
+inflating an already-stretched cell is the next unresolved boundary.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/table-row-growth-qualification-v7-fixed.json`.
+Current geometry: `target/wpt-targeted/baseline-font-position-20261003/table-row-height-evidence-v7-fixed.json`.
+The pinned6548 membership/revision is validated, not fully replayed or closed.
+No reference/tolerance, WPT source, outside-vendor code, commit or push changes.
+Dirty work is retained; generic table layout changes no Product Agent concepts,
+authority, wire fields or tool semantics, so knowledge requires no update.
+
+### 2026-10-04 flow siblings inside table cells — focused V8
+
+A focused RED leaves the following block at y50 instead of54 after a nested
+table grows. Coverage distinguishes a full70px cell from a stretched100px cell
+and an absolute child. Height propagation now enters TableCell to relocate
+in-flow siblings; existing spare cell height is preserved. When content exceeds
+that height, cell and row-grid growth settles before the enclosing table is
+visited. Collapsed border halves and relative flow offsets remain respected.
+
+Focused GREEN and auto-table16/16 pass. Table113/119 retains the same six
+unwaived failures; baseline35/35 passes. Registered190 remains146 pass/44 fail
+with no status/pixel changes from V7. White-space111/111 and original2791
+padding guard pass. Original1878 strict pair remains0 pixels.
+
+Fresh native geometry now matches the unchanged Chromium141 oracle for all
+seven right-column wrapper heights and y coordinates: the cumulative12px
+displacement is eliminated. Actual/reference each improve from43252 to2593
+pixels against that browser oracle. Residual color and text-edge differences
+remain unresolved; matching these wrapper rectangles is not full-page parity.
+Next work returns to the registered44 failures; this residual page discrepancy
+also remains open rather than being waived.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/table-cell-flow-qualification-v8.json`.
+RED: `target/wpt-targeted/baseline-font-position-20261003/table-cell-flow-red-v8.log`.
+Geometry: `target/wpt-targeted/baseline-font-position-20261003/table-row-height-evidence-v8.json`.
+Fixed6548 membership/revision validated, not fully replayed or closed. No WPT
+source/reference/tolerance, outside-vendor code, commit or push changes. Existing
+dirty work is preserved. Generic layout changes no Product Agent concepts,
+authority, wire fields or tool semantics; product knowledge unchanged.
+
+### 2026-10-04 font keyword investigation — V9 not qualified
+
+Fresh Chromium141 actual/reference comparisons retain selected strict failures.
+V8 native actual matches Chromium actual exactly for background144/147,
+position-relative4314, pseudo4947, margin-bottom2515, overflow1341/1342 and
+replaced3841. These are not renderer repair claims or waivers: strict fixed
+references still fail. Other selected inputs differ from Chromium and remain
+implementation investigations. An initial SVG browser probe omitted SVG MIME;
+that artifact is rejected and separate MIME-correct probes are retained.
+
+`inherit-computed-001` exposes a separate font-size issue: native ignores
+`larger` and stays16px versus Chromium19.2px. A DOM RED reports16 instead of28.8
+under a24px parent. Candidate parent-relative larger/smaller resolution includes
+font shorthand. DOM font-size17/17 and runtime baseline35/35 pass; table113/119
+retains six existing failures. Browser controls cover16 combinations of parent
+sizes12/16/24/40, longhand/shorthand and inherited descendants.
+
+The same8 affected WPT entries were replayed with the SHA-verified V8 runner
+and candidate V9 runner:7/1 becomes6/2. New `font-size-121` regression is0 to6171
+pixels, so broader registered190 and white-space replay stop automatically.
+Absolute `xx-small`/`xx-large` still resolve to16px, making the partial keyword
+chain incoherent. Chromium itself has1785 strict pixels on that fixed test;
+this does not explain away the larger native discrepancy or authorize tolerance.
+V9 is not qualified. V8 remains the last qualified146/44 checkpoint, not a
+current V9 result. Next work must complete keyword resolution and repair/retest
+the new regression rather than suppress it.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/font-keywords-candidate-v9.json`.
+Browser evidence: `target/wpt-targeted/baseline-font-position-20261003/browser-failure-comparison-v9.json`.
+RED/GREEN, old/new runners, source hashes and rejected artifacts are retained.
+Pinned6548 not fully replayed or closed; no WPT/reference/tolerance,
+outside-vendor code, commit or push changes. Generic CSS parsing changes no
+Product Agent concepts, authority, wire fields or tool semantics.
+
+### 2026-10-04 absolute font keyword chain — V10 not qualified
+
+Absolute keywords now resolve through a shared UA table instead of remaining
+at16px. Case-insensitive longhand, font shorthand and final-family cascade share
+the same resolution; proportional defaults are9/10/13/16/18/24/32/48 and generic
+monospace defaults9/9/10/13/16/20/26/40. Font shorthand accepts relative keywords,
+resets omitted fields and resolves its line-height after its final family/size.
+Inherited descendants retain the computed numeric size, not the original token.
+These are current default tables, not configurable-host font policy closure.
+
+RED captures16 instead of9. A second RED captures9 instead of10 for `x-small`
+with `monospace, serif`; a family list is not equivalent to the single generic
+monospace family. Both are covered by DOM font52/52 GREEN. Browser controls cover
+48 proportional/monospace combinations and48 family-list combinations. Runtime
+baseline35/35 passes; table113/119 retains six unwaived existing failures.
+
+The exact same expanded37 WPT entries run on preserved V8, V9 and V10 binaries:
+36/1,35/2 and35/2 respectively. `font-size-121` improves6171 to1697 pixels but
+does not recover V8's0. Broader registered190/white-space replay stops. V8 remains
+the last qualified146/44 checkpoint, not a current source result. Native actual
+and reference differ from the reused Chromium oracle by1358 and470 pixels;
+Chromium itself has1785 strict pixels. Neither that browser/reference conflict
+nor fixed keyword parsing explains away the remaining native layout/paint gap.
+Nested mixed-size inline bottom alignment is the next implementation boundary.
+
+There is also an acceptance conflict: background144/147 native actual equals
+Chromium actual at0 pixels, while both differ from the pinned reference by1.
+Literal browser pixel identity and literal fixed-reference zero cannot both be
+true for those inputs. No waiver, tolerance, changed reference or alternate
+completion criterion is authorized; final acceptance priority requires a user
+decision. Independent renderer defects remain in scope.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/font-keywords-candidate-v10.json`.
+Fixed6548 membership/revision validated, not fully replayed or closed. Source,
+RED, guard logs, old/new binaries and structured comparison are retained. No
+WPT source/reference/tolerance, outside-vendor code, commit or push changes.
+Generic CSS parsing changes no Product Agent concepts, authority, wire fields
+or tool semantics; knowledge unchanged.
+
+### 2026-10-04 nested bottom inline alignment — V11 focused candidate
+
+Nested undecorated single-line bottom-aligned inline fragments now anchor
+anonymous text to their CSS line edge. Synthetic unbroken-word wrappers are
+not required to share their default font with child text runs. This distinction
+recovers the first candidate's grouped-word regression without reverting the
+new nested-fragment correction. Multi-line and decorated fragments are excluded.
+
+The valid RED records 9px text at y0 instead of y17; the initial invalid fixture
+compilation is retained separately and is not RED proof. The new nested test
+and old grouped-word test pass. Bottom filter is35/36, retaining one existing
+table-height failure. Baseline35/35; table113/119 retains the same six failures.
+
+The same37 font-keyword WPT entries remain35/2 with no new status failures.
+`font-size-121` strict pixels improve1697 to1171. Native actual versus the reused
+Chromium actual improves1358 to663; this is not a new browser replay or zero
+pixel acceptance. Positive/negative-leading browser controls are retained but
+are not runtime-qualified. Registered190, white-space and full6548 were not
+replayed on V11; no full-suite closure is claimed.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/nested-bottom-candidate-v11.json`.
+Pinned revision remains unchanged. No reference/tolerance, outside-vendor code,
+commit or push changes. This internal layout fix changes no Product Agent
+concepts, authority, wire fields or tool semantics; knowledge unchanged.
+
+### 2026-10-04 registered Ahem raster experiment — V12 rejected
+
+V11 headless text rectangles now match Chromium's vertical positions. Two
+horizontal advances still differ by one CSS layout unit (1/64px), so geometry
+and glyph rasterization remain separate residuals. A candidate replacing
+registered Ahem cell rectangles with real glyph painting runs the same37 font
+keyword tests at35/2, but `font-size-121` strict pixels worsen1171 to1585. Native
+actual versus reused Chromium improves only663 to653. This candidate is
+rejected; no tolerance or fixed-reference waiver is introduced.
+
+Only the experimental paint change is removed; the production source diff
+hash is restored exactly to V11. Rebuilt-runner replay and candidate/restored
+results are tracked by `target/wpt-targeted/baseline-font-position-20261003/ahem-raster-rejected-v12.json`.
+The full6548 remains unclosed; no commit/push or outside-vendor code changes.
+
+### 2026-10-04 unquoted font-family whitespace — V13 focused candidate
+
+Unquoted family identifier sequences now collapse CSS whitespace before font
+matching, for longhand and shorthand. Quoted string whitespace is preserved;
+escaped identifiers retain their existing representation, not newly decoded.
+A valid RED records `White\t \n Space` unchanged instead of `White Space`.
+Font-focused DOM tests53/53 pass; three fresh Chromium141 computed-style
+controls confirm the quoted/unquoted whitespace distinction.
+
+Before this parser change, restored V11/V12 runner replays registered190 at
+146/44. That queue excludes the new font-size-121 regression and is not a
+full6548 remaining-failure count. On changed code, font-keyword37 stays35/2
+with unchanged pixel results. Original1740 `font-family-rule-002a` remains
+9030 pixels. Its upstream prerequisite requires the White Space host font;
+the harness does not supply it, host installation is not verified, and user
+stylesheet profiles explicitly reject font-face. Parser GREEN is not proof
+of that WPT case passing, nor permission to bypass its environment requirement.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/font-family-space-candidate-v13.json`.
+Fixed6548 membership/revision checked, not fully replayed or closed. No WPT
+source/reference/tolerance, outside-vendor code, commit/push changes. This
+internal CSS parsing fix changes no Product Agent concepts, authority, wire
+fields or tool semantics; knowledge unchanged.
+
+### 2026-10-04 explicit test-font prerequisites — V14
+
+The runner accepts repeatable `--test-font FAMILY=PATH` for process-local
+prerequisites. Test and reference isolated workers receive identical mappings.
+Fonts use a dedicated registry lifecycle owner and are cleared when the worker
+scope ends. Font bytes and original family/path mappings are retained under
+the batch artifacts; no host installation, author CSS or user-origin font-face
+injection is performed. File-load errors are fatal prerequisite errors, not
+fallback passes. Registry registration semantics otherwise remain unchanged.
+
+CLI RED rejects the previously unavailable option. Runner20/20 tests cover CLI,
+font load, scope cleanup and missing-file errors. The initial lifecycle fixture
+pointed to a missing upstream asset; that failure and one intermediate compiler
+error are retained separately. Final lifecycle validation uses real pinned
+`fonts/Ahem.ttf`, not a replacement for another family. The same37 keyword
+cases with `--test-font Ahem=../wpt/fonts/Ahem.ttf` remain35/2 with no status or
+pixel changes; retained font bytes match the input SHA256.
+
+The pinned Git tree has no `css/CSS2/fonts/support/AHEM_whitespace.ttf`, although
+`font-family-rule-002a` links it as a host-font prerequisite. An explicit attempt
+to supply that path fails before suite execution. No White Space substitute,
+waiver or case PASS is claimed. Obtaining its authoritative asset remains an
+environment gap; other renderer failures remain independently actionable.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/test-font-prerequisite-v14.json`.
+Full6548 remains unclosed; no commit/push, reference/tolerance or outside-vendor
+code changes. Test infrastructure only; Product Agent knowledge unchanged.
+
+### 2026-10-04 br generated-content experiment — V15 rejected
+
+Current `quotes-036` native versus fresh Chromium141 differs1223 pixels.
+Lowering br returns a forced-break marker before generating visible pseudos.
+RED demonstrates missing A/B around that break. The candidate preserves those
+items and DOM br4/4 passes, but an anonymous nested break does not advance
+following sibling text: `S quotes work!!!` stays at y26 instead of browser y44.
+Both fixes must be addressed together, not accepted from DOM lowering alone.
+
+The same14 quote entries run11/3 on V14 and candidate V15. `quotes-036` strict
+pixels worsen2648 to2921, native/browser1223 to1804. Candidate is rejected;
+source diff and restored runner hashes match V14 exactly. A restored original
+2059 replay returns2648. Other14 results expose quotes-035 and035a at30 pixels
+each; these focused results are not a full6548 remaining count.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/quotes-rejected-v15.json`.
+RED, failed candidate, browser oracle, layout dumps and restoration retained.
+Full6548 unclosed; no reference/tolerance, outside-vendor code, commit/push
+changes. No Product Agent semantic change; knowledge unchanged.
+
+### 2026-10-04 quote glyph localization — V16 rejected metadata candidate
+
+Single-text pseudos lack the source-run marker already used by multi-item
+pseudos. RED confirms that metadata gap, but adding it changes none of the14
+quote WPT results: baseline and candidate remain11/3 with identical pixels.
+It is not accepted as a fix for the target failures. Generated-content DOM
+candidate43/45 and baseline42/45 (including the new RED test) show the same two
+pre-existing component-tree assertions; the candidate fixes only its new
+metadata assertion. Production source and runner are restored to V14 hashes.
+
+For quotes-035, all30 native/reference differing pixels lie within x312–314,
+y10–22, at the middle terminal exclamation mark. Body text and line placement
+are not the residual. Fresh Chromium141 has238 strict reference pixels, so
+browser parity and fixed-reference zero must remain separate evidence.
+Next inspect glyph positioning and authored-fragment adjustments at that mark.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/quotes-source-rejected-v16.json`.
+No full6548 closure, reference/tolerance, outside-vendor code or commit/push
+changes. Diagnostic evidence only; Product Agent knowledge unchanged.
+
+### 2026-10-04 quote glyph positioning proof — V17 diagnostic only
+
+Actual/reference quotes-035 diagnostic runs have identical raw glyph IDs,
+positions, origin x40 and baseline22. The actual coalesced run carries authored
+fragment ends and its existing snapped-advance adjustment accumulates0.046875px;
+reference carries no fragment adjustment. Middle terminal `!` raw x270.85938
+therefore reaches a different raster-mask sampling position. This explains
+the30 pixels without a different string or shaping result.
+
+No snapping algorithm or tolerance changes are made. Fresh Chromium itself
+differs238 pixels from the same fixed reference, so forcing a shared-run
+reference position is not by itself evidence of browser parity. Acceptance
+priority remains unresolved; avoid removing the fragment adjustment solely
+to erase this screenshot difference.
+
+Temporary glyph diagnostics are removed. Production source and runner hashes
+match V14; restored original2057/2058 both remain30 pixels. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/glyph-localization-v17.json`.
+Full6548 remains unclosed; no outside-vendor code or commit/push changes.
+Diagnostic evidence only; Product Agent knowledge unchanged.
+
+### 2026-10-04 observed failure queue refresh — V18
+
+Union the failed paths from known187 plus three supplements, font-keyword37
+and quote14. This identifies47 unique original-suite entries. Re-run them on
+the current V14-bound source/binary:0/47 passes. This is an observed failure
+queue, not proof that the other6501 entries pass on current code.
+
+Fresh Chromium141 viewport800x600 DPR1 captures actual/reference for all47.
+Native actual exactly equals browser actual for34; native reference equals
+browser reference for43. Browser strict references pass0/47. All captured
+native/reference pixel counts agree with the native structured report. The
+explicit user stylesheet's selectors match none of these browser pages; no
+author-origin substitute for user styles is injected. No routed asset requests
+fail, but the White Space host-font prerequisite remains absent separately.
+
+The13 actual-page browser gaps are inherit-computed-001; four CSS1 margin/
+padding003 cases; errata s-11-1-1b-002; font-family-rule-002a; font-size-121;
+quotes-035/035a/036; replaced-intrinsic-001; and letter-spacing-080. Use their
+per-case counts to select genuine renderer work rather than treating every
+fixed-reference mismatch as a native bug. Browser/reference acceptance priority
+is still unresolved; no waiver, changed reference or pass substitution exists.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/failed47-receipt-v18.json`.
+Pair PNGs, hashes, browser version, resource failures and separate actual/
+reference deltas are in `failed47-triage-v18.json`. Full6548 unclosed; source
+unchanged, no outside-vendor code or commit/push. Evidence-only triage changes
+no Product Agent semantics; knowledge unchanged.
+
+### 2026-10-04 empty inline whitespace boundary — V19
+
+`inherit-computed-001` had the same 1284-pixel native/browser gap on both
+actual and reference. Browser font-size probes (19, 19.1875, 19.2, 19.203125,
+19.21875px) did not eliminate it. Layout evidence instead identifies a duplicated
+collapsible space across an empty bordered inline: native following text width
+151.42188px versus Chromium 146.625px, approximately one 4.8px space.
+
+The DOM lowering now carries the preceding whitespace boundary through empty
+non-replaced inline boxes. BR, replaced/atomic content and generated pseudo
+boxes remain boundaries. A new test covers consecutive empty decorated boxes
+with spaces before, after, or on both sides. Valid RED:0/1. Wider DOM inline
+guards: baseline107/6 (including new RED), candidate108/5; the same five other
+failures were reproduced on the unmodified implementation. The intermediate
+String-versus-str compile error is not a GREEN receipt.
+
+Candidate runner build passed. Fixed-revision observed47 replay stays0/47,
+with strict pixel counts unchanged for all47. Comparing verified immutable V18
+Chromium screenshots, inherit-computed-001 actual and reference gaps both
+fall1284→47; all other46 comparisons are unchanged. White-space111/111 passes.
+The remaining47-pixel browser gap and the168-pixel fixed-reference failure are
+separate unresolved evidence; this does not close a WPT case or full6548.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/empty-inline-receipt-v19.json`.
+Diagnostic font probes: `inherit-raster-v19/receipt.json`; headless layout:
+`inherit-layout-v19.log`. RED, baseline guards, candidate guards, build and
+focused WPT reports retain distinct logs/artifacts. Source/binary hashes and
+all47 native image hashes are bound in the receipt. No reference/tolerance
+changes, outside-vendor code, commit or push; no Product Agent semantic impact.
+
+### 2026-10-04 fixed-reference conflict controls — V20
+
+Pixel-localize all47 current V19 failures and native/browser comparisons,
+validating source/binary and retained PNG hashes. Production source is unchanged.
+The black96x96 reference asset decodes to96x96 fully opaque black pixels;
+it is not a damaged asset. Background-applies-to-006 differs at(103,53):
+actual RGB5/5/5 versus reference0/0/0. Native and Chromium actual pages are
+identical. A fresh browser-only control removing cell characters, without
+changing the background geometry, matches the original reference exactly.
+This attributes that one-pixel difference to text ink rather than an erroneous
+background box. The modified control is not WPT acceptance.
+
+`letter-spacing-080` contains20px Ahem, first-row margin-left6em and second-row
+letter-spacing6em. Its fixed reference `letter-spacing-007-ref` contains96px
+margin-left in both rows. Fresh Chromium computed values are120px versus96px,
+and second-box positions148px versus124px. Original browser strict failure is
+1804pixels; changing both test spacings to96px in a diagnostic browser context
+matches the original reference exactly. The native strict failure remains1600,
+with the same24px displacement. Correctly resolving6em at20px cannot equal96px.
+No production renderer change, WPT file edit, tolerance or accepted override
+has been made. A source-derived reference conflict is not a native PASS.
+
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/failed-pixel-localization-v20.json`
+and `reference-controls-receipt-v20.json`, with separate original/reference/
+diagnostic PNGs in `reference-controls-v20`. Resource requests succeed; pinned
+WPT checkout stays clean. Original47 RED verdicts and full6548 goal remain
+unclosed. Authorizing reference corrections or another acceptance policy is a
+human decision, not permission inferred from an automatic goal continuation.
+Product Agent knowledge unchanged: evidence/renderer internals only.
+
+### 2026-10-04 pinned White Space font prerequisite — V21
+
+Correct the overbroad V14/V18 missing-asset conclusion: the obsolete
+`css/CSS2/fonts/support/AHEM_whitespace.ttf` link is absent, but the pinned
+WPT tree contains `fonts/ahem-extra/AHEM_WhiteSpace.TTF`. Its family/full-name
+records are exactly `White Space`; PostScript name is `WhiteSpace`, not Ahem.
+Blob10c218a1e97dbd60d4524486929fec58c0d47adc,10944bytes, SHA256
+4518971ebb29ba98223503cbb17c645a0d4eb77d6b1f60f928dd23666819f52b.
+Historical2026-10-01 browser diagnostics already located this font; this batch
+now qualifies the current V19 native runner with the exact pinned bytes.
+
+Fresh native RED without font:9030pixels. Supply the explicit prerequisite:
+
+```sh
+target/wpt/w3cos-wpt --wpt-root ../wpt \
+  --suite target/wpt-targeted/full-6548-suite-20260928.json \
+  --case-start 1740 --case-limit 1 --jobs 1 --report-only \
+  --artifacts target/wpt-targeted/baseline-font-position-20261003/white-space-font-v21 \
+  --user-stylesheet tests/wpt/profiles/css2-userstyle.css \
+  --test-font 'White Space=../wpt/fonts/ahem-extra/AHEM_WhiteSpace.TTF'
+```
+
+Native remainsFAIL732,max_difference57. Fresh Chromium141 loads the same bytes
+through page-local FontFace (no CSS declaration override or system install):
+strictFAIL732,max_difference57, same edge-pixel colors and bounds. Native/browser
+actual and reference each still differ629pixels, localized to the prerequisite
+instructions' hyperlink at x362–443,y18–33. Inspect generic UA link defaults
+separately; neither this629 gap nor supplying the font closes strict732.
+
+With the same explicit font prerequisite, observed47 queue remains0/47.
+Only font-family-rule-002a changes9030→732; other46 strict counts are unchanged.
+Other local White Space manual pages (002,009,017) are not original6548 entries;
+they are not silently added to acceptance. Input and retained worker-font
+hashes agree. No renderer edit, alias/substitute, OS font install, reference
+change, tolerance, outside-vendor write, commit or push. Full6548 unclosed.
+
+Receipts: `target/wpt-targeted/baseline-font-position-20261003/font-queue-receipt-v21.json`
+and `white-space-font-receipt-v21.json`. Separate fresh RED, font-supplied
+single-case,47-case guard, name-table records and Chromium actual/reference
+PNGs are retained. Product Agent knowledge unchanged: internal test prerequisites.
+
+### 2026-10-04 unvisited hyperlink UA style — V22
+
+The629-pixel native/browser instruction-link gap has a valid DOM RED:
+an anchor with href inherits green instead of the default unvisited blue.
+Attribute-sensitive HTML UA defaults now set blue and underline only for
+href links (including empty href), below normal user/author declarations.
+Anchors without href retain inheritance. Explicit color inherit/unset and
+currentColor request the parent color; initial resets to black rather than
+retaining the new UA blue. No visited-history state is inferred or claimed.
+
+New tests cover href addition/removal, absent href, valid/invalid author color,
+inherit/unset/initial/currentColor, author text-decoration:none and normal
+user-stylesheet overrides. RED1/2, GREEN2/2. Wider color guards: candidate23/2
+versus unmodified production22/3 (including new RED). Both reproduce the
+same pre-existing SVG lowering failures: svg_current_color_uses_the_host_computed_color
+and stroke_only_svg_inherits_color_and_explicit_size_through_button_host.
+Only this batch's production hunks were removed/restored for that baseline.
+
+Candidate runner build passed. Eight original6548 reftests containing href
+anchors remain7/8, with all strict counts unchanged. White Space font-supplied
+observed47 queue remains0/47, also with all strict counts unchanged. Immutable
+V21 Chromium image hashes and the exact font bytes are checked before native
+comparison: font-family-rule-002a actual/reference gaps both fall629→77.
+The remaining77 pixels lie entirely at y31,x362–443, the underline row.
+The typed decoration reaches style, but current runtime text painting has no
+text_decoration draw implementation; adding UA style alone does not complete
+underline painting or this case. Strict732 remains native/browser-shared.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/ua-link-receipt-v22.json`.
+Separate RED/GREEN, candidate/baseline color guards, build,8-case link guards
+and47-case receipts are retained. Current source/binary hashes and native PNG
+hashes are bound. Next entry: decoration propagation and actual line painting,
+not a parser workaround or a reference PASS substitution. Full6548 unclosed;
+no reference/tolerance change, outside-vendor edit, commit or push. Product
+Agent knowledge unchanged: generic UA defaults/internal rendering only.
+
+### 2026-10-04 solid text-decoration paint candidate — V23 (not accepted)
+
+Pinned revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+The new whitespace raster test records RED `0/1` (underline paints no line)
+and GREEN `1/1` for None/Underline/Overline/LineThrough, with invariant advance.
+The candidate adds horizontal solid-line paint and shaped-glyph intercept
+clipping, keeping concrete font faces and authored-fragment offsets.
+Ancestor decoration ownership, propagation across atomic inline boundaries,
+combined decoration values and other raster backends are not closed.
+
+The canonical 22-case decoration/link guard is baseline `21/1`, candidate
+`19/3`. Newly failing `text-decoration-applies-to-002` and `005` each differ
+by 67 pixels. Do not call this candidate accepted or these cases repaired.
+Against immutable V21 Chromium captures with the exact pinned White Space
+font, `font-family-rule-002a` actual/reference native-browser differences
+improve from 77 to 2 pixels each; strict native-reference remains 732.
+Both residual pixels are fractional underline endpoints at y31: browser
+partial coverage versus candidate full blue. Investigate edge rasterization,
+not a coordinate-specific patch or tolerance change.
+
+The existing Skia raster unit group is `69 passed / 3 failed`; the three
+failures still require a baseline comparison, so their prior status is not
+claimed. Structured candidate receipt and RED/GREEN, build, focused baseline
+and candidate logs live under
+`target/wpt-targeted/baseline-font-position-20261003/decoration-receipt-v23.json`.
+The observed 47-case failure queue was replayed: `0/47`, with no strict pixel
+count or status changes against V22. This is not a full remaining-case count.
+Next entry: endpoint coverage and the two decoration application regressions,
+then qualify the raster failures against baseline. Full6548 remains
+unclosed. No reference/tolerance change, commit or push. Product Agent
+knowledge is unaffected: this is generic raster/test plumbing only.
+
+### 2026-10-04 direct anonymous decoration and endpoint coverage — V24 (not accepted)
+
+The revision, original6548 manifest and reference/tolerance policy are unchanged.
+Two new REDs are retained: direct inline div text loses Underline (`0/1`),
+and a fractional underline endpoint becomes full coverage (`0/1`). Anonymous
+text used-style now retains its immediate parent's decoration; computed
+element styles still do not inherit text-decoration. HTML u has its UA inline
+underline default, with author none verified. DOM guards are `2/2` and the
+related runtime decoration tests are `5/5`.
+
+Horizontal endpoint coverage AA is restored while the vertical stripe remains
+snapped. White Space actual and reference now each match immutable pinned-font
+Chromium captures at **zero pixels**, improving V23's two endpoint pixels;
+their strict native-reference mismatch still remains 732. Fresh browser
+captures for applies-to001/002/005 prove browser strict0 and native strict0,
+but actual and reference each retain one endpoint pixel at (74,65): browser
+RGB104 versus native RGB106. This is not browser pixel closure. Investigate
+decoration-width/layout-unit precision before adding any rounding policy;
+do not patch this coordinate or color.
+
+Canonical22 focused results change from V23 `19/3` to V24 `15/7`:
+002 and005 recover from67 pixels to0, while006–011 each newly expose67 pixels.
+These six cases declare underline on table, inline-table, table row groups
+or table rows, not the direct cell text. The now-visible u reference exposes
+missing ancestor decoration propagation. Next entry is a general applied-
+decoration owner pipeline preserving owner color, font geometry and atomic/
+out-of-flow boundaries, not ordinary property inheritance or a table-only fix.
+
+The observed47 failure queue remains `0/47`, all strict counts unchanged.
+Skia module guards are `74/3`, retaining the same three failure names as V23;
+V24 uses the broader render_skia:: filter (77 tests), while V23 used
+render_skia::tests:: (72 tests), so pass counts are not identical-scope totals.
+The three failures still require qualification against the pre-V23 source.
+Receipts: `target/wpt-targeted/baseline-font-position-20261003/decoration-receipt-v24.json`
+and `decoration-browser-receipt-v24.json`, with RED/GREEN, module/build logs,
+source/binary/font/capture hashes and focused results. This candidate remains
+NOT_ACCEPTED, full6548 unclosed. No outside-vendor edit, reference/tolerance
+change, commit or push; Product Agent knowledge remains unaffected.
+
+### 2026-10-04 retain decoration owner before raster propagation — V25
+
+Pinned revision and original6548 scope remain unchanged. A real DOM lowering
+RED (`0/1`) loses a green16px underline owner when flattening it into blue24px
+inline descendant text. The same merge policy would erase the owner's font,
+color and atomic-inline boundary before PaintArtifact can collect applied
+decorations. Decorated principal boxes now remain structural owners rather
+than being merged into a descendant's independent computed style.
+
+Restored candidate owner/computed-style tests are `3/3`, including inline and
+inline-block descendants and the non-inherited property boundary. Inline DOM
+guards are candidate `109/5` and hunk-removed baseline `109/5`, with identical
+five failure names. Only this batch's merge-barrier hunk was temporarily
+removed for comparison, then restored and requalified; other dirty source
+was not reset or overwritten.
+
+The22-case decoration/link guard stays `15/7`, with all44 native actual and
+reference PNGs byte-identical to V24. White-space111 passes `111/111` using
+unchanged entries from the original6548 manifest. This qualifies owner
+retention in the lowered IR, **not** ancestor-decoration raster propagation.
+The six table cases remain RED; applied owner collection, per-line baseline,
+owner font/color, atomic/out-of-flow isolation and actual line painting remain
+the next entry. The V24 direct-text endpoint pixel and three Skia unit failures
+are still unclosed. The observed47 queue was not replayed on V25, and its V24
+receipt is historical rather than current complete proof.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/decoration-owner-receipt-v25.json`,
+with RED/restored GREEN, inline candidate/baseline, runner build, canonical22
+and white-space111 receipts plus source/binary hashes. Full6548 unclosed;
+no reference/tolerance change, outside-vendor edit, commit or push. Product
+Agent knowledge is unaffected: generic DOM lowering/test internals only.
+
+### 2026-10-04 applied ancestor decoration raster candidate — V26
+
+Pinned WPT revision and canonical6548 scope are unchanged. The actual-raster
+RED loses a green16px underline on blue24px descendant text (`0/1`). Typed
+applied decorations now preserve originating color/font geometry without
+changing descendant computed style. Atomic inline, float and absolute/fixed
+boundaries isolate external decorations. Ordinary per-line paint reuses the
+glyph layout callback; shared shaping retains original glyph positions for
+skip-ink. Accumulated vertical-align lengths restore decoration baselines.
+Final focused decoration units pass `3/3`; white-space stays `111/111`.
+
+Canonical22 changes V25 `15/7` to candidate `18/4`. All six table/inline-table/
+row/group propagation failures006–011 change67 pixels to0. Three formerly
+green comparisons expose remaining defects: content082 differs8 pixels and
+vertical-align length001/002 each differ18. The first candidate's vertical-
+align mismatches1236/852 are preserved, not overwritten. Current remaining
+vertical-align pixels lie at fragment seams/endpoints; no tolerance changed.
+
+Fresh Chromium141.0.7390.37 captures show content082 actual native/browser0,
+reference native/browser8 and browser strict0. The actual underline must not
+be deleted: `boxed_split_inline_group` drops the reference's decoration owner
+when an inline splits around a block child. Vertical-align001/002 browser
+strict differences are1236/18; native/browser actual differences1968/336 and
+reference1956/331. Native strict18 is not browser closure. Keep reference
+conflicts separate from continuous-line geometry and width/coverage defects.
+The CSS decoration propagation/baseline requirement is documented in
+[CSS2.2 section16.3.1](https://www.w3.org/TR/CSS22/text.html#lining-striking-props).
+
+This candidate is **NOT_ACCEPTED**. Next entry: preserve split-inline owner
+through boxless lowering and aggregate continuous fragment decoration without
+alpha seams or width drift. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/decoration-artifact-receipt-v26.json`,
+plus `decoration-browser-receipt-v26.json` and RED/final-unit/build/guard logs.
+Observed47 and full6548 were not replayed; no current global remaining count
+or full-suite closure is claimed. No outside-vendor edit, reference/tolerance
+change, commit or push. Product Agent knowledge remains unaffected: generic
+paint/layout internals only.
+
+V27 construction boundary: split inline decorations must retain originating
+line kind, color and font metrics on the hoisted in-flow block without changing
+that block's computed text-decoration. Internal owner metadata accompanies the
+already-boxless lowering; it must not introduce a new flex fallback box, an
+ordinary inherited CSS property or propagation through atomic/out-of-flow
+boundaries. DOM RED and unchanged canonical references qualify this boundary.
+
+### 2026-10-04 preserve dissolved split-inline decoration owner — V27
+
+DOM RED is `0/1`: a linked inline surrounding a green block loses its blue
+decoration owner when split around that block. The block's computed decoration
+must remain none. Lowering now attaches owner-only internal paint metadata to
+hoisted in-flow block roots, retaining owner line/color/font independently of
+child computed style. It does not retain a contents/flex fallback box, modify
+text layout, or transmit external decoration through atomic/out-of-flow
+boundaries. Nested metadata retains outer-to-inner order and quoted/comma/
+newline font-family text without adding dependencies or public Style fields.
+
+Final DOM decoration tests are `6/6`; metadata roundtrip `1/1`; split-inline
+geometry/filter/opacity guards `6/6`. Runner build and diff check pass.
+Canonical22 changes V26 `18/4` to `19/3`: content082's reference mismatch8
+pixels becomes0; all other strict pixel counts stay unchanged. Fresh Chromium
+141.0.7390.37 captures prove content082 actual native/browser0, reference
+native/browser0, browser strict0 and native strict0. White-space111 remains
+`111/111` with original entries and fixed WPT revision.
+
+This qualifies the split-inline owner fix, not the whole decoration pipeline.
+Vertical-align001/002 each retain18 native-reference pixels; font-family-rule
+002a's White Space font/reference mismatch732 remains. Continuous-line alpha
+seams/width precision and native/browser baseline/Chromium-reference conflicts
+remain separate next entries. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/split-decoration-receipt-v27.json`
+and `decoration-browser-receipt-v27.json`, with immutable RED and focused captures.
+Observed47 and full6548 were not rerun, so no global remaining count or closure
+is inferred. File-size check still fails on six pre-existing outside-vendor
+files; no baseline increased. No reference/tolerance or outside-vendor changes,
+commit or push. Product Agent knowledge is unaffected: generic lowering/paint
+internals only.
+
+### 2026-10-04 reject fragmentation-invariance assumption — V28
+
+The proposed continuous-stripe merger prerequisite was tested before changing
+production paint. A new manual-PaintArtifact raster diagnostic compares two
+adjacent spaces with one two-space text, including opaque and half-alpha owner
+colors. It is RED `0/1`: each native comparison differs1 pixel. The existing
+owner-font/color/isolation guard passes `1/1` on this diagnostic build.
+
+Fresh Chromium141.0.7390.37 with the exact bundled Inter bytes also differs
+at the fragmented seam, for both opaque and half-alpha colors. Browser whole/
+split comparisons each differ2 pixels: one source-over coverage seam and one
+outer endpoint affected by per-fragment LayoutUnit rounding. Browser rectangles
+are recorded; the manual native diagnostic uses raw advances, so its1 versus
+browser2 count is not an equal-geometry native/browser comparison.
+
+Therefore fragmentation invariance alone is **not** a browser-conformance RED.
+No merger is added solely to make this synthetic assertion green. Only this
+turn's new invariant test is removed from the active unit suite after archiving
+its exact source and RED/build hash in
+`target/wpt-targeted/baseline-font-position-20261003/decoration-continuity-receipt-v28.json`.
+Browser captures/geometry/font hashes are in
+`decoration-continuity-browser-receipt-v28.json`. No original WPT case is
+removed, skipped, tolerated or marked passed. Production source is unchanged
+from V27. The prior planned merger is rejected pending actual native/browser
+evidence rather than presumed fragment invariance.
+
+Next entry is native/browser baseline and used-layout-unit width differences,
+separate from shared Chromium seams/reference conflicts; independent observed47
+failures remain available. V27 `19/3` and white-space `111/111` are historical
+receipts, not rerun here. Full6548 remains unclosed, fixed revision unchanged.
+No reference/tolerance or outside-vendor edits, commit or push. Product Agent
+knowledge remains unaffected: internal renderer diagnostics only.
+
+### 2026-10-04 registered Ahem bold and computed precision — V29
+
+Fresh original font-size-121 browser captures exposed two independent gaps:
+the deterministic Ahem cell path ignored requested synthetic bold, and nested
+larger/smaller operations accumulated f32-factor rounding. Registered Ahem bold
+now uses its real glyph outlines, sharing style-aware synthetic bold with
+fragment painting and ink/skip-ink bounds without expanding shaping advance.
+Unregistered Ahem retains its deterministic fallback. Relative font-size
+arithmetic evaluates the factor in double precision before storing computed
+f32, matching pinned Chromium141 FontDescription::LargerSize/SmallerSize.
+
+The bold raster assertion has RED `0/1`, final GREEN `1/1`, with the real pinned
+Ahem asset present and no skip. Font loading is runtime-only like neighboring
+WPT font tests, not a compile-time dependency on the external checkout. Exact
+nested computed-size RED catches `12.960001 != 12.96`; font-size GREEN is `19/19`
+including longhand/shorthand ladders. Final runner build and diff check pass.
+
+Final frozen-source focused results: original21 font-weight/font-size `20/1`,
+keywords37 `35/2`, decoration22 `19/3`, white-space111 `111/111`. Decoration
+pixel counts are unchanged from V27. Font-size-121 native/browser actual
+difference improves `663 -> 14`, reference `470 -> 0`; double arithmetic fixes
+computed sizes but does not remove the residual14 raster pixels. Native strict
+reference difference becomes1785, the same count as Chromium's own1785 conflict,
+so the original WPT case remains failed. It is not waived or called clear.
+
+Current broad `skia` unit filter is `79 passed / 3 failed`; the failure names are
+the same three recorded previously (glyph origin, borderless inline background,
+and fragment invariance). This is NOT broad runtime qualification. The earlier
+`76/3` log is intermediate evidence, not final-source proof. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/ahem-font-receipt-v29.json`,
+with frozen source/untracked hashes, runner/font hashes, RED/GREEN logs, original
+entry checks, focused capture hashes and final Chromium browser receipt.
+
+Observed47 and full6548 are NOT_RUN here; no current global remaining count or
+closure follows. Next entry is residual14 raster precision and independent
+native/browser gaps, separate from Chromium/reference conflicts. No WPT source,
+reference, tolerance, outside-vendor edits, commit or push. File-size gate still
+has the same six pre-existing outside-vendor failures; no baseline increased.
+Product Agent knowledge is unaffected by these generic font/paint internals.
+
+### 2026-10-04 BR generated-box eligibility and quote depth — V30
+
+Fresh original quotes-036 RED reproduces native/browser1223 pixels, reference
+native/browser0, native strict2648 and Chromium strict2968. The first candidate
+retained visible BR before/after text and made a new DOM assertion green, but
+fresh Chromium141 synthetic captures disprove that assertion: BR does not paint
+those pseudo children. The candidate worsens native/browser to1804, strict2921.
+Its exact source, assertion, report and captures are archived in
+`target/wpt-targeted/baseline-font-position-20261003/br-rejected-receipt-v30.json`.
+Only that new assertion and candidate hunks were removed; tracked source was
+verified restored to V29 before the accepted-direction experiment. No original
+WPT test was modified or removed. This corrects V15's claim that missing visible
+BR pseudos are a rendering bug; its DOM green was not browser conformance.
+
+The actual gap is quote depth: the pseudo eligibility helper counted quote
+operations for BR child boxes which cannot exist. Proper RED observes depth2
+instead of0. The helper now excludes HTML BR pseudo boxes, shared by quote and
+pseudo-counter traversal, without changing the forced-break marker. Browser
+diagnostics cover inline/block/contents BR, and the exact quote-depth oracle
+matches its literal reference at0 pixels. Final unit GREEN1/1, quote guards9/9,
+break guards26/26 and runner build pass.
+
+Final frozen candidate original quote14 is11/3; quotes-035/035a remain30 strict
+pixels. Quotes-036 actual native/browser1223->0 and reference native/browser0;
+native/browser strict-reference counts are both2968. Thus the real renderer gap
+is closed, but original quotes-036 WPT is still FAIL, not waived or called clear.
+Decoration22 remains19/3; white-space111 remains111/111.
+
+Expanded original counter23 yields18/5: content-counter007759,0081618,01393,
+01493 and counters-root0003088. Those five passed a historical Sept30 chunk,
+so they cannot be dismissed as permanent baseline debt. A controlled rebuild
+without only this BR eligibility guard gives identical23 reports and all PNGs;
+the failures predate this guard, but their earlier regression origin is unknown.
+Fresh Chromium confirms013/014 actual/reference native/browser0 and browser
+strict93;007/008 have actual native/browser2461/3915, and root0003088 while its
+browser strict0. These are explicit next entries, not hidden by the quote fix.
+After the control, final source and saved final runner were restored and hash
+verified against the original frozen candidate.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/quotes-br-eligibility-receipt-v30.json`.
+It binds RED/GREEN, fixed clean WPT revision, original suite entries, source/
+untracked/binary/font hashes, captures, browser proof and counter control.
+Full6548 was NOT_RUN; focused counts do not establish the global remaining count
+or closure. Next priority is counters-root000's genuine3088-pixel gap, followed
+by counter007/008 and locating the earlier regression. File-size remains the
+same six outside-vendor failures. No tolerance/reference/outside-vendor changes,
+commit or push. Product Agent knowledge is unaffected: generic DOM rendering
+eligibility and generated-content state only.
+
+### 2026-10-04 Collapsed root whitespace pseudo boxes — V31
+
+Original counters-root-000 RED is3088 strict pixels; Chromium strict0 and
+native/browser actual3088. Native layout creates an extra18px anonymous line
+for html::before's whitespace-only principal inline box, shifting the body.
+Counter text4.8 itself is correct. The former boundary helper recognizes only
+Text leaves, while generated whitespace deliberately retains an Inline Box.
+
+Block-edge pseudo collapse now recursively recognizes transparent, undecorated,
+in-flow inline whitespace boxes and skips equivalent DOM edge whitespace when
+finding the first/last block. Preserved whitespace, pre-line newlines, visible
+decoration, atomic/replaced and out-of-flow content remain excluded. Counter
+and quote state traversal and table whitespace-fixup rules are unchanged.
+New DOM RED0/1 becomes GREEN1/1 (normal/pre/pre-wrap/bordered cases). Whitespace
+guards17/17, break26/26, counter13/13 and runner build pass. A counter guard's
+old fixed child-index assertion failed here and in V16 baseline logs; it now
+asserts the entire rendered counter text exactly0, independent of lowering.
+
+Frozen original counter23 is19/4, up from18/5. Counters-root-000 is strict0,
+actual native/browser0, reference native/browser0 and Chromium strict0, with
+no missing browser requests. Counter007759,0081618,01393,01493 are unchanged.
+Quotes14 remains11/3, decoration22 remains19/3, white-space111 remains111/111.
+All focused original entry/reference lists and non-root failure pixel counts
+match V30. No tolerance, WPT source/reference, font or viewport changes.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/counter-root-receipt-v31.json`.
+It binds clean pinned WPT revision, frozen tracked/untracked source, candidate
+runner/font hashes, RED/GREEN, guard logs, original reports and four capture
+hashes. Full6548 is NOT_RUN; global remaining count remains unknown. Next entry
+is counter007/008's genuine native/browser gap, not strict-reference waiver.
+No outside-vendor edits, commit or push; the file-size gate still reports the
+same six outside-vendor violations without baseline increases. Product Agent
+knowledge is unaffected by this generic DOM/inline-whitespace change.
+
+### 2026-10-04 Roman counter paint/scope separation — V32 diagnostic
+
+Fresh original counter007/008 RED remains759/1618 strict pixels. Chromium141
+original strict2701/4039, actual native/browser2461/3915, reference native/
+browser0. Native actual/reference generated letters agree; lower-case layout
+widths580.4375/580.3594 differ because of authored inline fragment origins.
+
+Two explicitly non-acceptance browser controls isolate that paint hypothesis:
+(1) replace counter pseudos by expected literal span text; (2) retain the before
+pseudo structure and replace counter() only by attr(data-expected). Each
+control's actual and reference match native at0 pixels; each still differs
+from the original reference by759/1618. Thus eliminating fragment-origin
+rounding to force those two original references green would contradict these
+browser controls. V31's proposed font/layout fix is not supported by evidence.
+
+An independent original-page counter-scope disagreement remains after sibling
+resets. CSS2 scope prose and current CSS Lists inheritance algorithms were read
+separately; the diagnostic does not silently select a compatibility mode or
+claim modern counter semantics implemented. Sources:
+<https://www.w3.org/TR/CSS21/generate.html#scope> and
+<https://drafts.csswg.org/css-lists/#inheriting-counters>.
+No production change or GREEN is claimed. Both originals remain FAIL without
+waiver, reference rewrite or tolerance change. A decision must separate the
+counter scope contract from these reference/font-fragment conflicts before
+using either oracle as automatic zero-failure closure.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/roman-counter-diagnostic-receipt-v32.json`.
+It verifies V31 source/untracked/runner unchanged, clean pinned WPT, original
+entries, RED and layout logs, all browser controls/capture hashes and missing
+resource lists. Full6548 is NOT_RUN; global remaining unknown. Next independent
+repair entry is vertical-align decoration's native/browser gap. File-size has
+the same six outside-vendor failures; no baseline increased. No commit/push or
+outside-vendor edits. Product Agent knowledge unchanged: diagnostics only.
+
+### 2026-10-04 Inline leading allocation and decoration origin — V33
+
+Original vertical-align decoration002 RED has actual native/browser336 and
+reference native/browser331 pixels; native and Chromium strict-reference both
+remain18. Fresh Chromium141 original-page geometry is wrapper y64 and high/up/
+baseline y40/52/64; native starts these font boxes0.8px too low. The genuine
+layout unit RED asserts64.8 !=64, not an arbitrary one-pixel paint translation.
+The first synthetic painter test was invalid (default decoration color WHITE,
+so no black pixels); only that new test was removed and its exact defect/log
+recorded in `va-decoration-invalid-test-v33.md`. The attempted Git diff snapshot
+is empty because the painter source was already untracked, not a test backup.
+
+Used inline line-height now retains1/64px layout precision. Upper half-leading
+is floored when computing the strut ascent and projecting the font box; remaining
+line-height is retained below the baseline. This follows Chromium141
+[CalculateLeadingSpace](https://chromium.googlesource.com/chromium/src/+/refs/tags/141.0.7390.37/third_party/blink/renderer/core/layout/inline/line_utils.cc).
+No glyph, decoration thickness, horizontal endpoint, WPT reference or tolerance
+changes. New layout assertions cover64/40/52/64 and used line-height33.59375;
+GREEN1/1, shared line-metrics4/4 and runner build pass.
+
+Decoration002 actual native/browser336->12, reference331->6. Native strict18
+and Chromium strict18 persist: this closes the vertical origin gap only, not
+the original WPT failure. Remaining differences occupy two six-pixel endpoint
+columns (x123 and230). Decoration001 remains1968/1956 browser gaps and strict18.
+Original counter23 remains19/4, quote14 remains11/3, decoration22 remains19/3,
+white-space111 remains111/111. Current linebox198 is191/7, not the old196/2.
+All seven failures are also reproduced with the preserved, hash-bound V30
+runner; all six pixel counts match, and the same testharness case fails. This
+rules out V33 as their first introduction but does not locate the earlier
+regression or prove a complete V30 linebox run. They remain active repair work.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/va-decoration-receipt-v33.json`.
+It binds frozen tracked/untracked source, binary/fonts, clean pinned WPT,
+original entries, valid/invalid RED separation, GREEN/guard logs, all focused
+reports, browser captures and seven-case V30 control. Testharness reports omit
+reference while the manifest uses null; verification normalizes only that empty
+representation, without changing any original entry. Full6548 is NOT_RUN,
+global remaining unknown. Next entry: decoration002 endpoint coverage and the
+seven current linebox failures. Same six outside-vendor file-size violations;
+no baseline increase, commit/push or outside-vendor edit. Product Agent knowledge
+unchanged: generic font-line layout internals, no business/tool semantics.
+
+### 2026-10-04 Decoration endpoint coverage — V34
+
+Valid endpoint unit RED observes coverage9 instead of Chromium's6 at x123.
+Both ancestor-applied and local decoration paths now use the existing1/64px
+LayoutUnit advance for painted width only. Glyph positions, returned text
+advance and layout are unchanged. GREEN1/1, paint guards2/2, line-metrics4/4
+and runner build pass.
+
+The applied-only intermediate candidate introduced six one-pixel reference
+regressions (decoration13/9). Its source and receipt are archived separately;
+the final local-path correction restores decoration19/3. All six original
+applies-to006–011 actual/reference captures and strict comparisons are0 against
+Chromium141. Decoration002 actual native/browser12->0, reference6->0, but
+original strict18 remains identical to Chromium strict18: still FAIL without
+waiver, tolerance or reference changes. Counter23 is19/4, quotes14 is11/3,
+white-space111 is111/111 on the final frozen candidate.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/decoration-endpoint-receipt-v34.json`.
+Verification binds tracked and untracked source, runner, pinned clean WPT,
+original entries, RED/GREEN, intermediate archive and final browser captures.
+Linebox198 was not rerun in V34 (V33:191/7); full6548 is NOT_RUN and global
+remaining is UNKNOWN. Next repair: negative-margin original height assertions
+9/11/12 expect20 but observe10. Same six outside-vendor size violations; no
+baseline increase, outside-vendor edit or commit/push. Product Agent knowledge
+unaffected: generic paint internals, no business/tool semantics changed.
+
+### 2026-10-04 Negative-margin wrapping — V35 RED
+
+Fresh original `inline-negative-margin-001.html` on the V34 final source and
+runner reproduces exactly three failing height assertions9/11/12 (20 expected,
+10 observed); the other ten pass and harness passes. Existing runtime unit
+`anonymous_inline_line_items_preserve_negative_margin_wrapping` independently
+fails0/1 with10 versus20. This is a genuine layout repair entry, not a browser
+reference conflict or harness timeout. No production candidate or GREEN yet.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/negative-margin-red-receipt-v35.json`.
+It checks frozen tracked/untracked source and binary before and after execution,
+clean pinned WPT and the original full-suite entry, then binds the fresh report
+and existing unit log. Next: trace anonymous atomic wrapping and single-line
+projection eligibility without losing zero/negative outer-width cases. Full6548
+NOT_RUN, global remaining UNKNOWN; no commit/push or outside-vendor edits.
+
+### 2026-10-04 Negative-margin image widths and line eligibility — V36
+
+V35 original RED repeats three height failures; the existing unit also fails
+10 versus20. Expanded failure diagnostics show a4ch image rendered24px and a2ch
+image12px despite40px/20px anonymous wrappers. Replaced leaf sizing re-resolved
+ch using the default font rather than the authored Ahem font. Its undersized
+images then made the single-line projection incorrectly accept a wrapped row.
+
+Replaced image ch widths now use the same authored-font advance as ordinary
+boxes. Single-line eligibility also rejects equal horizontal restart after a
+positive-advance item: a later negative margin cannot erase an established
+break. Zero outer advance remains supported. Existing RED becomes GREEN1/1,
+zero-outer-width guard1/1 and shared line-metrics4/4; runner build and diff check
+pass. No debug instrumentation was added; the unit retains layout in its failure
+message for future diagnostics.
+
+Fresh original negative-margin page passes all13 assertions, including9/11/12.
+The seven-case linebox failure batch is1/6; remaining six pixel counts stay
+84/2250/619/619/2175/2175. Decoration22 remains19/3 and white-space111 is111/111.
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/negative-margin-candidate-receipt-v36.json`.
+It binds frozen tracked/untracked source, fresh runner, clean pinned WPT,
+unchanged original entries, RED and final reports/guard hashes. Full linebox198
+and full6548 were NOT_RUN in V36; global remaining UNKNOWN. Next entry is one of
+the remaining six linebox failures, with fresh native/browser evidence before
+choosing a candidate. Same six outside-vendor size violations, no baseline
+increase, outside-vendor edits or commit/push. Product Agent knowledge unchanged:
+generic font-relative sizing and line eligibility, no business/tool semantics.
+
+### 2026-10-04 Block-split inline first background fragment — V37
+
+Fresh Chromium141 original `inline-box-002` actual/reference are identical;
+native reference/browser is0, native actual/browser and strict-reference2250.
+The difference is exactly the unused125x18px portion of the first blue stripe.
+Layout confirms the first text and inline principal rectangles coincide, while
+the third text forms a continuation below the orange block. Geometric dedup
+discarded the first text fragment, leaving only the continuation and incorrectly
+classifying the background as a single full-width line.
+
+New pixel unit RED observes BLUE instead of WHITE in that first unused area.
+Retaining the coincident fragment yields GREEN1/1; existing first/continuation
+and multiline background guards each pass1/1. No layout, text shaping, reference
+or tolerance changes. Fresh original002 native strict2250->0; actual/browser,
+reference/browser and browser strict are all0. Eight original linebox controls
+are3/5 (includes previously green001 and repaired negative-margin case); the
+remaining five stay84/619/619/2175/2175 pixels. Decoration22 remains19/3 and
+white-space111 remains111/111.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/inline-box-final-receipt-v37.json`.
+It binds frozen tracked/untracked source, runner, original entries, unit RED,
+GREEN/guards and both browser rounds/capture hashes. The first receipt attempt
+failed on an old unit-log name after all tests finished. Receipt-only recovery
+validates existing suites/logs/reports; no tests were repeated. Runner build and
+diff check pass. Same six outside-vendor file-size violations; no baseline
+increase or outside-vendor edits. No commit/push. Linebox198/full6548 NOT_RUN,
+global remaining UNKNOWN. Next: verify translucent coincident-fragment paint
+eligibility before proceeding to the five linebox originals; this batch does
+not qualify all background compositing. Product Agent knowledge unaffected:
+generic paint fragment collection, no business/tool semantic change.
+
+### 2026-10-04 Inline translucent fragment coverage — V38
+
+V37's retained first fragment exposes a compositing RED: half-transparent blue
+over white is63/63/255 instead of127/127/255 because the same owner background
+is painted twice. Chromium141 diagnostic split-inline variant confirms the
+first and continuation samples are127/127/255, with white unused areas and an
+unchanged orange intervening block. This diagnostic is not an original WPT
+reference or pass. New native alpha unit fails0/1 with exactly63 versus127.
+
+Continuation replay now skips coverage already painted by the principal
+background. Rectangle containment is used only for square corners; identical
+geometry can also reuse identical rounded coverage. Different rounded shapes
+are not treated as covered merely by their bounds. Five split-inline guards
+pass5/5, including the new alpha and retained opaque first fragment. First and
+continuation alpha samples both paint once. Layout/fonts/references/tolerances
+are unchanged; runner build and diff check pass.
+
+Fresh original linebox eight controls remain3/5, decoration22 remains19/3 and
+white-space111 remains111/111. Verification compares every original path,
+status, pixel count and subtest status against V37 rather than only totals.
+Original002 actual/browser, reference/browser and both strict comparisons
+remain0. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/inline-alpha-final-receipt-v38.json`.
+It binds frozen tracked/untracked source, runner, clean pinned WPT, RED/GREEN,
+original reports and browser capture hashes; alpha diagnostics stay separate.
+Full linebox198/full6548 NOT_RUN, global remaining UNKNOWN. Next repair is
+anonymous-inline-inherit001 and the remaining four vertical-align originals.
+Same six outside-vendor size violations; no baseline increase, outside-vendor
+edit or commit/push. Product Agent knowledge unaffected: generic paint coverage,
+no business/tool semantic change; broad rounded-background compositing is not
+qualified by these focused guards.
+
+### 2026-10-04 Anonymous text internal baseline under top-aligned inline — V39
+
+Fresh Chromium141 original anonymous-inline-inherit001 actual/reference are
+identical, and native reference/browser0. Native actual/browser and strict84
+pixels isolate the small x: native font box y82 versus Chromium y66; large A
+is already correct at y8. The anonymous text has initial baseline alignment,
+so this is not inheritance of top. The shared metrics solver excluded the
+ordinary inline container and left Taffy's leaf-bottom baseline unresolved.
+
+New local metrics unit RED rejects that internal line. Eligibility now includes
+baseline-only single-line text inside an authored top-aligned inline; existing
+collect checks still reject unsupported leaves/wrapping. Projection keeps the
+inline principal height instead of assigning the full internal line height.
+GREEN and all shared metrics guards5/5 verify A y8, anonymous x y66, unchanged
+principal18px height and stable projected ownership. No DOM inheritance, outer
+top alignment, horizontal advance, font, reference or tolerance changes.
+
+Fresh original001 strict84->0; actual/browser, reference/browser and Chromium
+strict all0. Eight original linebox controls now4/4, with only baseline006/010
+and sub001/super001 still failing. Decoration22 remains19/3; white-space111 is
+111/111. Every other original path/status/pixel count/subtest status is compared
+to V38 and unchanged. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/anonymous-inline-final-receipt-v39.json`.
+It binds tracked/untracked frozen source, runner, pinned clean WPT, original
+entries, RED/GREEN logs, layout diagnostics and browser/capture hashes. Runner
+build and diff check pass; same six outside-vendor size violations, no baseline
+increase, outside-vendor edit or commit/push. Linebox198/full6548 NOT_RUN, global
+remaining UNKNOWN. Next: fresh browser evidence for the four vertical-align
+originals. Product Agent knowledge unaffected: internal text baseline eligibility,
+no business/tool semantics; this focused proof does not qualify all decorated
+inline principal-box geometry.
+
+### 2026-10-04 Single-line inline-block font baseline — V40
+
+Fresh original baseline006/010 Chromium actual/reference are identical; native
+reference/browser0, actual/browser619 each. Native small text top y69 versus
+Chromium y65 isolates leaf-bottom alignment. Shared metrics excluded the
+inline-block owner in010 and the lowered inline-block text leaf in006.
+New unit RED rejects the internal line. Solver now accepts inline-block owners
+whose collected descendants pass existing single-line eligibility, and plain
+atomic text with auto height, visible overflow and no decoration or margins.
+Explicit heights, scrolling, decorated atomic leaves and soft wrapping remain
+outside this path. Metrics GREEN6/6 verifies small top65, large top50 and
+line height37. Runner build and diff check pass.
+
+Original baseline006/010 strict619->0 each; fresh actual/browser,
+reference/browser and both strict comparisons all0. Original eight linebox
+controls now6/2, decoration22 remains19/3, white-space111 remains111/111.
+Every other original path/status/pixel count/subtest status matches V39.
+Sub001/super001 stay FAIL2175 each: native actual/browser0 and reference/browser0,
+but Chromium strict also2175. Their red-then-green overpaint differs from a
+single green reference at antialiased edges. No reference edits, tolerance
+relaxation, compatibility branch or waiver was introduced.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/vertical-align-final-receipt-v40.json`.
+It binds frozen tracked/untracked source, runner, pinned clean WPT, original
+RED/GREEN, unit guards, layout and browser capture hashes. Same six
+outside-vendor size violations; no baseline increase, outside-vendor edits or
+commit/push. Linebox198/full6548 NOT_RUN, global remaining UNKNOWN. Next:
+preserve the two strict failures and verify the wider fixed-revision linebox
+scope before moving to the remaining original queue. Product Agent knowledge
+unaffected: generic baseline eligibility, no business/tool semantic change.
+
+### 2026-10-04 Explicit leading inside top-aligned inline — V41
+
+Frozen V40 complete linebox regression is195/198. Nested-top001 exposes a
+150-pixel failure in addition to sub/super; its V33 original was green.
+Fresh Chromium actual/reference strict0 and native reference/browser0 isolate
+native actual/browser150. Headless actual top-inline principal font box y11
+and anonymous XX y14 show half-leading applied twice for12px/20px text.
+New unit RED is y14 versus expected11. Recovering the ordinary inline's line
+origin from its already-projected font box fixes this without changing the
+principal rectangle, inline-block sizes, fonts, wrapping or reference policy.
+Metrics GREEN7/7 retains V39/V40 repairs and soft-wrap rejection.
+
+Fresh original nested-top001 strict150->0; actual/browser, reference/browser
+and both strict comparisons0. Complete linebox198 is196/2, decoration22 is19/3
+and white-space111 is111/111. Comparing per-original status, pixels and subtests
+against V40, only nested-top changes; the other197 linebox entries and all
+decoration/white-space entries are unchanged. sub/super remain strict FAIL2175
+each, without reference changes or waivers.
+
+Frozen V40 also freshly replays the historical47 queue:0/47. Seven original
+browser captures retain actual/native gaps: four CSS1 inline margin/padding003
+each452, errata table002400, replaced-intrinsic00122500 and letter-spacing080204.
+All seven references match native/browser0 except letter-spacing reference204;
+browser strict also fails each. These are fresh diagnostic inputs, not original
+PASSes or a current global failure count. Their captures bind the V40 binary,
+not the V41 candidate; do not splice them into V41 acceptance.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/nested-top-final-receipt-v41.json`.
+It binds frozen tracked/untracked source, runner, pinned clean WPT, unit
+RED/GREEN, original complete linebox/decoration/white-space reports and browser
+capture hashes; V40 census/queue diagnostics remain separately versioned.
+Runner build and diff pass; same six outside-vendor size violations, no baseline
+increase, outside-vendor edits or commit/push. Full6548 NOT_RUN and global
+remaining UNKNOWN. Next: fresh focused native/browser RED for the remaining
+margin/padding or table-clipping gap; retain strict reference conflicts.
+Product Agent knowledge unaffected: generic inline line-box origin, no business
+or tool semantic change.
+
+### 2026-10-04 Relative block displacement during table-cell alignment — V42
+
+Correct the browser oracle's missing SVG MIME in a separately versioned
+seven-page capture. Chromium object child document is loaded as image/svg+xml.
+Replaced-intrinsic001 still differs22500, but the mismatch moves from the old
+left-square region to x158..307: Chromium object is300x150, native150x150.
+Equal pixel totals did not mean equivalent evidence. This fresh V40-native
+diagnostic identifies intrinsic sizing, not a failed SVG load; it is not
+spliced into V42 candidate acceptance. Native and browser strict still fail.
+
+Fresh V41-native errata002 actual/browser400 and reference/browser0 isolate
+relative positioning. Headless child normal-flow top35 plus authored top15
+should paint at50. Cell middle alignment measured the visually shifted margin
+box and cancelled the15px displacement. New unit RED paints35 instead of50.
+Cell alignment now subtracts inherited relative offsets only while measuring
+normal-flow content bounds, using actual viewport/containing geometry; subtree
+movement retains those visual offsets. Positive/negative offset, middle/bottom
+and repeated projection guards pass. Table unit group11/4->12/3 has exactly
+the same three other failures (inline padding, column-group paint, row width).
+Wrapped inline cell half-leading guard1/1 passes. No broad module PASS claimed.
+
+Original errata002 actual/browser400->0 and reference/browser0. Chromium strict
+is1000; native strict800->1000, still FAIL. Red-border leakage and reference
+placement conflict remain visible; no reference/tolerance/clip-policy change.
+Errata nine remain6/3 and table height/valign25 remain25/25. Every other original
+path/status/pixel count/subtest status is unchanged against fresh baseline.
+This improves native/browser agreement but closes no strict WPT failure.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/relative-cell-final-receipt-v42.json`.
+It binds frozen tracked/untracked source, runner, clean fixed WPT revision,
+unit RED/GREEN and baseline failures, focused original RED/candidate reports,
+browser/capture hashes and the separately versioned MIME diagnostic. Runner
+build and diff pass; same six outside-vendor size violations, no baseline
+increase, outside-vendor edits or commit/push. Full6548 NOT_RUN, global remaining
+UNKNOWN. Linebox198/white-space111 were not rerun on V42; V41 receipts are not
+current-binary closure. Next: SVG object default intrinsic sizing, then the
+four CSS1 margin/padding actual/browser gaps. Product Agent knowledge unchanged:
+generic normal-flow/relative-paint geometry, no business/tool semantics.
+
+### V43: default SVG object sizing in the synthetic inline formatting context
+
+Fresh original replaced-element RED covers28 cases:23 pass/5 fail. Correct SVG
+MIME browser captures confirm intrinsic001 object document loaded, Chromium
+300x150 versus native150x150, actual/browser22500. The plain Box unit control
+passes before the fix but does not reproduce the DOM Row lowering; it is not
+unit RED. The actual-page/browser capture is the RED evidence. A subsequent
+unit compile typo is preserved separately and is not counted as GREEN.
+
+Synthetic inline formatting contexts use a flex row for line fitting. Disable
+flex-shrink for their in-flow inline replaced children only: used replaced
+width wraps or overflows instead of shrinking. Authored flex retains shrink,
+and authored max-width remains effective. Row-path candidate unit1/1 plus six
+focused guards across five filters pass; runner build and diff check pass.
+
+Original28 remain23/5. Intrinsic001 actual/browser22500->0 and reference/browser0;
+native strict1->22501 equals Chromium strict22501, still FAIL. Intrinsic002
+actual/browser0 with strict22500 remains unchanged. Inline-width002/003/006
+still have actual/browser1600/1600/768 while Chromium strict0. Every other27
+original report is unchanged. No reference/tolerance changes or strict failures
+closed; browser agreement is not substituted for strict WPT completion.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/svg-object-final-receipt-v43.json`.
+Frozen tracked/untracked source, runner, original RED/candidate, correct-MIME
+browser/native captures and guards are hash-bound. Same six outside-vendor
+size violations; no baseline increase, outside-vendor edits or commit/push.
+Full6548 NOT_RUN, global remaining UNKNOWN. Next: the three genuine inline
+replaced-width gaps. Product Agent knowledge unchanged: generic replaced-element
+layout only, no business concepts, authority or tool semantics changed.
+
+### V44: carry anonymous atomic-line descent into following block flow
+
+Fresh V43-binary original28 RED remains23/5. Unit RED confirms an anonymous
+image line grows96->100 but the following normal-flow block stays at96. Carry
+the settled child height delta through later in-flow block siblings and auto
+parent height; authored flex, floats and positioned siblings are excluded.
+Unit GREEN1/1 includes following position, parent height and repeat idempotency.
+Six relevant runtime guards pass. Interrupted initial candidate compilation
+has no terminal result; absent process/handle justified recovery, whose GREEN
+log is separately preserved, not substituted for the interrupted log.
+
+SVG UA default RED is Block versus InlineBlock. Add SVG to the default atomic
+inline family; UA8/8 and SVG DOM8/8 pass. However original002/003 are prefixed
+svg:svg and retain their block default: the default-style caller still passes
+qualified names while component lowering uses local names. This incomplete
+production reachability is not claimed repaired; next batch must normalize
+that actual path and retain a prefixed-name RED.
+
+Original28 candidate24/4: inline-width006 strict768->0, actual/browser and
+reference/browser0, browser strict0. All other27 original reports unchanged.
+Inline-width002/003 still1600 each, intrinsic001/002 still22501/22500 with
+native/browser0. Exactly one strict original failure closed, no old-green
+regression. No reference/tolerance changes. V43 browser RED is reused only
+after all fresh V44 native RED actual/expected captures prove byte identity.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/inline-width-final-receipt-v44.json`.
+It binds frozen source, runner, RED/GREEN, guards and native/browser captures.
+Build and diff pass; same six outside-vendor size violations, no baseline
+increase, outside-vendor edits or commit/push. Full6548 NOT_RUN, global remaining
+UNKNOWN. Product Agent knowledge unaffected: generic line flow/default styling,
+no business concepts, authority or tool semantics changed.
+
+### V62/V62c: cluster precision retained; independent painting rejected
+
+The fractional cluster regression has genuine RED/GREEN receipts:
+`cluster-precision-red-receipt-v62.json` and
+`cluster-precision-green-receipt-v62.json` under
+`target/wpt-targeted/baseline-font-position-20261003/`.
+Accumulation now uses f64; public Skia points and advances remain f32. This
+fixes prefix-dependent cluster widths, not the remaining original-page paint
+discrepancy. The V62 module checks remain separately scoped in the stage receipt.
+
+Independent authored-segment painting still regressed inherit-computed-001
+from 32 to 47 native/browser pixels after the precision fix. V62b is rejected
+and preserved in `cluster-precision-failed-receipt-v62b.json`. V62c removes only
+that painting change, retains the precision and layout-boundary fixes, rebuilds
+the runner, and rechecks original cases and seven neighboring cases. Receipt:
+`cluster-precision-rollback-receipt-v62c.json`. Original inherit actual and
+reference native/browser return to 32; both strict results remain FAIL168.
+Overflow actual/reference/browser/native comparisons remain zero. Neighboring
+strict results remain 4PASS/3FAIL; 117a/118a actual and reference native/browser
+remain zero, despite their unchanged strict failures. These are not full-suite
+results, nor a strict conformance waiver.
+
+Exact Chromium141.0.7390.37 source audit is recorded in
+`chromium-advance-source-audit-v63.json`: Apple selects the Skia nominal advance
+callback for fonts without trak, and its scalar conversion uses 16.16 integer
+units. Local Times has neither trak nor sbix. A new single-glyph test investigates
+this advance-source difference. V63 has genuine RED: native Times n advance9.6
+versus the Skia-to-16.16 callback9.599991. Compilation succeeds; the test fails
+on the expected assertion (exit101), not on a build error. Frozen source, log
+and binary are bound in `callback-red-receipt-v63.json`. At the RED checkpoint
+no callback candidate had been installed; this is not proof of the original32-pixel cause. Next
+work is to preserve shaping adjustments while aligning nominal advance input,
+then verify the original page rather than claiming closure from a single glyph.
+Full6548 NOT_RUN; global remaining UNKNOWN. No upstream/reference/tolerance
+changes or commit/push. Six outside-vendor file-size violations remain separate.
+Product Agent knowledge unaffected: this is generic font positioning only.
+
+### V63: nominal Skia callback precision — GREEN, original paint unresolved
+
+The Apple no-trak path now measures nominal advances from the actual Skia face
+and converts them to 16.16 units, while retaining Rustybuzz contextual advance
+adjustments. Fonts with trak and no sbix retain the previous nominal source;
+other platforms are unchanged. Zero-advance positioned glyphs remain zero.
+Both precision tests pass, including the preserved prefix-invariance regression.
+Separate serial filters pass: shaping2/2, width6/6 (includes a JS constructor
+test), authored-boundary1/1, coalesced2/2. These are not a full runtime suite.
+
+Fresh runner build succeeds. Original inherit actual/reference native/browser
+remain32; browser/native strict both168 FAIL. Original overflow remains0 in all
+comparisons. Seven adjacent original cases retain4PASS/3FAIL, with 117a/118a
+actual/reference native/browser0. Thus the nominal measurement mismatch is
+fixed but does not close the authored-boundary painting issue. Do not relabel
+the32-pixel residual or any unchanged strict failures as repaired.
+
+Bound RED/GREEN, source/runner/captures and guard evidence:
+`target/wpt-targeted/baseline-font-position-20261003/callback-stage-receipt-v63.json`.
+Next: inspect Chromium's ShapeResult view/sliced glyph positioning rather than
+reintroduce rejected whole-segment offsets without new evidence. Full6548
+NOT_RUN; global remaining UNKNOWN; no reference/tolerance changes or publication.
+The same six outside-vendor size violations remain; diff check passes. Product
+Agent knowledge has no new business concept, authority or tool semantics.
+
+### V64: authored glyph-view origin — original browser mismatch closed
+
+Read exact Chromium141.0.7390.37 ShapeResultView and bloberizer sources:
+glyph views slice the original shaping result, retain glyph advances/offsets,
+and restart their local glyph iteration at zero. They do not independently
+reshape every authored string. V64 Canvas/DOM/native diagnostics establish that
+the first three authored strings have identical native/browser prefix widths
+(maximum difference0); DOM layout widths instead ceil to LayoutUnit precision.
+Diagnostic receipt is not original WPT acceptance.
+
+New genuine RED: authored first glyph painted at125.121704 while its used
+inline origin is125.125. Preserve validated source boundaries and full shaping
+context, then subtract the source logical cursor (not its first glyph offset)
+and use its layout origin. Generated words are not new glyph views. Missing or
+stale authored metadata retains the original full-run path. RED/GREEN1/1 is
+bound in `authored-glyph-view-red-receipt-v64.json` and
+`authored-glyph-view-green-receipt-v64.json`. Serial filters pass shaping3/3,
+width6/6, authored-boundary1/1, coalesced2/2 and precision2/2; scopes overlap,
+and the width filter includes a JS constructor test.
+
+Fresh original inherit-computed-001 actual/native-browser32->0 and reference/
+native-browser32->0. Original overflow retains all comparisons0. Both native
+and Chromium inherit strict reftest remain168 FAIL; native/browser parity is
+not a strict waiver. Neighboring originals retain4PASS/3FAIL; 117a/118a actual
+and reference native/browser remain0. No upstream, reference, relation, font
+registration, viewport or tolerance override is used to obtain original0.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/authored-glyph-view-final-receipt-v64.json`.
+It binds current source, runner, RED/GREEN, diagnostics, captures and guards.
+Build and diff checks pass; the same six outside-vendor size violations remain.
+Full6548 NOT_RUN; global remaining UNKNOWN; all strict failures remain in scope.
+No commit/push. Product Agent knowledge unaffected: generic glyph positioning,
+no new business concept, authority or tool semantics. Continue the remaining
+failure ledger and eventually the original full6548; this is not final closure.
+
+### V65: refresh known56 — generated underline seam exposed
+
+Current V64 production source/runner is bound to a fresh original56 replay:
+11PASS/45 strict FAIL, not a global remaining count. Chromium141 comparison
+is actual53/56 exact and reference55/56 exact. The original inherit gap stays0.
+Newly detected font-family-rule-002a actual/reference gaps are2 pixels each at
+y31,x401 and405; strict remains9030 on native and Chromium. This unchanged
+no-fixture census does not supply White Space; historical V21 font-supplied
+732 proof is separate, not current acceptance or a font substitution.
+
+Fresh geometry locates generated native White/space/Space boundaries at
+401.46875 and405.46875, matching the two differing underline pixels. Browser
+holds one81.296875-wide authored text range. Investigate decoration coverage
+across generated pieces of that same source; V28's rejected assumption about
+merging independently authored fragments remains rejected. No coordinate/color
+patch or global stripe merger has been implemented in this batch.
+
+Both other Chromium141 gaps (content175576 and moveBefore10000) have no page
+errors or missing resources, while native strict remains0. Installed Chrome
+154.0.8037.97 executes moveBefore with a100x100 flex item and strict0; Chromium
+141 executes the move but retains zero-height inline layout. Chrome154 font
+geometry also differs, and content175 strict remains704, so this diagnostic
+does not silently replace the pinned browser oracle or change native behavior
+to reproduce an old browser's failed reference result.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/known-scope-final-receipt-v65.json`.
+Source/runner, original captures, fresh pixel RED, both browser versions and
+geometry dumps are bound. Production code unchanged this batch. Full6548 and
+current complete linebox/white-space scope NOT_RUN; global remaining UNKNOWN.
+No reference/tolerance change or commit/push. Product Agent knowledge unaffected:
+renderer evidence and test prerequisites only, no business/authority changes.
+
+### V66: generated-source decoration candidate — unit GREEN, original still RED
+
+Same-source generated words now have a shared decoration span and shared ink
+intercepts, without merging independently authored fragments. Underline and
+overline remain before glyph paint; line-through remains after the final
+fragment. Direct decoration is included when shared glyph painting bypasses
+the ordinary per-line painter. Layout eligibility is not globally relaxed.
+
+The genuine unit pixel RED is two differing pixels at opaque opacity; the
+opaque and half-opacity variants both pass after the candidate. Two earlier
+compile errors and a fragment-count setup failure are retained separately and
+are not pixel RED evidence. Decoration module3, inline shaping3, shaped filter6
+(including a JS constructor test), source-boundary1, coalesced2 and precision2
+all pass:17 focused tests. Runner build passes in2m07; diff check passes.
+
+Original font-family-rule-002a actual/browser and reference/browser remain2
+pixels each, at the generated word boundaries. Strict native/reference and
+Chromium/reference both remain9030 without the required White Space fixture.
+Fresh original56 replay is unchanged:11 strictPASS/45 strictFAIL,
+actual/browser53/56 exact, reference/browser55/56 exact. No new pixel change
+versus V65. Thus this candidate is NOT accepted as the original repair; the
+DOM-lowering/paint-group path requires a focused regression next.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/generated-decoration-final-receipt-v66.json`.
+Source/runner, genuine RED, unit GREEN, focused logs and original captures are
+bound. Full6548 NOT_RUN; global remaining UNKNOWN. No upstream/reference,
+tolerance, commit or push changes. Existing outside-vendor size violations
+remain separate; Product Agent knowledge is unaffected by generic paint work.
+
+### V67: preserve text identity in DOM inline fast path — browser gap closed
+
+The real DOM regression is RED: the text-only inline element fast path
+reconstructs text with the element style and loses SOURCE_RUN before word
+splitting. Its resulting link words cannot receive shared decoration coverage.
+Retain the original text-node identity when there is exactly one text child;
+do not assign a shared identity to independent authored text nodes. Real DOM
+regression is GREEN. Six focused filters pass18 tests; runner build passes in
+2m10 and diff check passes. V66 pixel RED and failed original remain retained.
+
+Fresh original font-family-rule-002a actual/browser2->0 and reference/browser
+2->0. Strict native/reference and Chromium/reference both remain9030 without
+the required font. With the exact pinned AHEM_WhiteSpace.TTF supplied through
+process-local registration and page-local FontFace, both browser comparisons
+remain0; strict native/reference and Chromium/reference both remain732. This
+closes the renderer's generated underline gap, not the strict WPT failure.
+
+Original56 guards remain11 strictPASS/45 strictFAIL. Actual/browser exact cases
+53->54 of56; reference/browser55->56 of56. Only the font-case browser gap changes;
+all other strict and browser pixel counts remain unchanged from V65. The two
+remaining actual/browser differences are content175 and moveBefore-as-flex-item,
+whose distinct browser execution diagnostics are retained in V65.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/generated-decoration-final-receipt-v67.json`.
+DOM RED/GREEN, source/runner, exact font bytes, original and56 captures and
+focused logs are bound. Full6548 NOT_RUN; global remaining UNKNOWN. No
+upstream/reference/tolerance changes or commit/push. Product Agent knowledge
+unaffected: source-preserving generic renderer lowering only, no business
+concept, authority or tool semantics change.
+
+### V68: current linebox census — remaining strict failures preserved
+
+Using the frozen V67 source and runner, original linebox198 is62 strictPASS/
+136 strictFAIL. Every failed original is compared freshly against Chromium141:
+136/136 actual images exact and136/136 reference images exact; no native/browser
+gap remains in this failed subset. The historical117a/118a instruction mismatch
+is no longer present. Do not turn browser parity into strict WPT acceptance.
+
+Separate focused7 captures also establish strictPASS for006/007/015/baseline003;
+022 strict101,117a/118a strict1006 each are reproduced identically by Chromium.
+Original known56 plus linebox198 union to252 unique cases:73 strictPASS/
+179 strictFAIL at the current source, superseding the historical V57 census
+for this bounded scope. Full6548 NOT_RUN; global remaining UNKNOWN.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/expanded-census-receipt-v68.json`.
+Source/runner, canonical suite membership, overlapping-case agreement, native
+results and all failed-case browser/native captures are bound. No code changes
+in this census, no reference/tolerance change and no commit/push. Product Agent
+knowledge unaffected: rendering evidence only.
+
+### V69: eight historical float failures — current strict and browser PASS
+
+Refresh the eight historical floats-clear cases outside known56/linebox198:
+clear-inline001,float003,floats029/030/124/153,margin-collapse165/166. All8
+strictPASS; all8 actual/browser and reference/browser are exact, and Chromium
+strict comparisons also all0. This refresh verifies historical repairs at
+the current frozen V67 source, not eight newly implemented fixes.
+
+First scope preflight accidentally included four already-refreshed multicol
+cases and rejected the twelve-case count before native execution. Preserve
+that log separately; exclusion of those four selects the intended new8 and
+does not change the original suite or reference policy. Union with V68 now
+covers260 unique original cases:81 strictPASS/179 strictFAIL. Full6548 NOT_RUN;
+global remaining UNKNOWN. No production change, commit or push in this batch.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/floats-refresh-final-receipt-v69.json`.
+Source/runner, suite, native result, all captures, preflight and overlap checks
+are bound. Product Agent knowledge unaffected: renderer acceptance only.
+
+### V70/V71: absolute block upper leading — two strict failures repaired
+
+Fresh original21 historical box/position cases expose real native differences:
+abspos011/012 each strict1287/native-browser1287 (Chromium strict0); display018
+reference809; abspos-block-level001 actual/reference4909 despite native strict0;
+abspos-negative-margin001 actual52/reference26/strict26. Preserve the frozen
+RED captures and layout dump in `box-position-red-receipt-v70.json`.
+
+Absolute paragraphs have correct x8/y40/height32 layout. Block text paints
+fractional upper half-leading, unlike the existing inline metric path which
+floors upper leading. Align block half-leading with used LayoutUnit line
+height and that same floor allocation. Static/absolute/fixed baseline guard
+passes; line_box filter8 and six font/shaping/decoration filters18 pass26 tests.
+
+Fresh original abspos011/012 strict1287->0 each; actual/browser and reference/
+browser0 each. Box21 now19 strictPASS/2 strictFAIL, only the target pair's pixel
+counts change. Known56 stays11 strictPASS/45 strictFAIL; every browser/strict
+pixel count is unchanged from V67. Native/reference GREEN is now demonstrated,
+not inferred from the unit. Build and diff checks pass. File-size check retains
+the same six outside-vendor violations; no baseline or those files changed.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/block-upper-leading-final-receipt-v71.json`.
+Source/runner, original RED/GREEN, all21/56 captures and focused logs are bound.
+V69's260-case census is historical at a different source, not current global
+proof. Full6548 NOT_RUN; global remaining UNKNOWN. No reference/tolerance change,
+commit or push. Product Agent knowledge unaffected: generic line painting only.
+
+Next concrete gap: spacing parser currently maps `ch` to Em while dimension
+width has a separate Ch variant (whose non-Ahem metric also needs scrutiny).
+abspos-block-level001 uses padding1ch and exposes both actual/reference native
+differences despite strict0; do not label that native strict result browser
+parity. Fix via source-preserving font-relative spacing, not a case-specific
+padding override. display018 and negative-margin remain separate real gaps.
+
+### V72: character-relative spacing original browser acceptance
+
+Retain authored `ch` as a distinct Spacing::Ch value through CSS declaration,
+W3IR serde and compiler code generation; do not serialize it as Em or apply a
+case-specific padding fix. Resolve with the element's final font zero-glyph
+advance, excluding letter/word spacing and transforms. Layout, intrinsic sizing
+and paint must consume that same metric. Width Ch must stop using a different
+bundled-font metric. Without usable metrics the CSS half-em fallback is explicit;
+it is not proof of font-matched acceptance. Font changes must be read at use
+time rather than inherit stale pixels from a previous family/size.
+
+Parser unit is genuine RED:1ch currently returns Em1. Original block-level
+abspos actual/reference4909 evidence is retained in V71, despite its strict0.
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/character-spacing-red-receipt-v72.json`.
+Spacing::Ch now survives DOM/compiler parsing, Rust/web codegen and IR serde.
+A thread-local native font adapter supplies the current untracked zero-glyph
+advance to spacing, indentation, Taffy dimensions and computed margins; DOM
+lowering and component flattening install it. No previous-font pixel cache is
+inherited. Context-free legacy resolution and non-Skia platform-font coverage
+are not claimed as font-matched acceptance.
+
+Parser GREEN1/1, compiler spacing2/2, runtime metric/serde2/2 and existing
+layout/shaping/decoration guards26/26. Runner build succeeded in1m53s.
+Original abspos-block-level-001 actual/browser4909->0 and reference/browser
+4909->0; native strict remains0. Original21 stays19PASS/2FAIL; known56 stays
+11PASS/45FAIL with no pixel changes. Remaining box gaps: display018 reference
+809; negative-margin001 actual52/reference26. Known browser execution gaps
+content175 and moveBefore-as-flex-item remain separately reported.
+
+Source/binary/results/captures and RED/GREEN logs are bound in
+`target/wpt-targeted/baseline-font-position-20261003/character-spacing-final-receipt-v72.json`.
+Full6548 NOT_RUN; global remaining UNKNOWN. No commit/push or upstream/reference/
+tolerance change. Product Agent knowledge unaffected: only generic font units.
+
+### V73: short inline strut fallback RED (in progress)
+
+Original negative-margin001 actual/browser52, reference/browser26, native
+strict26 and browser strict0. Differences are limited to the two x glyphs;
+blue absolute/static boxes agree. Native nested and forced-line text origins
+remain6.5/16.5 while the already projected first reference line starts6.0.
+Shared baseline/inline-line metrics already floor upper leading. Fallback
+projection must use that same upper-leading split without rounding the total
+line height, adding it twice or moving absolute containing-block origins.
+
+Original RED and layout dumps are bound in
+`target/wpt-targeted/baseline-font-position-20261003/negative-margin-red-receipt-v73.json`.
+First inert-parser fixture failed8.0/4.0; explicit original font declarations
+also retained16px instead of10px. Neither is accepted as the original layout
+RED; logs/source remain preserved, and this does not establish a shorthand
+defect. The standalone inert parser does not reproduce the navigation runner's
+style environment. Replacement uses an explicit computed-style component tree
+with original nested/absolute and inline-block/forced-break relationships.
+Its first compile failed on the Edges::all argument type; corrected RED is
+running. That compile failure is setup evidence, not renderer RED.
+Explicit computed-style unit RED now reproduces6.5/6.0; source/log/test binary
+bound in `negative-margin-unit-red-receipt-v73d.json` under that directory.
+Candidate centralizes the LayoutUnit-aware floored upper leading for font
+baseline, passive inline projection, matching anonymous text rows and inverse
+line-origin recovery. Total line height and lower leading are not rounded.
+First candidate passes the nested RED assertions but fails the reference
+fixture (8.0/6.0). That fixture used Block rather than the real DOM's marked
+Flex/Baseline inline formatting context. Source/log are retained as partial,
+not GREEN. Corrected reference lowering candidate unit GREEN1/1. Existing
+line_box guards7/8: split-inline forced-break fixture still assumes fractional
+upper leading1.6. Do not change the assertion until original browser proof
+distinguishes a real regression from its hand-authored rectangle convention.
+Candidate source/test binary/logs and all setup/partial attempts are bound in
+`negative-margin-candidate-receipt-v73b.json`. Runner build succeeds2m05s.
+Original negative-margin001 actual/browser52->0, reference/browser26->0 and
+native strict26->0; original21 now20PASS/1FAIL, only target pixels change.
+Known56 stays11PASS/45FAIL with no pixel changes. Original source/binary/
+results/captures bound in `negative-margin-original-proof-receipt-v73.json`.
+Guard7/8 is unresolved. Original linebox198 finishes61PASS/137FAIL versus
+historical62/136: only testharness inline-negative-margin001 changes, with five
+new height assertion failures. All191 reftest strict statuses/pixels unchanged.
+Browser comparison of all191 (not just strict failures) identifies six shared
+native/browser gaps in previously strict-passing cases: baseline-block-with-
+overflow001, two iframe inline cases, line-breaking-font-size-zero001,
+line-height-oof-descendants001 and vertical-align-top-bottom-padding. They
+were not covered by V68's failed-reftest-only browser receipt; whether each
+predates this candidate remains unproven. Failed initial screenshot orchestration
+treated seven testharness cases as reftests; corrected mixed-scope receipt is
+`negative-margin-linebox-browser-receipt-v73b.json` (191 reftests, seven native
+testharness cases separately preserved). No result is dropped.
+
+### V74: negative character-relative margin strut RED/GREEN (in progress)
+
+DOM's negative-margin classifier omitted new Spacing::Ch, bypassing transparent
+inline strut wrappers. Original five failing assertions and V73 source/runner/
+results/browser captures bound in `negative-margin-linebox-red-receipt-v74.json`.
+Direct DOM unit RED0/1 confirms the missing strut, bound in
+`negative-character-unit-red-receipt-v74.json`; adding Ch to the common sign
+classifier gives unit GREEN1/1. Authored Ch remains on the real paint box,
+not converted to stale pixels. Runner rebuild and focused original13-assertion
+acceptance are pending; guard and six shared browser gaps remain unresolved.
+DOM guards initially2/3: existing parser unit still expected Em for authored
+4ch/-1ch, contradicting the V72 distinct Ch contract. Corrected its dimension/
+spacing enum expectations only; initial failure log is preserved separately.
+DOM guards GREEN3/3 and runner build2m12s. Focused original does not complete
+assertions: document-load timeout, not accepted. Same-budget diagnostic replay
+is sampled; it also times out. Seven original linebox testharness pages in
+Chromium141 pass665 subtests, including target13/13 (observer only, no source
+override). Native timeout, runner/source/result, sampled profile and browser
+assertions are bound in `negative-character-timeout-red-receipt-v75.json`.
+
+### V75: bounded zero-advance font unit cache (in progress)
+
+Sampled native main thread repeatedly enters CoreText family enumeration;
+uncached ch measurement repeatedly resolves/measures the zero. This identifies
+a plausible hotspot, not proof that the timeout cause is completely resolved.
+Candidate cache has256-entry capacity and keys family, size, weight/slant,
+kerning, direction and resolved cascade identity, so loaded/replaced/unloaded
+fonts cannot reuse an old face's advance. A fresh font-only style excludes
+authored-fragment metadata, box edges, tracking and transforms. Cache entries
+are not inherited pixels. Unit coverage checks repeated reuse, tracking
+exclusion, size changes and real font load/unload. Unit GREEN3/3 (including
+existing metric/serde guards); runner rebuild succeeds. Same-budget original
+execution completes in2094.98ms (complete wrapper, not isolated layout timing),
+with12/13 assertions PASS. Remaining overwide-image/zero-outer-advance text
+expects20px height but gets10px. Cache removes the observed timeout; original
+layout acceptance remains FAIL. Bound in `font-unit-cache-proof-receipt-v75.json`.
+Do not increase the timeout budget or change WPT assertions.
+
+Independent browser control with pinned Ahem16px/1.2 confirms content height16,
+first glyph origin1px and forced continuation20.1875px, computed line-height
+19.2px. This exposes the old split-inline unit's baked-in1.6px upper leading
+and a used-line-stride precision requirement. Control/font hash bound in
+`upper-leading-browser-control-receipt-v75.json`; it is diagnostic geometry,
+not substituted WPT acceptance. Resolve that guard after original cache proof.
+Full6548 NOT_RUN; global remaining UNKNOWN; no commit/push.
+
+### V76: signed outer advance in overwide first-pair fitting (in progress)
+
+Minimal runtime regression reproduces the original50px image +30px text with
+-3ch margin in a40px line: RED actual10px, expected20px. Source/log/test binary
+bound in `overwide-zero-advance-red-receipt-v76.json`. Pair fitting subtracted
+the negative margin twice and relied on an Ahem/em-only boundary workaround.
+Candidate reads the transparent wrapper child's signed max-content outer
+advance once, retaining zero vs strictly-negative semantics independent of
+font family or authored unit. Minimal regression GREEN1/1 and unbroken-word
+negative-advance guard GREEN1/1. Runner build succeeds and unchanged original
+WPT testharness GREEN13/13, including strictly-negative rescue and zero-advance
+overflow boundaries. Source/binary/results/RED/GREEN hashes are bound in
+`overwide-zero-advance-proof-receipt-v76.json`. This closes that original case,
+not the older198-case census or unresolved shared browser gaps/internal guard.
+Full6548 NOT_RUN; global remaining UNKNOWN; no commit/push. Product Agent
+knowledge unaffected: generic line fitting only, no business/authority change.
+
+### V77: forced-break used-strut precision (in progress)
+
+V76 line-box guards7/8 retain a split-inline fixture with old1.6px upper
+leading. Pinned Ahem browser geometry instead gives1px leading and20.1875px
+continuation for16px/1.2. Corrected fixture inputs expose genuine precision RED:
+native continuation20.2, expected20.1875. Source/log/test binary and browser
+control bound in `forced-break-used-strut-red-receipt-v77.json`.
+
+Candidate uses the shared LayoutUnit strut for forced-break line fitting and
+resets. First forced-break sweep20/23 is preserved as partial, not GREEN.
+Two additional fixtures assumed old upper leading; their font/content geometry
+now uses explicit Ahem and exact used strides. A26px computed ratio loses one
+float ULP before quantization; only near-integer-unit arithmetic noise is
+restored, genuine fractional units still truncate. Independent browser controls
+confirm5px/1.2 origins0/6 and22px/26px total52px, bound in
+`forced-break-boundary-browser-receipt-v77b.json`.
+
+V77b forced-break guards GREEN23/23 and line-box guards GREEN8/8. Runner build
+succeeds; original21 box-position remains20PASS/1FAIL with no status/pixel-count
+changes. All63 test/reference/diff PNGs are byte-identical to V73. Original
+negative-margin assertions remain GREEN13/13. RED, partial candidate, browser
+controls, frozen source, runner, results and capture hashes are bound in
+`forced-break-used-strut-proof-receipt-v77.json`. Seven known browser pixel gaps
+remain; strict full-suite residual is not inferred from this focused scope.
+Full6548 NOT_RUN; global remaining UNKNOWN; no commit/push. Product Agent
+knowledge unaffected: generic layout precision only, not business or authority
+semantics.
+
+### V78: typographic text measurement cache identity
+
+Current original display018 RED strict809, actual/browser0 and reference/
+browser809. Native reference bold Filler occupies34.671875px (plain width),
+while original Chromium Range measures37.3125px. Plain-fragment warmup poisons
+the later bold intrinsic size because the retained key contains resolved
+cascade identities but not fallback typography. Minimal warmup regression RED
+and original/source/runner/browser/geometry/layout evidence are bound in
+`text-style-cache-red-receipt-v78.json`.
+
+TextMeasureKey now retains family/weight/slant, kerning, tracking, transform,
+direction/bidi and transform language/word-continuation metadata. Paint-only
+properties do not invalidate measurement, resolved font identity still handles
+font loading, and the bounded4096-entry cache remains. Unit checks six style
+variants after plain warmup, direct vs cached width and wrapped-height parity,
+then same-style hits: GREEN1/1. Existing retained-measure reuse GREEN1/1 and
+character-font guards GREEN3/3; runner build succeeds.
+
+Original21 box-position GREEN21/21. All21 test/reference captures match Chromium
+exactly; display018 strict809->0 and reference/browser809->0. Known56 remains
+11PASS/45FAIL with no status or pixel-count changes. Original negative-margin
+assertions GREEN13/13. Source/binary/RED/GREEN/results/browser/capture hashes bound
+in `text-style-cache-proof-receipt-v78.json`. Six earlier linebox browser gaps
+still require fresh targeted repair; known45 strict failures remain unresolved.
+Full6548 NOT_RUN; global remaining UNKNOWN. No WPT source/reference/tolerance
+change or commit/push. Product Agent knowledge unaffected: generic measurement
+cache identity only, no business concepts/authority/tool semantics changed.
+
+### V79: zero-height text lines prevent margin collapse-through
+
+Fresh six-case census confirms all six earlier shared browser gaps remain
+after V78; strict test/reference remains0 for each. Zero-line-height original
+and reference both differ4643 pixels from Chromium. Original Range text origins
+are8/28/48/68, whereas native text paragraphs overlap at8. Font content boxes
+and the first origin agree: the zero-height text block incorrectly propagates
+collapse-through rather than separating its adjoining margins.
+
+First standalone DOM fixture incorrectly assumed the original navigation's
+absolute origin; failure/source are retained as fixture mismatch, not accepted
+minimal RED. Corrected fixture tests strict20px relative strides, zero heights,
+true-empty paragraph collapse and float/absolute/fixed empty descendants. RED
+has0px stride instead of20px. Bound in `zero-line-margin-red-receipt-v79b.json`.
+
+The Taffy leaf adapter now distinguishes text-generated line boxes from empty
+blocks even at zero height, using non-block leaf classification internally.
+Authored display/height/overflow are unchanged; no epsilon height or padding is
+added. Shared CSS whitespace classification preserves true-empty collapse.
+Zero-line-height guards GREEN3/3, adjacent block-margin guards GREEN2/2 and
+line-box guards GREEN8/8; runner build succeeds. Original zero-line-height test
+and reference browser gaps4643->0; other five shared gaps unchanged. Strict
+six-case regression GREEN6/6 and box-position GREEN21/21, neither substitutes
+for full-suite acceptance.
+
+RED/fixture mismatch/candidate/logs/source/binary/browser/capture hashes bound
+in `zero-line-margin-proof-receipt-v79.json`. Five known linebox browser gaps
+remain. Earlier known56 strict45 failures remain unresolved and are not freshly
+rerun here. Full6548 NOT_RUN; global remaining UNKNOWN; no WPT/reference/tolerance
+change or commit/push. Product Agent knowledge unaffected: generic line-box and
+margin-collapse adapter semantics only, no business authority/tool changes.
+
+### V80–V84: empty atomic line edges and baseline fallback ownership
+
+Original `vertical-align-top-bottom-padding.html` and reference both differed
+350 pixels from Chromium141 despite strict native test/reference equality.
+Original browser text Range origins are48/148; final native layout instead
+placed text at70/150. Empty inline-blocks were absent from shared line metrics,
+and inline vertical padding rejected the containing font strut. V80 adds empty
+atomic margin-box metrics and separates inline vertical decoration from the
+line's ascent/descent. Its manual layout guards pass, but original top/bottom
+pixels remain unchanged: this intermediate candidate is not accepted.
+
+A real inert-parser DOM fixture establishes top/no-padding RED: relative text
+origin20 instead of-2. Initial fixture node-lookup failure is retained as a
+setup failure, not renderer RED. Removing the text-height eligibility guard
+does not fix it (nine guards pass, DOM still fails); V82 is rejected/reverted.
+V83 proves direct shared projection on the same completed DOM succeeds and
+places text at48, with actual wrapped text height10. The later legacy atomic
+baseline fallback incorrectly includes top/bottom boxes in its deepest
+baseline, overriding the shared solver. V84 limits that fallback to baseline
+aligned atomic boxes; temporary diagnostics are removed.
+
+Shared line metrics GREEN10/10 including DOM top/bottom with and without20px
+padding, line-box guards GREEN8/8, runner build succeeds, box-position
+GREEN21/21. Original top/bottom actual/browser350->0 and reference/browser350->0;
+strict native/browser relations remain0. Other three unchanged shared gaps
+are overflow-baseline3614 and the two iframe cases2213 each. Font-size-zero
+actual/browser2760->0 but reference/browser2760 remains: strict six-case status
+is5PASS/1FAIL, not suite closure. Its browser geometry confirms five20px lines
+and100px container height for both original and reference; forced-break
+reference handling remains the next focused repair.
+
+REDs, setup failure, rejected candidate, probe, frozen source, unit/runner
+binaries, logs and original captures are bound in
+`top-bottom-proof-receipt-v84.json` under the baseline-font-position artifact
+directory. Four shared browser gaps remain; historical known56 strict45
+failures are not newly rerun or waived. Full6548 NOT_RUN, global remaining
+UNKNOWN. Fixed WPT revision unchanged, no source/reference/tolerance change or
+commit/push. Same six outside-vendor file-size violations; no baseline increase.
+Product Agent knowledge unaffected: generic layout metrics and baseline
+ownership only, no business concepts/authority/tool semantics changed.
+
+### V85: empty atomic baseline descent across forced breaks
+
+After V84, `line-breaking-font-size-zero-001.html` actual/browser is0 but its
+`br` reference still differs2760 pixels, making the strict relation FAIL.
+Chromium141 independent original geometry records atomic y8/28/48/68/88,
+container height100 for both pages. Fresh native reference dump records
+y8/26/44/62/80 and height90. Real inert-parser DOM RED preserves the original
+five empty1em inline-blocks separated bybr: stride18 instead of20.
+
+The forced-break adapter already adds parent strut descent below a baseline
+replaced element's bottom margin edge. It now also handles empty inline-block
+row/box margin-edge baselines, retaining descent on the final line too. It
+does not alter authored atomic height, references, tolerance or line-edge
+alignment. New DOM guard becomes GREEN with20px stride and100px height.
+
+Intermediate forced-break guards are21PASS/3FAIL, retained as partial evidence.
+Independent browser controls show three older expectations omitted descent:
+serif16/1.2 centered20px atomic next y25.1875; serif22/26 with22px atomic next
+y28 and total56;100px atomic plus10px bottom margin next y114. Two manually
+constructed fixtures now declare serif explicitly and all three expectations
+follow those exact independent coordinates, not candidate output alone.
+
+Final forced-break GREEN24/24, shared line metrics GREEN10/10, line-box GREEN8/8,
+runner build succeeds. Original six-case strict GREEN6/6 and position GREEN21/21.
+Zero-font reference/browser2760->0 and actual/browser remains0; zero-line-height
+and top/bottom actual/reference/browser remain0. Three shared browser gaps
+remain unchanged: overflow baseline3614, iframe-in-block2213 and wrapped iframe
+2213. These strict-green shared discrepancies are not conformance closure.
+
+Evidence, RED/partial/browser-calibration/frozen source/unit and runner hashes,
+original results and captures are bound in `zero-font-proof-receipt-v85.json`.
+Historical known56 strict45 failures not newly rerun or waived. Full6548
+NOT_RUN; global remaining UNKNOWN. Fixed WPT revision and source/reference/
+tolerance unchanged; no commit/push. Product Agent knowledge unaffected:
+generic CSS font strut and forced-break semantics, no business authority/tool
+semantics changed.
+
+### V86: iframe UA defaults, wrapped forced-break still pending
+
+Fresh original/browser geometry shows iframe computed displayinline,2px inset
+border,currentColor and304x154 border box around300x150 content. Embedded text
+origin is18/18 for the block case. Native defaults wereblock, border0,300x150
+box and text16/16. UA RED isBlock vsInline; lowest-priority HTML defaults now
+include inline iframe and2px inset/currentColor border. Existing component
+lowering converts the replaced host to atomic InlineBlock. Author border0 and
+displayblock overrides are retained; UA group GREEN9/9.
+
+Runner build succeeds. Block-in-inline original and reference browser gaps
+2213->0; wrapped reference2213->0. Wrapped original is not accepted: newly
+correct atomic layout exposes a first-br displacement, frame y160 vs browser26,
+actual/browser3943 and strict relation3943. Native firstbr y142 is used as a
+line origin instead of the empty first line's owner origin. This remains a
+real unresolved failure, not waived or treated as whole-batch green.
+Original six-case strict5PASS/1FAIL; box-position GREEN21/21. Other solved
+zero-font, zero-line-height and top/bottom remain exact; overflow3614 remains.
+
+UA RED, browser original geometry, frozen candidate/source, DOM unit and runner
+hashes, original results/captures and displaced wrapped dump are bound in
+`iframe-partial-receipt-v86.json`. A real inert-parser wrapped iframe regression
+is being established separately; no fix claim for that path yet. Full6548
+NOT_RUN/global remaining UNKNOWN, historical strict failures not newly rerun
+or waived. Same six outside-vendor size violations, no baseline increase or
+commit/push. Product Agent knowledge unaffected: generic HTML UA defaults and
+replaced-frame rendering only, no business authority/tool changes.
+
+### V87: first empty inline line origin, original wrapped iframe exact
+
+Real inert-parser RED puts the wrapped iframe154px after its body origin,
+instead of18px. The initial forced break now recovers its owner's content
+line origin rather than using the BR displaced by an atomic baseline.
+Forced-break guards25/25, shared metrics10/10 and line-box guards8/8 pass.
+Frozen V87 runner originals: six strict6/6 and box-position21/21. Wrapped
+iframe actual/browser3943->0, reference/browser0, strict0; all other solved
+originals remain exact. Overflow remains3614 pixels on both actual/reference
+against Chromium despite native strict0. It is not accepted as browser exact.
+
+`iframe-wrapped-proof-receipt-v87.json` binds source, runner, RED, guards,
+original results and capture hashes. The DOM iframe group at that checkpoint
+is2PASS/1FAIL: its direct child indexing selects an anonymous inline row,
+not the iframe. Final fixture locates the NativeHost identity recursively,
+retaining300x150 fallback, percentage height and empty replaced-host assertions.
+V87b compile fails for an unqualified Component type; V87c DOM guards3/3 pass.
+Final V87c runner rebuild succeeds and fresh originals repeat strict6/6,
+box-position21/21 and wrapped actual/reference/browser0. Final source, DOM
+binary, runner, captures and results bind in
+`iframe-wrapped-proof-receipt-v87c.json`; source generations are not
+interchangeable. No full6548 run, no global remaining count or commit/push.
+Product Agent knowledge unaffected: generic layout and test identity only.
+
+### V88b: nested clipped baseline real DOM RED, candidate pending
+
+The five-row overflow control first used stylesheet text with an inert parser.
+V88 produced18/36px rows rather than styled30px inner boxes; this is an invalid
+layout reproduction. Keep its log and explicit invalid-fixture clarification,
+do not interpret the earlier RED receipt as baseline evidence.
+
+V88b uses equivalent inline declarations and independently confirms every
+expected row in Chromium141: [top,height,external text offset]
+[[0,54,16],[55,50,16],[106,50,16],[157,84,46],[242,80,46]]. Native RED instead
+[[0,50,40],[51,50,36],[102,50,0],[153,80,0],[234,80,0]]. Frozen source, binary,
+native log and exact browser control bind in
+`overflow-nested-red-receipt-v88b.json`. Original WPT is untouched.
+V89 production candidate is pending: clipped descendants synthesize margin-edge
+baseline; sized non-empty atomic boxes participate in local line metrics;
+DOM block-only bottom-alignment approximation excludes clipped child boxes.
+No accepted original pixel result or full6548 closure at this generation.
+
+V89 partial native rows are[[0,54,16],[55,50,16],[106,50,0],[157,84,46],
+[242,80,0]]. Height propagation and rows1/2/4 match; rows3/5 still fail.
+`overflow-nested-partial-receipt-v89.json` preserves this candidate, source,
+binary and log before further changes. V89b extends clipped-box baseline
+export to blocks lowered by the single-text fast path, not only Row/Box.
+V89b repeats the same failing rows; extending the clipped Text guard did not
+improve rows3/5. Fast-path diagnosis remains unconfirmed, not an established
+root cause. `overflow-nested-partial-receipt-v89b.json` retains source/binary/log
+before V90 adds failure-only component/layout diagnostics to the existing
+five-row test. V90 is pending. No original pixel acceptance yet; production
+candidates are unaccepted while this focused test fails.
+
+V90 diagnostics disprove the single-Text hypothesis: inner nodes12/22 are
+Row/Flex/Hidden/Auto; external nodes14/24 retain the internal glyph baseline.
+The styled blocks were lowered to internally marked Flex IFCs, excluded by
+the clipped Block/FlowRoot/InlineBlock guard. Source/binary/log and the prior
+candidate bind in `overflow-nested-diagnostic-receipt-v90.json`.
+V91 restores the Row/Box eligibility and adds only Flex carrying the internal
+inline-formatting-context marker, preserving authored real Flex scope.
+V91 five-row regression passes. Focused runtime guards inline-block31/31,
+clipped5/5,forced-break25/25,shared-metrics10/10,line-box8/8 pass (groups overlap,
+not the full runtime suite). Source/binary/RED/diagnostic/log bind in
+`overflow-nested-unit-receipt-v91.json`; original pixel acceptance remains absent.
+
+DOM inline-block group at V91 is3PASS/2FAIL: two old expectations require
+InlineFlex for an authored inline-block. Independent Chromium controls retain
+inline-block in both image and RTL fixtures (`overflow-dom-browser-receipt-v91.json`).
+V91b only updates those cfg(test) display assertions, preserving image presence
+and RTL FlexEnd checks; DOM group5/5 passes. Final V91b runner rebuild is pending;
+prior runtime guards remain bound to V91 rather than pretending to be rerun.
+
+Final V91b runner build succeeds. Fresh original six-case strict6/6,
+box-position21/21; all six actual/browser,reference/browser,browser strict and
+native strict pixel counts are0. Overflow actual/reference gaps3614->0.
+`overflow-nested-proof-receipt-v91b.json` binds source, runner, DOM tests,
+prior source-bound runtime guards/RED, original results/capture hashes and
+fresh Chromium comparison. This closes only the six shared-gap originals,
+not the198 linebox or6548 full suite. Historical known56 strict45 failures
+remain unrefreshed at this checkpoint; no waiver, commit or push.
+
+### V92/V93: refresh historical strict failures, preserve browser parity evidence
+
+Frozen V91b source and runner refresh known56:11PASS/45FAIL, no status or pixel
+changes from V78. Fresh Chromium comparison covers all56 originals with no
+missing requests:54 actual images exact,56 references exact. Every strict
+failure is exact against Chromium on both actual and reference; browser strict
+relations also fail. These45 failures remain unresolved, not waived.
+Native-pass content175 and moveBefore-as-flex-item retain separate actual/browser
+gaps576/10000 with reference gaps0; do not disguise those gaps as strict failures
+or change native behavior merely to reproduce a failing browser result.
+`overflow-known-proof-receipt-v92.json` binds refreshed source/runner/results,
+browser capture hashes and exact failure classifications.
+
+V93 refreshes the original198 linebox suite, then compares all191 reftests,
+including native-pass shared-bug checks. Seven harness cases are tracked by
+native subtest receipts rather than screenshot comparison. This is pending,
+not a full6548 run. No reference/tolerance changes, commit or push.
+
+V93 completed:linebox19862PASS/136FAIL; all191 reftest actual images and191
+reference images are pixel-exact against fresh Chromium. Seven native harness
+cases pass665 subtests. Union with known56 is252 unique cases:73PASS/179FAIL.
+Those179 strict failures reproduce in Chromium itself; they have not been
+waived or recategorized as passes. Example background-applies-to006 has one
+strict differing pixel at(103,53):actualRGBA(5,5,5,255),reference(0,0,0,255),
+identically in native and Chromium, under unchanged zero-tolerance metadata.
+Thus exact Chromium parity and zero strict reference failures cannot both be
+achieved for these originals without an acceptance-policy decision.
+`overflow-expanded-proof-receipt-v93.json` binds current source/runner,
+canonical6548 membership, overlap agreement, all191 browser/native captures,
+native harness evidence and strict failure counts. Full6548 remains NOT_RUN,
+global remaining UNKNOWN. Do not mark the goal complete or silently waive
+these failures; request direction before changing acceptance or references.
+
+V94 acceptance audit checks all179 original test/reference sources and the
+current comparer/discovery/profile. No failed original declares fuzzy metadata;
+all179 canonical tolerances remain0/0. Scoped user stylesheet does not affect
+them. Source, runner and clean fixed WPT revision still match the V93 binding.
+`acceptance-metadata-audit-receipt-v94.json` retains original source/reference
+hashes and metadata/allowance classification. This rules out recovering an
+ignored upstream fuzzy allowance as a resolution. Acceptance choice remains
+pending human input; no production change, waiver, full run or completion claim.
+
+### V95: human acceptance decision — browser pixel consistency first
+
+Human decision on2026-10-05 Asia/Shanghai: “浏览器像素一致优先，严格参考失败单列保留”.
+This resolves the V93/V94 acceptance blocker. Native/browser actual and
+reference pixel differences are the primary rendering acceptance metric;
+strict native/reference failures remain visible and are not waived, converted
+to passes, or hidden by fuzzy/reference edits. Testharness results and browser
+execution limitations remain independently reported. Full scope stays6548,
+with6178 original reftests and370 original harness cases at the fixed revision.
+
+V95 reuses the frozen V91b source/runner, starts the original6548 native run,
+and binds the human decision, suite membership/hash, source/runner and process
+in `browser-priority-full-start-receipt-v95.json`. Native results alone cannot
+close browser consistency; fresh actual/reference browser comparison must
+cover all6178 originals. No production code, upstream, tolerance or reference
+changes. Preserve the prior179 strict failures separately and retain new
+strict failures too. This run is pending, not a zero-failure claim.
+Product Agent knowledge unaffected: acceptance evidence for generic renderer
+only; no business concepts, authority, tools or installed model knowledge changed.
+
+### V54b/V55: default fixed-family origin and shared font metrics
+
+V54b font-origin DOM controls pass (nine inheritance cases), with font-size
+20/20, shorthand 19/19 and custom-property 2/2 guards. This is not accepted:
+original word-spacing-characters-001 changes strict native/reference 0->4361
+pixels. Actual/browser 73724->34372 and reference/browser 73724->32663 are
+improvements, not closure. Source, runner, logs and comparisons are bound in
+`target/wpt-targeted/baseline-font-position-20261003/monospace-final-receipt-v54b.json`.
+
+V55 read-only browser diagnostics identify actual platform Courier through
+CDP CSS.getPlatformFontsForNode. At 13px: canvas advance 7.80126953125, inline
+advance 7.8125 and normal line box 15px; at 16px: canvas 9.6015625, inline
+9.609375 and line box 18px. Courier controls match the generic family; Courier
+New has different ascent/descent. Original screenshot equality with V54b is
+checked. Native V54b instead had 8.671875 advance and 15.6px line box at 13px.
+
+Shared-font regression is genuine RED (0/1): CSS font runs use the embedding's
+primary face for bare monospace, not platform Courier. RED source, test binary,
+log and browser metrics are hash-bound in `monospace-metrics-red-receipt-v55.json`
+under the same artifact directory. V55 candidate resolves bare monospace in the
+shared generic resolver and removes synthetic fixed advance and rounded glyph
+painting. Candidate shared-font unit GREEN1/1 and monospace guards GREEN3/3;
+original WPT regression remains pending and this is not acceptance. Source and
+test binary are bound in `monospace-metrics-candidate-receipt-v55.json`.
+Named/registered font stacks and broader generic fallback ordering require
+separate validation. Fresh V55 original strict FAIL4340; actual/browser4340,
+reference/browser0. The remaining actual-page mismatch is authored
+word-spacing4em computed against initial16px (64px), not final13px (52px).
+These source-bound comparisons remain preserved in `monospace-final-receipt-v55.json`.
+
+Full6548 NOT_RUN on this source; global remaining UNKNOWN. Original WPT and
+references unchanged, dirty worktree preserved, no commit/push. Product Agent
+knowledge unaffected: only generic font resolution/measurement/painting.
+
+### V56b: word spacing resolves after the final font cascade
+
+First V56 unit fixture wrote raw style attributes directly to Document, which
+does not perform HTML parser attribute-to-style processing. Its observed0px is
+not accepted RED. Both attempted logs remain preserved. Corrected fixture uses
+CSSStyleDeclaration.set_property, and pre-fix RED64px versus expected52px now
+matches the unmodified original WPT layout dump. Source/test binary/log bound
+in `word-spacing-red-receipt-v56b.json`.
+
+Compute authored em word-spacing after final font-family/font-size resolution,
+as already done for ex spacing. Descendants inherit the resulting pixel length.
+Six controls cover inherited generic13px, inherited explicit20px, same-element
+declaration order25px, root-relative rem preservation and negative spacing.
+Corrected unit GREEN1/1, spacing guards12/12. Removed the unused local from the
+V55 synthetic advance removal; no new runtime branch.
+
+Fresh original word-spacing-characters001 strict PASS1/1, actual/browser0,
+reference/browser0, browser strict0 and native strict0. No CSS/reference/font/
+viewport/tolerance override. RED4340->GREEN0 is against frozen V55 native, not
+a claimed new global failure-count reduction: old V51 passed this relation
+while differing73724 pixels from browser on both actual and reference pages.
+Now the relation and both independent browser comparisons are exact.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/word-spacing-final-receipt-v56b.json`.
+Known56 focused refresh completed: strict11/56 PASS and45 FAIL, no status
+changes versus V52. Actual/browser exact51->52 of56, reference/browser
+exact53->54 of56; original word-spacing difference73724->0 in both comparisons.
+Four actual browser gaps remain: inherit-computed001(47), content175(576),
+overflow-applies-to001(622), moveBefore-as-flex-item(10000). Browser itself
+fails the reference relation for content175 and moveBefore; this does not
+waive either original case or establish a native bug without investigation.
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/known-failures-final-receipt-v56b.json`.
+Full6548 NOT_RUN and global remaining UNKNOWN.
+Original WPT files untouched, dirty worktree preserved, no commit/push.
+Product Agent knowledge unaffected: generic CSS computed spacing only.
+
+### V57: fractional line-height accepted; expanded strict census still red
+
+Read-only original font-geometry diagnostics preserve byte-identical V56b
+Chromium captures for inherit-computed001 and overflow-applies-to001. The
+latter retains622 actual/browser and reference/browser pixel differences,
+while strict native and browser both pass. Its projected text top50.6 differs
+from Chromium50. Generated controls distinguish unitless1.2 line19.1875 from
+length1.2em/19.2px line19.203125; both place the Times16 font box at line top.
+This is evidence for consistent units, not permission to unify different CSS
+computed line-height forms or waive the old strict failures.
+
+Small shared-metrics regression establishes RED: raw wrapped height19.2 is
+compared against used LayoutUnit19.1875 with0.01 tolerance, wrongly rejecting
+one line. Candidate quantizes the wrapping measurement using the existing
+LayoutUnit helper. Actual wrapped text remains rejected from the single-line
+path. Block and marked synthetic-flex controls GREEN1/1; module guards8/8.
+Other geometry, global rounding, references and tolerances are unchanged.
+
+Source, test binary, RED and diagnostic captures are bound in
+`target/wpt-targeted/baseline-font-position-20261003/fractional-wrap-red-receipt-v57.json`
+and `fractional-wrap-unit-receipt-v57.json`. The frozen V57 runner subsequently
+completed the original-case comparison: overflow actual/browser and
+reference/browser622→0; both original strict comparisons remain0 PASS.
+Receipt: `fractional-wrap-final-receipt-v57.json`. This fixes the real font
+position difference, not the unrelated legacy strict failures.
+
+The same frozen V57 source refreshes known56 at11 PASS/45 FAIL; actual/browser
+53/56 exact and reference/browser55/56 exact. Linebox198 now62 PASS/136 FAIL,
+superseding the historical V41 result196/198. All136 failed original linebox
+cases were compared against Chromium: actual and reference both exact in134;
+vertical-align117a/118a retain4476/4480 pixels in their instruction paragraphs.
+Their strict native and Chromium comparisons both remain1006 pixels FAIL.
+The concrete native gap is following-text wrapping after a bold inline run,
+not the colored vertical-align diagram. Evidence: `linebox-candidate-v57/results.json`
+and `linebox-failures-browser-receipt-v57.json` under the same targeted directory.
+Known56 and linebox198 union to252 unique cases:73 PASS/179 strict FAIL.
+These are bounded verified scopes, not the global remaining count.
+
+The inherit-computed00147-pixel glyph difference survives six diagnostic
+margin positions (`inherit-margin-probe-receipt-v58.json`); global margin
+snapping is not justified. Its separate strict168-pixel red border is also
+reproduced by Chromium. Modern currentColor inheritance remains protected by
+the passing DOM guard; neither legacy references nor tolerance are changed.
+Full6548 NOT_RUN; global remaining UNKNOWN. No commit/push or outside-vendor
+changes. Product Agent knowledge unaffected: generic inline line metrics only.
+
+### V58b: styled text boundary wrapping improved, not pixel-exact yet
+
+The original117a/118a paragraph suffix was one unsplittable flex item after a
+bold run. New Document regression establishes RED on the unchanged lowering.
+The first candidate exposed spaces for every pair of inline text leaves but
+introduced a self-painted-inline structural regression. That candidate and
+its guard log are preserved; it is not accepted. V58b restricts the new trigger
+to passive mergeable text leaves, retaining existing independent-box rules.
+
+Serial inline DOM guards: baseline110 PASS/6 FAIL (including the new RED);
+initial candidate110 PASS/6 FAIL (one newly introduced structural failure);
+V58b111 PASS/5 FAIL. The five remaining guard failures reproduce on baseline;
+the new RED becomes GREEN and the introduced structural failure is removed.
+This is not a clean whole-DOM result. Runner build PASS,2m17s; diff check PASS.
+
+Fresh original117a/118a actual/browser4476/4480→30 pixels each, and their
+reference/browser differences also reduce to30. Wrapping now matches visually,
+but the first line's final glyph remains different at x752–757,y18–29.
+Both original strict native and Chromium comparisons remain1006 FAIL each.
+Receipt: `styled-inline-final-receipt-v58b.json` (CANDIDATE_NOT_ACCEPTED), with
+RED, frozen sources, binary, guard logs, originals and captures bound.
+
+Read-only `styled-inline-geometry-receipt-v58b.json` records Chromium first-run
+width302.96875 and next bold-run origin310.96875. Native accumulated origin
+retains the raw302.96094 advance. This identifies a run-boundary LayoutUnit
+rounding candidate, not proof of a rounding fix. No global positional offset,
+reference change or tolerance increase is installed. Neighboring five-case
+WPT guard is4 PASS/1 unchanged FAIL (022101 pixels); all five statuses and
+pixel counts unchanged from frozen V57. Follow-up receipt:
+`styled-inline-guard-final-receipt-v58b.json`. Full6548 NOT_RUN; current global
+remaining UNKNOWN. V57's252-case census is historical, not V58b acceptance.
+No commit/push or outside-vendor changes. Product Agent knowledge N/A: generic
+DOM lowering and glyph positioning, no product semantics or tools changed.
+
+### V59: font-run boundary quantization makes117a/118a browser-exact
+
+Independent shared-advance regression RED302.96094 vs browser302.96875 confirms
+the completed normal run was not converted to layout units before its bold
+successor. Candidate adjusts only the completed shaping group's final advance
+at a font-family/size/weight/style boundary; internal glyph and word positions
+remain fractional. No global origin offset or per-word quantization is added.
+New unit GREEN1/1; `shaped_` filtered tests6/6 and principal-IFC guard1/1 PASS.
+Runner build PASS2m22s; diff check PASS. Size gate retains6 outside-vendor
+violations and is not reported green.
+
+Original117a/118a actual/browser30→0 and reference/browser30→0, both now exact.
+Their native and Chromium strict comparisons remain1006 FAIL each; this does
+not lower the strict remaining count. Five neighboring WPT cases retain4 PASS
+and1 unchanged FAIL (022101 pixels), with no status or pixel-count regression.
+Source, binaries, RED/GREEN, captures and guards are bound by
+`run-boundary-final-receipt-v59.json` and `run-boundary-guard-receipt-v59.json`
+under `target/wpt-targeted/baseline-font-position-20261003`.
+Current proof covers these2+5 originals and module guards, not the previous
+252-case census or full6548. Full6548 NOT_RUN, global remaining UNKNOWN;
+original WPT files, reference relations and tolerance unchanged. No commit/push.
+Product Agent knowledge N/A: generic font-run layout only.
+
+### V60: original same-font source boundary loss — RED, fix pending
+
+Fresh V59-runner original inherit-computed001 actual/browser and
+reference/browser now32 pixels (previous V57 47), confined to the span's initial
+`i` at x125–130,y25–38. Original strict168 remains FAIL in both engines;
+overflow001 companion actual/reference/browser and strict all0 remain PASS.
+Read-only source geometry establishes prefix114.125 and span origin125.125;
+native word-fragment prefix114.12188 incorrectly exports raw shaping precision.
+Independent fractional19.2 serif regression preserving original fragment ends
+establishes RED114.12188 vs114.125. No production fix is installed in V60.
+
+Browser live-DOM diagnostics distinguish ownership from text-node boundaries:
+removing span but retaining its text node0 pixels; setting relative positioning0;
+removing span then normalizing adjacent text nodes changes exactly32 pixels in
+the native-difference region. Native actual and reference both match those
+normalized diagnostic pages at0 pixels. This proves boundary loss, not correct
+rendering of the originals. Diagnostic pages cannot become acceptance refs.
+Next correction must preserve original boundaries in both shared fragment
+advances and glyph origins, without quantizing every generated word or dropping
+contextual shaping/ligature safeguards.
+
+Receipt: `authored-boundary-diagnostic-receipt-v60.json` under the targeted
+directory, binding original captures, geometry, controls, RED, sources/binaries.
+Installed runner is V59; V60 adds the failing regression only. Full6548 NOT_RUN;
+global remaining UNKNOWN; WPT originals/relations/tolerance unchanged.
+No commit/push. Product Agent knowledge N/A: generic text layout only.
+
+### V61d: partial source-boundary layout fix; paint candidates rejected
+
+Shared `authored_word_groups` recovers whitespace-delimited, cluster-safe original
+text-node ranges from generated words. Only authored range ends occupy snapped
+layout advances; generated words retain fractional shaping widths. V60 RED
+114.12188 vs114.125 becomes V61 GREEN. Initial module controls: inline shaping2/2,
+`shaped_`6/6 and coalesced renderer1/1 PASS, all bound to V61 source (not V61d).
+
+Three paint candidates were actually compared and rejected: independent source
+reshaping, coordinate rebasing of shared glyphs, and source-origin offsets all
+change original inherit-computed00132→47 pixels, relocating the remaining glyph
+difference. Failed receipts V61/V61b/V61c retain each source, binary and captures.
+V61d removes all three paint changes and retains only the layout helper; fresh
+original actual/reference/browser return to32, strict168 FAIL remains unchanged.
+Overflow001 companion remains browser-exact and strict PASS.
+
+Seven original linebox neighbors remain4 PASS/3 FAIL with identical statuses and
+pixel counts;117a/118a actual and reference remain Chromium-exact at0. Final
+V61d receipt `authored-boundary-final-receipt-v61d.json` binds the partial layout
+delivery and paint rollback. Current module rerun NOT_RUN; previous module green
+is not promoted to whole current-source acceptance. The next investigation is
+prefix-dependent cluster precision in `skia_text_run`'s f32 cursor accumulation,
+not permission for another global margin or glyph offset.
+Full6548 NOT_RUN; global remaining UNKNOWN. No commit/push, no original WPT,
+reference/relation/tolerance changes. Product Agent knowledge N/A: generic layout.
+
+### V51: isolate real-font regression; refresh original letter-spacing080
+
+The new inline background regression now registers Ahem in an exact-test child
+process, not the parent unit-test process. Missing pinned font is rejected by
+the parent rather than silently accepted as a skipped proof. Default parallel
+background guards now9/9 PASS, versus preserved V50b8/9 FAIL. V51 runner rebuild
+and diff pass; no renderer behavior changes in this test-isolation increment.
+
+Fresh original letter-spacing080 actual/native0 and reference/native0. Both
+native and Chromium strict1804 remain FAIL. Original test spacing6em at20px is
+120px, while its original letter-spacing007 reference specifies96px. Neither
+file, relation nor zero tolerance is changed. Matching browser rendering is not
+strict WPT closure, and the original failure stays in the6548 suite.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/isolated-font-final-receipt-v51.json`.
+Frozen source, runner/test binary, parallel failure/GREEN logs, pinned font and
+four fresh screenshots are hash-bound. Same six outside-vendor size violations;
+no baseline increase, outside-vendor edits or commit/push. Full6548 NOT_RUN,
+global remaining UNKNOWN. Next: refresh the original56 historical failure
+scope, distinguish remaining native gaps from strict reference conflicts.
+Product Agent knowledge unaffected: generic renderer tests only, no business
+concepts, authority or tool semantics changed.
+
+### V52/V53: refresh original56; default monospace origin RED
+
+Current frozen V51 runner original56 historical failure scope is11/45. This is
+not the global6548 remaining count. Browser captures cover all56: actual/native
+exact51, reference/native exact53. Five actual/native gaps: inherit-computed001
+47, content175576, word-spacing-characters00173724, overflow-applies001622,
+moveBefore-as-flex-item10000. Four have native strict PASS; those two-sided
+passes do not establish browser fidelity, and browser-only mismatches are not
+automatically native defects. Browser diagnostics preserve byte-identical V52
+screenshots and collect errors/computed fonts; no page errors occur in the five.
+
+Word-spacing uses native16px monospace versus Chromium13px, changing em spacing
+and accumulated line positions. Generated diagnostic controls (not WPT PASS)
+show default/medium/1em/100% resolving13px, large resolving16px, 1.25em
+resolving16.25px, and explicit16px/20px remaining16px/20px. New DOM unit is RED:
+default inherited family change yields16 versus13. No production fix yet;
+preserve absolute, relative and keyword origin rather than globally coercing
+all monospace16px to13px.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/known-failures-final-receipt-v52.json`.
+Installed source/binary, all56 comparisons/captures and diagnostics are bound.
+RED log: `target/wpt-targeted/baseline-font-position-20261003/monospace-inheritance-unit-red-v53.log`.
+Full6548 NOT_RUN; global remaining UNKNOWN. References and tolerance unchanged,
+no commit/push. Next: repair origin-aware generic font sizing, focused guards,
+then original word-spacing test/reference browser comparison. Product Agent
+knowledge unaffected: generic CSS font computation only.
+
+### V45: prefixed SVG default-style lookup reaches the real DOM path
+
+Fresh V44-binary original28 RED24/4. New DOM RED confirms svg:svg resolves
+Block while unprefixed svg resolves InlineBlock. Default lookup now extracts
+the qualified name's local part, matching retained component lowering. DOM
+GREEN1/1 checks computed and lowered styles for both spellings and preserves
+explicit author display:block. SVG9/9 and user-agent8/8 guards pass.
+
+Original002/003 strict1600->0 each, actual/browser0, reference/browser0 and
+Chromium strict0. Candidate original28 is26/2; every other26 report is unchanged,
+including repaired006. Intrinsic001/002 remain strict22501/22500 with native/
+browser0 and unchanged browser/reference conflicts. Exactly two strict original
+failures closed, no old-green regressions, no reference/tolerance changes.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/prefixed-svg-final-receipt-v45.json`.
+Frozen source, binary, fresh original RED/candidate, guards and browser/native
+capture hashes are bound. Browser RED reuse is verified against byte-identical
+fresh V45 native RED captures from the same V44 binary. Build and diff pass;
+same six outside-vendor size violations, no baseline increase, outside-vendor
+edits or commit/push. Full6548 NOT_RUN, global remaining UNKNOWN. Next: fresh
+evidence for the four CSS1 margin/padding browser gaps. Product Agent knowledge
+unchanged: generic default-style lookup, no business or tool semantics.
+
+### V46/V47: preserve negative advance through anonymous unbroken words
+
+Fresh original margin/padding24 with the V45 binary is18/6: four003 strict150
+and two004 strict1800. Browser captures identify004 as genuine native errors:
+Chromium strict0, actual/native1800. A generated unbroken word sums to a negative
+advance but its content width is clamped0; following text starts113 instead of
+83 and three15px lines cover the green bar instead of two. Four003 remain
+actual/native452 and browser strict527, reference/native0; first003 measured
+line/fragment coordinates agree, leaving raster edges and reference placement
+conflicts separate from004. Do not call these003 fixed or reference-waived.
+
+New unit RED45 versus30. Initial E0277 compile failure is not RED and remains
+separate; V46a diagnostic receipt corrects the earlier unverified running label.
+V47 first candidate reaches30 for px/em but fails the percentage guard45 versus
+30. V47b retains nonnegative synthetic width0 and exports residual negative
+advance as trailing margin; percentage inline margins are resolved against the
+authored containing block rather than the anonymous zero-width word. This
+applies only to generated unbroken words, not authored flex. Unit GREEN1/1
+covers both margin sides with px/em/percentage; six layout guards6/6 pass.
+
+Original004 strict1800->0 each; actual/browser0, reference/browser0 and browser
+strict0. Candidate24 is20/4. Every other22 original report is unchanged, including
+the four003. Exactly two strict failures closed, no old-green regression, no
+reference/tolerance changes. Browser capture covers all six originally failing
+pages; source/binary/WPT/capture hashes are bound.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/negative-word-final-receipt-v47.json`.
+Both failed candidates, unit RED/GREEN, focused original reports and browser
+captures are preserved. Build and diff pass; same six outside-vendor size
+violations, no baseline increase, outside-vendor edits or commit/push. Full6548
+NOT_RUN, global remaining UNKNOWN. Next: analyze registered Ahem glyph raster
+edges without shifting correct layout toward the conflicting003 reference.
+Product Agent knowledge unchanged: generic inline geometry only, no business
+concepts, authority or tool semantics changed.
+
+### V48: registered normal Ahem raster candidate — NOT ACCEPTED
+
+Fresh V47-binary original24 RED remains20/4. New registered-font raster unit
+fails at integer x23 with snapped cells; candidate uses the registered covering
+face for normal weight as well as bold, keeping the unregistered fallback.
+Ink bounds follow the same face path. Raster units2/2 and coverage guards4/4
+pass; source-bound runner build succeeds.
+
+Candidate strict original24 is10/14: ten old-green cases become FAIL. All24
+Chromium captures were checked, not just the original four failures. Actual/
+native is exact in22/24 and reference/native is exact in24/24. Four003 actual/
+native452->0, but strict150->527 matches Chromium's527; these are still FAIL,
+not repaired or waived. Two005 retain30 actual/native pixels each: native has
+opaque blue where Chromium retains orange/blue glyph edge blending. Their strict259/304
+differs from Chromium289/334. Remaining strict mismatches reproduce Chromium's
+reference differences. Browser fidelity does not establish strict WPT closure.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/ahem-raster-final-receipt-v48.json`.
+Status is CANDIDATE_PENDING_NOT_ACCEPTED. RED, frozen source, binary, all24
+captures, ten strict regressions and logs are hash-bound. Source retains the
+candidate for investigation; it must not be described as an accepted repair.
+Next: inspect two005 fragment/background overpaint edges, then resolve the
+strict raster/reference conflicts without per-case overrides or tolerance
+changes. Same six outside-vendor size violations; no baseline increase or
+commit/push. Full6548 NOT_RUN; global remaining UNKNOWN. Product Agent knowledge
+unaffected: generic font painting only, no business or tool semantics change.
+
+### V49/V50: split inline backgrounds precede all their glyphs
+
+V48 pixel samples were initially interpreted backwards: comparison a is
+Chromium, b is native. Corrected prose above; original numeric receipts and
+captures remain unchanged. Native005 had opaque blue, while Chromium retained
+orange/blue antialias coverage. Assigned-space and DOM pure-blue controls pass
+before production changes and are not RED despite attempted-RED log filenames.
+
+Whole registered Ahem text over one background establishes real RED at x98:
+native[0,0,255,255], expected[28,18,227,255], exactly the browser discrepancy.
+First candidate tags flattened inline hosts but still fails: the real page
+merges the span into decorated text before word splitting. V50b tags that path
+too. Parent-local source groups keep one authored background phase before all
+generated glyph fragments; unrelated adjacent elements are not grouped by color.
+Unit GREEN1/1. Background guards serial9/9 and translucent guard1/1 pass.
+Parallel background guards8/9 fail while the new unit registers global Ahem;
+serial execution confirms interference. Test isolation remains required, not
+waived or described as a passing parallel check.
+
+Fresh V48-binary original24 RED10/14; V50b remains strict10/14, no strict cases
+closed or newly regressed versus V48. Both005 actual/native30->0. All24 actual/
+native0 and reference/native0; native strict matches Chromium strict on every
+case. Two005 strict259/304->289/334 now matches Chromium; still FAIL. V48's ten
+old-green strict regressions remain unresolved reference/raster conflicts, not
+accepted as strict repairs or removed from the original suite.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/inline-background-final-receipt-v50b.json`.
+RED, failed candidate, GREEN, parallel failure, serial guards, frozen source,
+runner and all24 captures are bound; browser RED reuse is checked against fresh
+byte-identical native captures. Candidate remains unaccepted pending font-test
+isolation and strict closure. Build/diff pass, same six outside-vendor size
+violations, no baseline increase or commit/push. Full6548 NOT_RUN; global
+remaining UNKNOWN. Product Agent knowledge unaffected: generic inline painting,
+no business concepts, authority or tool semantics changed.

@@ -721,6 +721,29 @@ fn render_node(
         height: rect.height * style.transform.scale_y,
     };
     let rect = crate::paint_artifact::table_grid_paint_rect(style, rect);
+    let decoration_rect = if style.display == w3cos_std::style::Display::Inline
+        && matches!(kind, ComponentKind::Row | ComponentKind::Box)
+        && style.position == w3cos_std::style::Position::Static
+        && (style.background.a > 0
+            || style.border_width > 0.0
+            || style.border_top_width.is_some_and(|width| width > 0.0)
+            || style.border_right_width.is_some_and(|width| width > 0.0)
+            || style.border_bottom_width.is_some_and(|width| width > 0.0)
+            || style.border_left_width.is_some_and(|width| width > 0.0))
+    {
+        let line_height = style.font_size * style.line_height
+            + style.padding_lengths().top
+            + style.padding_lengths().bottom
+            + style.border_top_width.unwrap_or(style.border_width)
+            + style.border_bottom_width.unwrap_or(style.border_width);
+        LayoutRect {
+            y: rect.y,
+            height: rect.height.max(line_height),
+            ..rect
+        }
+    } else {
+        rect
+    };
 
     // Box shadow (render before the element; shadows stay outside filtered layer)
     let css_filter = style.filter.as_deref().and_then(filter::parse_css_filter);
@@ -769,13 +792,13 @@ fn render_node(
     let opacity = style.opacity;
     let color_chain = if in_layer { None } else { css_filter.as_ref() };
     let bg = node_color(style.background, opacity, color_chain);
-    for background_rect in crate::paint_artifact::box_background_paint_rects(style, rect) {
+    for background_rect in crate::paint_artifact::box_background_paint_rects(style, decoration_rect) {
         if bg.a > 0 {
             draw_rect(pixmap, background_rect, bg, style.border_radius, clip_mask);
         }
         for layer in crate::background_image::background_paint_layers_with_overrides(
             style,
-            rect,
+            decoration_rect,
             crate::paint_artifact::box_background_positioning_rect(style, rect),
             Some(background_rect),
         )
@@ -786,6 +809,8 @@ fn render_node(
                 crate::background_image::BackgroundPaintLayer::Raster(layer) => {
                     if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
                         for tile in layer.tiles {
+                            let viewport = decoded.svg_viewport(tile.width, tile.height);
+                            let decoded = viewport.as_ref().unwrap_or(&decoded);
                             draw_image_pixels(
                                 pixmap,
                                 tile,
@@ -827,7 +852,8 @@ fn render_node(
         || style.border_bottom_color.is_some()
         || style.border_left_color.is_some()
         || (style.border_collapse && style.display == w3cos_std::style::Display::TableCell);
-    let has_edge_border = has_edge_border || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
+    let has_edge_border = has_edge_border
+        || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
     if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         draw_border(
             pixmap,
@@ -850,40 +876,69 @@ fn render_node(
             style.border_bottom_color.unwrap_or(style.border_color),
             style.border_left_color.unwrap_or(style.border_color),
         ];
-        let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
+        let edges = crate::paint_artifact::border_edge_paint_rects(style, decoration_rect, widths);
         if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
             let origin = (rect.x.floor(), rect.y.floor());
             let layer_width = (rect.x + rect.width).ceil() - origin.0;
             let layer_height = (rect.y + rect.height).ceil() - origin.1;
-            let mut border_layer = Pixmap::new(layer_width.max(1.0) as u32, layer_height.max(1.0) as u32);
-            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors) {
+            let mut border_layer =
+                Pixmap::new(layer_width.max(1.0) as u32, layer_height.max(1.0) as u32);
+            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors)
+            {
                 let mut builder = PathBuilder::new();
                 for points in layer.polygons {
                     builder.move_to(points[0].0 - origin.0, points[0].1 - origin.1);
-                    for point in &points[1..] { builder.line_to(point.0 - origin.0, point.1 - origin.1); }
+                    for point in &points[1..] {
+                        builder.line_to(point.0 - origin.0, point.1 - origin.1);
+                    }
                     builder.close();
                 }
                 if let Some(path) = builder.finish() {
                     let mut color = node_color(layer.color, 1.0, color_chain);
-                    if layer.shadow { color.a = 255; }
+                    if layer.shadow {
+                        color.a = 255;
+                    }
                     let mut paint = Paint::default();
                     paint.set_color(SkColor::from_rgba8(color.r, color.g, color.b, color.a));
                     paint.anti_alias = true;
-                    if layer.shadow { paint.blend_mode = tiny_skia::BlendMode::SourceAtop; }
+                    if layer.shadow {
+                        paint.blend_mode = tiny_skia::BlendMode::SourceAtop;
+                    }
                     if let Some(border_layer) = border_layer.as_mut() {
-                        border_layer.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                        border_layer.fill_path(
+                            &path,
+                            &paint,
+                            FillRule::Winding,
+                            Transform::identity(),
+                            None,
+                        );
                     }
                 }
             }
             if let Some(border_layer) = border_layer {
-                let paint = tiny_skia::PixmapPaint { opacity, ..Default::default() };
-                pixmap.draw_pixmap(origin.0 as i32, origin.1 as i32, border_layer.as_ref(),
-                    &paint, Transform::identity(), clip_mask);
+                let paint = tiny_skia::PixmapPaint {
+                    opacity,
+                    ..Default::default()
+                };
+                pixmap.draw_pixmap(
+                    origin.0 as i32,
+                    origin.1 as i32,
+                    border_layer.as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    clip_mask,
+                );
             }
         } else {
             for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
                 if width > 0.0 && color.a > 0 {
-                    draw_rect(pixmap, edge, node_color(color, opacity, color_chain), 0.0, clip_mask);
+                    draw_rect(
+                        pixmap,
+                        edge,
+                        node_color(color, opacity, color_chain),
+                        0.0,
+                        clip_mask,
+                    );
                 }
             }
         }
@@ -901,6 +956,8 @@ fn render_node(
         ComponentKind::Image { src } => {
             let content_rect = text_content_box(rect, style);
             if let Some(decoded) = crate::image_loader::get_or_load(src) {
+                let viewport = decoded.svg_viewport(content_rect.width, content_rect.height);
+                let decoded = viewport.as_ref().unwrap_or(&decoded);
                 draw_image_pixels(
                     pixmap,
                     content_rect,
@@ -1017,13 +1074,10 @@ fn render_node(
             *stroke_width,
             clip_mask,
         ),
-        ComponentKind::SvgDocument {
-            source,
-            width,
-            height,
-            ..
-        } => {
-            if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
+        ComponentKind::SvgDocument { source, .. } => {
+            let rect = crate::svg_renderer::content_box(rect, style);
+            if let Some(raster) = crate::svg_renderer::get_or_render_inline(
+                source, rect.width.ceil().max(1.0) as u32, rect.height.ceil().max(1.0) as u32) {
                 draw_image_pixels(
                     pixmap,
                     rect,
@@ -1482,7 +1536,11 @@ fn draw_text_in_rect(
         } else {
             ink.left
         };
-        let line_content = if i == 0 { first_line_content } else { continuation_content };
+        let line_content = if i == 0 {
+            first_line_content
+        } else {
+            continuation_content
+        };
         let align = if i + 1 == lines.len() {
             text_align_last(style)
                 .unwrap_or_else(|| single_line_h_align(style, line_content.width, ink.width))

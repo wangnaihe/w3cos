@@ -26,6 +26,7 @@ impl Element {
     }
 
     pub fn set_text_content(&self, doc: &mut Document, text: &str) {
+        doc.preserve_anonymous_table_text_change(self.id, text);
         doc.get_node_mut(self.id).text_content = Some(text.to_string());
         doc.mark_text_dirty(self.id);
     }

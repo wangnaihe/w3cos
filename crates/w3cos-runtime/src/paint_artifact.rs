@@ -7,7 +7,7 @@
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{
-    Display, Overflow, Position, Style, Transform2D, Visibility, WhiteSpace,
+    Display, Overflow, Position, Spacing, Style, Transform2D, Visibility, WhiteSpace,
 };
 
 use crate::layout::LayoutRect;
@@ -24,35 +24,59 @@ pub struct PaintNode {
     pub sticky_counter_signal: Option<usize>,
 }
 
+pub(crate) struct AppliedTextDecoration<'a> {
+    pub style: std::borrow::Cow<'a, Style>,
+    pub baseline_shift: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineLineContext {
     pub line_box: LayoutRect,
     pub first_line_box: LayoutRect,
     pub direction: w3cos_std::style::TextDirection,
     pub text_align: w3cos_std::style::TextAlign,
+    pub line_advance: Option<f32>,
+    #[cfg(feature = "skia")]
+    pub tab_stops: crate::render_skia::TabStops,
 }
 
 impl InlineLineContext {
     pub fn fragment_box(&self, style: &Style, first: bool, last: bool) -> LayoutRect {
-        let line = if first { self.first_line_box } else { self.line_box };
+        let line = if first {
+            self.first_line_box
+        } else {
+            self.line_box
+        };
         let padding = style.padding_lengths();
         let margin = style.margin_lengths();
         let widths = crate::text_layout::inline_fragment_border_widths(style, first, last);
         let rtl = style.direction == w3cos_std::style::TextDirection::Rtl;
         let left = if (first && !rtl) || (last && rtl) {
             margin.left + padding.left + widths[3]
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let right = if (last && !rtl) || (first && rtl) {
             margin.right + padding.right + widths[1]
-        } else { 0.0 };
-        LayoutRect { x: line.x + left, width: (line.width - left - right).max(1.0), ..line }
+        } else {
+            0.0
+        };
+        LayoutRect {
+            x: line.x + left,
+            width: (line.width - left - right).max(1.0),
+            ..line
+        }
     }
 
     pub fn alignment(&self) -> w3cos_std::style::TextAlign {
         use w3cos_std::style::{TextAlign, TextDirection};
         match (self.text_align, self.direction) {
-            (TextAlign::Start, TextDirection::Rtl) | (TextAlign::End, TextDirection::Ltr) => TextAlign::Right,
-            (TextAlign::Start, TextDirection::Ltr) | (TextAlign::End, TextDirection::Rtl) => TextAlign::Left,
+            (TextAlign::Start, TextDirection::Rtl) | (TextAlign::End, TextDirection::Ltr) => {
+                TextAlign::Right
+            }
+            (TextAlign::Start, TextDirection::Ltr) | (TextAlign::End, TextDirection::Rtl) => {
+                TextAlign::Left
+            }
             (align, _) => align,
         }
     }
@@ -144,6 +168,9 @@ pub struct EffectNode {
     pub parent: PropertyNodeId,
     pub opacity: f32,
     pub filter: Option<String>,
+    /// A compositor hint isolates this subtree's raster surface even when
+    /// its opacity is one and its transform is currently the identity.
+    pub isolates_surface: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +178,7 @@ pub struct ScrollNode {
     pub parent: PropertyNodeId,
     pub host_index: Option<usize>,
     pub scrollport: Option<LayoutRect>,
+    pub clip: Option<PropertyNodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,11 +204,13 @@ impl Default for PropertyTrees {
                 parent: 0,
                 opacity: 1.0,
                 filter: None,
+                isolates_surface: false,
             }],
             scrolls: vec![ScrollNode {
                 parent: 0,
                 host_index: None,
                 scrollport: None,
+                clip: None,
             }],
         }
     }
@@ -191,6 +221,18 @@ pub struct DisplayItem {
     pub client_index: usize,
     pub visual_rect: LayoutRect,
     pub chunk_id: PaintChunkId,
+}
+
+/// A physical slice of one logical source box. Vertical clipping slices the
+/// box decoration rather than repeating top/bottom borders at column breaks.
+/// Inline-axis overflow is not clipped to the nominal column width.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnFragment {
+    pub visual_rect: LayoutRect,
+    pub translate_x: f32,
+    pub translate_y: f32,
+    pub clip_top: f32,
+    pub clip_bottom: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,6 +247,10 @@ pub struct PaintChunk {
 #[derive(Clone)]
 pub struct PaintArtifact {
     pub nodes: Vec<PaintNode>,
+    /// Root viewport scroll in CSS pixels; layout and recordings stay in
+    /// document coordinates so scrolling can replay retained pictures.
+    pub viewport_scroll: (f32, f32),
+    pub body_index: Option<usize>,
     pub canvas_background: Color,
     pub canvas_background_style: Option<Style>,
     pub canvas_background_source: Option<usize>,
@@ -221,14 +267,15 @@ pub struct PaintArtifact {
     /// clip. The `clip` property and inline fragment clips do apply to the box
     /// itself, so they appear here as well. Kept beside `node_properties`
     /// rather than inside `PaintProperties` because the latter is the
-    /// compositor's layer identity: an overflow box and its contents must keep
-    /// merging into one layer.
+    /// compositor's layer identity: the overflow box's own paint remains
+    /// stationary while its contents can scroll in a separate layer.
     pub self_clip: Vec<PropertyNodeId>,
     pub z_order: Vec<i32>,
     pub paint_order: Vec<Vec<PaintOrderLevel>>,
     logical_paint_ordinals: Vec<usize>,
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
+    pub column_fragments: Vec<Vec<ColumnFragment>>,
     pub generation: u64,
 }
 
@@ -236,6 +283,8 @@ impl Default for PaintArtifact {
     fn default() -> Self {
         Self {
             nodes: Vec::new(),
+            viewport_scroll: (0.0, 0.0),
+            body_index: None,
             canvas_background: Color::WHITE,
             canvas_background_style: None,
             canvas_background_source: None,
@@ -250,6 +299,7 @@ impl Default for PaintArtifact {
             logical_paint_ordinals: Vec::new(),
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
+            column_fragments: Vec::new(),
             generation: 0,
         }
     }
@@ -257,7 +307,10 @@ impl Default for PaintArtifact {
 
 fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
     let rank = |index: usize| {
-        nodes[index].style.custom_properties.as_ref()
+        nodes[index]
+            .style
+            .custom_properties
+            .as_ref()
             .and_then(|properties| properties.get("--w3cos-internal-bidi-logical-order"))
             .and_then(|value| value.parse::<usize>().ok())
     };
@@ -269,8 +322,11 @@ fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
     // Subtrees remain contiguous; indices and layout stay in visual order.
     let mut children = vec![Vec::new(); nodes.len() + 1];
     for (index, node) in nodes.iter().enumerate() {
-        children[node.parent.filter(|parent| *parent < nodes.len()).unwrap_or(nodes.len())]
-            .push(index);
+        children[node
+            .parent
+            .filter(|parent| *parent < nodes.len())
+            .unwrap_or(nodes.len())]
+        .push(index);
     }
     for siblings in &mut children {
         if siblings.iter().all(|index| rank(*index).is_some()) {
@@ -312,25 +368,18 @@ fn inline_fragment_clip_rect(
             let height = parts.next()?.parse::<f32>().ok()?;
             Some((alignment, height))
         });
-    let (alignment, height) = internal_clip.or_else(|| {
-        if matches!(
-            kind,
-            ComponentKind::Image { .. }
-                | ComponentKind::Canvas { .. }
-                | ComponentKind::SvgDocument { .. }
-        ) {
-            return None;
-        }
-        if style.display != w3cos_std::style::Display::Inline {
-            return None;
-        }
-        let alignment = match style.align_self {
-            w3cos_std::style::AlignSelf::FlexStart => "top",
-            w3cos_std::style::AlignSelf::FlexEnd => "bottom",
-            _ => return None,
-        };
-        Some((alignment, style.font_size * style.line_height))
-    })?;
+    if matches!(
+        kind,
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::SvgDocument { .. }
+    ) {
+        return None;
+    }
+    // Vertical alignment positions an inline box; it does not clip its
+    // background, borders, or overflowing descendants. Only an explicit
+    // fragment boundary from inline splitting creates a paint clip.
+    let (alignment, height) = internal_clip?;
     let height = height.clamp(0.0, rect.height);
     if height >= rect.height {
         return None;
@@ -440,16 +489,24 @@ fn trim_collapsible_inline_whitespace_at_line_start(
     for index in 0..nodes.len() {
         let node = &nodes[index];
         if node.style.display != Display::Inline
-            || matches!(node.style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap)
+            || matches!(
+                node.style.white_space,
+                WhiteSpace::Pre | WhiteSpace::PreWrap
+            )
         {
             continue;
         }
-        let (Some(parent), Some(rect)) = (
-            node.parent,
-            rect_by_index.get(index).copied().flatten(),
-        ) else {
+        let (Some(mut parent), Some(rect)) =
+            (node.parent, rect_by_index.get(index).copied().flatten())
+        else {
             continue;
         };
+        while nodes[parent].style.display == Display::Inline {
+            let Some(ancestor) = nodes[parent].parent else {
+                break;
+            };
+            parent = ancestor;
+        }
         let Some(parent_rect) = rect_by_index.get(parent).copied().flatten() else {
             continue;
         };
@@ -464,12 +521,23 @@ fn trim_collapsible_inline_whitespace_at_line_start(
         if (rect.x - line_start).abs() > 0.01 {
             continue;
         }
-        let ComponentKind::Text { content } = &mut nodes[index].kind else {
+        let node = &mut nodes[index];
+        let ComponentKind::Text { content } = &mut node.kind else {
             continue;
         };
         let trimmed = content.trim_start_matches([' ', '\t', '\n', '\r', '\u{000c}']);
         if trimmed.len() != content.len() {
+            let removed = content.len() - trimmed.len();
+            let ends = w3cos_std::inline_text::fragment_ends(content, &node.style);
             *content = trimmed.to_string();
+            if let Some(ends) = ends {
+                // Anonymous text may contain independently authored DOM or
+                // pseudo-element runs. Rebase their byte boundaries and text
+                // fingerprint when discarding a line-leading separator.
+                let ends = ends.into_iter().filter(|end| *end > removed)
+                    .map(|end| end - removed).collect::<Vec<_>>();
+                w3cos_std::inline_text::set_fragment_ends(&mut node.style, content, &ends);
+            }
         }
     }
 }
@@ -517,9 +585,12 @@ fn annotate_separated_table_background_fragments(
     for source in 0..original_len {
         if !matches!(
             nodes[source].style.display,
-            Display::TableColumnGroup | Display::TableColumn
-                | Display::TableRow | Display::TableRowGroup
-                | Display::TableHeaderGroup | Display::TableFooterGroup
+            Display::TableColumnGroup
+                | Display::TableColumn
+                | Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
         ) || (nodes[source].style.background.a == 0
             && nodes[source].style.background_image.is_none())
         {
@@ -556,9 +627,13 @@ fn annotate_separated_table_background_fragments(
             })
             .map(|(column, _)| column)
             .collect::<std::collections::HashSet<_>>();
-        let row_source = matches!(nodes[source].style.display,
-            Display::TableRow | Display::TableRowGroup
-                | Display::TableHeaderGroup | Display::TableFooterGroup);
+        let row_source = matches!(
+            nodes[source].style.display,
+            Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+        );
         if covered.is_empty() && !row_source {
             continue;
         }
@@ -582,7 +657,8 @@ fn annotate_separated_table_background_fragments(
             let mut column = 0usize;
             for cell in cells {
                 let span = column_span(&nodes[cell].style);
-                if (row_source || (column..column.saturating_add(span)).any(|index| covered.contains(&index)))
+                if (row_source
+                    || (column..column.saturating_add(span)).any(|index| covered.contains(&index)))
                     && let Some(rect) = rect_by_index.get(cell).copied().flatten()
                 {
                     fragments.push(format!(
@@ -674,15 +750,12 @@ fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
                 let covered_columns = collapsed_columns
                     .get(column..column.saturating_add(span))
                     .unwrap_or_default();
-                let any_collapsed = covered_columns.iter().any(|collapsed| *collapsed);
                 let all_collapsed = !covered_columns.is_empty()
                     && covered_columns.iter().all(|collapsed| *collapsed);
                 if all_collapsed {
                     nodes[cell].style.visibility = Visibility::Collapse;
                     nodes[cell].style.overflow_x = Some(Overflow::Hidden);
                     nodes[cell].style.overflow_y = Some(Overflow::Hidden);
-                } else if any_collapsed {
-                    nodes[cell].style.overflow_x = Some(Overflow::Hidden);
                 }
                 column = column.saturating_add(span);
             }
@@ -749,6 +822,34 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
     fn hidden(style: &Style, side: usize) -> bool {
         style.border_styles[side] == Some(w3cos_std::style::BorderLineStyle::Hidden)
     }
+    fn adopt_edge(nodes: &mut [PaintNode], owner: usize, cell: usize, side: usize) {
+        let (width, color) = edge(&nodes[owner].style, side);
+        let line_style = nodes[owner].style.border_styles[side];
+        let current_color = nodes[owner].style.border_current_color
+            .is_some_and(|mask| mask[side]);
+        set_edge(&mut nodes[cell].style, side, width, color);
+        nodes[cell].style.border_styles[side] = line_style;
+        if current_color || nodes[cell].style.border_current_color.is_some() {
+            nodes[cell].style.border_current_color.get_or_insert([false; 4])[side] = current_color;
+        }
+    }
+    fn line_priority(style: &Style, side: usize) -> u8 {
+        use w3cos_std::style::BorderLineStyle;
+        // Compare authored styles before color/owner precedence. Outset's
+        // groove-like painting does not change its conflict priority.
+        match style.border_styles[side].unwrap_or(BorderLineStyle::Solid) {
+            BorderLineStyle::Hidden => 10,
+            BorderLineStyle::Double => 9,
+            BorderLineStyle::Solid => 8,
+            BorderLineStyle::Dashed => 7,
+            BorderLineStyle::Dotted => 6,
+            BorderLineStyle::Ridge => 5,
+            BorderLineStyle::Outset => 4,
+            BorderLineStyle::Groove => 3,
+            BorderLineStyle::Inset => 2,
+            BorderLineStyle::None => 0,
+        }
+    }
     fn hide_edge(style: &mut Style, side: usize) {
         style.border_styles[side] = Some(w3cos_std::style::BorderLineStyle::Hidden);
         set_edge(style, side, 0.0, Color::TRANSPARENT);
@@ -802,12 +903,16 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         .enumerate()
         .rev()
         .filter(|(_, node)| {
-            node.style.border_collapse && matches!(
-                node.style.display,
-                Display::TableRow | Display::TableRowGroup
-                    | Display::TableHeaderGroup | Display::TableFooterGroup
-                    | Display::TableColumn | Display::TableColumnGroup
-            )
+            node.style.border_collapse
+                && matches!(
+                    node.style.display,
+                    Display::TableRow
+                        | Display::TableRowGroup
+                        | Display::TableHeaderGroup
+                        | Display::TableFooterGroup
+                        | Display::TableColumn
+                        | Display::TableColumnGroup
+                )
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -821,17 +926,22 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         _ => 3,
     });
     for part in parts {
-        let column_part = matches!(nodes[part].style.display,
-            Display::TableColumn | Display::TableColumnGroup);
+        let column_part = matches!(
+            nodes[part].style.display,
+            Display::TableColumn | Display::TableColumnGroup
+        );
         let part_rows = if nodes[part].style.display == Display::TableRow {
             vec![part]
         } else {
-            rows.iter().copied()
+            rows.iter()
+                .copied()
                 .filter(|row| {
                     if nearest_table(nodes, *row) != nearest_table(nodes, part) {
                         return false;
                     }
-                    if column_part { return true; }
+                    if column_part {
+                        return true;
+                    }
                     let mut parent = nodes[*row].parent;
                     while let Some(index) = parent {
                         if index == part {
@@ -843,7 +953,9 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                 })
                 .collect()
         };
-        let populated_rows = part_rows.iter().copied()
+        let populated_rows = part_rows
+            .iter()
+            .copied()
             .filter(|row| !row_cells(nodes, *row).is_empty())
             .collect::<Vec<_>>();
         let Some(first) = populated_rows.first().copied() else {
@@ -851,7 +963,10 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         };
         let last = populated_rows.last().copied().unwrap_or(first);
         let mut boundary_cells = [
-            row_cells(nodes, first), Vec::new(), row_cells(nodes, last), Vec::new(),
+            row_cells(nodes, first),
+            Vec::new(),
+            row_cells(nodes, last),
+            Vec::new(),
         ];
         for row in populated_rows {
             let cells = row_cells(nodes, row);
@@ -865,32 +980,45 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         if column_part {
             fn descendant(nodes: &[PaintNode], mut index: usize, ancestor: usize) -> bool {
                 while let Some(parent) = nodes[index].parent {
-                    if parent == ancestor { return true; }
+                    if parent == ancestor {
+                        return true;
+                    }
                     index = parent;
                 }
                 false
             }
             fn span(style: &Style) -> usize {
-                style.custom_properties.as_ref()
+                style
+                    .custom_properties
+                    .as_ref()
                     .and_then(|properties| properties.get("--w3cos-internal-table-column-span"))
                     .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1).clamp(1, 1000)
+                    .unwrap_or(1)
+                    .clamp(1, 1000)
             }
             let mut columns = Vec::new();
             for (index, node) in nodes.iter().enumerate() {
-                if nearest_table(nodes, index) != nearest_table(nodes, part) { continue; }
+                if nearest_table(nodes, index) != nearest_table(nodes, part) {
+                    continue;
+                }
                 let implicit_group = node.style.display == Display::TableColumnGroup
                     && !nodes.iter().enumerate().any(|(child, node)| {
-                        node.style.display == Display::TableColumn && descendant(nodes, child, index)
+                        node.style.display == Display::TableColumn
+                            && descendant(nodes, child, index)
                     });
                 if node.style.display == Display::TableColumn || implicit_group {
                     columns.extend(std::iter::repeat_n(index, span(&node.style)));
                 }
             }
-            let covered = columns.iter().enumerate().filter(|(_, column)| {
-                **column == part || descendant(nodes, **column, part)
-            }).map(|(column, _)| column).collect::<Vec<_>>();
-            let Some(start) = covered.first().copied() else { continue; };
+            let covered = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| **column == part || descendant(nodes, **column, part))
+                .map(|(column, _)| column)
+                .collect::<Vec<_>>();
+            let Some(start) = covered.first().copied() else {
+                continue;
+            };
             let end = covered.last().copied().unwrap_or(start) + 1;
             boundary_cells = std::array::from_fn(|_| Vec::new());
             for row in &part_rows {
@@ -898,11 +1026,19 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                 for cell in row_cells(nodes, *row) {
                     let next = column + span(&nodes[cell].style);
                     if column < end && next > start {
-                        if *row == first { boundary_cells[0].push(cell); }
-                        if *row == last { boundary_cells[2].push(cell); }
+                        if *row == first {
+                            boundary_cells[0].push(cell);
+                        }
+                        if *row == last {
+                            boundary_cells[2].push(cell);
+                        }
                     }
-                    if column == start { boundary_cells[3].push(cell); }
-                    if next == end { boundary_cells[1].push(cell); }
+                    if column == start {
+                        boundary_cells[3].push(cell);
+                    }
+                    if next == end {
+                        boundary_cells[1].push(cell);
+                    }
                     column = next;
                 }
             }
@@ -912,8 +1048,11 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             for cell in &boundary_cells[side] {
                 if hidden(&nodes[part].style, side) || hidden(&nodes[*cell].style, side) {
                     hide_edge(&mut nodes[*cell].style, side);
-                } else if part_edge.0 > edge(&nodes[*cell].style, side).0 {
-                    set_edge(&mut nodes[*cell].style, side, part_edge.0, part_edge.1);
+                } else if part_edge.0 > edge(&nodes[*cell].style, side).0
+                    || (part_edge.0 == edge(&nodes[*cell].style, side).0
+                        && line_priority(&nodes[part].style, side) > line_priority(&nodes[*cell].style, side))
+                {
+                    adopt_edge(nodes, part, *cell, side);
                 }
             }
             if !boundary_cells[side].is_empty() {
@@ -924,18 +1063,34 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         }
     }
 
+    let grid_nodes = nodes.iter().map(|node| (&node.style, node.parent)).collect::<Vec<_>>();
+    let spanning_grids = crate::table_grid::calculate(&grid_nodes).into_iter()
+        .filter(|grid| nodes[grid.table].style.border_collapse
+            && grid.cells.iter().any(|cell| cell.row_span > 1)).collect::<Vec<_>>();
+    let mut occupied_rows = std::collections::HashMap::new();
+    for grid in &spanning_grids {
+        for (row_number, row) in grid.rows.iter().enumerate() {
+            let mut cells = grid.cells.iter().filter(|cell| cell.row <= row_number
+                && row_number < cell.row + cell.row_span).copied().collect::<Vec<_>>();
+            cells.sort_by_key(|cell| cell.column);
+            occupied_rows.insert(*row, cells);
+        }
+    }
+    #[derive(Default)]
+    struct HorizontalVotes { covered: usize, span: usize, won: usize, hidden: usize, width: f32 }
+    let mut horizontal_votes = std::collections::HashMap::<(usize, usize), HorizontalVotes>::new();
     for row in &rows {
-        let cells = row_cells(nodes, *row);
-        for pair in cells.windows(2) {
-            let left = pair[0];
-            let right = pair[1];
+        let pairs = if let Some(cells) = occupied_rows.get(row) {
+            cells.windows(2).filter(|pair| pair[0].column + pair[0].column_span == pair[1].column)
+                .map(|pair| (pair[0].index, pair[1].index, pair[0].row_span, pair[1].row_span))
+                .collect::<Vec<_>>()
+        } else {
+            row_cells(nodes, *row).windows(2).map(|pair| (pair[0], pair[1], 1, 1)).collect()
+        };
+        for (left, right, left_span, right_span) in pairs {
             let left_edge = edge(&nodes[left].style, 1);
             let right_edge = edge(&nodes[right].style, 3);
-            if hidden(&nodes[left].style, 1) || hidden(&nodes[right].style, 3) {
-                hide_edge(&mut nodes[left].style, 1);
-                hide_edge(&mut nodes[right].style, 3);
-                continue;
-            }
+            let hidden_conflict = hidden(&nodes[left].style, 1) || hidden(&nodes[right].style, 3);
             let left_collapsed = nodes[left].style.visibility == Visibility::Collapse;
             let right_collapsed = nodes[right].style.visibility == Visibility::Collapse;
             let left_wins = if left_collapsed != right_collapsed {
@@ -944,16 +1099,35 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                 true
             } else if right_edge.0 > left_edge.0 {
                 false
+            } else if line_priority(&nodes[left].style, 1) != line_priority(&nodes[right].style, 3) {
+                line_priority(&nodes[left].style, 1) > line_priority(&nodes[right].style, 3)
             } else {
                 nodes[*row].style.direction != TextDirection::Rtl
             };
-            if left_wins {
-                set_edge(&mut nodes[left].style, 1, left_edge.0, left_edge.1);
-                suppress_edge(&mut nodes[right].style, 3, left_edge.0);
-            } else {
-                suppress_edge(&mut nodes[left].style, 1, right_edge.0);
-                set_edge(&mut nodes[right].style, 3, right_edge.0, right_edge.1);
+            for (cell, side, span, won, other_width) in [
+                (left, 1, left_span, left_wins, right_edge.0),
+                (right, 3, right_span, !left_wins, left_edge.0),
+            ] {
+                let vote = horizontal_votes.entry((cell, side)).or_default();
+                vote.span = span;
+                vote.covered += 1;
+                vote.won += usize::from(won);
+                vote.hidden += usize::from(hidden_conflict);
+                vote.width = vote.width.max(other_width);
             }
+        }
+    }
+    for ((cell, side), vote) in horizontal_votes {
+        // A neighbor on one row cannot suppress an entire rowspan edge.
+        // Mixed ownership needs per-segment painting, just as for colspan.
+        if vote.covered != vote.span { continue; }
+        if vote.hidden == vote.covered {
+            hide_edge(&mut nodes[cell].style, side);
+        } else if vote.hidden == 0 && vote.won == 0 {
+            suppress_edge(&mut nodes[cell].style, side, vote.width);
+        } else if vote.hidden == 0 && vote.won == vote.covered {
+            let winner = edge(&nodes[cell].style, side);
+            set_edge(&mut nodes[cell].style, side, winner.0, winner.1);
         }
     }
 
@@ -1015,12 +1189,14 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                     continue;
                 }
                 let cell_edge = edge(&nodes[*cell].style, side);
-                let winner = if table_edge.0 > cell_edge.0 {
-                    table_edge
+                if table_edge.0 > cell_edge.0
+                    || (table_edge.0 == cell_edge.0
+                        && line_priority(&nodes[table].style, side) > line_priority(&nodes[*cell].style, side))
+                {
+                    adopt_edge(nodes, table, *cell, side);
                 } else {
-                    cell_edge
-                };
-                set_edge(&mut nodes[*cell].style, side, winner.0, winner.1);
+                    set_edge(&mut nodes[*cell].style, side, cell_edge.0, cell_edge.1);
+                }
             }
             // Boundary cells paint the resolved collapsed edge on the grid.
             // Leaving the table wrapper border active would inset and paint a
@@ -1029,11 +1205,16 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             // its ink. CSS2 takes inline outer edges from the first row;
             // block outer edges use the maximum across the boundary row.
             let used_width = if matches!(side, 1 | 3) {
-                boundary_cells[side].first().map(|cell| edge(&nodes[*cell].style, side).0)
+                boundary_cells[side]
+                    .first()
+                    .map(|cell| edge(&nodes[*cell].style, side).0)
             } else {
-                boundary_cells[side].iter().map(|cell| edge(&nodes[*cell].style, side).0)
+                boundary_cells[side]
+                    .iter()
+                    .map(|cell| edge(&nodes[*cell].style, side).0)
                     .reduce(f32::max)
-            }.unwrap_or(table_edge.0);
+            }
+            .unwrap_or(table_edge.0);
             suppress_edge(&mut nodes[table].style, side, used_width);
         }
     }
@@ -1041,24 +1222,57 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         if nearest_table(nodes, pair[0]) != nearest_table(nodes, pair[1]) {
             continue;
         }
-        let top_cells = row_cells(nodes, pair[0]);
-        let bottom_cells = row_cells(nodes, pair[1]);
-        for (top, bottom) in top_cells.into_iter().zip(bottom_cells) {
+        let ranges = |row| {
+            let mut column = 0usize;
+            row_cells(nodes, row).into_iter().map(|cell| {
+                let span = nodes[cell].style.custom_properties.as_ref()
+                    .and_then(|properties| properties.get("--w3cos-internal-table-column-span"))
+                    .and_then(|span| span.parse::<usize>().ok()).unwrap_or(1).clamp(1, 1000);
+                let start = column;
+                column += span;
+                (cell, start, column)
+            }).collect::<Vec<_>>()
+        };
+        let top_cells = ranges(pair[0]);
+        let bottom_cells = ranges(pair[1]);
+        #[derive(Default)]
+        struct Votes { covered: usize, span: usize, won: usize, hidden: usize, width: f32 }
+        let mut votes = std::collections::HashMap::<(usize, usize), Votes>::new();
+        let (mut top_index, mut bottom_index) = (0, 0);
+        while top_index < top_cells.len() && bottom_index < bottom_cells.len() {
+            let (top, top_start, top_end) = top_cells[top_index];
+            let (bottom, bottom_start, bottom_end) = bottom_cells[bottom_index];
+            let overlap = top_end.min(bottom_end).saturating_sub(top_start.max(bottom_start));
             let top_edge = edge(&nodes[top].style, 2);
             let bottom_edge = edge(&nodes[bottom].style, 0);
-            if hidden(&nodes[top].style, 2) || hidden(&nodes[bottom].style, 0) {
-                hide_edge(&mut nodes[top].style, 2);
-                hide_edge(&mut nodes[bottom].style, 0);
-                continue;
-            }
+            let hidden_conflict = hidden(&nodes[top].style, 2) || hidden(&nodes[bottom].style, 0);
             let top_collapsed = nodes[top].style.visibility == Visibility::Collapse;
             let bottom_collapsed = nodes[bottom].style.visibility == Visibility::Collapse;
-            if (top_collapsed && !bottom_collapsed) || bottom_edge.0 > top_edge.0 {
-                suppress_edge(&mut nodes[top].style, 2, bottom_edge.0);
-                set_edge(&mut nodes[bottom].style, 0, bottom_edge.0, bottom_edge.1);
-            } else {
-                set_edge(&mut nodes[top].style, 2, top_edge.0, top_edge.1);
-                suppress_edge(&mut nodes[bottom].style, 0, top_edge.0);
+            let bottom_wins = (top_collapsed && !bottom_collapsed) || bottom_edge.0 > top_edge.0
+                || (bottom_edge.0 == top_edge.0
+                    && line_priority(&nodes[bottom].style, 0) > line_priority(&nodes[top].style, 2));
+            for (cell, side, span, won, other_width) in [
+                (top, 2, top_end - top_start, !bottom_wins, bottom_edge.0),
+                (bottom, 0, bottom_end - bottom_start, bottom_wins, top_edge.0),
+            ] {
+                let vote = votes.entry((cell, side)).or_default();
+                vote.span = span;
+                vote.covered += overlap;
+                vote.won += if won { overlap } else { 0 };
+                vote.hidden += if hidden_conflict { overlap } else { 0 };
+                vote.width = vote.width.max(other_width);
+            }
+            if top_end <= bottom_end { top_index += 1; }
+            if bottom_end <= top_end { bottom_index += 1; }
+        }
+        for ((cell, side), vote) in votes {
+            // Never suppress an entire spanning edge on the strength of a
+            // single track. Mixed winners require separate ink segments.
+            if vote.covered != vote.span { continue; }
+            if vote.hidden == vote.covered {
+                hide_edge(&mut nodes[cell].style, side);
+            } else if vote.hidden == 0 && vote.won == 0 {
+                suppress_edge(&mut nodes[cell].style, side, vote.width);
             }
         }
     }
@@ -1067,6 +1281,119 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
 const COLLAPSED_BORDER_SUPPRESSED: &str = "--w3cos-internal-collapsed-border-suppressed";
 const COLLAPSED_BORDER_BOTTOM_EXTENSION: &str =
     "--w3cos-internal-collapsed-border-bottom-extension";
+
+const COLLAPSED_BORDER_JOINTS: &str = "--w3cos-internal-collapsed-border-joints";
+
+fn annotate_collapsed_border_joints(nodes: &mut [PaintNode], rects: &[Option<LayoutRect>]) {
+    use std::collections::HashMap;
+    use w3cos_std::style::BorderLineStyle;
+    struct Edge {
+        cell: usize,
+        side: usize,
+        width: f32,
+        priority: u8,
+    }
+    let mut edges = Vec::<Edge>::new();
+    let mut joints = HashMap::<(usize, i64, i64), Vec<(usize, usize)>>::new();
+    let mut lines = HashMap::<(usize, usize, i64), Vec<(i64, i64, usize)>>::new();
+    let mut offsets = HashMap::<usize, [[f32; 2]; 4]>::new();
+    for (cell, node) in nodes.iter().enumerate() {
+        if node.style.display != Display::TableCell || !node.style.border_collapse
+            || node.style.visibility == Visibility::Collapse {
+            continue;
+        }
+        let Some(rect) = rects.get(cell).and_then(|rect| *rect) else { continue };
+        let mut parent = node.parent;
+        let mut table = None;
+        while let Some(index) = parent {
+            if matches!(nodes[index].style.display, Display::Table | Display::InlineTable) {
+                table = Some(index);
+                break;
+            }
+            parent = nodes[index].parent;
+        }
+        let Some(table) = table else { continue };
+        let widths = [node.style.border_top_width, node.style.border_right_width,
+            node.style.border_bottom_width, node.style.border_left_width]
+            .map(|width| width.unwrap_or(node.style.border_width));
+        let endpoints = [
+            [(rect.x, rect.y), (rect.x + rect.width, rect.y)],
+            [(rect.x + rect.width, rect.y), (rect.x + rect.width, rect.y + rect.height)],
+            [(rect.x, rect.y + rect.height), (rect.x + rect.width, rect.y + rect.height)],
+            [(rect.x, rect.y), (rect.x, rect.y + rect.height)],
+        ];
+        for side in 0..4 {
+            if widths[side] <= 0.0 || collapsed_border_suppressed(&node.style, ["top", "right", "bottom", "left"][side]) {
+                continue;
+            }
+            let priority = match node.style.border_styles[side].unwrap_or(BorderLineStyle::Solid) {
+                BorderLineStyle::None | BorderLineStyle::Hidden => continue,
+                BorderLineStyle::Double => 9, BorderLineStyle::Solid => 8,
+                BorderLineStyle::Dashed => 7, BorderLineStyle::Dotted => 6,
+                BorderLineStyle::Ridge => 5, BorderLineStyle::Outset => 4,
+                BorderLineStyle::Groove => 3, BorderLineStyle::Inset => 2,
+            };
+            let edge_index = edges.len();
+            edges.push(Edge { cell, side, width: widths[side], priority });
+            offsets.entry(cell).or_insert([[0.0; 2]; 4]);
+            let points = endpoints[side].map(|(x, y)| ((x * 64.0).round() as i64, (y * 64.0).round() as i64));
+            let (line, start, end) = if side % 2 == 0 {
+                (points[0].1, points[0].0, points[1].0)
+            } else { (points[0].0, points[0].1, points[1].1) };
+            lines.entry((table, side % 2, line)).or_default().push((start, end, edge_index));
+            for (endpoint, (x, y)) in endpoints[side].into_iter().enumerate() {
+                // Layout coordinates are CSS layout units, not snapped paint
+                // pixels. Keep nearby but distinct joints separate.
+                joints.entry((table, (x * 64.0).round() as i64, (y * 64.0).round() as i64))
+                    .or_default().push((edge_index, endpoint));
+            }
+        }
+    }
+    // Include edges passing through T-joints, not just edges ending there.
+    // Row/column indexes and prefix maximum endpoints keep ordinary joints
+    // local rather than scanning every edge in the table.
+    let indexed_lines: HashMap<_, _> = lines.into_iter().map(|(key, mut segments)| {
+        segments.sort_by_key(|segment| segment.0);
+        let mut maximum = i64::MIN;
+        let maxima = segments.iter().map(|segment| {
+            maximum = maximum.max(segment.1);
+            maximum
+        }).collect::<Vec<_>>();
+        (key, (segments, maxima))
+    }).collect();
+    for (&(table, x, y), incident) in &mut joints {
+        for (axis, line, coordinate) in [(0, y, x), (1, x, y)] {
+            let Some((segments, maxima)) = indexed_lines.get(&(table, axis, line)) else { continue };
+            let mut index = segments.partition_point(|segment| segment.0 < coordinate);
+            while index > 0 && maxima[index - 1] > coordinate {
+                index -= 1;
+                let (_, end, edge) = segments[index];
+                if end > coordinate { incident.push((edge, usize::MAX)); }
+            }
+        }
+    }
+    let compare = |a: &Edge, b: &Edge| a.width.total_cmp(&b.width)
+        .then(a.priority.cmp(&b.priority)).then(b.cell.cmp(&a.cell));
+    for incident in joints.values() {
+        let Some((winner, _)) = incident.iter().max_by(|(a, _), (b, _)| compare(&edges[*a], &edges[*b])) else { continue };
+        for &(edge_index, endpoint) in incident {
+            if endpoint == usize::MAX { continue; }
+            let edge = &edges[edge_index];
+            let perpendicular_width = incident.iter()
+                .filter(|(other, _)| edges[*other].side % 2 != edge.side % 2)
+                .map(|(other, _)| edges[*other].width).fold(0.0, f32::max);
+            let wins = !compare(edge, &edges[*winner]).is_lt();
+            let signed_half = if wins { perpendicular_width / 2.0 } else { -perpendicular_width / 2.0 };
+            offsets.get_mut(&edge.cell).unwrap()[edge.side][endpoint] =
+                if endpoint == 0 { -signed_half } else { signed_half };
+        }
+    }
+    for (cell, offsets) in offsets {
+        nodes[cell].style.custom_properties.get_or_insert_with(Default::default)
+            .insert(COLLAPSED_BORDER_JOINTS.into(), offsets.into_iter().flatten()
+                .map(|value| value.to_string()).collect::<Vec<_>>().join(" "));
+    }
+}
 
 fn extend_collapsed_borders_across_empty_rows(
     nodes: &mut [PaintNode],
@@ -1127,12 +1454,21 @@ pub(crate) fn border_edge_paint_rects(
     rect: LayoutRect,
     widths: [f32; 4],
 ) -> [LayoutRect; 4] {
+    let grid = rect;
     let rect = if style.border_collapse && style.display == Display::TableCell {
-        LayoutRect { y: rect.y - widths[0] / 2.0,
-            height: rect.height + widths[0] / 2.0 + widths[2] / 2.0, ..rect }
-    } else { rect };
+        LayoutRect {
+            y: rect.y - widths[0] / 2.0,
+            height: rect.height + widths[0] / 2.0 + widths[2] / 2.0,
+            ..rect
+        }
+    } else {
+        rect
+    };
     if style.border_collapse
-        && matches!(style.display, Display::TableColumn | Display::TableColumnGroup)
+        && matches!(
+            style.display,
+            Display::TableColumn | Display::TableColumnGroup
+        )
     {
         // Column boxes describe grid tracks, not inset border boxes. A
         // collapsed border is centered on the corresponding grid line.
@@ -1172,9 +1508,17 @@ pub(crate) fn border_edge_paint_rects(
     };
     let suppressed = |name: &str| collapsed_border_suppressed(style, name);
     let top = if suppressed("top") { widths[0] } else { 0.0 };
-    let right = if suppressed("right") { widths[1] * (1.0 - cell_inline_half) } else { 0.0 };
+    let right = if suppressed("right") {
+        widths[1] * (1.0 - cell_inline_half)
+    } else {
+        0.0
+    };
     let bottom = if suppressed("bottom") { widths[2] } else { 0.0 };
-    let left = if suppressed("left") { widths[3] * (1.0 - cell_inline_half) } else { 0.0 };
+    let left = if suppressed("left") {
+        widths[3] * (1.0 - cell_inline_half)
+    } else {
+        0.0
+    };
     let bottom_extension = style
         .custom_properties
         .as_ref()
@@ -1182,11 +1526,43 @@ pub(crate) fn border_edge_paint_rects(
         .and_then(|value| value.parse::<f32>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(0.0);
+    if style.border_collapse && style.display == Display::TableCell {
+        let joints = style.custom_properties.as_ref()
+            .and_then(|properties| properties.get(COLLAPSED_BORDER_JOINTS))
+            .and_then(|value| value.split_ascii_whitespace().map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>().ok())
+            .filter(|values| values.len() == 8 && values.iter().all(|value| value.is_finite()));
+        if let Some(joints) = joints {
+            return [
+                LayoutRect { x: grid.x + joints[0], y: grid.y - widths[0] / 2.0,
+                    width: (grid.width + joints[1] - joints[0]).max(0.0), height: widths[0] },
+                LayoutRect { x: grid.x + grid.width - widths[1] / 2.0, y: grid.y + joints[2],
+                    width: widths[1], height: (grid.height + joints[3] - joints[2]).max(0.0) },
+                LayoutRect { x: grid.x + joints[4], y: grid.y + grid.height - widths[2] / 2.0,
+                    width: (grid.width + joints[5] - joints[4]).max(0.0), height: widths[2] + bottom_extension },
+                LayoutRect { x: grid.x - widths[3] / 2.0, y: grid.y + joints[6],
+                    width: widths[3], height: (grid.height + joints[7] - joints[6]).max(0.0) },
+            ];
+        }
+    }
+    let horizontal_insets = |width: f32| {
+        // A wider collapsed inline edge owns the junction, including its
+        // inner half. Horizontal ink must not paint over that winning edge.
+        let wider_left = if cell_inline_half > 0.0 && widths[3] > width {
+            widths[3] * cell_inline_half
+        } else { 0.0 };
+        let wider_right = if cell_inline_half > 0.0 && widths[1] > width {
+            widths[1] * cell_inline_half
+        } else { 0.0 };
+        (left.max(wider_left), right.max(wider_right))
+    };
+    let (top_left, top_right) = horizontal_insets(widths[0]);
+    let (bottom_left, bottom_right) = horizontal_insets(widths[2]);
     [
         LayoutRect {
-            x: rect.x + left,
+            x: rect.x + top_left,
             y: rect.y,
-            width: (rect.width - left - right).max(0.0),
+            width: (rect.width - top_left - top_right).max(0.0),
             height: widths[0],
         },
         LayoutRect {
@@ -1196,9 +1572,9 @@ pub(crate) fn border_edge_paint_rects(
             height: (rect.height - top - bottom).max(0.0),
         },
         LayoutRect {
-            x: rect.x + left,
+            x: rect.x + bottom_left,
             y: rect.y + rect.height - widths[2],
-            width: (rect.width - left - right).max(0.0),
+            width: (rect.width - bottom_left - bottom_right).max(0.0),
             height: widths[2] + bottom_extension,
         },
         LayoutRect {
@@ -1211,9 +1587,15 @@ pub(crate) fn border_edge_paint_rects(
 }
 
 pub(crate) fn paint_inline_border_widths(style: &Style) -> (f32, f32) {
-    let scale = if style.border_collapse && style.display == Display::TableCell { 0.5 } else { 1.0 };
-    (style.border_left_width.unwrap_or(style.border_width) * scale,
-        style.border_right_width.unwrap_or(style.border_width) * scale)
+    let scale = if style.border_collapse && style.display == Display::TableCell {
+        0.5
+    } else {
+        1.0
+    };
+    (
+        style.border_left_width.unwrap_or(style.border_width) * scale,
+        style.border_right_width.unwrap_or(style.border_width) * scale,
+    )
 }
 
 fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
@@ -1228,23 +1610,14 @@ fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
 /// the internal table boxes that are not block containers therefore never clip
 /// their overflowing content, however `overflow: hidden` is authored.
 fn establishes_overflow_clip(display: Display) -> bool {
-    !matches!(
-        display,
-        Display::Inline
-            | Display::TableRow
-            | Display::TableRowGroup
-            | Display::TableHeaderGroup
-            | Display::TableFooterGroup
-            | Display::TableColumn
-            | Display::TableColumnGroup
-    )
+    display.establishes_overflow_clip()
 }
 
 /// The overflow clipping region is the element's padding box (CSS 2.1 11.1.1),
 /// so the border widths come off the border box. A collapsed-border box owns
 /// only half of each shared edge, the same convention as
 /// `paint_inline_border_widths` and `box_background_positioning_rect`.
-fn overflow_clip_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
+pub(crate) fn overflow_clip_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
     let scale = if style.border_collapse
         && matches!(
             style.display,
@@ -1375,16 +1748,26 @@ fn annotate_table_caption_paint_insets(
     rect_by_index: &[Option<LayoutRect>],
 ) {
     let mut insets = vec![(0.0_f32, 0.0_f32); nodes.len()];
+    let mut has_top_caption = vec![false; nodes.len()];
     let mut grid_widths = vec![None::<f32>; nodes.len()];
+    let mut grid_tops = vec![None::<f32>; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
-        if matches!(node.style.display, Display::TableRow | Display::TableRowGroup
-            | Display::TableHeaderGroup | Display::TableFooterGroup)
-            && !matches!(node.style.position, Position::Absolute | Position::Fixed)
+        if matches!(
+            node.style.display,
+            Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+        ) && !matches!(node.style.position, Position::Absolute | Position::Fixed)
             && let Some(parent) = node.parent
-            && matches!(nodes[parent].style.display, Display::Table | Display::InlineTable)
+            && matches!(
+                nodes[parent].style.display,
+                Display::Table | Display::InlineTable
+            )
             && let Some(rect) = rect_by_index.get(index).copied().flatten()
         {
             grid_widths[parent] = Some(grid_widths[parent].unwrap_or(0.0).max(rect.width));
+            grid_tops[parent] = Some(grid_tops[parent].unwrap_or(rect.y).min(rect.y));
         }
         if node.style.display != Display::TableCaption {
             continue;
@@ -1406,19 +1789,38 @@ fn annotate_table_caption_paint_insets(
         if node.style.caption_side_bottom {
             insets[parent].1 += height;
         } else {
+            has_top_caption[parent] = true;
             insets[parent].0 += height;
         }
     }
-    for (index, (top, bottom)) in insets.into_iter().enumerate() {
+    for (index, (caption_top, bottom)) in insets.into_iter().enumerate() {
+        let style = &nodes[index].style;
+        let top = if has_top_caption[index] {
+            grid_tops[index]
+                .zip(rect_by_index.get(index).copied().flatten())
+                .map(|(row_top, table_rect)| {
+                    let border_top = style.border_top_width.unwrap_or(style.border_width);
+                    let before_row = if style.border_collapse {
+                        border_top * 0.5
+                    } else {
+                        border_top + style.padding_lengths().top + style.border_spacing_y
+                    };
+                    (row_top - table_rect.y - before_row).max(0.0)
+                })
+                .unwrap_or(caption_top)
+        } else {
+            caption_top
+        };
         if top <= 0.0 && bottom <= 0.0 {
             continue;
         }
-        let style = &nodes[index].style;
         let right = if !style.border_collapse {
-            grid_widths[index].zip(rect_by_index.get(index).copied().flatten())
+            grid_widths[index]
+                .zip(rect_by_index.get(index).copied().flatten())
                 .map_or(0.0, |(grid_width, rect)| {
                     let padding = style.padding_lengths();
-                    let edges = padding.left + padding.right
+                    let edges = padding.left
+                        + padding.right
                         + style.border_left_width.unwrap_or(style.border_width)
                         + style.border_right_width.unwrap_or(style.border_width)
                         + 2.0 * style.border_spacing_x;
@@ -1426,22 +1828,94 @@ fn annotate_table_caption_paint_insets(
                     // paints only the grid and its own edges.
                     (rect.width - grid_width - edges).max(0.0)
                 })
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         nodes[index]
             .style
             .custom_properties
             .get_or_insert_with(Default::default)
-            .insert(TABLE_CAPTION_INSETS.to_string(), format!("{top} {bottom} {right}"));
+            .insert(
+                TABLE_CAPTION_INSETS.to_string(),
+                format!("{top} {bottom} {right}"),
+            );
     }
 }
 
 impl PaintArtifact {
+    /// Applied decoration belongs to the originating box, not the child's
+    /// computed property. Atomic inline and out-of-flow boxes isolate their
+    /// contents, but an isolating box's own decoration still reaches them.
+    pub(crate) fn ancestor_text_decorations(&self, index: usize) -> Vec<AppliedTextDecoration<'_>> {
+        use w3cos_std::style::{Float, TextDecoration};
+        let isolates = |style: &Style| {
+            matches!(style.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+                || style.float != Float::None
+                || matches!(style.position, Position::Absolute | Position::Fixed)
+        };
+        let Some(source) = self.nodes.get(index) else { return Vec::new(); };
+        if !matches!(source.kind, ComponentKind::Text { .. }) || isolates(&source.style) {
+            return Vec::new();
+        }
+        let anonymous = source.style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.get(w3cos_std::inline_text::SOURCE_RUN).is_some_and(|source| source.starts_with("text:") || source.starts_with("pseudo:"))
+        });
+        let baseline_offset = |style: &Style| style.custom_properties.as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-vertical-align-length"))
+            .and_then(|value| value.split_ascii_whitespace().next())
+            .and_then(|value| value.parse::<f32>().ok()).unwrap_or(0.0);
+        let mut baseline_shift = baseline_offset(&source.style);
+        let mut parent = source.parent;
+        let mut owners = w3cos_std::inline_text::decoration_owners(&source.style)
+            .into_iter().rev().map(|style| AppliedTextDecoration {
+                style: std::borrow::Cow::Owned(style), baseline_shift: 0.0,
+            }).collect::<Vec<_>>();
+        while let Some(owner) = parent {
+            let node = &self.nodes[owner];
+            // The immediate anonymous text already paints its parent's used
+            // decoration. Do not paint the same line twice at fractional edges.
+            let represented_locally = anonymous && source.parent == Some(owner)
+                && source.style.text_decoration == node.style.text_decoration
+                && source.style.color == node.style.color
+                && source.style.font_size == node.style.font_size
+                && source.style.font_family == node.style.font_family
+                && source.style.font_weight == node.style.font_weight
+                && source.style.font_style == node.style.font_style
+                && source.style.font_variant == node.style.font_variant;
+            if node.style.text_decoration != TextDecoration::None
+                && node.style.display != Display::Contents && !represented_locally
+            {
+                owners.push(AppliedTextDecoration {
+                    style: std::borrow::Cow::Borrowed(&node.style), baseline_shift });
+            }
+            if isolates(&node.style) { break; }
+            owners.extend(w3cos_std::inline_text::decoration_owners(&node.style)
+                .into_iter().rev().map(|style| AppliedTextDecoration {
+                    style: std::borrow::Cow::Owned(style), baseline_shift,
+                }));
+            baseline_shift += baseline_offset(&node.style);
+            parent = node.parent;
+        }
+        owners.reverse();
+        owners
+    }
+
     /// The paragraph's available line geometry is distinct from the inline
     /// owner's intrinsic decoration box and its own bidi direction.
     pub(crate) fn inline_line_context(&self, index: usize) -> Option<InlineLineContext> {
         let node = self.nodes.get(index)?;
-        let ComponentKind::Text { content } = &node.kind else { return None; };
-        if node.style.display != Display::Inline || !content.contains('\u{2028}') { return None; }
+        let ComponentKind::Text { content } = &node.kind else {
+            return None;
+        };
+        let has_preserved_break = content.contains('\u{2028}')
+            || (matches!(
+                node.style.white_space,
+                WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+            ) && content.contains(['\n', '\r']));
+        let has_preserved_tab = node.style.white_space == WhiteSpace::Pre && content.contains('\t');
+        if node.style.display != Display::Inline || !(has_preserved_break || has_preserved_tab) {
+            return None;
+        }
         let mut owner = index;
         let mut parent = node.parent?;
         loop {
@@ -1451,39 +1925,100 @@ impl PaintArtifact {
                 parent = ancestor.parent?;
                 continue;
             }
-            let anonymous = ancestor.style.custom_properties.as_ref().is_some_and(|properties|
-                properties.contains_key("--w3cos-internal-inline-formatting-context"));
-            if !anonymous && !matches!(ancestor.style.display,
-                Display::Block | Display::FlowRoot | Display::ListItem | Display::TableCell | Display::InlineBlock)
-            { return None; }
+            let anonymous = ancestor
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                });
+            if !anonymous
+                && !matches!(
+                    ancestor.style.display,
+                    Display::Block
+                        | Display::FlowRoot
+                        | Display::ListItem
+                        | Display::TableCell
+                        | Display::InlineBlock
+                )
+            {
+                return None;
+            }
             let rect = self.rect_by_index.get(parent).copied().flatten()?;
             let padding = ancestor.style.padding_lengths();
-            let left = ancestor.style.border_left_width.unwrap_or(ancestor.style.border_width) + padding.left;
-            let right = ancestor.style.border_right_width.unwrap_or(ancestor.style.border_width) + padding.right;
-            let line_box = LayoutRect { x: rect.x + left, width: (rect.width - left - right).max(1.0), ..rect };
+            let left = ancestor
+                .style
+                .border_left_width
+                .unwrap_or(ancestor.style.border_width)
+                + padding.left;
+            let right = ancestor
+                .style
+                .border_right_width
+                .unwrap_or(ancestor.style.border_width)
+                + padding.right;
+            let line_box = LayoutRect {
+                x: rect.x + left,
+                width: (rect.width - left - right).max(1.0),
+                ..rect
+            };
             let mut first_line_box = line_box;
-            if let Some((previous_index, previous)) = self.nodes[..owner].iter().enumerate().rev()
-                .find(|(_, previous)| previous.parent == Some(parent)
-                    && previous.style.display != Display::None
-                    && previous.style.float == w3cos_std::style::Float::None
-                    && !matches!(previous.style.position, Position::Absolute | Position::Fixed))
-                && matches!(previous.style.display, Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+            if let Some((previous_index, previous)) = self.nodes[..owner]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, previous)| {
+                    previous.parent == Some(parent)
+                        && previous.style.display != Display::None
+                        && previous.style.float == w3cos_std::style::Float::None
+                        && !matches!(
+                            previous.style.position,
+                            Position::Absolute | Position::Fixed
+                        )
+                })
+                && matches!(
+                    previous.style.display,
+                    Display::Inline
+                        | Display::InlineBlock
+                        | Display::InlineFlex
+                        | Display::InlineTable
+                )
                 && !matches!(&previous.kind, ComponentKind::Text { content } if content == "\u{2028}")
-                && let Some(previous_rect) = self.rect_by_index.get(previous_index).copied().flatten()
+                && let Some(previous_rect) =
+                    self.rect_by_index.get(previous_index).copied().flatten()
+                && !self.rect_by_index.get(index).copied().flatten().is_some_and(|current| {
+                    // A multiline fragment can have a union x at the line
+                    // start even when its first line continues a sibling.
+                    // Reset only when both axes prove a later, rewound line.
+                    ancestor.style.direction == w3cos_std::style::TextDirection::Ltr
+                        && current.x + 0.01 < previous_rect.x + previous_rect.width
+                        && current.y >= previous_rect.y + previous_rect.height - 0.01
+                })
             {
                 let margin = previous.style.margin_lengths();
                 match ancestor.style.direction {
                     w3cos_std::style::TextDirection::Ltr => {
-                        first_line_box.x = (previous_rect.x + previous_rect.width + margin.right).max(line_box.x);
-                        first_line_box.width = (line_box.x + line_box.width - first_line_box.x).max(1.0);
+                        first_line_box.x =
+                            (previous_rect.x + previous_rect.width + margin.right).max(line_box.x);
+                        first_line_box.width =
+                            (line_box.x + line_box.width - first_line_box.x).max(1.0);
                     }
                     w3cos_std::style::TextDirection::Rtl => {
-                        first_line_box.width = (previous_rect.x - margin.left - line_box.x).max(1.0);
+                        first_line_box.width =
+                            (previous_rect.x - margin.left - line_box.x).max(1.0);
                     }
                 }
             }
-            return Some(InlineLineContext { line_box, first_line_box,
-                direction: ancestor.style.direction, text_align: ancestor.style.text_align });
+            return Some(InlineLineContext {
+                line_box,
+                first_line_box,
+                direction: ancestor.style.direction,
+                text_align: ancestor.style.text_align,
+                line_advance: Some(crate::inline_line_metrics::baseline_text_metrics(
+                    &ancestor.style, &node.style,
+                ).0),
+                #[cfg(feature = "skia")]
+                tab_stops: crate::render_skia::tab_stops_for_style(&ancestor.style),
+            });
         }
     }
 
@@ -1527,10 +2062,16 @@ impl PaintArtifact {
             cursor = node.parent;
         }
         self.nodes.get(index).map_or(0, |node| {
-            u8::from(matches!(
-                node.style.display,
-                Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
-            )) * 2
+            u8::from(
+                unadorned_block_text(node)
+                    || matches!(
+                        node.style.display,
+                        Display::Inline
+                            | Display::InlineBlock
+                            | Display::InlineFlex
+                            | Display::InlineTable
+                    ),
+            ) * 2
         })
     }
 
@@ -1542,13 +2083,43 @@ impl PaintArtifact {
         Self::build_with_body_background(nodes, layout_cache, generation, None)
     }
 
+    /// Fixed boxes and their descendants are attached to the viewport rather
+    /// than the scrolling document. This mirrors layout's fixed-box owner.
+    pub(crate) fn viewport_attached(&self, index: usize) -> bool {
+        let mut current = Some(index);
+        while let Some(index) = current {
+            let Some(node) = self.nodes.get(index) else {
+                break;
+            };
+            if node.style.position == Position::Fixed {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    pub(crate) fn viewport_scroll_for(&self, index: usize) -> (f32, f32) {
+        if self.viewport_attached(index) {
+            (0.0, 0.0)
+        } else {
+            self.viewport_scroll
+        }
+    }
+
     pub fn build_with_body_background(
         nodes: impl IntoIterator<Item = PaintNode>,
         layout_cache: &[(LayoutRect, usize)],
         generation: u64,
         body_index: Option<usize>,
     ) -> Self {
-        Self::build_with_body_background_and_viewport(nodes, layout_cache, generation, body_index, None)
+        Self::build_with_body_background_and_viewport(
+            nodes,
+            layout_cache,
+            generation,
+            body_index,
+            None,
+        )
     }
 
     pub(crate) fn build_with_body_background_and_viewport(
@@ -1559,7 +2130,19 @@ impl PaintArtifact {
         viewport: Option<(f32, f32)>,
     ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
-        for node in &mut nodes { node.style.resolve_used_border_widths(); }
+        let mut has_percentage_padding = false;
+        for node in &mut nodes {
+            crate::background_image::annotate_fixed_background_viewport(&mut node.style, viewport);
+            node.style.resolve_used_border_widths();
+            has_percentage_padding |= [
+                node.style.padding.top,
+                node.style.padding.right,
+                node.style.padding.bottom,
+                node.style.padding.left,
+            ]
+            .into_iter()
+            .any(|edge| matches!(edge, Spacing::Percent(_)));
+        }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
                 value
@@ -1575,15 +2158,57 @@ impl PaintArtifact {
                 body_index.filter(|index| {
                     *index != 0
                         && nodes.get(*index).is_some_and(|node| {
-                            node.parent == Some(0)
-                                && (node.style.background.a > 0
-                                    || has_background_image(&node.style))
+                            node.style.display != Display::None
+                                && (node.style.background.a > 0 || has_background_image(&node.style))
                         })
                 })
-            });
+            })
+            // A display:none document element has no box to paint on the
+            // canvas. Its suppressed body cannot supply a fallback either.
+            .filter(|_| nodes[0].style.display != Display::None);
         let root_rect = layout_cache
             .iter()
             .find_map(|(rect, index)| (*index == 0).then_some(*rect));
+        if has_percentage_padding {
+            let mut rects = vec![None; nodes.len()];
+            for (rect, index) in layout_cache {
+                if let Some(slot) = rects.get_mut(*index) {
+                    *slot = Some(*rect);
+                }
+            }
+            let root_basis =
+                viewport.map_or_else(|| root_rect.map_or(0.0, |rect| rect.width), |size| size.0);
+            let mut child_bases = vec![root_basis; nodes.len()];
+            for index in 0..nodes.len() {
+                let basis = nodes[index]
+                    .parent
+                    .map_or(root_basis, |parent| child_bases[parent]);
+                let style = &mut nodes[index].style;
+                for edge in [
+                    &mut style.padding.top,
+                    &mut style.padding.right,
+                    &mut style.padding.bottom,
+                    &mut style.padding.left,
+                ] {
+                    if let Spacing::Percent(percent) = *edge {
+                        *edge = Spacing::Px(basis * percent / 100.0);
+                    }
+                }
+                child_bases[index] = if matches!(style.display, Display::Inline | Display::Contents)
+                {
+                    basis
+                } else {
+                    let padding = style.padding_lengths();
+                    let borders = style.border_left_width.unwrap_or(style.border_width)
+                        + style.border_right_width.unwrap_or(style.border_width);
+                    (rects[index].map_or(basis, |rect| rect.width)
+                        - padding.left
+                        - padding.right
+                        - borders)
+                        .max(0.0)
+                };
+            }
+        }
         let root_style = &nodes[0].style;
         let root_borders = (
             root_style
@@ -1667,14 +2292,30 @@ impl PaintArtifact {
             }
         }
         if let Some((width, height)) = viewport {
-            let refs: Vec<_> = nodes.iter().map(|node|
-                (&node.kind, &node.style, node.parent)).collect();
-            let flows = crate::layout::resolve_float_text_layouts(&refs, &rect_by_index, width, height);
+            let refs: Vec<_> = nodes
+                .iter()
+                .map(|node| (&node.kind, &node.style, node.parent))
+                .collect();
+            let flows =
+                crate::layout::resolve_float_text_layouts(&refs, &rect_by_index, width, height);
             for flow in flows {
-                let encoded = flow.bands.iter().map(|band| format!("{} {} {}",
-                    band.x - flow.content.x, band.y - flow.content.y, band.width))
-                    .collect::<Vec<_>>().join(";");
-                nodes[flow.text_index].style.custom_properties.get_or_insert_with(Default::default)
+                let encoded = flow
+                    .bands
+                    .iter()
+                    .map(|band| {
+                        format!(
+                            "{} {} {}",
+                            band.x - flow.content.x,
+                            band.y - flow.content.y,
+                            band.width
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                nodes[flow.text_index]
+                    .style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
                     .insert("--w3cos-internal-float-line-bands".into(), encoded);
             }
         }
@@ -1683,10 +2324,12 @@ impl PaintArtifact {
         suppress_hidden_empty_cell_paint(&mut nodes);
         project_collapsed_table_tracks_to_cells(&mut nodes);
         resolve_collapsed_cell_border_conflicts(&mut nodes);
+        annotate_collapsed_border_joints(&mut nodes, &rect_by_index);
         extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
         annotate_separated_table_background_fragments(&mut nodes, &rect_by_index);
         let mut artifact = Self {
             logical_paint_ordinals: logical_paint_ordinals(&nodes),
+            body_index,
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
             self_clip: vec![0; nodes.len()],
@@ -1703,10 +2346,70 @@ impl PaintArtifact {
         };
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
 
+        if artifact.nodes.iter().any(|node| {
+            node.style.column_count.is_some()
+                || !matches!(node.style.column_width, w3cos_std::style::Dimension::Auto)
+        }) {
+            let column_nodes: Vec<_> = artifact.nodes.iter()
+                .map(|node| (&node.style, node.parent)).collect();
+            let fragment_heights = crate::layout::resolve_column_fragment_heights(
+                &column_nodes, &artifact.rect_by_index, viewport);
+            artifact.column_fragments = (0..artifact.nodes.len())
+                .map(|index| artifact.build_column_fragments(index, viewport, &fragment_heights))
+                .collect();
+        }
+
         for index in 0..artifact.nodes.len() {
             artifact.append_node(index);
         }
         artifact
+    }
+
+    fn build_column_fragments(&self, index: usize, viewport: Option<(f32, f32)>, fragment_heights: &[Option<f32>]) -> Vec<ColumnFragment> {
+        use w3cos_std::style::TextDirection;
+        let Some(rect) = self.rect_by_index[index] else { return Vec::new(); };
+        if rect.height <= 0.0 || !rect.height.is_finite() { return Vec::new(); }
+        let mut ancestor = self.nodes[index].parent;
+        if matches!(self.nodes[index].style.position, Position::Absolute | Position::Fixed) {
+            return Vec::new();
+        }
+        while let Some(owner) = ancestor {
+            let style = &self.nodes[owner].style;
+            let Some(principal) = self.rect_by_index[owner] else { return Vec::new(); };
+            let padding = style.padding_lengths();
+            let left = style.border_left_width.unwrap_or(style.border_width) + padding.left;
+            let right = style.border_right_width.unwrap_or(style.border_width) + padding.right;
+            let top = style.border_top_width.unwrap_or(style.border_width) + padding.top;
+            let content_width = (principal.width - left - right).max(0.0);
+            let (vw, vh) = viewport.unwrap_or((principal.width, principal.height));
+            if let Some(column_width) = crate::layout::used_column_width(style, content_width, vw, vh) {
+                let Some(height) = fragment_heights[owner] else { return Vec::new(); };
+                if !height.is_finite() || height <= 0.0 { return Vec::new(); }
+                let gap = style.column_gap.unwrap_or(style.font_size).max(0.0);
+                let stride = column_width + gap;
+                let origin_y = principal.y + top;
+                let first = ((rect.y - origin_y) / height).floor().max(0.0) as usize;
+                let last = ((rect.y + rect.height - origin_y) / height).ceil().max(1.0) as usize;
+                let rtl = style.direction == TextDirection::Rtl;
+                let first_offset = if rtl { content_width - column_width } else { 0.0 };
+                return (first..last).filter_map(|column| {
+                    let band_top = origin_y + column as f32 * height;
+                    let start = rect.y.max(band_top);
+                    let end = (rect.y + rect.height).min(band_top + height);
+                    if end <= start { return None; }
+                    let translate_x = first_offset + column as f32 * stride * if rtl { -1.0 } else { 1.0 };
+                    let translate_y = -(column as f32 * height);
+                    Some(ColumnFragment {
+                        visual_rect: LayoutRect { x: rect.x + translate_x, y: start + translate_y,
+                            width: rect.width, height: end - start },
+                        translate_x, translate_y, clip_top: origin_y, clip_bottom: origin_y + height,
+                    })
+                }).collect();
+            }
+            if matches!(style.position, Position::Absolute | Position::Fixed) { break; }
+            ancestor = self.nodes[owner].parent;
+        }
+        Vec::new()
     }
 
     fn append_node(&mut self, index: usize) {
@@ -1715,6 +2418,19 @@ impl PaintArtifact {
             .parent
             .and_then(|parent| self.node_properties.get(parent).copied())
             .unwrap_or_default();
+        if node.style.display == Display::TableCaption
+            && let Some(parent) = node.parent
+            && matches!(
+                self.nodes[parent].style.display,
+                Display::Table | Display::InlineTable
+            )
+            && matches!(
+                self.nodes[parent].style.resolved_overflow_x(),
+                Overflow::Hidden
+            )
+        {
+            inherited.clip = self.self_clip[parent];
+        }
         if matches!(node.style.position, Position::Absolute | Position::Fixed) {
             // Overflow clips between an out-of-flow box and its containing
             // block do not clip that box. Inherit the clip chain from the
@@ -1734,13 +2450,15 @@ impl PaintArtifact {
                 }
                 owner
             };
-            inherited.clip = positioned_ancestor
-                .and_then(|owner| {
-                    self.node_properties
-                        .get(owner)
-                        .map(|properties| properties.clip)
-                })
+            let containing_properties = positioned_ancestor
+                .and_then(|owner| self.node_properties.get(owner))
+                .copied()
                 .unwrap_or_default();
+            inherited.clip = containing_properties.clip;
+            // An out-of-flow box escapes intermediate overflow scrollports
+            // together with their clips. Keep both property chains rooted at
+            // its actual positioned containing block.
+            inherited.scroll = containing_properties.scroll;
         }
         let inherited_z = node
             .parent
@@ -1813,6 +2531,7 @@ impl PaintArtifact {
         // parent's border either. The `clip` property and the inline fragment
         // clip below do apply to the box itself, so each refreshes this value.
         let mut self_clip = properties.clip;
+        let mut overflow_clip = None;
         if establishes_overflow_clip(node.style.display)
             && (matches!(
                 overflow_x,
@@ -1823,6 +2542,7 @@ impl PaintArtifact {
             ))
         {
             properties.clip = self.properties.clips.len();
+            overflow_clip = Some(properties.clip);
             self.properties.clips.push(ClipNode {
                 parent: inherited.clip,
                 // The clipping region is the padding box, not the border box
@@ -1830,7 +2550,9 @@ impl PaintArtifact {
                 // exactly its own width of overflowing content show through:
                 // `css/CSS2/ui/overflow-applies-to-009.xht` leaks the 5 px of
                 // `border: 5px solid transparent`, and a 20 px border leaks 20.
-                rect: self.rect_by_index[index].map(|rect| overflow_clip_rect(&node.style, rect)),
+                rect: self.rect_by_index[index].map(|rect| {
+                    overflow_clip_rect(&node.style, table_grid_paint_rect(&node.style, rect))
+                }),
             });
         }
         if let Some(rect) = self.rect_by_index[index]
@@ -1855,22 +2577,34 @@ impl PaintArtifact {
             });
             self_clip = properties.clip;
         }
-        if node.style.opacity < 0.999 || node.style.filter.is_some() {
+        if node.style.opacity < 0.999 || node.style.filter.is_some()
+            || node.style.will_change.promotes_layer() {
             properties.effect = self.properties.effects.len();
             self.properties.effects.push(EffectNode {
                 parent: inherited.effect,
                 opacity: node.style.opacity,
                 filter: node.style.filter.clone(),
+                isolates_surface: node.style.will_change.promotes_layer(),
             });
         }
-        if matches!(overflow_x, Overflow::Scroll | Overflow::Auto)
-            || matches!(overflow_y, Overflow::Scroll | Overflow::Auto)
+        let self_scroll = properties.scroll;
+        // `overflow: hidden` is also a scroll container: it has no user
+        // scrollbar, but CSSOM may move its scroll offset programmatically.
+        if establishes_overflow_clip(node.style.display)
+            && (matches!(
+                overflow_x,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            ) || matches!(
+                overflow_y,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            ))
         {
             properties.scroll = self.properties.scrolls.len();
             self.properties.scrolls.push(ScrollNode {
                 parent: inherited.scroll,
                 host_index: Some(index),
                 scrollport: self.rect_by_index[index],
+                clip: overflow_clip,
             });
         }
         self.node_properties[index] = properties;
@@ -1885,24 +2619,27 @@ impl PaintArtifact {
         };
         let bounds = if node.style.border_collapse && node.style.display == Display::TableCell {
             let (left, right) = paint_inline_border_widths(&node.style);
-            LayoutRect { x: bounds.x - left, width: bounds.width + left + right, ..bounds }
+            LayoutRect {
+                x: bounds.x - left,
+                width: bounds.width + left + right,
+                ..bounds
+            }
         } else {
             bounds
         };
-        let item_index = self.display_items.len();
-        let chunk_id = self.chunks.len();
-        self.display_items.push(DisplayItem {
-            client_index: index,
-            visual_rect: bounds,
-            chunk_id,
-        });
-        self.chunks.push(PaintChunk {
-            begin: item_index,
-            end: item_index + 1,
-            bounds,
-            properties,
-            z_order: self.z_order[index],
-        });
+        let fragments = self.column_fragments.get(index).map(Vec::as_slice).unwrap_or(&[]);
+        let physical_bounds = fragments.iter()
+            .map(|fragment| fragment.visual_rect)
+            .chain(fragments.is_empty().then_some(bounds));
+        for bounds in physical_bounds {
+            let item_index = self.display_items.len();
+            let chunk_id = self.chunks.len();
+            self.display_items.push(DisplayItem { client_index: index, visual_rect: bounds, chunk_id });
+            self.chunks.push(PaintChunk { begin: item_index, end: item_index + 1, bounds,
+                properties: PaintProperties { scroll: self_scroll, ..properties },
+                z_order: self.z_order[index],
+            });
+        }
     }
 
     fn hierarchical_paint_order(&self, index: usize) -> Vec<PaintOrderLevel> {
@@ -1939,7 +2676,8 @@ impl PaintArtifact {
 
     fn paint_context_prefix(&self, index: usize) -> Option<Vec<PaintOrderLevel>> {
         let node = self.nodes.get(index)?;
-        if node.parent.is_none() || establishes_stacking_context(node) || is_positioned(&node.style) {
+        if node.parent.is_none() || establishes_stacking_context(node) || is_positioned(&node.style)
+        {
             let mut key = self.paint_order.get(index)?.clone();
             if establishes_stacking_context(node) || is_positioned(&node.style) {
                 key.pop();
@@ -1952,7 +2690,11 @@ impl PaintArtifact {
 
     fn local_paint_order_level(&self, index: usize) -> PaintOrderLevel {
         let node = &self.nodes[index];
-        let ordinal = self.logical_paint_ordinals.get(index).copied().unwrap_or(index);
+        let ordinal = self
+            .logical_paint_ordinals
+            .get(index)
+            .copied()
+            .unwrap_or(index);
         if is_positioned(&node.style) {
             return match node.style.z_index.cmp(&0) {
                 std::cmp::Ordering::Less => (0, node.style.z_index, ordinal),
@@ -1974,9 +2716,18 @@ impl PaintArtifact {
             )
             && (node.style.border_width > 0.0
                 || node.style.border_top_width.is_some_and(|width| width > 0.0)
-                || node.style.border_right_width.is_some_and(|width| width > 0.0)
-                || node.style.border_bottom_width.is_some_and(|width| width > 0.0)
-                || node.style.border_left_width.is_some_and(|width| width > 0.0));
+                || node
+                    .style
+                    .border_right_width
+                    .is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_bottom_width
+                    .is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_left_width
+                    .is_some_and(|width| width > 0.0));
         if collapsed_table_part_border {
             // Collapsed table borders paint over cell contents. Transparent
             // table-part backgrounds can therefore use a late display item
@@ -2012,16 +2763,60 @@ impl PaintArtifact {
             cursor = current_node.parent;
         }
 
-        let phase = if matches!(
-            node.style.display,
-            Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
-        ) {
+        let split_inline_edge = node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-split-inline-edge")
+            });
+        let normal_inline_border = node.style.display == Display::Inline
+            && node.style.line_height_is_normal
+            && matches!(node.kind, ComponentKind::Row | ComponentKind::Box)
+            && (node.style.border_width > 0.0
+                || node.style.border_top_width.is_some_and(|width| width > 0.0)
+                || node.style.border_right_width.is_some_and(|width| width > 0.0)
+                || node.style.border_bottom_width.is_some_and(|width| width > 0.0)
+                || node.style.border_left_width.is_some_and(|width| width > 0.0));
+        let phase = if split_inline_edge || normal_inline_border {
+            // Inline decoration and in-flow foreground share tree order:
+            // a later fragment covers preceding block glyph overflow, while
+            // remaining behind its own/following text. Moving every border
+            // before all foreground loses that ordering across split lines.
+            3
+        } else if unadorned_block_text(node)
+            || matches!(
+                node.style.display,
+                Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+            )
+        {
             3
         } else {
             1
         };
         (phase, 0, ordinal)
     }
+}
+
+fn unadorned_block_text(node: &PaintNode) -> bool {
+    matches!(node.kind, ComponentKind::Text { .. })
+        && node.style.display == Display::Block
+        && node.style.background.a == 0
+        && node
+            .style
+            .background_image
+            .as_deref()
+            .is_none_or(|image| image == "none")
+        && node.style.border_width == 0.0
+        && [
+            node.style.border_top_width,
+            node.style.border_right_width,
+            node.style.border_bottom_width,
+            node.style.border_left_width,
+        ]
+        .into_iter()
+        .all(|width| width.unwrap_or(0.0) == 0.0)
+        && node.style.box_shadow.is_none()
 }
 
 fn is_positioned(style: &Style) -> bool {
@@ -2053,16 +2848,202 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_line_context_resets_only_after_a_rewound_later_line() {
+        for (x, y, expected_x) in [(8.0, 28.0, 8.0), (88.0, 8.0, 88.0), (8.0, 8.0, 88.0)] {
+            let mut parent = Style::default();
+            parent.display = Display::Block;
+            parent.font_size = 20.0;
+            parent.line_height = 1.0;
+            let mut text = parent.clone();
+            text.display = Display::Inline;
+            text.white_space = WhiteSpace::Pre;
+            let nodes = [
+                PaintNode { kind: ComponentKind::Row, style: parent, parent: None, sticky_counter_signal: None },
+                PaintNode { kind: ComponentKind::Text { content: "\u{200b}".into() },
+                    style: text.clone(), parent: Some(0), sticky_counter_signal: None },
+                PaintNode { kind: ComponentKind::Text { content: "XX\nXX".into() },
+                    style: text, parent: Some(0), sticky_counter_signal: None },
+            ];
+            let artifact = PaintArtifact::build(nodes, &[
+                (LayoutRect { x: 8.0, y: 8.0, width: 100.0, height: 60.0 }, 0),
+                (LayoutRect { x: 88.0, y: 8.0, width: 0.0, height: 20.0 }, 1),
+                (LayoutRect { x, y, width: 100.0, height: 20.0 }, 2),
+            ], 1);
+            let context = artifact.inline_line_context(2).unwrap();
+            assert_eq!(context.first_line_box.x, expected_x, "x={x}, y={y}");
+            assert_eq!(context.first_line_box.width, 108.0 - expected_x, "x={x}, y={y}");
+        }
+    }
+
+    #[test]
+    fn paint_snapshot_resolves_percentage_padding_from_containing_block() {
+        let mut text_style = Style::default();
+        text_style.display = Display::Block;
+        text_style.padding.right = w3cos_std::style::Spacing::Percent(45.3);
+        let nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: Style::default(),
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: Style {
+                    display: Display::Block,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: "x".into(),
+                },
+                style: text_style,
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+        ];
+        let layouts = [
+            (
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 800.0,
+                    height: 600.0,
+                },
+                0,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 0.0,
+                    width: 106.0,
+                    height: 100.0,
+                },
+                1,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 0.0,
+                    width: 106.0,
+                    height: 10.0,
+                },
+                2,
+            ),
+        ];
+        let artifact = PaintArtifact::build(nodes, &layouts, 1);
+        assert!((artifact.nodes[2].style.padding_lengths().right - 48.018).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_ancestor_does_not_replace_percentage_padding_basis() {
+        let mut parent_style = Style::default();
+        parent_style.display = Display::Block;
+        parent_style.padding.left = Spacing::Px(10.0);
+        let mut inline_style = Style::default();
+        inline_style.display = Display::Inline;
+        let mut text_style = Style::default();
+        text_style.display = Display::Inline;
+        text_style.padding.right = Spacing::Percent(50.0);
+        let nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: Style::default(),
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: parent_style,
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: inline_style,
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: "x".into(),
+                },
+                style: text_style,
+                parent: Some(2),
+                sticky_counter_signal: None,
+            },
+        ];
+        let layouts = [
+            (
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 800.0,
+                    height: 600.0,
+                },
+                0,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 0.0,
+                    width: 106.0,
+                    height: 100.0,
+                },
+                1,
+            ),
+            (
+                LayoutRect {
+                    x: 18.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 10.0,
+                },
+                2,
+            ),
+            (
+                LayoutRect {
+                    x: 18.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 10.0,
+                },
+                3,
+            ),
+        ];
+        let artifact = PaintArtifact::build(nodes, &layouts, 1);
+        assert_eq!(artifact.nodes[3].style.padding_lengths().right, 48.0);
+    }
+
+    #[test]
     fn collapsed_column_edges_cover_outer_corner_quadrants() {
         for display in [Display::TableColumn, Display::TableColumnGroup] {
-            let style = Style { display, border_collapse: true, ..Style::default() };
-            let edges = border_edge_paint_rects(&style,
-                LayoutRect { x: 10.0, y: 53.0, width: 100.0, height: 100.0 },
-                [4.0; 4]);
+            let style = Style {
+                display,
+                border_collapse: true,
+                ..Style::default()
+            };
+            let edges = border_edge_paint_rects(
+                &style,
+                LayoutRect {
+                    x: 10.0,
+                    y: 53.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                [4.0; 4],
+            );
             for (x, y) in [(8.5, 51.5), (111.5, 51.5), (8.5, 154.5), (111.5, 154.5)] {
-                assert!(edges.iter().any(|rect| x >= rect.x && x < rect.x + rect.width
-                    && y >= rect.y && y < rect.y + rect.height),
-                    "{display:?} leaves the outer corner ({x}, {y}) uncovered");
+                assert!(
+                    edges.iter().any(|rect| x >= rect.x
+                        && x < rect.x + rect.width
+                        && y >= rect.y
+                        && y < rect.y + rect.height),
+                    "{display:?} leaves the outer corner ({x}, {y}) uncovered"
+                );
             }
         }
     }
@@ -2203,6 +3184,9 @@ mod tests {
         parent_style.border_left_width = Some(2.0);
         let mut inline_style = Style::default();
         inline_style.display = Display::Inline;
+        w3cos_std::inline_text::set_fragment_ends(
+            &mut inline_style, "  next line", &[7, 11],
+        );
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Row,
@@ -2239,6 +3223,8 @@ mod tests {
             &nodes[1].kind,
             ComponentKind::Text { content } if content == "next line"
         ));
+        assert_eq!(w3cos_std::inline_text::fragment_ends("next line", &nodes[1].style),
+            Some(vec![5, 9]), "line-start trimming must rebase authored shaping boundaries");
 
         nodes[1].style.white_space = WhiteSpace::Pre;
         nodes[1].kind = ComponentKind::Text {
@@ -2252,12 +3238,75 @@ mod tests {
     }
 
     #[test]
-    fn inline_fragment_clip_keeps_layout_rect_and_clips_only_paint() {
+    fn nested_inline_leading_space_is_not_trimmed_mid_line() {
+        let mut inline_style = Style::default();
+        inline_style.display = Display::Inline;
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: Style::default(),
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: inline_style.clone(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: " X".into(),
+                },
+                style: inline_style,
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+        ];
+        let mut rects = vec![
+            Some(LayoutRect {
+                x: 28.0,
+                y: 0.0,
+                width: 744.0,
+                height: 20.0,
+            }),
+            Some(LayoutRect {
+                x: 208.0,
+                y: 0.0,
+                width: 40.0,
+                height: 20.0,
+            }),
+            Some(LayoutRect {
+                x: 208.0,
+                y: 0.0,
+                width: 40.0,
+                height: 20.0,
+            }),
+        ];
+
+        trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rects);
+        assert!(matches!(&nodes[2].kind, ComponentKind::Text { content } if content == " X"));
+
+        for rect in &mut rects[1..] {
+            rect.as_mut().unwrap().x = 28.0;
+        }
+        trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rects);
+        assert!(matches!(&nodes[2].kind, ComponentKind::Text { content } if content == "X"));
+    }
+
+    #[test]
+    fn explicit_inline_fragment_clip_keeps_layout_rect_and_clips_only_paint() {
         let mut style = Style::default();
-        style.display = w3cos_std::style::Display::InlineFlex;
+        style.display = w3cos_std::style::Display::Inline;
         style.font_size = 20.0;
         style.line_height = 1.0;
-        style.align_self = w3cos_std::style::AlignSelf::FlexEnd;
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-inline-fragment-clip".into(),
+                "bottom 20".into(),
+            );
         let layout = LayoutRect {
             x: 12.0,
             y: 40.0,
@@ -2287,6 +3336,29 @@ mod tests {
             ),
             None,
             "vertical alignment must not crop a replaced element to the line-height strut"
+        );
+    }
+
+    #[test]
+    fn top_aligned_decorated_inline_keeps_its_vertical_border_paint() {
+        let style = Style {
+            display: Display::Inline,
+            align_self: w3cos_std::style::AlignSelf::FlexStart,
+            border_top_width: Some(4.0),
+            border_bottom_width: Some(4.0),
+            font_size: 16.0,
+            line_height: 1.2,
+            ..Style::default()
+        };
+        let rect = LayoutRect {
+            x: 8.0,
+            y: 5.6,
+            width: 16.0,
+            height: 24.0,
+        };
+        assert_eq!(
+            inline_fragment_clip_rect(&ComponentKind::Row, &style, rect),
+            None
         );
     }
 
@@ -2382,25 +3454,59 @@ mod tests {
         let red = Color::rgb(255, 0, 0);
         let node = |display, width, color, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style { display, border_collapse: true,
-                border_width: width, border_color: color, ..Style::default() },
-            parent, sticky_counter_signal: None,
+            style: Style {
+                display,
+                border_collapse: true,
+                border_width: width,
+                border_color: color,
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
         };
-        for (cell_owner, display) in [(false, Display::TableColumn), (true, Display::TableColumn),
-            (false, Display::TableColumnGroup), (true, Display::TableColumnGroup)] {
+        for (cell_owner, display) in [
+            (false, Display::TableColumn),
+            (true, Display::TableColumn),
+            (false, Display::TableColumnGroup),
+            (true, Display::TableColumnGroup),
+        ] {
             let mut nodes = vec![
                 node(Display::Table, 0.0, red, None),
                 node(display, 25.0, red, Some(0)),
-                node(Display::TableRow, if cell_owner { 0.0 } else { 25.0 }, green, Some(0)),
-                node(Display::TableCell, if cell_owner { 25.0 } else { 0.0 }, green, Some(2)),
+                node(
+                    Display::TableRow,
+                    if cell_owner { 0.0 } else { 25.0 },
+                    green,
+                    Some(0),
+                ),
+                node(
+                    Display::TableCell,
+                    if cell_owner { 25.0 } else { 0.0 },
+                    green,
+                    Some(2),
+                ),
             ];
             resolve_collapsed_cell_border_conflicts(&mut nodes);
-            assert_eq!([nodes[1].style.border_top_width, nodes[1].style.border_right_width,
-                nodes[1].style.border_bottom_width, nodes[1].style.border_left_width],
-                [Some(0.0); 4], "cell owner: {cell_owner}");
-            assert_eq!([nodes[3].style.border_top_color, nodes[3].style.border_right_color,
-                nodes[3].style.border_bottom_color, nodes[3].style.border_left_color],
-                [Some(green); 4], "cell owner: {cell_owner}");
+            assert_eq!(
+                [
+                    nodes[1].style.border_top_width,
+                    nodes[1].style.border_right_width,
+                    nodes[1].style.border_bottom_width,
+                    nodes[1].style.border_left_width
+                ],
+                [Some(0.0); 4],
+                "cell owner: {cell_owner}"
+            );
+            assert_eq!(
+                [
+                    nodes[3].style.border_top_color,
+                    nodes[3].style.border_right_color,
+                    nodes[3].style.border_bottom_color,
+                    nodes[3].style.border_left_color
+                ],
+                [Some(green); 4],
+                "cell owner: {cell_owner}"
+            );
         }
     }
 
@@ -2409,11 +3515,20 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style { display, border_collapse: true, ..Style::default() },
-            parent, sticky_counter_signal: None,
+            style: Style {
+                display,
+                border_collapse: true,
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
         };
-        for display in [Display::TableRow, Display::TableRowGroup,
-            Display::TableColumn, Display::TableColumnGroup] {
+        for display in [
+            Display::TableRow,
+            Display::TableRowGroup,
+            Display::TableColumn,
+            Display::TableColumnGroup,
+        ] {
             let mut nodes = vec![node(Display::Table, None)];
             let cell;
             if display == Display::TableRow {
@@ -2437,8 +3552,16 @@ mod tests {
             nodes[cell].style.border_color = Color::rgb(255, 0, 0);
             resolve_collapsed_cell_border_conflicts(&mut nodes);
             let style = &nodes[cell].style;
-            assert_eq!([style.border_top_width, style.border_right_width,
-                style.border_bottom_width, style.border_left_width], [Some(0.0); 4], "{display:?}");
+            assert_eq!(
+                [
+                    style.border_top_width,
+                    style.border_right_width,
+                    style.border_bottom_width,
+                    style.border_left_width
+                ],
+                [Some(0.0); 4],
+                "{display:?}"
+            );
         }
     }
 
@@ -2479,6 +3602,180 @@ mod tests {
         assert_eq!(nodes[2].style.border_bottom_width, Some(0.0));
         assert_eq!(nodes[6].style.border_left_width, Some(10.0));
         assert_eq!(nodes[6].style.border_left_color, Some(blue));
+    }
+
+    #[test]
+    fn collapsed_colspan_border_resolves_every_overlapping_track() {
+        use w3cos_std::style::BorderLineStyle;
+        let node = |display, parent, line_style| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true,
+                border_width: if display == Display::TableCell { 10.0 } else { 0.0 },
+                border_color: Color::rgb(0, 128, 0),
+                border_styles: [Some(line_style); 4], ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        let mut nodes = vec![node(Display::Table, None, BorderLineStyle::Solid),
+            node(Display::TableRow, Some(0), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(1), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(1), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(1), BorderLineStyle::Outset),
+            node(Display::TableRow, Some(0), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(5), BorderLineStyle::Solid),
+            node(Display::TableRow, Some(0), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(7), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(7), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(7), BorderLineStyle::Outset)];
+        nodes[6].style.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-table-column-span".into(), "3".into());
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+        for cell in [2, 3, 4] {
+            assert_eq!(nodes[cell].style.border_bottom_color, Some(Color::TRANSPARENT),
+                "upper track cell {cell} yields to the solid spanning cell");
+        }
+        for cell in [8, 9, 10] {
+            assert_eq!(nodes[cell].style.border_top_color, Some(Color::TRANSPARENT),
+                "lower track cell {cell} yields to the solid spanning cell");
+        }
+        assert_ne!(nodes[6].style.border_bottom_color, Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn collapsed_rowspan_border_owns_neighbors_in_every_occupied_row() {
+        use w3cos_std::style::BorderLineStyle;
+        let node = |display, parent, line_style| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true,
+                border_width: if display == Display::TableCell { 10.0 } else { 0.0 },
+                border_color: Color::rgb(0, 128, 0),
+                border_styles: [Some(line_style); 4], ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        let mut nodes = vec![node(Display::Table, None, BorderLineStyle::Solid),
+            node(Display::TableRow, Some(0), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(1), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(1), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(1), BorderLineStyle::Outset),
+            node(Display::TableRow, Some(0), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(5), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(5), BorderLineStyle::Outset),
+            node(Display::TableRow, Some(0), BorderLineStyle::Solid),
+            node(Display::TableCell, Some(8), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(8), BorderLineStyle::Outset)];
+        nodes[3].style.custom_properties.get_or_insert_with(Default::default)
+            .insert(crate::table_grid::ROW_SPAN.into(), "3".into());
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+        for cell in [2, 6, 9] {
+            assert_eq!(nodes[cell].style.border_right_color, Some(Color::TRANSPARENT),
+                "left neighbor {cell} yields to the solid rowspan edge");
+        }
+        for cell in [4, 7, 10] {
+            assert_eq!(nodes[cell].style.border_left_color, Some(Color::TRANSPARENT));
+        }
+        assert_ne!(nodes[3].style.border_left_color, Some(Color::TRANSPARENT));
+        assert_ne!(nodes[3].style.border_right_color, Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn collapsed_part_style_priority_transfers_the_winning_line_style() {
+        use w3cos_std::style::BorderLineStyle;
+        let node = |display, parent, width, line_style| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true, border_width: width,
+                border_color: Color::rgb(0, 128, 0),
+                border_styles: [Some(line_style); 4], ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        for part_display in [Display::Table, Display::TableRow, Display::TableRowGroup,
+            Display::TableColumn, Display::TableColumnGroup] {
+            let mut nodes = vec![node(Display::Table, None, 0.0, BorderLineStyle::Solid)];
+            let cell;
+            if part_display == Display::Table {
+                nodes[0].style.border_width = 10.0;
+                nodes.push(node(Display::TableRow, Some(0), 0.0, BorderLineStyle::Solid));
+                cell = 2;
+                nodes.push(node(Display::TableCell, Some(1), 10.0, BorderLineStyle::Outset));
+            } else if part_display == Display::TableRow {
+                nodes.push(node(part_display, Some(0), 10.0, BorderLineStyle::Solid));
+                cell = 2;
+                nodes.push(node(Display::TableCell, Some(1), 10.0, BorderLineStyle::Outset));
+            } else {
+                nodes.push(node(part_display, Some(0), 10.0, BorderLineStyle::Solid));
+                let parent = if part_display == Display::TableRowGroup { 1 } else { 0 };
+                nodes.push(node(Display::TableRow, Some(parent), 0.0, BorderLineStyle::Solid));
+                cell = 3;
+                nodes.push(node(Display::TableCell, Some(2), 10.0, BorderLineStyle::Outset));
+            }
+            resolve_collapsed_cell_border_conflicts(&mut nodes);
+            assert_eq!(nodes[cell].style.border_styles, [Some(BorderLineStyle::Solid); 4],
+                "same-width solid {part_display:?} wins over cell outset and supplies the ink style");
+        }
+    }
+
+    #[test]
+    fn collapsed_grid_joints_use_neighbor_owner_and_extend_winning_edges() {
+        use w3cos_std::style::BorderLineStyle;
+        let node = |display, parent| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true,
+                border_width: if display == Display::TableCell { 10.0 } else { 0.0 },
+                border_color: Color::rgb(0, 128, 0),
+                border_styles: [Some(BorderLineStyle::Groove); 4], ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        let mut nodes = vec![node(Display::Table, None), node(Display::TableRow, Some(0)),
+            node(Display::TableCell, Some(1)), node(Display::TableCell, Some(1))];
+        let rects = vec![None, None,
+            Some(LayoutRect { x: 20.0, y: 30.0, width: 40.0, height: 30.0 }),
+            Some(LayoutRect { x: 60.0, y: 30.0, width: 40.0, height: 30.0 })];
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+        annotate_collapsed_border_joints(&mut nodes, &rects);
+        let first = border_edge_paint_rects(&nodes[2].style, rects[2].unwrap(), [10.0; 4]);
+        let second = border_edge_paint_rects(&nodes[3].style, rects[3].unwrap(), [10.0; 4]);
+        assert_eq!((first[0].x, first[0].width), (15.0, 50.0),
+            "winning horizontal edge fills both joint quadrants");
+        assert_eq!((first[1].y, first[1].height), (25.0, 40.0));
+        assert_eq!((second[0].x, second[0].width), (65.0, 40.0),
+            "later cell's horizontal edge yields its start joint to the earlier owner");
+    }
+
+    #[test]
+    fn collapsed_wider_inline_edge_owns_the_block_edge_junction() {
+        let style = Style {
+            display: Display::TableCell,
+            border_collapse: true,
+            ..Style::default()
+        };
+        let rect = LayoutRect { x: 20.0, y: 30.0, width: 40.0, height: 30.0 };
+        let edges = border_edge_paint_rects(&style, rect, [10.0, 11.0, 10.0, 11.0]);
+        // The wider inline borders win at both horizontal junctions, rather
+        // than letting the later-painted bottom edge cover their inner halves.
+        for horizontal in [edges[0], edges[2]] {
+            assert_eq!(horizontal.x, 25.5);
+            assert_eq!(horizontal.width, 29.0);
+        }
+    }
+
+    #[test]
+    fn collapsed_equal_width_border_prefers_solid_over_outset() {
+        use w3cos_std::style::BorderLineStyle;
+        let node = |display, parent, line_style| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style { display, border_collapse: true, border_width: 10.0,
+                border_color: Color::rgb(0, 128, 0),
+                border_styles: [Some(line_style); 4], ..Style::default() },
+            parent, sticky_counter_signal: None,
+        };
+        let mut nodes = vec![
+            node(Display::TableRow, None, BorderLineStyle::None),
+            node(Display::TableCell, Some(0), BorderLineStyle::Outset),
+            node(Display::TableCell, Some(0), BorderLineStyle::Solid),
+        ];
+        nodes[0].style.border_width = 0.0;
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+        assert_eq!(nodes[1].style.border_right_color, Some(Color::TRANSPARENT),
+            "equal-width solid must win before directional cell-owner precedence");
+        assert_eq!(nodes[2].style.border_left_color, Some(Color::rgb(0, 128, 0)));
     }
 
     #[test]
@@ -2594,16 +3891,30 @@ mod tests {
         let node = PaintNode {
             kind: ComponentKind::Box,
             style: Style {
-                display: Display::TableCell, border_collapse: true,
-                border_left_width: Some(25.0), border_right_width: Some(25.0),
+                display: Display::TableCell,
+                border_collapse: true,
+                border_left_width: Some(25.0),
+                border_right_width: Some(25.0),
                 ..Style::default()
             },
-            parent: None, sticky_counter_signal: None,
+            parent: None,
+            sticky_counter_signal: None,
         };
-        let rect = LayoutRect { x: 12.5, y: 0.0, width: 75.0, height: 100.0 };
+        let rect = LayoutRect {
+            x: 12.5,
+            y: 0.0,
+            width: 75.0,
+            height: 100.0,
+        };
         let artifact = PaintArtifact::build(vec![node], &[(rect, 0)], 1);
-        assert_eq!(artifact.display_items[0].visual_rect,
-            LayoutRect { x: 0.0, width: 100.0, ..rect });
+        assert_eq!(
+            artifact.display_items[0].visual_rect,
+            LayoutRect {
+                x: 0.0,
+                width: 100.0,
+                ..rect
+            }
+        );
         assert_eq!(artifact.rect_by_index[0], Some(rect));
     }
 
@@ -2611,19 +3922,42 @@ mod tests {
     fn collapsed_table_background_origin_uses_resolved_outer_edges() {
         let node = |display, border_width, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style { display, border_collapse: true, border_width,
-                border_color: Color::rgb(0, 128, 0), ..Style::default() },
-            parent, sticky_counter_signal: None,
+            style: Style {
+                display,
+                border_collapse: true,
+                border_width,
+                border_color: Color::rgb(0, 128, 0),
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
         };
-        let mut nodes = vec![node(Display::Table, 2.0, None),
+        let mut nodes = vec![
+            node(Display::Table, 2.0, None),
             node(Display::TableRow, 0.0, Some(0)),
-            node(Display::TableCell, 6.0, Some(1))];
+            node(Display::TableCell, 6.0, Some(1)),
+        ];
         resolve_collapsed_cell_border_conflicts(&mut nodes);
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
-        assert_eq!(box_background_positioning_rect(&nodes[0].style, rect),
-            Some(LayoutRect { x: 3.0, y: 3.0, width: 94.0, height: 94.0 }));
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        assert_eq!(
+            box_background_positioning_rect(&nodes[0].style, rect),
+            Some(LayoutRect {
+                x: 3.0,
+                y: 3.0,
+                width: 94.0,
+                height: 94.0
+            })
+        );
         assert_eq!(nodes[0].style.border_left_color, Some(Color::TRANSPARENT));
-        assert_eq!(nodes[2].style.border_left_color, Some(Color::rgb(0, 128, 0)));
+        assert_eq!(
+            nodes[2].style.border_left_color,
+            Some(Color::rgb(0, 128, 0))
+        );
     }
 
     #[test]
@@ -2689,7 +4023,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_columns_clip_partial_spans_and_hide_full_cells() {
+    fn collapsed_columns_preserve_partial_span_overflow_and_hide_full_cells() {
         let node = |display, visibility, parent, span: Option<&str>| PaintNode {
             kind: ComponentKind::Box,
             style: Style {
@@ -2723,38 +4057,224 @@ mod tests {
         project_collapsed_table_tracks_to_cells(&mut nodes);
 
         assert_eq!(nodes[5].style.visibility, Visibility::Visible);
-        assert_eq!(nodes[5].style.overflow_x, Some(Overflow::Hidden));
+        assert_eq!(nodes[5].style.overflow_x, None,
+            "Chromium preserves authored overflow for partially collapsed spans");
         assert_eq!(nodes[9].style.visibility, Visibility::Collapse);
         assert_eq!(nodes[9].style.overflow_x, Some(Overflow::Hidden));
         assert_eq!(nodes[9].style.overflow_y, Some(Overflow::Hidden));
+        nodes[5].style.overflow_x = Some(Overflow::Hidden);
+        project_collapsed_table_tracks_to_cells(&mut nodes);
+        assert_eq!(nodes[5].style.overflow_x, Some(Overflow::Hidden),
+            "explicit author clipping is not removed");
     }
 
     #[test]
     fn table_background_paint_rect_uses_grid_width_not_wider_caption() {
         for bottom in [false, true] {
             let mut nodes = vec![
-                PaintNode { kind: ComponentKind::Box,
-                    style: Style { display: Display::Table, ..Style::default() },
-                    parent: None, sticky_counter_signal: None },
-                PaintNode { kind: ComponentKind::Box,
-                    style: Style { display: Display::TableCaption,
-                        caption_side_bottom: bottom, ..Style::default() },
-                    parent: Some(0), sticky_counter_signal: None },
-                PaintNode { kind: ComponentKind::Box,
-                    style: Style { display: Display::TableRowGroup, ..Style::default() },
-                    parent: Some(0), sticky_counter_signal: None },
+                PaintNode {
+                    kind: ComponentKind::Box,
+                    style: Style {
+                        display: Display::Table,
+                        ..Style::default()
+                    },
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Box,
+                    style: Style {
+                        display: Display::TableCaption,
+                        caption_side_bottom: bottom,
+                        ..Style::default()
+                    },
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Box,
+                    style: Style {
+                        display: Display::TableRowGroup,
+                        ..Style::default()
+                    },
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
             ];
             let grid_y = if bottom { 0.0 } else { 30.0 };
             let rects = vec![
-                Some(LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 60.0 }),
-                Some(LayoutRect { x: 0.0, y: if bottom { 30.0 } else { 0.0 },
-                    width: 192.0, height: 30.0 }),
-                Some(LayoutRect { x: 0.0, y: grid_y, width: 100.0, height: 30.0 }),
+                Some(LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 192.0,
+                    height: 60.0,
+                }),
+                Some(LayoutRect {
+                    x: 0.0,
+                    y: if bottom { 30.0 } else { 0.0 },
+                    width: 192.0,
+                    height: 30.0,
+                }),
+                Some(LayoutRect {
+                    x: 0.0,
+                    y: grid_y,
+                    width: 100.0,
+                    height: 30.0,
+                }),
             ];
             annotate_table_caption_paint_insets(&mut nodes, &rects);
-            assert_eq!(table_grid_paint_rect(&nodes[0].style, rects[0].unwrap()),
-                LayoutRect { x: 0.0, y: grid_y, width: 100.0, height: 30.0 });
+            assert_eq!(
+                table_grid_paint_rect(&nodes[0].style, rects[0].unwrap()),
+                LayoutRect {
+                    x: 0.0,
+                    y: grid_y,
+                    width: 100.0,
+                    height: 30.0
+                }
+            );
         }
+    }
+
+    #[test]
+    fn empty_top_caption_does_not_expand_table_overflow_clip() {
+        let node = |display, parent: Option<usize>| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display,
+                overflow: if parent.is_none() {
+                    Overflow::Hidden
+                } else {
+                    Overflow::Visible
+                },
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            vec![
+                node(Display::Table, None),
+                node(Display::TableCaption, Some(0)),
+                node(Display::TableRow, Some(0)),
+                node(Display::TableCell, Some(2)),
+                node(Display::Block, Some(3)),
+            ],
+            &[
+                (
+                    LayoutRect {
+                        x: 8.0,
+                        y: 51.0,
+                        width: 20.0,
+                        height: 30.0,
+                    },
+                    0,
+                ),
+                (
+                    LayoutRect {
+                        x: 8.0,
+                        y: 51.0,
+                        width: 20.0,
+                        height: 0.0,
+                    },
+                    1,
+                ),
+                (
+                    LayoutRect {
+                        x: 8.0,
+                        y: 61.0,
+                        width: 20.0,
+                        height: 20.0,
+                    },
+                    2,
+                ),
+                (
+                    LayoutRect {
+                        x: 8.0,
+                        y: 61.0,
+                        width: 20.0,
+                        height: 20.0,
+                    },
+                    3,
+                ),
+                (
+                    LayoutRect {
+                        x: 8.0,
+                        y: 46.0,
+                        width: 20.0,
+                        height: 35.0,
+                    },
+                    4,
+                ),
+            ],
+            1,
+        );
+        let clip = artifact.node_properties[0].clip;
+        assert_eq!(artifact.properties.clips[clip].rect.unwrap().y, 61.0);
+        assert_eq!(
+            artifact.node_properties[1].clip, 0,
+            "caption lives outside table grid"
+        );
+        assert_eq!(artifact.node_properties[4].clip, clip);
+    }
+
+    #[test]
+    fn table_grid_border_tracks_a_row_overlapped_by_the_top_caption() {
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::Table,
+                    border_top_width: Some(16.0),
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCaption,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRow,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+        let rects = vec![
+            Some(LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 119.2,
+            }),
+            Some(LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 22.4,
+            }),
+            Some(LayoutRect {
+                x: 0.0,
+                y: 19.2,
+                width: 200.0,
+                height: 100.0,
+            }),
+        ];
+        annotate_table_caption_paint_insets(&mut nodes, &rects);
+        let grid = table_grid_paint_rect(&nodes[0].style, rects[0].unwrap());
+        assert!(
+            (grid.y - 3.2).abs() < 0.01,
+            "grid border precedes the first row: {grid:?}"
+        );
     }
 
     #[test]
@@ -2892,7 +4412,10 @@ mod tests {
         );
         assert_eq!(
             box_background_paint_rects(&nodes[1].style, row_group),
-            vec![LayoutRect { width: 90.0, ..row_group }]
+            vec![LayoutRect {
+                width: 90.0,
+                ..row_group
+            }]
         );
     }
 
@@ -2943,6 +4466,52 @@ mod tests {
             inline_fragment_clip_rect(&ComponentKind::Box, &style, rect(0.0)),
             None
         );
+    }
+
+    #[test]
+    fn display_none_root_suppresses_root_and_body_canvas_backgrounds() {
+        for background in [Color::rgb(0, 128, 0), Color::TRANSPARENT] {
+            let root = PaintNode {
+                kind: ComponentKind::Column,
+                style: Style { display: Display::None, background, ..Style::default() },
+                parent: None,
+                sticky_counter_signal: None,
+            };
+            let body = PaintNode {
+                kind: ComponentKind::Column,
+                style: Style {
+                    background: Color::rgb(255, 0, 0),
+                    background_image: Some("url(square-white.png)".into()),
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            };
+            let artifact = PaintArtifact::build_with_body_background(
+                [root, body], &[], 1, Some(1),
+            );
+            assert_eq!(artifact.canvas_background, Color::WHITE);
+            assert_eq!(artifact.canvas_background_source, None);
+            assert!(artifact.canvas_background_style.is_none());
+        }
+    }
+
+    #[test]
+    fn display_none_body_does_not_propagate_its_canvas_background() {
+        let node = |parent, style| PaintNode {
+            kind: ComponentKind::Column, style, parent, sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build_with_body_background(
+            [node(None, Style::default()), node(Some(0), Style {
+                display: Display::None,
+                background: Color::rgb(0, 128, 0),
+                background_image: Some("url(square-white.png)".into()),
+                ..Style::default()
+            })], &[(rect(0.0), 0)], 1, Some(1),
+        );
+        assert_eq!(artifact.canvas_background, Color::WHITE);
+        assert_eq!(artifact.canvas_background_source, None);
+        assert!(artifact.canvas_background_style.is_none());
     }
 
     #[test]
@@ -3017,6 +4586,41 @@ mod tests {
     }
 
     #[test]
+    fn transparent_block_text_paints_after_later_in_flow_block_background() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut text_style = Style::default();
+        text_style.display = Display::Block;
+        let text = PaintNode {
+            kind: ComponentKind::Text {
+                content: "instruction".into(),
+            },
+            style: text_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let mut bar_style = Style::default();
+        bar_style.background = Color::rgb(255, 165, 0);
+        let bar = PaintNode {
+            kind: ComponentKind::Box,
+            style: bar_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, text, bar],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+            1,
+        );
+
+        assert!(artifact.paint_order_key(2) < artifact.paint_order_key(1));
+    }
+
+    #[test]
     fn absolute_box_inherits_clip_chain_from_its_containing_block() {
         let nodes = vec![
             PaintNode {
@@ -3049,6 +4653,42 @@ mod tests {
 
         assert_ne!(artifact.node_properties[1].clip, 0);
         assert_eq!(artifact.node_properties[2].clip, 0);
+        assert_ne!(artifact.node_properties[1].scroll, 0);
+        assert_eq!(artifact.node_properties[2].scroll, 0);
+    }
+
+    #[test]
+    fn body_background_propagates_through_anonymous_table_wrappers() {
+        let node = |parent, display, background| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display,
+                background,
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
+        };
+        let nodes = [
+            node(None, Display::Table, Color::TRANSPARENT),
+            node(Some(0), Display::TableRow, Color::TRANSPARENT),
+            node(Some(1), Display::TableCell, Color::TRANSPARENT),
+            node(Some(2), Display::Block, Color::rgb(255, 255, 0)),
+        ];
+        let artifact = PaintArtifact::build_with_body_background(
+            nodes,
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+            ],
+            1,
+            Some(3),
+        );
+        assert_eq!(artifact.canvas_background_source, Some(3));
+        assert_eq!(artifact.canvas_background, Color::rgb(255, 255, 0));
+        assert_eq!(artifact.nodes[3].style.background, Color::TRANSPARENT);
     }
 
     #[test]
@@ -3133,21 +4773,49 @@ mod tests {
     #[test]
     fn nonvisible_css_borders_use_zero_width_paint_snapshots() {
         use w3cos_std::style::BorderLineStyle;
-        for line_style in [Some(BorderLineStyle::None), Some(BorderLineStyle::Hidden),
-            Some(BorderLineStyle::Solid), None] {
-            let source = Style { border_width: 32.0,
-                border_styles: [line_style; 4], ..Style::default() };
-            let artifact = PaintArtifact::build([PaintNode {
-                kind: ComponentKind::Column, style: source.clone(), parent: None,
-                sticky_counter_signal: None,
-            }], &[(rect(0.0), 0)], 1);
+        for line_style in [
+            Some(BorderLineStyle::None),
+            Some(BorderLineStyle::Hidden),
+            Some(BorderLineStyle::Solid),
+            None,
+        ] {
+            let source = Style {
+                border_width: 32.0,
+                border_styles: [line_style; 4],
+                ..Style::default()
+            };
+            let artifact = PaintArtifact::build(
+                [PaintNode {
+                    kind: ComponentKind::Column,
+                    style: source.clone(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                }],
+                &[(rect(0.0), 0)],
+                1,
+            );
             let used = &artifact.nodes[0].style;
-            let expected = if line_style.is_some_and(|style| !style.is_visible()) { 0.0 } else { 32.0 };
-            for width in [used.border_top_width, used.border_right_width,
-                used.border_bottom_width, used.border_left_width] {
-                assert_eq!(width.unwrap_or(used.border_width), expected, "{line_style:?}");
+            let expected = if line_style.is_some_and(|style| !style.is_visible()) {
+                0.0
+            } else {
+                32.0
+            };
+            for width in [
+                used.border_top_width,
+                used.border_right_width,
+                used.border_bottom_width,
+                used.border_left_width,
+            ] {
+                assert_eq!(
+                    width.unwrap_or(used.border_width),
+                    expected,
+                    "{line_style:?}"
+                );
             }
-            assert_eq!(used.border_styles, source.border_styles, "hidden identity retained");
+            assert_eq!(
+                used.border_styles, source.border_styles,
+                "hidden identity retained"
+            );
             assert_eq!(source.border_width, 32.0, "computed width retained");
         }
     }
@@ -3187,6 +4855,7 @@ mod tests {
         );
 
         assert_eq!(artifact.generation, 7);
+        assert!(artifact.column_fragments.is_empty(), "ordinary pages do not allocate per-node column slices");
         assert_eq!(artifact.display_items.len(), 3);
         assert_eq!(artifact.chunks.len(), 3);
         assert_eq!(artifact.properties.scrolls.len(), 2);
@@ -3196,6 +4865,66 @@ mod tests {
         assert_ne!(artifact.node_properties[2].scroll, 0);
         assert_ne!(artifact.node_properties[2].effect, 0);
         assert_ne!(artifact.node_properties[2].transform, 0);
+    }
+
+    #[test]
+    fn fixed_auto_multicol_artifact_retains_physical_fragments_and_source_identity() {
+        use w3cos_std::style::{ColumnFill, Dimension};
+        let node = |style, parent| PaintNode {
+            kind: ComponentKind::Column, style, parent, sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build([
+            node(Style { display: Display::Block, width: Dimension::Px(300.0),
+                height: Dimension::Px(100.0), column_width: Dimension::Px(100.0),
+                column_gap: Some(0.0), column_fill: ColumnFill::Auto,
+                ..Style::default() }, None),
+            node(Style { display: Display::Block, ..Style::default() }, Some(0)),
+            node(Style { display: Display::Block, position: Position::Absolute,
+                ..Style::default() }, Some(0)),
+        ], &[
+            (LayoutRect { x: 20.0, y: 30.0, width: 300.0, height: 100.0 }, 0),
+            (LayoutRect { x: 20.0, y: 30.0, width: 100.0, height: 250.0 }, 1),
+            (LayoutRect { x: 20.0, y: 30.0, width: 20.0, height: 250.0 }, 2),
+        ], 1);
+        assert_eq!(artifact.nodes.len(), 3, "fragments do not duplicate source nodes");
+        let fragments: Vec<_> = artifact.display_items.iter()
+            .filter(|item| item.client_index == 1).map(|item| item.visual_rect).collect();
+        assert_eq!(fragments, vec![
+            LayoutRect { x: 20.0, y: 30.0, width: 100.0, height: 100.0 },
+            LayoutRect { x: 120.0, y: 30.0, width: 100.0, height: 100.0 },
+            LayoutRect { x: 220.0, y: 30.0, width: 100.0, height: 50.0 },
+        ]);
+        assert_eq!(artifact.display_items.iter().filter(|item| item.client_index == 2).count(), 1,
+            "absolute children do not flow through columns");
+        assert_eq!(artifact.rect_by_index[1].unwrap().height, 250.0,
+            "logical source geometry remains available");
+    }
+
+    #[test]
+    fn balanced_multicol_artifact_uses_shorter_fragmentainers_with_fixed_principal_height() {
+        use w3cos_std::style::{ColumnFill, Dimension};
+        let node = |style, parent| PaintNode {
+            kind: ComponentKind::Column, style, parent, sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build([
+            node(Style { display: Display::Block, width: Dimension::Px(300.0),
+                height: Dimension::Px(100.0), column_width: Dimension::Px(100.0),
+                column_gap: Some(0.0), column_fill: ColumnFill::Balance,
+                ..Style::default() }, None),
+            node(Style { display: Display::Block, ..Style::default() }, Some(0)),
+        ], &[
+            (LayoutRect { x: 20.0, y: 30.0, width: 300.0, height: 100.0 }, 0),
+            (LayoutRect { x: 20.0, y: 30.0, width: 100.0, height: 255.0 }, 1),
+        ], 1);
+        let fragments: Vec<_> = artifact.display_items.iter()
+            .filter(|item| item.client_index == 1).map(|item| item.visual_rect).collect();
+        assert_eq!(fragments, vec![
+            LayoutRect { x: 20.0, y: 30.0, width: 100.0, height: 85.0 },
+            LayoutRect { x: 120.0, y: 30.0, width: 100.0, height: 85.0 },
+            LayoutRect { x: 220.0, y: 30.0, width: 100.0, height: 85.0 },
+        ]);
+        assert_eq!(artifact.rect_by_index[0].unwrap().height, 100.0,
+            "balancing shortens fragmentainers, not an explicit principal height");
     }
 
     #[test]
@@ -3248,14 +4977,23 @@ mod tests {
                 rank.to_string(),
             )]));
             nodes.push(PaintNode {
-                kind: ComponentKind::Text { content: rank.to_string() },
+                kind: ComponentKind::Text {
+                    content: rank.to_string(),
+                },
                 style,
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
         }
         let artifact = PaintArtifact::build(
-            nodes, &[(rect(0.0), 0), (rect(0.0), 1), (rect(20.0), 2), (rect(40.0), 3)], 1,
+            nodes,
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(20.0), 2),
+                (rect(40.0), 3),
+            ],
+            1,
         );
         assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
         assert!(artifact.paint_order_key(2) < artifact.paint_order_key(1));
@@ -3291,7 +5029,9 @@ mod tests {
             1,
         );
 
-        assert_eq!(artifact.z_order, vec![i32::MIN, i32::MIN + 1, i32::MIN]);
+        assert!(artifact.paint_order_key(0) < artifact.paint_order_key(2));
+        assert!(artifact.paint_order_key(2) < artifact.paint_order_key(1),
+            "positioned-auto subtree must paint after later normal-flow content");
     }
 
     #[test]
@@ -3301,14 +5041,26 @@ mod tests {
             (Some(0), Position::Relative),
             (Some(1), Position::Absolute),
             (Some(1), Position::Static),
-        ].map(|(parent, position)| PaintNode {
+        ]
+        .map(|(parent, position)| PaintNode {
             kind: ComponentKind::Box,
-            style: Style { position, ..Style::default() },
+            style: Style {
+                position,
+                ..Style::default()
+            },
             parent,
             sticky_counter_signal: None,
         });
-        let artifact = PaintArtifact::build(nodes,
-            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2), (rect(0.0), 3)], 1);
+        let artifact = PaintArtifact::build(
+            nodes,
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+            ],
+            1,
+        );
         assert!(artifact.paint_order_key(1) < artifact.paint_order_key(3));
         assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
     }
@@ -3620,6 +5372,77 @@ mod tests {
         assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2));
         assert!(artifact.paint_order_key(2) < artifact.paint_order_key(3));
         assert!(artifact.paint_order_key(3) < artifact.paint_order_key(4));
+    }
+
+    #[test]
+    fn inline_border_paints_after_preceding_block_text_and_before_following_text() {
+        for split in [false, true] {
+            let mut border = Style::default();
+            border.display = Display::Inline;
+            border.line_height_is_normal = true;
+            border.border_width = 3.0;
+            if split {
+                border.custom_properties = Some(std::collections::HashMap::from([(
+                    "--w3cos-internal-split-inline-edge".to_string(), "1".to_string(),
+                )]));
+            }
+            let mut text = Style::default();
+            text.display = Display::Block;
+            let artifact = PaintArtifact::build(
+                [
+                    PaintNode { kind: ComponentKind::Column, style: Style::default(), parent: None, sticky_counter_signal: None },
+                    PaintNode { kind: ComponentKind::Text { content: "Eight".into() }, style: text.clone(), parent: Some(0), sticky_counter_signal: None },
+                    PaintNode { kind: ComponentKind::Row, style: border, parent: Some(0), sticky_counter_signal: None },
+                    PaintNode { kind: ComponentKind::Text { content: "Nine".into() }, style: text, parent: Some(0), sticky_counter_signal: None },
+                ],
+                &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2), (rect(0.0), 3)],
+                1,
+            );
+            assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2), "inline border must cover preceding block glyph overflow, split={split}");
+            assert!(artifact.paint_order_key(2) < artifact.paint_order_key(3), "inline border must remain behind following text, split={split}");
+        }
+    }
+
+    #[test]
+    fn split_inline_edge_paints_behind_following_block_text() {
+        let mut edge_style = Style::default();
+        edge_style.display = Display::Inline;
+        edge_style.custom_properties = Some(std::collections::HashMap::from([(
+            "--w3cos-internal-split-inline-edge".to_string(),
+            "1".to_string(),
+        )]));
+        let mut text_style = Style::default();
+        text_style.display = Display::Block;
+        let artifact = PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style::default(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Row,
+                    style: edge_style,
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Text {
+                        content: "Second line".into(),
+                    },
+                    style: text_style,
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+            1,
+        );
+        assert!(
+            artifact.paint_order_key(1) < artifact.paint_order_key(2),
+            "the first split inline edge must stay behind the following block's text"
+        );
     }
 
     #[test]

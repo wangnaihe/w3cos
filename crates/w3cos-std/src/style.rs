@@ -3,6 +3,27 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
+/// Per-thread renderer adapter for the final font's zero-glyph advance.
+pub type ChAdvanceProvider = fn(&Style) -> Option<f32>;
+thread_local! {
+    static CH_ADVANCE_PROVIDER: std::cell::Cell<Option<ChAdvanceProvider>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub fn set_ch_advance_provider(provider: Option<ChAdvanceProvider>) {
+    CH_ADVANCE_PROVIDER.with(|slot| slot.set(provider));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColumnFill {
+    Auto,
+    #[default]
+    Balance,
+    BalanceAll,
+}
+
 /// Authored line style retained independently from the used border width.
 /// In collapsed tables, hidden suppresses competitors while none does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +53,7 @@ impl BorderLineStyle {
 pub fn parse_absolute_length_px(value: &str) -> Option<f32> {
     let value = value.trim();
     for (suffix, pixels_per_unit) in [
-        ("px", 1.0_f32),
+        ("px", 1.0_f64),
         ("cm", 96.0 / 2.54),
         ("mm", 96.0 / 25.4),
         ("q", 96.0 / 101.6),
@@ -41,9 +62,12 @@ pub fn parse_absolute_length_px(value: &str) -> Option<f32> {
         ("pc", 16.0),
     ] {
         if let Some(number) = value.strip_suffix(suffix)
-            && let Ok(number) = number.trim().parse::<f32>()
+            && let Ok(number) = number.trim().parse::<f64>()
         {
-            return Some(number * pixels_per_unit);
+            // CSS numeric literals and canonical-unit factors are doubles.
+            // Round once at the used f32 boundary, not before conversion:
+            // e.g. 10pt otherwise gains one ULP and changes host glyph masks.
+            return Some((number * pixels_per_unit) as f32);
         }
     }
     value.parse().ok()
@@ -113,6 +137,13 @@ pub struct Style {
     pub row_gap: Option<f32>,
     #[serde(default)]
     pub column_gap: Option<f32>,
+    #[serde(default)]
+    pub column_width: Dimension,
+    /// None is the CSS initial `auto`, not zero columns.
+    #[serde(default)]
+    pub column_count: Option<u32>,
+    #[serde(default)]
+    pub column_fill: ColumnFill,
     #[serde(default)]
     pub border_spacing_x: f32,
     #[serde(default)]
@@ -200,6 +231,10 @@ pub struct Style {
     /// native numeric styles without inventing an authored CSS declaration.
     #[serde(default)]
     pub border_styles: [Option<BorderLineStyle>; 4],
+    /// Authored/computed widths before none or hidden reduces the used width.
+    /// None means the CSS initial medium width when explicitly inherited.
+    #[serde(default)]
+    pub computed_border_widths: [Option<f32>; 4],
     #[serde(default)]
     pub border_top_width: Option<f32>,
     #[serde(default)]
@@ -225,6 +260,10 @@ pub struct Style {
     /// Retained CSS keyword; old wire styles and native numeric builders default to false.
     #[serde(default)]
     pub line_height_is_normal: bool,
+    /// Computed CSS length for an authored length or percentage. Unitless
+    /// line-height stays `None` so descendants inherit its multiplier.
+    #[serde(default)]
+    pub line_height_computed_px: Option<f32>,
     #[serde(default = "default_text_indent")]
     pub text_indent: Dimension,
     #[serde(default)]
@@ -236,6 +275,15 @@ pub struct Style {
     pub text_overflow: TextOverflow,
     pub font_family: Option<String>,
     pub font_style: FontStyle,
+    /// CSS2 `font-variant`; glyph selection does not alter the CSS font size.
+    #[serde(default)]
+    pub font_variant: FontVariant,
+    /// Whether OpenType `kern` is enabled for this inherited text style.
+    #[serde(default = "default_font_kerning")]
+    pub font_kerning: bool,
+    /// Low-level `font-feature-settings` override for OpenType `kern`.
+    #[serde(default)]
+    pub font_feature_kern: Option<bool>,
     pub word_break: WordBreak,
     #[serde(default)]
     pub direction: TextDirection,
@@ -315,6 +363,9 @@ impl Default for Style {
             gap: 0.0,
             row_gap: None,
             column_gap: None,
+            column_width: Dimension::Auto,
+            column_count: None,
+            column_fill: ColumnFill::Balance,
             border_spacing_x: 0.0,
             border_spacing_y: 0.0,
             border_collapse: false,
@@ -358,6 +409,7 @@ impl Default for Style {
             border_color: Color::TRANSPARENT,
             border_current_color: None,
             border_styles: [None; 4],
+            computed_border_widths: [None; 4],
             border_top_width: None,
             border_right_width: None,
             border_bottom_width: None,
@@ -371,6 +423,7 @@ impl Default for Style {
             white_space: WhiteSpace::Normal,
             line_height: 1.2,
             line_height_is_normal: false,
+            line_height_computed_px: None,
             text_indent: Dimension::Px(0.0),
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
@@ -379,6 +432,9 @@ impl Default for Style {
             text_overflow: TextOverflow::Clip,
             font_family: None,
             font_style: FontStyle::Normal,
+            font_variant: FontVariant::Normal,
+            font_kerning: true,
+            font_feature_kern: None,
             word_break: WordBreak::Normal,
             direction: TextDirection::Ltr,
             unicode_bidi: UnicodeBidi::Normal,
@@ -414,15 +470,20 @@ impl Style {
     /// must retain its lengths so explicit inheritance can copy them.
     pub fn resolve_used_border_widths(&mut self) {
         for (line_style, width) in self.border_styles.iter().zip([
-            &mut self.border_top_width, &mut self.border_right_width,
-            &mut self.border_bottom_width, &mut self.border_left_width,
+            &mut self.border_top_width,
+            &mut self.border_right_width,
+            &mut self.border_bottom_width,
+            &mut self.border_left_width,
         ]) {
             if line_style.is_some_and(|style| !style.is_visible()) {
                 *width = Some(0.0);
             }
         }
-        if self.border_styles.iter().all(|style|
-            style.is_some_and(|style| !style.is_visible())) {
+        if self
+            .border_styles
+            .iter()
+            .all(|style| style.is_some_and(|style| !style.is_visible()))
+        {
             self.border_width = 0.0;
         }
     }
@@ -460,6 +521,9 @@ impl Style {
             gap,
             row_gap,
             column_gap,
+            column_width,
+            column_count,
+            column_fill,
             border_spacing_x,
             border_spacing_y,
             border_collapse,
@@ -503,6 +567,7 @@ impl Style {
             border_color,
             border_current_color,
             border_styles,
+            computed_border_widths,
             border_top_width,
             border_right_width,
             border_bottom_width,
@@ -516,6 +581,7 @@ impl Style {
             white_space,
             line_height,
             line_height_is_normal,
+            line_height_computed_px,
             text_indent,
             text_transform,
             letter_spacing,
@@ -524,6 +590,9 @@ impl Style {
             text_overflow,
             font_family,
             font_style,
+            font_variant,
+            font_kerning,
+            font_feature_kern,
             word_break,
             direction,
             unicode_bidi,
@@ -570,6 +639,9 @@ impl Style {
             gap: gap_b,
             row_gap: row_gap_b,
             column_gap: column_gap_b,
+            column_width: column_width_b,
+            column_count: column_count_b,
+            column_fill: column_fill_b,
             border_spacing_x: border_spacing_x_b,
             border_spacing_y: border_spacing_y_b,
             border_collapse: border_collapse_b,
@@ -613,6 +685,7 @@ impl Style {
             border_color: border_color_b,
             border_current_color: border_current_color_b,
             border_styles: border_styles_b,
+            computed_border_widths: computed_border_widths_b,
             border_top_width: border_top_width_b,
             border_right_width: border_right_width_b,
             border_bottom_width: border_bottom_width_b,
@@ -626,6 +699,7 @@ impl Style {
             white_space: white_space_b,
             line_height: line_height_b,
             line_height_is_normal: line_height_is_normal_b,
+            line_height_computed_px: line_height_computed_px_b,
             text_indent: text_indent_b,
             text_transform: text_transform_b,
             letter_spacing: letter_spacing_b,
@@ -634,6 +708,9 @@ impl Style {
             text_overflow: text_overflow_b,
             font_family: font_family_b,
             font_style: font_style_b,
+            font_variant: font_variant_b,
+            font_kerning: font_kerning_b,
+            font_feature_kern: font_feature_kern_b,
             word_break: word_break_b,
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
@@ -678,6 +755,9 @@ impl Style {
             && gap == gap_b
             && row_gap == row_gap_b
             && column_gap == column_gap_b
+            && column_width == column_width_b
+            && column_count == column_count_b
+            && column_fill == column_fill_b
             && border_spacing_x == border_spacing_x_b
             && border_spacing_y == border_spacing_y_b
             && border_collapse == border_collapse_b
@@ -721,6 +801,7 @@ impl Style {
             && border_color == border_color_b
             && border_current_color == border_current_color_b
             && border_styles == border_styles_b
+            && computed_border_widths == computed_border_widths_b
             && border_top_width == border_top_width_b
             && border_right_width == border_right_width_b
             && border_bottom_width == border_bottom_width_b
@@ -734,6 +815,7 @@ impl Style {
             && white_space == white_space_b
             && line_height == line_height_b
             && line_height_is_normal == line_height_is_normal_b
+            && line_height_computed_px == line_height_computed_px_b
             && text_indent == text_indent_b
             && text_transform == text_transform_b
             && letter_spacing == letter_spacing_b
@@ -742,6 +824,9 @@ impl Style {
             && text_overflow == text_overflow_b
             && font_family == font_family_b
             && font_style == font_style_b
+            && font_variant == font_variant_b
+            && font_kerning == font_kerning_b
+            && font_feature_kern == font_feature_kern_b
             && word_break == word_break_b
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
@@ -775,6 +860,10 @@ const fn default_overflow_anchor() -> bool {
     true
 }
 
+const fn default_font_kerning() -> bool {
+    true
+}
+
 const fn default_text_indent() -> Dimension {
     Dimension::Px(0.0)
 }
@@ -792,7 +881,7 @@ impl Style {
             Dimension::Percent(value) => containing_width * value / 100.0,
             Dimension::Rem(value) => value * 16.0,
             Dimension::Em(value) => value * self.font_size,
-            Dimension::Ch(value) => value * self.font_size * 0.5,
+            Dimension::Ch(value) => value * self.ch_advance(),
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
             Dimension::Auto => 0.0,
@@ -823,6 +912,23 @@ pub enum Display {
     ListItem,
     Contents,
     None,
+}
+
+impl Display {
+    /// CSS 2.1 overflow applies to block containers, not inline boxes or
+    /// non-cell internal table boxes.
+    pub fn establishes_overflow_clip(self) -> bool {
+        !matches!(
+            self,
+            Self::Inline
+                | Self::TableRow
+                | Self::TableRowGroup
+                | Self::TableHeaderGroup
+                | Self::TableFooterGroup
+                | Self::TableColumn
+                | Self::TableColumnGroup
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -941,6 +1047,7 @@ pub enum Spacing {
     Percent(f32),
     Rem(f32),
     Em(f32),
+    Ch(f32),
     Vw(f32),
     Vh(f32),
     Auto,
@@ -973,6 +1080,7 @@ impl Spacing {
             Spacing::Percent(_) | Spacing::Auto => 0.0,
             Spacing::Rem(v) => *v * 16.0,
             Spacing::Em(v) => *v * 16.0,
+            Spacing::Ch(v) => *v * 8.0,
             Spacing::Vw(_) | Spacing::Vh(_) => 0.0,
             Spacing::SafeAreaInset(edge) => insets.value(*edge),
             Spacing::Maximum { px, safe_area } => px.max(insets.value(*safe_area)),
@@ -1015,6 +1123,12 @@ pub struct Edges {
     pub left: Spacing,
 }
 
+/// Quantize a resolved margin/padding length at the used box-value boundary.
+/// Computed CSS lengths and glyph/letter-spacing advances stay unmodified.
+pub fn used_box_spacing(value: f32) -> f32 {
+    if value.is_finite() { (value * 64.0).trunc() / 64.0 } else { value }
+}
+
 impl Edges {
     pub const ZERO: Self = Self {
         top: Spacing::Px(0.0),
@@ -1050,15 +1164,16 @@ impl Edges {
         }
     }
 
-    fn resolve_lengths_with_font_size(
+    fn resolve_lengths_with_style(
         &self,
         insets: &SafeAreaInsets,
-        font_size: f32,
+        style: &Style,
     ) -> EdgeLengths {
-        let resolve = |value: Spacing| match value {
-            Spacing::Em(value) => value * font_size,
+        let resolve = |value: Spacing| used_box_spacing(match value {
+            Spacing::Em(value) => value * style.font_size,
+            Spacing::Ch(value) => value * style.ch_advance(),
             other => other.resolve(insets),
-        };
+        });
         EdgeLengths {
             top: resolve(self.top),
             right: resolve(self.right),
@@ -1069,6 +1184,13 @@ impl Edges {
 }
 
 impl Style {
+    /// Resolve against the current font, never cached pixels from an ancestor.
+    pub fn ch_advance(&self) -> f32 {
+        CH_ADVANCE_PROVIDER.with(|slot| slot.get()).and_then(|provider| provider(self))
+            .filter(|advance| advance.is_finite() && *advance >= 0.0)
+            .unwrap_or(self.font_size * 0.5)
+    }
+
     /// CSS corner radii in top-left, top-right, bottom-right, bottom-left order.
     pub fn border_corner_radii(&self) -> [f32; 4] {
         [
@@ -1082,31 +1204,80 @@ impl Style {
 
     pub fn padding_lengths(&self) -> EdgeLengths {
         self.padding
-            .resolve_lengths_with_font_size(&crate::safe_area::current(), self.font_size)
+            .resolve_lengths_with_style(&crate::safe_area::current(), self)
     }
 
     pub fn margin_lengths(&self) -> EdgeLengths {
         self.margin
-            .resolve_lengths_with_font_size(&crate::safe_area::current(), self.font_size)
+            .resolve_lengths_with_style(&crate::safe_area::current(), self)
     }
 
     pub fn resolved_overflow_x(&self) -> Overflow {
-        self.overflow_x.unwrap_or(self.overflow)
+        self.table_overflow(self.overflow_x.unwrap_or(self.overflow))
     }
 
     pub fn resolved_overflow_y(&self) -> Overflow {
-        self.overflow_y.unwrap_or(self.overflow)
+        self.table_overflow(self.overflow_y.unwrap_or(self.overflow))
+    }
+
+    fn table_overflow(&self, overflow: Overflow) -> Overflow {
+        if matches!(self.display, Display::Table | Display::InlineTable)
+            && matches!(overflow, Overflow::Auto | Overflow::Scroll)
+        {
+            Overflow::Visible
+        } else {
+            overflow
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Edges, Spacing, Style};
+    use super::{Display, Edges, Overflow, Spacing, Style};
+
+    #[test]
+    fn absolute_length_conversion_rounds_only_the_final_pixel_value() {
+        for (unit, scale) in [("pt", 96.0_f64 / 72.0), ("cm", 96.0 / 2.54),
+            ("mm", 96.0 / 25.4), ("q", 96.0 / 101.6), ("in", 96.0),
+            ("pc", 16.0), ("px", 1.0)] {
+            for number in ["10", "1.1", "-1.2345678901", "0.000017", "123.456789"] {
+                let expected = (number.parse::<f64>().unwrap() * scale) as f32;
+                let actual = super::parse_absolute_length_px(&format!("{number}{unit}")).unwrap();
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{number}{unit}");
+            }
+        }
+        assert_eq!(super::parse_absolute_length_px(" 12 "), Some(12.0));
+        assert_eq!(super::parse_absolute_length_px("invalid"), None);
+    }
+
+    #[test]
+    fn table_auto_and_scroll_overflow_are_visible() {
+        for display in [Display::Table, Display::InlineTable] {
+            for overflow in [Overflow::Auto, Overflow::Scroll] {
+                let style = Style {
+                    display,
+                    overflow,
+                    ..Style::default()
+                };
+                assert_eq!(style.resolved_overflow_x(), Overflow::Visible);
+                assert_eq!(style.resolved_overflow_y(), Overflow::Visible);
+            }
+        }
+        let block = Style {
+            display: Display::Block,
+            overflow: Overflow::Auto,
+            ..Style::default()
+        };
+        assert_eq!(block.resolved_overflow_x(), Overflow::Auto);
+    }
 
     #[test]
     fn normal_line_height_is_not_compatible_with_the_same_numeric_ratio() {
         let numeric = Style::default();
-        let normal = Style { line_height_is_normal: true, ..numeric.clone() };
+        let normal = Style {
+            line_height_is_normal: true,
+            ..numeric.clone()
+        };
         assert!(!numeric.eq_except_display(&normal));
         assert_ne!(numeric, normal);
     }
@@ -1312,7 +1483,7 @@ pub fn transformed_text<'a>(
             for character in text.chars() {
                 if character.is_alphanumeric() {
                     if at_word_start {
-                        push_css_uppercase(&mut output, character);
+                        push_css_titlecase(&mut output, character);
                     } else {
                         output.push(character);
                     }
@@ -1335,17 +1506,25 @@ fn push_css_uppercase(output: &mut String, character: char) {
         output.push(character);
         return;
     }
-    let simple_greek_uppercase = match codepoint {
+    output.extend(character.to_uppercase());
+}
+
+fn push_css_titlecase(output: &mut String, character: char) {
+    // Greek titlecase keeps ypogegrammeni, while full uppercase expands it
+    // to a separate capital iota. Do not use an old reftest's simple casing
+    // baseline as the uppercase rendering rule.
+    let codepoint = character as u32;
+    let greek_titlecase = match codepoint {
         0x1f80..=0x1f87 | 0x1f90..=0x1f97 | 0x1fa0..=0x1fa7 => char::from_u32(codepoint + 8),
         0x1fb3 => Some('\u{1fbc}'),
         0x1fc3 => Some('\u{1fcc}'),
         0x1ff3 => Some('\u{1ffc}'),
         _ => None,
     };
-    if let Some(character) = simple_greek_uppercase {
+    if let Some(character) = greek_titlecase {
         output.push(character);
     } else {
-        output.extend(character.to_uppercase());
+        push_css_uppercase(output, character);
     }
 }
 
@@ -1362,6 +1541,14 @@ pub enum FontStyle {
     Normal,
     Italic,
     Oblique,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FontVariant {
+    #[default]
+    Normal,
+    SmallCaps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

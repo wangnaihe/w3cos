@@ -418,6 +418,7 @@ fn text_input_delta(previous: &str, next: &str) -> (String, &'static str) {
 // HitNode — interactive region for click/focus
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct HitNode {
     rect: LayoutRect,
     index: usize,
@@ -425,6 +426,20 @@ struct HitNode {
     is_host_target: bool,
     is_focusable: bool,
     on_click: EventAction,
+}
+
+fn physical_column_hit_nodes(nodes: Vec<HitNode>, artifact: &PaintArtifact) -> Vec<HitNode> {
+    let mut seen = HashSet::new();
+    nodes.into_iter().filter(|node| seen.insert(node.index)).flat_map(|node| {
+        let fragments = artifact.column_fragments.get(node.index)
+            .filter(|fragments| !fragments.is_empty());
+        match fragments {
+            Some(fragments) => fragments.iter().map(|fragment| HitNode {
+                rect: fragment.visual_rect, ..node.clone()
+            }).collect::<Vec<_>>(),
+            None => vec![node],
+        }
+    }).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -2876,6 +2891,8 @@ impl App {
                     }),
             )
         };
+        let had_column_fragments = self.paint_artifact.column_fragments.iter()
+            .any(|fragments| !fragments.is_empty());
         self.paint_artifact = PaintArtifact::build_with_body_background_and_viewport(
             paint_nodes,
             &self.layout_cache,
@@ -2883,6 +2900,11 @@ impl App {
             canvas_body_index,
             Some((w, layout_h)),
         );
+        if had_column_fragments || self.paint_artifact.column_fragments.iter().any(|fragments| !fragments.is_empty()) {
+            self.hit_nodes = physical_column_hit_nodes(
+                std::mem::take(&mut self.hit_nodes), &self.paint_artifact);
+            self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+        }
         for (scroll_index, correction) in virtual_anchor_corrections {
             self.queue_scroll_damage(scroll_index, correction);
         }
@@ -3651,6 +3673,7 @@ impl App {
     fn paint_cpu(&mut self) {
         let layout_started = Instant::now();
         self.ensure_layout();
+        self.paint_artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
         crate::perf::record_layout(layout_started.elapsed());
         let paint_started = Instant::now();
 
@@ -3750,6 +3773,10 @@ impl App {
             .iter()
             .copied()
             .filter(|&(rect, idx)| {
+                // The existing culler consumes document-space overflow clips.
+                // Do not discard content using that space while the viewport
+                // transform is nonzero; Skia applies it to content and clips.
+                self.paint_artifact.viewport_scroll != (0.0, 0.0) ||
                 node_intersects_paint_cull(
                     idx,
                     rect,
@@ -3818,13 +3845,29 @@ impl App {
         });
 
         let table_replay = crate::table_paint::replay(&render_nodes, &self.paint_artifact);
-        let render_nodes = table_replay.iter().map(|node|
-            (node.index, node.rect, node.kind.as_ref(), node.style.as_ref())
-        ).collect::<Vec<_>>();
+        let render_nodes = table_replay
+            .iter()
+            .map(|node| {
+                (
+                    node.index,
+                    node.rect,
+                    node.kind.as_ref(),
+                    node.style.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>();
         let bidi_replay = crate::bidi_paint::replay(&render_nodes, &self.paint_artifact);
-        let render_nodes = bidi_replay.iter().map(|node|
-            (node.index, node.rect, node.kind.as_ref(), node.style.as_ref())
-        ).collect::<Vec<_>>();
+        let render_nodes = bidi_replay
+            .iter()
+            .map(|node| {
+                (
+                    node.index,
+                    node.rect,
+                    node.kind.as_ref(),
+                    node.style.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>();
         let scroll_info: Vec<Option<(f32, f32, LayoutRect)>> = scroll_info_raw
             .iter()
             .map(|si| {
@@ -5581,9 +5624,8 @@ impl App {
         if let Some(node) = flat.get(idx)
             && let ComponentKind::SvgDocument {
                 source,
-                width,
-                height,
                 event_targets,
+                ..
             } = node.kind
             && let Some((rect, _)) = self
                 .layout_cache
@@ -5593,12 +5635,16 @@ impl App {
             && rect.height > 0.0
         {
             let (layout_x, layout_y) = self.viewport_to_layout(self.mouse_x, self.mouse_y);
-            let raster_x = (layout_x - rect.x) * *width as f32 / rect.width;
-            let raster_y = (layout_y - rect.y) * *height as f32 / rect.height;
-            if let Some(mut host_ids) = crate::svg_renderer::hit_test(
+            let content = crate::svg_renderer::content_box(*rect, node.style);
+            if content.width <= 0.0 || content.height <= 0.0 { return Vec::new(); }
+            let width = content.width.ceil().max(1.0) as u32;
+            let height = content.height.ceil().max(1.0) as u32;
+            let raster_x = (layout_x - content.x) * width as f32 / content.width;
+            let raster_y = (layout_y - content.y) * height as f32 / content.height;
+            if let Some(mut host_ids) = crate::svg_renderer::hit_test_inline(
                 source,
-                *width,
-                *height,
+                width,
+                height,
                 event_targets,
                 raster_x,
                 raster_y,
@@ -6462,6 +6508,30 @@ fn direct_scroll_chain_parent(
 /// Build scroll info using pre-computed scroll ancestors and optionally the
 /// retained PrePaint ownership/geometry produced by the last layout pass.
 /// O(n) instead of O(n * tree_depth), with no tree walk on compositor scroll.
+pub(crate) fn build_headless_scroll_info(
+    scroll_ancestor: &[Option<usize>],
+    scrollable: &[(usize, LayoutRect, ScrollExtent)],
+    clip_only: &[(usize, LayoutRect)],
+    offsets: &HashMap<usize, (f32, f32)>,
+    layouts: &[(LayoutRect, usize)],
+    flat: &[layout::FlatNodeInfo<'_>],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Vec<Option<(f32, f32, LayoutRect)>> {
+    build_scroll_info_fast(
+        scroll_ancestor,
+        scrollable,
+        clip_only,
+        offsets,
+        &HashMap::new(),
+        layouts,
+        flat,
+        None,
+        viewport_w,
+        viewport_h,
+    )
+}
+
 fn build_scroll_info_fast<T: PaintNodeView>(
     scroll_ancestor: &[Option<usize>],
     scrollable: &[(usize, LayoutRect, ScrollExtent)],
@@ -6478,10 +6548,31 @@ fn build_scroll_info_fast<T: PaintNodeView>(
         return Vec::new();
     }
 
-    let scrollable_rect: HashMap<usize, LayoutRect> =
-        scrollable.iter().map(|(i, r, _)| (*i, *r)).collect();
-    let clip_only_rect: HashMap<usize, LayoutRect> =
-        clip_only.iter().map(|(i, r)| (*i, *r)).collect();
+    // Layout retains border boxes for hit testing and scroll extent. The
+    // compositor's visual overflow clip, like PaintArtifact's clip node, is
+    // the padding box (CSS 2.1 11.1.1).
+    let scrollable_rect: HashMap<usize, LayoutRect> = scrollable
+        .iter()
+        .map(|(i, r, _)| {
+            (
+                *i,
+                flat.get(*i).map_or(*r, |node| {
+                    crate::paint_artifact::overflow_clip_rect(node.paint_style(), *r)
+                }),
+            )
+        })
+        .collect();
+    let clip_only_rect: HashMap<usize, LayoutRect> = clip_only
+        .iter()
+        .map(|(i, r)| {
+            (
+                *i,
+                flat.get(*i).map_or(*r, |node| {
+                    crate::paint_artifact::overflow_clip_rect(node.paint_style(), *r)
+                }),
+            )
+        })
+        .collect();
     let mut owned_rect_by_index = Vec::new();
     let mut owned_sticky_owner = Vec::new();
     let (sticky_owner, rect_by_index) = if let Some(retained) = retained_prepaint {
@@ -8492,6 +8583,30 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn fixed_auto_multicol_hit_regions_keep_identity_and_remove_logical_overflow() {
+        use crate::paint_artifact::ColumnFragment;
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 15.0, height: 250.0 };
+        let node = HitNode { rect, index: 0, is_interactive: true,
+            is_host_target: true, is_focusable: true, on_click: EventAction::None };
+        let mut artifact = PaintArtifact::default();
+        artifact.column_fragments = vec![(0..3).map(|column| ColumnFragment {
+            visual_rect: LayoutRect { x: column as f32 * 100.0, y: 0.0,
+                width: 15.0, height: if column == 2 { 50.0 } else { 100.0 } },
+            translate_x: column as f32 * 100.0, translate_y: -(column as f32 * 100.0),
+            clip_top: 0.0, clip_bottom: 100.0,
+        }).collect()];
+        let hits = physical_column_hit_nodes(vec![node.clone(), node], &artifact);
+        assert_eq!(hits.len(), 3, "retained fragments must not expand twice");
+        assert!(hits.iter().all(|hit| hit.index == 0 && hit.is_focusable));
+        let grid = SpatialGrid::build(&hits, 300.0, 300.0);
+        for x in [5.0, 105.0, 205.0] {
+            assert_eq!(grid.query(x, 25.0, &hits, &[None]), Some(0));
+        }
+        assert_eq!(grid.query(205.0, 75.0, &hits, &[None]), None);
+        assert_eq!(grid.query(5.0, 150.0, &hits, &[None]), None);
+    }
+
+    #[test]
     fn hit_order_prefers_dom_host_over_higher_z_lowered_button_node() {
         let rect = LayoutRect {
             x: 20.0,
@@ -9475,6 +9590,67 @@ mod scroll_physics_tests {
         let (_, sy, visual_clip) = scroll_info[3].unwrap();
         assert_eq!(sy, 250.0);
         assert_eq!(visual_clip.y, 100.0);
+    }
+
+    #[test]
+    fn compositor_overflow_clip_excludes_the_border_for_scroll_and_hidden() {
+        let border_box = LayoutRect {
+            x: 10.0,
+            y: 20.0,
+            width: 110.0,
+            height: 30.0,
+        };
+        let expected = LayoutRect {
+            x: 15.0,
+            y: 25.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        for overflow in [
+            w3cos_std::style::Overflow::Hidden,
+            w3cos_std::style::Overflow::Scroll,
+        ] {
+            let root = Component::root(vec![Component::column(
+                w3cos_std::Style {
+                    display: w3cos_std::style::Display::Block,
+                    overflow,
+                    border_width: 5.0,
+                    ..w3cos_std::Style::default()
+                },
+                vec![Component::column(w3cos_std::Style::default(), vec![])],
+            )]);
+            let flat = layout::pre_flatten(&root);
+            let scrollable = if overflow == w3cos_std::style::Overflow::Scroll {
+                vec![(
+                    1,
+                    border_box,
+                    ScrollExtent {
+                        max_x: 0.0,
+                        max_y: 10.0,
+                    },
+                )]
+            } else {
+                Vec::new()
+            };
+            let clip_only = if overflow == w3cos_std::style::Overflow::Hidden {
+                vec![(1, border_box)]
+            } else {
+                Vec::new()
+            };
+            let scroll_info = build_scroll_info_fast(
+                &[None, None, Some(1)],
+                &scrollable,
+                &clip_only,
+                &HashMap::new(),
+                &HashMap::new(),
+                &[(border_box, 1), (border_box, 2)],
+                &flat,
+                None,
+                800.0,
+                600.0,
+            );
+            assert_eq!(scroll_info[2].unwrap().2, expected, "{overflow:?}");
+        }
     }
 
     #[test]

@@ -1021,6 +1021,7 @@ fn parse_declarations(block: &str) -> StyleDecl {
 }
 
 fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
+    if !w3cos_dom::css_style::valid_multicol_declaration(property, value) { return; }
     if property.starts_with("--") {
         let props = style.custom_properties.get_or_insert_with(HashMap::new);
         props.insert(property.to_string(), value.to_string());
@@ -1037,6 +1038,27 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         }
         "row-gap" => style.row_gap = css_parse_px(value),
         "column-gap" => style.column_gap = css_parse_px(value),
+        "column-width" => {
+            if let Some(width) = w3cos_dom::css_style::parse_column_width(value) {
+                style.column_width = Some(width);
+            }
+        }
+        "column-count" => {
+            if let Some(count) = w3cos_dom::css_style::parse_column_count(value) {
+                style.column_count = Some(count.into());
+            }
+        }
+        "column-fill" => {
+            if let Some(fill) = w3cos_dom::css_style::parse_column_fill(value) {
+                style.column_fill = Some(fill);
+            }
+        }
+        "columns" => {
+            if let Some((width, count)) = w3cos_dom::css_style::parse_columns(value) {
+                style.column_width = Some(width);
+                style.column_count = Some(count.into());
+            }
+        }
         "border-spacing" => {
             let values: Vec<f32> = value.split_whitespace().filter_map(css_parse_px).collect();
             if let Some(x) = values.first().copied() {
@@ -1078,6 +1100,10 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
             style.font_family = Some(value.trim_matches('"').trim_matches('\'').to_string())
         }
         "font-style" => style.font_style = Some(value.to_string()),
+        "font-variant" => match value.trim().to_ascii_lowercase().as_str() {
+            "normal" | "small-caps" => style.font_variant = Some(value.trim().to_ascii_lowercase()),
+            _ => {},
+        },
         "color" => style.color = Some(value.to_string()),
         "background" => {
             let parsed = w3cos_std::background::parse_shorthand(value);
@@ -1370,6 +1396,7 @@ fn css_parse_padding_spacing(value: &str) -> Option<Spacing> {
         | Spacing::Percent(value)
         | Spacing::Rem(value)
         | Spacing::Em(value)
+        | Spacing::Ch(value)
         | Spacing::Vw(value)
         | Spacing::Vh(value)
             if value < 0.0 =>
@@ -1496,16 +1523,35 @@ fn parse_font_weight(value: &str) -> Option<u16> {
 }
 
 fn apply_font_shorthand(style: &mut StyleDecl, value: &str) {
-    let Some((before_line_height, after_slash)) = value.split_once('/') else {
-        return;
+    let (before_line_height, after_slash) = value.split_once('/')
+        .map_or((value, None), |(before, after)| (before, Some(after)));
+    let parts = before_line_height.split_ascii_whitespace().collect::<Vec<_>>();
+    let size_index = if after_slash.is_some() { parts.len().checked_sub(1) } else {
+        parts.iter().position(|token| ["px", "pt", "pc", "in", "cm", "mm", "q", "em", "rem", "%"]
+            .into_iter().any(|unit| token.strip_suffix(unit).is_some_and(|value| value.parse::<f32>().is_ok())))
     };
-    let Some(size) = before_line_height.split_ascii_whitespace().next_back() else {
-        return;
-    };
+    let Some(size_index) = size_index else { return; };
+    let size = parts[size_index];
+    if parts[..size_index].iter().any(|token|
+        !matches!(*token, "normal" | "italic" | "oblique" | "small-caps" | "bold" | "bolder" | "lighter")
+            && parse_font_weight(token).is_none()) { return; }
+    let family = if let Some(after_slash) = after_slash {
+        let after_slash = after_slash.trim_start();
+        let line_height_end = after_slash.find(char::is_whitespace).unwrap_or(after_slash.len());
+        after_slash[line_height_end..].trim().to_string()
+    } else { parts[size_index + 1..].join(" ") };
+    if family.is_empty() { return; }
+    style.font_variant = Some(if parts[..size_index].contains(&"small-caps") {
+        "small-caps"
+    } else { "normal" }.to_string());
     if let Some(size) = w3cos_std::style::parse_absolute_length_px(size) {
         style.font_size = Some(size);
     }
 
+    let Some(after_slash) = after_slash else {
+        style.font_family = Some(family.trim_matches('"').trim_matches('\'').to_string());
+        return;
+    };
     let after_slash = after_slash.trim_start();
     let line_height_end = after_slash
         .find(char::is_whitespace)
@@ -1631,6 +1677,17 @@ mod tests {
     }
 
     #[test]
+    fn small_caps_survive_longhand_and_both_font_shorthand_forms() {
+        for value in ["font-variant:small-caps", "font:small-caps 96px serif",
+            "font:small-caps 96px/1 serif"] {
+            let sheet = parse_css(&format!("p {{{value}}}"));
+            assert_eq!(sheet.rules[0].style.font_variant.as_deref(), Some("small-caps"));
+        }
+        let sheet = parse_css("p {font-variant:small-caps; font:16px serif}");
+        assert_eq!(sheet.rules[0].style.font_variant.as_deref(), Some("normal"));
+    }
+
+    #[test]
     fn text_indent_is_retained_for_typed_codegen() {
         let sheet = parse_css("p { text-indent: +72pt; }");
         assert_eq!(sheet.rules[0].style.text_indent.as_deref(), Some("+72pt"));
@@ -1645,6 +1702,20 @@ mod tests {
         assert_eq!(style.padding, Some(Spacing::Px(4.0)));
         assert_eq!(style.padding_top, Some(Spacing::Px(4.0)));
         assert_eq!(style.padding_bottom, Some(Spacing::Px(4.0)));
+    }
+
+    #[test]
+    fn multicol_static_css_preserves_valid_values_and_shorthand_resets() {
+        let sheet = parse_css("div { columns: 3 100px; column-width: 20%; column-count: 0; column-fill: auto; }");
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.column_width, Some(w3cos_std::style::Dimension::Px(100.0)));
+        assert_eq!(style.column_count, Some(crate::parser::ColumnCount::Count(3)));
+        assert_eq!(style.column_fill, Some(w3cos_std::style::ColumnFill::Auto));
+        let sheet = parse_css("div { columns: 3 100px; columns: auto; column-fill: unset; }");
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.column_width, Some(w3cos_std::style::Dimension::Auto));
+        assert_eq!(style.column_count, Some(crate::parser::ColumnCount::Auto));
+        assert_eq!(style.column_fill, Some(w3cos_std::style::ColumnFill::Balance));
     }
 
     #[test]

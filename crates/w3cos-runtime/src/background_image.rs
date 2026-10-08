@@ -3,6 +3,40 @@ use w3cos_std::background::split_top_level;
 use w3cos_std::style::Style;
 
 const MAX_BACKGROUND_TILES_PER_LAYER: usize = 4096;
+const FIXED_BACKGROUND_VIEWPORT: &str = "--w3cos-internal-fixed-background-viewport";
+const FIXED_BACKGROUND_POSITION: &str = "--w3cos-internal-fixed-background-position";
+
+/// Snapshot frame geometry before canvas propagation rewrites default origins.
+/// These private paint values are refreshed, not inherited from a prior frame.
+pub(crate) fn annotate_fixed_background_viewport(style: &mut Style, viewport: Option<(f32, f32)>) {
+    if let Some(properties) = style.custom_properties.as_mut() {
+        properties.remove(FIXED_BACKGROUND_VIEWPORT);
+        properties.remove(FIXED_BACKGROUND_POSITION);
+    }
+    let Some((width, height)) = viewport.filter(|(width, height)| {
+        width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0
+    }) else {
+        return;
+    };
+    if !style.background_attachment.as_deref().is_some_and(|attachments| {
+        attachments.split(',').any(|attachment| attachment.trim().eq_ignore_ascii_case("fixed"))
+    }) {
+        return;
+    }
+    let position = style.background_position.clone().unwrap_or_else(|| "0% 0%".into());
+    let properties = style.custom_properties.get_or_insert_with(Default::default);
+    properties.insert(FIXED_BACKGROUND_VIEWPORT.into(), format!("{width} {height}"));
+    properties.insert(FIXED_BACKGROUND_POSITION.into(), position);
+}
+
+fn fixed_background_viewport(style: &Style) -> Option<LayoutRect> {
+    let value = style.custom_properties.as_ref()?.get(FIXED_BACKGROUND_VIEWPORT)?;
+    let mut parts = value.split_ascii_whitespace();
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    (parts.next().is_none() && width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some(LayoutRect { x: 0.0, y: 0.0, width, height })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct RasterBackgroundLayer {
@@ -10,6 +44,10 @@ pub(crate) struct RasterBackgroundLayer {
     pub source: String,
     pub clip: BackgroundClip,
     pub tiles: Vec<LayoutRect>,
+    pub repeat_shader_tile: Option<LayoutRect>,
+    /// A non-repeating raster axis snaps its destination to device pixels;
+    /// repeating axes retain the subpixel sampling phase across tile seams.
+    pub snap_raster_axes: (bool, bool),
     pub blend_mode: BackgroundBlendMode,
 }
 
@@ -23,6 +61,7 @@ pub(crate) struct BackgroundClip {
 pub(crate) struct BackgroundGeometry {
     pub clip: BackgroundClip,
     pub tiles: Vec<LayoutRect>,
+    pub repeat_shader_tile: Option<LayoutRect>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,11 +202,19 @@ fn raster_background_layers_with_overrides(
                 positioning_area,
                 clip_override,
             )?;
+            let (repeat_x, repeat_y) = parse_repeat(layer_value(
+                style.background_repeat.as_deref(), index, "repeat",
+            ));
             Some(RasterBackgroundLayer {
                 layer_index: index,
                 source,
                 clip: geometry.clip,
                 tiles: geometry.tiles,
+                repeat_shader_tile: geometry.repeat_shader_tile,
+                snap_raster_axes: (
+                    matches!(repeat_x, Repeat::NoRepeat),
+                    matches!(repeat_y, Repeat::NoRepeat),
+                ),
                 blend_mode: layer_blend_mode(style, index),
             })
         })
@@ -353,14 +400,19 @@ fn layer_geometry(
     let clip_value = layer_value(style.background_clip.as_deref(), index, "border-box");
     let mut positioning_area = positioning_override
         .unwrap_or_else(|| background_box(style, border_box, parse_box(origin)));
-    if layer_value(style.background_attachment.as_deref(), index, "scroll")
-        .eq_ignore_ascii_case("fixed")
-    {
+    let fixed = layer_value(style.background_attachment.as_deref(), index, "scroll")
+        .eq_ignore_ascii_case("fixed");
+    let fixed_viewport = fixed.then(|| fixed_background_viewport(style)).flatten();
+    if fixed {
         // Layout rects are already expressed in viewport coordinates. Anchoring
         // the positioning area at the viewport origin keeps the image phase
         // stable while the element clip moves during scrolling.
-        positioning_area.x = 0.0;
-        positioning_area.y = 0.0;
+        if let Some(viewport) = fixed_viewport {
+            positioning_area = viewport;
+        } else {
+            positioning_area.x = 0.0;
+            positioning_area.y = 0.0;
+        }
     }
     let clip_kind = parse_box(clip_value);
     let clip_rect = background_box(style, border_box, clip_kind);
@@ -421,7 +473,10 @@ fn layer_geometry(
             width = height * ratio;
         }
     }
-    let position = layer_value(style.background_position.as_deref(), index, "0% 0%");
+    let original_position = fixed_viewport.and_then(|_| {
+        style.custom_properties.as_ref()?.get(FIXED_BACKGROUND_POSITION).map(String::as_str)
+    });
+    let position = layer_value(original_position.or(style.background_position.as_deref()), index, "0% 0%");
     let (position_x, position_y) = resolve_position_with_ex(
         position,
         positioning_area,
@@ -448,6 +503,18 @@ fn layer_geometry(
         height,
         repeat_y,
     );
+    let repeat_shader_tile = (xs.len().saturating_mul(ys.len()) >= MAX_BACKGROUND_TILES_PER_LAYER
+        && matches!(repeat_x, Repeat::Repeat | Repeat::Round)
+        && matches!(repeat_y, Repeat::Repeat | Repeat::Round))
+    .then(|| {
+        xs.first().zip(ys.first()).map(|(x, y)| LayoutRect {
+            x: *x,
+            y: *y,
+            width,
+            height,
+        })
+    })
+    .flatten();
     let mut tiles = Vec::with_capacity(
         xs.len()
             .saturating_mul(ys.len())
@@ -466,7 +533,11 @@ fn layer_geometry(
             });
         }
     }
-    Some(BackgroundGeometry { clip, tiles })
+    Some(BackgroundGeometry {
+        clip,
+        tiles,
+        repeat_shader_tile,
+    })
 }
 
 fn layer_blend_mode(style: &Style, index: usize) -> BackgroundBlendMode {
@@ -672,7 +743,10 @@ fn svg_intrinsic_length(value: crate::image_loader::SvgIntrinsicLength) -> Lengt
     match value {
         crate::image_loader::SvgIntrinsicLength::Auto => Length::Auto,
         crate::image_loader::SvgIntrinsicLength::Px(value) => Length::Px(value),
-        crate::image_loader::SvgIntrinsicLength::Percent(value) => Length::Percent(value),
+        // SVG root percentages depend on the image viewport; they are not
+        // intrinsic CSS image dimensions. `background-size: auto` supplies
+        // the positioning area when no absolute dimension/ratio is present.
+        crate::image_loader::SvgIntrinsicLength::Percent(_) => Length::Auto,
     }
 }
 
@@ -1250,16 +1324,42 @@ mod tests {
             border_left_width: Some(2.0),
             ..Style::default()
         };
-        let rect = LayoutRect { x: 138.0, y: 55.0, width: 57.0, height: 19.0 };
+        let rect = LayoutRect {
+            x: 138.0,
+            y: 55.0,
+            width: 57.0,
+            height: 19.0,
+        };
         assert_eq!(background_box(&style, rect, BoxKind::Border), rect);
-        assert_eq!(background_box(&style, rect, BoxKind::Padding),
-            LayoutRect { x: 139.0, y: 57.0, width: 55.0, height: 15.0 });
+        assert_eq!(
+            background_box(&style, rect, BoxKind::Padding),
+            LayoutRect {
+                x: 139.0,
+                y: 57.0,
+                width: 55.0,
+                height: 15.0
+            }
+        );
         style.border_left_width = Some(6.0);
-        assert_eq!(background_box(&style, rect, BoxKind::Padding),
-            LayoutRect { x: 141.0, y: 57.0, width: 53.0, height: 15.0 });
+        assert_eq!(
+            background_box(&style, rect, BoxKind::Padding),
+            LayoutRect {
+                x: 141.0,
+                y: 57.0,
+                width: 53.0,
+                height: 15.0
+            }
+        );
         style.border_collapse = false;
-        assert_eq!(background_box(&style, rect, BoxKind::Padding),
-            LayoutRect { x: 144.0, y: 59.0, width: 49.0, height: 11.0 });
+        assert_eq!(
+            background_box(&style, rect, BoxKind::Padding),
+            LayoutRect {
+                x: 144.0,
+                y: 59.0,
+                width: 49.0,
+                height: 11.0
+            }
+        );
     }
 
     fn install_image(source: &str, width: u32, height: u32) {
@@ -1521,13 +1621,12 @@ mod tests {
             "auto",
             area,
             Some(IntrinsicSize {
-                width: Length::Percent(0.4),
-                height: Length::Percent(0.6),
+                width: svg_intrinsic_length(crate::image_loader::SvgIntrinsicLength::Percent(0.4)),
+                height: svg_intrinsic_length(crate::image_loader::SvgIntrinsicLength::Percent(0.6)),
                 ratio: None,
             }),
         );
-        assert!((percentages.0 - 32.0).abs() < 0.001);
-        assert!((percentages.1 - 60.0).abs() < 0.001);
+        assert_eq!(percentages, (80.0, 100.0));
     }
 
     #[test]
@@ -1646,6 +1745,50 @@ mod tests {
         ));
         assert_eq!(layers[0].blend_mode, BackgroundBlendMode::Multiply);
         assert_eq!(layers[1].blend_mode, BackgroundBlendMode::Screen);
+    }
+
+    #[test]
+    fn fixed_background_percentages_use_the_artifact_viewport_extent() {
+        use crate::paint_artifact::{PaintArtifact, PaintNode};
+        use w3cos_std::component::ComponentKind;
+
+        let body = LayoutRect { x: 51.0, y: 51.0, width: 698.0, height: 212.0 };
+        let nodes = [
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    background: w3cos_std::color::Color::rgb(0, 0, 128),
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    border_width: 3.0,
+                    background_image: Some("linear-gradient(red, blue)".into()),
+                    background_size: Some("17px 17px".into()),
+                    background_repeat: Some("no-repeat".into()),
+                    background_position: Some("50% 50%".into()),
+                    background_attachment: Some("fixed".into()),
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+        let artifact = PaintArtifact::build_with_body_background_and_viewport(
+            nodes,
+            &[(LayoutRect { x: 16.0, y: 16.0, width: 768.0, height: 282.0 }, 0), (body, 1)],
+            1,
+            Some(1),
+            Some((800.0, 600.0)),
+        );
+        let layers = gradient_background_layers(&artifact.nodes[1].style, body);
+        let tile = layers[0].geometry.tiles[0];
+        assert_eq!((tile.x, tile.y), (391.5, 291.5));
+        assert_eq!(layers[0].geometry.clip.rect, body);
     }
 
     #[test]

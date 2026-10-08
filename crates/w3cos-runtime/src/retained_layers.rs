@@ -140,6 +140,11 @@ pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
             .flatten();
         let same_as_current = layers.last().is_some_and(|layer: &CompositorLayer| {
             layer.properties == chunk.properties && layer.sticky_owner == sticky
+                && layer.client_indices.first().zip(artifact.display_items.get(chunk.begin))
+                    .is_some_and(|(previous, item)| {
+                        artifact.viewport_attached(*previous)
+                            == artifact.viewport_attached(item.client_index)
+                    })
         });
         if same_as_current {
             let layer = layers.last_mut().expect("current layer");
@@ -294,6 +299,7 @@ fn compositor_fingerprint(
     }
     for effect in &artifact.properties.effects {
         effect.opacity.to_bits().hash(&mut hasher);
+        effect.isolates_surface.hash(&mut hasher);
     }
     let mut opacity_over: Vec<_> = overrides.opacity.iter().collect();
     opacity_over.sort_by_key(|(id, _)| *id);
@@ -413,6 +419,11 @@ fn hash_paint_style(style: &Style, hasher: &mut impl Hasher) {
     style.word_spacing.to_bits().hash(hasher);
     std::mem::discriminant(&style.text_decoration).hash(hasher);
     style.outline_width.to_bits().hash(hasher);
+    style.outline_color.r.hash(hasher);
+    style.outline_color.g.hash(hasher);
+    style.outline_color.b.hash(hasher);
+    style.outline_color.a.hash(hasher);
+    std::mem::discriminant(&style.outline_style).hash(hasher);
 }
 
 pub fn layer_scroll_translation(
@@ -482,6 +493,21 @@ mod tests {
     use w3cos_std::style::{Float, Overflow, Position, Style, Transform2D};
 
     use crate::paint_artifact::PaintNode;
+
+    #[test]
+    fn outline_color_and_line_style_invalidate_paint_fingerprint() {
+        let fingerprint=|style:&Style| {
+            let mut hash=std::collections::hash_map::DefaultHasher::new();
+            hash_paint_style(style,&mut hash);hash.finish()
+        };
+        let base=Style {outline_width:4.0,
+            outline_style:w3cos_std::style::OutlineStyle::Solid,
+            outline_color:w3cos_std::Color::rgb(128,0,128),..Style::default()};
+        let recolored=Style {outline_color:w3cos_std::Color::BLACK,..base.clone()};
+        let dashed=Style {outline_style:w3cos_std::style::OutlineStyle::Dashed,..base.clone()};
+        assert_ne!(fingerprint(&base),fingerprint(&recolored));
+        assert_ne!(fingerprint(&base),fingerprint(&dashed));
+    }
 
     fn rect(y: f32) -> LayoutRect {
         LayoutRect {
