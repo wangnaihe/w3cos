@@ -1,5 +1,114 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication checkpoint: first-line and opacity candidate
+
+The user authorizes publishing the accumulated vendor-only changes from base
+5993c00c5169ae8f02a0ce919f543d79a4c0244b to origin/main. The first-line evidence
+below remains bounded to its measured partition: 25 browser-exact originals,
+9 exact dynamic insertion controls, and independently retained strict failures.
+Earlier statements that these batches were local describe their pre-publication
+state; publication does not change their acceptance level.
+
+The opacity candidate additionally replaces legacy layer alpha composition
+with normalized float32 SrcOver and explicit UNORM8 rounding. V2645 retains
+the genuine RED; V2646 retains a failed intermediate candidate. Chromium V2647
+provides 40 independent solid-color samples. V2649 passes six focused runtime
+tests, including all 40 samples, baked/retained paths and replay, ordinary alpha,
+oval layer boundaries, filters and canvas upload. This is focused unit evidence,
+not repaired WPT originals: the runner has not yet been rebuilt for the opacity
+candidate, and its four original opacity stacking controls remain NOT_RUN on
+that candidate. Next rebuild the runner and compare those controls, then rerun
+the first-line and insertion partitions with source-bound receipts.
+
+No full 6,548-case rerun, current global remaining count or completion claim.
+Parent source and pin remain untouched. The size gate still reports six
+preexisting outside-vendor violations. No Product Agent business semantics or
+contract impact; no upstream fixtures, pixel tolerances or failure waivers change.
+
+## 2026-10-09 First-line browser partition: 25/25 exact, strict failures retained
+
+V2632 replays the three remaining originals with layout/style diagnostics.
+Native floats-002 is green, and inherit-002/003 have green text backgrounds.
+Direct browser PNG inspection establishes the opposite oracle: red float text
+and red inherited first-line backgrounds. Earlier color-direction inference
+was reversed. The browser originals contradict their green strict references;
+the user explicitly prioritizes browser pixel parity and separate strict failure
+retention. No upstream test, reference, fuzzy allowance or tolerance is changed.
+
+V2633 retains valid DOM RED for explicit background inheritance and a nested
+float with a real text-node child. V2634 exposes an additional invalid fixture:
+setting a raw style attribute in that direct Document test did not create a
+float. It now uses the style API and asserts Float::Left before its color.
+The common first-line traversal excludes floated content at every inline depth.
+Computed background inherit retains source-local provenance so the pseudo can
+supply its first-line inheritance parent, while authored descendant backgrounds
+stay independent. The new blue-descendant control also checks provenance does
+not leak through inherited custom properties. V2635 passes 8 focused controls.
+
+After a 2m00s runner rebuild, V2637 compares all 25 first-line original reftests:
+25 browser-exact, zero gaps and zero unverified. Floats-002 falls from 991 to 0;
+inherit-002/003 from 1253 each to 0. All reference/native-browser comparisons
+are also zero, and previously repaired cases remain exact. Browser PNG bytes
+are unchanged. V2639 retains 9/9 dynamic insertion originals at browser-exact
+and strict zero. V2642 passes the single remove-float-in-first-line testharness
+subtest (no crash or DCHECK failure); this is native harness evidence, not a
+browser pixel measurement or a broader behavioral acceptance claim.
+
+Strict native/reference and browser/reference remain separately FAILED for
+14 cases each, including the three newly browser-exact originals. V2636 retains
+the DOM partition at 210 passed, 9 unchanged failures and 1 ignored. Prior
+runtime failures remain in the previous checkpoint's independent ledger, not
+freshly rerun in this batch. The first-line partition is NOT strictly green.
+
+V2641 binds RED, fixture correction, current source/runner hashes, unchanged
+oracles, regressions, harness and both strict ledgers:
+`target/wpt-targeted/baseline-font-position-20261003/first-line-inherit-float-checkpoint-v2641.json`.
+No full 6,548-case rerun or current global remaining count; goal incomplete.
+Changes remain local, uncommitted and unpushed. Parent source/pin untouched;
+6 preexisting outside-vendor size violations remain. Generic rendering changes
+have no Product Agent business semantics or contract impact. Continue with the
+next recorded browser gap group while retaining strict and unit failures.
+
+## 2026-10-09 First-line 014/015/016 browser-exact: 22/25 in focused partition
+
+At published base 5993c00c5169ae8f02a0ce919f543d79a4c0244b, V2616 retains a
+genuine layout RED: a bottom-aligned 20px inline with a top-aligned 100px
+descendant incorrectly places its anonymous text 80px below the segment top.
+The common keyword projection now uses that descendant's line top, preserving
+half-leading and independently positioned glyphs. A single-line principal
+font box follows its anonymous text; multiline unions are not shifted.
+V2617 passes 4 focused controls. After a 1m56s runner rebuild, V2618 reduces
+original 016 from 9768 to 6000 browser pixels, with all previously exact cases
+unchanged. V2620 retains 9/9 exact dynamic insertion controls.
+
+V2623 then retains a separate genuine paint RED: background shorthand lowers
+an absent image to explicit `Some("none")`, whereas the principal-font-box
+paint path accepted only `None`. Both absent-image representations now use
+the same decoration geometry; actual background images remain excluded.
+V2624 passes 6 focused controls, including both representations and the
+independent top/bottom geometry regression. The runner rebuild takes 1m58s.
+
+V2625 measures 25 original first-line reftests: 22 browser-exact, 3 gaps and
+zero unverified. 014/015/016 are now 0 actual/browser and 0 reference/browser
+pixels, down from 1125/8000/9768. 012/013 remain exact. The remaining browser
+gaps are floats-002 at 991 and inherit-002/003 at 1253 each. Browser PNG bytes
+are unchanged across both repair stages. V2627 retains 9/9 dynamic insertion
+originals at browser-exact and strict zero.
+
+V2629 binds RED, both candidate stages, source and runner hashes, unchanged
+browser oracles and per-case independent strict native/reference and
+browser/reference ledgers. V2630 preserves the two existing image/top-alignment
+runtime failures with unchanged coordinates. V2631 retains the DOM partition
+at 209 passed, 9 unchanged failures and 1 ignored, separately FAILED.
+Strict reference contradictions remain FAILED even for browser-exact cases.
+
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/first-line-top-none-checkpoint-v2629.json`.
+No full 6,548-case rerun, current global remaining count or completion claim.
+This batch remains local, uncommitted and unpushed. Parent source/pin untouched;
+6 preexisting outside-vendor size violations remain. Generic rendering repairs
+have no Product Agent business semantics or contract impact. Next isolate the
+three remaining first-line inheritance/float gaps, retaining strict failures.
+
 ## 2026-10-09 Publication checkpoint: first-line clipping, geometry and backgrounds
 
 The user authorizes committing and pushing the accumulated vendor-only changes

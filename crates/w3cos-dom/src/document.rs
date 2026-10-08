@@ -2161,12 +2161,20 @@ impl Document {
         {
             style.background = style.color;
         }
+        // This is source provenance, not an inheritable custom declaration.
+        // Only an explicit background inherit participates in the first-line
+        // pseudo's inheritance parent; authored descendant colors stay local.
+        if let Some(properties) = style.custom_properties.as_mut() {
+            properties.remove("--w3cos-internal-background-inherit");
+        }
         if let Some((property, value)) =
             declared_property_value(&["background", "background-color", "backgroundColor"])
             && value.trim().eq_ignore_ascii_case("inherit")
             && let Some(parent) = inherited
         {
             style.background = parent.background;
+            style.custom_properties.get_or_insert_with(Default::default)
+                .insert("--w3cos-internal-background-inherit".into(), "1".into());
             if css_property_eq(property, "background") {
                 style.background_image = parent.background_image.clone();
                 style.background_size = parent.background_size.clone();
@@ -9606,7 +9614,9 @@ fn first_line_text_style(
         .filter(|(property, _, _)| !css_property_eq(property, "vertical-align"))
         .cloned().collect::<Vec<_>>();
     let declarations = supported.as_slice();
-    let preserves_background = base.background.a != 0;
+    let preserves_background = base.background.a != 0
+        && base.custom_properties.as_ref().is_none_or(|properties|
+            !properties.contains_key("--w3cos-internal-background-inherit"));
     let preserves_vertical_align = base.align_self != w3cos_std::style::AlignSelf::Auto;
     let group_background = |style: &mut w3cos_std::style::Style| {
         if !preserves_background && style.background.a > 0 {
@@ -10148,7 +10158,6 @@ fn apply_first_line_style(
         fragment_height,
         available_width,
         &mut used_width,
-        false,
     )
 }
 
@@ -10158,7 +10167,6 @@ fn apply_first_line_style_inner(
     fragment_height: f32,
     available_width: Option<f32>,
     used_width: &mut f32,
-    inside_first_line_inline: bool,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut index = 0;
@@ -10174,33 +10182,8 @@ fn apply_first_line_style_inner(
         }
 
         if components[index].style.float != w3cos_std::style::Float::None {
-            if inside_first_line_inline {
-                if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
-                    if !content.is_empty() {
-                        let advance = first_line_text_advance(content, &components[index].style);
-                        components[index].style = first_line_text_style(
-                            &components[index].style,
-                            declarations,
-                            fragment_height,
-                        );
-                        changed = true;
-                        *used_width += advance;
-                    }
-                } else {
-                    let (nested_changed, stopped) = apply_first_line_style_inner(
-                        &mut components[index].children,
-                        declarations,
-                        fragment_height,
-                        available_width,
-                        used_width,
-                        true,
-                    );
-                    changed |= nested_changed;
-                    if stopped {
-                        return (changed, true);
-                    }
-                }
-            }
+            // Out-of-flow content is outside this first-line pseudo even
+            // when a transparent inline ancestor encloses it.
             index += 1;
             continue;
         }
@@ -10255,7 +10238,6 @@ fn apply_first_line_style_inner(
                 fragment_height,
                 available_width,
                 used_width,
-                true,
             );
             changed |= nested_changed;
             if stopped {
@@ -17701,8 +17683,36 @@ mod image_component_tests {
         );
         assert_eq!(
             runs[0].1.background,
-            w3cos_std::Color::from_named("green").unwrap()
+            // Chromium inherits from the first-line pseudo parent here,
+            // contrary to this WPT's green strict reference.
+            w3cos_std::Color::from_named("red").unwrap()
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_background_inherit_provenance_does_not_override_authored_descendant() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("background", "green")]);
+        crate::stylesheet::register_rule("div::first-line", &[("background-color", "red")]);
+        crate::stylesheet::register_rule("span.outer", &[("background", "inherit")]);
+        crate::stylesheet::register_rule("span.inner", &[("background", "blue")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let outer = document.create_element("span");
+        outer.set_attribute(&mut document, "class", "outer");
+        let inner = document.create_element("span");
+        inner.set_attribute(&mut document, "class", "inner");
+        inner.set_text_content(&mut document, "X");
+        outer.append_child(&mut document, inner);
+        block.append_child(&mut document, outer);
+        document.body().append_child(&mut document, block);
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree);
+        assert_eq!(runs[0].1.background, w3cos_std::Color::from_named("blue").unwrap());
+        assert!(runs[0].1.custom_properties.as_ref().is_none_or(|properties|
+            !properties.contains_key("--w3cos-internal-background-inherit")),
+            "inherit provenance is not an authored inherited custom property");
         crate::stylesheet::clear_rules();
     }
 
@@ -17732,7 +17742,7 @@ mod image_component_tests {
     }
 
     #[test]
-    fn first_line_inherited_color_reaches_a_nested_float_text_node() {
+    fn first_line_inherited_color_excludes_a_nested_float_text_node() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("div", &[("color", "red")]);
         crate::stylesheet::register_rule("div:first-line", &[("color", "green")]);
@@ -17752,13 +17762,13 @@ mod image_component_tests {
         assert_eq!(runs[0].1.float, w3cos_std::style::Float::Left);
         assert_eq!(
             runs[0].1.color,
-            w3cos_std::Color::from_named("green").unwrap()
+            w3cos_std::Color::from_named("red").unwrap()
         );
         crate::stylesheet::clear_rules();
     }
 
     #[test]
-    fn first_line_inherited_color_reaches_a_nested_float() {
+    fn first_line_inherited_color_excludes_a_nested_float() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("div", &[("color", "red")]);
         crate::stylesheet::register_rule("div:first-line", &[("color", "green")]);
@@ -17766,7 +17776,7 @@ mod image_component_tests {
         let block = document.create_element("div");
         let inline = document.create_element("span");
         let floated = document.create_element("span");
-        floated.set_attribute(&mut document, "style", "float: left");
+        floated.style_mut(&mut document).set_property("float", "left");
         floated.set_text_content(&mut document, "This should be green");
         inline.append_child(&mut document, floated);
         block.append_child(&mut document, inline);
@@ -17774,9 +17784,13 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
+        assert_eq!(runs[0].1.float, w3cos_std::style::Float::Left,
+            "the fixture must actually be out of flow");
         assert_eq!(
             runs[0].1.color,
-            w3cos_std::Color::from_named("green").unwrap(),
+            // Floats are outside the originating block's first line even
+            // when an inline ancestor wraps them (browser original is red).
+            w3cos_std::Color::from_named("red").unwrap(),
             "unexpected tree: {:#?}",
             tree.children[0]
         );

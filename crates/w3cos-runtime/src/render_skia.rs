@@ -687,12 +687,8 @@ fn paint_display_list_with_suppressed_effects(
             else {
                 continue;
             };
-            let mut paint = if effect.isolates_surface {
-                color_paint(w3cos_std::Color::WHITE, 1.0)
-            } else { Paint::default() };
-            if bake_compositor_props {
-                paint.set_alpha_f(effect.opacity.clamp(0.0, 1.0));
-            }
+            let mut paint = opacity_layer_paint(
+                if bake_compositor_props { effect.opacity } else { 1.0 });
             if let Some(filter) = effect
                 .filter
                 .as_deref()
@@ -793,7 +789,8 @@ fn paint_display_list_with_suppressed_effects(
                 let mut background_style = node.style.clone();
                 background_style.opacity = 1.0;
                 if plain_inline_background(&background_style)
-                    && background_style.background_image.is_none()
+                    && background_style.background_image.as_deref().is_none_or(|image|
+                        image.trim().eq_ignore_ascii_case("none"))
                     && let Some((y, height)) = first_line_font_box
                 {
                     // A first-line pseudo owns one principal font box. A
@@ -1260,10 +1257,9 @@ fn composite_skia_layers(
         let isolates_surface = artifact.properties.effects.get(layer.properties.effect)
             .is_some_and(|effect| effect.isolates_surface);
         if opacity < 0.999 || isolates_surface {
-            let mut paint = if isolates_surface {
-                color_paint(w3cos_std::Color::WHITE, 1.0)
-            } else { Paint::default() };
-            paint.set_alpha_f(opacity);
+            // CSS opacity uses the same normalized SrcOver rounding as
+            // ordinary paint, not Skia's legacy integer layer shortcut.
+            let paint = opacity_layer_paint(opacity);
             canvas.save_layer(&SaveLayerRec::default().paint(&paint));
         }
         canvas.draw_picture(picture, Some(&matrix), None);
@@ -4922,6 +4918,25 @@ thread_local! {
     static CSS_SRC_OVER: Option<skia_safe::Blender> = skia_safe::RuntimeEffect::make_for_blender(
         "half4 main(half4 src, half4 dst) { return src + dst * (1 - src.a); }", None,
     ).ok().and_then(|effect| effect.make_blender(skia_safe::Data::new_empty(), None));
+    // Opacity layers have floating-point alpha until the surface restore.
+    // Preserve float32 SrcOver, then convert to UNORM8 without rounding a
+    // near-half 255*x product to a false exact tie. 256*x is an exact binary
+    // scale; splitting its integer part keeps the residual subtraction small.
+    static CSS_OPACITY_SRC_OVER: Option<skia_safe::Blender> = skia_safe::RuntimeEffect::make_for_blender(
+        "half4 main(half4 src, half4 dst) { float4 color = src + dst * (1 - src.a); float4 scaled = color * 256; float4 whole = floor(scaled); return half4((whole + floor(scaled - whole - color + .5)) / 255); }", None,
+    ).ok().and_then(|effect| effect.make_blender(skia_safe::Data::new_empty(), None));
+}
+
+fn opacity_layer_paint(opacity: f32) -> Paint {
+    let mut paint = color_paint(w3cos_std::Color::WHITE, 1.0);
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity < 1.0 {
+        CSS_OPACITY_SRC_OVER.with(|blender| {
+            if let Some(blender) = blender { paint.set_blender(blender.clone()); }
+        });
+    }
+    paint.set_alpha_f(opacity);
+    paint
 }
 
 pub(crate) fn color_paint(color: w3cos_std::color::Color, opacity: f32) -> Paint {
@@ -5382,6 +5397,88 @@ mod tests {
     }
 
     #[test]
+    fn opacity_layer_composition_matches_browser_pixels_and_retained_replay() {
+        CSS_OPACITY_SRC_OVER.with(|blender| assert!(blender.is_some()));
+        use crate::paint_artifact::PaintNode;
+        let rect = LayoutRect { x: 1.0, y: 1.0, width: 4.0, height: 4.0 };
+        for (opacity, color, expected) in [
+            (0.5, w3cos_std::Color::rgb(0,128,0), [128,191,128,255]),
+            (0.9, w3cos_std::Color::rgb(0,0,255), [26,26,255,255]),
+            (1.0, w3cos_std::Color::rgb(0,128,0), [0,128,0,255]),
+        ] {
+            let artifact = PaintArtifact::build([
+                PaintNode { kind: ComponentKind::Box, style: Style { opacity,
+                    ..Style::default() }, parent: None, sticky_counter_signal: None },
+                PaintNode { kind: ComponentKind::Box, style: Style { background: color,
+                    ..Style::default() }, parent: Some(0), sticky_counter_signal: None },
+            ], &[(rect,0),(rect,1)], 1);
+            let nodes = artifact.nodes.iter().enumerate().map(|(i,n)|
+                (i,rect,&n.kind,&n.style)).collect::<Vec<_>>();
+            let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+            for _ in 0..2 {
+                let pixels = rasterizer.render_frame(8,8,&nodes,&test_font(),&[],
+                    &HashMap::new(),None,w3cos_std::Color::WHITE,Some(&artifact),None,1.0).unwrap();
+                assert_eq!(&pixels[(2*8+2)*4..(2*8+2)*4+4], &expected,
+                    "browser opacity layer {opacity}");
+            }
+            assert_eq!(rasterizer.retained_replays(),1);
+            let mut surface = Surface::new_raster_n32_premul((8,8)).unwrap();
+            paint_display_list(surface.canvas(), &primary_typeface(TEST_FONT).unwrap(), ReplayFrame {
+                nodes:&nodes,metrics_font:&test_font(),scroll_info:&[],text_input_values:&HashMap::new(),
+                focused_index:None,background:w3cos_std::Color::WHITE,artifact:Some(&artifact),
+                retained:None,compositor_overrides:None,scale_factor:1.0,
+            },true);
+            let mut pixels = [0u8;8*8*4];
+            let info = ImageInfo::new((8,8),ColorType::RGBA8888,AlphaType::Premul,None);
+            assert!(surface.read_pixels(&info,&mut pixels,8*4,(0,0)));
+            assert_eq!(&pixels[(2*8+2)*4..(2*8+2)*4+4],&expected,
+                "baked opacity layer {opacity}");
+        }
+    }
+
+    #[test]
+    fn opacity_layer_calibration_matches_browser_solid_colors() {
+        use crate::paint_artifact::PaintNode;
+        // Chromium141 V2647: four colors, two destinations, five opacities.
+        // These independent screenshot bytes are not generated by the shader.
+        let expected = [
+            [229,242,229],[191,223,191],[128,191,128],[102,179,102],[26,141,26],
+            [12,51,78],[10,64,65],[7,85,44],[5,94,35],[1,119,9],
+            [229,229,255],[191,191,255],[128,128,255],[102,102,255],[26,26,255],
+            [12,38,104],[10,32,129],[7,21,171],[5,17,188],[1,4,238],
+            [233,239,251],[200,216,244],[146,177,233],[124,161,229],[59,115,215],
+            [15,48,99],[19,56,118],[25,71,149],[27,76,161],[35,93,199],
+            [255,246,229],[255,233,191],[255,210,128],[255,201,102],[255,174,26],
+            [37,54,78],[74,73,65],[134,104,44],[158,116,35],[231,153,9],
+        ];
+        let rect = LayoutRect { x:1.0,y:1.0,width:4.0,height:4.0 };
+        let mut case = 0;
+        for color in [[0,128,0],[0,0,255],[37,99,211],[255,165,0]] {
+            for bg in [[255,255,255],[13,42,87]] {
+                for opacity in [0.1,0.25,0.5,0.6,0.9] {
+                    let artifact = PaintArtifact::build([
+                        PaintNode { kind:ComponentKind::Box,style:Style { opacity,
+                            ..Style::default() },parent:None,sticky_counter_signal:None },
+                        PaintNode { kind:ComponentKind::Box,style:Style {
+                            background:w3cos_std::Color::rgb(color[0],color[1],color[2]),
+                            ..Style::default() },parent:Some(0),sticky_counter_signal:None },
+                    ],&[(rect,0),(rect,1)],1);
+                    let nodes = artifact.nodes.iter().enumerate().map(|(i,n)|
+                        (i,rect,&n.kind,&n.style)).collect::<Vec<_>>();
+                    let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+                    let pixels = rasterizer.render_frame(8,8,&nodes,&test_font(),&[],
+                        &HashMap::new(),None,w3cos_std::Color::rgb(bg[0],bg[1],bg[2]),
+                        Some(&artifact),None,1.0).unwrap();
+                    assert_eq!(&pixels[(2*8+2)*4..(2*8+2)*4+3],&expected[case],
+                        "browser calibration {case}: {color:?} over {bg:?}, opacity={opacity}");
+                    case += 1;
+                }
+            }
+        }
+        assert_eq!(case,40);
+    }
+
+    #[test]
     fn css_src_over_rounds_normalized_alpha_without_a_float_framebuffer() {
         CSS_SRC_OVER.with(|blender| assert!(blender.is_some()));
         let mut surface = Surface::new_raster_n32_premul((256, 1)).unwrap();
@@ -5790,8 +5887,10 @@ mod tests {
     #[test]
     fn first_line_background_uses_principal_font_box_across_large_glyph() {
         use crate::paint_artifact::PaintNode;
+        for background_image in [None, Some("none")] {
         let text_style = |size| Style { display: Display::Inline,
             font_family: Some("Ahem".into()), font_size: size, line_height: 1.0,
+            background_image: background_image.map(str::to_owned),
             line_height_is_normal: false, background: w3cos_std::Color::rgb(255, 0, 0),
             color: w3cos_std::Color::rgb(0, 128, 0),
             custom_properties: Some(HashMap::from([
@@ -5817,6 +5916,7 @@ mod tests {
         let pixel = |x: usize,y: usize| &pixels[(y*160+x)*4..(y*160+x)*4+4];
         assert_eq!(pixel(30, 10), &[255,255,255,255], "large glyph must not enlarge pseudo background");
         assert_eq!(pixel(30, 90), &[0,128,0,255], "large glyph keeps its independent ink position");
+        }
     }
 
     #[test]

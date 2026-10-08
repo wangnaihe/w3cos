@@ -15267,7 +15267,17 @@ fn project_inline_block_vertical_align_keywords(
                     if rect.height > inline_font_height(&child.style).max(line_height) + 0.5 {
                         return None; // A multi-line union is not one line-edge anchor.
                     }
-                    Some(rect.y + rect.height + (line_height - rect.height) * 0.5)
+                    if component.style.display == WDisplay::Inline
+                        && component.style.align_self == WAlignSelf::FlexEnd
+                        && child.style.align_self == WAlignSelf::FlexStart
+                    {
+                        // The top-aligned descendant anchors the segment's
+                        // top, not its own (possibly much lower) line bottom.
+                        Some(rect.y - (line_height - rect.height) * 0.5
+                            + inline_style_line_height(&component.style))
+                    } else {
+                        Some(rect.y + rect.height + (line_height - rect.height) * 0.5)
+                    }
                 })
                 .max_by(f32::total_cmp);
             if let Some(line_bottom) = line_edge_anchor {
@@ -15315,8 +15325,10 @@ fn project_inline_block_vertical_align_keywords(
                     }
                 }
                 if component.style.display == WDisplay::Inline
-                    && component.style.align_self == WAlignSelf::FlexStart
+                    && matches!(component.style.align_self, WAlignSelf::FlexStart | WAlignSelf::FlexEnd)
                     && let (Some(top), Some(position)) = (principal_top, positions.get(&component_index))
+                    && layouts[*position].0.height <= inline_font_height(&component.style)
+                        .max(inline_style_line_height(&component.style)) + 0.5
                 {
                     // `top` aligns the whole inline subtree, not the
                     // principal font box alone. Its decoration follows the
@@ -27662,6 +27674,30 @@ mod tests {
         assert_eq!(rect(1).height, 192.0);
         assert_eq!(rect(2).height, 96.0, "layout={layout:#?}");
         stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn bottom_inline_with_top_child_keeps_anonymous_text_on_segment_top() {
+        let text = |size, alignment| Component::text("X", Style {
+            display: WDisp::Inline, font_family: Some("Ahem".into()),
+            font_size: size, line_height: 1.0, align_self: alignment,
+            ..Style::default()
+        });
+        let root = Component::row(Style {
+            display: WDisp::Inline, font_family: Some("Ahem".into()),
+            font_size: 20.0, line_height: 1.0, align_self: WAlignSelf::FlexEnd,
+            align_items: WAlign::Baseline, ..Style::default()
+        }, vec![text(20.0, WAlignSelf::Auto), text(100.0, WAlignSelf::FlexStart),
+            text(20.0, WAlignSelf::Auto)]);
+        let rect = |x, y, width, height| LayoutRect { x, y, width, height };
+        let mut layout = vec![(rect(0.0,80.0,140.0,20.0),0),
+            (rect(0.0,80.0,20.0,20.0),1), (rect(20.0,0.0,100.0,100.0),2),
+            (rect(120.0,80.0,20.0,20.0),3)];
+        project_inline_block_vertical_align_keywords(&mut layout, &root, 800.0, 600.0);
+        assert_eq!(layout[1].0.y, 0.0, "top descendant anchors anonymous text at the segment top");
+        assert_eq!(layout[3].0.y, 0.0);
+        assert_eq!(layout[2].0.y, 0.0, "independently aligned child does not move");
+        assert_eq!(layout[0].0.y, 0.0, "principal font decoration follows anonymous text");
     }
 
     #[test]
