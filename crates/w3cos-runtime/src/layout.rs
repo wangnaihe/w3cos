@@ -7253,6 +7253,28 @@ fn project_simple_float_margin_boxes(
             child_index += count_nodes(child);
         }
 
+        if component.style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-cleared-float-wrapper"))
+            && matches!(component.style.height, WDim::Auto)
+            && component.children.len() == 1
+            && component.children[0].style.float != WFloat::None
+            && let (Some(parent_position), Some(child_position)) = (
+                layout_position.get(&component_index).copied(),
+                layout_position.get(&(component_index + 1)).copied(),
+            )
+        {
+            // This transparent extraction wrapper is not a CSS flex box.
+            // Settle its sole float's final margin extent before the parent
+            // places the next clearing float. Fallback font line metrics may
+            // have enlarged that child since Taffy's original flex sizing.
+            let parent = layouts[parent_position].0;
+            let child = layouts[child_position].0;
+            let margin = resolve_spacing_for_layout(
+                component.children[0].style.margin.bottom, parent.width,
+                &component.children[0].style, viewport_w, viewport_h);
+            layouts[parent_position].0.height = (child.y + child.height + margin - parent.y).max(0.0);
+        }
+
         if component.style.float != WFloat::None
             && matches!(component.style.width, WDim::Auto)
             && component.children.len() == 1
@@ -22479,6 +22501,41 @@ mod tests {
             assert_eq!(pair[0].1.y, pair[1].1.y, "the fitting word must not gain a soft line");
             assert!((pair[0].1.x + pair[0].1.width - pair[1].1.x).abs() < 0.01,
                 "the hyphen must not add whitespace between its fragments");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "skia")]
+    fn cleared_float_wrappers_use_settled_nested_margin_box_height() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::xml_tree_builder::StreamingXmlDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        crate::jsdom::set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            Rc::new(InertParserScriptHost), "https://example.test/cleared-floats.xht");
+        let item = "<div class='item'><div>&#x05D0; + - &#xD7; &#xF7; &#xA0;</div><div>&#xA0; + - &#xD7; &#xF7; &#x05EA;</div></div>";
+        parser.write(&format!("<html xmlns='http://www.w3.org/1999/xhtml'><head/><body>{}</body></html>",
+            format!("<div class='set'>{item}{item}</div>").repeat(3))).unwrap();
+        parser.finish().unwrap();
+        w3cos_dom::stylesheet::register_rule(".item", &[("font", "bold 15.6px monospace"),
+            ("margin", "1em"), ("padding", ".25em"), ("border", "3px solid silver"), ("float", "left")]);
+        w3cos_dom::stylesheet::register_rule(".set", &[("clear", "both"), ("float", "left"),
+            ("border-bottom", "3px solid orange")]);
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let sets = flat.iter().enumerate().filter(|(_,n)| n.style.border_bottom_width == Some(3.0)
+            && n.style.clear == WClear::Both && n.style.display == WDisp::Block)
+            .map(|(index,_)| layout.iter().find(|(_,i)| *i==index).unwrap().0).collect::<Vec<_>>();
+        assert_eq!(sets.len(),3);
+        for pair in sets.windows(2) {
+            assert!((pair[1].y-pair[0].y-pair[0].height).abs()<0.01,
+                "clear must use the settled preceding margin box: {sets:?}");
         }
     }
 

@@ -1,5 +1,77 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication boundary: settled float geometry only
+
+The user authorizes publishing the validated float-wrapper height repair and
+its existing focused evidence from base 2179c76. The later resolved-bidi-boundary
+candidate in `render_skia.rs` and `text_layout.rs` is excluded: V2675 records
+browser gaps of 19,497 / 8,381 / 17,462 pixels, including premature wrapping
+regressions. Its failed evidence remains retained; it is not an accepted repair.
+The sections below describe their original source-bound checkpoints, not a new
+full-suite result. Parent source and submodule pin remain untouched. No Product
+Agent business semantics or contract changes are introduced.
+
+## 2026-10-09 Bidi float geometry repaired; three original browser gaps remain
+
+V2662 native geometry and V2663 browser geometry isolate cumulative 2/4/6px
+vertical offsets despite correct final outer heights. V2664's Latin-only control
+passes; it does not reproduce the failure. Replacing those runs with fallback
+Hebrew glyphs yields genuine RED in V2665: each clearing float starts 2px before
+the preceding settled border/margin extent. The transparent cleared-float
+extraction wrapper now settles its sole float's final margin height before its
+parent places later floats. This changes neither authored Flex semantics nor
+test-specific coordinates. V2666 passes seven focused controls, including the
+RED, clear/anonymous groups, genuine Flex, bidi wrapping and opacity replay.
+
+After the 1m56s runner rebuild, V2667 measures original bidi-breaking-001/002/003
+at 42 / 696 / 8780 browser pixels, down from 15964 / 4398 / 14095. All three
+reference/native-browser comparisons are now zero. All three originals still
+FAIL browser parity and both strict sides; this is partial repair, not closure.
+V2669 retains all eleven float BFC margin originals browser-exact, with unchanged
+browser PNG bytes and strict pixel counts against the repaired V2522 baseline.
+The earlier V2502 is pre-repair and cannot serve as that strict baseline.
+
+`target/wpt-targeted/baseline-font-position-20261003/bidi-settlement-checkpoint-v2671.json`
+binds genuine RED, source/runner hashes, browser/native diagnostics, unchanged
+oracles, seven unit controls, both strict sides and prior failure ledgers.
+Next isolate the 42-pixel natural/override fallback segment geometry from the
+remaining paragraph-boundary differences in 002/003. No full 6,548-case rerun or
+current global remaining-count claim; goal incomplete. Changes remain local and
+unpublished, parent source/pin untouched. The six existing size failures outside
+vendor remain separate; no Product Agent business semantics or contract changes.
+
+## 2026-10-09 Opacity originals verified; bidi paragraph-boundary RED retained
+
+At published 2179c76ed43d2ebf708a87c2de35735d3a9a3a44, V2659 passes all six
+focused runtime controls. The runner rebuild completes in 1m54s. V2650 compares
+four original opacity stacking reftests: all four are browser-exact, both
+actual/native-browser and reference/native-browser are zero, and both strict
+comparison sides are zero. The two measured before failures fall from 10,000
+pixels each to zero; their browser oracle PNG bytes are unchanged. The other
+two cases are dynamic parent/transition controls, not newly fixed failures.
+
+V2652 retains first-line 25/25 browser-exact; V2654 retains dynamic insertion
+9/9 browser-exact and strict zero. All existing browser oracle bytes and all
+first-line strict comparison pixel counts remain unchanged. Fourteen first-line
+cases still fail each independent strict side (28 ledger rows); publication and
+opacity success do not waive these contradictions. Prior DOM/runtime failures
+remain retained, not freshly rerun as full partitions.
+
+`target/wpt-targeted/baseline-font-position-20261003/opacity-checkpoint-v2656.json`
+binds source/runner hashes, genuine RED, the failed intermediate candidate,
+40 browser calibration samples, focused units, original WPT comparisons and
+regressions. No full-corpus pass or current global remaining-count claim.
+
+Next V2660 freshly remeasures bidi-breaking-001/002/003 on that same source:
+all three remain browser gaps, at 15,964 / 4,398 / 14,095 actual pixels. Both
+strict sides remain independently FAILED. Direct PNG inspection shows cumulative
+vertical box offsets after the first float row as well as glyph differences;
+the next investigation must separate float/clear geometry from bidi rasterization,
+not infer a pure text-order bug from filenames. RED, source binding and raw PNGs
+are retained in `bidi-breaking-browser-v2660/receipt.json` under the same evidence
+directory. No fixture, tolerance or failure waiver changes; this continuation
+does not commit or push. Parent source/pin and business knowledge are untouched.
+
 ## 2026-10-09 Publication checkpoint: first-line and opacity candidate
 
 The user authorizes publishing the accumulated vendor-only changes from base
