@@ -70,9 +70,20 @@ fn uniforms(bounds: Rect, radius: f32, stroke: f32, color: skia_safe::Color4f) -
 pub(super) fn draw(canvas: &Canvas, bounds: Rect, radius: f32, paint: &Paint) -> bool {
     let stroke = match paint.style() { paint::Style::Fill=>0.0,
         paint::Style::Stroke=>paint.stroke_width()*0.5,_=>return false };
-    if !canvas.local_to_device_as_3x3().is_identity() || !bounds.is_finite()
+    let matrix = canvas.local_to_device_as_3x3();
+    if !matrix.is_scale_translate() || matrix.scale_x() <= 0.0
+        || matrix.scale_x() != matrix.scale_y() || !bounds.is_finite()
+    { return false; }
+    let Some(bounds) = matrix.map_rect_scale_translate(bounds) else { return false; };
+    let radius = radius * matrix.scale_x();
+    let stroke = stroke * matrix.scale_x();
+    // Filled capsules retain a valid corner mesh when the opposite radii
+    // meet. Stroke interiors still require the existing non-overlap guard.
+    let capsule = stroke == 0.0 && bounds.height() == 2.0 * radius
+        && bounds.width() >= bounds.height();
+    if !bounds.is_finite()
         || radius<=stroke+1.0 || bounds.width()<=2.0*(radius+stroke+1.0)
-        || bounds.height()<=2.0*(radius+stroke+1.0) || paint.shader().is_some()
+        || (!capsule && bounds.height()<=2.0*(radius+stroke+1.0)) || paint.shader().is_some()
         || paint.mask_filter().is_some() || paint.image_filter().is_some()
         || paint.color_filter().is_some() || paint.path_effect().is_some()
     { return false; }
@@ -84,8 +95,59 @@ pub(super) fn draw(canvas: &Canvas, bounds: Rect, radius: f32, paint: &Paint) ->
         let mut analytic=paint.clone();
         analytic.set_style(paint::Style::Fill).set_color(Color::WHITE).set_shader(shader).set_anti_alias(false);
         let extent=stroke+1.0;
+        let save = canvas.save();
+        canvas.reset_matrix();
         canvas.draw_rect(Rect::new((bounds.left-extent).floor(),(bounds.top-extent).floor(),
             (bounds.right+extent).ceil(),(bounds.bottom+extent).ceil()),&analytic);
+        canvas.restore_to_count(save);
         true
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skia_safe::{AlphaType, ColorType, ImageInfo};
+
+    fn pixels(surface: &mut skia_safe::Surface) -> Vec<u8> {
+        let info = ImageInfo::new((128,64), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0; 128*64*4];
+        assert!(surface.read_pixels(&info, &mut pixels, 128*4, (0,0)));
+        pixels
+    }
+
+    #[test]
+    fn scale_translate_preserves_device_coverage_and_matrix() {
+        for (width,height,radius,stroke) in [(31.5,2.0,1.0,0.0),(40.0,16.0,3.0,0.0),(40.0,16.0,3.0,1.0)] {
+            let mut transformed = skia_safe::surfaces::raster_n32_premul((128,64)).unwrap();
+            let mut direct = skia_safe::surfaces::raster_n32_premul((128,64)).unwrap();
+            let mut fill = crate::render_skia::color_paint(w3cos_std::Color::WHITE,0.3);
+            if stroke > 0.0 { fill.set_style(paint::Style::Stroke).set_stroke_width(stroke); }
+            let canvas = transformed.canvas();
+            canvas.clear(Color::BLACK);
+            canvas.translate((8.0,13.0));
+            canvas.scale((2.0,2.0));
+            let matrix = canvas.local_to_device_as_3x3();
+            assert!(draw(canvas,Rect::from_xywh(4.0,4.0,width,height),radius,&fill));
+            assert_eq!(canvas.local_to_device_as_3x3(),matrix);
+            let mut device_fill = fill.clone();
+            device_fill.set_stroke_width(stroke*2.0);
+            let canvas = direct.canvas();
+            canvas.clear(Color::BLACK);
+            assert!(draw(canvas,Rect::from_xywh(16.0,21.0,width*2.0,height*2.0),radius*2.0,&device_fill));
+            assert_eq!(pixels(&mut transformed),pixels(&mut direct));
+        }
+    }
+
+    #[test]
+    fn unsupported_nonuniform_transform_does_not_paint() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((128,64)).unwrap();
+        surface.canvas().clear(Color::BLACK);
+        let before = pixels(&mut surface);
+        let canvas = surface.canvas();
+        canvas.scale((2.0,1.0));
+        let fill = crate::render_skia::color_paint(w3cos_std::Color::WHITE,1.0);
+        assert!(!draw(canvas,Rect::from_xywh(8.0,8.0,60.0,4.0),2.0,&fill));
+        assert_eq!(before,pixels(&mut surface));
+    }
 }

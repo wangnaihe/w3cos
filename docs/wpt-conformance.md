@@ -1,5 +1,144 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication candidate: browser fidelity repairs
+
+The user authorized committing and pushing the four-file candidate to upstream
+main, based on d9aa2b9. V2464 and V2469 match the current production diff hash;
+the DOM binary and the border/video checkpoint evidence hashes were rechecked.
+The previous focused results and independent strict-reference FAILED ledgers
+remain scoped as documented below. The newly reproduced inline insertion
+cases (V2470/V2471) remain open; no layout fix or full-corpus acceptance is
+included. Parent code and submodule pin are not part of this publication.
+The size check still fails on six existing outside-vendor files; no budget is
+relaxed. Product Agent knowledge semantics are unaffected by these engine fixes.
+
+## 2026-10-09 Browser border-width inheritance aligned; strict contradictions retained
+
+V2458 indexes newest compatible historical receipts per canonical path:393
+receipts,6178 observed paths and215 historical gaps. This mixed-source index
+selects targets only; it is not a current remaining count or fresh census.
+V2459 remeasures border-width-011/012:each actual/browser gap remains52153,
+reference/browser0. V2461 records Chromium141 computed widths0px for none/hidden
+parents and their solid children, while the untouched reference declares32px.
+V2462 checks cross-generation and changed-child-font variants:visible parent
+widths still inherit32px or medium3px; none/hidden widths inherit0px.
+
+Following the user's browser-pixel priority, three previous native assertions
+of restored hidden-parent lengths are changed to these measured browser
+expectations. V2463 records all3 RED before production changes. Inheritance now
+resolves parent edge visibility before copying widths; retained authored lengths
+remain available for the parent's own style changes. V2464 passes51/51 DOM
+border tests, including visible styles, relative units, side/shorthand cascade
+and hidden conflict identity. The runner builds in2m09s.
+
+V2465 remeasures both originals:actual and reference native/browser differences
+are0, with unchanged browser PNG bytes. V2467 covers22 canonical border-width
+cases:22/22 browser-exact, no gaps/unverified results. V2469 binds selection,
+RED, computed-style oracle, regression and source/binary evidence. For each of
+011/012, both native/reference and browser/reference stay separately FAILED at
+52153 pixels; the reference contradiction is not waived or fixed by editing WPT.
+
+No full6,548 census or completion claim, new commit/push, parent code/pin change
+or Product Agent knowledge semantic impact. Prior strict ledgers remain retained.
+Next remeasure the remaining historical browser-gap queue in focused batches.
+The size gate retains the same6 outside-vendor violations.
+
+## 2026-10-09 Original video and normal-flow browser-exact; strict ledger retained
+
+V2448 isolates the native shadow mask: both residual pixels have A8 coverage51,
+so authored black alpha0.5 over gray5 produces exactly4.5. The old combined
+opacity/mask path stores4 while the browser stores5. A white blur mask now
+remains independent of opacity; final black SrcOver explicitly rounds RGBA8.
+No test-coordinate branch is added. The diagnostic is replaced with a native
+coverage invariant test, not treated as an independent browser mask oracle.
+
+V2449 passes all5 controls tests, including the unchanged shadow RED. V2450
+passes79/79 related tests. The runner builds in2m59s. V2451's original actual
+and reference pages both have0 native/browser pixels; V2453 has no regional
+residuals. V2454 binds RED, mask isolation, units and unchanged browser captures.
+V2455 refreshes all50 normal-flow cases:50/50 browser-exact, no gaps or unverified
+comparisons. V2457 binds that regression and retains8 strict FAILED entries
+across4 paths (inlines-017, max-width-applies-to-005/006, video-controls-paint-order).
+The video native/reference and browser/reference comparisons each remain9025
+pixels FAILED. No reference, browser fixture or tolerance changed.
+
+This is focused browser closure, not full6,548-case closure or complete media
+controls acceptance. F16 target rounding, same-z ownership, insets, loaded media
+and platform variants remain unverified. Prior strict ledgers outside this
+refresh remain retained. Next continue current-source measurement of the
+historical browser-gap queue and the pending paint ownership variants.
+No new commit/push, parent code/pin or Product Agent knowledge semantic change.
+The size gate retains the same6 outside-vendor violations.
+
+## 2026-10-08 Overflow icon browser-exact; shadow RED remains open
+
+V2439 adds the four remaining original pixels to their existing tests and
+records two genuine REDs. Float final opacity and float shadow alpha alone
+do not repair them (V2440). A binary16(0.3) final compositor repairs the icon
+samples; a shadow image-filter candidate still fails (V2441). Both unsuccessful
+shadow experiments are reverted, retaining the prior mask-filter path.
+An intermediate compile error used an unqualified RuntimeEffect; it is fixed.
+
+V2442 records the complete related scope as FAIL: 78 tests, 77 pass and one
+shadow test fails. V2443 separately records the 77 passing tests, not a waiver
+or an accepted unit gate. The runner builds in2m54s. V2444's diagnostic original
+capture reduces actual/browser differences from4 to2 (maximum1), reference/
+browser0, with unchanged browser oracle PNG bytes. V2446 confirms the icon is
+exact and both remaining pixels are the shadow samples (30,83) and (80,83),
+browser5 versus native4. V2447 binds the failed gate as well as RED, source,
+binary and fresh captures; status is partial progress, not acceptance.
+
+The half-precision explanation is an inference calibrated to this browser
+capture, not a universal GPU/opacity claim. Native/reference and browser/
+reference stay separately FAILED at9025 pixels. No full census, completion,
+fixture/tolerance modification or commit/push. Next isolate shadow mask coverage
+from final compositing without changing the original samples. Parent code/pin
+and Product Agent knowledge semantics are unchanged.
+
+## 2026-10-08 Analytic capsule ends browser-exact; 4 control pixels remain
+
+V2432 is a genuine RED for the original timeline endpoint samples (native30,
+browser34 at the first sample). Filled height-equals-diameter capsules now use
+the existing Graphite analytic corner mesh. Positive uniform scale/translation
+maps geometry to device coordinates; canvas matrix restoration and identical
+device coverage are checked for fill and stroke. Nonuniform transforms decline
+without painting, preserving the caller fallback and existing stroke guards.
+
+V2433 passes the browser-bound endpoint regression. V2434 passes 78/78 related
+tests. The runner build takes 3m25s. V2435 refreshes the original WPT and reduces
+actual/browser differences from16 to4 (maximum1), reference/browser remains0.
+V2437 confirms all12 prior endpoint differences are gone; two central icon
+composition pixels and two shadow-rounding pixels remain. V2438 binds RED,
+regression, source, binary and unchanged original browser PNG bytes.
+
+Both native/reference and browser/reference remain separately FAILED at9025
+pixels. No full census, zero-failure acceptance, fixture/tolerance modification
+or new commit/push. Next establish original-sample RED for residual opacity
+composition and shadow precision. Parent code/pin and Product Agent knowledge
+semantics are unchanged; the size gate retains6 outside-vendor violations.
+
+## 2026-10-08 Video controls residuals reduced to 16; strict failures retained
+
+After publication at d9aa2b9, V2421 rebinds the 71-test regression to that clean
+source. V2422 refreshes the original case: measured shadow reduces actual/browser
+differences from 196 to 23, reference/browser remains 0. V2424 localizes all 23
+differences to icon/timeline controls; the background region is exact.
+
+V2425 establishes a real RED for disabled overflow opacity. Preserving authored
+0.3 with floating-point paint alpha rather than the rounded 77/255 byte passes
+V2426. V2427 passes 72/72 related tests. The runner builds in 3m01s. V2428's fresh
+original-page comparison has 16 residual pixels, maximum difference 10, with
+reference/browser 0 and unchanged browser PNG bytes. V2430 identifies 2 central
+icon pixels, 12 timeline capsule edge pixels and 2 shadow-rounding pixels.
+V2431 binds source, binary, RED, regression and original captures.
+
+Both native/reference and browser/reference remain separately FAILED at 9025
+pixels. No fixture, oracle or tolerance changed; no full census or completion
+claim. Next establish tiny capsule coverage RED and resolve the remaining icon
+composition and shadow rounding. The publication authorization was already
+fulfilled; this opacity change is local and uncommitted. Parent code/pin and
+Product Agent knowledge semantics are unchanged.
+
 ## 2026-10-08 Publication checkpoint: controls shadow and layout reuse pending pixel acceptance
 
 V2413 records two genuine REDs: paint-only UA children entered retained layout

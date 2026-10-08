@@ -2326,10 +2326,20 @@ impl Document {
             if inherits_background_longhand("background-blend-mode") {
                 style.background_blend_mode = parent.background_blend_mode.clone();
             }
+            // Inherit the browser-computed width, not the retained authored
+            // length used when this element's own line style later changes.
+            // Chromium141 resolves none/hidden edges to zero (V2461/V2462).
+            let inherited_border_widths: [Option<f32>; 4] = std::array::from_fn(|side| {
+                Some(if parent.border_styles[side].is_some_and(|line| line.is_visible()) {
+                    parent.computed_border_widths[side].unwrap_or(3.0)
+                } else {
+                    0.0
+                })
+            });
             if declared_property_value(&["border"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
-                style.computed_border_widths = parent.computed_border_widths;
+                style.computed_border_widths = inherited_border_widths;
                 style.border_width = parent.border_width;
                 style.border_color = parent.border_color;
                 style.border_top_width = parent.border_top_width;
@@ -2418,28 +2428,28 @@ impl Document {
             if declared_property_value(&["border-top"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
-                style.computed_border_widths[0] = parent.computed_border_widths[0];
+                style.computed_border_widths[0] = inherited_border_widths[0];
                 style.border_top_width = parent.border_top_width;
                 style.border_top_color = parent.border_top_color;
             }
             if declared_property_value(&["border-right"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
-                style.computed_border_widths[1] = parent.computed_border_widths[1];
+                style.computed_border_widths[1] = inherited_border_widths[1];
                 style.border_right_width = parent.border_right_width;
                 style.border_right_color = parent.border_right_color;
             }
             if declared_property_value(&["border-bottom"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
-                style.computed_border_widths[2] = parent.computed_border_widths[2];
+                style.computed_border_widths[2] = inherited_border_widths[2];
                 style.border_bottom_width = parent.border_bottom_width;
                 style.border_bottom_color = parent.border_bottom_color;
             }
             if declared_property_value(&["border-left"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
-                style.computed_border_widths[3] = parent.computed_border_widths[3];
+                style.computed_border_widths[3] = inherited_border_widths[3];
                 style.border_left_width = parent.border_left_width;
                 style.border_left_color = parent.border_left_color;
             }
@@ -2483,10 +2493,8 @@ impl Document {
             if declared_property_value(&["border-width"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
-                style.computed_border_widths = parent.computed_border_widths;
-                let widths = parent
-                    .computed_border_widths
-                    .map(|width| width.unwrap_or(3.0));
+                style.computed_border_widths = inherited_border_widths;
+                let widths = inherited_border_widths.map(|width| width.unwrap_or(3.0));
                 let used: [f32; 4] = std::array::from_fn(|side| {
                     if style.border_styles[side].is_some_and(|line| line.is_visible()) {
                         widths[side]
@@ -2513,10 +2521,10 @@ impl Document {
                 if declared_property_value(&[property])
                     .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
                 {
-                    style.computed_border_widths[side] = parent.computed_border_widths[side];
+                    style.computed_border_widths[side] = inherited_border_widths[side];
                     *target = Some(
                         if style.border_styles[side].is_some_and(|line| line.is_visible()) {
-                            parent.computed_border_widths[side].unwrap_or(3.0)
+                            inherited_border_widths[side].unwrap_or(3.0)
                         } else {
                             0.0
                         },
@@ -22453,7 +22461,7 @@ mod computed_style_cache_tests {
     }
 
     #[test]
-    fn hidden_parent_border_width_inherits_its_computed_length() {
+    fn nonpainting_parent_border_width_inherits_browser_zero() {
         for (line_style, inherited_width) in
             [("none", "2em"), ("hidden", "2em"), ("hidden", "medium")]
         {
@@ -22490,11 +22498,9 @@ mod computed_style_cache_tests {
             let parent_style = document.computed_style_for(parent.id);
             let child_style = document.computed_style_for(child.id);
             let grandchild_style = document.computed_style_for(grandchild.id);
-            let expected = if inherited_width == "medium" {
-                3.0
-            } else {
-                32.0
-            };
+            // Chromium141 V2461 resolves none/hidden parent widths to zero
+            // before inheritance. Keep the contradictory WPT reference red.
+            let expected = 0.0;
             assert_eq!(
                 parent_style.border_left_width,
                 Some(0.0),
@@ -22548,13 +22554,13 @@ mod computed_style_cache_tests {
         );
         assert_eq!(
             document.computed_style_for(grandchild.id).border_left_width,
-            Some(32.0)
+            Some(0.0)
         );
         crate::stylesheet::clear_rules();
     }
 
     #[test]
-    fn hidden_relative_border_left_width_inherits_computed_length() {
+    fn hidden_relative_border_left_width_inherits_browser_zero() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
             "#parent",
@@ -22584,7 +22590,7 @@ mod computed_style_cache_tests {
         );
         assert_eq!(
             document.computed_style_for(child.id).border_left_width,
-            Some(32.0)
+            Some(0.0)
         );
         crate::stylesheet::clear_rules();
     }
