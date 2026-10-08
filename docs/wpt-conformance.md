@@ -1,5 +1,120 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication checkpoint: browser parity repairs, nested pixels pending
+
+The user authorized committing and pushing this accumulated vendor-only batch
+to remote main. It includes the nine dynamic insertion repairs, RTL atomic
+inline progression, negative-margin BFC browser alignment and the nested BFC
+containing-interval candidate. The parent repository and submodule pin are not
+part of this publication.
+
+For nested BFC008/009, V2518 preserves the genuine unit RED against original
+browser geometry. Shared float collision projection now ignores inherited
+float exclusions outside the ordinary parent's content interval, rather than
+reintroducing them through the overflowing nested BFC border box. V2519 passes
+four focused runtime tests. V2520 runs all25 BFC units:23 pass and the same two
+existing failures as V2512; this partition remains FAILED. Runtime unit build
+completed in20.52s. These receipts bind the production source diff and binary.
+
+The nested candidate has NOT yet been rebuilt into the pixel runner or accepted
+by fresh browser screenshots. The last original008/009 measurements remain
+5000 actual/browser pixels each (V2515), not zero. Previously retained strict
+reference FAILED entries remain independent; this publication does not waive
+them or claim the6,548-case objective complete. Next rebuild the runner, retest
+008/009 and all11 BFC margin originals, retaining strict side ledgers.
+
+## 2026-10-09 Negative-margin BFC browser parity; nested cases remain
+
+V2507 records original Chromium141 geometry for006-009 at the existing profile.
+For006/007 the auto BFC is100px wide below the first float; the explicit75px
+BFC is below the next float. V2508 independently captures native layout: the
+old path narrows the auto BFC to75px and keeps both beside floats. Following
+browser-pixel priority, the old unit's same-line expectation is replaced with
+measured browser geometry; V2509 records its genuine RED before production.
+
+Negative margins no longer enlarge a narrowed float exclusion band. The auto
+BFC's minimum width still prevents shrink-to-fit when it cannot fit, and normal
+authored margins apply below the float. V2511 passes5 focused units, including
+bordered minima and trailing-margin/viewport constraints. The25-test BFC
+partition goes from22 pass/3 fail (V2510) to23 pass/2 fail (V2512); both remaining
+failures are unchanged and the partition remains FAILED. No assertion/tolerance
+is loosened to conceal those failures.
+
+The runner builds in2m14s. V2513 remeasures006/007 at0 actual/browser and0
+reference/browser pixels. V2515 covers all11 BFC margin cases:9 browser-exact,
+008/009 still5000 pixels each on actual pages, reference/browser0. V2517 binds
+original geometry, native diagnostic, RED, units, source/binary and all11 fresh
+captures, verifying unchanged browser PNG bytes. For006/007, native/reference
+and browser/reference both stay separately FAILED at11250/10000 pixels. For
+008/009, browser/reference stays FAILED at5000 each and native/reference PASS.
+All6 strict FAILED entries remain visible; prior out-of-scope ledgers are retained.
+
+No full6,548 census, current remaining-count or goal-completion claim, new
+commit/push, parent code/pin change or Product Agent knowledge semantic impact.
+The size gate retains6 outside-vendor violations. Next isolate the excessive
+shared-float clearance of nested BFCs008/009 and establish browser-bound RED.
+
+## 2026-10-09 RTL atomic inline progression repaired; BFC margin scope partial
+
+V2495 freshly reproduces23812 native/browser pixels on both actual/reference
+pages of floats-wrap-bfc-with-margin-001 and001a. Original screenshots show
+LTR groups exact but RTL groups retain LTR source-box progression. The common
+inline-context bidi pass now handles paragraphs containing only neutral atomic
+inline boxes with RowReverse and the corresponding alignment axis, retaining
+logical child order for wrapping. It does not alter real flex containers,
+mixed text paragraphs, floats or positioned out-of-flow boxes.
+
+V2497 records the genuine RTL progression RED. V2498 passes5 focused units;
+V2501 records206 pass,10 unchanged DOM partition failures and1 ignored, not
+a green partition gate. The runner builds in2m16s. V2499 remeasures both
+originals at0 actual/browser and0 reference/browser pixels, with unchanged
+browser PNG bytes. V2502 covers all11 canonical BFC margin cases:7 browser-exact
+and4 remaining browser gaps. 006/007/008/009 have actual/browser11250/10000/
+5000/5000 pixels respectively; all four reference/browser comparisons are0.
+Their browser/reference comparisons remain independently FAILED at those
+same counts; native/reference remains PASS, not evidence of browser fidelity.
+
+V2504 refreshes the previous9 dynamic insertion cases:9/9 still browser-exact.
+V2506 binds source/binary, RED, regressions and independent strict ledgers.
+Prior strict FAILED entries outside this scope remain retained. No current
+remaining-count or full6,548 closure claim, new commit/push, parent code/pin
+change or Product Agent knowledge semantic impact. The size gate retains6
+outside-vendor violations. Next isolate browser geometry of negative-margin
+BFC cases006-009 before changing their native/reference-passing layout.
+
+## 2026-10-09 Dynamic inline insertion: nine originals browser-exact
+
+V2470 freshly reproduces end-001/end-003 browser gaps of24702/26272 pixels
+on both native actual and reference pages. Their strict native/reference and
+browser/reference comparisons pass, so native reference parity alone misses
+this shared layout defect. V2473 records a genuine fragment-boundary RED.
+Regrouping split decorated sentences passes that unit but leaves both original
+pixel gaps unchanged (V2477); it is not treated as pixel acceptance.
+
+Anonymous block lines created around mixed block/inline content lack the
+common inline-context lowering marker. V2481 records this path's RED, then
+the shared wrapping/splitting path repairs six of nine originals (V2486).
+The three remaining001 cases retain a following multiword text leaf as one
+box (V2488 layout diagnostic). V2489 records the reverse-boundary RED. Inline
+borders now also trigger adjacent text fragmentation; regrouping preserves
+glued words while authored spaces/hyphens remain break opportunities. No
+WPT path, fixture, tolerance or browser oracle is changed.
+
+V2490 passes9/9 focused DOM units. V2475 establishes10 existing DOM partition
+failures plus the new RED; V2493 records205 pass,10 same failures and1 ignored,
+with no new failures. This partition remains FAILED, not waived by the focused
+unit gate. The runner builds in2m02s. V2491 remeasures all9 canonical dynamic
+insertion cases:9/9 browser-exact on actual and reference pages. All18 strict
+native/reference and browser/reference entries pass within this scope.
+V2494 binds RED, unsuccessful candidate, diagnostic, units and source/binary
+evidence, and verifies unchanged original browser PNG bytes.
+
+Prior strict FAILED ledgers outside this scope remain retained. No full6,548
+census or current remaining-count claim, goal completion, new commit/push,
+parent code/pin change or Product Agent knowledge semantic impact. The size
+gate retains6 outside-vendor violations. Continue current-source focused
+repairs of the historical browser-gap queue before final corpus verification.
+
 ## 2026-10-09 Publication candidate: browser fidelity repairs
 
 The user authorized committing and pushing the four-file candidate to upstream

@@ -145,36 +145,16 @@ fn bfc_inline_bounds(
     viewport_w: f32,
     viewport_h: f32,
 ) -> (f32, f32) {
-    // An auto-width BFC normally resolves its negative margin against the
-    // narrowed float band. A margin large enough to move its opposite edge
-    // entirely beyond the containing block can instead extend that edge.
+    // A negative margin cannot enlarge the narrowed float band. Chromium's
+    // computed geometry retains the BFC's minimum width and clears a float
+    // when that width cannot fit; authored margins apply again below it.
     let narrowed = band.width < containing.width - 0.01;
-    let padding_border = child
-        .style
-        .border_left_width
-        .unwrap_or(child.style.border_width)
-        + child
-            .style
-            .border_right_width
-            .unwrap_or(child.style.border_width)
-        + [child.style.padding.left, child.style.padding.right]
-            .into_iter()
-            .map(|padding| {
-                resolve_spacing_for_layout(
-                    padding,
-                    containing.width,
-                    &child.style,
-                    viewport_w,
-                    viewport_h,
-                )
-            })
-            .sum::<f32>();
-    let left_margin = if narrowed && -left_margin < containing.width + padding_border - 0.01 {
+    let left_margin = if narrowed {
         left_margin.max(0.0)
     } else {
         left_margin
     };
-    let right_margin = if narrowed && -right_margin < containing.width + padding_border - 0.01 {
+    let right_margin = if narrowed {
         right_margin.max(0.0)
     } else {
         right_margin
@@ -8272,17 +8252,10 @@ fn project_simple_float_margin_boxes(
                     let minimum_border_box = (-(margins[0] + margins[1])).max(padding_border);
                     let table =
                         matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable);
-                    let extends_entirely_past_container = (band.x > containing.x + 0.01
-                        && -margins[1] >= containing.width + padding_border - 0.01)
-                        || (band.x + band.width < containing.x + containing.width - 0.01
-                            && -margins[0] >= containing.width + padding_border - 0.01);
                     if available > 0.01 && available < current.width - 0.01
-                        // Merely extending outside the containing block does
-                        // not make a bordered auto-width BFC fit beside the
-                        // float. Its opposite margin must offset the whole
-                        // containing width plus the non-shrinkable edges.
-                        && (minimum_border_box <= band.width + 0.01
-                            || extends_entirely_past_container)
+                        // The negative-margin minimum still constrains the
+                        // border box, even if its opposite edge overflows.
+                        && minimum_border_box <= band.width + 0.01
                         && (!table || table_min_content_border_box_width(child,
                             containing.width, viewport_w, viewport_h) <= available + 0.01)
                     {
@@ -11666,12 +11639,29 @@ fn project_shared_bfc_float_collisions(
                 }
                 let original = normal_rect(layouts[position].0);
                 let mut top = original.y;
+                // Exclusions outside an ordinary containing block's content
+                // interval do not re-enter via an overflowing nested BFC.
+                // Keep shared floats that actually narrow that interval;
+                // the BFC's own wider border box is not a new containing band.
+                let parent_interval = positions[parent].map(|position| {
+                    let rect = layouts[position].0;
+                    let style = flat[parent].style;
+                    let edge = |spacing| resolve_spacing_for_layout(
+                        spacing, rect.width, style, vw, vh);
+                    (rect.x + style.border_left_width.unwrap_or(style.border_width)
+                        + edge(style.padding.left),
+                     rect.x + rect.width - style.border_right_width.unwrap_or(style.border_width)
+                        - edge(style.padding.right))
+                });
                 loop {
                     let next = previous
                         .iter()
                         .map(|(floating, _)| floating.margin_box)
                         .filter(|floating| {
                             floating.width > 0.01
+                                && parent_interval.is_none_or(|(left, right)|
+                                    floating.x < right - 0.01
+                                        && floating.x + floating.width > left + 0.01)
                                 && top < floating.y + floating.height - 0.01
                                 && top + original.height > floating.y + 0.01
                                 && original.x < floating.x + floating.width - 0.01
@@ -41782,7 +41772,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_margin_bfc_fits_outside_container_without_crossing_right_float() {
+    fn negative_margin_bfc_clears_float_at_browser_computed_width() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
@@ -41825,11 +41815,11 @@ mod tests {
         assert_eq!(floats.len(), 2);
         assert_eq!(
             (bfcs[0].x, bfcs[0].y, bfcs[0].width),
-            (floats[0].x - 75.0, floats[0].y, 75.0)
+            (floats[0].x - 75.0, floats[0].y + floats[0].height, 100.0)
         );
         assert_eq!(
             (bfcs[1].x, bfcs[1].y, bfcs[1].width),
-            (floats[1].x - 75.0, floats[1].y, 75.0)
+            (floats[1].x - 75.0, floats[1].y + floats[1].height, 75.0)
         );
     }
 
@@ -41889,7 +41879,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_bfc_avoids_earlier_float_in_the_shared_formatting_context() {
+    fn nested_bfc_overflow_does_not_reenter_float_exclusion_outside_parent() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
@@ -41934,13 +41924,14 @@ mod tests {
             let parent = rect(flat[bfc_index].parent.unwrap());
             assert_eq!(
                 bfc.y,
-                floating.y + floating.height,
-                "nested BFC must clear the shared float's border box: side={side} float={floating:?} bfc={bfc:?}"
+                floating.y,
+                "browser keeps overflow at the ordinary parent's line: side={side} float={floating:?} bfc={bfc:?}"
             );
             assert!(
                 parent.y + parent.height >= bfc.y + bfc.height - 0.01,
                 "auto-height parent must contain the shifted BFC: side={side} parent={parent:?} bfc={bfc:?}"
             );
+            assert_eq!(parent.height, 50.0, "no extra clearance may grow the ordinary parent");
         }
     }
 

@@ -10739,6 +10739,14 @@ fn wrap_inline_runs_between_block_boxes(component: &mut w3cos_std::Component) {
         let mut style = Style::default();
         inherit_text_style(&mut style, &component.style, "", |_| false);
         style.display = Display::Block;
+        // Anonymous block lines own the same inline formatting semantics as
+        // authored blocks. Expose soft separators before line fitting, while
+        // retaining nowrap/pre overflow and the block's outer identity.
+        style.flex_wrap = if matches!(style.white_space,
+            w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre)
+        { w3cos_std::style::FlexWrap::NoWrap } else { w3cos_std::style::FlexWrap::Wrap };
+        style.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-inline-formatting-context".into(), "1".into());
         style
             .custom_properties
             .get_or_insert_with(Default::default)
@@ -10860,6 +10868,30 @@ mod text_indent_lowering_tests {
 }
 
 fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
+    use w3cos_std::style::{Display, Float, Position, TextDirection, UnicodeBidi};
+    if component.style.direction == TextDirection::Rtl
+        && component.style.unicode_bidi == UnicodeBidi::Normal
+        && component.style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-inline-formatting-context"))
+        && !component.children.is_empty()
+        && component.children.iter().all(|child|
+            matches!(child.style.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+                && child.style.float == Float::None
+                && !matches!(child.style.position, Position::Absolute | Position::Fixed)
+                && child.style.unicode_bidi == UnicodeBidi::Normal)
+    {
+        // Atomic inline boxes contribute neutral object units to this line,
+        // not the strong characters of their independent inner paragraphs.
+        // Reverse inline progression, not source order: wrapped lines must
+        // continue consuming the original logical sequence.
+        component.style.flex_direction = w3cos_std::style::FlexDirection::RowReverse;
+        component.style.justify_content = match component.style.text_align {
+            w3cos_std::style::TextAlign::Left | w3cos_std::style::TextAlign::End =>
+                w3cos_std::style::JustifyContent::FlexEnd,
+            w3cos_std::style::TextAlign::Center => w3cos_std::style::JustifyContent::Center,
+            _ => w3cos_std::style::JustifyContent::FlexStart,
+        };
+    }
     if matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
         && component.style.text_align == w3cos_std::style::TextAlign::Justify
         && matches!(
@@ -11146,7 +11178,8 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             && (child.style.padding.left != Spacing::Px(0.0)
                 || child.style.padding.right != Spacing::Px(0.0)
                 || child.style.margin.left != Spacing::Px(0.0)
-                || child.style.margin.right != Spacing::Px(0.0))
+                || child.style.margin.right != Spacing::Px(0.0)
+                || has_border(&child.style))
     });
     let has_atomic_inline_sibling = component
         .children
@@ -11365,15 +11398,11 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
         }
         fragments.extend(pieces);
     }
-    // A generated quote owns its shaping source, but its boundary is not
-    // an extra line-break opportunity next to an ASCII word. Group only
-    // after word/hyphen splitting, retaining the quote and text as separate
-    // children of an unbroken inline word.
-    component.children = if fragments.iter().any(|child|
-        child.style.custom_properties.as_ref().is_some_and(|p|
-            p.contains_key("--w3cos-internal-generated-quote"))) {
-        group_unbroken_ascii_inline_words(fragments, &component.style)
-    } else { fragments };
+    // Splitting a decorated sentence can expose its initial/final word next
+    // to an adjacent authored run. An element boundary is not a soft break:
+    // regroup after splitting while retaining spaces/hyphens as separators
+    // and individual source fragments for shaping and decoration.
+    component.children = group_unbroken_ascii_inline_words(fragments, &component.style);
 }
 
 fn split_collapsible_space_after_nonbreaking_run(component: &mut w3cos_std::Component) {
@@ -17961,6 +17990,101 @@ mod image_component_tests {
         assert!(matches!(&children[1].children[1].kind,
             ComponentKind::Text { content } if content == "x"));
         assert_eq!(children[1].children[1].style.margin.left, Spacing::Em(4.0));
+    }
+
+    #[test]
+    fn split_decorated_sentence_keeps_glued_initial_word() {
+        use w3cos_std::{Component, component::ComponentKind, style::{FlexWrap, Style}};
+        let inline = Style { display: Display::Inline, ..Style::default() };
+        let decorated = Style {
+            border_left_width: Some(10.0), border_right_width: Some(10.0),
+            ..inline.clone()
+        };
+        let mut row = Component::row(Style {
+            display: Display::Block, flex_wrap: FlexWrap::Wrap,
+            custom_properties: Some(std::collections::HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into())
+            ])), ..Style::default()
+        }, vec![Component::text("Eight8888Inline", inline),
+            Component::text("Inserted new inline", decorated)]);
+        split_padded_inline_text_fragments(&mut row);
+        let word = &row.children[0];
+        assert_eq!(word.style.display, Display::InlineFlex,
+            "decoration must not add a break between the adjacent authored words");
+        assert_eq!(word.children.len(), 2);
+        assert!(matches!(&word.children[0].kind, ComponentKind::Text { content }
+            if content == "Eight8888Inline"));
+        assert!(matches!(&word.children[1].kind, ComponentKind::Text { content }
+            if content == "Inserted"));
+        assert_eq!(word.children[1].style.border_left_width, Some(10.0));
+        assert!(matches!(&row.children[1].kind, ComponentKind::Text { content } if content == " "),
+            "the authored separator still permits a soft wrap");
+        assert_eq!(row.children.last().unwrap().style.border_right_width, Some(10.0));
+    }
+
+    #[test]
+    fn anonymous_inline_run_preserves_glued_decorated_sentence() {
+        use w3cos_std::{Component, style::Style};
+        let inline = Style { display: Display::Inline, ..Style::default() };
+        let block = Style { display: Display::Block, ..Style::default() };
+        let decorated = Style { border_left_width: Some(10.0),
+            border_right_width: Some(10.0), ..inline.clone() };
+        let mut root = Component::row(block.clone(), vec![
+            Component::text("preceding block", block),
+            Component::text("Eight8888Inline", inline),
+            Component::text("Inserted new inline", decorated),
+        ]);
+        wrap_inline_runs_between_block_boxes(&mut root);
+        split_padded_inline_text_fragments(&mut root);
+        let line = &root.children[1];
+        assert_eq!(line.children[0].style.display, Display::InlineFlex,
+            "anonymous block lines need the same word-boundary lowering");
+        assert_eq!(line.children[0].children.len(), 2);
+    }
+
+    #[test]
+    fn decorated_sentence_keeps_glued_following_multiword_run() {
+        use w3cos_std::{Component, component::ComponentKind, style::{FlexWrap, Style}};
+        let inline = Style { display: Display::Inline, ..Style::default() };
+        let decorated = Style { border_left_width: Some(10.0),
+            border_right_width: Some(10.0), ..inline.clone() };
+        let mut row = Component::row(Style {
+            display: Display::Block, flex_wrap: FlexWrap::Wrap,
+            custom_properties: Some(std::collections::HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into())
+            ])), ..Style::default()
+        }, vec![Component::text("Inserted new inline", decorated),
+            Component::text("Seven777Inline Eight8888Inline", inline)]);
+        split_padded_inline_text_fragments(&mut row);
+        let word = row.children.iter().find(|child| child.style.display == Display::InlineFlex)
+            .expect("a following multiword run must expose its glued initial word");
+        assert_eq!(word.children.len(), 2);
+        assert!(matches!(&word.children[0].kind, ComponentKind::Text { content } if content == "inline"));
+        assert!(matches!(&word.children[1].kind, ComponentKind::Text { content } if content == "Seven777Inline"));
+        assert_eq!(word.children[0].style.border_right_width, Some(10.0));
+        assert!(matches!(&row.children.last().unwrap().kind, ComponentKind::Text { content } if content == "Eight8888Inline"));
+    }
+
+    #[test]
+    fn rtl_atomic_inline_context_keeps_logical_wrap_order() {
+        use w3cos_std::{Component, style::{FlexDirection, FlexWrap, JustifyContent, Style, TextDirection}};
+        let mut row = Component::row(Style {
+            display: Display::Flex, direction: TextDirection::Rtl,
+            flex_wrap: FlexWrap::Wrap, justify_content: JustifyContent::FlexEnd,
+            custom_properties: Some(std::collections::HashMap::from([
+                ("--w3cos-internal-inline-formatting-context".into(), "1".into())
+            ])), ..Style::default()
+        }, (0..3).map(|i| Component::row(Style {
+            display: Display::InlineBlock, width: w3cos_std::style::Dimension::Px(30.0),
+            height: w3cos_std::style::Dimension::Px(40.0), ..Style::default()
+        }, vec![Component::text(i.to_string(), Style::default())])).collect());
+        reorder_explicit_bidi_inline_rows(&mut row);
+        assert_eq!(row.style.flex_direction, FlexDirection::RowReverse,
+            "neutral atomic boxes follow the paragraph's RTL inline progression");
+        assert_eq!(row.style.justify_content, JustifyContent::FlexStart);
+        assert!(matches!(&row.children[0].children[0].kind,
+            ComponentKind::Text { content } if content == "0"),
+            "logical source order must remain intact when wrapping rows");
     }
 
     #[test]
