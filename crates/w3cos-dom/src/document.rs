@@ -9599,6 +9599,13 @@ fn first_line_text_style(
     declarations: &[(String, String, u32)],
     fragment_height: f32,
 ) -> w3cos_std::style::Style {
+    // Chromium does not apply vertical-align to the first-line pseudo box.
+    // Keep alignment authored on real inline descendants, but do not create
+    // offsets or fragment clips from this pseudo's declaration.
+    let supported = declarations.iter()
+        .filter(|(property, _, _)| !css_property_eq(property, "vertical-align"))
+        .cloned().collect::<Vec<_>>();
+    let declarations = supported.as_slice();
     let preserves_background = base.background.a != 0;
     let preserves_vertical_align = base.align_self != w3cos_std::style::AlignSelf::Auto;
     if !preserves_background && !preserves_vertical_align {
@@ -11205,6 +11212,8 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
         && component.children[0].style.custom_properties.as_ref().is_some_and(|properties| {
             properties.contains_key("--w3cos-internal-text-line-width")
         });
+    let has_forced_line_break = component.children.iter().any(|child|
+        matches!(&child.kind, ComponentKind::Text { content } if content == "\u{2028}"));
     let mut fragments = Vec::with_capacity(component.children.len());
     for (source_index, child) in std::mem::take(&mut component.children).into_iter().enumerate() {
         let ComponentKind::Text { content } = &child.kind else {
@@ -11238,7 +11247,12 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             .any(|width| width.unwrap_or(0.0) > 0.0);
         let has_hyphen_break = content.char_indices().any(|(index, _)|
             w3cos_std::inline_text::explicit_hyphen_break_end(content, index).is_some());
-        if retained_margin_paragraph && has_horizontal_margin
+        // The explicit paragraph-width run before a forced break owns its
+        // first-line indent and internal wrapping. Fragmenting that run
+        // repeats the indent inside every word-sized paint box.
+        if has_forced_line_break && style.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-text-line-width"))
+            || retained_margin_paragraph && has_horizontal_margin
                 && !has_horizontal_padding && !decorated_border
             || !child.children.is_empty()
             || style.display != Display::Inline
@@ -11343,6 +11357,11 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 piece.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
             }
             pieces[0].style.padding.left = Spacing::Percent(indent);
+            if source_index == 0 && component.style.text_indent == style.text_indent {
+                // The first fragment now owns the used indent. The parent
+                // must not retain a second line-breaking constraint.
+                component.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
+            }
         }
         // Authored vertical margins do not apply to non-replaced inline
         // boxes. Keep synthetic vertical-align offsets distinct: those
@@ -17558,6 +17577,26 @@ mod image_component_tests {
     }
 
     #[test]
+    fn first_line_vertical_align_does_not_create_an_inline_offset() {
+        use w3cos_std::style::{Display, Style};
+        for value in ["0.8em", "top", "bottom"] {
+            let base = Style { display: Display::Inline, font_size: 50.0,
+                line_height: 1.0, ..Style::default() };
+            let declarations = vec![("vertical-align".into(), value.into(), 0),
+                ("color".into(), "green".into(), 1)];
+            let styled = super::first_line_text_style(&base, &declarations, 50.0);
+            let normal = super::text_pseudo_style(&base, &declarations[1..]);
+            assert_eq!(styled.align_self, normal.align_self, "{value}");
+            assert_eq!(styled.height, normal.height, "{value}");
+            assert!(styled.custom_properties.as_ref().is_none_or(|p|
+                !p.contains_key("--w3cos-internal-vertical-align-length")
+                    && !p.contains_key("--w3cos-internal-vertical-align-keyword")
+                    && !p.contains_key("--w3cos-internal-inline-fragment-clip")), "{value}");
+            assert_eq!(styled.color, w3cos_std::Color::from_named("green").unwrap());
+        }
+    }
+
+    #[test]
     fn first_line_stops_at_a_forced_break() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("p::first-line", &[("color", "fuchsia")]);
@@ -17699,7 +17738,7 @@ mod image_component_tests {
     }
 
     #[test]
-    fn first_line_length_stops_at_width_and_keeps_explicit_inline_wrapper() {
+    fn first_line_ignores_length_but_keeps_authored_inline_wrapper() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
             "p",
@@ -17743,11 +17782,11 @@ mod image_component_tests {
         assert_eq!(pseudo_runs[0].0, "É");
         assert_eq!(
             pseudo_runs[0].1.height,
-            w3cos_std::style::Dimension::Px(90.0)
+            w3cos_std::style::Dimension::Auto
         );
         assert_eq!(pseudo_runs[0].1.custom_properties.as_ref()
             .and_then(|properties| properties.get("--w3cos-internal-reserved-line-lift"))
-            .map(String::as_str), Some("40"));
+            .map(String::as_str), None);
         assert_eq!(pseudo_runs[1].0, "X");
         assert!(
             pseudo_runs[1]

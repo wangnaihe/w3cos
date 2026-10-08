@@ -973,7 +973,10 @@ fn image_intrinsic_ratio(src: &str) -> Option<f32> {
 
     if let Some(size) = crate::image_loader::svg_intrinsic_size(src) {
         if size.uses_default_image_size() {
-            return Some(2.0);
+            // The default object viewport supplies two fallback dimensions,
+            // not an intrinsic ratio. A CSS constraint on one axis must not
+            // scale the other axis for this SVG sizing mode.
+            return None;
         }
         return match (size.width, size.height) {
             (SvgIntrinsicLength::Px(width), SvgIntrinsicLength::Px(height)) if height > 0.0 => {
@@ -3054,22 +3057,28 @@ fn inline_leading_separator_flags(
     component: &Component,
     available_width: f32,
     shaped_widths: &[Option<f32>],
+    viewport_w: f32,
+    viewport_h: f32,
 ) -> Vec<bool> {
     let mut flags = vec![false; component.children.len()];
     if !is_simple_wrapping_text_packet(component, available_width) { return flags; }
     let mut advance = 0.0;
     for (index, child) in component.children.iter().enumerate() {
-        let padding = child.style.padding_lengths();
-        let margin = child.style.margin_lengths();
+        let edge = |spacing| resolve_spacing_for_layout(
+            spacing, available_width, &child.style, viewport_w, viewport_h);
+        let padding_left = edge(child.style.padding.left);
+        let padding_right = edge(child.style.padding.right);
+        let margin_left = edge(child.style.margin.left);
+        let margin_right = edge(child.style.margin.right);
         let width = shaped_widths.get(index).copied().flatten().map(|width| {
-            width + margin.left + margin.right
+            width + margin_left + margin_right
                 + if child.style.box_sizing == WBoxSizing::ContentBox {
-                    padding.left + padding.right
+                    padding_left + padding_right
                 } else { 0.0 }
         }).unwrap_or_else(|| component_max_content_width(child));
         let separator = matches!(&child.kind, ComponentKind::Text { content } if content == " ")
-            && padding.left == 0.0 && padding.right == 0.0
-            && margin.left == 0.0 && margin.right == 0.0
+            && padding_left == 0.0 && padding_right == 0.0
+            && margin_left == 0.0 && margin_right == 0.0
             && child.style.border_left_width.unwrap_or(child.style.border_width) == 0.0
             && child.style.border_right_width.unwrap_or(child.style.border_width) == 0.0
             && child.style.background.a == 0 && child.style.background_image.is_none();
@@ -19410,7 +19419,7 @@ fn build_taffy_tree(
         #[cfg(not(feature = "skia"))]
         let shaped_fragment_widths = vec![None; comp.children.len()];
         let leading_separators = inline_leading_separator_flags(
-            comp, child_containing_width, &shaped_fragment_widths,
+            comp, child_containing_width, &shaped_fragment_widths, viewport_w, viewport_h,
         );
         let mut separator_breaks = Vec::new();
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
@@ -23099,6 +23108,30 @@ mod tests {
             assert_eq!(rect.height > 0.0, expects_line, "{decoration}: {rect:?}");
         }
         stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn soft_wrap_after_percent_inline_start_discards_leading_space() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for content in [
+            "<div style='width:196px;text-indent:50%'>X The first X in this sentence should be indented to the center of this block.</div>",
+            "<div style='width:196px'><span style='padding-left:50%'>X The first X in this sentence should be indented to the center of this block.</span></div>",
+        ] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/percent-start.html").unwrap();
+            parser.write(&format!("<!doctype html><body style='margin:8px;font-size:16px'>{content}")).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let layouts = compute(&root, 800.0, 600.0).unwrap();
+            let rect = layouts.iter().find(|(_, index)| matches!(flat[*index].kind,
+                ComponentKind::Text { content } if content == "in")).unwrap().0;
+            assert_eq!(rect.x, 8.0, "soft line must start at the containing edge: {content}");
+        }
     }
 
     #[test]
@@ -30047,6 +30080,25 @@ mod tests {
             let rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
             assert_eq!((rect.width, rect.height), (300.0, 150.0), "{dimensions}");
             assert_eq!(crate::image_loader::dimensions(&src), Some((300, 150)), "DOM natural dimensions must agree");
+            crate::image_loader::invalidate(&src);
+        }
+    }
+
+    #[test]
+    fn svg_default_object_size_does_not_supply_an_intrinsic_ratio() {
+        for dimensions in ["height=\"25\"", "width=\"50\"", ""] {
+            let src = format!("browser-none-constrained-{dimensions}.svg");
+            let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {dimensions} viewBox=\"0 0 1000 500\" preserveAspectRatio=\"none\"/>");
+            crate::image_loader::decode_and_install(&src, svg.as_bytes()).unwrap();
+            for (style, expected) in [
+                (Style { height: WDim::Px(20.0), ..Style::default() }, (300.0, 20.0)),
+                (Style { max_height: WDim::Px(20.0), ..Style::default() }, (300.0, 20.0)),
+                (Style { width: WDim::Px(40.0), ..Style::default() }, (40.0, 150.0)),
+                (Style { max_width: WDim::Px(40.0), ..Style::default() }, (40.0, 150.0)),
+            ] {
+                assert_eq!(image_intrinsic_size(&src, &style, Some(200.0)), expected,
+                    "a fallback viewport is not an aspect-ratio constraint: {dimensions}");
+            }
             crate::image_loader::invalidate(&src);
         }
     }

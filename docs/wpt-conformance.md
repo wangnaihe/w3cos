@@ -1,5 +1,162 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication checkpoint: SVG sizing, indent and first-line repairs
+
+The user authorizes publishing the accumulated vendor-only changes to main.
+Before publication, origin/main equals local base da5028e. The production
+diff hash matches V2566's immutable source-bound receipt; no additional
+renderer change is included. Published scope comprises default-object SVG
+ratio handling, forced-break/percentage indent wrapping and the first-line
+vertical-align policy with focused regressions and the evidence below.
+
+The latest first-line focused units pass4/4 and dynamic inline insertion
+regression is browser-exact9/9. First-line012/013 remain open at132/4926
+actual/browser pixels. Strict reference contradictions and the DOM
+partition's9 unchanged failures remain independently FAILED. Publication
+does not imply full6,548 acceptance or a current remaining-count census.
+The size gate still reports6 existing outside-vendor violations. Parent
+source/pin is untouched; generic rendering changes do not change Product
+Agent concepts, authority or tool semantics.
+
+## 2026-10-09 First-line vertical-align policy: 012/013 improved, still open
+
+V2555 freshly retains012/013 browser RED at22086/9895 actual pixels, with
+reference/browser0 and the already repaired c547 at browser-exact. Original
+screenshots show Chromium ignores vertical-align on the first-line pseudo,
+while the explicit inline wrapper still contributes its40px line extension.
+The common first-line style pass now filters that pseudo declaration without
+disabling alignment authored on real descendants or other first-line styles.
+
+V2557's first unit expectation used an incorrect default-alignment assumption;
+it is retained, not evidence of the production bug. The normalized no-property
+comparison is corrected before production, with genuine RED V2558. V2559
+records the old90px pseudo expectation failing after the candidate. That
+expectation is replaced by observed browser behavior, while the real wrapper's
+90px assertion remains unchanged. V2560 passes4 focused units. V2561 records
+208 pass/9 unchanged failures/1 ignored; the DOM partition remains FAILED.
+
+The runner rebuild completes in2m06s. V2562 reduces012 to132 and013 to4926
+actual/browser pixels; both references remain0 and c547 remains browser-exact.
+Neither pseudo case is accepted as complete. Their strict native/reference
+failures remain27430/10700; browser/reference remains27430/13095, separately
+FAILED. V2564 regresses all9 dynamic inline insertion cases at browser-exact
+and strict zero. V2566 binds RED, normalized tests, source/runner, byte-identical
+browser PNGs and the inherited strict ledger. V2567 retains current native
+geometry:012's real-wrapper É text rect starts at integer y243; the remaining
+132px edge mismatch needs paint-level evidence, not a guessed layout offset.
+
+No full6,548/current-count or goal-completion claim; changes remain local,
+uncommitted and unpushed. Parent code/pin and Product Agent semantics remain
+unchanged. The size gate retains6 outside-vendor violations. Next isolate012's
+132px real-inline edge paint mismatch and013's ordinary top/bottom alignment,
+retaining strict browser/reference contradictions independently.
+
+## 2026-10-09 CSS1 percent indent shared wrapping gap browser-exact
+
+The residual c547-indent-001 difference is a retained soft-line-leading
+separator: native starts the second line at13.327988px instead of8px, changing
+the subsequent word fitting on both the authored indent and reference padding
+pages. V2546 records a genuine runtime RED covering both equivalent paths.
+
+Percentage indent transferred to the first inline fragment no longer remains
+as a second parent line-breaking constraint. The shared separator-fitting pass
+now resolves inline padding/margins using the actual containing width and
+viewport, including percentage edges formerly read as0 by padding_lengths.
+No path/fixture-specific offset, oracle change or tolerance is introduced.
+V2547 passes4 runtime units; V2548 passes4 DOM indent units. V2553 retains
+the DOM partition's207 pass/9 unchanged failures/1 ignored, separately FAILED.
+
+The runner rebuild completes in2m03s. V2549 measures c547 actual/browser,
+reference/browser and both strict comparisons at0 pixels. First-line-pseudo
+012/013 remain22086/9895 actual/browser pixels and remain open; their strict
+native/reference and browser/reference failures are independently retained.
+V2551 regresses all9 dynamic inline insertion cases at browser-exact and
+strict zero. V2554 binds source/binary, RED, units, unchanged browser PNGs,
+fresh pixels and prior strict ledgers; no full6,548/current-count claim.
+Changes remain local and uncommitted; parent code/pin untouched. The size gate
+retains6 outside-vendor violations, with no Product Agent semantic change.
+Next isolate first-line pseudo012/013 browser geometry and their remaining
+font/line-metric failures before any final fixed-revision corpus audit.
+
+## 2026-10-09 Forced-break indent regression repaired; shared wrapping gap remains
+
+V2535 freshly remeasures c547-indent-001 and first-line-pseudo012/013 at the
+current source: actual/browser35105/22086/9895 pixels, reference/browser
+3858/0/0. V2537 native layout shows word-sized fragments of the indented
+paragraph carrying its paragraph indent and becoming two lines tall. V2538
+records the genuine existing DOM regression RED before the production fix.
+
+The common fragmentation pass now retains a marked paragraph-width text run
+in a forced-break context. That run owns its internal wrapping and first-line
+indent rather than repeating the indent inside every word box. V2539 passes
+7 focused DOM units, including percent indent, anonymous lines and decorated
+word-boundary regressions. V2540's217-test DOM partition records207 pass,
+9 unchanged failures and1 ignored (previously206 pass/10 fail/1 ignored);
+it remains FAILED, with no new failures.
+
+The runner rebuild completes in2m20s. V2541 reduces c547 actual/browser from
+35105 to3858 pixels and turns native/reference to strict zero. Actual and
+reference still share3858 browser pixels in the narrow final container, so
+the case is NOT browser-accepted. First-line-pseudo012/013 stay at22086/9895
+actual/browser pixels and are still open. V2543 regresses all9 dynamic inline
+insertion cases at browser-exact with strict zero. V2545 binds unchanged
+browser PNG bytes, RED, units, source/binary, partial pixels and independent
+strict ledgers; prior out-of-scope strict failures are retained.
+
+No full6,548 census, current remaining-count or goal-completion claim. Changes
+remain local/uncommitted, parent code/pin untouched. The size gate retains6
+outside-vendor violations; no Product Agent semantic change. Next establish
+the remaining shared3858-pixel narrow-container wrapping RED and repair it,
+then isolate first-line pseudo geometry independently.
+
+## 2026-10-09 Constrained SVG default object sizing: nine browser-exact originals
+
+V2525 freshly reproduces the historical four constrained SVG sizing gaps:
+height/max-height20 each38528 actual/browser pixels, width/max-width40
+each36172; all references are browser-exact. Inspection shows that the SVG
+default300x150 object viewport was incorrectly promoted to an intrinsic2:1
+ratio, causing one-axis CSS constraints to rescale the other axis.
+
+V2527 records the genuine minimal RED: a20px CSS height produced40x20
+instead of the browser's300x20. The common image intrinsic-ratio resolver now
+returns no intrinsic ratio for the existing default-object SVG sizing mode.
+It retains real two-axis intrinsic ratios and independent fallback dimensions.
+V2528 passes5 focused units, including normal ratios, explicit axes and narrow
+containing blocks. No fixture, browser oracle or pixel tolerance changes.
+
+The runner rebuild completes in2m03s. V2529 accepts all four original pages
+at0 actual/browser and0 reference/browser pixels. V2531 verifies unchanged
+browser PNG bytes and binds RED, units, source, runner and strict side ledgers.
+V2532 regresses all9 canonical replaced-element SVG sizing cases:9/9
+browser-exact, no unverified comparisons. V2534 binds that full group receipt.
+All9 native/reference and9 browser/reference comparisons remain independently
+FAILED (18 entries), not waived. The earlier BFC ledger and other strict
+failures remain retained outside this refresh. No current remaining-count or
+full6,548 closure claim is made. Runtime/document changes are uncommitted;
+no further push is authorized. Parent code/pin and Product Agent semantics
+remain unchanged. The size gate retains6 outside-vendor violations.
+Next remeasure the next historical browser-gap batch at the current source.
+
+## 2026-10-09 Nested BFC browser pixels accepted; strict contradictions retained
+
+At published vendor SHA da5028e, the pixel runner rebuild completes in2m12s.
+V2521 refreshes four passing runtime units at this clean source. V2522 measures
+all11 canonical BFC margin originals and their references:11 browser-exact,
+zero browser gaps or unverified comparisons. In particular008/009 improve from
+5000 actual/browser pixels each in V2515 to0. V2524 verifies byte-identical
+original browser PNGs, source/runner binding, RED V2518, focused regressions
+and immutable evidence hashes.
+
+Strict native/reference AND browser/reference remain independently FAILED
+for006/007/008/009 at11250/10000/5000/5000 pixels respectively (eight entries).
+These are not waived or relabeled as passes. The BFC unit partition stays
+23 pass/2 unchanged failures (V2520), separately FAILED. Prior out-of-scope
+strict ledgers are retained. No full6,548 census or current remaining-count
+claim is made. Parent code/pin remains untouched; the size gate still reports
+six outside-vendor violations. This evidence update is local and uncommitted.
+Next remeasure the next historical browser-gap batch against this source;
+the full goal remains open and requires the final fixed-revision audit.
+
 ## 2026-10-09 Publication checkpoint: browser parity repairs, nested pixels pending
 
 The user authorized committing and pushing this accumulated vendor-only batch
