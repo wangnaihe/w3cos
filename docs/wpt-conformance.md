@@ -1,5 +1,137 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Preserved source LS: three originals browser-exact
+
+V2721 retains genuine DOM RED: source LS and synthetic BR both become the same
+mandatory marker in a preserved paragraph. Source text is now normalized while
+its origin is still known, before BR merging: under Pre/PreWrap, authored LS
+has a space glyph and bidi class WS; BR retains its hard marker. DOM source is
+unchanged. Ordinary text lowering, rendered-text projection and the passive
+single-span fast path share this operation. Collapsing whitespace modes are
+explicitly not normalized: they still need non-collapsing literal-space provenance.
+
+V2722 passes the new two-mode DOM control and three other selected controls,
+but `first_line_stops_at_a_forced_break` still FAILS. Historical V2615 contains
+the same named failure and `first line` error; same-source baseline replay has
+not been performed. This mixed DOM gate remains FAIL, not silently filtered.
+V2723 passes 66 runtime executions. After a 1m58s runner build, V2724 makes
+bidi-breaking-001/002/003 browser-exact on both original and reference pages.
+003 improves from 4471 to zero browser pixels, but its native/reference pixels
+increase from 4323 to 8794, matching the existing browser/reference contradiction.
+All six independent strict rows remain FAILED.
+
+V2726 remeasures the canonical 105-case bidi-text partition: 91 exact,
+14 browser gaps, no unverified comparisons. Only 003 changes pixel counts
+against V2712. V2728 first-line 25/25, V2730 insertion 9/9 and V2732 opacity
+4/4 preserve exact browser pixels, unchanged browser PNG bytes and strict counts.
+`target/wpt-targeted/baseline-font-position-20261003/ls-checkpoint-v2734.json`
+binds DOM RED, mixed DOM controls and historical failure, runtime units, source/
+runner hashes, original pixels, regressions and independent strict ledgers.
+Next target the remaining bidi partition gaps; collapsing-mode LS and the DOM
+failure remain discoverable outstanding items. No current full 6548-case pass
+or global remaining count. Changes remain local/unpublished, parent source/pin
+untouched; no Product Agent business semantics/contracts change. The six size
+violations remain existing outside-vendor items.
+
+## 2026-10-09 Authored PS preserved; 003 remains FAILED on LS
+
+V2707 retains genuine RED: an authored U+2029 splits one preformatted CSS line
+into two. Whitespace preparation now preserves PS instead of converting it to
+LF. Glyph rendering resolves each bidi paragraph independently, then maps PS
+to its space glyph, retaining logical paragraph classes until resolution.
+The previous PS-as-hard-break unit expectation is replaced by the observed
+browser behavior. V2708 initially miscounts the authored spaces plus NBSPs at
+the paragraph join (three instead of five); correcting that fixture does not
+relax the genuine no-forced-break RED. V2709 passes 66 focused executions,
+including forced-break controls, normal fallback metrics and prior repairs.
+
+After a 1m57s runner rebuild, V2710 retains 001/002 browser-exact and reduces
+003 from 8800 to 4471 actual/native-browser pixels. The remaining difference
+bounds begin at y=245, in the LS row: the PS row is now browser-exact. 003 is
+still FAILED, not a completed case. Its native/reference comparison increases
+from 64 to 4323px while browser/reference remains 8794px; both remain separately
+FAILED, reflecting the requested browser-priority policy without waivers.
+
+V2712 remeasures all 105 canonical bidi-text reftests: 90 exact, 15 gaps,
+zero unverified. Only 003 changes comparison pixel counts against V2704.
+V2714 first-line 25/25, V2716 insertion 9/9 and V2718 opacity 4/4 retain exact
+browser pixels, unchanged oracle PNG bytes and prior strict pixel counts.
+`target/wpt-targeted/baseline-font-position-20261003/ps-checkpoint-v2720.json`
+binds RED, source/runner hashes, units, all focused comparisons and strict ledgers.
+Next distinguish authored U+2028 from synthetic BR in portable text lowering;
+do not globally disable mandatory breaks. Full 6548-case completion is unproven.
+Changes remain local/unpublished; parent source/pin and Product Agent business
+semantics/contracts are untouched. Six size-gate violations remain outside vendor.
+
+## 2026-10-09 Multiline fallback metrics: original 002 browser-exact
+
+V2693 reproduces a second minimal RED: two normal monospace lines containing
+the Hebrew fallback measure 36px instead of Chromium141's 38px. Measurement now
+accounts for each line's concrete normal fallback spacing. The preserved-text
+projection retains that measured height and first-line resolved baseline;
+multiline glyph painting accumulates the corresponding line advances. Explicit
+line-height remains unchanged. V2694's explicit-height control incorrectly
+assumes 36px rather than the existing LayoutUnit-quantized 35.96875px; V2695
+corrects that assertion to the actual computed explicit height and passes all
+65 focused executions. The genuine normal-height RED is not relaxed.
+
+After a 1m56s runner rebuild, V2696 retains 001 browser-exact and repairs 002
+from 654 actual/native-browser pixels to zero. References are browser-exact.
+003 remains FAILED and its browser difference increases from 8738 to 8800px;
+it still incorrectly treats authored Unicode separators as forced breaks.
+Its improved native/reference difference (1397 to 64px) is not browser parity
+and cannot be used as acceptance. Both strict sides for all three originals
+remain independently FAILED (six rows).
+
+V2704 remeasures all 105 canonical bidi-text reftests: 90 browser-exact,
+15 gaps, zero unverified. Only 002/003 change comparison pixel counts against
+source-bound V2684; the 003 worsening is retained, not hidden. V2698 first-line
+25/25, V2700 insertion 9/9 and V2702 opacity 4/4 retain exact browser pixels,
+unchanged browser PNG bytes and prior strict comparison pixel counts.
+
+`target/wpt-targeted/baseline-font-position-20261003/multiline-fallback-checkpoint-v2706.json`
+binds RED, focused units, source/runner hashes, original comparisons, controls
+and independent strict ledgers. Next separate authored Unicode separators from
+synthetic forced-break provenance without breaking BR or bidi paragraph classes.
+No full 6548-case rerun or current global remaining count. Changes remain local
+and unpublished. Parent source/pin and Product Agent business semantics/contracts
+remain untouched; the six size-gate violations are existing outside-vendor items.
+
+## 2026-10-09 Resolved bidi boundaries: original 001 browser-exact
+
+From published db3ce74529f4527665559afea9d65a345d144f1f, the local candidate
+retains resolved directional run boundaries before non-rendering controls are
+removed, rather than resolving the resulting visual string a second time.
+V2675's intermediate candidate regresses wrapping; its failed evidence is kept.
+V2680 reproduces the cause: prefix measurement wraps a complete trailing-RLM run
+into 36px despite the full run fitting one 18px line. The greedy wrapper now
+checks complete-run fit in the first available band, while mandatory breaks
+retain their normal path. V2681 passes 48 focused unit executions.
+
+After a 1m56s runner build, V2682 compares three original bidi-breaking cases.
+001 is browser-exact on both original and reference pages (42 pixels to zero).
+002/003 improve from 696/8780 to 654/8738 actual/native-browser pixels; their
+references remain browser-exact. All three strict native/reference and
+browser/reference comparisons remain FAILED independently (six ledger rows).
+001 still has 192 pixels on each strict side, not waived by browser parity.
+
+V2684 remeasures all 105 canonical bidi-text reftests: 89 browser-exact,
+16 browser gaps, no unverified comparisons. Against failed intermediate V2677,
+only the three targeted cases change comparison pixel counts; this is not a
+pre-candidate no-regression census. V2686 first-line 25/25, V2688 dynamic insertion
+9/9 and V2690 opacity 4/4 remain browser-exact, with unchanged oracle PNG bytes
+and comparison pixel counts against their prior checkpoints. First-line retains
+28 independent strict failure rows.
+
+`target/wpt-targeted/baseline-font-position-20261003/bidi-boundary-checkpoint-v2692.json`
+binds RED, focused units, source/runner hashes, original comparisons, unchanged
+browser oracles, regression controls and explicit strict failure ledgers.
+Next resolve multiline normal fallback font metrics in 002 and distinguish
+authored Unicode separators from internal forced-break provenance in 003.
+No current full 6,548-case pass or global remaining-count claim. These changes
+remain local and unpublished; parent source/pin and Product Agent business
+semantics/contracts are untouched.
+
 ## 2026-10-09 Publication boundary: settled float geometry only
 
 The user authorizes publishing the validated float-wrapper height repair and
@@ -23055,3 +23187,23 @@ isolation and strict closure. Build/diff pass, same six outside-vendor size
 violations, no baseline increase or commit/push. Full6548 NOT_RUN; global
 remaining UNKNOWN. Product Agent knowledge unaffected: generic inline painting,
 no business concepts, authority or tool semantics changed.
+### Publication checkpoint: 2026-10-09 bidi and solid-border work
+
+This checkpoint publishes the current local bidi/text metrics repairs and the
+opaque square solid-border miter candidate, not full WPT closure. Runtime unit
+build succeeds; V2762 miter rounding test passes and V2763 related runtime
+regression filters execute 73 tests, all passing. Receipts are under
+`target/wpt-targeted/baseline-font-position-20261003/soft-wrap-units-v2762.json`
+and `soft-wrap-units-v2763.json`.
+
+The analytic miter candidate has NOT yet been rebuilt into the WPT runner or
+checked against fresh whole-page Chromium captures. V2746's nine bidi box-model
+cases still record 10 native/browser differing pixels each for the preceding
+candidate; those receipts are not proof of the current source. Failed rounding
+candidates V2749/V2750 remain retained independently. Prior V2722 DOM regression
+`first_line_stops_at_a_forced_break` remains unresolved, not a passing DOM gate.
+Strict native/reference and browser/reference failures stay independently
+recorded even where native/browser pixels match. Full 6,548 cases NOT_RUN for
+this checkpoint; current global remaining count UNKNOWN. Next: source-bound
+runner build, nine original border cases, then bidi and relevant controls.
+Product Agent knowledge unaffected: generic text/raster behavior only.

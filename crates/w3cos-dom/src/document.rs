@@ -4468,7 +4468,7 @@ impl Document {
             parent_style.white_space,
             WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::PreLine
         ) {
-            return raw.to_string();
+            return preserved_authored_text(raw, parent_style.white_space).into_owned();
         }
 
         let sibling_inline_state = |sibling_id: NodeId, from_end: bool| {
@@ -5281,7 +5281,8 @@ impl Document {
                 normalize_css_table_internal_used_style(&mut style);
                 style.custom_properties.get_or_insert_with(Default::default).insert(
                     w3cos_std::inline_text::SOURCE_RUN.into(), format!("text:{}", id.as_u32()));
-                w3cos_std::Component::text(text, style)
+                let text = preserved_authored_text(text, style.white_space);
+                w3cos_std::Component::text(text.as_ref(), style)
             }
             NodeType::Comment | NodeType::DocumentType => {
                 return w3cos_std::Component::column(style, vec![]);
@@ -5577,7 +5578,9 @@ impl Document {
                                     return self.attach_native_host(
                                         id,
                                         w3cos_std::Component::text(
-                                            grandchild.text_content.as_deref().unwrap_or(""),
+                                            preserved_authored_text(
+                                                grandchild.text_content.as_deref().unwrap_or(""),
+                                                child_style.white_space).as_ref(),
                                             child_style,
                                         ),
                                     );
@@ -14008,6 +14011,20 @@ fn fixup_css_table_children(
     }
 }
 
+/// Source text is still distinct from BR at this boundary. In preserved
+/// whitespace modes LS has a space glyph and bidi class WS, not a mandatory
+/// layout break. Normalize only authored text, before synthetic BR is merged;
+/// leave the DOM source and the internal BR marker untouched. Collapsing modes
+/// need separate non-collapsing-space provenance and are not normalized here.
+fn preserved_authored_text(value: &str, white_space: w3cos_std::style::WhiteSpace)
+    -> std::borrow::Cow<'_, str>
+{
+    if matches!(white_space, w3cos_std::style::WhiteSpace::Pre
+        | w3cos_std::style::WhiteSpace::PreWrap) && value.contains('\u{2028}')
+    { std::borrow::Cow::Owned(value.replace('\u{2028}', " ")) }
+    else { std::borrow::Cow::Borrowed(value) }
+}
+
 fn collapse_css_whitespace(value: &str, keep_leading: bool, keep_trailing: bool) -> String {
     let starts_with_whitespace = value.chars().next().is_some_and(is_css_whitespace);
     let ends_with_whitespace = value.chars().next_back().is_some_and(is_css_whitespace);
@@ -21436,6 +21453,35 @@ mod image_component_tests {
             w3cos_std::style::TextAlign::Right,
             "logical start must remain the RTL inline end after consuming the override"
         );
+    }
+
+    #[test]
+    fn preserved_source_ls_is_not_the_synthetic_br_marker() {
+        for white_space in ["pre", "pre-wrap"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("div", &[("white-space",white_space)]);
+            let mut document=Document::new();
+            let block=document.create_element("div");
+            let source=document.create_text_node("left\u{2028}right");
+            let source_id=source.id;
+            block.append_child(&mut document,source);
+            let br=document.create_element("br");
+            block.append_child(&mut document,br);
+            let after=document.create_text_node("end");
+            block.append_child(&mut document,after);
+            document.body().append_child(&mut document,block);
+            fn collect(node:&w3cos_std::Component,out:&mut String) {
+                if let ComponentKind::Text {content}=&node.kind {out.push_str(content);}
+                for child in &node.children {collect(child,out);}
+            }
+            let mut text=String::new();
+            collect(&document.to_component_tree(),&mut text);
+            assert_eq!(text,"left right\u{2028}end",
+                "authored LS paints a space in preserved text, while BR remains mandatory: {white_space}");
+            assert_eq!(document.get_node(source_id).text_content.as_deref(),Some("left\u{2028}right"),
+                "used text normalization must not mutate DOM source");
+        }
+        crate::stylesheet::clear_rules();
     }
 
     #[test]

@@ -389,11 +389,16 @@ fn preserved_text(component: &Component, index: usize, layouts: &[(LayoutRect, u
     let position = *positions.get(&(index + 1))?;
     let authored_height = crate::layout::inline_style_line_height(&style);
     if authored_height <= 0.0 { return None; }
-    let lines = (crate::layout::wrapped_text_height(content, layouts[position].0.width, style)
-        / authored_height).round();
+    let measured_height = crate::layout::wrapped_text_height(content, layouts[position].0.width, style);
+    let lines = (measured_height / authored_height).round();
     if lines < 2.0 { return None; }
-    let (advance, baseline) = baseline_text_metrics(&component.style, style);
-    Some((position, lines * advance, baseline - inline_font_content_ascent(style),
+    let (advance, mut baseline) = baseline_text_metrics(&component.style, style);
+    #[cfg(feature = "skia")]
+    if style.line_height_is_normal
+        && let Some(metrics) = crate::render_skia::resolved_text_font_geometry(
+            content.split(['\n', '\r', '\u{2028}']).next().unwrap_or(""), style)
+    { baseline = baseline.max(metrics.ascent); }
+    Some((position, measured_height.max(lines * advance), baseline - inline_font_content_ascent(style),
         inline_font_height(style)))
 }
 

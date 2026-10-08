@@ -2286,6 +2286,59 @@ fn render_node(
     );
 }
 
+thread_local! {
+    static SOLID_BORDER_MITER: Option<skia_safe::RuntimeEffect> = skia_safe::RuntimeEffect::make_for_shader(r#"
+        uniform float4 corner;
+        uniform float4 sizes;
+        uniform float4 horizontal_rgba;
+        uniform float4 vertical_rgba;
+        float sq(float v) { v=max(v,0); return v*v; }
+        half4 main(float2 xy) {
+            float2 q=(xy-corner.xy)*corner.zw;
+            float w=sizes.x,h=sizes.y,d=h*q.x-w*q.y,e=(w+h)*.5;
+            float coverage=d>=e?1:(d<=-e?0:
+                clamp((sq(d+e)-sq(d+(h-w)*.5)-sq(d+(w-h)*.5)+sq(d-e))/(2*w*h),0,1));
+            return half4(floor(mix(vertical_rgba,horizontal_rgba,coverage)+.5)/255);
+        }
+    "#,None).ok();
+}
+
+/// Integrate the shared diagonal over a device pixel once. Independently
+/// rasterizing adjacent quads quantizes their complementary coverages and
+/// biases midpoint colors. Keep unsupported transforms/fractional corner
+/// extents on the ordinary path; this shader does not alter glyph/opacity AA.
+fn draw_opaque_border_miter(canvas:&Canvas, rect:LayoutRect, corner:usize,
+    width:f32,height:f32,horizontal:w3cos_std::Color,vertical:w3cos_std::Color) -> bool {
+    if width<=0.0 || height<=0.0 || horizontal==vertical {return false;}
+    let matrix=canvas.local_to_device_as_3x3();
+    if !matrix.is_scale_translate() || matrix.scale_x()<=0.0 || matrix.scale_y()<=0.0 {return false;}
+    let right=matches!(corner,1|2);
+    let bottom=corner>=2;
+    let bounds=Rect::from_xywh(if right {rect.x+rect.width-width} else {rect.x},
+        if bottom {rect.y+rect.height-height} else {rect.y},width,height);
+    let Some(bounds)=matrix.map_rect_scale_translate(bounds) else {return false;};
+    if !bounds.is_finite() || [bounds.left,bounds.top,bounds.right,bounds.bottom]
+        .iter().any(|edge|edge.fract()!=0.0) {return false;}
+    SOLID_BORDER_MITER.with(|effect| {
+        let Some(effect)=effect else {return false;};
+        let values=[if right {bounds.right} else {bounds.left},if bottom {bounds.bottom} else {bounds.top},
+            if right {-1.0} else {1.0},if bottom {-1.0} else {1.0},
+            bounds.width(),bounds.height(),0.0,0.0,
+            horizontal.r as f32,horizontal.g as f32,horizontal.b as f32,255.0,
+            vertical.r as f32,vertical.g as f32,vertical.b as f32,255.0];
+        let bytes=values.iter().flat_map(|value|value.to_ne_bytes()).collect::<Vec<_>>();
+        let Some(shader)=effect.make_shader(skia_safe::Data::new_copy(&bytes),&[],None) else {return false;};
+        let mut paint=Paint::default();
+        paint.set_anti_alias(false).set_color(Color::WHITE).set_shader(shader)
+            .set_blend_mode(skia_safe::BlendMode::Src);
+        let save=canvas.save();
+        canvas.reset_matrix();
+        canvas.draw_rect(bounds,&paint);
+        canvas.restore_to_count(save);
+        true
+    })
+}
+
 fn draw_box_border(canvas: &Canvas, rect: LayoutRect, style: &Style) {
     let has_edge_border = style.border_top_width.is_some()
         || style.border_right_width.is_some()
@@ -2358,6 +2411,53 @@ fn draw_box_border(canvas: &Canvas, rect: LayoutRect, style: &Style) {
                 canvas.draw_path(&builder.detach(), &paint);
             }
             canvas.restore();
+        } else if !style.border_collapse
+            && colors.iter().all(|color| color.a == 255)
+            && style.border_corner_radii().iter().all(|radius| *radius == 0.0)
+            && style.border_styles.iter().all(|line| matches!(line,
+                None | Some(w3cos_std::style::BorderLineStyle::Solid)))
+        {
+            // Opaque adjacent sides must meet at a miter. Fill the side
+            // underpaint first, then overlay top/bottom quads: AA on a shared
+            // diagonal blends the two border colors, not an uncovered backdrop.
+            // Apply element opacity once, after resolving those opaque joins.
+            let snap = |value:f32| (value + 0.5).floor();
+            let left = snap(rect.x);
+            let top = snap(rect.y);
+            let right = snap(rect.x + rect.width);
+            let bottom = snap(rect.y + rect.height);
+            let rect = LayoutRect {x:left,y:top,width:(right-left).max(0.0),height:(bottom-top).max(0.0)};
+            let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
+            let save = canvas.save_count();
+            if style.opacity != 1.0 {
+                let opacity = color_paint(w3cos_std::Color::rgb(255,255,255),style.opacity);
+                canvas.save_layer(&SaveLayerRec::default().paint(&opacity));
+            }
+            for side in [0,2,3,1] {
+                if widths[side] > 0.0 {
+                    draw_round_rect(canvas,edges[side],0.0,&color_paint(colors[side],1.0));
+                }
+            }
+            let outer=[(left,top),(right,top),(right,bottom),(left,bottom)];
+            let inner=[(left+widths[3],top+widths[0]),(right-widths[1],top+widths[0]),
+                (right-widths[1],bottom-widths[2]),(left+widths[3],bottom-widths[2])];
+            for side in [0,2] {
+                if widths[side] <= 0.0 {continue;}
+                let next=(side+1)%4;
+                let mut path=PathBuilder::new();
+                path.move_to(outer[side]).line_to(outer[next]).line_to(inner[next])
+                    .line_to(inner[side]).close();
+                canvas.draw_path(&path.detach(),&color_paint(colors[side],1.0));
+            }
+            if widths[1]+widths[3]<=rect.width && widths[0]+widths[2]<=rect.height {
+                for corner in 0..4 {
+                    let horizontal=if corner<2 {0} else {2};
+                    let vertical=if matches!(corner,1|2) {1} else {3};
+                    draw_opaque_border_miter(canvas,rect,corner,widths[vertical],widths[horizontal],
+                        colors[horizontal],colors[vertical]);
+                }
+            }
+            canvas.restore_to_count(save);
         } else {
             for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
                 if width > 0.0 && color.a > 0 {
@@ -3207,7 +3307,17 @@ fn draw_text_in_rect_with_line_painter(
     }
     let line_height = line_context.and_then(|context| context.line_advance)
         .unwrap_or(crate::layout::inline_style_line_height(&style));
-    let text_height = layout.lines.len() as f32 * line_height;
+    let line_heights = layout.lines.iter().enumerate().map(|(index, line)| {
+        let line_style = authored_styles.as_ref().map_or(style, |styles| &styles[index]);
+        line_height.max(resolved_text_line_height(line, line_style))
+    }).collect::<Vec<_>>();
+    let mut next_line_top = 0.0;
+    let line_tops = line_heights.iter().map(|height| {
+        let top = next_line_top;
+        next_line_top += height;
+        top
+    }).collect::<Vec<_>>();
+    let text_height = next_line_top;
     let top = content.y + text_vertical_offset(style, content.height, text_height);
     let paragraph_ends =
         text_layout::paragraph_terminal_lines(text, style.white_space, &layout.lines);
@@ -3250,7 +3360,7 @@ fn draw_text_in_rect_with_line_painter(
                     text_layout::justification_expansion(line, line_content.width,
                         measure_skia_text_advance(line, typeface, style))).flatten();
                 paint_line(canvas, line_content.x,
-                    top + index as f32 * line_height + line_box_half_leading(style),
+                    top + line_tops[index] + line_box_half_leading(style),
                     line, line_content.width, style, expansion);
                 continue;
             }
@@ -3262,7 +3372,7 @@ fn draw_text_in_rect_with_line_painter(
                 // word boundaries. Per-word origins add an extra float
                 // conversion before Skia positions the contextual glyphs.
                 paint_line(canvas, line_content.x,
-                    top + index as f32 * line_height + line_box_half_leading(style),
+                    top + line_tops[index] + line_box_half_leading(style),
                     line, line_content.width, style, Some(expansion));
                 continue;
             }
@@ -3275,7 +3385,7 @@ fn draw_text_in_rect_with_line_painter(
                     paint_line(
                         canvas,
                         line_content.x + offset,
-                        top + index as f32 * line_height + line_box_half_leading(style),
+                        top + line_tops[index] + line_box_half_leading(style),
                         word,
                         measure_skia_text_advance(word, typeface, style),
                         style,
@@ -3302,7 +3412,7 @@ fn draw_text_in_rect_with_line_painter(
         paint_line(
             canvas,
             x,
-            top + index as f32 * line_height + line_box_half_leading(style),
+            top + line_tops[index] + line_box_half_leading(style),
             line,
             advance,
             style,
@@ -3569,7 +3679,7 @@ fn draw_text_glyph_line_with_expansion(
         return advance;
     }
     let paint = color_paint(color, opacity);
-    let font_text = text_layout::font_render_text_for_style(text, style);
+    let (font_text, bidi_boundaries) = text_layout::font_render_text_for_style_with_boundaries(text, style);
     if style_uses_ahem(style) {
         // Ahem paints one deterministic em cell per character it covers, but
         // `font-family` still applies per character: a stack such as
@@ -3606,6 +3716,7 @@ fn draw_text_glyph_line_with_expansion(
         style,
         &paint,
         expansion.map(|expansion| expansion.for_text(font_text.as_ref())),
+        Some(&bidi_boundaries),
     )
 }
 
@@ -3825,17 +3936,22 @@ fn draw_font_stack_runs(
     paint: &Paint,
 ) -> f32 {
     draw_font_stack_runs_with_expansion(canvas, x, baseline, text, font_size,
-        typeface, style, paint, None)
+        typeface, style, paint, None, None)
 }
 
 fn draw_font_stack_runs_with_expansion(
     canvas: &Canvas, x: f32, baseline: f32, text: &str, font_size: f32,
     typeface: &Typeface, style: &Style, paint: &Paint,
     expansion: Option<text_layout::JustificationExpansion>,
+    resolved_boundaries: Option<&[usize]>,
 ) -> f32 {
     let mut cursor_x = x;
     let adjustments = authored_fragment_adjustments(text, style);
-    let bidi_boundaries = unresolved_bidi_segment_boundaries(text, style);
+    let fallback_boundaries;
+    let bidi_boundaries = if let Some(boundaries) = resolved_boundaries { boundaries } else {
+        fallback_boundaries = unresolved_bidi_segment_boundaries(text, style);
+        &fallback_boundaries
+    };
     let mut byte_offset = 0;
     for (index, run) in css_font_runs(text, typeface, style).into_iter().enumerate() {
         // Bidi segment boxes use LayoutUnit starts. A same-direction font
@@ -4045,15 +4161,14 @@ fn font_stack_ink_bounds(
     let mut bottom = f32::MIN;
     let mut saw_ink = false;
 
-    let font_text = style.map_or_else(
-        || text_layout::font_render_text(text, w3cos_std::style::TextDirection::Ltr),
-        |style| text_layout::font_render_text_for_style(text, style),
+    let (font_text, bidi_boundaries) = style.map_or_else(
+        || (text_layout::font_render_text(text, w3cos_std::style::TextDirection::Ltr), Vec::new()),
+        |style| text_layout::font_render_text_for_style_with_boundaries(text, style),
     );
     let runs = style.map_or_else(
         || fallback_font_runs(font_text.as_ref(), typeface, font_weight),
         |style| css_font_runs(font_text.as_ref(), typeface, style),
     );
-    let bidi_boundaries = style.map(|style| unresolved_bidi_segment_boundaries(font_text.as_ref(), style)).unwrap_or_default();
     let mut byte_offset = 0;
     for (index, run) in runs.into_iter().enumerate() {
         if index > 0 && bidi_boundaries.contains(&byte_offset) {
@@ -4201,7 +4316,7 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
     if let Some((_, advance)) = positioned_tab_runs(text, typeface, style) {
         return advance;
     }
-    let render_text = text_layout::font_render_text_for_style(text, style);
+    let (render_text, bidi_boundaries) = text_layout::font_render_text_for_style_with_boundaries(text, style);
     if style_uses_ahem(style) {
         return ahem_segments(render_text.as_ref(), style)
             .into_iter()
@@ -4212,7 +4327,7 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
             })
             .sum();
     }
-    font_stack_advance(render_text.as_ref(), typeface, style)
+    font_stack_advance_with_boundaries(render_text.as_ref(), typeface, style, &bidi_boundaries)
 }
 
 /// Position preserved tabs before glyph shaping. A tab is a shift, not a
@@ -4361,6 +4476,12 @@ fn ahem_cell_advance(text: &str, style: &Style) -> f32 {
 /// Advance of `text` measured through the CSS font stack.
 fn font_stack_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
     let bidi_boundaries = unresolved_bidi_segment_boundaries(text, style);
+    font_stack_advance_with_boundaries(text, typeface, style, &bidi_boundaries)
+}
+
+fn font_stack_advance_with_boundaries(
+    text: &str, typeface: &Typeface, style: &Style, bidi_boundaries: &[usize],
+) -> f32 {
     let mut byte_offset = 0;
     css_font_runs(text, typeface, style)
         .into_iter()
@@ -4476,6 +4597,14 @@ pub(crate) fn measure_skia_inline_fragment_advances(
     })
 }
 
+fn resolved_text_line_height(text: &str, style: &Style) -> f32 {
+    let authored = crate::layout::inline_style_line_height(style);
+    if style.line_height_is_normal {
+        resolved_text_font_geometry(text, style).map_or(authored,
+            |metrics| authored.max(metrics.line_spacing()))
+    } else { authored }
+}
+
 pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
     let registered = registered_typeface_covering(style, text);
     let generic = generic_serif_typeface(style);
@@ -4507,8 +4636,10 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
         // CSS line box. Browser block/inline layout advances by the computed
         // line-height; fallback-specific CJK expansion is applied centrally
         // by `browser_normal_cjk_height` in layout.rs.
-        let content_height = text_layout::used_text_line_count(text, style, &lines) as f32
-            * crate::layout::inline_style_line_height(style);
+        let used = text_layout::used_text_line_count(text, style, &lines);
+        let content_height = if used > 1 {
+            lines.iter().take(used).map(|line| resolved_text_line_height(line, style)).sum()
+        } else { used as f32 * crate::layout::inline_style_line_height(style) };
         (
             width + padding.left + padding.right,
             content_height + padding.top + padding.bottom,
@@ -4552,7 +4683,7 @@ pub(crate) fn measure_skia_wrapped_text_height(text: &str, width: f32, style: &S
         let content_height = if used_line_count == 1 {
             measure_skia_text_intrinsic_size(&lines[0], style).1 - padding.top - padding.bottom
         } else {
-            used_line_count as f32 * crate::layout::inline_style_line_height(&style)
+            lines.iter().take(used_line_count).map(|line| resolved_text_line_height(line, style)).sum()
         };
         content_height + padding.top + padding.bottom
     })
@@ -5003,6 +5134,27 @@ mod tests {
     }
 
     #[test]
+    fn opaque_four_color_solid_border_joins_diagonally_without_a_white_seam() {
+        let mut surface=Surface::new_raster_n32_premul((24,24)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        let style=Style {border_width:5.0,
+            border_top_color:Some(w3cos_std::Color::rgb(255,165,0)),
+            border_right_color:Some(w3cos_std::Color::rgb(128,0,128)),
+            border_bottom_color:Some(w3cos_std::Color::rgb(0,128,128)),
+            border_left_color:Some(w3cos_std::Color::rgb(255,255,0)),..Style::default()};
+        draw_box_border(surface.canvas(),LayoutRect {x:2.0,y:2.0,width:20.0,height:20.0},&style);
+        let info=ImageInfo::new((24,24),ColorType::RGBA8888,AlphaType::Premul,None);
+        let mut pixels=vec![0u8;24*24*4];
+        assert!(surface.read_pixels(&info,&mut pixels,24*4,(0,0)));
+        let pixel=|x:usize,y:usize| &pixels[(y*24+x)*4..(y*24+x+1)*4];
+        assert_eq!(pixel(3,2),[255,165,0,255],"top owns the corner above the miter");
+        assert_eq!(pixel(2,3),[255,255,0,255],"left owns the corner below the miter");
+        assert_eq!(pixel(2,2),[255,210,0,255],"AA join blends the two sides, not the white background");
+        assert_eq!(pixel(2,21),[128,192,64,255],
+            "Chromium141 rounds the 50% yellow/teal miter coverage to the nearest channel");
+    }
+
+    #[test]
     fn structural_table_columns_do_not_paint_outlines() {
         for display in [Display::TableColumn,Display::TableColumnGroup] {
             let mut surface=Surface::new_raster_n32_premul((40,30)).unwrap();
@@ -5043,6 +5195,54 @@ mod tests {
         assert!(surface.read_pixels(&info,&mut pixels,40*4,(0,0)));
         let purple=pixels.chunks_exact(4).filter(|p|*p==[128,0,128,255]).count();
         assert_eq!(purple,32*8,"empty border box retains outward outline ink");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn multiline_normal_text_includes_each_lines_resolved_fallback_metrics() {
+        let style=Style {font_size:15.6,font_weight:700,font_family:Some("monospace".into()),
+            white_space:w3cos_std::style::WhiteSpace::Pre,
+            line_height:18.0/15.6,line_height_is_normal:true,..Style::default()};
+        let text="א + - × ÷ \u{a0}\n\u{a0} + - × ÷ ת";
+        assert_eq!(resolved_text_font_geometry("א + - × ÷ \u{a0}",&style).unwrap().line_spacing(),19.0);
+        assert_eq!(measure_skia_text_intrinsic_size(text,&style).1,38.0,
+            "Chromium141: two normal lines containing the fallback face occupy 38px");
+        assert_eq!(measure_skia_wrapped_text_height(text,200.0,&style),38.0);
+        let explicit=Style {line_height_is_normal:false,..style.clone()};
+        assert_eq!(measure_skia_text_intrinsic_size(text,&explicit).1,
+            2.0 * crate::layout::inline_style_line_height(&explicit),
+            "explicit line-height must not expand to fallback metrics");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trailing_bidi_control_keeps_a_fitting_complete_run_on_one_line() {
+        let style=Style { font_size:15.6,font_weight:700,font_family:Some("monospace".into()),
+            line_height:18.0/15.6,line_height_is_normal:true,..Style::default() };
+        let text="ת + - × ÷ \u{a0}\u{200f}";
+        let (width,height)=measure_skia_text_intrinsic_size(text,&style);
+        assert_eq!(measure_skia_wrapped_text_height(text,
+            text_layout::inline_layout_advance(width),&style),height,
+            "prefix shaping must not break a complete run that fits after its trailing control");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rtl_marked_fallback_line_preserves_one_resolved_segment_advance() {
+        let style = Style { font_size:15.6, font_weight:700,
+            font_family:Some("monospace".into()), ..Style::default() };
+        let mut visual = style.clone();
+        visual.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-bidi-visual-order".into(),"1".into());
+        let logical="\u{200f}\u{a0} + - × ÷ א";
+        let rendered=text_layout::font_render_text_for_style(logical,&style);
+        assert_eq!(rendered,"א ÷ × - +  ");
+        let natural=crate::layout::text_intrinsic_size(logical,&style).0;
+        // Keep the authored NBSP until CSS white-space processing, just as
+        // the override control does; rendered ordinary spaces would collapse.
+        let override_width=crate::layout::text_intrinsic_size("א ÷ × - + \u{a0}",&visual).0;
+        assert_eq!(natural,override_width,
+            "removing RLM must not invent a second bidi segment boundary");
     }
 
     #[cfg(target_os = "macos")]

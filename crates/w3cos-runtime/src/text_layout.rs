@@ -292,7 +292,7 @@ fn normalized_segment_breaks(text: &str) -> String {
                 }
                 output.push('\n');
             }
-            '\u{000c}' | PARAGRAPH_SEPARATOR => output.push('\n'),
+            '\u{000c}' => output.push('\n'),
             _ => output.push(character),
         }
     }
@@ -600,6 +600,17 @@ fn wrap_greedy_with_line_width(
     mut line_width: impl FnMut(usize) -> f32,
     mut run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
+    // Shaping prefixes is not monotonic: a trailing directional control can
+    // change neutral resolution and reduce the complete run's advance. Never
+    // invent a soft break when that complete run fits the first available band.
+    // Mandatory breaks still take the ordinary line-by-line path below.
+    if !text.is_empty() && !text.chars().any(|ch| matches!(ch, '\n' | FORCED_LINE_BREAK)) {
+        let available_width = line_width(0).max(1.0);
+        let fitting_roundoff = available_width * f32::EPSILON * 4.0;
+        if run_width(text) <= available_width + fitting_roundoff {
+            return vec![text.to_string()];
+        }
+    }
     let mut lines = Vec::new();
     let mut current = String::new();
     let flush = |lines: &mut Vec<String>, current: &mut String| {
@@ -741,7 +752,7 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
 }
 
 pub(crate) fn font_glyph_character(character: char) -> char {
-    if character == '\u{00a0}' {
+    if matches!(character, '\u{00a0}' | PARAGRAPH_SEPARATOR) {
         ' '
     } else {
         character
@@ -752,8 +763,15 @@ pub(crate) fn font_render_text(
     text: &str,
     direction: w3cos_std::style::TextDirection,
 ) -> Cow<'_, str> {
+    font_render_text_with_boundaries(text, direction).0
+}
+
+fn font_render_text_with_boundaries(
+    text: &str,
+    direction: w3cos_std::style::TextDirection,
+) -> (Cow<'_, str>, Vec<usize>) {
     if text.is_ascii() && direction == w3cos_std::style::TextDirection::Ltr {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), Vec::new());
     }
 
     let paragraph_level = match direction {
@@ -762,28 +780,40 @@ pub(crate) fn font_render_text(
     };
     let bidi = unicode_bidi::BidiInfo::new(text, Some(paragraph_level));
     let logical = text.chars().collect::<Vec<_>>();
-    let Some(paragraph) = bidi.paragraphs.first() else {
-        return Cow::Borrowed(text);
-    };
-    let levels = bidi.reordered_levels_per_char(paragraph, paragraph.range.clone());
-    let visual_order = unicode_bidi::BidiInfo::reorder_visual(&levels);
-    let rendered = visual_order
-        .into_iter()
-        .map(|index| {
+    if bidi.paragraphs.is_empty() {
+        return (Cow::Borrowed(text), Vec::new());
+    }
+    let mut rendered = String::new();
+    let mut boundaries = Vec::new();
+    for paragraph in &bidi.paragraphs {
+        // An authored PS changes bidi paragraph resolution, not CSS line
+        // breaking. Resolve every paragraph before normalizing its glyph;
+        // reordering all levels together would join independent paragraphs.
+        let start = text[..paragraph.range.start].chars().count();
+        let end = start + text[paragraph.range.clone()].chars().count();
+        let all_levels = bidi.reordered_levels_per_char(paragraph, paragraph.range.clone());
+        let levels = &all_levels[start..end];
+        if !rendered.is_empty() { boundaries.push(rendered.len()); }
+        let mut previous_rtl = None;
+        for local_index in unicode_bidi::BidiInfo::reorder_visual(levels) {
+            let index = start + local_index;
             let character = logical[index];
-            if levels[index].is_rtl() {
-                unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
-            } else {
-                character
+            if is_non_rendering_format_character(character) { continue; }
+            let rtl = levels[local_index].is_rtl();
+            if previous_rtl.is_some_and(|previous| previous != rtl) {
+                boundaries.push(rendered.len());
             }
-        })
-        .filter(|character| !is_non_rendering_format_character(*character))
-        .map(font_glyph_character)
-        .collect::<String>();
+            previous_rtl = Some(rtl);
+            let character = if rtl {
+                unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
+            } else { character };
+            rendered.push(font_glyph_character(character));
+        }
+    }
     if rendered == text {
-        Cow::Borrowed(text)
+        (Cow::Borrowed(text), boundaries)
     } else {
-        Cow::Owned(rendered)
+        (Cow::Owned(rendered), boundaries)
     }
 }
 
@@ -791,6 +821,15 @@ pub(crate) fn font_render_text_for_style<'a>(
     text: &'a str,
     style: &w3cos_std::style::Style,
 ) -> Cow<'a, str> {
+    font_render_text_for_style_with_boundaries(text, style).0
+}
+
+/// Resolve segment starts before removing bidi controls. Re-parsing the
+/// visual string would lose those controls' effect on neutral characters.
+pub(crate) fn font_render_text_for_style_with_boundaries<'a>(
+    text: &'a str,
+    style: &w3cos_std::style::Style,
+) -> (Cow<'a, str>, Vec<usize>) {
     let language = style.custom_properties.as_ref().and_then(|properties| {
         properties
             .get("--w3cos-internal-text-language")
@@ -812,13 +851,16 @@ pub(crate) fn font_render_text_for_style<'a>(
             .chars()
             .any(|character| font_glyph_character(character) != character)
         {
-            return Cow::Owned(transformed.chars().map(font_glyph_character).collect());
+            return (Cow::Owned(transformed.chars().map(font_glyph_character).collect()), Vec::new());
         }
-        return transformed;
+        return (transformed, Vec::new());
     }
     match transformed {
-        Cow::Borrowed(text) => font_render_text(text, style.direction),
-        Cow::Owned(text) => Cow::Owned(font_render_text(&text, style.direction).into_owned()),
+        Cow::Borrowed(text) => font_render_text_with_boundaries(text, style.direction),
+        Cow::Owned(text) => {
+            let (rendered, boundaries) = font_render_text_with_boundaries(&text, style.direction);
+            (Cow::Owned(rendered.into_owned()), boundaries)
+        }
     }
 }
 
@@ -1969,6 +2011,18 @@ mod tests {
     }
 
     #[test]
+    fn resolved_bidi_boundaries_keep_control_effect_after_glyph_normalization() {
+        let style=w3cos_std::style::Style::default();
+        let (text,boundaries)=font_render_text_for_style_with_boundaries(
+            "\u{200f}\u{a0} + - × ÷ א",&style);
+        assert_eq!(text,"א ÷ × - +  ");
+        assert!(boundaries.is_empty(),"one RTL segment remains one segment after RLM removal");
+        let (text,boundaries)=font_render_text_for_style_with_boundaries("א + - × ÷ \u{a0}",&style);
+        assert_eq!(text,"א + - × ÷  ");
+        assert_eq!(boundaries,vec!["א".len()],"an actual logical level boundary is retained");
+    }
+
+    #[test]
     fn explicit_bidi_overrides_are_reordered_before_font_rendering() {
         assert_eq!(
             font_render_text("\u{202e}elbadaer", w3cos_std::style::TextDirection::Ltr),
@@ -2108,12 +2162,23 @@ mod tests {
     }
 
     #[test]
-    fn unicode_paragraph_separator_starts_a_new_preformatted_line() {
+    fn authored_ps_keeps_bidi_paragraphs_without_a_css_forced_break() {
+        let text="א + - × ÷ \u{a0}\u{2029}\u{a0} + - × ÷ ת";
+        let lines=wrap_text_with_run_width(text,1000.0,WhiteSpace::Pre,|run|run.chars().count() as f32);
+        assert_eq!(lines,vec![text.to_string()],
+            "Chromium141 preserves authored PS in one CSS line; it is not a BR marker");
+        assert_eq!(font_render_text(text,w3cos_std::style::TextDirection::Ltr),
+            "א + - × ÷     + - × ÷ ת",
+            "each bidi paragraph resolves independently before the PS space glyph is emitted");
+    }
+
+    #[test]
+    fn unicode_paragraph_separator_is_preserved_in_preformatted_css_text() {
         assert_eq!(
             wrap_text_with_run_width("first\u{2029}second", 1000.0, WhiteSpace::Pre, |text| text
                 .len()
                 as f32,),
-            vec!["first", "second"]
+            vec!["first\u{2029}second"]
         );
     }
 
