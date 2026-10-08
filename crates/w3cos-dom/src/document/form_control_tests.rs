@@ -3,6 +3,45 @@ use crate::events::EventType;
 use w3cos_std::{ComponentKind, style::Display};
 
 #[test]
+fn video_controls_paint_state_tracks_boolean_attribute_without_inheriting() {
+    const MARKER: &str = "--w3cos-internal-video-controls";
+    fn state(tree: &w3cos_std::Component, id: u64) -> Option<&str> {
+        if matches!(tree.on_click, w3cos_std::EventAction::NativeHost { id: host, .. } if host == id) {
+            return tree.style.custom_properties.as_ref()?.get(MARKER).map(String::as_str);
+        }
+        tree.children.iter().find_map(|child| state(child, id))
+    }
+    let mut document = Document::new();
+    let video = document.create_element("video");
+    let fallback = document.create_element("span");
+    video.append_child(&mut document, fallback);
+    let sibling = document.create_element("div");
+    document.body().append_child(&mut document, video);
+    document.body().append_child(&mut document, sibling);
+    assert_eq!(state(&document.to_component_tree(), video.id.as_u32() as u64), None);
+    // HTML boolean attributes are true by presence, even with the value "false".
+    for value in ["", "controls", "false"] {
+        video.set_attribute(&mut document, "controls", value);
+        let tree = document.to_component_tree();
+        assert_eq!(state(&tree, video.id.as_u32() as u64), Some("no-source"));
+        assert_eq!(state(&tree, fallback.id.as_u32() as u64), None);
+        assert_eq!(state(&tree, sibling.id.as_u32() as u64), None);
+    }
+    video.set_attribute(&mut document, "src", "movie.mp4");
+    assert_eq!(state(&document.to_component_tree(), video.id.as_u32() as u64), Some("source-pending"));
+    video.set_attribute(&mut document, "src", " ");
+    assert_eq!(state(&document.to_component_tree(), video.id.as_u32() as u64), Some("no-source"));
+    let source = document.create_element("source");
+    source.set_attribute(&mut document, "src", "movie.webm");
+    video.append_child(&mut document, source);
+    assert_eq!(state(&document.to_component_tree(), video.id.as_u32() as u64), Some("source-pending"));
+    video.remove_attribute(&mut document, "controls");
+    assert_eq!(state(&document.to_component_tree(), video.id.as_u32() as u64), None);
+    sibling.style_mut(&mut document).set_property(MARKER, "no-source");
+    assert_eq!(state(&document.to_component_tree(), sibling.id.as_u32() as u64), None);
+}
+
+#[test]
 fn html_control_auto_appearance_yields_to_author_decoration() {
     for (tag, part) in [("input", "textfield"), ("button", "button")] {
         for (property, value, expected) in [

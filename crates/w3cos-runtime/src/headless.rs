@@ -83,9 +83,11 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         Some((width as f32, height as f32)),
     );
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
-    let mut nodes = layout_cache
+    let mut nodes = artifact.rect_by_index
         .iter()
-        .filter_map(|&(rect, index)| {
+        .enumerate()
+        .filter_map(|(index, rect)| {
+            let rect = (*rect)?;
             let node = artifact.nodes.get(index)?;
             Some((index, rect, &node.kind, &node.style))
         })

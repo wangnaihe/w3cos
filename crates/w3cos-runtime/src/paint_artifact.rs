@@ -12,6 +12,9 @@ use w3cos_std::style::{
 
 use crate::layout::LayoutRect;
 
+#[path = "paint_artifact/media_controls.rs"]
+mod media_controls;
+
 pub type PropertyNodeId = usize;
 pub type PaintChunkId = usize;
 pub type PaintOrderLevel = (u8, i32, usize);
@@ -22,6 +25,14 @@ pub struct PaintNode {
     pub style: Style,
     pub parent: Option<usize>,
     pub sticky_counter_signal: Option<usize>,
+}
+
+impl PaintNode {
+    /// UA paint children are appended after all DOM/layout source nodes.
+    pub(crate) fn is_paint_only(&self) -> bool {
+        self.style.custom_properties.as_ref().is_some_and(|p|
+            p.contains_key("--w3cos-internal-media-controls-layer"))
+    }
 }
 
 pub(crate) struct AppliedTextDecoration<'a> {
@@ -2130,6 +2141,9 @@ impl PaintArtifact {
         viewport: Option<(f32, f32)>,
     ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
+        // Reused snapshots include paint-only UA children; reconstruct them
+        // from their live hosts rather than accumulating another copy.
+        nodes.retain(|node| !node.is_paint_only());
         let mut has_percentage_padding = false;
         for node in &mut nodes {
             crate::background_image::annotate_fixed_background_viewport(&mut node.style, viewport);
@@ -2327,6 +2341,7 @@ impl PaintArtifact {
         annotate_collapsed_border_joints(&mut nodes, &rect_by_index);
         extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
         annotate_separated_table_background_fragments(&mut nodes, &rect_by_index);
+        media_controls::append(&mut nodes, &mut rect_by_index);
         let mut artifact = Self {
             logical_paint_ordinals: logical_paint_ordinals(&nodes),
             body_index,

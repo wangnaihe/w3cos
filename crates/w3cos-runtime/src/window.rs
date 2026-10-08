@@ -3838,6 +3838,15 @@ impl App {
                 })
                 .collect();
         let paint_z = &self.paint_artifact.z_order;
+        for (idx, node) in self.paint_artifact.nodes.iter().enumerate() {
+            if node.style.custom_properties.as_ref().is_some_and(|p|
+                p.contains_key("--w3cos-internal-media-controls-layer"))
+                && let Some(rect) = self.paint_artifact.rect_by_index[idx]
+            {
+                render_nodes.push((idx, LayoutRect { x: rect.x * scale, y: rect.y * scale,
+                    width: rect.width * scale, height: rect.height * scale }, &node.kind, &node.style));
+            }
+        }
         render_nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
             self.paint_artifact
                 .paint_order_key(*left)
@@ -6226,6 +6235,7 @@ fn paint_nodes_as_flat<'a>(
 ) -> Vec<layout::FlatNodeInfo<'a>> {
     nodes
         .iter()
+        .filter(|node| !node.is_paint_only())
         .map(|node| layout::FlatNodeInfo {
             stable_id: 0,
             kind: &node.kind,
@@ -6235,6 +6245,28 @@ fn paint_nodes_as_flat<'a>(
             parent: node.parent,
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn retained_layout_excludes_video_controls_paint_children() {
+    use w3cos_std::style::Style;
+    let nodes = vec![
+        PaintNode { kind: ComponentKind::Root, style: Style::default(), parent: None, sticky_counter_signal: None },
+        PaintNode { kind: ComponentKind::Box, style: Style {
+            custom_properties: Some(HashMap::from([("--w3cos-internal-video-controls".into(), "no-source".into())])),
+            ..Style::default()
+        }, parent: Some(0), sticky_counter_signal: None },
+        PaintNode { kind: ComponentKind::Box, style: Style::default(), parent: Some(0), sticky_counter_signal: None },
+    ];
+    let rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+    let artifact = PaintArtifact::build(nodes, &[(rect,0),(rect,1),(rect,2)], 1);
+    assert_eq!(artifact.nodes.len(), 4);
+    let action = EventAction::None;
+    let flat = paint_nodes_as_flat(&artifact.nodes, &action);
+    assert_eq!(flat.len(), 3, "UA paint children must never enter layout reuse");
+    assert_eq!(flat[2].parent, Some(0));
+    assert!(std::ptr::eq(flat[2].style, &artifact.nodes[2].style), "source indices must remain stable");
 }
 
 trait PaintNodeView {

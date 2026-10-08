@@ -34,6 +34,10 @@ mod analytic_ellipse;
 mod analytic_round_rect;
 #[path = "browser_blur.rs"]
 mod browser_blur;
+#[path = "browser_dither.rs"]
+mod browser_dither;
+#[path = "media_controls_paint.rs"]
+mod media_controls_paint;
 #[cfg(target_os = "macos")]
 #[path = "browser_font_defaults.rs"]
 mod browser_font_defaults;
@@ -2012,6 +2016,11 @@ fn render_node_with_applied_decorations(
     }
     if !themed_control && !(style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. })) {
         draw_box_border(canvas, inline_decoration_rect, style);
+    }
+
+    if style.custom_properties.as_ref().is_some_and(|p|
+        p.get("--w3cos-internal-media-controls-layer").map(String::as_str) == Some("no-source")) {
+        media_controls_paint::draw(canvas, rect, style);
     }
 
     match kind {

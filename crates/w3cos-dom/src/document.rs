@@ -5053,6 +5053,25 @@ impl Document {
             || qualified_tag.clone(),
             |(_, local_name)| local_name.to_string(),
         );
+        // Native UA controls belong to the media host, not to its fallback
+        // children. Internal paint metadata must not follow CSS inheritance.
+        const VIDEO_CONTROLS: &str = "--w3cos-internal-video-controls";
+        if let Some(properties) = style.custom_properties.as_mut() {
+            properties.remove(VIDEO_CONTROLS);
+            properties.remove("--w3cos-internal-media-controls-layer");
+        }
+        if tag == "video" && node.attributes.iter().any(|(name, _)| name.as_str() == "controls") {
+            let has_source = |source: &DomNode| source.attributes.iter()
+                .any(|(name, value)| name.as_str() == "src" && !value.trim().is_empty());
+            let source_pending = has_source(node) || self.children_ids(id).iter().any(|child| {
+                let source = self.get_node(*child);
+                source.tag.as_str() == "source" && has_source(source)
+            });
+            style.custom_properties.get_or_insert_with(Default::default).insert(
+                VIDEO_CONTROLS.into(),
+                if source_pending { "source-pending" } else { "no-source" }.into(),
+            );
+        }
         if style.text_transform != w3cos_std::style::TextTransform::None {
             if style.text_transform == w3cos_std::style::TextTransform::Capitalize {
                 let mut previous_sibling = node.prev_sibling;

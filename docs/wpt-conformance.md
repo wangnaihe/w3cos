@@ -1,5 +1,91 @@
 # Raw Web Platform Tests
 
+## 2026-10-08 Publication checkpoint: controls shadow and layout reuse pending pixel acceptance
+
+V2413 records two genuine REDs: paint-only UA children entered retained layout
+flattening, and the timeline shadow erased measured browser background samples.
+The adapter now excludes appended paint-only children without shifting source
+indices. The timeline uses the measured 0.5 alpha, 2px offset and 10px blur
+(sigma 5) instead of an opaque unblurred black fill. V2414 passes both focused
+regressions; V2415 and the pre-publication refresh V2420 pass 71/71 tests with
+matching source and binary bindings. The runner build completed in 2m59s.
+
+The latest shadow candidate has NOT_RUN original-page browser pixel comparison;
+V2409's 196 residual pixels describe the preceding candidate only. Both strict
+native/reference and browser/reference failures remain separately retained, not
+waived. No full 6,548-case census or completion claim. Publication is explicitly
+authorized by the user; local receipts remain under target/wpt-targeted.
+The parent repository and submodule pin are not part of this publication.
+The size gate retains 6 outside-vendor violations. Product Agent knowledge has
+no semantic impact from these native paint/layout changes.
+
+## 2026-10-08 Video background gradient browser-exact, 196 control pixels remain
+
+V2401 separates the 2634 residuals into 2383 background pixels and 251 control
+pixels. V2403's numerical model matches all 1520 sampled background values only
+with authored floating-point UA alpha and the Graphite UNORM dither table.
+Computed CSS serialization had lost alpha precision. V2402 establishes the
+gradient RED; V2406 also catches the reserved shader input identifier and
+unsupported bitwise syntax instead of silently relying on the stock fallback.
+Portable arithmetic bit extraction now compiles, and the known solid UA
+background is composed before final RGBA8 storage. The necessity of that
+precomposition versus direct shader blending has not been isolated.
+
+V2408 passes 69 focused tests. The runner build took 2m33s. V2409's original WPT
+capture has 196 actual/browser differences, reference/browser 0, maximum 11;
+the original browser PNG hash is unchanged. V2411 confirms background-region
+differences 0 and all 196 remaining differences in the icon/timeline region.
+V2412 retains both strict comparisons as FAILED at 9025 pixels. No tolerance,
+fixture, reference or browser oracle changed.
+
+Next correct the track shadow's measured rgba(0,0,0,0.5) / 2px offset / 10px blur
+and remaining curve/composition residuals. Paint-only children also need a RED
+against retained layout flattening: the window reuse adapter currently walks
+the entire artifact snapshot. Same-z sibling order and inset/scroll/DPR/poster
+variants remain unaccepted. No full census, goal completion, commit or push.
+The size gate still has the same 6 outside-vendor violations. Product Agent
+knowledge semantics are unaffected.
+
+## 2026-10-08 Video controls paint path integrated, residual pixels retained
+
+V2395 is a real RED for the absent host-owned UA paint node. The artifact now
+creates paint-only controls using the host box and inherited effect/clip trees;
+headless and window node streams include them without changing DOM/layout
+indices. Snapshot rebuild removes prior synthetic controls before regenerating
+them. Compact no-source controls paint the bottom-aligned gradient, disabled
+overflow icon and shadowed timeline. Tokens come from V2389's Chromium141
+computed styles/commands, with the generic structure cross-checked against
+[Chromium UA controls CSS](https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/modules/media_controls/resources/mediaControls.css).
+
+The runner build took 2m42s. V2397 passes 64 paint-artifact and 3 blur tests.
+V2398 refreshes the original WPT: actual/browser improves from 9025 to 2634
+different pixels, reference/browser stays 0, maximum residual difference 11.
+Both browser/reference and native/reference remain FAILED at 9025 pixels and
+are retained separately. V2400 binds the source, RED, units and fresh captures.
+This candidate is PIXEL_PROGRESS_NOT_ACCEPTED: gradient quantization/dithering,
+curve coverage, same-z positioned sibling order, content-box insets, scroll/DPR
+and transform variants still need focused evidence. Large, loaded and interactive
+media controls are not accepted by this compact no-source implementation.
+No full census, goal completion, commit or push; no Product Agent semantics changed.
+
+## 2026-10-08 Video controls DOM paint state verified, painting still pending
+
+V2391 is a genuine RED: the controls host has no paint state in the component
+tree. The DOM bridge now derives host-owned no-source/source-pending metadata
+from the boolean controls attribute and nonempty src/source children. It clears
+inherited or author-supplied copies on nonhosts. Source-pending does not assert
+successful media loading. V2393 passes all 5 form-control tests, covering live
+attribute removal, controls="false", empty src, source children and isolation.
+V2394 binds the RED, focused regression, current source and fixed WPT revision.
+An intermediate compile error used a nonexistent children field; the repaired
+implementation uses the document's LCRS child accessor.
+
+No media-controls painting is implemented yet. The prior 9025/0 browser pixel
+RED and separate strict ledger remain historical, not a fresh measurement or
+repair acceptance. Next integrate UA controls display items with stacking,
+effects and clips, then refresh the original browser comparison. No full census,
+completion, commit or push. No Product Agent knowledge semantics changed.
+
 ## 2026-10-08 Video-controls missing UA paint path localized
 
 V2389 inspects the original actual/reference pages through Chromium UA shadow
