@@ -1,5 +1,128 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication checkpoint: first-line clipping, geometry and backgrounds
+
+The user authorizes committing and pushing the accumulated vendor-only changes
+to remote main, from c076c843cc822f4d56f04398434a6751df4396cb. Parent source
+and submodule pin remain untouched. Fixed WPT revision remains
+fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0.
+
+V2608 retains the principal-font-background runtime RED; V2609 passes all
+5 focused runtime controls after the repair. The runner rebuild completes
+in 1m56s. V2610 binds runner ce4ab43e19e7a8bdee3cc9c8d6756a0697d2a7b154f2c911a3c828a793a563bb
+and source diff e5a6580196f7139329d27dc58080225f1eaa34ce7cae0793963a965d007cf815.
+Its 25 first-line reftests retain 19 browser-exact and 6 browser gaps, with
+zero unverified comparisons. In particular, the new principal-font-box
+unit repair does NOT clear original 014/015/016: they remain 1125/8000/9768
+pixels. Floats-002 remains 991; inherit-002/003 remain 1253 each.
+These failures are not waived. Previously repaired 012/013 remain exact.
+
+V2612 regresses 9/9 dynamic inline insertion originals at browser-exact and
+strict zero. V2615 retains the DOM partition at 209 passed, 9 failed and
+1 ignored, independently FAILED. Earlier image/top-alignment unit failures
+and strict native/reference and browser/reference contradictions remain
+independent failures. No full 6,548-case rerun or current global remaining
+count is claimed. Publication is not conformance completion.
+
+The size gate retains 6 preexisting outside-vendor violations. Generic
+layout/paint repairs change no Product Agent business semantics or contracts.
+Earlier entries describe their historical local/unpublished checkpoints;
+this publication entry supersedes only that publication status.
+
+## 2026-10-09 First-line shared background:012/013 browser-exact; six group gaps
+
+V2596 retains genuine DOM RED for a pseudo background crossing60px baseline
+and75px bottom-aligned font fragments. The common first-line style pass now
+assigns that contributed background a parent-local source identity, reusing
+the existing background-before-glyph renderer grouping. Authored child
+backgrounds remain independent. V2597 passes12 focused units. V2598 records
+209 pass/9 unchanged failures/1 ignored in the DOM partition, still FAILED.
+
+The runner rebuild completes in2m00s. V2599 measures c547, first-line012 and
+first-line013 at0 actual/browser AND0 reference/browser pixels, with unchanged
+browser PNG bytes. The final01315-pixel glyph fringe is restored without
+changing coordinates, font policy or tolerance. V2601 regresses all9 dynamic
+inline insertion originals at browser-exact and strict zero.
+
+V2604 completes the canonical26-case first-line native group:15 native pass,
+11 native fail. Its browser wrapper incorrectly expects26 reftests and stops
+at the scope guard; one case is a testharness. V2606 reuses the same bound
+native report without rerunning it:25 reftests yield19 browser-exact,6 gaps,
+zero unverified; the separate harness passes. Fresh browser gaps are
+floats-002991px, inherit-002/0031253px each, pseudo-0141125px,
+pseudo-0158000px and pseudo-0169768px. This is a current focused inventory,
+not a full census or a before/after proof that all26 are regression-free.
+
+V2603 binds RED, current source/runner, focused units, byte-identical browser
+oracles, controls, the wider partition and its independent strict ledgers.
+012/013 strict native/reference AND browser/reference remain FAILED at
+27430/13095 pixels respectively; parity does not waive reference contradictions.
+The wider first-line partition remains FAILED. No full6,548/current-count or
+goal-completion claim; changes remain uncommitted/unpushed. Parent source/pin
+untouched;6 outside-vendor size violations and no Product Agent semantic
+impact. Next isolate the fresh016/015 browser gaps and preserve other failures.
+
+## 2026-10-09 Nested top/bottom inline geometry: first-line013 down to15 pixels
+
+V2579 retains a minimal runtime RED: a60px top-aligned inline containing
+a75px bottom-aligned child leaves its anonymous60px text at0 instead of15px.
+The existing bottom-segment projection now also handles top-aligned owners.
+V2584 corrects glyph origins and reduces013 from4926 to2940 browser pixels.
+Its principal font background still paints at the obsolete origin. The
+principal box now follows its anonymous text baseline without moving the
+independently aligned descendant. V2588 passes4 focused units, including
+existing bottom/nested alignment cases and the principal-decoration assertion.
+
+The first and second runner rebuilds complete in1m57s and1m56s. V2589 reduces
+013 to15 actual/browser pixels: x80, y185..199, max channel difference80.
+The browser preserves the left X's antialias fringe over the adjacent red
+first-line background; native's later fragment background covers that fringe.
+This remaining paint-order gap is not waived. Reference/browser remains0;
+012 and c547 remain browser-exact. V2592 regresses9/9 dynamic insertion
+originals at browser-exact and strict zero, with byte-identical browser PNGs.
+
+V2580 retains two image/top-alignment unit failures; withdrawing the candidate
+reproduces identical coordinate failures in V2581, and V2591 preserves them
+after the final candidate. They remain independently FAILED. V2593 retains
+the DOM partition's208 pass/9 unchanged failures/1 ignored. V2594 binds RED,
+both candidates, source/runner, units, unchanged oracles and the prior ledger.
+Strict reference failures remain separately FAILED. No full6,548/current-count
+or goal-completion claim; changes remain uncommitted and unpushed. Parent
+source/pin untouched;6 outside-vendor size violations and no Product Agent
+semantic impact. Next repair013's common sibling background/glyph paint order.
+
+## 2026-10-09 Vertical-align ink clipping: first-line012 browser-exact
+
+At published base c076c84, V2568 traces integer origins/baselines and identity
+paint matrices for both50px Ahem É glyphs. The lifted wrapper alone carries
+a narrow synthetic clip. Direct PNG reads correct the previous handoff's
+reversed pixel interpretation: browser retains the fringe at(11,242),
+RGB(0,183,183); native is black there. V2569/V2570 preserve an exploratory
+132-pixel clip contrast. Equality of clipped/unclipped masks was an invalid
+normative assumption; that diagnostic test and temporary trace are removed.
+
+V2571 is the genuine DOM RED: positive/negative vertical-align promotion
+must preserve line-extension geometry without creating an overflow clip.
+The common promotion pass no longer creates that synthetic clip. Actual
+inline-splitting clip generation is unchanged. V2572 passes10 focused units,
+including both offsets and explicit wrapper height. V2575 retains208 pass,
+9 unchanged failures and1 ignored in the DOM partition, separately FAILED.
+
+The runner rebuild completes in2m00s. V2573 remeasures first-line012 at0
+actual/browser and0 reference/browser pixels; c547 remains0 on all sides.
+First-line013 remains4926 actual/browser pixels, with reference/browser0.
+Its control's two60px X glyphs start15px above the browser's glyphs around
+the75px bottom-aligned inner É; nested top/bottom line alignment is next.
+V2576 regresses all9 dynamic inline insertion cases at browser-exact and
+strict zero. V2578 binds RED, diagnostics, units, current source/runner,
+unchanged browser PNGs and the prior independent strict failure ledger.
+
+First-line012/013 strict native/reference AND browser/reference failures
+remain independently FAILED; browser pixel parity does not waive them.
+No full6,548/current-count or completion claim. Changes remain local and
+uncommitted; parent source/pin untouched. The size gate reports6 existing
+outside-vendor violations; Product Agent semantics are unaffected.
+
 ## 2026-10-09 Publication checkpoint: SVG sizing, indent and first-line repairs
 
 The user authorizes publishing the accumulated vendor-only changes to main.

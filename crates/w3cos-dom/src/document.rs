@@ -9608,9 +9608,19 @@ fn first_line_text_style(
     let declarations = supported.as_slice();
     let preserves_background = base.background.a != 0;
     let preserves_vertical_align = base.align_self != w3cos_std::style::AlignSelf::Auto;
+    let group_background = |style: &mut w3cos_std::style::Style| {
+        if !preserves_background && style.background.a > 0 {
+            // One pseudo background spans differently sized/aligned text
+            // fragments. Paint its fragments before any of their glyphs,
+            // using the renderer's existing parent-local source grouping.
+            style.custom_properties.get_or_insert_with(Default::default)
+                .insert("--w3cos-internal-inline-background-group".into(), "first-line".into());
+        }
+    };
     if !preserves_background && !preserves_vertical_align {
         let mut style = text_pseudo_style(base, declarations);
         attach_first_line_fragment_clip(&mut style, declarations, fragment_height);
+        group_background(&mut style);
         return style;
     }
     let inherited_inline_style = declarations
@@ -9626,6 +9636,7 @@ fn first_line_text_style(
     let mut style = text_pseudo_style(base, &inherited_inline_style);
     attach_first_line_fragment_clip(&mut style, declarations, fragment_height);
     promote_vertical_align_line_box_extension(&mut style);
+    group_background(&mut style);
     style
 }
 
@@ -9819,13 +9830,9 @@ fn promote_vertical_align_line_box_extension(style: &mut w3cos_std::style::Style
     if offset > 0.0 {
         properties.insert("--w3cos-internal-reserved-line-lift".into(), format!("{offset}"));
     }
-    style
-        .custom_properties
-        .get_or_insert_with(Default::default)
-        .insert(
-            "--w3cos-internal-inline-fragment-clip".to_string(),
-            format!("top {line_height}"),
-        );
+    // The reserved line extension changes layout only. Vertical alignment
+    // is not an overflow clip: glyph bearings and antialias coverage may
+    // extend outside this font box just as they do on unshifted inlines.
 }
 
 #[cfg(test)]
@@ -9863,6 +9870,22 @@ mod inline_line_extra_ascent_tests {
             .as_ref()
             .and_then(|properties| properties.get("--w3cos-internal-line-extra-ascent"))
             .and_then(|value| value.parse::<f32>().ok())
+    }
+
+    #[test]
+    fn vertical_align_line_extension_does_not_clip_glyph_ink() {
+        for offset in [40.0, -40.0] {
+            let mut style = text_style();
+            style.custom_properties = Some(std::collections::HashMap::from([(
+                "--w3cos-internal-vertical-align-length".to_string(),
+                format!("{offset} {}", offset - 4.0),
+            )]));
+            promote_vertical_align_line_box_extension(&mut style);
+            assert_eq!(style.height, w3cos_std::style::Dimension::Px(60.0));
+            assert!(style.custom_properties.as_ref().is_none_or(|properties|
+                !properties.contains_key("--w3cos-internal-inline-fragment-clip")),
+                "vertical alignment moves the font box without clipping its ink: {offset}");
+        }
     }
 
     #[test]
@@ -17574,6 +17597,29 @@ mod image_component_tests {
             w3cos_std::Color::from_named("green").unwrap()
         );
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_background_groups_cross_font_fragments_before_glyphs() {
+        use w3cos_std::style::{AlignSelf, Display, Style};
+        let declarations = vec![("background".into(), "red".into(), 0)];
+        let group = |style: &Style| style.custom_properties.as_ref()
+            .and_then(|p| p.get("--w3cos-internal-inline-background-group")).cloned();
+        let mut groups = Vec::new();
+        for (size, alignment) in [(60.0, AlignSelf::Auto), (75.0, AlignSelf::FlexEnd)] {
+            let base = Style { display: Display::Inline, font_size: size,
+                line_height: 1.0, align_self: alignment, ..Style::default() };
+            let styled = super::first_line_text_style(&base, &declarations, 60.0);
+            groups.push(group(&styled).expect("one first-line background source"));
+            let authored = Style { background: w3cos_std::Color::rgb(0, 0, 255), ..base };
+            let styled = super::first_line_text_style(&authored, &declarations, 60.0);
+            assert_eq!(styled.background, authored.background);
+            assert!(group(&styled).is_none(), "authored child background is not the pseudo's source");
+        }
+        assert_eq!(groups[0], groups[1]);
+        let styled = super::first_line_text_style(&Style::default(),
+            &[("color".into(), "green".into(), 0)], 60.0);
+        assert!(group(&styled).is_none(), "text color alone creates no background group");
     }
 
     #[test]

@@ -15230,7 +15230,10 @@ fn project_inline_block_vertical_align_keywords(
         }
 
         if (component.style.display == WDisplay::Inline
-            && component.style.align_self == WAlignSelf::FlexEnd
+            // A top-aligned inline still owns a baseline-aligned segment.
+            // Its bottom-aligned descendant may extend that segment below
+            // the owner's em box, just as with a bottom-aligned owner.
+            && matches!(component.style.align_self, WAlignSelf::FlexStart | WAlignSelf::FlexEnd)
             && component.style.align_items == WAlign::Baseline)
             || component
                 .style
@@ -15268,6 +15271,7 @@ fn project_inline_block_vertical_align_keywords(
                 })
                 .max_by(f32::total_cmp);
             if let Some(line_bottom) = line_edge_anchor {
+                let mut principal_top = None;
                 for (child, index) in &children {
                     if child.style.display != WDisplay::Inline
                         || !matches!(child.kind, ComponentKind::Text { .. })
@@ -15301,6 +15305,7 @@ fn project_inline_block_vertical_align_keywords(
                     // Both boxes share a CSS line bottom, not their painted
                     // glyph bottom. Preserve positive and negative half-leading.
                     let delta = line_bottom - rect.height - (line_height - rect.height) * 0.5 - rect.y;
+                    principal_top = Some(rect.y + delta);
                     if delta.abs() > f32::EPSILON {
                         for descendant in *index..*index + count_nodes(child) {
                             if let Some(position) = positions.get(&descendant) {
@@ -15308,6 +15313,16 @@ fn project_inline_block_vertical_align_keywords(
                             }
                         }
                     }
+                }
+                if component.style.display == WDisplay::Inline
+                    && component.style.align_self == WAlignSelf::FlexStart
+                    && let (Some(top), Some(position)) = (principal_top, positions.get(&component_index))
+                {
+                    // `top` aligns the whole inline subtree, not the
+                    // principal font box alone. Its decoration follows the
+                    // anonymous text baseline; aligned descendants keep
+                    // their independently resolved coordinates.
+                    layouts[*position].0.y = top;
                 }
             }
         }
@@ -27647,6 +27662,32 @@ mod tests {
         assert_eq!(rect(1).height, 192.0);
         assert_eq!(rect(2).height, 96.0, "layout={layout:#?}");
         stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn top_inline_with_bottom_child_aligns_anonymous_text_to_segment_bottom() {
+        let text = |size, alignment| Component::text("X", Style {
+            display: WDisp::Inline, font_family: Some("Ahem".into()),
+            font_size: size, line_height: 1.0, align_self: alignment,
+            ..Style::default()
+        });
+        let root = Component::row(Style {
+            display: WDisp::Inline, font_family: Some("Ahem".into()),
+            font_size: 60.0, line_height: 1.0, align_self: WAlignSelf::FlexStart,
+            align_items: WAlign::Baseline,
+            custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-vertical-align-keyword".into(), "top".into()),
+            ])), ..Style::default()
+        }, vec![text(60.0, WAlignSelf::Auto), text(75.0, WAlignSelf::FlexEnd),
+            text(60.0, WAlignSelf::Auto)]);
+        let rect = |x, width, height| LayoutRect { x, y: 0.0, width, height };
+        let mut layout = vec![(rect(0.0,195.0,60.0),0), (rect(0.0,60.0,60.0),1),
+            (rect(60.0,75.0,75.0),2), (rect(135.0,60.0,60.0),3)];
+        project_inline_block_vertical_align_keywords(&mut layout, &root, 800.0, 600.0);
+        assert_eq!(layout[1].0.y, 15.0, "anonymous text belongs to the bottom-aligned segment");
+        assert_eq!(layout[3].0.y, 15.0);
+        assert_eq!(layout[2].0.y, 0.0, "bottom child stays on the resolved line edge");
+        assert_eq!(layout[0].0.y, 15.0, "principal font decoration follows its anonymous text");
     }
 
     #[test]

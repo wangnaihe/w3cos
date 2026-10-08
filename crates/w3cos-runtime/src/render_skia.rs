@@ -769,6 +769,21 @@ fn paint_display_list_with_suppressed_effects(
         if let Some(group) = background_groups.get(&idx) {
             let artifact = frame.artifact.expect("groups require retained nodes");
             let origin = artifact.rect_by_index[idx].expect("group has layout");
+            let first_line_font_box = style.custom_properties.as_ref()
+                .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
+                .filter(|source| source.as_str() == "first-line")
+                .and_then(|_| artifact.nodes[idx].parent)
+                .and_then(|parent| group.iter().find(|&&member| {
+                    let font = &artifact.nodes[member].style;
+                    let owner = &artifact.nodes[parent].style;
+                    font.font_size == owner.font_size && font.font_family == owner.font_family
+                        && font.font_weight == owner.font_weight && font.font_style == owner.font_style
+                }))
+                .and_then(|&member| artifact.rect_by_index[member].map(|font_box| {
+                    let font = &artifact.nodes[member].style;
+                    (font_box.y + rect.y - origin.y, resolved_font_geometry(font)
+                        .map_or(font.font_size, ResolvedFontGeometry::height))
+                }));
             for &member in group {
                 let node = &artifact.nodes[member];
                 let ComponentKind::Text { content } = &node.kind else { continue; };
@@ -777,6 +792,15 @@ fn paint_display_list_with_suppressed_effects(
                 member_rect.y += rect.y - origin.y;
                 let mut background_style = node.style.clone();
                 background_style.opacity = 1.0;
+                if plain_inline_background(&background_style)
+                    && background_style.background_image.is_none()
+                    && let Some((y, height)) = first_line_font_box
+                {
+                    // A first-line pseudo owns one principal font box. A
+                    // larger descendant's ink does not enlarge that source.
+                    background_style.custom_properties.get_or_insert_with(Default::default)
+                        .insert("--w3cos-internal-inline-background-font-box".into(), format!("{y} {height}"));
+                }
                 let context = artifact.inline_line_context(member).map(|mut context| {
                     context.line_box.x += rect.x - origin.x;
                     context.line_box.y += rect.y - origin.y;
@@ -3072,12 +3096,19 @@ fn draw_text_in_rect_with_line_painter(
             let x = aligned_text_x(line_content, line_align, 0.0, advance);
             // Inline decoration follows the font em box, not the line-height
             // strut; half-leading belongs to the ancestor's background.
-            let decoration_height = resolved_font_geometry(style)
-                .map_or(style.font_size, ResolvedFontGeometry::height);
+            let group_font_box = style.custom_properties.as_ref()
+                .and_then(|p| p.get("--w3cos-internal-inline-background-font-box"))
+                .and_then(|value| {
+                    let mut parts = value.split_ascii_whitespace();
+                    Some((parts.next()?.parse::<f32>().ok()?, parts.next()?.parse::<f32>().ok()?))
+                })
+                .filter(|(y, height)| y.is_finite() && height.is_finite() && *height > 0.0);
+            let decoration_height = group_font_box.map(|(_, height)| height).unwrap_or_else(|| resolved_font_geometry(style)
+                .map_or(style.font_size, ResolvedFontGeometry::height));
             let fragment = text_layout::inline_fragment_background_box(
                 LayoutRect {
                     x,
-                    y: top + index as f32 * line_height,
+                    y: group_font_box.map_or(top, |(y, _)| y) + index as f32 * line_height,
                     height: decoration_height,
                     ..line_content
                 },
@@ -5754,6 +5785,38 @@ mod tests {
             assert_eq!(pixel(205, 75), &[255, 255, 255, 255]);
             assert_eq!(pixel(5, 150), &[255, 255, 255, 255], "unfragmented paint leaked below column");
         }
+    }
+
+    #[test]
+    fn first_line_background_uses_principal_font_box_across_large_glyph() {
+        use crate::paint_artifact::PaintNode;
+        let text_style = |size| Style { display: Display::Inline,
+            font_family: Some("Ahem".into()), font_size: size, line_height: 1.0,
+            line_height_is_normal: false, background: w3cos_std::Color::rgb(255, 0, 0),
+            color: w3cos_std::Color::rgb(0, 128, 0),
+            custom_properties: Some(HashMap::from([
+                ("--w3cos-internal-inline-background-group".into(), "first-line".into()),
+            ])), ..Style::default() };
+        let kinds = [ComponentKind::Box, ComponentKind::Text { content: "X".into() },
+            ComponentKind::Text { content: "p".into() }, ComponentKind::Text { content: "X".into() }];
+        let styles = [Style { display: Display::Block, font_family: Some("Ahem".into()),
+            font_size: 20.0, ..Style::default() }, text_style(20.0), text_style(100.0), text_style(20.0)];
+        let rects = [LayoutRect { x: 8.0, y: 0.0, width: 140.0, height: 100.0 },
+            LayoutRect { x: 8.0, y: 80.0, width: 20.0, height: 20.0 },
+            LayoutRect { x: 28.0, y: 0.0, width: 100.0, height: 100.0 },
+            LayoutRect { x: 128.0, y: 80.0, width: 20.0, height: 20.0 }];
+        let layouts = rects.iter().copied().enumerate().map(|(i,r)| (r,i)).collect::<Vec<_>>();
+        let artifact = PaintArtifact::build((0..4).map(|i| PaintNode {
+            kind: kinds[i].clone(), style: styles[i].clone(),
+            parent: (i != 0).then_some(0), sticky_counter_signal: None,
+        }), &layouts, 1);
+        let nodes = (0..4).map(|i| (i, rects[i], &kinds[i], &styles[i])).collect::<Vec<_>>();
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+        let pixels = rasterizer.render_frame(160, 110, &nodes, &test_font(), &[],
+            &HashMap::new(), None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
+        let pixel = |x: usize,y: usize| &pixels[(y*160+x)*4..(y*160+x)*4+4];
+        assert_eq!(pixel(30, 10), &[255,255,255,255], "large glyph must not enlarge pseudo background");
+        assert_eq!(pixel(30, 90), &[0,128,0,255], "large glyph keeps its independent ink position");
     }
 
     #[test]
