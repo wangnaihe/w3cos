@@ -1,5 +1,24 @@
 # Raw Web Platform Tests
 
+## 2026-10-08 Video-controls missing UA paint path localized
+
+V2389 inspects the original actual/reference pages through Chromium UA shadow
+DOM, computed styles, box models and retained layer command logs. Before/after
+PNG hashes match the unchanged V2382 browser captures. Actual paint order is
+the overlapping green sibling first, followed by the controls' #333 background,
+panel gradient, disabled overflow SVG circles and timeline. Reference has no
+visible controls paint. The bottom-aligned gradient is auto112px with16 stops;
+it is not simply a flat gray replacement. Native currently has video layout
+defaults and media API wrappers, but no visible controls renderer in its paint
+path. This explains the observed missing layer; no production fix yet.
+
+V2390 retains the9025/0 actual/reference browser RED and separates native strict
+PASS0 from browser strict FAILED9025. Next implement DOM-derived ownership/state
+and general UA media-controls painting, not a WPT-coordinate patch. The prior
+strict ledgers and full-corpus limitations remain unchanged. No new census,
+acceptance, commit or push; the preceding push authorization was fulfilled by
+2232eea. Product Agent knowledge has no semantic impact from this diagnosis.
+
 ## 2026-10-08 Clip-safe small blur accepted in focused browser regression
 
 V2368 records a genuine partial-output RED: the runtime image-filter wrapper's
