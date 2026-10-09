@@ -1983,25 +1983,40 @@ fn resolve_collapsed_table_layout_borders(root: &mut Component) {
 }
 
 fn table_track_widths(component: &Component) -> Vec<f32> {
-    // An auto table with authored column widths uses those columns as the
-    // preferred grid.  Its cell contents wrap within the authored tracks;
-    // using max-content here incorrectly expands a `<col width>` reference
-    // table to the unwrapped text width.
-    let has_authored_column_width = fn_has_authored_column_width(component);
-    table_intrinsic_track_widths(component, has_authored_column_width)
-}
-
-fn fn_has_authored_column_width(component: &Component) -> bool {
-    component.children.iter().any(|child| match child.style.display {
-        WDisplay::TableColumn => {
-            specified_border_box_width_with_basis(&child.style, None).is_some()
+    fn collect(component: &Component, inherited: bool, columns: &mut Vec<bool>) {
+        for child in &component.children {
+            let constrained = inherited
+                || specified_border_box_width_with_basis(&child.style, None).is_some();
+            match child.style.display {
+                WDisplay::TableColumn => columns.push(constrained),
+                WDisplay::TableColumnGroup => {
+                    if child.children.iter().any(|column|
+                        column.style.display == WDisplay::TableColumn)
+                    {
+                        collect(child, constrained, columns);
+                    } else {
+                        columns.push(constrained);
+                    }
+                }
+                _ => {}
+            }
         }
-        WDisplay::TableColumnGroup => {
-            specified_border_box_width_with_basis(&child.style, None).is_some()
-                || fn_has_authored_column_width(child)
+    }
+    // Authored columns constrain their own preferred tracks, not every
+    // column in the table. Automatic neighbors retain max-content width;
+    // shrinking them to min-content can break even short arrow labels.
+    let mut tracks = table_intrinsic_track_widths(component, false);
+    let mut columns = Vec::new();
+    collect(component, false, &mut columns);
+    if columns.iter().any(|constrained| *constrained) {
+        let minimums = table_intrinsic_track_widths(component, true);
+        for (index, constrained) in columns.into_iter().enumerate() {
+            if constrained && let Some(track) = tracks.get_mut(index) {
+                *track = minimums[index];
+            }
         }
-        _ => false,
-    })
+    }
+    tracks
 }
 
 fn table_intrinsic_track_widths(component: &Component, minimum: bool) -> Vec<f32> {
@@ -40002,6 +40017,78 @@ mod tests {
                 "settled row must still stretch its shorter cell: grouped={grouped}, layouts={layouts:?}");
             assert_eq!(at(row_index + 4).y, 0.0, "stretching the cell does not move its text");
         }
+    }
+
+    #[test]
+    fn authored_table_column_preserves_other_tracks_preferred_content_width() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/table-preferred-tracks.html",
+        ).unwrap();
+        parser.write("<!doctype html><table style='border-spacing:0'><col><col style='width:80px'><col>\
+            <tr><td style='padding:0;vertical-align:bottom'>--&gt;&nbsp;</td>\
+            <td style='padding:0'>Filler Text Filler Text Filler Text Filler Text Filler Text Filler Text</td>\
+            <td style='padding:0;vertical-align:bottom'>&nbsp;&lt;--</td></tr></table>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        fn find(component: &Component, display: WDisplay) -> Option<&Component> {
+            if component.style.display == display { return Some(component); }
+            component.children.iter().find_map(|child| find(child, display))
+        }
+        let table = find(&root, WDisplay::Table).unwrap();
+        let row = find(table, WDisplay::TableRow).unwrap();
+        let cells = row.children.iter().filter(|cell|
+            cell.style.display == WDisplay::TableCell).collect::<Vec<_>>();
+        assert_eq!(cells.len(), 3);
+        let tracks = table_track_widths(table);
+        assert_eq!(tracks.len(), 3);
+        let expected = [component_max_content_width(cells[0]), 80.0,
+            component_max_content_width(cells[2])];
+        assert_eq!(tracks[1], 80.0, "fixture must preserve the authored middle column");
+        assert_eq!(tracks, expected,
+            "a definite middle column must not contract the automatic arrow columns");
+        let flat = pre_flatten(&root);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let table_index = flat.iter().position(|node| node.style.display == WDisplay::Table).unwrap();
+        let rect = layout.iter().find(|(_, node)| *node == table_index).unwrap().0;
+        assert_eq!(rect.width, expected.iter().sum::<f32>());
+    }
+
+    #[test]
+    fn decorated_tall_inline_does_not_repeat_its_baseline_on_the_next_soft_line() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/soft-line-baseline.html",
+        ).unwrap();
+        parser.write("<!doctype html><body style='margin:0'><p style='margin:0;width:688px;font:16px/22px sans-serif'>\
+            Clockwise from top, the borders around <span style='border:32px solid;line-height:96px'>THIS&nbsp;PHRASE</span> \
+            should be: PURPLE, GREEN, BLUE, YELLOW.</p></body>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let text = |word: &str| flat.iter().enumerate().find(|(_, node)|
+            matches!(&node.kind, ComponentKind::Text { content } if content == word)).unwrap().0;
+        let first = text("Clockwise");
+        let next = text("GREEN,");
+        let tall = text("THIS\u{a0}PHRASE");
+        let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert!(rect(next).x < rect(tall).x, "fixture must wrap after the tall inline: {layout:?}");
+        let first_baseline = rect(first).y + inline_font_content_ascent(flat[first].style);
+        let next_baseline = rect(next).y + inline_font_content_ascent(flat[next].style);
+        let expected = inline_style_line_height(flat[tall].style)
+            - inline_font_baseline_from_line_top(flat[tall].style, 96.0)
+            + inline_font_baseline_from_line_top(flat[next].style, 22.0);
+        assert_eq!(next_baseline - first_baseline, expected,
+            "the next soft line must use its own strut baseline: {layout:?}");
     }
 
     #[test]

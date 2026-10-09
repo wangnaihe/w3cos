@@ -211,7 +211,12 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             vertical_margin(style, 1.0);
         }
         "b" | "strong" => style.font_weight = 700,
-        "em" | "i" => style.font_style = FontStyle::Italic,
+        "em" | "i" | "address" => style.font_style = FontStyle::Italic,
+        "blockquote" => {
+            vertical_margin(style, 1.0);
+            style.margin.left = Spacing::Px(40.0);
+            style.margin.right = Spacing::Px(40.0);
+        }
         "ins" | "u" => style.text_decoration = w3cos_std::style::TextDecoration::Underline,
         "del" => style.text_decoration = w3cos_std::style::TextDecoration::LineThrough,
         _ => {}
@@ -491,6 +496,33 @@ mod tests {
         assert_eq!(inherited.font_size, 20.0);
         // `white-space` is not part of the shorthand, so `pre` keeps it.
         assert_eq!(inherited.white_space, w3cos_std::style::WhiteSpace::Pre);
+    }
+
+    #[test]
+    fn quotation_default_margins_keep_author_overrides() {
+        let style = html_default_style("blockquote");
+        assert_eq!(style.margin.left, Spacing::Px(40.0));
+        assert_eq!(style.margin.right, Spacing::Px(40.0));
+        assert_eq!(style.margin.top, Spacing::Em(1.0));
+        assert_eq!(style.margin.bottom, Spacing::Em(1.0));
+        let mut document = crate::document::Document::new();
+        let quotation = document.create_element("blockquote");
+        document.body().append_child(&mut document, quotation);
+        quotation.style_mut(&mut document).set_property("margin", "0");
+        assert_eq!(document.computed_style_for(quotation.id).margin, Edges::ZERO);
+    }
+
+    #[test]
+    fn address_default_italic_reaches_descendants_and_keeps_author_overrides() {
+        let mut document = crate::document::Document::new();
+        let address = document.create_element("address");
+        let span = document.create_element("span");
+        address.append_child(&mut document, span);
+        document.body().append_child(&mut document, address);
+        assert_eq!(document.computed_style_for(address.id).font_style, FontStyle::Italic);
+        assert_eq!(document.computed_style_for(span.id).font_style, FontStyle::Italic);
+        address.style_mut(&mut document).set_property("font-style", "normal");
+        assert_eq!(document.computed_style_for(span.id).font_style, FontStyle::Normal);
     }
 
     #[test]

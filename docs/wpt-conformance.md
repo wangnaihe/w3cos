@@ -1,5 +1,101 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication: table tracks, soft lines and quotation defaults
+
+This publication includes the table preferred-track and decorated soft-line
+repairs documented below. Their focused browser receipts remain scoped to
+those candidates, not proof of subsequent user-agent changes. Blockquote
+defaults now retain 40px horizontal margins and address defaults retain
+italic style through inheritance; author overrides remain effective. V3049
+records both genuine REDs, and V3050 passes all 18 user-agent tests. The
+publication repeats that 18-test gate (V3053) after excluding the unfinished
+legacy font-size RED from the commit. The current-source runtime test build
+succeeds in 50.90s; V3054 passes all 24 related soft-line, table-track and
+inline-edge tests. Both gates bind source and binary hashes in local receipts.
+Fresh whole-page browser acceptance of these
+quotation defaults remains NOT_RUN.
+
+The legacy `<font size>` implementation is unfinished; its V3051 RED stays
+local and is excluded from publication. The 86 white-space strict failures,
+twelve independent native/browser strict comparison rows, and five previously
+recorded extended-unit failures remain open, without upstream modifications
+or tolerance changes. Full current6548 NOT_RUN; global remaining UNKNOWN.
+Only the w3cos repository is published; the parent submodule pin is unchanged.
+The parent size gate still reports six outside-vendor violations. Generic
+layout and user-agent defaults do not change Product Agent knowledge or
+business authority.
+
+## 2026-10-09 decorated inline soft-line baseline repair
+
+V3035 retains the baseline border-case layout diagnostic: the first line has
+a 96px authored strut, but following normal text repeats its baseline distance
+instead of using the next line's strut. V3036 is an invalid fixture, not RED:
+a missing separator lets GREEN stay on the preceding line. V3037 corrects
+the separator and retains genuine 96-versus-59 baseline-distance RED, with
+the previous table-track regression passing.
+
+The shared inline metrics solver now retains horizontal soft-wrap membership
+while resolving each simple inline-text line's own ascent/descent. Decorative
+vertical borders/padding stay outside line height and surround the font box;
+they do not become baseline geometry. Unsupported nested/positioned/RTL runs
+remain on their existing paths. V3038 passes all 24 focused tests, including
+20 shared-line metrics controls, table-track, image-strut and border controls.
+Compilation succeeds in 41.44s; the frozen-source runner build takes 2m41s.
+
+V3039 clears c5516-ibrdr-c-000 actual/reference browser gaps 2210 -> 0,
+with both strict comparisons still zero. The primary six-page window now
+has four exact pages and two unchanged browser gaps (3808 and 3472 on
+actual/reference alike). V3041 retains 16/16 exact controls and all twelve
+independent strict failure rows. V3043 binds RED, invalid fixture, unit and
+source/runner evidence with the pixel windows; no upstream test is modified.
+
+Expanded white-space regression V3044 records 25 passed / 86 failed, not
+111/111 green. Removing only this soft-line candidate and rebuilding (2m17s)
+produces identical V3045 results: all 111 statuses/pixel metrics and all
+222 actual/reference PNG hashes match. V3047 retains this baseline attribution
+and every failure; it is not a waiver or browser acceptance of those 86 cases.
+The candidate is restored. The current on-disk runner still belongs to the
+without-soft-line baseline and must be rebuilt before new candidate pixels.
+Four earlier extended-unit failures and the attributed fixed-table percentage
+failure remain open and are not remeasured by this batch.
+
+Receipts are under `target/wpt-targeted/baseline-font-position-20261003/`,
+including `soft-line-checkpoint-v3043.json` and
+`soft-line-attribution-v3047.json`. Full current6548 NOT_RUN, global remaining
+UNKNOWN. No commit/push or parent pin changes. The root size gate retains six
+outside-vendor violations, with no baseline increase. Generic line sizing
+changes do not affect Product Agent knowledge or business authority.
+
+## 2026-10-09 table preferred-track browser parity repair
+
+V3024/V3025 isolate the baseline-003 reference mismatch: its explicit 80px
+middle column is correct, but automatic arrow columns contract to min-content
+(15.015625/24.703125) instead of Chrome's 34.375px preferred widths. V3026
+retains the genuine RED. The candidate constrains only authored columns and
+preserves automatic neighbors' max-content widths, without changing the
+already-correct inline-block test page or upstream reference.
+
+V3027 discovers a percentage fixed-table unit failure. V3033 removes the table
+candidate and reproduces the identical 82.4/164.8 versus 80/160 failure, while
+the new preferred-track regression is RED again. This is baseline attribution,
+not a waiver. After restoring the candidate, compilation takes 28.51s and
+V3034 records 35 passing tests and that one unchanged failure; the module is
+not all green. Four earlier extended-unit failures are not remeasured here.
+
+The runner rebuild takes 2m28s with production source frozen. V3028 makes
+baseline-003 actual/reference browser gaps and native/browser strict gaps all
+zero: the reference and native strict gaps drop 8787 -> 0, actual stays zero.
+The primary window has three exact pages and three unchanged gaps (2210,
+3808, 3472 actual/reference pixels respectively). V3030 retains 16/16 exact
+controls and all twelve independent native/browser strict failure rows.
+V3032 binds diagnostics, genuine RED, baseline attribution, candidate units,
+source/runner hashes and both pixel windows in
+`target/wpt-targeted/baseline-font-position-20261003/table-track-checkpoint-v3032.json`.
+No tolerances or upstream assertions are changed. Full current6548 NOT_RUN,
+global remaining UNKNOWN. This batch is local only, with no new commit/push
+or parent pin change. Generic table sizing changes have no Product Agent
+knowledge or business-authority impact.
+
 ## 2026-10-09 publication scope
 
 This publication contains the containing-interval float repairs and their

@@ -9441,7 +9441,7 @@ fn inherit_text_style(
                 .insert(property.to_string(), value.clone());
         }
     }
-    if !declares("font-style") && !declares("font") && !form_control && !matches!(tag, "em" | "i") {
+    if !declares("font-style") && !declares("font") && !form_control && !matches!(tag, "em" | "i" | "address") {
         style.font_style = parent.font_style;
     }
     if !declares("font-variant") && !declares("font") && !form_control {

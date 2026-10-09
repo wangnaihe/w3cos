@@ -125,13 +125,17 @@ impl Line {
         let container = !component.children.is_empty()
             && matches!(component.kind, ComponentKind::Row | ComponentKind::Box)
             && style.display == Display::Inline;
+        let decorated_text = text && style.display == Display::Inline;
+        let border_top = style.border_top_width.unwrap_or(style.border_width);
+        let border_bottom = style.border_bottom_width.unwrap_or(style.border_width);
+        let vertical_edges = padding.top + padding.bottom + border_top + border_bottom;
         if !text && !atomic_box && !container { return None; }
         if !atomic_box && ((!atomic_text && style.display != Display::Inline)
-            || (!container && (padding.top != 0.0 || padding.bottom != 0.0))
+            || (!container && !decorated_text && (padding.top != 0.0 || padding.bottom != 0.0))
             || (!text && (padding.left != 0.0 || padding.right != 0.0))
-            || style.border_width != 0.0
+            || !decorated_text && (style.border_width != 0.0
             || [style.border_top_width, style.border_bottom_width, style.border_left_width,
-                style.border_right_width].into_iter().flatten().any(|v| v != 0.0)
+                style.border_right_width].into_iter().flatten().any(|v| v != 0.0))
             || margin.left != 0.0 || margin.right != 0.0) { return None; }
         // Non-replaced inline vertical margins do not participate in line-box
         // metrics (including margins synthesized by DOM vertical-align lowering).
@@ -155,14 +159,16 @@ impl Line {
         if !height.is_finite() || height < 0.0 || !rect.width.is_finite() { return None; }
         if let ComponentKind::Text { content } = &component.kind {
             if content.contains(['\n', '\r', '\u{2028}']) || !component.children.is_empty()
-                || rect.height > height.max(font_height) + 0.01
+                || rect.height > height.max(font_height) + vertical_edges + 0.01
                 // A projected text rect may already have been reduced to its
                 // em box. Recheck shaping at the used width before claiming a
                 // single line; pre-wrap can retain soft breaks inside one leaf.
                 // The candidate line height uses LayoutUnits. Compare the
                 // wrapping measurement in those same units, not raw f32 px:
                 // 19.2 versus 19.1875 otherwise rejects an actual single line.
-                || inline_used_line_height(crate::layout::wrapped_text_height(content, rect.width, style))
+                || inline_used_line_height(crate::layout::wrapped_text_height(content,
+                    rect.width - style.border_left_width.unwrap_or(style.border_width)
+                        - style.border_right_width.unwrap_or(style.border_width), style))
                     > height.max(font_height)
                         .max(crate::layout::inline_style_line_height(style)) + 0.01 { return None; }
         }
@@ -200,9 +206,11 @@ impl Line {
             offset: relative_y + if atomic_box { margin.top }
                 else if atomic_text { 0.0 }
                 else { text_baseline - inline_font_content_ascent(style)
-                    - if container { padding.top } else { 0.0 } },
+                    - if decorated_text { padding.top + border_top }
+                        else if container { padding.top } else { 0.0 } },
             font_height: (!atomic_box && !atomic_text).then_some(font_height
-                + if container { padding.top + padding.bottom } else { 0.0 }) });
+                + if decorated_text { vertical_edges }
+                    else if container { padding.top + padding.bottom } else { 0.0 }) });
         if container {
             let mut child_index = index + 1;
             for child in &component.children {
@@ -286,6 +294,47 @@ fn line_content_top(component: &Component, rect: LayoutRect) -> f32 {
     } else { 0.0 };
     rect.y - half_leading + style.padding_lengths().top
         + style.border_top_width.unwrap_or(style.border_width)
+}
+
+/// Preserve the line breaker's horizontal membership, but resolve each soft
+/// line's own strut. A tall inline on an earlier line must not export its
+/// baseline distance into a later line which contains only ordinary text.
+fn soft_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usize)],
+    positions: &HashMap<usize, usize>) -> Option<Vec<Line>> {
+    let style = &component.style;
+    if style.direction != TextDirection::Ltr
+        || !matches!(style.display, Display::Block | Display::InlineBlock | Display::TableCell)
+            && !(style.display == Display::Flex
+                && marker(component, "--w3cos-internal-inline-formatting-context"))
+        || component.children.is_empty()
+        || !component.children.iter().all(|child| child.children.is_empty()
+            && child.style.display == Display::Inline && child.style.position == Position::Static
+            && child.style.float == Float::None
+            && matches!(&child.kind, ComponentKind::Text { content }
+                if !content.contains(['\n', '\r', '\u{2028}'])))
+    { return None; }
+    let height = inline_used_line_height(crate::layout::inline_style_line_height(style));
+    let ascent = inline_font_baseline_from_line_top(style, height);
+    let fresh = || Line { items: Vec::new(), ascent, descent: height - ascent,
+        top_height: 0.0, bottom_height: 0.0, width: 0.0,
+        first_x: f32::INFINITY, last_x: f32::NEG_INFINITY, last_advance: 0.0 };
+    let mut lines = vec![fresh()];
+    let mut child_index = index + 1;
+    for child in &component.children {
+        let rect = layouts[*positions.get(&child_index)?].0;
+        let previous = lines.last()?.items.last().map(|item| layouts[item.position].0);
+        if let Some(previous) = previous
+            && rect.x + 0.01 < previous.x && rect.y > previous.y + 0.01
+        { lines.push(fresh()); }
+        lines.last_mut()?.collect(child, child_index, style, 0.0, 0.0, layouts, positions)?;
+        child_index += count_nodes(child);
+    }
+    let parent = layouts[*positions.get(&index)?].0;
+    let padding = style.padding_lengths();
+    let available = parent.width - padding.left - padding.right
+        - style.border_left_width.unwrap_or(style.border_width)
+        - style.border_right_width.unwrap_or(style.border_width);
+    (lines.len() > 1 && lines.iter().all(|line| line.width <= available + 0.01)).then_some(lines)
 }
 
 fn forced_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usize)],
@@ -456,7 +505,8 @@ pub(crate) fn project(component: &Component, index: usize, layouts: &mut [(Layou
 pub(crate) fn project_with_constraints(component: &Component, index: usize,
     layouts: &mut [(LayoutRect, usize)], positions: &HashMap<usize, usize>,
     used: Option<UsedHeightConstraints>) -> bool {
-    if let Some(lines) = forced_lines(component, index, layouts, positions) {
+    if let Some(lines) = forced_lines(component, index, layouts, positions)
+        .or_else(|| soft_lines(component, index, layouts, positions)) {
         let position = positions[&index];
         let mut top = line_content_top(component, layouts[position].0);
         let initial_top = top;
@@ -541,7 +591,8 @@ pub(crate) fn project_with_constraints(component: &Component, index: usize,
 
 pub(crate) fn is_projected(component: &Component, index: usize, layouts: &[(LayoutRect, usize)],
     positions: &HashMap<usize, usize>) -> bool {
-    if let Some(lines) = forced_lines(component, index, layouts, positions) {
+    if let Some(lines) = forced_lines(component, index, layouts, positions)
+        .or_else(|| soft_lines(component, index, layouts, positions)) {
         let mut top = line_content_top(component, layouts[positions[&index]].0);
         for line in lines {
             let (height, baseline) = line.metrics();
