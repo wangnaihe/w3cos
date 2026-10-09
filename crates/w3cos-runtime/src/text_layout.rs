@@ -785,6 +785,7 @@ fn font_render_text_with_boundaries(
     }
     let mut rendered = String::new();
     let mut boundaries = Vec::new();
+    let mut previous_rtl = None;
     for paragraph in &bidi.paragraphs {
         // An authored PS changes bidi paragraph resolution, not CSS line
         // breaking. Resolve every paragraph before normalizing its glyph;
@@ -793,8 +794,9 @@ fn font_render_text_with_boundaries(
         let end = start + text[paragraph.range.clone()].chars().count();
         let all_levels = bidi.reordered_levels_per_char(paragraph, paragraph.range.clone());
         let levels = &all_levels[start..end];
-        if !rendered.is_empty() { boundaries.push(rendered.len()); }
-        let mut previous_rtl = None;
+        // CSS retains an authored PS on this visual line. Independent bidi
+        // resolution alone does not start a paint box: only a direction
+        // transition requires a new shaping segment/quantized origin.
         for local_index in unicode_bidi::BidiInfo::reorder_visual(levels) {
             let index = start + local_index;
             let character = logical[index];
@@ -2170,6 +2172,9 @@ mod tests {
         assert_eq!(font_render_text(text,w3cos_std::style::TextDirection::Ltr),
             "א + - × ÷     + - × ÷ ת",
             "each bidi paragraph resolves independently before the PS space glyph is emitted");
+        let (rendered,boundaries)=font_render_text_with_boundaries(text,w3cos_std::style::TextDirection::Ltr);
+        assert_eq!(boundaries,vec!["א".len(),rendered.len()-"ת".len()],
+            "a PS preserves independent resolution but not a fictitious same-direction paint segment");
     }
 
     #[test]

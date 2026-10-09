@@ -3215,20 +3215,17 @@ fn draw_text_in_rect_with_line_painter(
             );
             // A merged decorated text leaf and a wrapper around the same
             // text must rasterize their non-empty normal inline edges alike.
-            let fragment = LayoutRect {
-                y: if style.line_height_is_normal
+            let fragment = if style.line_height_is_normal
                     && !top_aligned_inline(style)
                     && (style.padding_lengths().top > 0.0
                         || style.padding_lengths().bottom > 0.0
                         || style.border_top_width.unwrap_or(style.border_width) > 0.0
                         || style.border_bottom_width.unwrap_or(style.border_width) > 0.0)
                 {
-                    fragment.y.floor()
+                    floor_inline_decoration_origin(fragment)
                 } else {
-                    fragment.y
-                },
-                ..fragment
-            };
+                    fragment
+                };
             if style.background.a > 0 {
                 draw_rounded_rect(
                     canvas,
@@ -3565,7 +3562,10 @@ fn effective_text_align_last(style: &Style) -> Option<TextAlign> {
 
 fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_width: f32) -> f32 {
     match align {
-        TextAlign::Right => rect.x + rect.width - advance_width,
+        // The right-aligned box uses ShapeResult's snapped inline width;
+        // glyph positions inside it retain raw shaping precision. Subtracting
+        // raw width can move a final glyph across a subpixel raster phase.
+        TextAlign::Right => rect.x + rect.width - text_layout::inline_layout_advance(advance_width),
         TextAlign::Center => rect.x + (rect.width - advance_width) * 0.5,
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
             rect.x - ink_left.min(0.0)
@@ -3665,6 +3665,14 @@ fn draw_text_glyph_line(
 ) -> f32 {
     draw_text_glyph_line_with_expansion(canvas, x, top, text, font_size, color,
         opacity, typeface, style, None)
+}
+
+fn floor_inline_decoration_origin(rect: LayoutRect) -> LayoutRect {
+    // Align the top without translating the unsnapped bottom edge. Pixel
+    // coverage resolves both endpoints; moving only the origin loses the
+    // last border row when fractional padding crosses the bottom midpoint.
+    let y=rect.y.floor();
+    LayoutRect {y,height:rect.height+(rect.y-y),..rect}
 }
 
 fn draw_text_glyph_line_with_expansion(
@@ -3953,7 +3961,7 @@ fn draw_font_stack_runs_with_expansion(
         &fallback_boundaries
     };
     let mut byte_offset = 0;
-    for (index, run) in css_font_runs(text, typeface, style).into_iter().enumerate() {
+    for (index, run) in css_font_runs_with_boundaries(text, typeface, style, bidi_boundaries).into_iter().enumerate() {
         // Bidi segment boxes use LayoutUnit starts. A same-direction font
         // fallback is still inside that box and retains raw shaping precision.
         if index > 0 && bidi_boundaries.contains(&byte_offset) {
@@ -4167,7 +4175,7 @@ fn font_stack_ink_bounds(
     );
     let runs = style.map_or_else(
         || fallback_font_runs(font_text.as_ref(), typeface, font_weight),
-        |style| css_font_runs(font_text.as_ref(), typeface, style),
+        |style| css_font_runs_with_boundaries(font_text.as_ref(), typeface, style, &bidi_boundaries),
     );
     let mut byte_offset = 0;
     for (index, run) in runs.into_iter().enumerate() {
@@ -4483,7 +4491,7 @@ fn font_stack_advance_with_boundaries(
     text: &str, typeface: &Typeface, style: &Style, bidi_boundaries: &[usize],
 ) -> f32 {
     let mut byte_offset = 0;
-    css_font_runs(text, typeface, style)
+    css_font_runs_with_boundaries(text, typeface, style, bidi_boundaries)
         .into_iter()
         .enumerate()
         .fold(0.0, |cursor, (index, run)| {
@@ -4692,6 +4700,28 @@ pub(crate) fn measure_skia_wrapped_text_height(text: &str, width: f32, style: &S
 pub(crate) struct FallbackFontRun<'a> {
     pub(crate) text: &'a str,
     pub(crate) typeface: Typeface,
+}
+
+fn css_font_runs_with_boundaries<'a>(
+    text: &'a str, primary: &Typeface, style: &Style, boundaries: &[usize],
+) -> Vec<FallbackFontRun<'a>> {
+    // Font fallback and resolved bidi segments are independent partitions.
+    // A neutral/Latin direction transition can occur inside one font run;
+    // keeping it merged skips the segment's LayoutUnit origin and shaping
+    // boundary. Preserve raw precision only inside each resolved segment.
+    let mut result=Vec::new();
+    let mut offset=0;
+    for run in css_font_runs(text,primary,style) {
+        let end=offset+run.text.len();
+        let mut start=offset;
+        for boundary in boundaries.iter().copied().filter(|boundary|*boundary>offset&&*boundary<end)
+            .chain(std::iter::once(end)) {
+            result.push(FallbackFontRun {text:&text[start..boundary],typeface:run.typeface.clone()});
+            start=boundary;
+        }
+        offset=end;
+    }
+    result
 }
 
 pub(crate) fn css_font_runs<'a>(text: &'a str, primary: &Typeface, style: &Style) -> Vec<FallbackFontRun<'a>> {
@@ -5243,6 +5273,66 @@ mod tests {
         let override_width=crate::layout::text_intrinsic_size("א ÷ × - + \u{a0}",&visual).0;
         assert_eq!(natural,override_width,
             "removing RLM must not invent a second bidi segment boundary");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mirrored_rtl_paragraph_matches_equivalent_ltr_glyph_pixels() {
+        let primary=host_typeface().unwrap();
+        let mut captures=Vec::new();
+        for (text,direction) in [("(a b א) c d",w3cos_std::style::TextDirection::Ltr),
+            ("c d (א a b)",w3cos_std::style::TextDirection::Rtl)] {
+            let style=Style {font_size:16.0,direction,..Style::default()};
+            let mut surface=Surface::new_raster_n32_premul((160,40)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            let advance=draw_text_glyph_line(surface.canvas(),8.0,8.0,text,16.0,
+                w3cos_std::Color::BLACK,1.0,&primary,&style);
+            let info=ImageInfo::new((160,40),ColorType::RGBA8888,AlphaType::Premul,None);
+            let mut pixels=vec![0;160*40*4];
+            assert!(surface.read_pixels(&info,&mut pixels,160*4,(0,0)));
+            captures.push((advance,pixels));
+        }
+        assert_eq!(captures[0].1.iter().zip(&captures[1].1).filter(|(a,b)|a!=b).count(),0,
+            "Chromium bidi-glyph-mirroring-002 renders both equivalent paragraphs identically; advances {:?}",
+            [captures[0].0,captures[1].0]);
+    }
+
+    #[test]
+    fn fractional_normal_inline_origin_keeps_the_browser_bottom_border_row() {
+        let rect=floor_inline_decoration_origin(LayoutRect {
+            x:151.4375,y:83.40625,width:120.421875,height:41.1875});
+        let style=Style {border_width:3.0,border_color:w3cos_std::Color::rgb(255,165,0),
+            background:w3cos_std::Color::rgb(255,255,0),..Style::default()};
+        let mut surface=Surface::new_raster_n32_premul((300,140)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_rounded_rect(surface.canvas(),rect,[0.0;4],&color_paint(style.background,1.0));
+        draw_box_border(surface.canvas(),rect,&style);
+        let info=ImageInfo::new((300,140),ColorType::RGBA8888,AlphaType::Premul,None);
+        let mut pixels=vec![0;300*140*4];
+        assert!(surface.read_pixels(&info,&mut pixels,300*4,(0,0)));
+        let pixel=|x:usize,y:usize|&pixels[(y*300+x)*4..(y*300+x)*4+4];
+        assert_eq!(pixel(160,121),[255,255,0,255],"Chromium bidi011: interior above bottom border");
+        assert_eq!(pixel(160,124),[255,165,0,255],"Chromium bidi011: last bottom border row");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn right_aligned_standard_text_keeps_browser_final_glyph_coverage() {
+        let face=host_typeface().unwrap();
+        let mut style=Style {display:Display::Block,text_align:TextAlign::Right,color:w3cos_std::Color::BLACK,
+            font_size:16.0,line_height:1.375,line_height_is_normal:true,..Style::default()};
+        style.custom_properties.get_or_insert_with(Default::default)
+            .insert(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),"1".into());
+        let mut surface=Surface::new_raster_n32_premul((800,100)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_text_in_rect(surface.canvas(),LayoutRect {x:8.0,y:54.0,width:784.0,height:22.0},
+            "PASS PASS",&style,&face,crate::layout::layout_font());
+        let info=ImageInfo::new((800,100),ColorType::RGBA8888,AlphaType::Premul,None);
+        let mut pixels=vec![0;800*100*4];
+        assert!(surface.read_pixels(&info,&mut pixels,800*4,(0,0)));
+        assert_eq!(&pixels[(58*800+785)*4..(58*800+785)*4+4],&[241,241,241,255],
+            "Chromium unicode-bidi-applies-to009 final S; advance={}",
+            measure_skia_text_advance("PASS PASS",&face,&style));
     }
 
     #[cfg(target_os = "macos")]

@@ -23187,6 +23187,119 @@ isolation and strict closure. Build/diff pass, same six outside-vendor size
 violations, no baseline increase or commit/push. Full6548 NOT_RUN; global
 remaining UNKNOWN. Product Agent knowledge unaffected: generic inline painting,
 no business concepts, authority or tool semantics changed.
+### V2836: right-aligned inline width and final glyph raster phase
+
+V2821 confirms applies-to009's right-aligned block is x8/y54/width784/height22.
+V2822 diagnostic test had the embedding's white default text color, so it is
+NOT a valid page-equivalent RED. Correct the test's black color and HTML
+standard font marker: genuine V2823 RED reproduces native247 vs Chromium241
+at(785,58). Right alignment was subtracting raw87.34395px glyph width; the
+layout box instead uses87.359375px ShapeResult/inline LayoutUnit width. Use
+the snapped width for the right-aligned origin, keeping glyph positions inside
+the box unsnapped. V2824 pixel GREEN and V2825 related runtime gate77 executions
+pass, including inline-advance versus ink-width alignment controls. Current
+runner builds successfully in2m08s.
+
+V2826 applies-to009 actual/native-browser76->0 and reference/native-browser76->0;
+strict comparisons remain zero. V2828 all105 bidi cases improves from102 exact/
+3 gaps to103 exact/2 gaps, with only this case changed and no browser regression.
+Remaining: bidi003 actual2749/reference0, bidi0044465/0. Bidi retains142 strict
+comparison failure rows; those are not waived. First-line25, insertion9 and
+opacity4 controls are browser-exact with unchanged pixel and strict counts;
+first-line retains28 strict comparison failure rows. All Chromium actual/
+reference PNG hashes match their preceding accepted captures.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/right-align-checkpoint-v2836.json`.
+Diagnostic misconfiguration, genuine RED, GREEN, source/binary bindings, prior
+accepted checkpoint and per-case comparisons are retained. Full6548 NOT_RUN,
+global remaining UNKNOWN. Existing DOM first-line and authored LS provenance
+limitations remain open. Same six parent size violations outside vendor, no
+baseline increase and no commit/push. Product Agent knowledge unaffected:
+generic CSS alignment/raster geometry only.
+
+### V2820: fractional normal inline bottom endpoint
+
+V2807 layout diagnostic binds bidi011's decorated text rect:
+x151.4375/y83.40625/width120.421875/height41.1875. Flooring the paint origin
+while retaining height translated the bottom from124.59375 to124.1875,
+painting the orange bottom edge one row early. V2808 real pixel RED observes
+orange where Chromium has yellow at(160,121). Preserve the unsnapped bottom
+endpoint when aligning the normal inline decoration top; layout, glyph origins
+and wrapping are unchanged. V2809 related runtime gate executes75 tests, all
+pass. Current-source runner builds successfully in2m15s.
+
+V2810 bidi011 actual/native-browser472->0 and reference/native-browser472->0;
+strict test/reference failure remains independently recorded. V2812 all105
+bidi cases improves from101 exact/4 gaps to102 exact/3 gaps. Only bidi011 changes;
+no native/browser count increases. Remaining gaps are bidi0032749/0,
+bidi0044465/0, unicode-bidi-applies-to00976/76. The bidi suite retains142 strict
+comparison failure rows, not three total conformance failures. First-line25,
+insertion9 and opacity4 controls remain browser-exact with unchanged pixel and
+strict counts; first-line retains28 strict comparison failure rows. Every
+browser actual/reference PNG hash matches the preceding accepted captures.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/decoration-checkpoint-v2820.json`.
+RED, source/binary bindings, prior accepted checkpoint and per-case changes
+are retained. Full6548 NOT_RUN; global remaining UNKNOWN. DOM first-line and
+authored LS provenance limitations remain open. Same six parent size violations
+outside vendor; no baseline increase, no commit/push. Product Agent knowledge
+unaffected: generic inline decoration raster geometry only.
+
+### V2806: same-font bidi segments and PS paint-boundary regression
+
+Real mirror RED V2780 uses the page's host font: equivalent LTR/RTL paragraphs
+differ by333 channel bytes (111 pixels); initial Times-only V2776/V2779 controls
+pass and are NOT RED. Font fallback alone missed direction transitions inside
+a font run. Width, glyph painting and ink bounds now partition font runs at
+resolved bidi direction boundaries and share LayoutUnit origins.
+
+First candidate V2793 fixes `bidi-glyph-mirroring-002`, but newly regresses
+`bidi-breaking-003` from0 to136 actual/native-browser pixels: NOT ACCEPTED.
+V2794 PS boundary RED identifies a fictitious same-direction paint break at
+byte15. Preserve independent paragraph resolution without manufacturing that
+extra paint segment. V2795 related runtime gate executes74 tests, all pass;
+current-source runner rebuild succeeds after the earlier build was interrupted.
+
+V2796 mirror plus breaking001/002/003 are4/4 browser-exact. Mirror strict111->0;
+the three breaking cases' strict reference failures remain unchanged. V2798
+all105 bidi cases are101 exact/4 gaps (previous accepted V2767:100/5), no new
+browser regression. Remaining gaps: bidi003 actual2749/reference0, bidi004
+4465/0, bidi011472/472, unicode-bidi-applies-to00976/76. Strict failures remain
+142 independent comparison rows. First-line25, insertion9 and opacity4 controls
+are browser-exact and pixel/strict counts unchanged; first-line retains28
+strict comparison failure rows. Browser actual/reference PNG hashes match the
+preceding accepted captures for every case.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/mirroring-ps-checkpoint-v2806.json`.
+Source/binary, both genuine REDs, failed candidate and final per-case comparisons
+are bound; any increased native/browser count rejects the checkpoint. Full6548
+NOT_RUN, global remaining UNKNOWN. Existing DOM first-line failure and authored
+LS provenance limitations remain outstanding. Same six parent-repo size
+violations outside vendor; no baseline increase, no commit/push. Product Agent
+knowledge unaffected: generic bidi shaping/raster behavior only.
+
+### V2775: source-bound solid-border browser acceptance
+
+Commit `ac084d0011e7b88ec612d01884ce8e9224e2e01a` runner rebuilt in
+2m01s. V2764 related runtime unit gate passes 73 executions. Fresh original
+9 bidi-box-model cases V2765 are browser-exact on actual and reference, with
+both strict comparisons zero: preceding V2746's 10-pixel-per-page rounding
+gaps are now zero. V2767 all105 bidi cases improves from 91 exact/14 gaps to
+100 exact/5 gaps. Only the nine border cases change; remaining gaps are
+`bidi-003`, `bidi-004`, `bidi-011`, `bidi-glyph-mirroring-002`, and
+`unicode-bidi-applies-to-009`. Strict reference failures remain 143 independent
+comparison rows, not waived or described as five total failures.
+
+Controls: first-line25, inline insertion9 and opacity4 remain browser-exact;
+pixel counts and strict comparisons unchanged from preceding receipts.
+First-line retains28 strict comparison failure rows. All current Chromium
+actual/reference PNG hashes equal their baseline oracle captures. Source,
+runner, units, RED/failed candidates, prior LS checkpoint and per-case deltas
+are bound by `target/wpt-targeted/baseline-font-position-20261003/border-checkpoint-v2775.json`.
+No new commit/push. Full6548 NOT_RUN; global remaining UNKNOWN. Outstanding
+DOM first-line failure and authored LS provenance limitations remain recorded.
+Product Agent knowledge unaffected: generic border/text rendering only.
+
 ### Publication checkpoint: 2026-10-09 bidi and solid-border work
 
 This checkpoint publishes the current local bidi/text metrics repairs and the
