@@ -7,6 +7,7 @@ use w3cos_std::style::{
 };
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
+pub const TEXT_DECORATION_COLOR_PROPERTY: &str = w3cos_std::inline_text::DECORATION_COLOR;
 
 /// CSSStyleDeclaration — the `element.style` property.
 /// Mutable handle that writes directly to the node's Style.
@@ -824,7 +825,24 @@ impl CSSStyleDeclaration {
                 }
             }
             "text-decoration" | "textDecoration" => {
-                self.inner.text_decoration = parse_text_decoration(value)
+                self.inner.text_decoration = parse_text_decoration(value);
+                if matches!(value.trim(), "none" | "underline" | "overline" | "line-through") {
+                    self.inner.custom_properties.get_or_insert_with(Default::default)
+                        .insert(TEXT_DECORATION_COLOR_PROPERTY.into(), "currentcolor".into());
+                }
+            }
+            "text-decoration-color" | "textDecorationColor" => {
+                let value = value.trim();
+                let lower = value.to_ascii_lowercase();
+                if matches!(lower.as_str(), "currentcolor" | "inherit" | "initial" | "unset")
+                    || Color::from_css(value).is_some()
+                {
+                    self.inner.custom_properties.get_or_insert_with(Default::default)
+                        .insert(TEXT_DECORATION_COLOR_PROPERTY.into(),
+                            if matches!(lower.as_str(), "initial" | "unset") { "currentcolor".into() }
+                            else if matches!(lower.as_str(), "currentcolor" | "inherit") { lower }
+                            else { value.into() });
+                }
             }
             "text-overflow" | "textOverflow" => {
                 self.inner.text_overflow = parse_text_overflow(value)
@@ -987,6 +1005,9 @@ impl CSSStyleDeclaration {
 
     pub fn get_property(&self, name: &str) -> String {
         match name {
+            "text-decoration-color" | "textDecorationColor" => self.inner.custom_properties.as_ref()
+                .and_then(|properties| properties.get(TEXT_DECORATION_COLOR_PROPERTY)).cloned()
+                .unwrap_or_else(|| "currentcolor".into()),
             "column-width" | "columnWidth" => dimension_to_css(&self.inner.column_width),
             "column-count" | "columnCount" => self.inner.column_count
                 .map_or_else(|| "auto".into(), |count| count.to_string()),
@@ -4040,6 +4061,20 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_decoration_color_is_independent_of_text_color() {
+        let mut declaration = super::CSSStyleDeclaration::new();
+        declaration.set_property("color", "green");
+        declaration.set_property("text-decoration", "underline");
+        declaration.set_property("text-decoration-color", "black");
+        assert_eq!(declaration.get_property("text-decoration-color"), "black");
+        assert_eq!(declaration.inner.color, Color::rgb(0, 128, 0));
+        declaration.set_property("text-decoration-color", "not-a-color");
+        assert_eq!(declaration.get_property("text-decoration-color"), "black");
+        declaration.set_property("text-decoration-color", "currentColor");
+        assert_eq!(declaration.get_property("text-decoration-color"), "currentcolor");
+    }
+
     #[test]
     fn font_weight_keywords_override_existing_numeric_weight() {
         let mut declaration = super::CSSStyleDeclaration::default();

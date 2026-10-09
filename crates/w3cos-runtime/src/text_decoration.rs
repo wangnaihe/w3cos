@@ -5,6 +5,13 @@
 use skia_safe::{Canvas, ClipOp, Rect, Typeface};
 use w3cos_std::{Color, Style, style::TextDecoration};
 
+fn decoration_color(style: &Style, current_color: Color) -> Color {
+    style.custom_properties.as_ref()
+        .and_then(|properties| properties.get(w3cos_dom::css_style::TEXT_DECORATION_COLOR_PROPERTY))
+        .and_then(|value| Color::from_css(value))
+        .unwrap_or(current_color)
+}
+
 thread_local! {
     static ANALYTIC_RECT: Option<(skia_safe::RuntimeEffect, skia_safe::Blender)> = {
         let shader = skia_safe::RuntimeEffect::make_for_shader(
@@ -215,7 +222,7 @@ pub(super) fn paint_applied_in_rect(
                 let decoration_advance = crate::text_layout::inline_layout_advance(advance);
                 draw_decoration_rect(canvas,
                     Rect::from_xywh(x, y.round(), decoration_advance, thickness.floor().max(1.0)),
-                    owner.style.color, child.opacity,
+                    decoration_color(&owner.style, owner.style.color), child.opacity,
                 );
             }
             canvas.restore_to_count(save);
@@ -263,6 +270,7 @@ pub(super) fn paint_with_expansion(
     if style.text_decoration == TextDecoration::None || advance <= 0.0 {
         return;
     }
+    let color = decoration_color(style, color);
     let visual = crate::text_layout::font_render_text_for_style(text, style);
     let expansion = expansion.map(|expansion| expansion.for_text(visual.as_ref()));
     let runs = super::css_font_runs(visual.as_ref(), typeface, style);
@@ -350,6 +358,35 @@ pub(super) fn paint_with_expansion(
 mod tests {
     use super::*;
     use skia_safe::{AlphaType, ColorType, FontMgr, ImageInfo, Surface};
+
+    #[test]
+    fn explicit_color_controls_decoration_without_changing_glyph_color() {
+        let face = FontMgr::default().match_family_style("Times", skia_safe::FontStyle::normal()).unwrap();
+        let render = |explicit: Option<&str>, current: Color| {
+            let mut style = Style { color: current, font_size: 16.0,
+                text_decoration: TextDecoration::Underline, ..Style::default() };
+            if let Some(value) = explicit {
+                style.custom_properties = Some(std::collections::HashMap::from([
+                    (w3cos_dom::css_style::TEXT_DECORATION_COLOR_PROPERTY.into(), value.into())]));
+            }
+            let mut surface = Surface::new_raster_n32_premul((64, 32)).unwrap();
+            surface.canvas().clear(skia_safe::Color::WHITE);
+            paint(surface.canvas(), 4.0, 4.0, "test", 40.0, 16.0,
+                style.color, 1.0, &face, &style);
+            assert_eq!(style.color, current);
+            let info = ImageInfo::new((64, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 64 * 32 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 64 * 4, (0, 0)));
+            pixels
+        };
+        let black = render(None, Color::BLACK);
+        assert!(black.chunks_exact(4).any(|pixel| pixel == [0, 0, 0, 255]));
+        assert_eq!(render(Some("black"), Color::rgb(0, 128, 0)), black);
+        let green = render(None, Color::rgb(0, 128, 0));
+        assert_ne!(green, black);
+        assert_eq!(render(Some("currentcolor"), Color::rgb(0, 128, 0)), green);
+        assert_eq!(render(Some("transparent"), Color::BLACK), vec![255; 64 * 32 * 4]);
+    }
 
     #[test]
     fn analytic_decoration_browser_color_packing_at_half_boundaries() {

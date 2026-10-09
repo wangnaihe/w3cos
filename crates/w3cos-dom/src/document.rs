@@ -965,6 +965,20 @@ impl Document {
                 .find_map(|child| find_node_mut(child, node_id))
         }
 
+        // CSS Overflow viewport propagation gives body a used overflow of
+        // visible when html is visible in both axes and neither establishes
+        // containment. Consult that used value for margin collapse without
+        // changing authored/computed style or the existing scrolling path.
+        let body_overflow_is_viewport = self.document_element_id().is_some_and(|id| {
+            let node = self.get_node(id);
+            let body = self.get_node(self.body_id);
+            node.is_html_element && body.is_html_element
+                && body.tag.as_str().eq_ignore_ascii_case("body")
+                && root.style.display != w3cos_std::style::Display::None
+                && root.style.resolved_overflow_x() == w3cos_std::style::Overflow::Visible
+                && root.style.resolved_overflow_y() == w3cos_std::style::Overflow::Visible
+                && root.style.contain == w3cos_std::style::Contain::None
+        });
         let Some(body) = find_node_mut(root, u64::from(self.body_id.0)) else {
             return;
         };
@@ -977,7 +991,9 @@ impl Document {
                 w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
             )
             || !matches!(body.style.height, w3cos_std::style::Dimension::Auto)
-            || body.style.resolved_overflow_y() != w3cos_std::style::Overflow::Visible
+            || (body.style.resolved_overflow_y() != w3cos_std::style::Overflow::Visible
+                && !(body_overflow_is_viewport
+                    && body.style.contain == w3cos_std::style::Contain::None))
             || body
                 .style
                 .border_top_width
@@ -999,8 +1015,17 @@ impl Document {
         let Some(child) = child else {
             return;
         };
+        // Mixed inline content lowers a principal block into an internal
+        // Flex row. Margin collapse depends on the CSS box's display, not
+        // that implementation-only line container.
+        let child_display = match &child.on_click {
+            w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok()
+                .map(|id| self.computed_style_for(NodeId::from_u32(id)).display)
+                .unwrap_or(child.style.display),
+            _ => child.style.display,
+        };
         if !matches!(
-            child.style.display,
+            child_display,
             w3cos_std::style::Display::Block | w3cos_std::style::Display::ListItem
         ) || child.style.clear != w3cos_std::style::Clear::None
         {
@@ -1413,6 +1438,21 @@ impl Document {
                 let value = resolve_css_variables(value, &custom_properties);
                 if declaration_value_is_valid(prop, &value) {
                     merged.set_property(prop, &value);
+                    if css_property_eq(prop, "text-decoration-color")
+                        && value.trim().eq_ignore_ascii_case("inherit")
+                    {
+                        // The property itself is not inherited. Explicit inherit
+                        // copies the parent's computed color, including its
+                        // currentColor, rather than reusing the child's color.
+                        let color = inherited.map(|parent| {
+                            parent.custom_properties.as_ref()
+                                .and_then(|properties| properties.get(crate::css_style::TEXT_DECORATION_COLOR_PROPERTY))
+                                .and_then(|value| w3cos_std::Color::from_css(value))
+                                .unwrap_or(parent.color)
+                        }).unwrap_or(w3cos_std::Color::BLACK);
+                        merged.set_property("text-decoration-color",
+                            &format!("#{:02x}{:02x}{:02x}{:02x}", color.r, color.g, color.b, color.a));
+                    }
                     if css_property_eq(prop, "list-style") || css_property_eq(prop, "list-style-image") {
                         match value.trim().to_ascii_lowercase().as_str() {
                             "inherit" | "unset" => merged.set_property("list-style-image", inherited_list_image),
@@ -3194,7 +3234,7 @@ impl Document {
                 // items into one transparent row inside it.
                 let mut inherited = w3cos_std::style::Style::default();
                 inherit_text_style(&mut inherited, &style, "", |_| false);
-                inherited.text_decoration = style.text_decoration;
+                w3cos_std::inline_text::copy_used_decoration(&mut inherited, &style);
                 inherited.visibility = style.visibility;
 
                 let children = content
@@ -5322,7 +5362,7 @@ impl Document {
                 // decoration. This is used-style lowering, not inheritance
                 // of the non-inherited property between CSS element boxes.
                 if let Some(parent) = inherited {
-                    style.text_decoration = parent.text_decoration;
+                    w3cos_std::inline_text::copy_used_decoration(&mut style, parent);
                 }
                 // Text nodes inherit computed table properties from their
                 // element parent, but those properties do not apply to the
@@ -5514,7 +5554,7 @@ impl Document {
                         style.text_transform = generated_style.text_transform;
                         style.letter_spacing = generated_style.letter_spacing;
                         style.word_spacing = generated_style.word_spacing;
-                        style.text_decoration = generated_style.text_decoration;
+                        w3cos_std::inline_text::copy_used_decoration(&mut style, &generated_style);
                         return self
                             .attach_native_host(id, w3cos_std::Component::text(content, style));
                     }
@@ -6004,7 +6044,7 @@ impl Document {
                         let mut text_style = CSSStyleDeclaration::new().to_style();
                         text_style.display = w3cos_std::style::Display::Inline;
                         inherit_text_style(&mut text_style, &style, "", |_| false);
-                        text_style.text_decoration = style.text_decoration;
+                        w3cos_std::inline_text::copy_used_decoration(&mut text_style, &style);
                         children.push(w3cos_std::Component::text(text, text_style));
                     }
                     style.custom_properties.get_or_insert_with(Default::default).insert(
@@ -21939,6 +21979,108 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn viewport_propagated_body_overflow_allows_first_child_margin_collapse() {
+        use w3cos_std::style::{Contain, Overflow};
+        fn find(component: &w3cos_std::Component, id: NodeId) -> Option<&w3cos_std::Style> {
+            if matches!(&component.on_click, w3cos_std::EventAction::NativeHost { id: host, .. }
+                if *host == u64::from(id.0)) { return Some(&component.style); }
+            component.children.iter().find_map(|child| find(child, id))
+        }
+        for (root_overflow, root_contain, padding, expected) in [
+            ("visible", "none", "0", 16.0),
+            ("hidden", "none", "0", 8.0),
+            ("x-hidden", "none", "0", 8.0),
+            ("visible", "layout", "0", 8.0),
+            ("visible", "none", "1px", 8.0),
+        ] {
+            stylesheet::clear_rules();
+            let mut document = Document::new();
+            let html = document.create_element("html");
+            document.append_child(NodeId(0), html.id);
+            let body = document.body();
+            html.append_child(&mut document, body);
+            if root_overflow == "x-hidden" {
+                html.style_mut(&mut document).set_property("overflow-x", "hidden");
+            } else {
+                html.style_mut(&mut document).set_property("overflow", root_overflow);
+            }
+            html.style_mut(&mut document).set_property("contain", root_contain);
+            body.style_mut(&mut document).set_property("overflow", "scroll");
+            body.style_mut(&mut document).set_property("padding-top", padding);
+            let p = document.create_element("p");
+            let text = document.create_text_node("margin-collapse control");
+            p.append_child(&mut document, text);
+            let strong = document.create_element("strong");
+            let strong_text = document.create_text_node("bold inline");
+            strong.append_child(&mut document, strong_text);
+            p.append_child(&mut document, strong);
+            body.append_child(&mut document, p);
+            let tree = document.to_component_tree();
+            assert_eq!(find(&tree, body.id).unwrap().margin_lengths().top, expected,
+                "root overflow={root_overflow}, contain={root_contain}, padding={padding}");
+            assert_eq!(document.computed_style_for(body.id).resolved_overflow_y(), Overflow::Scroll,
+                "used margin handling must not rewrite computed overflow");
+            if root_contain == "layout" {
+                assert_eq!(document.computed_style_for(html.id).contain, Contain::Layout);
+            }
+        }
+    }
+
+    #[test]
+    fn anonymous_text_lowering_retains_decorating_element_color() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let owner = document.create_element("ins");
+        owner.style_mut(&mut document).set_property("color", "green");
+        owner.style_mut(&mut document).set_property("text-decoration-color", "black");
+        let text = document.create_text_node("colored decoration");
+        owner.append_child(&mut document, text);
+        document.body().append_child(&mut document, owner);
+        fn find(component: &w3cos_std::Component) -> Option<&w3cos_std::Style> {
+            if matches!(&component.kind, w3cos_std::ComponentKind::Text { content } if content == "colored decoration") {
+                return Some(&component.style);
+            }
+            component.children.iter().find_map(find)
+        }
+        let tree = document.to_component_tree();
+        let style = find(&tree).expect("anonymous text must survive lowering");
+        assert_eq!(style.color, w3cos_std::Color::rgb(0, 128, 0));
+        assert_eq!(style.text_decoration, w3cos_std::style::TextDecoration::Underline);
+        assert_eq!(style.custom_properties.as_ref().unwrap()
+            .get(crate::css_style::TEXT_DECORATION_COLOR_PROPERTY).map(String::as_str), Some("black"));
+    }
+
+    #[test]
+    fn decoration_color_cascade_is_non_inherited_with_explicit_parent_resolution() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.style_mut(&mut document).set_property("color", "green");
+        parent.style_mut(&mut document).set_property("text-decoration-color", "red");
+        let child = document.create_element("span");
+        child.style_mut(&mut document).set_property("color", "blue");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+        let value = |document: &Document| CSSStyleDeclaration::from_style(
+            document.computed_style_for(child.id)).get_property("text-decoration-color");
+        assert_eq!(value(&document), "currentcolor");
+        child.style_mut(&mut document).set_property("text-decoration-color", "inherit");
+        assert_eq!(w3cos_std::Color::from_css(&value(&document)), Some(w3cos_std::Color::rgb(255, 0, 0)));
+        parent.style_mut(&mut document).set_property("text-decoration-color", "currentcolor");
+        assert_eq!(w3cos_std::Color::from_css(&value(&document)), Some(w3cos_std::Color::rgb(0, 128, 0)));
+        child.style_mut(&mut document).set_property("text-decoration-color", "black");
+        child.style_mut(&mut document).set_property("text-decoration-color", "invalid-color");
+        assert_eq!(value(&document), "black");
+        child.style_mut(&mut document).set_property("text-decoration", "underline");
+        assert_eq!(value(&document), "currentcolor");
+        for reset in ["initial", "unset"] {
+            child.style_mut(&mut document).set_property("text-decoration-color", "black");
+            child.style_mut(&mut document).set_property("text-decoration-color", reset);
+            assert_eq!(value(&document), "currentcolor");
+        }
+    }
 
     #[test]
     fn user_origin_normal_loses_to_author_regardless_of_specificity() {

@@ -1,5 +1,77 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 V2957: viewport body margin matches browser
+
+V2939 retains the first-child margin RED (8 instead of 16). The body margin
+collapse path now recognizes viewport-propagated body overflow when both root
+axes are visible and containment does not disable propagation. Computed body
+overflow remains unchanged. Mixed paragraph lowering can synthesize a Flex
+row; collapse eligibility now uses the original DOM computed display instead
+of that internal layout representation. This is a scoped used-margin repair,
+not acceptance of the broader scrolling, clipping or containment pipeline.
+
+The first pixel candidate V2942/V2950 still differed by 6193 pixels and remains
+recorded. V2949 captures its layout diagnostic, not browser acceptance. The
+latest V2954 six-page comparison has 4 exact/2 gap cases: viewport scrollbar
+actual/reference pixels fall from 6193 to zero, with both strict comparisons
+zero. Decoration color and both list-image controls remain exact. V2955's
+13 margin-collapse controls are all exact in all four comparisons. The two
+CSS1 reference gaps and their four strict failure rows remain independently
+retained; no tolerance or reference waiver was introduced.
+
+V2951 passes 86 DOM executions. V2952 records 35 runtime passes and one failure:
+first_child_margin_collapses_through_body_margin_at_document_root expects
+51.2 but observes 54 for the following container. Its cause and baseline
+attribution remain unproven; the assertion is unchanged. V2953 separately
+confirms the same 35 passing selections, not additional distinct coverage.
+The final runner build succeeds in 3m00s. The whole module gate is not green.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/viewport-overflow-used-checkpoint-v2957.json`.
+It binds the current source and binaries, RED, failed candidate, diagnostics,
+pixel results and unresolved unit failure. Full current6548 NOT_RUN; global
+remaining UNKNOWN. Next investigate the CSS1 reference gaps and the runtime
+control failure. This batch is being submitted for user-authorized publication;
+parent source and submodule pin are unchanged. Product Agent knowledge has no
+impact: these are generic CSS used-style repairs, without business contracts or
+authority changes. Six existing outside-vendor size violations remain separate.
+
+## 2026-10-09 V2938: explicit decoration color clears content-070
+
+V2926 retains a genuine declaration RED: text-decoration-color black is
+discarded. The ordinary declaration/cascade path now retains explicit colors,
+currentColor, invalid-value preservation, initial/unset and explicit inherit.
+Explicit inherit resolves the parent's computed color; element boxes do not
+inherit the property by default. The existing single-line shorthand resets
+its omitted color slot. Painting uses the decorating owner's color without
+changing glyph color, metrics or opacity. This follows the
+[decoration color and ownership rules](https://www.w3.org/TR/css-text-decor-3/#text-decoration-color-property).
+
+V2929's first pixel candidate still leaves 219 reference pixels. It is retained,
+not accepted: anonymous text copied its parent's line but dropped its color.
+Used anonymous/pseudo/list text now copies both; dissolved inline owner
+snapshots also retain explicit decoration color without changing owner glyph
+color or legacy nine/ten-field records. V2932 is a fixture diagnostic (the test
+assumed a black Style default, which is white), not a rendering RED.
+
+V2933 passes 85 DOM executions, V2934 passes 3 std executions and V2935 passes
+36 runtime executions. Module builds pass; the final runner builds in 2m17s.
+V2936's six-page browser window now has 3 exact/3 gap cases. content-070 actual
+stays zero, reference 219 -> 0 and native strict 219 -> 0; browser strict stays
+zero. Both list images remain exact, all other comparison counts unchanged.
+The viewport scrollbar case remains 6193 actual/reference pixels; the two CSS1
+cases remain 11220 reference pixels, with native/browser strict 1240/12460 each.
+Four strict failure rows remain independent, no tolerance or reference waiver.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/decoration-color-used-checkpoint-v2938.json`.
+It binds source, runner, module binaries, genuine RED, failed candidate, fixture
+diagnostic and current pixel deltas. Full current6548 NOT_RUN; global remaining
+UNKNOWN. Full shorthand grammar, revert, unlike-decoration-color coalescing
+and broader pixel controls remain open. Next address the viewport-propagated
+body overflow/margin-collapse case, then CSS1 image/table reference gaps.
+No commit/push or parent source/pin change. Same six outside-vendor size
+violations; no baseline increase. Product Agent knowledge unaffected: generic
+CSS/HTML used styles only, no business contract or authority change.
+
 ## 2026-10-09 publication candidate: list images and modification elements
 
 User-authorized publication includes the V2919 list-image implementation and
