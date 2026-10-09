@@ -15421,12 +15421,15 @@ fn project_inline_block_vertical_align_keywords(
             return;
         }
 
-        let font_size = component.style.font_size;
-        let ascent = font_size * 0.8;
-        let descent = font_size - ascent;
-        let half_leading = (inline_style_line_height(&component.style) - inline_font_height(&component.style)) * 0.5;
-        let mut core_top = -ascent - half_leading;
-        let mut core_bottom = descent + half_leading;
+        let ascent = inline_font_content_ascent(&component.style);
+        let descent = inline_font_height(&component.style) - ascent;
+        // Use one font geometry for the strut and its leading. Mixing a
+        // synthetic 0.8em ascent with resolved font height shortened image-only
+        // lines after the shared line solver had already sized them correctly.
+        let strut_height = inline_style_line_height(&component.style);
+        let strut_ascent = inline_font_baseline_from_line_top(&component.style, strut_height);
+        let mut core_top = -strut_ascent;
+        let mut core_bottom = strut_height - strut_ascent;
         let mut top_height: f32 = 0.0;
         let mut bottom_height: f32 = 0.0;
         for (child, _, _, _, height) in &boxes {
@@ -18493,9 +18496,12 @@ fn build_taffy_tree(
                 Some(border_height + margin.top + margin.bottom + descent)
             })
             .fold(0.0_f32, f32::max);
-        if minimum > 0.0 {
+        if minimum > 0.0 || comp.children.iter().any(inline_line_has_in_flow_content) {
             // DOM-lowered line rows still have a font strut. A child with no
             // internal line boxes exports its bottom margin edge as baseline.
+            // Top/bottom-aligned content also retains that strut, even when
+            // it contributes no baseline descent. Include the floor in grid
+            // sizing so following rows consume the complete line height.
             let edges = if style.box_sizing == BoxSizing::BorderBox {
                 let resolve = |edge: LengthPercentage| {
                     edge.resolve_or_zero(Some(containing_width), |_, _| unreachable!())
@@ -39990,6 +39996,37 @@ mod tests {
                 "settled row must still stretch its shorter cell: grouped={grouped}, layouts={layouts:?}");
             assert_eq!(at(row_index + 4).y, 0.0, "stretching the cell does not move its text");
         }
+    }
+
+    #[test]
+    fn table_bottom_aligned_images_keep_parent_line_height_strut() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/table-image-strut.html",
+        ).unwrap();
+        parser.write("<!doctype html><table style='border-spacing:0;font:16px/22px sans-serif'><tr><td style='padding:0'><img style='vertical-align:bottom' src='a.png' width='20' height='20'><img style='vertical-align:bottom' src='b.png' width='20' height='20'><img style='vertical-align:bottom' src='c.png' width='20' height='20'></td></tr><tr><td style='padding:0'><img style='vertical-align:bottom' src='a.png' width='20' height='20'><img style='vertical-align:bottom' src='b.png' width='20' height='20'><img style='vertical-align:bottom' src='c.png' width='20' height='20'></td></tr></table>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let (cell, _) = flat.iter().enumerate().find(|(_, node)|
+            node.style.display == WDisplay::TableCell).unwrap();
+        assert_eq!(inline_style_line_height(flat[cell].style), 22.0,
+            "fixture must retain its authored parent line height");
+        let rect = layout.iter().find(|(_, index)| *index == cell).unwrap().0;
+        assert_eq!(rect.height, 22.0, "bottom images must not discard the parent strut: {layout:?}");
+        let image = flat.iter().enumerate().find(|(_, node)|
+            matches!(node.kind, ComponentKind::Image { .. })).unwrap().0;
+        let image_rect = layout.iter().find(|(_, index)| *index == image).unwrap().0;
+        assert_eq!(image_rect.y - rect.y, 2.0, "bottom alignment uses the full line box");
+        let next_cell = flat.iter().enumerate().skip(cell + 1).find(|(_, node)|
+            node.style.display == WDisplay::TableCell).unwrap().0;
+        let next_rect = layout.iter().find(|(_, index)| *index == next_cell).unwrap().0;
+        assert_eq!(next_rect.y - rect.y, 22.0, "following rows consume the settled line height");
     }
 
     #[test]

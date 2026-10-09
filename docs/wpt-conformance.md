@@ -1,5 +1,114 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 baseline attribution and lower-heading candidate
+
+V2980 temporarily removes only the two local font-strut/grid production changes,
+retaining the new test and the same HEAD/environment. All four extended unit
+failures reproduce with identical geometry/messages after normalizing thread
+IDs and source lines. V2984 records this attribution, not a failure waiver.
+The candidate source is restored exactly to V2979's source hash; V2981 confirms
+32 passes again. The whole runtime module is not green.
+
+V2982 remeasures six historical queue entries on that restored source. The
+text/plain stylesheet case is now pixel exact; five remain browser gaps:
+the two outside-containing-block floats (9500 actual pixels each), two
+descendant-selector pages (4709 actual/reference pixels each), and the
+moveBefore flex-item page (10000 actual pixels). Their native strict counts are
+zero, but browser strict fails for both floats and moveBefore; these remain
+independent. This partial queue measurement is not a global census.
+
+The descendant-selector screenshots expose missing h4 default weight/margins,
+not a selector match failure. V2985 retains a genuine DOM RED (h4 weight 400,
+expected 700). The local UA candidate adds h4/h5/h6 weight, size and spacing
+from the [HTML sections and headings defaults](https://html.spec.whatwg.org/multipage/rendering.html#sections-and-headings).
+Heading text lowering now consumes the computed style rather than repeating
+private default sizes/weight that could bypass the cascade. V2986 is a passing
+author font override control on the baseline, not a second RED. V2987 passes
+16 UA and 62 computed-style-cache executions; DOM compilation succeeds in
+37.66s. The runner rebuild succeeds in 2m34s. V2988 measures three browser-pixel
+exact pages and three remaining gaps: both descendant-selector actual and
+reference images improve 4709 -> 0 pixels; the text/plain stylesheet page stays
+exact. Both outside-containing-block floats remain at 9500 actual pixels and
+moveBefore remains at 10000. V2990 rechecks the preceding six controls: all six
+actual/reference pairs remain browser-pixel exact. The two CSS1 cases still
+have 12460-pixel native strict and browser strict failures each; these four
+independent failure rows remain open. Receipts are retained under
+`target/wpt-targeted/baseline-font-position-20261003/`, including
+`lower-headings-scope-v2989.json` and
+`lower-headings-controls-scope-v2991.json`. The older runtime unit gate is not
+a full-module validation of the new heading source.
+
+Full current6548 NOT_RUN; global remaining UNKNOWN. Generic HTML/CSS defaults
+do not change business contracts, authority or Product Agent knowledge. No
+parent pin changes. This batch is prepared for the user's requested publication;
+publication does not imply full-suite acceptance. Six outside-vendor size violations remain
+separate; no baseline increase.
+
+## 2026-10-09 CSS1 font strut and grid sizing candidates
+
+V2965-V2967 diagnostic receipts isolate the overwrite: shared line projection
+produces a 22px image line with 2px bottom offsets; the later vertical-align
+keyword fallback contracts it. That fallback mixed synthetic 0.8em font
+ascent/descent with resolved font height. The local candidate now uses resolved
+font content geometry and the same used strut baseline as the shared solver.
+All temporary diagnostic code has been removed.
+
+V2968 passes 32 focused executions. The runner builds in 2m43s. V2969's six
+browser comparisons keep four pages exact and both CSS1 actual pages exact;
+each CSS1 reference improves 11220 -> 9408 pixels. Native strict changes
+1240 -> 3252 while browser strict remains 12460: these failures remain separate,
+without tolerance or waiver. V2972 binds the source, binaries, RED, diagnostics,
+first candidate pixels and extended failures. This is progress toward browser
+parity, not a strict-reference pass.
+
+V2973's reference layout diagnosis finds the remaining propagation issue: rows
+are now 22px high but still start 40px apart with 20px border spacing. V2974
+extends the regression to two rows and retains a genuine 20-versus-22 following
+row offset RED. The second local candidate includes the containing font strut
+in the grid's initial minimum for in-flow top/bottom-aligned content, not only
+baseline-aligned atomics. V2975 passes 32 executions including both row heights
+and image offsets; module compilation succeeds in 27.05s. Its runner rebuild
+succeeds in 3m13s. V2976 remeasures six pages: all six are browser-pixel exact,
+including both actual and reference images of the two CSS1 cases. The reference
+gap falls 11220 -> 9408 -> 0. Both CSS1 strict reftests still fail in native and
+browser with 12460 pixels each. Browser parity does not erase these four strict
+failure rows or certify the upstream reference relationship. V2979 binds the
+current source/binaries, first candidate, second RED, focused controls and all
+remaining strict/extended failures; no full-suite acceptance is claimed.
+
+V2971 and V2978 each retain four extended unit failures: two top-aligned
+image/text tests, the middle-aligned cell baseline-image test, and the previous
+first-child margin test. Their baseline attribution is unproven; they are not
+silently excluded from a module-green claim. Full current6548 NOT_RUN, global
+remaining UNKNOWN. No commit/push, parent pin or business knowledge changes.
+
+## 2026-10-09 CSS1 reference image-line investigation
+
+After publication 9186ed9 the working tree was clean. V2958 captures the actual
+page and V2959 separately captures its table reference under the pinned WPT
+revision. The reference's anonymous image row and cell are 20px high despite
+their reported 22px normal line height; browser reference rows are 22px, with
+bottom-aligned images offset 2px within each row. Images are present, not a
+resource-loading failure. These are diagnostics, not new acceptance results.
+
+V2960 is a fixture diagnostic: the inert parser did not apply the style element,
+leaving default spacing/padding. The fixture was corrected to inline styles.
+V2961 then records a 20-versus-22 height failure. V2962 and V2963 retain two
+unsuccessful layout candidates with 31 control executions passing and the
+target still failing. Both production candidates were reverted, leaving only
+the focused regression test; an authored-line-height assertion was added to
+validate the fixture's basis before further changes. These receipts live under
+`target/wpt-targeted/baseline-font-position-20261003/soft-wrap-units-v2960.json`
+through `soft-wrap-units-v2963.json`; worker diagnostics use the same directory.
+V2964 verifies the authored parent line height is 22px and reproduces the
+20px cell height after both production candidates were reverted. Its module
+build succeeds in 39.82s; this current RED is retained independently.
+
+No pixel repair is accepted in this batch. Strict CSS1 failures and the prior
+runtime margin failure remain open. Full current6548 NOT_RUN; global remaining
+UNKNOWN. No new commit/push, parent pin or business knowledge changes. Size
+check retains the same six outside-vendor violations, without baseline changes.
+
 ## 2026-10-09 V2957: viewport body margin matches browser
 
 V2939 retains the first-child margin RED (8 instead of 16). The body margin

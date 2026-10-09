@@ -186,6 +186,20 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             style.font_weight = 700;
             vertical_margin(style, 1.0);
         }
+        "h4" => {
+            style.font_weight = 700;
+            vertical_margin(style, 1.33);
+        }
+        "h5" => {
+            style.font_size *= 0.83;
+            style.font_weight = 700;
+            vertical_margin(style, 1.67);
+        }
+        "h6" => {
+            style.font_size *= 0.67;
+            style.font_weight = 700;
+            vertical_margin(style, 2.33);
+        }
         "p" => vertical_margin(style, 1.0),
         "ul" | "ol" => {
             vertical_margin(style, 1.0);
@@ -477,6 +491,47 @@ mod tests {
         assert_eq!(inherited.font_size, 20.0);
         // `white-space` is not part of the shorthand, so `pre` keeps it.
         assert_eq!(inherited.white_space, w3cos_std::style::WhiteSpace::Pre);
+    }
+
+    #[test]
+    fn lower_heading_levels_have_ua_font_weight_size_and_margins() {
+        for (tag, scale, margin) in [("h4", 1.0, 1.33), ("h5", 0.83, 1.67), ("h6", 0.67, 2.33)] {
+            let mut style = Style::default();
+            apply_html_default_style(&mut style, tag);
+            assert_eq!(style.font_weight, 700, "{tag} UA weight");
+            assert!((style.font_size - 16.0 * scale).abs() < 0.0001, "{tag} UA size");
+            assert_eq!(style.margin.top, Spacing::Em(margin), "{tag} UA margin");
+            assert_eq!(style.margin.bottom, Spacing::Em(margin));
+        }
+        let mut document = crate::document::Document::new();
+        let heading = document.create_element("h4");
+        let span = document.create_element("span");
+        heading.append_child(&mut document, span);
+        document.body().append_child(&mut document, heading);
+        assert_eq!(document.computed_style_for(span.id).font_weight, 700);
+        heading.style_mut(&mut document).set_property("font-weight", "normal");
+        heading.style_mut(&mut document).set_property("font-size", "20px");
+        assert_eq!(document.computed_style_for(span.id).font_weight, 400);
+        assert_eq!(document.computed_style_for(span.id).font_size, 20.0);
+    }
+
+    #[test]
+    fn heading_lowering_keeps_author_font_weight_and_size() {
+        let mut document = crate::document::Document::new();
+        let heading = document.create_element("h4");
+        heading.set_text_content(&mut document, "authored heading");
+        heading.style_mut(&mut document).set_property("font-weight", "normal");
+        heading.style_mut(&mut document).set_property("font-size", "16px");
+        document.body().append_child(&mut document, heading);
+        fn find(component: &w3cos_std::Component) -> Option<&Style> {
+            if matches!(&component.kind, w3cos_std::ComponentKind::Text { content }
+                if content == "authored heading") { return Some(&component.style); }
+            component.children.iter().find_map(find)
+        }
+        let tree = document.to_component_tree();
+        let style = find(&tree).expect("heading text must be lowered");
+        assert_eq!(style.font_weight, 400, "lowering must not restore UA bold over author normal");
+        assert_eq!(style.font_size, 16.0, "lowering must retain authored 16px");
     }
 
     #[test]

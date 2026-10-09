@@ -8009,22 +8009,10 @@ impl Document {
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         if let Some(text) = &node.text_content {
-                            let mut heading_style = style;
-                            let default_size = match tag.as_str() {
-                                "h1" => 32.0,
-                                "h2" => 24.0,
-                                "h3" => 20.0,
-                                "h4" => 18.0,
-                                "h5" => 16.0,
-                                _ => 14.0,
-                            };
-                            if heading_style.font_size == 16.0 {
-                                heading_style.font_size = default_size;
-                            }
-                            if heading_style.font_weight == 400 {
-                                heading_style.font_weight = 700;
-                            }
-                            w3cos_std::Component::text(text, heading_style)
+                            // UA heading defaults already participate in the
+                            // cascade. Lower the computed style without
+                            // overriding author normal weight or 16px size.
+                            w3cos_std::Component::text(text, style)
                         } else {
                             w3cos_std::Component::column(style, children)
                         }
