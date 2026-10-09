@@ -132,11 +132,11 @@ impl Line {
         if !text && !atomic_box && !container { return None; }
         if !atomic_box && ((!atomic_text && style.display != Display::Inline)
             || (!container && !decorated_text && (padding.top != 0.0 || padding.bottom != 0.0))
-            || (!text && (padding.left != 0.0 || padding.right != 0.0))
+            || (!text && !container && (padding.left != 0.0 || padding.right != 0.0))
             || !decorated_text && (style.border_width != 0.0
             || [style.border_top_width, style.border_bottom_width, style.border_left_width,
                 style.border_right_width].into_iter().flatten().any(|v| v != 0.0))
-            || margin.left != 0.0 || margin.right != 0.0) { return None; }
+            || !container && (margin.left != 0.0 || margin.right != 0.0)) { return None; }
         // Non-replaced inline vertical margins do not participate in line-box
         // metrics (including margins synthesized by DOM vertical-align lowering).
         if container && keyword != "baseline" { return None; }
@@ -212,6 +212,9 @@ impl Line {
                 + if decorated_text { vertical_edges }
                     else if container { padding.top + padding.bottom } else { 0.0 }) });
         if container {
+            // Horizontal decoration consumes line width, but does not create
+            // a separate baseline for the non-replaced inline's descendants.
+            self.width += padding.left + padding.right + margin.left + margin.right;
             let mut child_index = index + 1;
             for child in &component.children {
                 self.collect(child, child_index, style, total_shift, relative_y, layouts, positions)?;

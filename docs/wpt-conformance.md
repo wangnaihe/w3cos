@@ -1,5 +1,166 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 nested inline023: shared baseline browser repair
+
+The completed V3081/V3084 linebox198 checkpoint records 189/191 browser-exact
+reftests, two real browser gaps (013 reference1800 and 023 actual987), and
+7/7 passing native testharness cases; browser testharness was NOT_RUN. Native
+strict totals are 60 passed / 138 failed, with 275 native/browser strict
+failure rows retained independently. These numbers supersede the old group
+receipts only for that exact candidate, not as a current global census.
+
+V3085's browser differential isolates the old fixed-table unit mismatch:
+422px content-box has a 434px outer table and a 412px inner grid, while
+422px border-box has a 400px inner grid and tracks80/80/160/80. The internal
+fixture now explicitly declares border-box, retaining its original assertions.
+V3088 passes all56 related tests; no production table change or upstream WPT
+change is made for this fixture correction.
+
+V3086/V3087 diagnose 023: the outer inline's horizontal margin/padding rejects
+shared baseline resolution, leaving the outer text about2px below the inner
+run. The parsed minimal fixture first needed an E0282 closure annotation fix
+(compile error, not RED); V3089 then retains genuine23-versus20 baseline RED.
+The shared solver now accepts non-replaced inline containers with horizontal
+padding/margin, counts those edges in line width, and preserves existing
+horizontal layout while solving descendant baselines together. Unsupported
+bordered containers and other existing safeguards remain unchanged.
+
+V3090 passes57 related tests. V3091 independently remeasures all four remaining
+historical unit failures; all four still fail and remain open. Runtime test
+compile succeeds in26.34s, runner rebuild in2m22s. V3092 drops 023 actual and
+native strict987 ->0, while 015 and baseline003 remain exact/strict-zero.
+013 reference remains1800, unchanged; browser strict2502 and native strict702
+are both retained. V3094 keeps6/6 primary pages exact, and V3096 keeps16/16
+controls exact with twelve control strict rows unchanged. All source/binary,
+RED, fixture differential and per-case evidence is bound in
+`target/wpt-targeted/baseline-font-position-20261003/nested-inline-checkpoint-v3098.json`.
+
+V3099/V3100 diagnose the next013 reference gap: native image tops74/94/114
+advance by20px, but browser tops74/96/118 advance by the22px parent strut;
+the browser decorated block height is106px. Next: wrapped replaced-inline
+line membership and per-line strut resolution, genuine RED and focused
+regression before another whole-linebox group gate. The191 group and111
+white-space browser receipts belong to preceding candidates; neither is a
+current-source full gate. Full current6548 NOT_RUN, global remaining UNKNOWN.
+No commit/push or parent pin change. Generic inline geometry does not affect
+Product Agent knowledge or business authority; parent size gate retains six
+outside-vendor violations, without baseline increase.
+
+## 2026-10-09 table contraction priority: linebox015 browser gap cleared
+
+The priority candidate replaces proportional contraction across every track
+with bounded category passes: automatic content first, then definite tracks,
+then percentage tracks, each respecting its intrinsic contraction capacity.
+All-definite tables still contract; authored cell widths do not become global
+hard minima. The earlier global-minimum candidate remains rejected as V3073.
+V3074 passes the genuine V3072 target and all 22 auto-table tests, including
+the empty-cell regression; related line/table gates record 55 passed / 1
+failed across 56 executions. The unchanged fixed-table percentage unit failure
+remains independently recorded, with four earlier extended failures not
+remeasured. Runtime test build succeeds in 50.87s; runner build in 3m41s.
+
+V3075 clears linebox015 actual/reference native/browser and both strict
+comparisons to zero; its reference/native strict gap drops 1988 -> 0.
+Baseline-003 stays exact/strict-zero. 022 stays browser-exact with 101-pixel
+native/browser strict failures, not waived. V3077 retains the six exact
+primary pages and V3079 all sixteen exact controls; twelve control strict
+failure rows remain unchanged. The source/binary-bound checkpoint is
+`target/wpt-targeted/baseline-font-position-20261003/table-contraction-checkpoint-v3083.json`.
+
+V3081 additionally starts the original linebox198 native regression and
+191-reftest browser comparison, with seven native testharness cases counted
+separately. Final group receipt is pending; a progress counter is not group
+acceptance. Production sources remain frozen during that process. The prior
+white-space111 browser acceptance belongs to the preceding candidate and
+its 86 strict failures remain retained, not a current-source whole-suite gate.
+Full current6548 NOT_RUN, global remaining UNKNOWN. No new commit/push or
+parent pin change. Generic table distribution has no Product Agent knowledge
+or business-authority impact; root size gate retains six outside-vendor issues.
+
+## 2026-10-09 linebox015: reference track contraction RED retained
+
+V3068 remeasures three historical linebox failures with the same frozen
+production candidate. Baseline-003 is browser-exact and strict-zero; 022 is
+browser-exact with identical 101-pixel native/browser strict failures retained.
+015 has an exact actual page but a 1988-pixel native/browser reference gap,
+also native strict 1988 while browser strict is zero. This is a real renderer
+gap, not a shared reference mismatch or a current global failure count.
+
+V3070 browser geometry preserves the first cell's 110px authored width and
+allocates 90px to the automatic text cell. V3071 native geometry instead uses
+81.234375 / 118.765625; the contraction minimum is 10 / 35.578125 although
+preferred tracks are 110 / 152.34375. V3072 retains genuine track-distribution
+RED with the earlier authored-column and soft-line controls passing.
+
+A global authored-cell minimum candidate passes the new test but fails
+`auto_table_empty_definite_cells_contract_to_available_grid_width` (50px
+instead of 44px across seventeen empty cells). V3073 retains this rejected
+candidate, plus the unchanged pre-existing fixed-table percentage failure.
+The production change is reverted; only the new RED test remains. The latest
+runtime unit executable belongs to the rejected candidate, not the restored
+source. Next: inspect contraction priority between automatic and definite
+tracks while preserving contraction when every column is definite; rebuild
+and rerun the target, empty-cell control and related table gates before pixels.
+
+Receipts are under `target/wpt-targeted/baseline-font-position-20261003/`.
+The completed UA/legacy-font repair remains local and its accepted pixel
+receipts precede this test-only addition. Full current6548 NOT_RUN; global
+remaining UNKNOWN. No new commit/push, upstream modifications or parent pin
+change. The root size gate still reports the same six outside-vendor issues.
+
+## 2026-10-09 white-space111: browser parity separated from strict reference
+
+V3064 rebuilds native artifacts and captures all 111 original white-space
+tests and references in Chrome 155 with the same resource protocol and user
+style. Every actual/reference page is browser-exact, with no script errors
+or unverified comparisons. Native strict remains 25 passed / 86 failed;
+browser strict has the identical 86 failures and pixel counts, retained as
+172 independent native/browser failure rows. Current native strict results
+also match V3044 case by case; no tolerance, test or reference is changed.
+This establishes zero native/browser gaps in this group, not strict WPT
+closure or permission to remove those failures from the ledger.
+
+`target/wpt-targeted/baseline-font-position-20261003/whitespace-checkpoint-v3066.json`
+binds source/runner, current per-case native/browser results and previous
+strict attribution. V3067 separately measures legacy font parser boundaries
+in Chrome (integer overflow, relative limits, whitespace and digit prefixes);
+it is a DOM-mutated diagnostic, not upstream pixel acceptance. Full
+current6548 NOT_RUN, global remaining UNKNOWN. No commit/push or parent pin
+changes; five previously recorded extended-unit failures remain open.
+
+## 2026-10-09 quotation and legacy font defaults: six original pages exact
+
+V3055 repeats the genuine legacy font RED after correcting the oversized
+integer fixture using measured browser behavior. Native font was block-level
+at 16px rather than inline at 24px for size=5. The generic HTML user-agent
+display now includes font; its size presentation hint enters the existing
+font-size cascade before author declarations. Digit-prefix and relative
+legacy sizes use absolute CSS keywords, preserving existing font-origin and
+host-minimum semantics rather than setting a late renderer-only pixel size.
+Author overrides and descendants remain on the same computed-style path.
+The parser follows the browser-compatible algorithm also retained in
+[WebKit HTMLFontElement](https://chromium.googlesource.com/external/github.com/WebKit/webkit/+/b498597741af207e69fc5510de87ab12193f7edc/Source/WebCore/html/HTMLFontElement.cpp).
+
+V3056 passes 25 DOM executions, including nineteen user-agent tests and
+font-keyword, minimum-size, origin and presentation-hint controls. The
+current-source runner rebuild succeeds in 2m51s. V3057 makes all six original
+primary pages browser-exact with zero strict differences: c71-fwd-parsing-002
+drops 3808 -> 0 and content-136 drops 3472 -> 0, on actual and reference alike.
+This also supplies fresh quotation/address whole-page acceptance for the
+previous publication. V3059 retains all sixteen browser-exact controls and
+all twelve independent strict reference failure rows unchanged.
+
+V3061 samples four original white-space failures: all four are browser-exact,
+while native/browser strict counts both remain 68, 360, 196 and 196. These are
+attributed reference mismatches, not waived failures or evidence for the rest
+of the group. Source/binary, genuine RED, units and per-case comparisons are
+bound in `target/wpt-targeted/baseline-font-position-20261003/legacy-font-checkpoint-v3063.json`.
+The previous expanded group remains 25/111 strict pass and 86 strict failures
+until current-source group evidence is complete. Five previously recorded
+extended-unit failures remain open, not remeasured here. Full current6548
+NOT_RUN; global remaining UNKNOWN. No new commit/push or parent pin change;
+generic HTML styling does not affect Product Agent knowledge or authority.
+
 ## 2026-10-09 publication: table tracks, soft lines and quotation defaults
 
 This publication includes the table preferred-track and decorated soft-line

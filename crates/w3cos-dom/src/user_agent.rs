@@ -74,7 +74,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "base" | "head" | "link" | "meta" | "noembed" | "noframes" | "param" | "script"
         | "style" | "template" | "title" => Display::None,
         "a" | "abbr" | "b" | "bdi" | "bdo" | "br" | "code" | "del" | "em" | "i" | "iframe" | "ins" | "label" | "object"
-        | "small" | "span" | "strong" | "u" => Display::Inline,
+        | "font" | "small" | "span" | "strong" | "u" => Display::Inline,
         "button" | "canvas" | "img" | "input" | "select" | "svg" | "textarea" | "video" => {
             Display::InlineBlock
         }
@@ -496,6 +496,27 @@ mod tests {
         assert_eq!(inherited.font_size, 20.0);
         // `white-space` is not part of the shorthand, so `pre` keeps it.
         assert_eq!(inherited.white_space, w3cos_std::style::WhiteSpace::Pre);
+    }
+
+    #[test]
+    fn legacy_font_size_hint_is_inline_and_accepts_author_overrides() {
+        let mut document = crate::document::Document::new();
+        for (value, expected) in [("5", 24.0), ("+2", 24.0), ("-2", 10.0),
+            ("7", 48.0), ("9999999999999999999", 10.0), ("invalid", 16.0),
+            ("5abc", 24.0), ("+", 16.0), ("-0", 16.0), ("0", 10.0)] {
+            let font = document.create_element("font");
+            let span = document.create_element("span");
+            font.set_attribute(&mut document, "size", value);
+            font.append_child(&mut document, span);
+            document.body().append_child(&mut document, font);
+            let style = document.computed_style_for(font.id);
+            assert_eq!(style.display, Display::Inline, "legacy font is not a block: {value}");
+            assert_eq!(style.font_size, expected, "font size hint: {value}");
+            assert_eq!(document.computed_style_for(span.id).font_size, expected);
+            font.style_mut(&mut document).set_property("font-size", "20px");
+            assert_eq!(document.computed_style_for(span.id).font_size, 20.0,
+                "author font-size overrides the hint: {value}");
+        }
     }
 
     #[test]

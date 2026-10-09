@@ -2582,11 +2582,27 @@ fn auto_table_track_widths(component: &Component, percentage_basis: Option<f32>)
             // therefore retain a larger grid instead of overflowing cells.
             let deficit = (intrinsic_width - grid_width).min(capacity);
             rounding_target = w3cos_std::style::used_box_spacing(intrinsic_width - deficit);
-            for (index, (width, available)) in tracks.iter_mut().zip(capacities).enumerate() {
-                if available > 0.0 {
-                    rounding_recipient = Some(index);
-                    *width -= deficit * (available / capacity);
+            let mut remaining = deficit;
+            // Preserve authored widths while automatic columns can absorb
+            // the deficit. If every column is definite (or automatic columns
+            // reach min-content), those columns still contract rather than
+            // becoming an artificial hard minimum for the whole table.
+            let category = |index: usize| {
+                if constraints[index].1 > 0.0 { 2 } else if constraints[index].0 { 1 } else { 0 }
+            };
+            for priority in 0..=2 {
+                let flexible = capacities.iter().enumerate()
+                    .filter(|(index, _)| category(*index) == priority)
+                    .map(|(_, available)| *available).sum::<f32>();
+                if flexible <= 0.0 || remaining <= 0.0 { continue; }
+                let shrink = remaining.min(flexible);
+                for (index, (width, available)) in tracks.iter_mut().zip(&capacities).enumerate() {
+                    if *available > 0.0 && category(index) == priority {
+                        rounding_recipient = Some(index);
+                        *width -= shrink * (*available / flexible);
+                    }
                 }
+                remaining -= shrink;
             }
         }
     }
@@ -24299,6 +24315,9 @@ mod tests {
                 display: WDisp::Table,
                 table_layout_fixed: true,
                 width: WDim::Px(422.0),
+                // This fixture's 400px inner grid assumes a 422px border box.
+                // Content-box uses a 412px grid and different percentage tracks.
+                box_sizing: WBoxSizing::BorderBox,
                 border_left_width: Some(6.0),
                 border_right_width: Some(6.0),
                 border_spacing_x: 2.0,
@@ -40017,6 +40036,60 @@ mod tests {
                 "settled row must still stretch its shorter cell: grouped={grouped}, layouts={layouts:?}");
             assert_eq!(at(row_index + 4).y, 0.0, "stretching the cell does not move its text");
         }
+    }
+
+    #[test]
+    fn parsed_inline_horizontal_edges_keep_descendants_on_shared_baseline() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/nested-inline-baseline.html",
+        ).unwrap();
+        parser.write("<!doctype html><body style='margin:0;font:16px/22px Arial'><div>\
+            <span style='margin:1px;padding:1px;line-height:25px'>Filler Text \
+            <span style='direction:rtl;unicode-bidi:bidi-override;line-height:30px'>txeT relliF</span> \
+            Filler Text</span></div></body>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let texts = flat.iter().enumerate().filter(|(_, node)|
+            matches!(&node.kind, ComponentKind::Text { content } if content.trim() == "Filler Text"))
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        assert_eq!(texts.len(), 3, "fixture must retain three lowered text fragments");
+        let baseline = |index: usize| layout.iter().find(|(_, node)| *node == index).unwrap().0.y
+            + inline_font_content_ascent(flat[index].style);
+        let expected = baseline(texts[1]);
+        for index in texts { assert_eq!(baseline(index), expected,
+            "horizontal inline edges must not disconnect descendant baselines: {layout:?}"); }
+    }
+
+    #[test]
+    fn authored_table_cell_width_is_not_contracted_below_its_minimum() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/table-cell-minimum.html",
+        ).unwrap();
+        parser.write("<!doctype html><table style='width:200px;border-spacing:0'>\
+            <tr><td style='padding:0;width:110px;vertical-align:top'>\
+            <div style='border:5px solid blue;height:20px'></div></td>\
+            <td style='padding:0;vertical-align:top'>Filler Text Filler Text</td></tr></table>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        fn find(component: &Component) -> Option<&Component> {
+            if component.style.display == WDisplay::Table { return Some(component); }
+            component.children.iter().find_map(find)
+        }
+        let table = find(&root).unwrap();
+        assert_eq!(auto_table_track_widths(table, Some(784.0)), vec![110.0, 90.0],
+            "the authored cell's minimum must survive auto-table contraction");
     }
 
     #[test]

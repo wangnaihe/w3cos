@@ -1300,6 +1300,16 @@ impl Document {
         if let Some(value) = font_color_hint {
             user_normal.push(("color".to_string(), value.to_string(), 0));
         }
+        let font_size_hint = (node.node_type == NodeType::Element
+            && node.tag.as_str().eq_ignore_ascii_case("font")
+            && node.is_html_element)
+            .then(|| node.attributes.iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("size"))
+                .and_then(|(_, value)| parse_html_font_size_attribute(value.as_str())))
+            .flatten();
+        if let Some(value) = font_size_hint {
+            user_normal.push(("font-size".to_string(), value.to_string(), 0));
+        }
         let body_background_hint = if node.node_type == NodeType::Element
             && node.tag.as_str().eq_ignore_ascii_case("body")
         {
@@ -14194,6 +14204,27 @@ fn is_css_whitespace(character: char) -> bool {
 
 fn is_only_css_whitespace(value: &str) -> bool {
     value.chars().all(is_css_whitespace)
+}
+
+fn parse_html_font_size_attribute(value: &str) -> Option<&'static str> {
+    let value = value.trim_start_matches(is_css_whitespace);
+    let (relative, digits) = match value.as_bytes().first() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => (0, value),
+    };
+    let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if count == 0 { return None; }
+    // Legacy HTML accepts a digit prefix; overflowing the signed integer
+    // conversion behaves like zero rather than a saturated large font size.
+    let number = i64::from(digits[..count].parse::<i32>().unwrap_or(0));
+    let size = match relative {
+        1 => 3 + number,
+        -1 => 3 - number,
+        _ => number,
+    }.clamp(1, 7);
+    Some(["x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"]
+        [(size - 1) as usize])
 }
 
 fn parse_html_dimension_attribute(value: &str) -> Option<w3cos_std::style::Dimension> {
