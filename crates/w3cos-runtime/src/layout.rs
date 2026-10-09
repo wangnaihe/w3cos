@@ -11530,6 +11530,54 @@ fn project_shared_bfc_float_collisions(
             continue;
         }
         if node.style.float == WFloat::None {
+            if node.style.display == WDisplay::Inline
+                && node.style.white_space == WWhiteSpace::NoWrap
+                && matches!(node.kind, ComponentKind::Text { .. })
+                && let (Some(owner), Some(parent), Some(position)) =
+                    (owners[index], node.parent, positions[index])
+                && flat[parent].style.display == WDisplay::Inline
+                && let Some(previous) = groups.get(&owner)
+            {
+                // Inline ancestors share their block's exclusion interval.
+                // An oversized nowrap run clears the float, then resumes at
+                // that interval's start, not the obsolete narrowed line edge.
+                let mut containing = parent;
+                while flat[containing].style.display == WDisplay::Inline {
+                    let Some(ancestor) = flat[containing].parent else { break; };
+                    containing = ancestor;
+                }
+                if let Some(container_position) = positions[containing] {
+                    let container = layouts[container_position].0;
+                    let container_style = flat[containing].style;
+                    let edge = |spacing| resolve_spacing_for_layout(
+                        spacing, container.width, container_style, vw, vh);
+                    let left = container.x + edge(container_style.padding.left)
+                        + container_style.border_left_width.unwrap_or(container_style.border_width);
+                    let right = container.x + container.width - edge(container_style.padding.right)
+                        - container_style.border_right_width.unwrap_or(container_style.border_width);
+                    let rect = layouts[position].0;
+                    if rect.width > right - left + 0.01
+                        && previous.iter().any(|(float, _)|
+                            float.margin_box.y < rect.y
+                                && rect.y >= float.margin_box.y + float.margin_box.height - 0.01)
+                    {
+                        layouts[position].0.x = if node.style.direction == w3cos_std::style::TextDirection::Rtl {
+                            right - rect.width
+                        } else { left };
+                        let bottom = rect.y + rect.height;
+                        let mut ancestor = Some(parent);
+                        while let Some(index) = ancestor {
+                            if !matches!(flat[index].style.height, WDim::Auto) { break; }
+                            if let Some(position) = positions[index] {
+                                let rect = &mut layouts[position].0;
+                                rect.height = rect.height.max(bottom - rect.y);
+                            }
+                            if index == containing { break; }
+                            ancestor = flat[index].parent;
+                        }
+                    }
+                }
+            }
             // HTML clearing BRs are inline break events, not block boxes.
             // Their clearance nevertheless constrains subsequent floats in
             // this BFC, across the anonymous wrappers used by inline lowering.
@@ -11789,7 +11837,12 @@ fn project_shared_bfc_float_collisions(
         else {
             continue;
         };
-        let Some(parent_position) = positions[parent] else {
+        let mut containing = parent;
+        while flat[containing].style.display == WDisplay::Inline {
+            let Some(ancestor) = flat[containing].parent else { break; };
+            containing = ancestor;
+        }
+        let Some(parent_position) = positions[containing] else {
             continue;
         };
         if genuine_tracks(flat[parent].style) {
@@ -11797,7 +11850,7 @@ fn project_shared_bfc_float_collisions(
         }
         let parent_rect = layouts[parent_position].0;
         let style = node.style;
-        let parent_style = flat[parent].style;
+        let parent_style = flat[containing].style;
         let spacing =
             |value, size| resolve_spacing_for_layout(value, parent_rect.width, size, vw, vh);
         let left = parent_rect.x
@@ -11850,7 +11903,7 @@ fn project_shared_bfc_float_collisions(
         let previous = groups.entry(owner).or_default();
         let mut x = margin_box.x;
         let mut y = margin_box.y;
-        if previous
+        if containing != parent || previous
             .iter()
             .any(|(_, prior_parent)| *prior_parent != node.parent)
             || clear_break_floors.get(&owner).is_some_and(|floor| y < *floor - 0.01)
@@ -42213,6 +42266,37 @@ mod tests {
             (spans[0].x, spans[0].y, spans[1].x, spans[1].y),
             (8.0, 58.0, 58.0, 58.0)
         );
+    }
+
+    #[test]
+    fn leading_float_in_nowrap_inline_uses_block_content_band() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/nested-float.html",
+        ).unwrap();
+        parser.write("<!doctype html><div style='width:10ch;font-family:monospace'>\n  Some\n  \
+            <span style='white-space:nowrap'>\n    \
+            <span style='float:right;width:5ch;height:5ch;background:blue'></span> \
+            text that overflows my parent.\n  </span>\n</div>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        for layout in [compute(&root, 800.0, 600.0).unwrap(),
+            LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+            let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+            let float = flat.iter().position(|node| node.style.float == WFloat::Right).unwrap();
+            let text = flat.iter().position(|node| matches!(node.kind,
+                ComponentKind::Text { content } if content.contains("text that overflows"))).unwrap();
+            assert_eq!(rect(float).x.floor(), 47.0,
+                "nested inline does not become the float's containing block: {layout:?}");
+            assert_eq!(rect(float).y.floor(), 23.0);
+            assert_eq!(rect(text).x, 8.0, "below-float line resets horizontal exclusion");
+            assert_eq!(rect(text).y.floor(), 62.0);
+        }
     }
 
     #[test]

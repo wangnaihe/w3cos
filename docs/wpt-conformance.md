@@ -1,5 +1,84 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication scope: accepted nested-inline repair only
+
+This publication includes only the V3203 accepted nested-inline float repair
+and its passing parsed fixture. The subsequent source-order experiment stays
+uncommitted: V3234 improves the nine-case group to7 browser-exact comparisons,
+but regresses float-nowrap-3 actual0 ->1158 and float-nowrap-6 actual0 ->531.
+Its DOM changes, whole-block nowrap trial and still-open fixture are excluded
+from this commit. The working tree and current runner contain that experiment;
+neither is evidence for the published source. V3203 remains the publication's
+focused checkpoint (4/9 browser-exact, five gaps), with87 passing related unit
+executions and separate strict-reference rows. Full current6548 NOT_RUN;
+global remaining UNKNOWN. Parent repository pin is intentionally unchanged.
+
+## 2026-10-09 block-nowrap candidate rejected: source-order provenance required
+
+V3206-3213 preserve native/browser geometry for nowrap1/2/9 and nowrap1's
+mismatch reference. Chrome leaves whole-block nowrap overflow on the original
+line, deferring a float only when its original inline prefix prevents fitting.
+The leading float must not clear that unbreakable text. V3214 preserves genuine
+parsed-fixture RED (trailing float y8 instead of23). The trial removed nowrap
+floats from synthetic flex slots and recovered line-constrained placement.
+V3215 caught a nested-inline regression; its boundary was corrected, and V3216
+passed89 related executions. V3225 retained the same five open runtime failures.
+
+However, V3217's complete nine-case pixel regression rejects the trial: nowrap1
+actual1157/reference2361 ->0, nowrap2 actual/reference1157 ->0, but nowrap6
+actual0 ->531 and nowrap7/8 actual0 ->1157 each. Their fitting original prefixes
+are lost when DOM hoisting/coalescing moves the float behind the entire text.
+V3223 historical12/12, V3219 controls16/16 and V3221 primary6/6 stay exact, but
+those green windows do not waive the three regressions. All34 separate strict
+pixel-difference rows remain in the rejected checkpoint:
+`target/wpt-targeted/baseline-font-position-20261003/nowrap-block-rejected-checkpoint-v3226.json`.
+
+Only this trial's production changes were removed; previous V3203 production
+is retained along with the new failing fixture. After rebuilding units, V3227
+passes the previous87 executions and V3228 reproduces the new RED on restored
+production. The current runner still belongs
+to rejected source and must be rebuilt before further pixel acceptance. No new
+browser repair is accepted in this batch. Next: preserve the original inline
+encounter position through DOM hoisting, then consume that anchor in shared
+layout rather than inferring it from merged text. Five nowrap-family browser
+gaps remain at the last accepted checkpoint. Full current6548 NOT_RUN; global
+remaining UNKNOWN. Local changes uncommitted/unpushed; WPT and parent pin are
+unchanged. Generic engine geometry has no Product Agent knowledge impact.
+Root size gate still reports six outside-vendor violations; baseline unchanged.
+
+## 2026-10-09 nested-inline float: nowrap reference browser gap cleared locally
+
+V3186/V3187/V3188 preserve original native/browser geometry. The mismatch
+reference float-nowrap-4 places its right float at browser x47/y23 and its
+oversized nowrap text at x8/y62. Native incorrectly uses the inline wrapper
+as the containing interval (float x8, following text x47 after clearance).
+V3189 preserves genuine parsed-fixture RED. Shared-BFC placement now obtains
+the float's content interval through inline ancestors; an oversized cleared
+nowrap run resets its horizontal exclusion and contributes its normal-flow
+bottom to automatic ancestor height. Direct/retained fixture paths pass.
+
+V3192 remeasures all nine fixed-suite nowrap cases before this repair:3 exact,
+6 browser gaps. V3196 clears float-nowrap-3-ref reference4390 ->0, actual stays0;
+the other five browser gaps are unchanged. This nine-case group is now4 exact,
+not complete. V3199 historical12/12, V3201 controls16/16 and V3204 primary6/6
+are exact, without script errors or unverified comparisons. V3194 passes87
+related unit executions; unit rebuild takes22.88s, runner rebuild2m26s.
+
+V3190's extra nowrap same-line assertion fails. V3191 temporarily removes only this
+batch's production changes, retaining the identical new fixture, and proves
+that assertion plus the prior four runtime failures also fail on published
+9e082b3 production. V3195 retains the same five failures on the restored
+candidate. They remain open, not waived. Two prior DOM failures (V3183) remain
+open; DOM is unchanged and was not remeasured in this batch.
+`target/wpt-targeted/baseline-font-position-20261003/nowrap-checkpoint-v3203.json`
+binds RED, baseline/candidate units, diagnostics and43 focused pixel comparisons;
+all34 strict pixel-difference rows remain independent, including duplicate
+paths across scopes. Mismatch relation outcomes are not pixel-difference counts.
+No upstream WPT or tolerance changes. Full current6548 NOT_RUN; global
+remaining UNKNOWN. Local uncommitted/unpushed; parent pin unchanged. Next
+entries are the five nowrap-family browser gaps and the open internal failures.
+Generic engine geometry has no Product Agent knowledge/authority impact.
+
 ## 2026-10-09 publication candidate: caption grid and floated first-letter struts
 
 User-authorized publication contains the caption allocation repair below and
