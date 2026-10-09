@@ -11823,7 +11823,13 @@ fn project_shared_bfc_float_collisions(
                     .iter()
                     .map(|(prior, _)| prior)
                     .filter(|prior| {
-                        prior.margin_box.y < y + margin_box.height.max(rect.height)
+                        // A float wholly outside this containing interval
+                        // does not narrow its placement band, even when the
+                        // new float overflows it. Intersecting same-side
+                        // floats still constrain source-order overflow.
+                        prior.margin_box.x < right - 0.01
+                            && prior.margin_box.x + prior.margin_box.width > left + 0.01
+                            && prior.margin_box.y < y + margin_box.height.max(rect.height)
                             && prior.margin_box.y + prior.margin_box.height > y
                     })
                     .collect();
@@ -11841,9 +11847,9 @@ fn project_shared_bfc_float_collisions(
                         .map(|prior| prior.margin_box.x - margin_box.width)
                         .fold(right - margin_box.width, f32::min)
                 };
-                // Oversized floats may overflow their own containing block,
-                // but cannot cross an opposing float, or overflow beside a
-                // preceding same-side float in the shared BFC (CSS2 rules3/7).
+                // Oversized floats may overflow their containing block, but
+                // cannot cross an opposing float narrowing its interval or
+                // overflow beside an intersecting preceding same-side float.
                 let blocked = if style.float == WFloat::Left {
                     (same && x + margin_box.width > right + 0.01)
                         || active.iter().any(|prior| {
@@ -42110,6 +42116,81 @@ mod tests {
     }
 
     #[test]
+    fn nested_oversized_float_ignores_exclusions_outside_containing_interval() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+
+        for (prior_side, item_side, margin_side) in [
+            ("right", "left", "right"), ("left", "right", "left"),
+        ] {
+            for gap in [25, 50, 100] {
+                crate::dom::reset_document();
+                crate::jsdom::reset_bridge();
+                let mut parser = StreamingDocumentParser::new_with_script_host(
+                    Rc::new(InertParserScriptHost), "https://example.test/nested-float-interval.html",
+                ).unwrap();
+                parser.write(&format!("<!doctype html><div style='float:left;width:500px;height:500px'>\
+                    <div style='float:{prior_side};width:50px;height:300px'></div>\
+                    <div style='margin-{margin_side}:{gap}px'>\
+                    <div style='float:{item_side};width:475px;height:10px;background:blue'></div>\
+                    </div></div>")).unwrap();
+                parser.finish().unwrap();
+                let root = crate::dom::to_component_tree();
+                let flat = pre_flatten(&root);
+                let layout = compute(&root, 800.0, 600.0).unwrap();
+                let (item, _) = flat.iter().enumerate().find(|(_, node)|
+                    node.style.background == w3cos_std::Color::rgb(0, 0, 255)).unwrap();
+                let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                let item_rect = rect(item);
+                let outer = flat.iter().enumerate().find(|(_, node)|
+                    node.style.width == WDim::Px(500.0)).unwrap().0;
+                let expected = if gap < 50 { 300.0 } else { 0.0 };
+                assert_eq!(item_rect.y - rect(outer).y, expected,
+                    "outside exclusions must not re-enter an overflowing float: side={item_side}, gap={gap}, layout={layout:?}");
+                assert_eq!(item_rect.width, 475.0);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_same_side_float_ignores_exclusions_outside_containing_interval() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+
+        for side in ["left", "right"] {
+            for width in [425, 475] {
+                for gap in [25, 50, 100] {
+                    crate::dom::reset_document();
+                    crate::jsdom::reset_bridge();
+                    let mut parser = StreamingDocumentParser::new_with_script_host(
+                        Rc::new(InertParserScriptHost), "https://example.test/same-float-interval.html",
+                    ).unwrap();
+                    parser.write(&format!("<!doctype html><div style='float:left;width:500px;height:500px'>\
+                        <div style='float:{side};width:50px;height:300px'></div>\
+                        <div style='margin-{side}:{gap}px'>\
+                        <div style='float:{side};width:{width}px;height:10px;background:blue'></div>\
+                        </div></div>")).unwrap();
+                    parser.finish().unwrap();
+                    let root = crate::dom::to_component_tree();
+                    let flat = pre_flatten(&root);
+                    let layout = compute(&root, 800.0, 600.0).unwrap();
+                    let item = flat.iter().position(|node|
+                        node.style.background == w3cos_std::Color::rgb(0, 0, 255)).unwrap();
+                    let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                    let outer = flat.iter().position(|node|
+                        node.style.width == WDim::Px(500.0)).unwrap();
+                    let expected = if gap < 50 && width > 450 { 300.0 } else { 0.0 };
+                    assert_eq!(rect(item).y - rect(outer).y, expected,
+                        "same-side interval: side={side}, gap={gap}, width={width}, layout={layout:?}");
+                    assert_eq!(rect(item).width, width as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn nested_bfc_overflow_does_not_reenter_float_exclusion_outside_parent() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
@@ -47863,8 +47944,11 @@ mod tests {
         for side in [WFloat::Left, WFloat::Right] {
             for (same, width, expected_y) in [
                 (false, 425.0, 0.0),
-                (false, 475.0, 300.0),
-                (true, 425.0, 300.0),
+                // Browser placement ignores either float side outside the
+                // wrapper interval, including when this box overflows it.
+                // Upstream rule3/rule7 strict failures remain separate.
+                (false, 475.0, 0.0),
+                (true, 425.0, 0.0),
             ] {
                 let prior_side = if same {
                     side

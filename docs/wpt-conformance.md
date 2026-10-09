@@ -1,5 +1,132 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication scope
+
+This publication contains the containing-interval float repairs and their
+focused browser-parity evidence below. The table preferred-track candidate
+remains local and is excluded from this commit: V3027 passes the new target,
+the authored-column control, 22 auto-table tests and both float tests, but
+`fixed_table_percentage_column_uses_inner_grid_width` fails (82.4/164.8 versus
+80/160). That failure is not yet attributed to baseline or candidate; the table
+candidate has no rebuilt-runner pixel acceptance. Full current6548 remains
+NOT_RUN and global remaining UNKNOWN. Parent submodule pin is unchanged.
+
+## 2026-10-09 same-side float containing-interval repair
+
+V3015 is an invalid fixture diagnostic, not RED: its literal width replacement
+missed upstream whitespace, leaving a requested 475px variant at 425px. V3016
+corrects the fixture and verifies all twelve browser geometries (both sides,
+425px/475px widths and 25px/50px/100px margins). Intersecting, non-fitting
+475px floats clear by 300px; a wholly outside or touching exclusion does not
+constrain overflowing floats. V3017 retains the genuine 300-versus-zero RED
+for the original 425px/100px same-side case, with preceding controls passing.
+
+The candidate applies the containing-interval filter to either float side,
+preserving clearance and overlap/source-order constraints inside the interval.
+The old outside same-side 300px unit expectation is corrected to the measured
+browser position, while the twelve-branch regression retains overlapping
+non-fitting clearance. No upstream WPT assertion/reference is modified.
+V3018 passes twelve focused executions; module compilation succeeds in 32.34s
+and the runner rebuild in 2m54s, with production source frozen through pixels.
+
+V3019 merges the preceding twelve-page window and six float controls into
+sixteen unique cases: all sixteen actual/reference pairs are browser-pixel
+exact. Same-side left/right actual gaps drop 8500/8160 -> 0; earlier rule3,
+heading, image-strut, marker, viewport and moveBefore controls remain exact.
+Native strict for each target changes zero -> 8500/8160 while browser strict
+is unchanged. V3021 binds current source, binaries, RED, invalid fixture,
+browser geometry and before/after captures; all twelve strict failure rows
+remain independent (native/browser for six cases), without a tolerance waiver.
+Four previously reproduced extended unit failures remain open and are not
+remeasured by this focused gate.
+
+Receipts are under `target/wpt-targeted/baseline-font-position-20261003/`,
+including `same-float-checkpoint-v3021.json`. V3022 remeasures six further
+historical font/table/inline-decoration queue entries: class-002 and
+line-breaking-font-size-zero-001 are exact. Four pages retain gaps:
+c5516-ibrdr-c-000 (2210 actual/reference each), c71-fwd-parsing-002 (3808 each),
+content-136 (3472 each), and vertical-align-baseline-003 (actual zero,
+reference 8787). The baseline case retains its native strict 8787-pixel
+failure; browser strict is zero. V3023 keeps these failures and the source/
+binary binding. This is not a census; the next entry is the table reference's
+definite-column preferred sizing, which must be diagnosed before changing it.
+Full current6548 NOT_RUN, global remaining UNKNOWN. No new commit/push or
+parent pin changes. Six root size violations remain outside vendor, with no
+baseline increase. Generic CSS placement changes do not affect business
+concepts or Product Agent knowledge.
+
+## 2026-10-09 opposing float containing-interval repair
+
+V3006 measures Chrome 155's interval boundary on both physical sides. With
+25px overlap the 475px float clears the prior 300px float; touching or wholly
+outside the containing interval (50px/100px margins) does not clear. V3007
+keeps the genuine RED: the touching case is displaced 300px instead of zero.
+The previous shared-BFC rule control passes before the candidate.
+
+The local placement candidate filters opposing float exclusions to those
+intersecting the current containing interval, retaining same-side source-order
+overflow constraints. V3008 keeps the intermediate result, including its
+failure against the prior strict-reference-derived 300px unit expectation.
+That one unit expectation is corrected to the measured browser geometry;
+upstream WPT assertions/references are unchanged. V3011 records 11 passing
+focused executions, including both-side boundary checks, same-side overflow,
+independent BFCs, negative margins, clearing breaks, image line struts and
+moveBefore layout. Compilation succeeds in 45.52s after that assertion update;
+the runner rebuild succeeds in 4m15s with source frozen.
+
+V3009 records 12/12 browser-pixel exact actual/reference pairs. Each target
+actual gap drops 9500 -> 0 pixels; all ten preceding controls remain exact.
+Native strict for each target changes 0 -> 9500 while browser strict stays
+9500: browser parity does not certify the upstream reference relationship.
+V3012 binds RED, intermediate failure, current unit/source/runner hashes,
+browser geometry, prior/current captures and all eight strict failure rows
+(native/browser for two float and two CSS1 cases). Four previously reproduced
+extended unit failures remain open and are not remeasured by this focused gate.
+
+Receipts are under `target/wpt-targeted/baseline-font-position-20261003/`,
+including `float-interval-checkpoint-v3012.json`. V3013 independently measures
+six adjacent rule3/rule7 cases: four browser-pixel exact and two remaining
+same-side rule7 gaps (left 8500/right 8160 actual pixels, references zero).
+Those match their historical gap counts; they are not newly attributed
+regressions or silently excluded. V3014 retains their two browser strict
+failures as well as the four native/browser rule3 strict failures. The next
+entry is the same-side containing-interval behavior. Full current6548 NOT_RUN; global
+remaining UNKNOWN. No new commit/push or parent pin changes. Root size gate
+still has six outside-vendor violations; no baseline increase. Generic float
+placement changes do not affect business concepts or Product Agent knowledge.
+
+## 2026-10-09 browser-version attribution after bce2a7d
+
+Direct inspection corrects the moveBefore gap direction: native paints the
+100px green square, while Chromium 141.0.7390.37 paints none. V2994 records
+successful reparenting but a 0x0 descendant box under both HTTP and HTTPS, with
+no script error. V2995 records a blockified 100x100 box under installed Chrome
+155.0.8059.39. The upstream test was added for missing post-move style recalc:
+[upstream WPT change](https://chromium.googlesource.com/external/github.com/web-platform-tests/wpt/+/refs/tags/merge_pr_57649).
+Neither origin diagnostic is pixel acceptance or a reason to regress native.
+
+V2996/V2998/V3000 keep browser extension-worker timeouts as unverified, not
+passes. V3002 confirms the extension is enabled but the old worker path is
+absent. V3004 uses an isolated extension page and the same
+`chrome.scripting.insertCSS` USER origin, preserving the sidecar resource
+protocol and exact stylesheet. Its 12-case comparison on published bce2a7d
+records 10 browser-pixel exact pages and two gaps: both outside-containing-block
+floats retain 9500 actual pixels each. MoveBefore actual/reference and strict
+comparisons are all zero on Chrome 155. The original Chromium 141 receipts
+remain retained separately; this does not retroactively turn them green.
+
+V3005 independently lists six strict failures: two browser-only float failures
+of 9500 pixels and native/browser failures for each of the two CSS1 line-height
+cases at 12460 pixels. Source, runner, WPT, suite and native results are bound
+in `chrome-version-binding-v2996.json`; current browser outputs and scope are
+`chrome-bridge-browser-v3004/receipt.json` and
+`chrome-bridge-scope-v3005.json`, under
+`target/wpt-targeted/baseline-font-position-20261003/`. No production change in
+this diagnostic batch; full current6548 NOT_RUN and global remaining UNKNOWN.
+No new commit/push or parent pin changes. The root size gate retains the same
+six outside-vendor violations. Generic rendering validation does not change
+business concepts, authority or Product Agent knowledge.
+
 ## 2026-10-09 baseline attribution and lower-heading candidate
 
 V2980 temporarily removes only the two local font-strut/grid production changes,
