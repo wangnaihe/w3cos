@@ -6,6 +6,8 @@ use w3cos_std::style::{
     UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
+pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
+
 /// CSSStyleDeclaration — the `element.style` property.
 /// Mutable handle that writes directly to the node's Style.
 #[derive(Debug, Clone)]
@@ -94,6 +96,23 @@ impl CSSStyleDeclaration {
             return;
         }
         match name {
+            "list-style-image" | "listStyleImage" => {
+                let value = value.trim();
+                if w3cos_std::background::split_top_level(value, ',').len() == 1
+                    && w3cos_std::background::is_valid_image_list(value)
+                {
+                    self.inner.custom_properties.get_or_insert_with(Default::default)
+                        .insert(LIST_IMAGE_PROPERTY.into(), if value.eq_ignore_ascii_case("none") {
+                            "none".into()
+                        } else { value.into() });
+                }
+            }
+            "list-style" | "listStyle" => {
+                if let Some((_, _, image)) = list_style_properties(value) {
+                    self.inner.custom_properties.get_or_insert_with(Default::default)
+                        .insert(LIST_IMAGE_PROPERTY.into(), image);
+                }
+            }
             "display" => self.inner.display = parse_display(value),
             "position" => self.inner.position = parse_position(value),
             "float" | "cssFloat" => self.inner.float = parse_float(value),
@@ -1084,6 +1103,9 @@ impl CSSStyleDeclaration {
                 .background_image
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
+            "list-style-image" | "listStyleImage" => self.inner.custom_properties.as_ref()
+                .and_then(|properties| properties.get(LIST_IMAGE_PROPERTY)).cloned()
+                .unwrap_or_else(|| "none".into()),
             "background-size" | "backgroundSize" => self
                 .inner
                 .background_size
@@ -2023,12 +2045,16 @@ fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
 }
 
 pub(crate) fn list_style_marker_properties(value: &str) -> Option<(String, String)> {
+    list_style_properties(value).map(|(marker_type, position, _)| (marker_type, position))
+}
+
+fn list_style_properties(value: &str) -> Option<(String, String, String)> {
     let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
     let tokens = split_css_whitespace(value);
     if tokens.is_empty() { return None; }
     let mut marker_type = None;
     let mut position = None;
-    let mut has_image = false;
+    let mut image = None;
     let mut none_count = 0usize;
     for token in tokens {
         let lower = token.to_ascii_lowercase();
@@ -2041,8 +2067,8 @@ pub(crate) fn list_style_marker_properties(value: &str) -> Option<(String, Strin
                 if marker_type.replace(lower).is_some() { return None; }
             }
             _ if lower.starts_with("url(") && lower.ends_with(')') => {
-                if has_image { return None; }
-                has_image = true;
+                if !w3cos_std::background::is_valid_image_list(&token)
+                    || image.replace(token).is_some() { return None; }
             }
             _ => return None,
         }
@@ -2050,11 +2076,12 @@ pub(crate) fn list_style_marker_properties(value: &str) -> Option<(String, Strin
     // `none` can fill either type or image. Explicit values claim their
     // slots first; a third ambiguous token invalidates the whole shorthand.
     // It must not override a prior valid declaration in the cascade.
-    let available = 2 - usize::from(marker_type.is_some()) - usize::from(has_image);
+    let available = 2 - usize::from(marker_type.is_some()) - usize::from(image.is_some());
     if none_count > available { return None; }
     if marker_type.is_none() && none_count > 0 { marker_type = Some("none".into()); }
     Some((marker_type.unwrap_or_else(|| "disc".into()),
-        position.unwrap_or_else(|| "outside".into())))
+        position.unwrap_or_else(|| "outside".into()),
+        image.unwrap_or_else(|| "none".into())))
 }
 
 fn split_css_whitespace(value: &str) -> Vec<String> {

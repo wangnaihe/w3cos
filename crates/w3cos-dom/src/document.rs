@@ -122,6 +122,7 @@ pub struct Document {
     style_revisions: Vec<u64>,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
     normal_line_height_provider: Option<(fn(&w3cos_std::style::Style) -> Option<f32>, u64)>,
+    css_image_dimensions_provider: Option<fn(&str) -> Option<(u32, u32)>>,
     minimum_font_size: f32,
     minimum_logical_font_size: f32,
     #[cfg(test)]
@@ -205,6 +206,12 @@ impl Document {
         self.computed_style_cache.borrow_mut().clear();
     }
 
+    /// Query host-decoded CSS images when lowering generated marker content.
+    /// No network request or authored DOM mutation occurs during lowering.
+    pub fn set_css_image_dimensions_provider(&mut self, provider: fn(&str) -> Option<(u32, u32)>) {
+        self.css_image_dimensions_provider = Some(provider);
+    }
+
     pub fn new() -> Self {
         let mut doc = Self {
             nodes: Vec::new(),
@@ -217,6 +224,7 @@ impl Document {
             style_revisions: Vec::new(),
             computed_style_cache: RefCell::new(HashMap::new()),
             normal_line_height_provider: None,
+            css_image_dimensions_provider: None,
             minimum_font_size: 0.0,
             minimum_logical_font_size: 0.0,
             #[cfg(test)]
@@ -1375,6 +1383,14 @@ impl Document {
         user_normal.extend(author_declarations);
         user_normal.extend(user_important);
         let author_declarations = user_normal;
+        // list-style-image is inherited, unlike most internal layout metadata.
+        // Keep it in the ordinary computed cascade so resource consumers and
+        // marker lowering observe the same winning value.
+        let inherited_list_image = inherited
+            .and_then(|style| style.custom_properties.as_ref())
+            .and_then(|properties| properties.get(crate::css_style::LIST_IMAGE_PROPERTY))
+            .map(String::as_str).unwrap_or("none");
+        merged.set_property("list-style-image", inherited_list_image);
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
@@ -1397,6 +1413,13 @@ impl Document {
                 let value = resolve_css_variables(value, &custom_properties);
                 if declaration_value_is_valid(prop, &value) {
                     merged.set_property(prop, &value);
+                    if css_property_eq(prop, "list-style") || css_property_eq(prop, "list-style-image") {
+                        match value.trim().to_ascii_lowercase().as_str() {
+                            "inherit" | "unset" => merged.set_property("list-style-image", inherited_list_image),
+                            "initial" => merged.set_property("list-style-image", "none"),
+                            _ => {},
+                        }
+                    }
                 }
             }
         }
@@ -3324,6 +3347,44 @@ impl Document {
             }
             current = self.get_node(node_id).parent;
         }
+        let mut style = CSSStyleDeclaration::new().to_style();
+        style.display = w3cos_std::style::Display::Inline;
+        inherit_text_style(&mut style, origin_style, "::marker", |_| false);
+        let loaded_image = origin_style.custom_properties.as_ref()
+            .and_then(|properties| properties.get(crate::css_style::LIST_IMAGE_PROPERTY))
+            .and_then(|value| generated_content_image_prefix(value))
+            .and_then(|(source, _)| self.css_image_dimensions_provider
+                .and_then(|provider| provider(&source)).map(|dimensions| (source, dimensions)))
+            .filter(|(_, (width, height))| *width > 0 && *height > 0);
+        if let Some((source, (width, height))) = loaded_image {
+            style.width = w3cos_std::style::Dimension::Px(width as f32);
+            style.height = w3cos_std::style::Dimension::Px(height as f32);
+            if position.as_deref() != Some("inside") {
+                style.position = w3cos_std::style::Position::Absolute;
+                style.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-outside-list-marker".into(), "image".into());
+                // A zero-advance atomic marker participates in the first
+                // line's ascent. Only its image paints outside the item.
+                // Tall images push content down rather than overflow above
+                // the item, as Blink's UnpositionedListMarker::AddToBox does.
+                let mut strut = style.clone();
+                strut.position = w3cos_std::style::Position::Static;
+                strut.display = w3cos_std::style::Display::InlineBlock;
+                strut.width = w3cos_std::style::Dimension::Px(0.0);
+                strut.custom_properties.as_mut().unwrap()
+                    .remove("--w3cos-internal-outside-list-marker");
+                return Some(w3cos_std::Component::boxed(strut,
+                    vec![w3cos_std::Component::image(source, style)]));
+            } else {
+                style.display = w3cos_std::style::Display::InlineBlock;
+                if style.direction == w3cos_std::style::TextDirection::Rtl {
+                    style.margin.left = w3cos_std::style::Spacing::Px(7.0);
+                } else { style.margin.right = w3cos_std::style::Spacing::Px(7.0); }
+            }
+            return Some(w3cos_std::Component::image(source, style));
+        }
+        // Unavailable/broken images use the authored marker type. A type of
+        // none suppresses only this fallback, not a successfully loaded image.
         let marker = match marker_type.as_deref().unwrap_or("disc") {
             "disc" => "•".to_string(),
             "circle" => "◦".to_string(),
@@ -3335,9 +3396,6 @@ impl Document {
             "none" => return None,
             _ => return None,
         };
-        let mut style = CSSStyleDeclaration::new().to_style();
-        style.display = w3cos_std::style::Display::Inline;
-        inherit_text_style(&mut style, origin_style, "::marker", |_| false);
         if position.as_deref() != Some("inside") {
             let marker_type = marker_type.as_deref().unwrap_or("disc");
             style.position = w3cos_std::style::Position::Absolute;
@@ -14130,6 +14188,58 @@ fn parse_html_dimension_attribute(value: &str) -> Option<w3cos_std::style::Dimen
 #[cfg(test)]
 mod generated_counter_format_tests {
     use super::*;
+
+    #[test]
+    fn loaded_list_image_precedes_none_type_and_unavailable_image_uses_fallback() {
+        fn dimensions(source: &str) -> Option<(u32, u32)> {
+            (source == "loaded.png").then_some((10, 6))
+        }
+        for position in ["outside", "inside"] {
+            let mut document = Document::new();
+            document.set_css_image_dimensions_provider(dimensions);
+            let item = document.create_element("li");
+            item.style_mut(&mut document).set_property("list-style", &format!("none url(loaded.png) {position}"));
+            let principal = document.list_marker_component(item.id, &document.computed_style_for(item.id)).unwrap();
+            let marker = if position == "outside" { &principal.children[0] } else { &principal };
+            assert!(matches!(marker.kind, w3cos_std::ComponentKind::Image { ref src } if src == "loaded.png"));
+            assert_eq!(marker.style.width, w3cos_std::style::Dimension::Px(10.0));
+            assert_eq!(marker.style.height, w3cos_std::style::Dimension::Px(6.0));
+            if position == "inside" {
+                assert_eq!(marker.style.display, w3cos_std::style::Display::InlineBlock);
+                assert_eq!(marker.style.margin.right, w3cos_std::style::Spacing::Px(7.0));
+            } else { assert_eq!(marker.style.position, w3cos_std::style::Position::Absolute); }
+            item.style_mut(&mut document).set_property("list-style-image", "url(unavailable.png)");
+            assert!(document.list_marker_component(item.id, &document.computed_style_for(item.id)).is_none());
+            item.style_mut(&mut document).set_property("list-style", "square url(unavailable.png) outside");
+            let fallback = document.list_marker_component(item.id, &document.computed_style_for(item.id)).unwrap();
+            assert_eq!(fallback.style.custom_properties.as_ref().unwrap()
+                .get("--w3cos-internal-outside-list-marker").map(String::as_str), Some("square"));
+        }
+    }
+
+    #[test]
+    fn list_image_cascade_preserves_url_case_and_resets_shorthand_slots() {
+        let mut document = Document::new();
+        let parent = document.create_element("ul");
+        let item = document.create_element("li");
+        parent.append_child(&mut document, item);
+        parent.style_mut(&mut document).set_property("list-style-image", "url('Diamond.PNG')");
+        let image = |document: &Document| CSSStyleDeclaration::from_style(
+            document.computed_style_for(item.id)).get_property("list-style-image");
+        assert_eq!(image(&document), "url('Diamond.PNG')");
+        item.style_mut(&mut document).set_property("list-style", "none square");
+        assert_eq!(image(&document), "none", "shorthand resets the inherited image");
+        item.style_mut(&mut document).set_property("list-style", "none url('Other.PNG')");
+        assert_eq!(image(&document), "url('Other.PNG')", "type none does not suppress image");
+        item.style_mut(&mut document).set_property("list-style", "none none url(red.png)");
+        assert_eq!(image(&document), "url('Other.PNG')", "invalid shorthand leaves the prior cascade");
+        item.style_mut(&mut document).set_property("list-style-image", "inherit");
+        assert_eq!(image(&document), "url('Diamond.PNG')");
+        item.style_mut(&mut document).set_property("list-style-image", "initial");
+        assert_eq!(image(&document), "none");
+        item.style_mut(&mut document).set_property("list-style-image", "unset");
+        assert_eq!(image(&document), "url('Diamond.PNG')");
+    }
 
     #[test]
     fn list_style_none_has_distinct_type_and_image_slots() {

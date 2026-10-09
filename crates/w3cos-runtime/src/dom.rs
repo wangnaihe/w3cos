@@ -21,6 +21,7 @@ fn new_host_document() -> Document {
     let mut document = Document::new();
     document.set_font_size_minimums(preference("W3COS_MINIMUM_FONT_SIZE"),
         preference("W3COS_MINIMUM_LOGICAL_FONT_SIZE"));
+    document.set_css_image_dimensions_provider(crate::image_loader::dimensions);
     document
 }
 

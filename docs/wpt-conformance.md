@@ -1,5 +1,115 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication candidate: list images and modification elements
+
+User-authorized publication includes the V2919 list-image implementation and
+the V2923 HTML UA correction: ins/del are inline, ins is underlined and del
+has line-through. V2923 passes 24 focused DOM executions; V2924 remeasures
+six browser comparisons with the corrected resource protocol. content-070's
+actual page improves from 6118 pixels to zero; its reference still differs
+by 219 underline-color pixels (native strict 219, browser strict zero).
+Both list image cases remain exact. The viewport-scrollbar case still differs
+by 6193 actual/reference pixels; both CSS1 line-height cases have exact actual
+pages but 11220 reference pixels (native strict 1240, browser strict 12460).
+These remain open, independently recorded, with no reference waiver.
+
+Evidence: `target/wpt-targeted/baseline-font-position-20261003/soft-wrap-units-v2923.json`
+and `modification-ua-browser-v2924/receipt.json` in the same directory.
+The newly captured V2926 text-decoration-color unit RED is retained locally,
+excluded from this publication; its implementation has not started. Production
+source in this candidate matches the V2923 source-diff binding. Current full
+6548 NOT_RUN, global remaining UNKNOWN. Parent source/pin unchanged; Product
+Agent knowledge has no impact because these are generic CSS/HTML corrections.
+Root size check still reports six pre-existing outside-vendor violations.
+
+## 2026-10-09 V2919: list image markers match browser pixels
+
+Host documents now supply a read-only decoded CSS-image dimensions provider
+to marker lowering. Loaded URL images precede the type fallback, including
+type none; unavailable images use the existing authored type. Outside images
+retain intrinsic dimensions and a directional 7px gap. Inside-image spacing
+and unavailable/none fallback have unit coverage, not broad browser acceptance.
+The generic painter renders the image; lowering performs no network request
+or authored DOM mutation.
+
+V2906 is a fixture socket WouldBlock diagnostic, NOT rendering RED. Corrected
+fixture V2907 retains a genuine host-wiring RED: requests and decode succeed
+but two loaded markers lower to zero, with the dimensions bridge uninstalled.
+V2910's first geometry candidate passes list-style-020 but leaves the tall
+cat image with 3411 actual/reference browser pixels. This failed candidate
+is retained. Outside images now have a zero-horizontal-advance atomic strut
+participating in the first line, while their image paints outside the item.
+An inline-block with only out-of-flow/hidden children has an empty atomic
+bottom baseline; that generic line-metrics condition has a focused control.
+This follows Blink's [outside marker alignment](https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/core/layout/list/unpositioned_list_marker.cc)
+and [marker margins](https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/core/layout/list/list_marker.cc),
+with actual pixel acceptance against the matching Chromium oracle.
+
+V2912 passes 29 runtime executions; V2913 passes 62 DOM/parser executions.
+Both module test builds succeed; the final runner build succeeds in 2m45s.
+V2914's six pages are all browser-pixel-exact: list-style-020 actual/reference
+120/120 -> 0/0; list-style-021 2154/2186 -> 0/0 and native/reference 32 -> 0.
+V2917's 143 bidi/first-line/insertion/opacity controls remain browser-exact;
+all browser PNG hashes and comparison counts equal V2897. The six-page window
+still has four independent strict failure rows; the 143-page window retains
+170 strict rows. Overlaps are not added as a global census. No tolerance or
+reference waiver.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/list-image-checkpoint-v2919.json`.
+It binds current source, runner, module gates, genuine REDs, infrastructure
+diagnostic, failed geometry candidate, pixel deltas and independent strict
+failures. Full current6548 NOT_RUN; global remaining UNKNOWN. Held-request
+load blocking, mutation/cancellation, broader inside/SVG/generated image
+marker parity and unsupported shorthand grammar remain open. Next remeasure
+the historical browser-gap queue beyond the now-cleared list image cases.
+No commit/push or parent source/pin change. Same six outside-vendor size
+violations, no baseline increase. Product Agent knowledge unaffected:
+generic CSS/image/inline geometry only, no business or authority contract change.
+
+## 2026-10-09 V2905: list image CSS subresource requests (partial)
+
+V2903 retains the next genuine RED: external CSS correctly resolves and
+inherits the case-sensitive list image URL, but the HTTP fixture sees only
+the document and stylesheet requests; the shared decoded cache stays empty.
+The CSS image collector now includes computed list-style-image alongside
+background-image, using the existing source set, policy, request queue,
+cancellation and decode lifecycle. No independent image loader was created.
+
+V2904 passes 27 focused runtime executions. Two inherited li markers share
+one request to the stylesheet-relative image and a decoded 3x2 cache entry.
+Existing external background, generated-content image, outside list symbol
+and inline strut controls pass. Runtime test compilation succeeds. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/list-image-resource-checkpoint-v2905.json`.
+Held-request load blocking, mutation/cancellation acceptance and pending/broken
+render fallback still need dedicated tests. Marker component lowering,
+intrinsic dimensions, baseline and browser pixel acceptance remain open.
+Previous strict-reference failures remain independently retained; current
+source browser comparison and full6548 NOT_RUN, global remaining UNKNOWN.
+No commit/push, parent source/pin or Product Agent knowledge change.
+
+## 2026-10-09 V2902: list image computed cascade (partial)
+
+V2900 retains a genuine DOM RED: an li inheriting its parent's
+`url('Diamond.PNG')` returns an empty computed list-style-image. The parser
+recognized URL shorthand tokens but discarded their image slot. That slot
+now preserves source case, resets to none on a valid image-free shorthand,
+and does not replace the previous declaration on invalid three-slot input.
+The ordinary computed cascade retains inherited list-style-image and resolves
+inherit/unset to the parent value and initial to none. The computed accessor
+is available to the existing resource consumer; no separate ancestor cascade
+has been added for images. The shorthand's existing type/position API remains.
+
+V2901 passes 61 focused DOM/parser executions, including the new inherited
+URL, shorthand reset, invalid declaration and CSS-wide reset regression.
+DOM test compilation succeeds. Receipt:
+`target/wpt-targeted/baseline-font-position-20261003/list-image-cascade-checkpoint-v2902.json`.
+This is NOT pixel acceptance: resource lifecycle, loaded intrinsic sizing,
+baseline, pending/broken fallback and marker painting remain open. The prior
+V2899 browser/strict receipts are retained but are not current-source proof.
+Full current6548 NOT_RUN; global remaining UNKNOWN. No reference waiver,
+commit/push or parent source/pin change. Generic CSS only; no Product Agent
+knowledge or business contract impact.
+
 ## 2026-10-09 V2899: padded middle text and outside symbol positioning
 
 V2881 native layout and V2882 matching Chromium oracle Ranges bind the original

@@ -105,7 +105,9 @@ impl Line {
         // An empty inline-block has no in-flow line baseline. Its margin
         // box participates just like a replaced atomic box, including when
         // top/bottom alignment leaves the surrounding text strut unchanged.
-        let empty_atomic = component.children.is_empty()
+        let empty_atomic = component.children.iter().all(|child|
+            child.style.display == Display::None
+                || matches!(child.style.position, Position::Absolute | Position::Fixed))
             && matches!(component.kind, ComponentKind::Row | ComponentKind::Box)
             && style.display == Display::InlineBlock;
         let table = style.display == Display::InlineTable;
@@ -571,6 +573,30 @@ pub(crate) fn is_projected(component: &Component, index: usize, layouts: &[(Layo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_flow_children_keep_empty_atomic_bottom_baseline() {
+        let parent = Style { display: Display::Block, font_family: Some("Ahem".into()),
+            font_size: 20.0, line_height: 1.0, line_height_is_normal: false,
+            ..Style::default() };
+        let tree = Component::row(parent.clone(), vec![
+            Component::boxed(Style { display: Display::InlineBlock,
+                width: Dimension::Px(0.0), height: Dimension::Px(100.0), ..parent.clone() },
+                vec![Component::image("marker.png", Style { position: Position::Absolute,
+                    width: Dimension::Px(100.0), height: Dimension::Px(100.0), ..parent.clone() })]),
+            Component::text("X", Style { display: Display::Inline, ..parent }),
+        ]);
+        let mut layouts = vec![
+            (LayoutRect { x: 0.0, y: 0.0, width: 120.0, height: 104.0 }, 0),
+            (LayoutRect { x: 0.0, y: 0.0, width: 0.0, height: 100.0 }, 1),
+            (LayoutRect { x: -107.0, y: 0.0, width: 100.0, height: 100.0 }, 2),
+            (LayoutRect { x: 0.0, y: 84.0, width: 20.0, height: 20.0 }, 3),
+        ];
+        assert!(project(&tree, 0, &mut layouts, &HashMap::from([(0,0),(1,1),(2,2),(3,3)])));
+        assert_eq!(layouts[0].0.height, 104.0);
+        assert_eq!(layouts[3].0.y, 84.0);
+        assert_eq!(layouts[2].0.x, -107.0);
+    }
 
     #[test]
     fn horizontal_inline_padding_keeps_middle_on_the_parent_strut() {

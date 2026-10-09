@@ -73,7 +73,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
     style.display = match local_name {
         "base" | "head" | "link" | "meta" | "noembed" | "noframes" | "param" | "script"
         | "style" | "template" | "title" => Display::None,
-        "a" | "abbr" | "b" | "bdi" | "bdo" | "br" | "code" | "em" | "i" | "iframe" | "label" | "object"
+        "a" | "abbr" | "b" | "bdi" | "bdo" | "br" | "code" | "del" | "em" | "i" | "iframe" | "ins" | "label" | "object"
         | "small" | "span" | "strong" | "u" => Display::Inline,
         "button" | "canvas" | "img" | "input" | "select" | "svg" | "textarea" | "video" => {
             Display::InlineBlock
@@ -198,7 +198,8 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         }
         "b" | "strong" => style.font_weight = 700,
         "em" | "i" => style.font_style = FontStyle::Italic,
-        "u" => style.text_decoration = w3cos_std::style::TextDecoration::Underline,
+        "ins" | "u" => style.text_decoration = w3cos_std::style::TextDecoration::Underline,
+        "del" => style.text_decoration = w3cos_std::style::TextDecoration::LineThrough,
         _ => {}
     }
 }
@@ -215,6 +216,16 @@ pub fn html_default_style(local_name: &str) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modification_elements_are_inline_with_ua_text_decoration() {
+        for (tag, decoration) in [("ins", w3cos_std::style::TextDecoration::Underline),
+            ("del", w3cos_std::style::TextDecoration::LineThrough)] {
+            let style = html_default_style(tag);
+            assert_eq!(style.display, Display::Inline, "{tag} must not create a block box");
+            assert_eq!(style.text_decoration, decoration, "{tag} UA decoration");
+        }
+    }
 
     #[test]
     fn initial_document_font_is_distinct_from_explicit_serif() {

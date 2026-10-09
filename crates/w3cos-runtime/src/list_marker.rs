@@ -96,6 +96,14 @@ pub(crate) fn project(layouts: &mut [(LayoutRect, usize)], flat: &[FlatNodeInfo<
         } else if kind == "decimal" {
             used.x = if item.style.direction == TextDirection::Ltr { start - used.width } else { end };
             used.y = baseline - inline_font_content_ascent(marker.style);
+        } else if kind == "image" {
+            // Blink ListMarker::InlineMarginsForOutside gives images a 7px
+            // inline-end gap. Replaced image content exports its bottom edge
+            // as the baseline instead of a text ascent.
+            used.x = if item.style.direction == TextDirection::Ltr {
+                start - used.width - 7.0
+            } else { end + 7.0 };
+            used.y = baseline - used.height;
         } else { continue; }
         layouts[position].0 = used;
     }
@@ -105,6 +113,35 @@ pub(crate) fn project(layouts: &mut [(LayoutRect, usize)], flat: &[FlatNodeInfo<
 mod tests {
     use super::*;
     use crate::layout::{compute, pre_flatten};
+
+    #[test]
+    fn outside_image_uses_replaced_baseline_and_directional_seven_pixel_gap() {
+        for direction in [TextDirection::Ltr, TextDirection::Rtl] {
+            let item = Style { font_family: Some("Ahem".into()), font_size: 20.0,
+                line_height: 1.0, direction,
+                custom_properties: Some(HashMap::from([("--w3cos-internal-list-item".into(), "1".into())])),
+                ..Style::default() };
+            let mut image = item.clone();
+            image.position = Position::Absolute;
+            image.custom_properties.as_mut().unwrap()
+                .insert("--w3cos-internal-outside-list-marker".into(), "image".into());
+            let tree = w3cos_std::Component::row(item.clone(), vec![
+                w3cos_std::Component::image("image.png", image),
+                w3cos_std::Component::text("X", item),
+            ]);
+            let mut layouts = vec![
+                (LayoutRect { x: 100.0, y: 40.0, width: 80.0, height: 20.0 }, 0),
+                (LayoutRect { x: 0.0, y: 0.0, width: 3.0, height: 2.0 }, 1),
+                (LayoutRect { x: 100.0, y: 40.0, width: 20.0, height: 20.0 }, 2),
+            ];
+            project(&mut layouts, &pre_flatten(&tree));
+            assert_eq!(layouts[1].0, LayoutRect {
+                x: if direction == TextDirection::Ltr { 90.0 } else { 187.0 },
+                y: 54.0, width: 3.0, height: 2.0,
+            });
+            assert_eq!(layouts[2].0.x, 100.0, "outside image must not indent text");
+        }
+    }
 
     #[test]
     fn outside_symbol_uses_item_border_edge_and_not_middle_text_baseline() {
