@@ -410,7 +410,8 @@ pub(crate) fn resolve_float_text_layouts(
             + parent_style
                 .border_top_width
                 .unwrap_or(parent_style.border_width);
-        let line_height = crate::layout::inline_style_line_height(&style);
+        let (line_height, baseline) =
+            crate::inline_line_metrics::baseline_text_metrics(parent_style, style);
         if line_height <= 0.0 {
             continue;
         }
@@ -426,7 +427,7 @@ pub(crate) fn resolve_float_text_layouts(
                 + if caption_line {
                     0.0
                 } else {
-                    (line_height - inline_font_height(style)) * 0.5
+                    baseline - inline_font_content_ascent(style)
                 },
             width: (parent_rect.width - left - right).max(0.0),
             height: inline_font_height(style),
@@ -434,8 +435,16 @@ pub(crate) fn resolve_float_text_layouts(
         let exclusions: Vec<_> = children
             .iter()
             .filter(|(_, (_, style, _))| style.float != WFloat::None)
-            .filter_map(|(index, (_, style, _))| {
-                let rect = rects.get(*index).copied().flatten()?;
+            .filter_map(|(index, (kind, style, _))| {
+                let mut rect = rects.get(*index).copied().flatten()?;
+                // A floated text leaf retains its font box for paint. Float
+                // exclusion belongs to its principal line box, not glyph ink
+                // extending above/below that box under negative leading.
+                if matches!(kind, ComponentKind::Text { .. }) && style.display == WDisplay::Inline {
+                    let height = inline_used_line_height(inline_style_line_height(style));
+                    rect.y -= inline_upper_leading(height, inline_font_height(style));
+                    rect.height = height;
+                }
                 let relative = relative_offsets[*index];
                 let ml = spacing(style.margin.left, &style);
                 let mr = spacing(style.margin.right, &style);
@@ -456,16 +465,21 @@ pub(crate) fn resolve_float_text_layouts(
             .iter()
             .map(|exclusion| exclusion.margin_box.y + exclusion.margin_box.height)
             .fold(content.y, f32::max);
-        let count = (((bottom - content.y) / line_height).ceil().max(1.0) as usize)
+        let line_top = parent_rect.y + top;
+        let count = (((bottom - line_top) / line_height).ceil().max(1.0) as usize)
             .min(text.chars().count() + 1);
         let mut bands: Vec<_> = (0..count)
             .map(|index| {
-                float_line_band(
+                let mut band = float_line_band(
                     content,
-                    content.y + index as f32 * line_height,
+                    line_top + index as f32 * line_height,
                     line_height,
                     &exclusions,
-                )
+                );
+                // Exclude against the logical line extent, but retain the
+                // text font-box origin consumed by layout and glyph paint.
+                band.y = content.y + index as f32 * line_height;
+                band
             })
             .collect();
         let rtl = style.direction == w3cos_std::style::TextDirection::Rtl;
@@ -2506,7 +2520,16 @@ fn auto_table_track_widths(component: &Component, percentage_basis: Option<f32>)
             // passing an unconstrained max-content track into a narrow table.
             let preferred = tracks.iter().map(|width| width.max(0.0)).sum::<f32>()
                 + spacing * (tracks.len() + 1) as f32;
-            Some(available_grid.min(preferred))
+            // CAPMIN constrains the used grid as well as its wrapper. When
+            // a caption is wider than the cells, distribute that surplus
+            // through the ordinary column allocator below. The caption's
+            // outer width includes edges that belong outside the grid.
+            let caption_minimum = component.children.iter()
+                .filter(|child| child.style.display == WDisplay::TableCaption
+                    && !matches!(child.style.position, WPos::Absolute | WPos::Fixed))
+                .map(component_min_content_width).fold(0.0_f32, f32::max);
+            let caption_grid = (caption_minimum - inner_edges).max(0.0);
+            Some(available_grid.min(preferred.max(caption_grid)).max(caption_grid))
         })
     else {
         return tracks;
@@ -40051,6 +40074,77 @@ mod tests {
             assert_eq!(at(row_index + 3).height, 59.0,
                 "settled row must still stretch its shorter cell: grouped={grouped}, layouts={layouts:?}");
             assert_eq!(at(row_index + 4).y, 0.0, "stretching the cell does not move its text");
+        }
+    }
+
+    #[test]
+    fn floated_first_letter_keeps_wrapped_text_on_parent_strut() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::xml_tree_builder::StreamingXmlDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        crate::jsdom::set_viewport(800.0, 600.0);
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            Rc::new(InertParserScriptHost), "https://example.test/first-letter.xht");
+        parser.write("<html xmlns='http://www.w3.org/1999/xhtml'><head></head><body>\
+            <div>T<span>his is text in a div.  Text in a div.  Text in a div.  Text in a div.  Text in a div.  Text in a div.  Text in a div.  Text in a div.</span></div>\
+            </body></html>").unwrap();
+        parser.finish().unwrap();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule("div", &[("float", "left"),
+            ("overflow", "scroll"), ("font-size", "50px"), ("width", "3em"),
+            ("line-height", "10px")]);
+        w3cos_dom::stylesheet::register_rule("div::first-letter", &[("float", "inherit")]);
+        w3cos_dom::stylesheet::register_rule("span", &[("font-size", "10px")]);
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let block_index = flat.iter().position(|node| node.style.float == WFloat::Left
+            && !matches!(node.kind, ComponentKind::Text { .. })).unwrap();
+        let text_index = flat.iter().position(|node| matches!(node.kind,
+            ComponentKind::Text { content } if content.starts_with("his is"))).unwrap();
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index: usize| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(rect(block_index).height, 96.0,
+            "four shared 24px lines, not four child-only 10px lines: {layout:?}");
+        assert_eq!(rect(text_index).y, 20.0, "shared parent baseline: {layout:?}");
+        assert_eq!(rect(text_index).width, 150.0, "float line bands own wrapping width");
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn auto_table_caption_minimum_expands_the_column_grid() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for bottom in [false, true] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/caption-grid.html",
+            ).unwrap();
+            parser.write(&format!("<!doctype html><body style='margin:0'><table style='border-spacing:0'>\
+                <caption style='width:190px;height:30px;padding:0;caption-side:{}'>Caption</caption>\
+                <tbody><tr><td style='padding:0'><div style='width:100px;height:30px'>Cell</div>\
+                </td></tr></tbody></table></body>", if bottom { "bottom" } else { "top" })).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let table_index = flat.iter().position(|node| node.style.display == WDisp::Table).unwrap();
+            let cell_index = flat.iter().position(|node| node.style.display == WDisp::TableCell).unwrap();
+            let caption_index = flat.iter().position(|node| node.style.display == WDisp::TableCaption).unwrap();
+            for layout in [compute(&root, 800.0, 600.0).unwrap(),
+                LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+                let rect = |index: usize| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                assert_eq!(rect(table_index).width, 190.0);
+                assert_eq!(rect(cell_index).width, 190.0,
+                    "caption minimum must expand the grid, not only the wrapper: {layout:?}");
+                assert_eq!(rect(caption_index).width, 190.0);
+                assert_eq!(rect(table_index).height, 60.0);
+                assert_eq!(rect(cell_index).y, if bottom { 0.0 } else { 30.0 });
+            }
         }
     }
 

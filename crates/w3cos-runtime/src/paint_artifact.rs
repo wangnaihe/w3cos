@@ -1924,7 +1924,10 @@ impl PaintArtifact {
                 WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
             ) && content.contains(['\n', '\r']));
         let has_preserved_tab = node.style.white_space == WhiteSpace::Pre && content.contains('\t');
-        if node.style.display != Display::Inline || !(has_preserved_break || has_preserved_tab) {
+        let has_float_lines = node.style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-float-line-bands"));
+        if node.style.display != Display::Inline
+            || !(has_preserved_break || has_preserved_tab || has_float_lines) {
             return None;
         }
         let mut owner = index;
@@ -2861,6 +2864,32 @@ fn establishes_stacking_context(node: &PaintNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_line_bands_export_shared_advance_without_preserved_breaks() {
+        let parent = Style { display: Display::Block, font_size: 50.0,
+            line_height: 0.2, line_height_is_normal: false,
+            custom_properties: Some(std::collections::HashMap::from([
+                (w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(), "1".into())])),
+            ..Style::default() };
+        let text = Style { display: Display::Inline, font_size: 10.0,
+            line_height: 1.0, ..parent.clone() };
+        let nodes = [
+            PaintNode { kind: ComponentKind::Row, style: parent, parent: None, sticky_counter_signal: None },
+            PaintNode { kind: ComponentKind::Text { content: "wrapped text without BR".into() },
+                style: text, parent: Some(0), sticky_counter_signal: None },
+        ];
+        let mut artifact = PaintArtifact::build(nodes, &[
+            (LayoutRect { x: 8.0, y: 8.0, width: 150.0, height: 96.0 }, 0),
+            (LayoutRect { x: 8.0, y: 20.0, width: 150.0, height: 14.0 }, 1),
+        ], 1);
+        // The flow generator and prepaint attach this retained line geometry;
+        // its consumer must not require an authored BR or preserved tab.
+        artifact.nodes[1].style.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-float-line-bands".into(), "30.953125 0 119.046875".into());
+        let context = artifact.inline_line_context(1).expect("float lines need shared metrics");
+        assert_eq!(context.line_advance, Some(24.0));
+    }
 
     #[test]
     fn inline_line_context_resets_only_after_a_rewound_later_line() {

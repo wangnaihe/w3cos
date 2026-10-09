@@ -6172,6 +6172,12 @@ impl Document {
                         line_style.line_height = style.line_height;
                         line_style.line_height_is_normal = style.line_height_is_normal;
                         line_style.line_height_computed_px = style.line_height_computed_px;
+                        // This row is an anonymous CSS line, not an authored
+                        // flex container. Retain font provenance so its strut
+                        // uses the same face as the originating floated block.
+                        line_style.custom_properties = style.custom_properties.clone();
+                        line_style.custom_properties.get_or_insert_with(Default::default)
+                            .insert("--w3cos-internal-inline-formatting-context".into(), "1".into());
                         children = vec![w3cos_std::Component::row(line_style, children)];
                     } else {
                         anonymous_inline_formatting_context |= children

@@ -1,5 +1,71 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication candidate: caption grid and floated first-letter struts
+
+User-authorized publication contains the caption allocation repair below and
+the floated first-letter repair. The anonymous first-letter row retains its
+inline-formatting context and font provenance. Float exclusions use the
+principal line box, shared parent/child metrics place the text, and retained
+float line bands export shared line advance to paint without requiring BR/tab.
+No upstream WPT, comparison tolerance or strict acceptance policy changes.
+
+Original first-letter-inherit-001 actual/reference native/browser gaps are
+2314 each (V3155). The intermediate layout-only candidate worsens both to2751
+(V3163) and is retained as rejected evidence. V3173 preserves genuine consumer
+RED; V3174 passes83 focused executions. Current V3175 clears both gaps to0,
+with native/browser strict0. Its twelve-page scope is11 browser-exact, with
+float-nowrap-3-ref reference4390 unchanged (actual0, native strict4734,
+browser strict2862). V3177 primary6/6 and V3179 controls16/16 remain exact.
+V3184 additionally keeps the complete BFC004-007 family4/4 browser-exact;
+BFC006 native/reference and browser/reference strict5460 each remain separate.
+All captures have no script errors or unverified comparisons.
+
+The source/binary-bound V3181 checkpoint retains18 independent strict failure
+rows across the34-page primary scope and preserves all RED/intermediate evidence:
+`target/wpt-targeted/baseline-font-position-20261003/first-letter-checkpoint-v3181.json`.
+Expanded checks V3182/V3183 retain four runtime and two DOM unit failures;
+their baseline/new-regression classification is still open. They are not waived
+or promoted as module PASS. The BFC family has its separate V3185 scope receipt.
+Full current6548 NOT_RUN; global remaining UNKNOWN. This is a focused progress
+publication, not full closure. Only four vendor files are included; the parent
+submodule pin is unchanged. Generic engine behavior has no Product Agent
+knowledge/authority impact. Root size gate retains six outside-vendor violations
+without baseline increase. Next entries are open-unit classification and the
+unchanged float-nowrap reference browser gap.
+
+## 2026-10-09 caption column allocation: BFC006 browser gap cleared locally
+
+V3141/V3142 compare the original fixed-revision native/browser geometry:
+float avoidance and table wrapper positions agree, but a wider caption leaves
+native cell tracks100px while Chrome expands them to190/192px. V3143 preserves
+genuine RED with a parsed top/bottom-caption fixture (wrapper190, cell100).
+The auto-table width budget now includes CAPMIN after removing non-grid edges,
+and ordinary surplus allocation expands the columns rather than paint boxes.
+V3144 passes80 related executions, including17 caption tests and both direct
+and retained-engine layout paths for the new fixture. Unit build takes30.62s;
+runner rebuild takes3m00s. No upstream WPT or comparison tolerance change.
+
+V3145 clears floats-wrap-bfc-006 actual native/browser5460 ->0; its reference
+comparison remains0. Native strict0 ->5460 now equals browser strict5460, which
+is explicitly retained, not waived. The12 targets,6 primary pages (V3147) and
+16 controls (V3149) are all browser-exact with no script errors or unverified
+comparisons. V3151 binds RED, diagnostics,80 units and before/after pixels in
+`target/wpt-targeted/baseline-font-position-20261003/bfc-caption-checkpoint-v3151.json`;
+all18 independent strict failure rows remain. V3152/V3153 additionally capture
+the complete four-case floats-wrap-bfc004-007 family:4/4 browser-exact, with
+BFC006 native/browser strict5460 each retained independently.
+
+V3154's historical selection index is not a current failure census. V3155
+freshly remeasures its next12 targets on this candidate:10 browser-exact and
+2 real gaps, first-letter-inherit-001 actual/reference2314 each and
+float-nowrap-3-ref reference4390 (actual0). The separate strict failures are
+retained in historical-next-scope-v3156.json. These are the next repair entries;
+the ten historical targets now exact are remeasurements, not ten new repairs.
+Full current6548 NOT_RUN; global remaining UNKNOWN. This caption allocation
+repair is uncommitted/unpushed; parent pin unchanged. Generic engine behavior
+has no Product Agent knowledge/authority impact. Root size gate retains the
+same six outside-vendor violations without baseline increase.
+
 ## 2026-10-09 publication candidate: wrapped images and nested-list UA margins
 
 User-authorized publication includes the wrapped-image repair and browser-grounded
