@@ -427,6 +427,36 @@ pub(crate) fn resolved_text_font_geometry(text: &str, style: &Style) -> Option<R
     }))
 }
 
+/// CSS middle alignment uses the parent's concrete x-height, not half an em.
+/// Resolve the same primary face and weight as its strut/glyph painter.
+pub(crate) fn resolved_font_x_height(style: &Style) -> Option<f32> {
+    if !style.font_size.is_finite() || style.font_size <= 0.0 { return None; }
+    let registered = registered_typeface(style);
+    if registered.is_none() && style_uses_ahem(style) { return Some(style.font_size * 0.8); }
+    let generic = generic_serif_typeface(style);
+    let face = registered.as_ref().map(|(_, face)| face).or(generic.as_ref())?;
+    let face = if registered.is_none() {
+        typeface_for_character(face, 'x', style.font_weight)
+    } else { face.clone() };
+    let font = crate::skia_text_run::css_font(&face, style.font_size);
+    let (_, metrics) = font.metrics();
+    let mut height = metrics.x_height;
+    #[cfg(target_os = "macos")]
+    {
+        // Blink SimpleFontData::PlatformInit uses only x's ink above the
+        // baseline on Apple platforms. CoreText's raw x-height includes
+        // below-baseline ink and is not the CSS ex/middle metric.
+        let glyph = face.unichar_to_glyph('x' as i32);
+        if glyph != 0 {
+            if let Some(bounds) = crate::skia_text_run::geometric_ink_bounds(
+                &font, &[glyph], &[skia_safe::Point::new(0.0, 0.0)]) {
+                height = -bounds.top;
+            }
+        }
+    }
+    (height.is_finite() && height > 0.0).then_some(height)
+}
+
 pub(crate) struct ReplayFrame<'a> {
     pub nodes: &'a [(usize, LayoutRect, &'a ComponentKind, &'a Style)],
     pub metrics_font: &'a fontdue::Font,

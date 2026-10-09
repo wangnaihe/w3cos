@@ -2,7 +2,8 @@
 use std::collections::HashMap;
 use w3cos_std::{ComponentKind, Style};
 use w3cos_std::style::{Display, Float, Position, TextDirection};
-use crate::layout::{FlatNodeInfo, LayoutRect, inline_font_content_ascent, inline_font_height};
+use crate::layout::{FlatNodeInfo, LayoutRect, inline_font_content_ascent, inline_font_height,
+    inline_style_alignment_keyword, inline_style_baseline_offset};
 
 fn property<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style.custom_properties.as_ref()?.get(key).map(String::as_str)
@@ -63,18 +64,19 @@ pub(crate) fn project(layouts: &mut [(LayoutRect, usize)], flat: &[FlatNodeInfo<
         let ascent = inline_font_content_ascent(marker.style).round().max(0.0) as i32;
         let baseline = (owner + 1..flat.len()).filter(|child|
             matches!(flat[*child].kind, ComponentKind::Text { content } if !content.is_empty())
-                && in_flow_descendant(flat, *child, owner))
+                && in_flow_descendant(flat, *child, owner)
+                && inline_style_alignment_keyword(flat[*child].style) == "baseline")
             .find_map(|child| positions.get(&child).map(|position|
-                layouts[*position].0.y + inline_font_content_ascent(flat[child].style)))
+                layouts[*position].0.y + inline_font_content_ascent(flat[child].style)
+                    + inline_style_baseline_offset(flat[child].style)))
             .unwrap_or_else(|| rect.y + item.style.padding_lengths().top
                 + item.style.border_top_width.unwrap_or(item.style.border_width)
                 + (item.style.font_size * item.style.line_height - inline_font_height(item.style)) * 0.5
                 + inline_font_content_ascent(item.style));
-        // Blink's outside marker anchors at the list item's edge, not the
-        // indented/padded content origin. Padding moves words, not the marker.
-        let start = rect.x + item.style.border_left_width.unwrap_or(item.style.border_width);
-        let end = rect.x + rect.width
-            - item.style.border_right_width.unwrap_or(item.style.border_width);
+        // Outside markers anchor at the list item's border edge. Borders,
+        // padding and indentation move content, not that outside edge.
+        let start = rect.x;
+        let end = rect.x + rect.width;
         let mut used = layouts[position].0;
         if matches!(kind, "disc" | "circle" | "square") {
             // Blink141 ListMarker::RelativeSymbolMarkerRect and outside margins:
@@ -103,6 +105,37 @@ pub(crate) fn project(layouts: &mut [(LayoutRect, usize)], flat: &[FlatNodeInfo<
 mod tests {
     use super::*;
     use crate::layout::{compute, pre_flatten};
+
+    #[test]
+    fn outside_symbol_uses_item_border_edge_and_not_middle_text_baseline() {
+        let mut item_style = w3cos_dom::user_agent::html_default_style("html");
+        item_style.font_size = 24.0;
+        item_style.line_height = 1.375;
+        item_style.border_left_width = Some(1.0);
+        item_style.custom_properties.as_mut().unwrap()
+            .insert("--w3cos-internal-list-item".into(), "1".into());
+        let mut symbol_style = item_style.clone();
+        symbol_style.position = Position::Absolute;
+        symbol_style.custom_properties.as_mut().unwrap()
+            .insert("--w3cos-internal-outside-list-marker".into(), "square".into());
+        let text_style = Style { display: Display::Inline, font_size: 16.08,
+            line_height: 22.0 / 16.08,
+            align_self: w3cos_std::style::AlignSelf::Center, ..item_style.clone() };
+        let root = w3cos_std::Component::row(item_style, vec![
+            w3cos_std::Component::row(symbol_style, vec![]),
+            w3cos_std::Component::text("blue square", text_style),
+        ]);
+        let flat = pre_flatten(&root);
+        let mut layouts = vec![
+            (LayoutRect { x: 104.0, y: 129.59375, width: 688.0, height: 33.0 }, 0),
+            (LayoutRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1),
+            (LayoutRect { x: 105.0, y: 137.390625, width: 90.03125, height: 22.0 }, 2),
+        ];
+        project(&mut layouts, &flat);
+        #[cfg(all(feature = "skia", target_os = "macos"))]
+        assert_eq!(layouts[1].0, LayoutRect { x: 81.0, y: 143.0, width: 8.0, height: 8.0 },
+            "V2891 browser marker: a middle-aligned child's baseline is not the list line's baseline");
+    }
 
     #[test]
     fn outside_marker_follows_single_word_first_line_indent() {

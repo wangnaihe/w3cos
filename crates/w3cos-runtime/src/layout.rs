@@ -14151,17 +14151,25 @@ fn image_text_line_packets<'a>(
 }
 
 pub(crate) fn inline_leaf_alignment_keyword(component: &Component) -> &str {
-    component.style.custom_properties.as_ref()
+    inline_style_alignment_keyword(&component.style)
+}
+
+pub(crate) fn inline_style_alignment_keyword(style: &w3cos_std::style::Style) -> &str {
+    style.custom_properties.as_ref()
         .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
         .map(String::as_str)
-        .unwrap_or(match component.style.align_self {
+        .unwrap_or(match style.align_self {
             WAlignSelf::FlexStart => "top", WAlignSelf::FlexEnd => "bottom",
             WAlignSelf::Center => "middle", _ => "baseline",
         })
 }
 
 pub(crate) fn inline_leaf_baseline_offset(component: &Component) -> f32 {
-    component.style.custom_properties.as_ref()
+    inline_style_baseline_offset(&component.style)
+}
+
+pub(crate) fn inline_style_baseline_offset(style: &w3cos_std::style::Style) -> f32 {
+    style.custom_properties.as_ref()
         .and_then(|properties| properties.get("--w3cos-internal-vertical-align-length"))
         .and_then(|value| value.split_ascii_whitespace().next())
         .and_then(|value| value.parse::<f32>().ok()).unwrap_or(0.0)

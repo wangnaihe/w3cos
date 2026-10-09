@@ -1,5 +1,44 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 V2899: padded middle text and outside symbol positioning
+
+V2881 native layout and V2882 matching Chromium oracle Ranges bind the original
+list-style-020 discrepancy: the padded span starts at y54 instead of y61.796875.
+Single-line collection rejected horizontal text padding and out-of-flow markers.
+Those markers now stay outside line metrics; horizontal text padding retains
+its measured width without disabling the parent's strut. Middle uses the
+concrete primary face's x ink above the baseline on macOS, following Blink
+SimpleFontData::PlatformInit, and converts the half-x-height at the LayoutUnit
+boundary. Registered faces, HTML font context and deterministic Ahem remain
+distinct. V2883's out-of-flow test is RED; its initial text fixture had a
+different font context and is diagnostic, not the original text RED. Corrected
+HTML-context coordinate RED V2887 remains retained; V2889 passes both controls.
+
+V2891 original-page gaps fall 7787->206 on actual and reference. V2893 retains
+the next genuine symbol RED: (82,142) instead of Chromium's (81,143). Outside
+symbols now anchor at the item's border edge and do not mistake a middle
+text run's baseline for its containing line baseline. Shared style alignment
+helpers retain the existing leaf API. V2894 executes 71 related runtime tests,
+all pass. The final runner build succeeds in 2m55s.
+
+V2895 original-page gaps are now 120/120: only the two missing image markers
+remain; text and blue symbols match browser pixels. list-style-021 retains
+2154/2186 browser pixels and 32 native/reference pixels. The six-case window
+is still 4 exact/2 gaps. V2897's 143 bidi/first-line/insertion/opacity controls
+remain browser-exact; all browser actual/reference PNG hashes and comparison
+counts equal V2857. Its 170 independent strict failure rows remain FAILED.
+The six-case window separately retains five strict failure rows; overlapping
+paths are not counted as a global census. No tolerance or reference waiver.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/list-middle-checkpoint-v2899.json`.
+It binds source/runner, genuine REDs, diagnostics, gates and per-case deltas.
+Next implement list-style-image cascade, resource lifecycle and image-marker
+geometry. Full current6548 NOT_RUN; global remaining UNKNOWN. Existing DOM
+first-line and authored LS limitations remain open. This batch is local and
+unpublished; parent source/pin untouched. Same six outside-vendor size
+violations, no baseline increase. Product Agent knowledge unaffected:
+generic CSS inline geometry only, no business semantics or contracts change.
+
 ## 2026-10-09 Publication: bidi whitespace, resource protocol and list parsing
 
 Publishes the locally verified bidi whitespace ownership and WPT sidecar MIME

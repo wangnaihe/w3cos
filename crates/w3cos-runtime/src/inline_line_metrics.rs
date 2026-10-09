@@ -53,6 +53,9 @@ impl Line {
     fn collect(&mut self, component: &Component, index: usize, parent: &Style,
         shift: f32, relative_y: f32, layouts: &[(LayoutRect, usize)], positions: &HashMap<usize, usize>) -> Option<()> {
         let style = &component.style;
+        // Positioned descendants (including outside markers) are not line
+        // participants. Their own positioning pass retains their geometry.
+        if matches!(style.position, Position::Absolute | Position::Fixed) { return Some(()); }
         if !matches!(style.position, Position::Static | Position::Relative) || style.float != Float::None
             || style.direction != TextDirection::Ltr { return None; }
         // Relative positioning displaces paint, not the line's ascent or
@@ -123,7 +126,7 @@ impl Line {
         if !text && !atomic_box && !container { return None; }
         if !atomic_box && ((!atomic_text && style.display != Display::Inline)
             || (!container && (padding.top != 0.0 || padding.bottom != 0.0))
-            || padding.left != 0.0 || padding.right != 0.0
+            || (!text && (padding.left != 0.0 || padding.right != 0.0))
             || style.border_width != 0.0
             || [style.border_top_width, style.border_bottom_width, style.border_left_width,
                 style.border_right_width].into_iter().flatten().any(|v| v != 0.0)
@@ -167,14 +170,18 @@ impl Line {
         } else { height };
         let parent_ascent = inline_font_content_ascent(parent);
         let parent_descent = inline_font_height(parent) - parent_ascent;
-        let x_height = parent.font_size * if parent.font_family.as_deref().is_some_and(|family|
+        let estimated_x_height = parent.font_size * if parent.font_family.as_deref().is_some_and(|family|
             family.split(',').any(|name| name.trim().trim_matches(['\'', '"']).eq_ignore_ascii_case("ahem")))
             { 0.8 } else { 0.5 };
+        #[cfg(feature = "skia")]
+        let x_height = crate::render_skia::resolved_font_x_height(parent).unwrap_or(estimated_x_height);
+        #[cfg(not(feature = "skia"))]
+        let x_height = estimated_x_height;
         let (top, edge) = match keyword {
             "top" => (0.0, 1), "bottom" => (0.0, 2),
             "text-top" => (-parent_ascent - shift, 0),
             "text-bottom" => (parent_descent - height - shift, 0),
-            "middle" => (-x_height * 0.5 - height * 0.5 - shift, 0),
+            "middle" => (-inline_used_line_height(x_height * 0.5) - height * 0.5 - shift, 0),
             "baseline" => (if atomic_box { -atomic_baseline - total_shift }
                 else { -text_baseline - total_shift }, 0),
             _ => return None,
@@ -564,6 +571,56 @@ pub(crate) fn is_projected(component: &Component, index: usize, layouts: &[(Layo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_inline_padding_keeps_middle_on_the_parent_strut() {
+        let parent = Style { display: Display::Block,
+            font_size: 24.0, line_height: 1.375, line_height_is_normal: true,
+            custom_properties: Some(HashMap::from([
+                (w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(), "1".into()),
+            ])),
+            ..Style::default() };
+        let child = Style { display: Display::Inline, font_size: 16.08,
+            line_height: 22.0 / 16.08, align_self: w3cos_std::style::AlignSelf::Center,
+            padding: w3cos_std::style::Edges { left: w3cos_std::style::Spacing::Px(3.216),
+                ..w3cos_std::style::Edges::ZERO }, ..parent.clone() };
+        let root = Component::row(parent, vec![Component::text("(nothing)", child)]);
+        let mut layouts = vec![(LayoutRect { x: 104.0, y: 54.0, width: 688.0, height: 33.0 }, 0),
+            (LayoutRect { x: 105.0, y: 54.0, width: 69.59375, height: 22.0 }, 1)];
+        assert!(project(&root, 0, &mut layouts, &HashMap::from([(0, 0), (1, 1)])),
+            "horizontal decoration must not disable the containing line's vertical strut: font={}, used={}, wrap={}",
+            inline_font_height(&root.children[0].style),
+            crate::layout::inline_style_line_height(&root.children[0].style),
+            crate::layout::wrapped_text_height("(nothing)", 69.59375, &root.children[0].style));
+        #[cfg(all(feature = "skia", target_os = "macos"))]
+        assert_eq!(layouts[1].0.y, 61.796875,
+            "V2882 Chromium141 font box: parent_height={} parent_ascent={} child_height={} child_ascent={} x_height={:?}",
+            inline_font_height(&root.style), inline_font_content_ascent(&root.style),
+            inline_font_height(&root.children[0].style), inline_font_content_ascent(&root.children[0].style),
+            crate::render_skia::resolved_font_x_height(&root.style));
+        assert_eq!(layouts[1].0.x, 105.0);
+        assert_eq!(layouts[0].0.height, 33.0);
+    }
+
+    #[test]
+    fn out_of_flow_marker_does_not_disable_inline_strut_projection() {
+        let parent = Style { display: Display::Block, font_family: Some("Ahem".into()),
+            font_size: 24.0, line_height: 1.0, line_height_is_normal: false,
+            ..Style::default() };
+        let child = Style { display: Display::Inline, font_size: 16.0,
+            align_self: w3cos_std::style::AlignSelf::Center, ..parent.clone() };
+        let root = Component::row(parent.clone(), vec![
+            Component::row(Style { position: Position::Absolute, ..parent }, vec![]),
+            Component::text("X", child),
+        ]);
+        let mut layouts = vec![(LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 24.0 }, 0),
+            (LayoutRect { x: -15.0, y: 0.0, width: 0.0, height: 0.0 }, 1),
+            (LayoutRect { x: 0.0, y: 0.0, width: 16.0, height: 16.0 }, 2)];
+        let marker = layouts[1].0;
+        assert!(project(&root, 0, &mut layouts, &HashMap::from([(0, 0), (1, 1), (2, 2)])));
+        assert_eq!(layouts[1].0, marker, "out-of-flow geometry is owned by its positioning pass");
+        assert!((layouts[2].0.y - 1.6).abs() < 0.01);
+    }
 
     #[test]
     fn collapsed_empty_text_after_break_does_not_reject_replaced_line_metrics() {
@@ -1038,7 +1095,12 @@ mod tests {
                 let expected = match keyword {
                     "text-top" => baseline - offset - large_ascent + small_leading,
                     "text-bottom" => baseline - offset + large_descent - 18.0 + small_leading,
-                    "middle" => baseline - offset - 32.0 * 0.25 - 9.0 + small_leading,
+                    "middle" => {
+                        let x_height = 32.0 * 0.5;
+                        #[cfg(feature = "skia")]
+                        let x_height = crate::render_skia::resolved_font_x_height(&large).unwrap_or(x_height);
+                        baseline - offset - inline_used_line_height(x_height * 0.5) - 9.0 + small_leading
+                    },
                     "top" => 10.0 + small_leading,
                     "bottom" => 10.0 + layouts[0].0.height - 18.0 + small_leading,
                     _ => baseline - offset - small_ascent,
