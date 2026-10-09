@@ -3290,18 +3290,11 @@ impl Document {
                         declared_position = None;
                         continue;
                     }
-                    declared_type = Some("disc".to_string());
-                    declared_position = Some("outside".to_string());
-                    for token in value.split_ascii_whitespace() {
-                        match token.to_ascii_lowercase().as_str() {
-                            "inside" | "outside" => {
-                                declared_position = Some(token.to_ascii_lowercase())
-                            }
-                            "disc" | "circle" | "square" | "decimal" | "none" => {
-                                declared_type = Some(token.to_ascii_lowercase());
-                            }
-                            _ => {}
-                        }
+                    if let Some((marker_type, marker_position)) =
+                        crate::css_style::list_style_marker_properties(&value)
+                    {
+                        declared_type = Some(marker_type);
+                        declared_position = Some(marker_position);
                     }
                 } else if css_property_eq(&name, "list-style-type") {
                     declared_type = (!value.trim().eq_ignore_ascii_case("inherit"))
@@ -11865,6 +11858,53 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         return false;
     }
 
+    let fixed_advance_bidi = units.iter().all(|unit| {
+        unit.component.style.font_family.as_deref().is_some_and(|families| {
+            families.split(',').any(|family| {
+                family.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case("ahem")
+            })
+        })
+    });
+    // Fixed-advance runs have exact line ranges below. Variable-width runs
+    // still require the real shaping pass to resolve each soft line edge.
+    let source_collapsed = (component.style.white_space == WhiteSpace::NoWrap
+        || (fixed_advance_bidi && matches!(component.style.width,
+            Dimension::Px(_) | Dimension::Em(_) | Dimension::Rem(_))))
+        && units.iter().all(|unit| {
+            matches!(unit.component.style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+        });
+    if source_collapsed {
+        // CSS whitespace belongs to logical source runs. Folding after bidi
+        // reordering moves an RTL trailing source space to the wrong box.
+        // Explicit controls separate collapse sequences, but are not visible
+        // content and cannot keep a paragraph-edge space alive.
+        let mut collapsed = Vec::with_capacity(logical.len());
+        let mut at_start = true;
+        let mut previous_space = false;
+        for (character, owner) in logical {
+            if is_bidi_control(character) {
+                collapsed.push((character, owner));
+                previous_space = false;
+            } else if is_css_whitespace(character) {
+                if !at_start && !previous_space {
+                    collapsed.push((' ', owner));
+                }
+                previous_space = true;
+            } else {
+                collapsed.push((character, owner));
+                at_start = false;
+                previous_space = false;
+            }
+        }
+        if let Some(index) = collapsed.iter().rposition(|(character, _)| !is_bidi_control(*character))
+            && is_css_whitespace(collapsed[index].0)
+        {
+            collapsed.remove(index);
+        }
+        logical = collapsed;
+        text = logical.iter().map(|(character, _)| *character).collect();
+    }
+
     let paragraph_level = match paragraph_direction {
         TextDirection::Ltr => unicode_bidi::Level::ltr(),
         TextDirection::Rtl => unicode_bidi::Level::rtl(),
@@ -12092,6 +12132,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             }
             if !first
                 && last
+                && !source_collapsed
                 && line_index > 0
                 && units[unit_index].content.contains('\u{202e}')
                 && units[unit_index]
@@ -12146,20 +12187,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             mark_bidi_visual_order(&mut space.style);
             space
         });
-    let freezes_estimated_line_breaks = units.iter().all(|unit| {
-        unit.component
-            .style
-            .font_family
-            .as_deref()
-            .is_some_and(|families| {
-                families.split(',').any(|family| {
-                    family
-                        .trim()
-                        .trim_matches(['"', '\''])
-                        .eq_ignore_ascii_case("ahem")
-                })
-            })
-    });
+    let freezes_estimated_line_breaks = fixed_advance_bidi;
     let line_ends = visual_fragments
         .iter()
         .enumerate()
@@ -12191,6 +12219,21 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         };
         let leading = content.chars().next().is_some_and(is_css_whitespace);
         let trailing = content.chars().next_back().is_some_and(is_css_whitespace);
+        if source_collapsed {
+            if freezes_estimated_line_breaks && line_ranges.len() > 1 {
+                // These spaces survived logical line-edge collapse. An RTL
+                // run can place them at a visual edge where a later LTR text
+                // pass would otherwise trim them a second time. Exact line
+                // breaks are already frozen, so retain their space advances.
+                if leading { content.replace_range(..1, "\u{00a0}"); }
+                if trailing {
+                    let start = content.char_indices().next_back().unwrap().0;
+                    content.replace_range(start.., "\u{00a0}");
+                }
+            }
+            edge_whitespace.push((leading, trailing));
+            continue;
+        }
         // Collapsed inter-fragment whitespace still belongs to its inline
         // decoration. Moving every trailing space into an anonymous run
         // shortens the inline's border/background by one space advance.
@@ -12273,7 +12316,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             // adjacent visual fragments must not become one longer word.
             normalized.push(space.clone());
         }
-        if index > 0 && !starts_new_line {
+        if index > 0 && !starts_new_line && !source_collapsed {
             let previous_unit = &units[visual_unit_indices[index - 1]];
             let current_unit = &units[fragment.unit_index];
             let source_boundary_has_space = previous_unit
@@ -12358,7 +12401,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
                 }
             }
         }
-        let preserve_wrapper = units[fragment.unit_index].wrapper.is_some()
+        let preserve_wrapper = !source_collapsed && units[fragment.unit_index].wrapper.is_some()
             && (units[fragment.unit_index].leading_ahem_wrapper
                 || (fragment.line_index > 0 && fragment.last));
         if preserve_wrapper
@@ -14087,6 +14130,46 @@ fn parse_html_dimension_attribute(value: &str) -> Option<w3cos_std::style::Dimen
 #[cfg(test)]
 mod generated_counter_format_tests {
     use super::*;
+
+    #[test]
+    fn list_style_none_has_distinct_type_and_image_slots() {
+        for (value, expected) in [
+            ("none", None), ("none none", None),
+            ("none square", Some("square")), ("square none", Some("square")),
+        ] {
+            let mut document = Document::new();
+            let item = document.create_element("div");
+            item.style_mut(&mut document).set_property("display", "list-item");
+            item.style_mut(&mut document).set_property("list-style", value);
+            let style = document.computed_style_for(item.id);
+            let marker = document.list_marker_component(item.id, &style);
+            let actual = marker.as_ref().and_then(|marker| marker.style.custom_properties.as_ref())
+                .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"))
+                .map(String::as_str);
+            assert_eq!(actual, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn invalid_list_style_shorthand_keeps_the_cascaded_marker() {
+        for previous in ["disc", "circle"] {
+          for value in ["none square none", "square none none", "none none square",
+            "none url(red.png) none", "url(red.png) none none", "none none url(red.png)",
+            "square url(red.png) none", "url(red.png) none square", "none square url(red.png)"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".item", &[("list-style", previous), ("list-style", value)]);
+            let mut document = Document::new();
+            let item = document.create_element("div");
+            item.class_list_add(&mut document, "item");
+            item.style_mut(&mut document).set_property("display", "list-item");
+            let style = document.computed_style_for(item.id);
+            let marker = document.list_marker_component(item.id, &style).expect("prior valid marker");
+            assert_eq!(marker.style.custom_properties.as_ref().unwrap()
+                .get("--w3cos-internal-outside-list-marker").map(String::as_str), Some(previous), "{value}");
+          }
+        }
+        crate::stylesheet::clear_rules();
+    }
 
     #[test]
     fn inside_symbol_markers_reserve_ua_inline_spacing() {
@@ -21165,6 +21248,76 @@ mod image_component_tests {
     }
 
     #[test]
+    fn wrapped_bidi_preserves_browser_owned_visual_edge_spaces() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let block = document.create_element("p");
+        for (name, value) in [("width", "28em"), ("font", "16px/1 Ahem")] {
+            block.style_mut(&mut document).set_property(name, value);
+        }
+        for (tag, content) in [
+            (Some("span"), " pppp pppX ppXp \u{202e} ppXp XXpp XppX "),
+            (None, " pppX XXXp pXXp "),
+            (Some("span"), " XpXp ppXX XXpX pXpX \u{202c} XXpX XXXp "),
+        ] {
+            let text = document.create_text_node(content);
+            if let Some(tag) = tag {
+                let span = document.create_element(tag);
+                for (name, value) in [("border", "3px solid"), ("padding", "0.4em 1em"), ("line-height", "3em")] {
+                    span.style_mut(&mut document).set_property(name, value);
+                }
+                span.append_child(&mut document, text);
+                block.append_child(&mut document, span);
+            } else {
+                block.append_child(&mut document, text);
+            }
+        }
+        document.body().append_child(&mut document, block);
+        let visual = descendant_text_runs(&document.to_component_tree()).iter()
+            .map(|(text, _)| text.replace('\u{00a0}', " ")).collect::<String>();
+        // V2850 Chromium character Ranges: source spaces survive when visual
+        // reordering places them at a line edge inside an inline decoration.
+        assert_eq!(visual, "pppp pppX ppXp ppXX pXpp \u{2028}pXpX pXXp pXXX Xppp XppX\u{2028} XpXp XpXX XXpp XXpX XXXp");
+    }
+
+    #[test]
+    fn explicit_bidi_keeps_browser_logical_space_ownership() {
+        // Chromium bidi-003 Range geometry (V2838): collapse source-adjacent
+        // spaces before reordering, not the visual edges of every fragment.
+        let plain = |content: &str| {
+            w3cos_std::Component::text(content, w3cos_std::style::Style {
+                display: Display::InlineBlock,
+                ..Default::default()
+            })
+        };
+        let decorated = |content: &str| {
+            w3cos_std::Component::row(w3cos_std::style::Style {
+                display: Display::Inline, border_width: 3.0,
+                ..Default::default()
+            }, vec![plain(content)])
+        };
+        let mut line = w3cos_std::Component::row(w3cos_std::style::Style {
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            ..Default::default()
+        }, vec![
+            decorated(" aaa bbb ccc \u{202e} lll kkk jjj "),
+            plain(" iii hhh ggg "),
+            decorated(" fff eee ddd \u{202c} mmm nnn ooo "),
+        ]);
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let runs = line.children.iter().filter_map(|child| {
+            if let ComponentKind::Text { content } = &child.kind {
+                Some((content.as_str(), child.style.border_width > 0.0))
+            } else { None }
+        }).collect::<Vec<_>>();
+        assert_eq!(runs, vec![
+            ("aaa bbb ccc ", true), (" ddd eee fff", true),
+            (" ggg hhh iii", false), (" jjj kkk lll ", true),
+            (" mmm nnn ooo", true),
+        ]);
+    }
+
+    #[test]
     fn explicit_bidi_preserves_decorated_fragment_trailing_space() {
         let plain = |content: &str| {
             let mut style = w3cos_std::style::Style::default();
@@ -21205,9 +21358,9 @@ mod image_component_tests {
             decorated_runs,
             [
                 "aaa bbb ccc ",
-                "ddd eee fff ",
-                "jjj kkk lll ",
-                "mmm nnn ooo"
+                " ddd eee fff",
+                " jjj kkk lll ",
+                " mmm nnn ooo"
             ]
         );
         let visual = line
@@ -21223,7 +21376,7 @@ mod image_component_tests {
             .collect::<String>();
         assert_eq!(
             visual,
-            "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo"
+            "aaa bbb ccc  ddd eee fff ggg hhh iii jjj kkk lll  mmm nnn ooo"
         );
     }
 

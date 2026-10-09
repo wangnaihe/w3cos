@@ -1,5 +1,34 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 Publication: bidi whitespace, resource protocol and list parsing
+
+Publishes the locally verified bidi whitespace ownership and WPT sidecar MIME
+support, plus a partial list-style shorthand parsing repair. V2859 records
+105/105 bidi pages browser-exact and 38 related browser-exact controls; strict
+reference failures remain independently retained. V2875 corrects the browser
+resource protocol for content-type-000 without changing the native capture.
+The resource-response Node tests pass 4/4 at publication.
+
+List parsing RED V2876 fails two DOM assertions. V2878 passes 10 focused DOM
+executions after distinguishing the type/image `none` slots and rejecting
+invalid shorthands without replacing the prior cascaded marker. Runner build
+succeeds in 2m51s. Fresh V2879/V2880 measures six originals with the corrected
+browser resource protocol: four browser-exact, two still FAILED.
+list-style-020 native/reference improves 96->0 pixels, but its actual/browser
+gap increases 7727->7787 while reference/browser remains 7787. This is NOT a
+browser-pixel acceptance checkpoint: marker parsing is fixed, but vertical
+alignment and image markers remain unresolved. list-style-021 retains gaps
+2154/2186 and native/reference 32 pixels. Bidi-003/004 strict reference failures
+remain independently recorded despite browser equality; no waiver or tolerance
+change. Receipts remain under
+`target/wpt-targeted/baseline-font-position-20261003/`.
+
+Full current 6,548 cases NOT_RUN; global remaining UNKNOWN. Existing DOM
+first-line and authored LS provenance limitations remain open. Parent size
+check fails the same six outside-vendor violations; baseline is not raised.
+Publication is confined to w3cos; parent source and submodule pin stay untouched.
+Product Agent knowledge is unaffected: only generic CSS and test protocol work.
+
 ## 2026-10-09 Preserved source LS: three originals browser-exact
 
 V2721 retains genuine DOM RED: source LS and synthetic BR both become the same
@@ -23187,6 +23216,107 @@ isolation and strict closure. Build/diff pass, same six outside-vendor size
 violations, no baseline increase or commit/push. Full6548 NOT_RUN; global
 remaining UNKNOWN. Product Agent knowledge unaffected: generic inline painting,
 no business concepts, authority or tool semantics changed.
+### V2875: browser resource MIME sidecar protocol correction
+
+V2861 refreshes the historical selection index:494 compatible receipts,
+6178 observed paths and166 historical pixel-gap entries. This mixes source
+versions and is NOT a current remaining count or acceptance census.
+
+V2862 remeasures content-type000 and list-style020. The first case exposes a
+browser comparison fixture bug: the WPT plaintext.css.headers declares
+Content-Type:text/plain, and the native HTTP server honors it, but the legacy
+browser route supplied text/css from the extension. Chromium wrongly loads
+the red stylesheet; native rendering is already green. Preserve the legacy
+34419-pixel screenshot as protocol-invalid diagnostic evidence, not as a
+renderer target or a strict reference failure to waive.
+
+Add the generic browser resource response module under
+`tools/wpt-runner/browser/resource-response.mjs`. V2864 sidecar/header tests
+are RED; V2865 GREEN. V2870 further proves reserved framing headers must not
+override the native server's behavior; final V2871 passes4 tests. V2872 DOM
+controls pass13 executions. The browser comparison entry V2866 consumes the
+module and records actual response MIME plus body/sidecar SHA256 for each
+requested resource. Future browser measurements use this corrected route.
+
+V2873 content-type000 is browser-exact and both strict comparisons are0;
+native actual/reference PNG hashes are unchanged from V2862. The actual
+browser PNG changes because the declared protocol is now correct. The bound
+resource response proves text/plain and exact fixed-WPT body/sidecar hashes.
+List-style020 is an unchanged real control failure:7727 actual/7787 reference
+native-browser pixels and96 native strict pixels; browser strict0.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/protocol-checkpoint-v2875.json`.
+RED/GREEN, old/new protocol captures, module/source/binary hashes and remaining
+strict failures are retained. This is a harness correction, not a renderer
+repair. No full6548 run; global remaining UNKNOWN. Same six outside-vendor
+size violations, no baseline increase or commit/push. Product Agent knowledge
+unaffected: generic WPT HTTP fixture fidelity only.
+
+### V2859: wrapped bidi visual-edge whitespace browser parity
+
+V2850 captures every Chromium character Range in bidi004; its PNG hash equals
+the preceding accepted oracle. Logical spaces before/after explicit controls
+survive at the first line's visual trailing edge and subsequent RTL leading
+edges. Native trimming and wrapper padding compensation lose those advances.
+V2851's direct-IR synthetic input differs from the real DOM lowering; it is
+diagnostic only. V2852 uses the real Document/CSS conversion and reproduces
+the missing first-line trailing space: genuine RED.
+
+Extend logical source collapse to the existing fixed-advance exact-line path.
+Retain surviving visual-edge advances in generated fragments after exact
+line breaks are frozen; remove wrapper padding compensation on this path.
+Authored DOM text is unchanged. Variable-width soft wrapping still requires
+real shaping to resolve line edges, not paragraph estimates. V2853 GREEN;
+V2854 related DOM gate13 executions pass. Broader V2858 bidi gate18/21 has
+the same three failures and identical actual/expected values as candidate-
+disabled V2845; they remain open, not waived.
+
+Current-source runner builds in2m53s. Focused V2855 proves bidi003 remains0/0
+and bidi004 improves4465/0->0/0. V2857 remeasures143 cases:143 browser-exact,
+zero gaps/unverified. Bidi105/105, first-line25/25, insertion9/9 and opacity4/4.
+All browser actual/reference PNG hashes match the preceding accepted captures;
+no native/browser pixel count increases. Bidi142 and first-line28 independent
+strict reference failure rows remain listed. Browser parity is not strict
+reference closure.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/bidi-wrapped-checkpoint-v2859.json`.
+Real RED, diagnostic synthetic input, GREEN, prior checkpoint and current
+source/binary bindings are retained. Full6548 NOT_RUN; global remaining UNKNOWN.
+Existing DOM first-line and authored LS provenance limitations remain open.
+Same six outside-vendor size violations, no baseline increase or commit/push.
+Product Agent knowledge unaffected: generic CSS bidi whitespace/layout only.
+
+### V2849: logical whitespace ownership across bidi inline fragments
+
+Chromium Range geometry V2838 matches the accepted browser PNG hash. V2840
+reproduces a genuine DOM RED: visual fragment trimming moves RTL source spaces
+to trailing edges and drops continuation leading spaces. Collapse source
+whitespace before bidi resolution for non-wrapping paragraphs, preserving its
+owning inline and controls' collapse boundaries. The existing nowrap trailing
+space assertion is corrected against the measured browser provenance, not
+against the candidate output.
+
+Initial V2842 fixes bidi003 but regresses wrapped bidi0044465->4561: NOT
+ACCEPTED. Soft-wrapped paragraphs need real per-line whitespace resolution;
+retain their previous path rather than applying paragraph-edge collapse to
+estimated lines. V2846 related DOM gate passes11 executions. Broader bidi
+gate V2844 remains17/20; all three failures reproduce with the candidate
+disabled in V2845, with identical actual/expected values. They remain open.
+
+Current runner builds in2m38s. V2847 remeasures143 cases:142 browser-exact,
+one gap. Bidi105 improves103->104 exact; bidi0032749->0, bidi004 stays4465/0.
+First-line25, insertion9 and opacity4 remain exact with unchanged comparisons.
+All Chromium actual/reference PNG hashes match the preceding accepted captures;
+no native/browser pixel count increases. Bidi142 and first-line28 independent
+strict reference failure rows remain listed, not waived.
+
+Receipt: `target/wpt-targeted/baseline-font-position-20261003/bidi-source-spaces-checkpoint-v2849.json`.
+RED, rejected candidate, candidate-disabled diagnostics and current source/
+binary bindings are retained. Full6548 NOT_RUN; global remaining UNKNOWN.
+Existing DOM first-line and authored LS provenance limitations remain open.
+No commit/push. Product Agent knowledge unaffected: generic CSS whitespace/
+bidi layout only, no business concepts, authority or tool semantics changed.
+
 ### V2836: right-aligned inline width and final glyph raster phase
 
 V2821 confirms applies-to009's right-aligned block is x8/y54/width784/height22.

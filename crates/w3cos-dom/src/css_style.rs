@@ -2022,6 +2022,41 @@ fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
     ))
 }
 
+pub(crate) fn list_style_marker_properties(value: &str) -> Option<(String, String)> {
+    let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
+    let tokens = split_css_whitespace(value);
+    if tokens.is_empty() { return None; }
+    let mut marker_type = None;
+    let mut position = None;
+    let mut has_image = false;
+    let mut none_count = 0usize;
+    for token in tokens {
+        let lower = token.to_ascii_lowercase();
+        match lower.as_str() {
+            "none" => none_count += 1,
+            "inside" | "outside" => {
+                if position.replace(lower).is_some() { return None; }
+            }
+            "disc" | "circle" | "square" | "decimal" => {
+                if marker_type.replace(lower).is_some() { return None; }
+            }
+            _ if lower.starts_with("url(") && lower.ends_with(')') => {
+                if has_image { return None; }
+                has_image = true;
+            }
+            _ => return None,
+        }
+    }
+    // `none` can fill either type or image. Explicit values claim their
+    // slots first; a third ambiguous token invalidates the whole shorthand.
+    // It must not override a prior valid declaration in the cascade.
+    let available = 2 - usize::from(marker_type.is_some()) - usize::from(has_image);
+    if none_count > available { return None; }
+    if marker_type.is_none() && none_count > 0 { marker_type = Some("none".into()); }
+    Some((marker_type.unwrap_or_else(|| "disc".into()),
+        position.unwrap_or_else(|| "outside".into())))
+}
+
 fn split_css_whitespace(value: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut start = None;
