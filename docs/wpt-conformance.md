@@ -1,5 +1,111 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication candidate: wrapped images and nested-list UA margins
+
+User-authorized publication includes the wrapped-image repair and browser-grounded
+internal fixture corrections below, plus nested HTML list UA margins. V3131
+preserves genuine RED (nested margin Em1 versus Px0). The UA descendant rule
+now removes nested ul/ol vertical margins before user/author cascade, including
+an intervening wrapper; outer margins and padding remain unchanged and an
+authored margin overrides the default. V3132 passes89 DOM executions and V3133
+passes62 runtime executions on the same source. The runner rebuild takes2m53s.
+
+V3134 remeasures the same twelve historical targets: c16-descendant-000 actual
+and reference browser gaps2948 ->0; eleven pages are now browser-exact. The
+remaining floats-wrap-bfc-006 actual gap5460 is unchanged (native strict0,
+browser strict5460), and is the next repair target. V3136 keeps6/6 primary
+pages exact; V3138 keeps16/16 controls exact, without script errors or
+unverified comparisons. All17 independent strict failure rows across these
+34 pages remain in
+`target/wpt-targeted/baseline-font-position-20261003/nested-list-checkpoint-v3140.json`,
+which binds source, binary, RED, units, diagnostics and before/after pixels.
+Browser parity takes priority; strict failures are not waived or hidden.
+
+This is focused evidence only. The earlier complete linebox and white-space
+receipts belong to their recorded frozen candidate, not a new full-suite run.
+Full current6548 NOT_RUN; global remaining UNKNOWN. Only the five scoped vendor
+files are staged for publication; the parent submodule pin is unchanged.
+No Product Agent knowledge/authority impact: these are generic engine geometry,
+UA defaults and internal tests. Root size gate still has the same six
+outside-vendor violations; no baseline increase or unrelated edits.
+
+## 2026-10-09 historical unit fixtures: browser-grounded corrections
+
+V3112's four failing assertions are preserved. V3120/V3121 directly measure
+their browser geometry, not WPT pixel acceptance: the unchanged parsed
+monospace fixture has text y15/height17 and baseline image y18, while the
+unchanged XHTML first-margin fixture places the following block at y54
+(first margin16, normal Times strut22, final margin16). Neither supports the
+old equal-top or synthetic19.2px normal-strut assumptions.
+
+The hand-built top-alignment fixture now declares Arial and uses the shared
+main line projection, preserving both initial-position scenarios and a taller
+fragment case. Browser font-box offsets are -1px for15/15px and -2px for30/30px;
+the baseline image stays at the line top. The table fixture declares serif
+and distinguishes unitless1.2 from fixed19.2px: V3123 measures104.1875 versus
+104.203125 in both baseline and middle cells. V3122 retains the intermediate
+length-versus-ratio mismatch; the expanded fixture tests both declarations
+without tolerance relaxation. An E0282 closure annotation issue was fixed
+before the passing run and is not behavioral RED.
+
+V3125 passes62 related executions, including the four corrected fixtures.
+`target/wpt-targeted/baseline-font-position-20261003/legacy-unit-checkpoint-v3128.json`
+binds browser diagnostics, old failures, the intermediate mismatch and units,
+and verifies the production layout prefix is unchanged from the published
+baseline. These are internal test corrections, not additional renderer or
+upstream WPT repairs. The prior191 linebox and111 white-space pixel receipts
+remain evidence for their frozen production candidate, not a global gate.
+
+V3124 indexes latest per-path historical resource/font-profile-compatible
+receipts across browser versions for selecting the next twelve targets.
+Its143 historical gaps across6178 observed paths are not a current remaining
+count or proof that the missing paths pass. V3126 is the fresh native/Chrome155
+remeasurement entry. Full current6548 NOT_RUN; global remaining UNKNOWN.
+No new commit/push or parent pin change; no Product Agent knowledge/authority
+impact. Root size gate retains the same six outside-vendor violations.
+
+## 2026-10-09 wrapped replaced lines: linebox browser gaps cleared
+
+The accepted font/table/nested-inline candidate was published as
+`eb3ab4f548c70bff0275566363d949ab1fb52e2e`; the unfinished 013 RED was
+excluded and retained locally. V3101 records genuine image tops20/40/60
+versus browser-derived20/42/64. Soft-line resolution now admits simple
+replaced image leaves and same-x line restarts, retaining each line's parent
+strut. Absent, undecorated separators are skipped only when empty or collapsed
+under their white-space semantics. Preserved whitespace and decorated nodes
+remain guarded. Negative horizontal image margins stay on the general path.
+
+V3102 and V3109 retain rejected candidates; V3110 diagnoses the separator as
+an original space without a rectangle, not an empty string. Temporary
+diagnostics were removed. Intermediate compiler type/scope errors were fixed
+before the passing run and are not counted as behavioral RED. V3111 passes
+58 related executions; V3112 remeasures four historical unit failures, all
+still open. Runtime test build succeeds in22.86s, runner build in2m12s.
+
+V3103 clears 013 reference native/browser1800 ->0; actual remains0. Its native
+strict702 ->2502 now equals browser strict2502: this increase is explicitly
+retained, not waived. Four target pages, six primary pages (V3105) and sixteen
+controls (V3107) are browser-exact. V3113 binds the RED, rejected candidates,
+units and pixel receipts in `target/wpt-targeted/baseline-font-position-20261003/`.
+
+V3114/V3116 then complete the original linebox198 group on the frozen source:
+191/191 reftests have exact actual/reference native/browser pixels, with no
+script errors or unverified comparisons. Native strict totals are61 passed /
+137 failed (reftests54/137); native testharness7/7 passes, browser testharness
+NOT_RUN. All274 independent strict native/browser failure rows remain in
+`linebox-checkpoint-v3116.json`. This is browser-gap closure for this group,
+not strict WPT or global closure. V3117/V3119 additionally revalidate all111
+original white-space cases on this source:111/111 browser-exact, native strict
+25 passed /86 failed, all172 independent strict failure rows retained and
+unchanged from the prior baseline. Receipts are bound in
+`whitespace-checkpoint-v3119.json`; no script errors or unverified comparisons.
+Next: browser differentials for the four open unit fixtures, then remaining
+fixed-suite failure groups. Full current6548
+NOT_RUN; global remaining UNKNOWN. This new wrapped-image repair is local,
+not committed/pushed; parent pin unchanged. Generic engine geometry has no
+Product Agent knowledge/authority impact. The size gate still reports six
+outside-vendor violations, with no baseline increase.
+
 ## 2026-10-09 nested inline023: shared baseline browser repair
 
 The completed V3081/V3084 linebox198 checkpoint records 189/191 browser-exact

@@ -1256,6 +1256,21 @@ impl Document {
             table_presentation::inherit_section_colors(&node.tag.as_str(),&mut merged.inner,inherited);
             table_presentation::append_border_hints(self,id,&mut user_normal);
         }
+        // HTML's nested-list UA rule is a descendant selector, not a
+        // direct-parent rule. Apply it before user/author declarations so
+        // explicit margins still win, including through an intervening box.
+        if node.is_html_element && matches!(node.tag.as_str().as_str(), "ul" | "ol") {
+            let mut ancestor = node.parent;
+            while let Some(parent) = ancestor {
+                let parent = self.get_node(parent);
+                if parent.is_html_element && matches!(parent.tag.as_str().as_str(), "ul" | "ol") {
+                    merged.inner.margin.top = w3cos_std::style::Spacing::Px(0.0);
+                    merged.inner.margin.bottom = w3cos_std::style::Spacing::Px(0.0);
+                    break;
+                }
+                ancestor = parent.parent;
+            }
+        }
         // Attribute-sensitive HTML UA defaults. A named anchor without href
         // is not a hyperlink; visited styling is not inferred from history.
         let ua_link = node.node_type == NodeType::Element

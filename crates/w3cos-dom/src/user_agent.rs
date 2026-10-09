@@ -237,6 +237,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nested_lists_have_zero_ua_vertical_margins_before_author_cascade() {
+        let mut document = crate::document::Document::new();
+        let outer = document.create_element("ul");
+        let item = document.create_element("li");
+        let wrapper = document.create_element("div");
+        let inner = document.create_element("ol");
+        document.body().append_child(&mut document, outer);
+        outer.append_child(&mut document, item);
+        item.append_child(&mut document, wrapper);
+        wrapper.append_child(&mut document, inner);
+        let outer_style = document.computed_style_for(outer.id);
+        assert_eq!(outer_style.margin.top, w3cos_std::style::Spacing::Em(1.0));
+        let nested = document.computed_style_for(inner.id);
+        assert_eq!(nested.margin.top, w3cos_std::style::Spacing::Px(0.0));
+        assert_eq!(nested.margin.bottom, w3cos_std::style::Spacing::Px(0.0));
+        assert_eq!(nested.padding.left, w3cos_std::style::Spacing::Em(2.5));
+        inner.style_mut(&mut document).set_property("margin-top", "7px");
+        assert_eq!(document.computed_style_for(inner.id).margin.top,
+            w3cos_std::style::Spacing::Px(7.0), "author declaration overrides nested-list UA");
+        assert_eq!(document.computed_style_for(inner.id).margin.bottom,
+            w3cos_std::style::Spacing::Px(0.0));
+    }
+
+    #[test]
     fn modification_elements_are_inline_with_ua_text_decoration() {
         for (tag, decoration) in [("ins", w3cos_std::style::TextDecoration::Underline),
             ("del", w3cos_std::style::TextDecoration::LineThrough)] {

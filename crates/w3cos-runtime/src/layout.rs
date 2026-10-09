@@ -28271,11 +28271,13 @@ mod tests {
     }
 
     #[test]
-    fn top_aligned_inline_text_shares_replaced_image_line_top() {
+    fn top_aligned_inline_font_box_keeps_baseline_image_on_shared_line() {
         let mut top_style = Style {
             display: WDisp::Inline,
             font_size: 15.0,
+            font_family: Some("Arial".into()),
             line_height: 1.0,
+            line_height_is_normal: false,
             align_self: WAlignSelf::FlexStart,
             ..Style::default()
         };
@@ -28283,11 +28285,13 @@ mod tests {
             "--w3cos-internal-vertical-align-keyword".into(),
             "top".into(),
         )]));
-        let root = Component::row(
+        let mut root = Component::row(
             Style {
                 display: WDisp::Flex,
                 font_size: 16.0,
+                font_family: Some("Arial".into()),
                 line_height: 1.2,
+                line_height_is_normal: false,
                 custom_properties: Some(HashMap::from([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
@@ -28336,32 +28340,34 @@ mod tests {
                 2,
             ),
         ];
-        align_inline_block_last_line_baselines(&mut layouts, &root);
-        assert!(
-            (layouts[2].0.y - layouts[1].0.y).abs() < 0.01,
-            "{layouts:?}"
-        );
+        let positions = HashMap::from([(0, 0), (1, 1), (2, 2)]);
+        assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
+        // Chrome's Arial 15px/15px inline has a 17px font box whose top is
+        // 1px above the line top; the 15px baseline image is at the line top.
+        assert!((layouts[1].0.y - 51.2).abs() < 0.01, "{layouts:?}");
+        assert!((layouts[2].0.y - 50.2).abs() < 0.01, "{layouts:?}");
 
         // The replaced image may already be at the line top while Taffy
         // leaves the top-aligned text on the lower strut baseline.
         layouts[1].0.y = 51.2;
         layouts[2].0.y = 55.4;
-        align_inline_block_last_line_baselines(&mut layouts, &root);
-        assert!(
-            (layouts[2].0.y - layouts[1].0.y).abs() < 0.01,
-            "{layouts:?}"
-        );
+        assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
+        assert!((layouts[1].0.y - 51.2).abs() < 0.01, "{layouts:?}");
+        assert!((layouts[2].0.y - 50.2).abs() < 0.01, "{layouts:?}");
 
         // A taller top-aligned fragment establishes its own line top; the
         // smaller baseline image must not pull it downward.
         layouts[2].0.y = 51.2;
-        layouts[2].0.height = 30.0;
-        align_inline_block_last_line_baselines(&mut layouts, &root);
-        assert!((layouts[2].0.y - 51.2).abs() < 0.01, "{layouts:?}");
+        root.children[1].style.font_size = 30.0;
+        layouts[2].0.height = 33.0;
+        assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
+        assert!((layouts[1].0.y - 51.2).abs() < 0.01, "{layouts:?}");
+        assert!((layouts[2].0.y - 49.2).abs() < 0.01, "{layouts:?}");
+        assert_eq!(layouts[0].0.height, 30.0, "{layouts:?}");
     }
 
     #[test]
-    fn parsed_top_aligned_span_shares_replaced_image_line_top() {
+    fn parsed_top_aligned_span_preserves_font_box_and_image_baseline() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
@@ -28399,10 +28405,11 @@ mod tests {
             .unwrap();
         let image = rect(image_index);
         let text = rect(text_index);
-        assert!(
-            (text.y - image.y).abs() < 0.01,
-            "image={image:?}, text={text:?}, layout={layout:?}"
-        );
+        // Browser geometry: the 15px/15px monospace font box is 17px tall
+        // and starts at15; the baseline-aligned 15px image starts at18.
+        assert_eq!(text.y, 15.0, "{layout:?}");
+        assert_eq!(text.height, 17.0, "{layout:?}");
+        assert_eq!(image.y, 18.0, "{layout:?}");
     }
 
     #[test]
@@ -34051,7 +34058,9 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(
-            (rect(following_index).y - 51.2).abs() < 0.01,
+            (rect(following_index).y - (rect(paragraph_index).y
+                + inline_used_line_height(inline_style_line_height(flat[paragraph_index].style))
+                + 16.0)).abs() < 0.01,
             "following container: {:?}",
             rect(following_index)
         );
@@ -36042,13 +36051,16 @@ mod tests {
 
     #[test]
     fn middle_aligned_cell_keeps_the_baseline_image_line_box() {
-        let layout = |alignment| {
+        let layout = |alignment, fixed_length: bool| {
             let cell = Component::row(
                 Style {
                     display: WDisp::TableCell,
                     align_self: alignment,
                     font_size: 16.0,
+                    font_family: Some("serif".into()),
                     line_height: 1.2,
+                    line_height_is_normal: false,
+                    line_height_computed_px: fixed_length.then_some(19.2),
                     ..Style::default()
                 },
                 vec![Component::image(
@@ -36080,12 +36092,16 @@ mod tests {
             )
             .unwrap()
         };
-        let baseline = layout(WAlignSelf::Baseline);
-        let middle = layout(WAlignSelf::Center);
-        // Unspecified embedding font: ascent=0.8em and half-leading=0.1em,
-        // so the strut descent is 0.3em, not 20% of the line-height.
-        assert!((baseline[2].0.height - (99.0 + 16.0 * 0.3)).abs() < 0.0001);
-        assert!((baseline[3].0.y - middle[3].0.y).abs() < 0.0001);
+        // Chrome distinguishes fixed19.2px (nearest LayoutUnit) from
+        // unitless1.2 (truncated LayoutUnit), although computed CSS text is
+        // identical. Neither table-cell alignment removes the image strut.
+        for (fixed_length, expected) in [(false, 104.1875), (true, 104.203125)] {
+            let baseline = layout(WAlignSelf::Baseline, fixed_length);
+            let middle = layout(WAlignSelf::Center, fixed_length);
+            assert_eq!(baseline[2].0.height, expected, "{baseline:?}");
+            assert_eq!(middle[2].0.height, expected, "{middle:?}");
+            assert!((baseline[3].0.y - middle[3].0.y).abs() < 0.0001);
+        }
     }
 
     #[test]
@@ -40036,6 +40052,36 @@ mod tests {
                 "settled row must still stretch its shorter cell: grouped={grouped}, layouts={layouts:?}");
             assert_eq!(at(row_index + 4).y, 0.0, "stretching the cell does not move its text");
         }
+    }
+
+    #[test]
+    fn wrapped_top_images_keep_each_lines_parent_strut() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/wrapped-image-struts.html",
+        ).unwrap();
+        parser.write("<!doctype html><body style='margin:0;font:16px/22px Arial'>\
+            <div style='width:100px;border-top:20px solid green;border-bottom:20px solid green'>\
+            <img src='blue.png' width='100' height='20' style='vertical-align:top'> \
+            <img src='green.png' width='100' height='20' style='vertical-align:top'>\
+            <img src='blue.png' width='100' height='20' style='vertical-align:top'></div></body>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index: usize| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+        let images = flat.iter().enumerate().filter(|(_, node)|
+            matches!(node.kind, ComponentKind::Image { .. }))
+            .map(|(index, _)| rect(index)).collect::<Vec<_>>();
+        assert_eq!(images.len(), 3);
+        assert_eq!(images.iter().map(|image| image.y).collect::<Vec<_>>(), vec![20.0, 42.0, 64.0],
+            "wrapped images must retain the 22px parent strut: {layout:?}");
+        let parent = flat.iter().position(|node| node.style.border_top_width == Some(20.0)).unwrap();
+        assert_eq!(rect(parent).height, 106.0, "three struts plus vertical borders");
     }
 
     #[test]

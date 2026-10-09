@@ -311,10 +311,16 @@ fn soft_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usize
                 && marker(component, "--w3cos-internal-inline-formatting-context"))
         || component.children.is_empty()
         || !component.children.iter().all(|child| child.children.is_empty()
-            && child.style.display == Display::Inline && child.style.position == Position::Static
+            && child.style.position == Position::Static
             && child.style.float == Float::None
-            && matches!(&child.kind, ComponentKind::Text { content }
-                if !content.contains(['\n', '\r', '\u{2028}'])))
+            && match &child.kind {
+                ComponentKind::Text { content } => child.style.display == Display::Inline
+                    && !content.contains(['\n', '\r', '\u{2028}']),
+                ComponentKind::Image { .. } => child.style.display == Display::InlineBlock
+                    && child.style.margin_lengths().left >= 0.0
+                    && child.style.margin_lengths().right >= 0.0,
+                _ => false,
+            })
     { return None; }
     let height = inline_used_line_height(crate::layout::inline_style_line_height(style));
     let ascent = inline_font_baseline_from_line_top(style, height);
@@ -324,10 +330,28 @@ fn soft_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usize
     let mut lines = vec![fresh()];
     let mut child_index = index + 1;
     for child in &component.children {
+        // A collapsed, undecorated separator may have no layout rectangle.
+        // It must not prevent the adjoining replaced items forming lines.
+        let margin = child.style.margin_lengths();
+        if !positions.contains_key(&child_index)
+            && matches!(&child.kind, ComponentKind::Text { content }
+                if content.is_empty() || content.chars().all(|c| matches!(c, ' ' | '\t'))
+                    && matches!(child.style.white_space, w3cos_std::style::WhiteSpace::Normal
+                        | w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::PreLine))
+            && child.style.padding == w3cos_std::style::Edges::ZERO
+            && [margin.top, margin.bottom, margin.left, margin.right].into_iter()
+                .all(|value| value == 0.0)
+            && child.style.border_width == 0.0
+            && [child.style.border_top_width, child.style.border_bottom_width,
+                child.style.border_left_width, child.style.border_right_width].into_iter()
+                .flatten().all(|width| width == 0.0)
+        { child_index += count_nodes(child); continue; }
         let rect = layouts[*positions.get(&child_index)?].0;
         let previous = lines.last()?.items.last().map(|item| layouts[item.position].0);
         if let Some(previous) = previous
-            && rect.x + 0.01 < previous.x && rect.y > previous.y + 0.01
+            && (rect.x + 0.01 < previous.x
+                || (rect.x - previous.x).abs() <= 0.01 && previous.width > 0.01)
+            && rect.y > previous.y + 0.01
         { lines.push(fresh()); }
         lines.last_mut()?.collect(child, child_index, style, 0.0, 0.0, layouts, positions)?;
         child_index += count_nodes(child);
