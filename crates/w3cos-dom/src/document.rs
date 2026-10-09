@@ -1619,7 +1619,16 @@ impl Document {
             .or_else(|| node.get_attribute_ns(None, "lang"))
             .map(|value| value.trim().to_ascii_lowercase())
             .or_else(|| inherited.and_then(|parent| parent.custom_properties.as_ref())
-            .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY)).cloned());
+            .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY)).cloned())
+            // The document language also selects generic font defaults. Use
+            // the selector's metadata fallback before resolving font metrics,
+            // while an explicit empty lang still blocks that fallback.
+            .or_else(|| if inherited.is_none() {
+                // Resolve metadata once at the inheritance root, not by
+                // scanning the document again for each language-less child.
+                crate::stylesheet::document_language(self)
+                    .map(|language| language.trim().to_ascii_lowercase())
+            } else { None });
         if let Some(language) = language {
             style.custom_properties.get_or_insert_with(Default::default)
                 .insert(user_agent::TEXT_LANGUAGE_PROPERTY.to_string(), language);
@@ -13522,14 +13531,15 @@ fn hoist_floats_into_block_formatting_context(
                     .any(contributes_in_flow_content);
                 // Wrappable inline content shares the outer line context even
                 // when its float is first. A first float in an unbroken nowrap
-                // run instead retains that run's source anchor; extracting it
-                // to the trailing queue would place it after the entire run.
+                // run instead retains that run's source anchor. Keep every
+                // right-float encounter in a nowrap run, not only its first:
+                // later coalescing must not replace a fitting prefix with the
+                // entire overflowing run when deciding float placement.
                 // Same-line float extraction may not cross an earlier forced
                 // break. Keep that float in its inline source context so the
                 // outer BFC can resolve its line-constrained placement.
                 let extract_child = !has_prior_forced_break
                     && (child.style.float != w3cos_std::style::Float::Right
-                        || has_prior_in_flow
                         || component.style.white_space != w3cos_std::style::WhiteSpace::NoWrap);
                 if let Some(child) = collect(
                     child,
@@ -13703,7 +13713,8 @@ fn hoist_floats_into_block_formatting_context(
                         "1".to_string(),
                     );
                 in_flow.push(child);
-            } else if direct_float == w3cos_std::style::Float::Right && has_prior_in_flow {
+            } else if direct_float == w3cos_std::style::Float::Right && has_prior_in_flow
+                && formatting_context_style.white_space != w3cos_std::style::WhiteSpace::NoWrap {
                 // A right float encountered after in-flow content cannot rise
                 // above the earlier line box. Keep later text in flow and
                 // place the float at this block's trailing float position.
@@ -17200,6 +17211,29 @@ mod image_component_tests {
         );
         assert_eq!(fixed.len(), 1);
         assert_eq!(fixed[0].children[0].style.float, Float::Right);
+    }
+
+    #[test]
+    fn nowrap_right_float_preserves_its_inline_encounter_position() {
+        use w3cos_std::style::{Style, WhiteSpace};
+        let inline = Style { display: Display::Inline,
+            white_space: WhiteSpace::NoWrap, ..Style::default() };
+        let children = vec![
+            w3cos_std::Component::text("Some ", inline.clone()),
+            w3cos_std::Component::boxed(Style { float: Float::Right,
+                width: Dimension::Px(39.0), height: Dimension::Px(39.0),
+                ..inline.clone() }, vec![]),
+            w3cos_std::Component::text("text that overflows", inline.clone()),
+        ];
+        let block = Style { white_space: WhiteSpace::NoWrap, ..Style::default() };
+        let direct = hoist_floats_into_block_formatting_context(&block, children.clone());
+        assert_eq!(direct.len(), 3, "do not merge text across a nowrap float encounter");
+        assert_eq!(direct[1].style.float, Float::Right);
+        let nested = hoist_floats_into_block_formatting_context(&Style::default(),
+            vec![w3cos_std::Component::boxed(inline, children)]);
+        assert_eq!(nested.len(), 1, "nowrap float stays anchored within its inline run");
+        assert_eq!(nested[0].children.len(), 3);
+        assert_eq!(nested[0].children[1].style.float, Float::Right);
     }
 
     #[test]
@@ -22386,6 +22420,28 @@ mod computed_style_cache_tests {
         child.set_attribute_ns(&mut document, Some("http://www.w3.org/XML/1998/namespace"),
             "xml:lang", Some("xml"), "lang", "");
         assert_eq!(language(&document.computed_style_for(child.id)), Some(""));
+    }
+
+    #[test]
+    fn content_language_meta_reaches_font_context_without_overriding_empty_lang() {
+        crate::stylesheet::clear_rules();
+        for html_document in [true, false] {
+            let mut document = Document::new();
+            document.set_html_document(html_document);
+            let meta = document.create_element("meta");
+            meta.set_attribute(&mut document, "http-equiv", "content-language");
+            meta.set_attribute(&mut document, "content", "FR-ca");
+            document.body().append_child(&mut document, meta);
+            let child = document.create_element("div");
+            document.body().append_child(&mut document, child);
+            let language = |style: &w3cos_std::Style| style.custom_properties.as_ref()
+                .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY)).cloned();
+            assert_eq!(language(&document.computed_style_for(child.id)), Some("fr-ca".into()),
+                "selector and font contexts must see the same document language");
+            child.set_attribute(&mut document, "lang", "");
+            assert_eq!(language(&document.computed_style_for(child.id)), Some("".into()),
+                "explicit empty language stops the metadata fallback");
+        }
     }
 
     #[test]

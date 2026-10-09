@@ -1,5 +1,118 @@
 # Raw Web Platform Tests
 
+## 2026-10-09 publication scope: accepted nowrap, language and padding repairs
+
+The staged production/test patch exactly matches the accepted V3304 source
+diff SHA256 a8c48883dfe6121dbfcdc79735adfdb346ad47c417b5d70fe6ad640140ba7982
+against base12bb930. It includes the V3258 nowrap source-anchor repair, V3282
+metadata font-context repair and V3304 resolved-percentage-padding repair,
+with their regression tests. V3304 binds64 scoped pixel comparisons and
+115 runtime /75 DOM passing executions; the same five runtime and two DOM
+failures and29 separate strict-reference rows remain recorded.
+
+The subsequent counter-reset scope candidate and square-symbol RED fixture
+are deliberately excluded and remain local. No current pixel acceptance is
+claimed for those counter changes. This publication does not update the
+parent repository pin, upstream WPT or tolerances. Full current6548 NOT_RUN;
+global remaining UNKNOWN. Root size check still reports six unrelated
+outside-vendor violations; no size baseline is raised. This is a generic
+rendering-engine change without Product Agent knowledge/authority impact.
+Earlier sections describe local status at their checkpoint timestamps.
+
+## 2026-10-09 resolved percentage padding: inline projection gap cleared locally
+
+V3283/V3284 confirm original padding-percentage-inherit-001 red-image geometry:
+native x98/y132 versus Chrome x98/y162. Computed inheritance correctly retains
+20%, and the solver resolves30px; subsequent inline-line projection previously
+treated that computed percentage as0px. V3285 preserves parsed-fixture RED.
+V3286 independently measures the authored explicit Times18px fixture:164px
+one-line height and268px forced-break height (4px descent, unlike the original
+WPT's5px). Those fixture-height expectations were corrected from that browser
+measurement; the genuine missing30px top-padding assertion remains unchanged.
+
+The solver snapshot now retains resolved percentage padding for principal
+boxes. Line projection consumes those pixel edges in a temporary component
+view, preserving authored computed percentages and passive-inline decoration
+semantics. The view is cloned only when percentage padding or collapsed table
+borders require it, reusing the existing collapsed-border projection path.
+V3287 passes115 runtime executions, including direct/retained one-line and
+forced-break fixtures; V3288 DOM75 passes. V3289/V3305 retain the same five
+runtime and two DOM failures without expectation changes.
+
+V3290 clears original actual3000 ->0, reference stays0. The twelve-case window
+now has6 exact,6 browser gaps; all other differences stay unchanged. V3292
+inheritance4/4, V3294 nowrap9/9, V3296 language5/5, V3298 controls16/16,
+V3300 primary6/6 and V3302 historical12/12 are browser-exact. Runtime rebuild
+20.75s, runner2m10s. `target/wpt-targeted/baseline-font-position-20261003/padding-checkpoint-v3304.json`
+binds source a8c48883 and runner03dc179b to64 scoped comparisons; all29 nonzero
+strict-reference rows remain independent, including duplicate paths. Next:
+the six current browser gaps, especially content-counter-007/008's reset scope
+differences. Full current6548 NOT_RUN; global remaining UNKNOWN. Candidate
+changes remain uncommitted/unpushed; WPT, tolerances and parent pin unchanged.
+Root size gate retains six unrelated outside-vendor violations, baseline unchanged.
+Generic box geometry has no Product Agent knowledge/authority semantics impact.
+
+## 2026-10-09 metadata language: browser font context gap cleared locally
+
+V3262 remeasures the next twelve historical browser-gap targets on current
+source:4 exact,8 gaps. V3264 proves lang-selector-006 already matches :lang(fr)
+and paints green in Chrome; its Times font differs from native's language-less
+standard context. V3265 preserves DOM RED (missing fr-ca font-context property).
+The computed font context now consumes the selector's document-metadata
+language source at the inheritance root. Explicit empty lang still blocks
+fallback, and no per-child metadata scan is introduced. Dynamic metadata
+mutation invalidation is not covered by this static repair's evidence.
+
+V3270 language-selector family5/5 is browser pixel-exact. V3272 clears
+lang-selector-006 actual3829 ->0; strict native/reference0 ->3829 is explicitly
+retained, matching Chrome's3829 rather than waiving that failure. The same
+twelve-case window now has5 exact,7 gaps; the other seven differences remain
+unchanged. V3274 nowrap9/9, V3276 controls16/16, V3278 primary6/6 and V3280
+historical12/12 remain browser-exact. V3266 DOM75 and V3267 runtime92 related
+executions pass. V3268/V3269 retain the same five runtime and two DOM failures.
+Final DOM unit rebuild28.68s, runtime44.01s, runner2m19s.
+
+`target/wpt-targeted/baseline-font-position-20261003/lang-meta-checkpoint-v3282.json`
+binds source ddbfce99 and runner280d1f2a to60 scoped pixel comparisons and RED;
+27 nonzero strict-reference rows remain independent, including duplicate paths.
+Next current RED entries are c414-flt-fit-006, floats-wrap-bfc-outside-001,
+content-counter-007/008, margin-collapse-min-height-001,
+padding-percentage-inherit-001 and position-relative-033. V3283/V3284 diagnose
+the padding case: inherited20% stays computed correctly, but the red image is
+native x98/y132 versus browser x98/y162 (the child's30px vertical padding is
+lost downstream). These geometry receipts are diagnostic, not acceptance.
+Full current6548 NOT_RUN; global remaining UNKNOWN. All new candidate changes
+remain local uncommitted/unpushed; parent pin, WPT and tolerances unchanged.
+Generic font/layout repairs have no Product Agent knowledge/authority impact.
+
+## 2026-10-09 nowrap source anchors: nine-case browser parity cleared locally
+
+DOM lowering now preserves the right-float encounter within direct and nested
+nowrap runs instead of merging text across that encounter. Floats do not own
+synthetic flex slots; shared placement consumes the original prefix. Fitting
+text uses the remaining float band, and an overflowing prefix defers only the
+float to the following line. V3229 preserves structural RED; V3246 reproduces
+the leading-left-float text overlap (x8 instead of50.625), and V3247 then exposes
+the nested long-prefix float floor (y23 instead of38). No assertions were waived.
+
+V3250 remeasures all nine fixed-suite nowrap cases:9/9 browser pixel-exact,
+including actual and reference. The five gaps at accepted V3203 are cleared;
+V3234's two experimental regressions are also cleared. V3252 controls16/16,
+V3254 primary6/6 and V3256 historical12/12 are exact without unverified
+comparisons. V3248 runtime90 and V3249 DOM70 focused executions pass. V3259
+and V3260 separately retain the same five runtime and two DOM failures.
+Runner rebuild2m12s; final runtime unit rebuild21.79s.
+
+`target/wpt-targeted/baseline-font-position-20261003/nowrap-source-anchor-checkpoint-v3258.json`
+binds frozen source5ec06070 to runner a262043e, RED, units and43 scoped pixel
+comparisons. All17 nonzero strict-reference rows remain separate, including
+duplicates across scopes and mismatch-relation outcomes; raw pixel differences
+are not assertion failure counts. Full current6548 NOT_RUN; global remaining
+UNKNOWN. This candidate is uncommitted/unpushed after publication12bb930;
+parent pin, upstream WPT, tolerances and size baseline unchanged. Root size gate
+still reports six unrelated outside-vendor violations. Generic rendering
+geometry has no Product Agent knowledge or authority semantics impact.
+
 ## 2026-10-09 publication scope: accepted nested-inline repair only
 
 This publication includes only the V3203 accepted nested-inline float repair

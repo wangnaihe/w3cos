@@ -1415,18 +1415,18 @@ fn node_language(document: &Document, mut node: NodeId) -> Option<String> {
             return Some(language.clone());
         }
         let Some(parent) = current.parent else {
-            return document
-                .query_selector_all("meta")
-                .into_iter()
-                .find(|meta| {
-                    meta.get_attribute(document, "http-equiv")
-                        .is_some_and(|value| value.eq_ignore_ascii_case("content-language"))
-                })
-                .and_then(|meta| meta.get_attribute(document, "content").map(str::to_string))
-                .filter(|language| !language.trim().is_empty());
+            return document_language(document);
         };
         node = parent;
     }
+}
+
+pub(crate) fn document_language(document: &Document) -> Option<String> {
+    document.query_selector_all("meta").into_iter().find(|meta| {
+        meta.get_attribute(document, "http-equiv")
+            .is_some_and(|value| value.eq_ignore_ascii_case("content-language"))
+    }).and_then(|meta| meta.get_attribute(document, "content").map(str::to_string))
+        .filter(|language| !language.trim().is_empty())
 }
 
 fn node_direction(document: &Document, mut node: NodeId) -> String {

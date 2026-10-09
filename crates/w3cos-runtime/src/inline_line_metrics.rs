@@ -492,6 +492,7 @@ pub(crate) struct UsedHeightConstraints {
     pub minimum: Option<f32>,
     pub maximum: Option<f32>,
     pub fixed: Option<f32>,
+    pub padding: Option<w3cos_std::style::EdgeLengths>,
 }
 
 /// Keep the sizing solver's resolved constraints separate from natural line
@@ -517,6 +518,7 @@ pub(crate) fn projected_height(style: &Style, previous: f32, natural: f32,
             maximum: absolute(style.max_height).map(|h| h + edges),
             fixed: (matches!(style.position, Position::Absolute | Position::Fixed)
                 && style.top != Dimension::Auto && style.bottom != Dimension::Auto).then_some(previous),
+            padding: None,
         }
     });
     if let Some(fixed) = constraints.fixed { return fixed; }
@@ -869,6 +871,7 @@ mod tests {
                 minimum: (root.style.min_height != Dimension::Auto).then_some(used_height),
                 maximum: (root.style.max_height != Dimension::Auto).then_some(used_height),
                 fixed: (root.style.position == Position::Absolute).then_some(used_height),
+                padding: None,
             };
             assert!(project_with_constraints(&root,0,&mut layouts,&positions,Some(used)));
             assert_eq!(layouts[0].0.height, used_height,

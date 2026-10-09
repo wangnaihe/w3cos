@@ -8208,7 +8208,9 @@ fn project_simple_float_margin_boxes(
                         if content != "\u{2028}")
                 {
                     (crate::layout::inline_style_line_height(&previous_child.style)
-                        - previous_child.style.font_size)
+                        - if previous_child.style.white_space == WWhiteSpace::NoWrap {
+                            inline_font_height(&previous_child.style)
+                        } else { previous_child.style.font_size })
                         * 0.5
                 } else {
                     0.0
@@ -8243,6 +8245,11 @@ fn project_simple_float_margin_boxes(
                     + relative_shift(&child.style).1;
                 let delta_y = target_y - layouts[child_position].0.y;
                 if delta_y < -f32::EPSILON
+                    || (component.style.white_space == WWhiteSpace::NoWrap
+                        && previous_child.style.white_space == WWhiteSpace::NoWrap
+                        && matches!(previous_child.kind, ComponentKind::Text { .. })
+                        && content_box.is_some_and(|containing|
+                            layouts[previous_position].0.width > containing.width + 0.01))
                     || (previous_margin.bottom > 0.0
                         && child_margin.top > 0.0
                         && delta_y > f32::EPSILON
@@ -8612,6 +8619,14 @@ fn project_simple_float_margin_boxes(
                             | WDisplay::InlineTable
                     ))
                 && !active_floats.is_empty()
+                && !(component.style.white_space == WWhiteSpace::NoWrap
+                    && child.style.white_space == WWhiteSpace::NoWrap
+                    && matches!(child.kind, ComponentKind::Text { .. })
+                    && (previous_in_flow.is_some()
+                        || component.style.display != WDisplay::Inline
+                            && content_box.is_some_and(|containing|
+                                layout_position.get(&child_index).is_some_and(|position|
+                                    layouts[*position].0.width > containing.width + 0.01))))
                 && let (Some(parent_position), Some(child_position)) = (
                     layout_position.get(&component_index).copied(),
                     layout_position.get(&child_index).copied(),
@@ -8744,6 +8759,20 @@ fn project_simple_float_margin_boxes(
                                 child_count,
                                 target_x - current.x,
                             );
+                        } else if child.style.white_space == WWhiteSpace::NoWrap
+                            && matches!(child.kind, ComponentKind::Text { .. })
+                        {
+                            // Removing a float's synthetic flex slot leaves
+                            // the following text at its normal block edge.
+                            // A fitting nowrap run still uses the float band;
+                            // preserve positions already inside that band.
+                            let minimum_x = left_edge + margin.left
+                                + relative_shift(&child.style).0;
+                            let maximum_x = (right_edge - margin.right - current.width
+                                + relative_shift(&child.style).0).max(minimum_x);
+                            let target_x = current.x.clamp(minimum_x, maximum_x);
+                            shift_subtree_x(layouts, layout_position, child_index,
+                                child_count, target_x - current.x);
                         }
                         break;
                     }
@@ -11903,6 +11932,31 @@ fn project_shared_bfc_float_collisions(
         let previous = groups.entry(owner).or_default();
         let mut x = margin_box.x;
         let mut y = margin_box.y;
+        if containing != parent
+            && style.float == WFloat::Right
+            && flat[parent].style.white_space == WWhiteSpace::NoWrap
+            && let Some(prefix) = (parent + 1..index).rev().find(|candidate| {
+                flat[*candidate].parent == Some(parent)
+                    && flat[*candidate].style.float == WFloat::None
+                    && flat[*candidate].style.position == WPos::Static
+                    && flat[*candidate].style.display == WDisplay::Inline
+                    && positions[*candidate].is_some()
+            })
+        {
+            let prefix_rect = layouts[positions[prefix].unwrap()].0;
+            let prefix_style = flat[prefix].style;
+            let prefix_right = prefix_rect.x + prefix_rect.width
+                + spacing(prefix_style.margin.right, prefix_style);
+            // Keep the original encounter prefix, not the coalesced whole
+            // nowrap run, as the float's line-fitting constraint. Only the
+            // float moves when that prefix has already filled the line.
+            if prefix_right > right - margin_box.width + 0.01 {
+                let line_height = inline_style_line_height(prefix_style);
+                let line_top = prefix_rect.y
+                    - inline_upper_leading(line_height, inline_font_height(prefix_style));
+                y = y.max(line_top + inline_used_line_height(line_height));
+            }
+        }
         if containing != parent || previous
             .iter()
             .any(|(_, prior_parent)| *prior_parent != node.parent)
@@ -14345,8 +14399,19 @@ fn used_inline_height_constraints(tree: &TaffyTree<usize>, root: NodeId,
             fixed: (css.height == WDim::Auto && matches!(css.position, WPos::Absolute | WPos::Fixed)
                 && css.top != WDim::Auto && css.bottom != WDim::Auto)
                 .then(|| rects.get(&index).map(|rect| rect.height)).flatten(),
+            // Preserve the solver's containing-block percentage basis when
+            // inline projection recomputes natural height and content origin.
+            // Passive inline decorations retain their separate paint extents.
+            padding: (css.display != WDisplay::Inline && [css.padding.top,
+                css.padding.right, css.padding.bottom, css.padding.left].into_iter()
+                .any(|edge| matches!(edge, WSpacing::Percent(_))))
+                .then_some(w3cos_std::style::EdgeLengths {
+                    top: layout.padding.top, right: layout.padding.right,
+                    bottom: layout.padding.bottom, left: layout.padding.left,
+                }),
         };
-        if used.minimum.is_some() || used.maximum.is_some() || used.fixed.is_some() {
+        if used.minimum.is_some() || used.maximum.is_some() || used.fixed.is_some()
+            || used.padding.is_some() {
             output.insert(index, used);
         }
     }
@@ -14463,10 +14528,26 @@ fn project_forced_break_lines_with_constraints(layouts: &mut [(LayoutRect, usize
     // not the authored borders. Match the grid solver's half-border geometry
     // before placing text or settling the natural line height. Keep authored
     // paint styles and the original component tree unchanged.
-    let resolved = has_collapsed_table(root).then(|| {
+    fn use_resolved_padding(component: &mut Component, index: &mut usize,
+        constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>) {
+        let own_index = *index;
+        *index += 1;
+        if let Some(padding) = constraints.get(&own_index).and_then(|used| used.padding) {
+            component.style.padding = w3cos_std::style::Edges {
+                top: WSpacing::Px(padding.top), right: WSpacing::Px(padding.right),
+                bottom: WSpacing::Px(padding.bottom), left: WSpacing::Px(padding.left),
+            };
+        }
+        for child in &mut component.children { use_resolved_padding(child, index, constraints); }
+    }
+    let collapsed = has_collapsed_table(root);
+    let resolved = (collapsed || constraints.values().any(|used| used.padding.is_some())).then(|| {
         let mut resolved = root.clone();
-        resolve_collapsed_table_layout_borders(&mut resolved);
-        use_cell_half_borders(&mut resolved);
+        if collapsed {
+            resolve_collapsed_table_layout_borders(&mut resolved);
+            use_cell_half_borders(&mut resolved);
+        }
+        use_resolved_padding(&mut resolved, &mut 0, constraints);
         resolved
     });
     let root = resolved.as_ref().unwrap_or(root);
@@ -19909,6 +19990,24 @@ fn build_taffy_tree(
                     // following text can use the remaining line space.
                     let mut child_style = tree.style(node)?.clone();
                     child_style.position = Position::Absolute;
+                    tree.set_style(node, child_style)?;
+                }
+                if c.style.float != WFloat::None
+                    && comp.style.white_space == WWhiteSpace::NoWrap
+                    && (comp.style.display == WDisplay::Inline
+                        || comp.style.custom_properties.as_ref().is_some_and(|properties|
+                            properties.contains_key("--w3cos-internal-inline-formatting-context")))
+                {
+                    // A nowrap line's overflow does not create a flex slot
+                    // for a float or let the float enlarge its line strut.
+                    // Source-order placement is settled by the float pass.
+                    let mut child_style = tree.style(node)?.clone();
+                    child_style.position = Position::Absolute;
+                    if c.style.float == WFloat::Right {
+                        child_style.inset.right = LengthPercentageAuto::length(0.0);
+                    } else {
+                        child_style.inset.left = LengthPercentageAuto::length(0.0);
+                    }
                     tree.set_style(node, child_style)?;
                 }
                 if owns_table_layout && c.style.display == WDisplay::Block {
@@ -27571,6 +27670,43 @@ mod tests {
         );
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!((layout[1].0.width, layout[1].0.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn inherited_percentage_padding_survives_replaced_inline_line_projection() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for forced_break in [false, true] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/padding-line.html",
+            ).unwrap();
+            let image = "<img src='unused.png' width='100' height='100'/>";
+            parser.write(&format!("<!doctype html><div style='width:300px;font:16px/18px Times'><div style='width:150px;height:150px;padding:20%'><div style='padding:inherit'>{image}{}</div></div></div>",
+                if forced_break { format!("<br/>{image}") } else { String::new() })).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let images = flat.iter().enumerate().filter_map(|(index, node)|
+                matches!(node.kind, ComponentKind::Image { .. }).then_some(index)).collect::<Vec<_>>();
+            let child = flat[images[0]].parent.unwrap();
+            assert_eq!(flat[child].style.padding.top, WSpacing::Percent(20.0),
+                "inherit retains the computed percentage");
+            for layout in [compute(&root, 800.0, 600.0).unwrap(),
+                LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+                let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                assert_eq!(rect(images[0]).x, 98.0);
+                assert_eq!(rect(images[0]).y, 98.0,
+                    "inline projection retains the child's resolved30px top padding: {layout:?}");
+                let lines = if forced_break { 2.0 } else { 1.0 };
+                // Chrome155 fixture v3286: explicit Times18px has4px descent.
+                assert_eq!(rect(child).height, 60.0 + lines * 104.0,
+                    "auto height includes both30px padding edges and each image-line descent");
+                if forced_break { assert_eq!(rect(images[1]).y, 202.0); }
+            }
+        }
     }
 
     #[test]
@@ -42269,6 +42405,41 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_nowrap_block_keeps_line_and_defers_only_trailing_float() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for leading in [false, true] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/nowrap-block.html",
+            ).unwrap();
+            let floating = "<span style='float:right;width:5ch;height:5ch'></span>";
+            let text = "Some text that overflows my parent.";
+            parser.write(&format!("<!doctype html><div style='width:10ch;white-space:nowrap;font-family:monospace'>\n {}\n {}\n</div>",
+                if leading { floating } else { text }, if leading { text } else { floating })).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let float = flat.iter().position(|node| node.style.float == WFloat::Right).unwrap();
+            let text = flat.iter().position(|node| matches!(node.kind,
+                ComponentKind::Text { content } if content.contains("Some text"))).unwrap();
+            let parent = flat[text].parent.unwrap();
+            for layout in [compute(&root, 800.0, 600.0).unwrap(),
+                LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+                let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                assert_eq!(rect(text).x, 8.0, "nowrap overflow remains at block start");
+                assert_eq!(rect(text).y, 8.0, "leading float does not clear nowrap overflow");
+                assert_eq!(rect(float).x.floor(), 47.0);
+                assert_eq!(rect(float).y, if leading { 8.0 } else { 23.0 },
+                    "float source order determines deferred line: {layout:?}");
+                assert_eq!(rect(parent).height, 15.0, "out-of-flow float does not grow block");
+            }
+        }
+    }
+
+    #[test]
     fn leading_float_in_nowrap_inline_uses_block_content_band() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
@@ -42296,6 +42467,46 @@ mod tests {
             assert_eq!(rect(float).y.floor(), 23.0);
             assert_eq!(rect(text).x, 8.0, "below-float line resets horizontal exclusion");
             assert_eq!(rect(text).y.floor(), 62.0);
+        }
+    }
+
+    #[test]
+    fn nowrap_float_source_anchor_preserves_text_band_and_prefix_floor() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for leading_left in [true, false] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/nowrap-anchor.html",
+            ).unwrap();
+            parser.write(if leading_left {
+                "<!doctype html><div style='white-space:nowrap'><span style='float:left'>Hello&nbsp;</span>Kittie</div>"
+            } else {
+                "<!doctype html><div style='width:10ch;font-family:monospace'>Some <span style='white-space:nowrap'>text that overflows <span style='float:right;width:5ch;height:5ch'></span> my parent.</span></div>"
+            }).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let float = flat.iter().position(|node| node.style.float != WFloat::None).unwrap();
+            let text = flat.iter().position(|node| matches!(node.kind,
+                ComponentKind::Text { content } if if leading_left {
+                    content == "Kittie"
+                } else { content.contains("text that overflows") })).unwrap();
+            for layout in [compute(&root, 800.0, 600.0).unwrap(),
+                LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+                let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
+                if leading_left {
+                    assert_eq!(rect(text).x, rect(float).x + rect(float).width,
+                        "fitting nowrap text starts after leading left float: {layout:?}");
+                    assert_eq!(rect(text).y, rect(float).y);
+                } else {
+                    assert_eq!(rect(text).y, 23.0, "nowrap prefix remains on its line");
+                    assert_eq!(rect(float).y, 38.0,
+                        "overflowing prefix defers only the float: {layout:?}");
+                }
+            }
         }
     }
 
