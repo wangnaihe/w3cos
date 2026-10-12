@@ -6,7 +6,7 @@
 
 use w3cos_std::color::Color;
 use w3cos_std::style::{
-    AlignSelf, BorderLineStyle, BoxSizing, Display, Edges, FlexDirection, FontStyle, Spacing, Style, UnicodeBidi,
+    AlignSelf, BorderLineStyle, BoxSizing, Display, Edges, FlexDirection, FontStyle, Overflow, Spacing, Style, UnicodeBidi,
 };
 
 /// Distinguish an HTML document's initial standard face from an embedding's
@@ -21,12 +21,17 @@ pub const TEXT_LANGUAGE_PROPERTY: &str = "--w3cos-internal-text-language";
 /// painting must not apply to a native component merely sharing its kind.
 pub const CONTROL_APPEARANCE_PROPERTY: &str = "--w3cos-internal-html-control-appearance";
 
+/// Textarea line metrics remain distinct from single-line inputs, even when
+/// an author disables automatic control painting.
+pub const TEXTAREA_PROPERTY: &str = "--w3cos-internal-html-textarea";
+
 pub(crate) fn control_appearance<'a>(
     tag: &str, input_type: Option<&str>,
     declarations: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> &'static str {
     let part = match tag {
         "button" => "button",
+        "textarea" => "textarea",
         "input" if matches!(input_type.unwrap_or("text").to_ascii_lowercase().as_str(),
             "text" | "search" | "url" | "tel" | "email" | "password") => "textfield",
         _ => return "none",
@@ -46,7 +51,7 @@ pub(crate) fn control_appearance<'a>(
         // Color, typography, dimensions and border-radius alone do not.
         decorated |= matches!(property.as_str(), "background" | "background-color" | "backgroundcolor" | "background-image" | "backgroundimage" | "border")
             || (property.starts_with("border-") && !property.contains("radius") && !property.contains("image"));
-        decorated |= part == "textfield" && matches!(property.as_str(), "box-shadow" | "boxshadow")
+        decorated |= matches!(part, "textfield" | "textarea") && matches!(property.as_str(), "box-shadow" | "boxshadow")
             && !value.trim().eq_ignore_ascii_case("none");
     }
     if automatic && !decorated { part } else { "none" }
@@ -74,7 +79,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "base" | "head" | "link" | "meta" | "noembed" | "noframes" | "param" | "script"
         | "style" | "template" | "title" => Display::None,
         "a" | "abbr" | "b" | "bdi" | "bdo" | "br" | "code" | "del" | "em" | "i" | "iframe" | "ins" | "label" | "object"
-        | "font" | "small" | "span" | "strong" | "u" => Display::Inline,
+        | "font" | "nobr" | "small" | "span" | "strong" | "u" => Display::Inline,
         "button" | "canvas" | "img" | "input" | "select" | "svg" | "textarea" | "video" => {
             Display::InlineBlock
         }
@@ -102,6 +107,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
     }
 
     match local_name {
+        "nobr" => style.white_space = w3cos_std::style::WhiteSpace::NoWrap,
         "bdo" => style.unicode_bidi = UnicodeBidi::BidiOverride,
         "bdi" => style.unicode_bidi = UnicodeBidi::Isolate,
         // The initial browser font is the host's standard face, not an
@@ -112,6 +118,16 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
                 .insert(HTML_STANDARD_FONT_PROPERTY.into(), "1".into());
         }
         "body" => style.margin = Edges::all(8.0),
+        "hr" => {
+            vertical_margin(style, 0.5);
+            style.margin.left = Spacing::Auto;
+            style.margin.right = Spacing::Auto;
+            style.overflow = w3cos_std::style::Overflow::Hidden;
+            style.color = Color::rgb(128, 128, 128);
+            style.border_width = 1.0;
+            style.border_styles = [Some(BorderLineStyle::Inset); 4];
+            style.border_current_color = Some([true; 4]);
+        }
         "iframe" => {
             // HTML frames are inline replaced elements. Component lowering
             // makes the host atomic, keeping its nested document isolated.
@@ -124,8 +140,8 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             style.border_spacing_x = 2.0;
             style.border_spacing_y = 2.0;
             style.box_sizing = w3cos_std::style::BoxSizing::BorderBox;
-            style.border_color = Color::rgb(128,128,128);
-            style.border_current_color = Some([false;4]);
+            style.border_color = style.color;
+            style.border_current_color = Some([true;4]);
         }
         "caption" => style.text_align = w3cos_std::style::TextAlign::Center,
         "td" | "th" => {
@@ -150,11 +166,16 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "input" | "textarea" => {
             if local_name == "textarea" {
                 style.font_family = Some("monospace".into());
+                style.overflow = Overflow::Auto;
+                style.custom_properties.get_or_insert_with(Default::default)
+                    .insert(TEXTAREA_PROPERTY.into(), "1".into());
+                style.custom_properties.get_or_insert_with(Default::default)
+                    .insert(crate::css_style::RESIZE_PROPERTY.into(), "both".into());
             }
             style.background = Color::WHITE;
             style.color = Color::BLACK;
             style.font_size = 13.333_333;
-            style.padding = Edges::xy(2.0, 1.0);
+            style.padding = if local_name == "textarea" { Edges::all(2.0) } else { Edges::xy(2.0, 1.0) };
             style.border_width = if local_name == "input" { 2.0 } else { 1.0 };
             style.border_color = Color::rgb(118, 118, 118);
             style.border_current_color = Some([false; 4]);
@@ -237,6 +258,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nobr_is_inline_nowrap_below_author_cascade() {
+        let mut document = crate::document::Document::new();
+        let parent = document.create_element("div");
+        parent.style_mut(&mut document).set_property("font-size", "10px");
+        parent.style_mut(&mut document).set_property("line-height", "1");
+        parent.style_mut(&mut document).set_property("white-space", "pre-wrap");
+        let nobr = document.create_element("nobr");
+        parent.append_child(&mut document, nobr);
+        document.body().append_child(&mut document, parent);
+        let style = document.computed_style_for(nobr.id);
+        assert_eq!(style.display, Display::Inline);
+        assert_eq!(style.white_space, w3cos_std::style::WhiteSpace::NoWrap);
+        assert_eq!(style.font_size, 10.0);
+        assert_eq!(style.line_height, 1.0);
+        nobr.style_mut(&mut document).set_property("white-space", "normal");
+        nobr.style_mut(&mut document).set_property("display", "block");
+        let overridden = document.computed_style_for(nobr.id);
+        assert_eq!(overridden.display, Display::Block);
+        assert_eq!(overridden.white_space, w3cos_std::style::WhiteSpace::Normal);
+        nobr.style_mut(&mut document).set_property("white-space", "inherit");
+        assert_eq!(document.computed_style_for(nobr.id).white_space,
+            w3cos_std::style::WhiteSpace::PreWrap);
+    }
+
+    #[test]
+    fn horizontal_rule_has_ua_inset_border_and_author_override() {
+        let mut document = crate::document::Document::new();
+        let hr = document.create_element("hr");
+        document.body().append_child(&mut document, hr);
+        let style = document.computed_style_for(hr.id);
+        assert_eq!(style.border_width, 1.0);
+        assert_eq!(style.border_styles, [Some(BorderLineStyle::Inset); 4]);
+        assert_eq!(style.color, Color::rgb(128, 128, 128));
+        assert_eq!(style.margin.top, Spacing::Em(0.5));
+        assert_eq!(style.margin.bottom, Spacing::Em(0.5));
+        assert_eq!(style.overflow, w3cos_std::style::Overflow::Hidden);
+        hr.style_mut(&mut document).set_property("border", "0");
+        hr.style_mut(&mut document).set_property("margin", "0");
+        let authored = document.computed_style_for(hr.id);
+        assert_eq!(authored.border_width, 0.0);
+        assert_eq!(authored.margin, Edges::ZERO);
+        document.body().style_mut(&mut document).set_property("color", "red");
+        hr.style_mut(&mut document).set_property("color", "inherit");
+        assert_eq!(document.computed_style_for(hr.id).color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
     fn nested_lists_have_zero_ua_vertical_margins_before_author_cascade() {
         let mut document = crate::document::Document::new();
         let outer = document.create_element("ul");
@@ -277,6 +345,15 @@ mod tests {
             "HTML's initial standard font must not become an explicit serif declaration");
         assert_eq!(root.custom_properties.as_ref().unwrap()
             .get(HTML_STANDARD_FONT_PROPERTY).map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn textarea_uses_auto_theme_and_two_pixel_padding_without_overriding_author_styles() {
+        let style = html_default_style("textarea");
+        assert_eq!(style.padding, Edges::all(2.0), "Chrome155 textarea computed padding");
+        assert_eq!(control_appearance("textarea", None, std::iter::empty()), "textarea");
+        assert_eq!(control_appearance("textarea", None, [("appearance", "none")].into_iter()), "none");
+        assert_eq!(control_appearance("textarea", None, [("border", "0")].into_iter()), "none");
     }
 
     #[test]

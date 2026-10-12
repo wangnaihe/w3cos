@@ -8851,9 +8851,9 @@ export function main() { return editor.createModel(4).getLineCount(); }"#,
             "api init should use one coalesced live-binding segment: {body}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(")
+            !code.contains("w3cos_vm") && !code.contains("w3cos_ir")
                 && !body.contains("W3IR module-init chunk"),
-            "editor assignment must compile through native W3IR: {body}"
+            "editor assignment must compile to the native Core ABI: {body}"
         );
 
         // Run the whole bundle through run_entry() against real w3cos-core
@@ -8874,7 +8874,7 @@ export function main() { return editor.createModel(4).getLineCount(); }"#,
             r#"
 fn main() {
     let r = run_entry();
-    assert!(matches!(r, w3cos_core::Value::Number(n) if n == 4.0), "editor.createModel(4).getLineCount(): {r:?}");
+    assert_eq!(r.as_number(), Some(4.0), "editor.createModel(4).getLineCount(): {r:?}");
     println!("W3COS_MODULE_INIT_E2E_OK");
 }
 "#
@@ -9341,7 +9341,7 @@ export function main() { return local + value; }"#,
         assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("__w3cos_async_function_await")
+            code.contains("w3cos_core::intrinsics::await_value(")
                 && code.contains("init-evaluation")
                 && code.contains("pub fn run_entry() -> w3cos_core::Value { run_entry_async() }")
                 && !code.contains("W3IR module-init chunk"),
@@ -9416,7 +9416,7 @@ fn main() {{
             r#"export let reached = "before";
 const value = await Promise.reject("tla-failed");
 reached = "after";
-export function main() { return value; }"#,
+export function main() { reached = "main"; return value; }"#,
         )
         .unwrap();
 
@@ -9426,7 +9426,7 @@ export function main() { return value; }"#,
         assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("__w3cos_async_function_await")
+            code.contains("w3cos_core::intrinsics::await_value(")
                 && code.contains("w3cos_core::intrinsics::promise_reject")
                 && !code.contains("W3IR module-init chunk"),
             "rejected native top-level await must stay on W3IR/Core: {code}"
@@ -9581,7 +9581,7 @@ fn main() {{
     );
 
     let result = run_entry();
-    assert!(matches!(result, Value::Number(value) if value == 2.0), "{{result:?}}");
+    assert_eq!(result.as_number(), Some(2.0), "{{result:?}}");
     assert_eq!(evaluations.get(), 1, "Core must cache runtime evaluation");
 }}
 "#
@@ -9685,7 +9685,7 @@ fn main() {{
     promise::drain_microtasks();
     assert!(matches!(
         promise::status(&pending),
-        Some(promise::PromiseStatus::Fulfilled(Value::Number(value))) if value == 7.0
+        Some(promise::PromiseStatus::Fulfilled(value)) if value.as_number() == Some(7.0)
     ));
 
     module_registry::clear();

@@ -120,6 +120,8 @@ pub struct Document {
     dirty: Vec<NodeId>,
     style_revision_clock: u64,
     style_revisions: Vec<u64>,
+    focused_node: Option<NodeId>,
+    focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
     normal_line_height_provider: Option<(fn(&w3cos_std::style::Style) -> Option<f32>, u64)>,
     css_image_dimensions_provider: Option<fn(&str) -> Option<(u32, u32)>>,
@@ -141,7 +143,6 @@ pub struct Document {
     // reports the selected `srcset`/`picture` candidate.
     image_render_sources: HashMap<NodeId, String>,
     embedded_document_hosts: HashSet<NodeId>,
-    anonymous_table_boundaries: HashMap<NodeId, table_mutation::Boundary>,
     // Selection state
     selection: Selection,
     // HTML attribute selector matching has a few document-language-specific
@@ -159,6 +160,13 @@ mod replaced_table;
 
 #[path = "document/table_presentation.rs"]
 mod table_presentation;
+
+#[path = "document/text_presentation.rs"]
+mod text_presentation;
+
+#[cfg(test)]
+#[path = "document/generated_content_inheritance_tests.rs"]
+mod generated_content_inheritance_tests;
 
 mod inline_boundary;
 
@@ -222,6 +230,8 @@ impl Document {
             dirty: Vec::new(),
             style_revision_clock: 0,
             style_revisions: Vec::new(),
+            focused_node: None,
+            focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
             normal_line_height_provider: None,
             css_image_dimensions_provider: None,
@@ -238,7 +248,6 @@ impl Document {
             tag_index: HashMap::new(),
             image_render_sources: HashMap::new(),
             embedded_document_hosts: HashSet::new(),
-            anonymous_table_boundaries: HashMap::new(),
             selection: Selection::new(),
             html_document: true,
             quirks_mode: false,
@@ -441,7 +450,6 @@ impl Document {
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
-        self.preserve_anonymous_table_boundary(parent, child);
         self.unlink_from_parent(child);
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
@@ -565,7 +573,6 @@ impl Document {
     }
 
     fn unlink_from_parent(&mut self, child: NodeId) {
-        self.anonymous_table_boundaries.remove(&child);
         let node = self.get_node(child);
         let parent = node.parent;
         let prev = node.prev_sibling;
@@ -682,9 +689,6 @@ impl Document {
         self.style_revisions[id.0 as usize] = self.style_revision_clock;
         self.image_render_sources.remove(&id);
         self.embedded_document_hosts.remove(&id);
-        self.anonymous_table_boundaries.retain(|anchor, boundary| {
-            *anchor != id && boundary.parent != id
-        });
         if let Some(node) = &self.nodes[id.0 as usize] {
             let tag = node.tag;
             // Remove from tag index
@@ -884,6 +888,41 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         !self.dirty.is_empty()
+    }
+
+    /// Focus is rendering state, never a reflected author attribute. The host
+    /// supplies the indication decision separately from the focused identity.
+    pub fn set_focus_state(&mut self, focused_node: Option<NodeId>, visible: bool) {
+        let visible = focused_node.is_some() && visible;
+        if self.focused_node == focused_node && self.focus_visible == visible {
+            return;
+        }
+        self.focused_node = focused_node;
+        self.focus_visible = visible;
+        // Focus can affect ancestors (:focus-within), sibling combinators and
+        // relational selectors. Conservatively invalidate the document scope.
+        self.invalidate_style_subtree(NodeId::ROOT);
+        self.record_layout_dirty(NodeId::ROOT);
+    }
+
+    pub fn is_focused(&self, id: NodeId) -> bool {
+        self.focused_node == Some(id)
+    }
+
+    pub fn is_focus_visible(&self, id: NodeId) -> bool {
+        self.is_focused(id) && self.focus_visible
+    }
+
+    pub fn is_focus_within(&self, id: NodeId) -> bool {
+        let mut current = self.focused_node;
+        while let Some(node) = current {
+            if node == id {
+                return true;
+            }
+            current = self.nodes.get(node.0 as usize)
+                .and_then(Option::as_ref).and_then(|node| node.parent);
+        }
+        false
     }
 
     fn invalidate_style_subtree(&mut self, root: NodeId) {
@@ -1181,6 +1220,7 @@ impl Document {
         stylesheet::SelectorContext::new(&node.tag.as_str(), id_attr, &class_refs)
             .with_attributes(&attribute_refs)
             .with_tree_state(is_first_child, is_root)
+            .with_focus_state(self.is_focused(id), self.is_focus_visible(id), self.is_focus_within(id))
             .with_html_document(self.html_document)
             .with_html_element(self.html_document && node.is_html_element)
     }
@@ -1252,6 +1292,14 @@ impl Document {
         author_declarations.extend(important);
         let mut merged =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+        // Textfield UA borders remain inset when author backgrounds disable
+        // automatic theme painting. Do not apply textfield geometry to other
+        // input types; author border declarations below still take precedence.
+        if user_agent::control_appearance(&node.tag.as_str(), node.get_attribute("type"),
+            std::iter::empty()) == "textfield"
+        {
+            merged.inner.border_styles = [Some(w3cos_std::style::BorderLineStyle::Inset); 4];
+        }
         if node.is_html_element {
             table_presentation::inherit_section_colors(&node.tag.as_str(),&mut merged.inner,inherited);
             table_presentation::append_border_hints(self,id,&mut user_normal);
@@ -1338,6 +1386,7 @@ impl Document {
         if let Some(value) = body_background_hint {
             user_normal.push(("background-color".to_string(), value.to_string(), 0));
         }
+        text_presentation::append_alignment_hint(self, id, &mut user_normal);
         let direction_hint = (node.node_type == NodeType::Element)
             .then(|| {
                 node.attributes
@@ -1550,8 +1599,14 @@ impl Document {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && ua_link
+                    && (ua_link || node.tag.as_str() == "hr")
                     && css_property_eq(property, "color")
+                {
+                    return true;
+                }
+                if winning_author_value.is_none()
+                    && node.tag.as_str() == "nobr"
+                    && css_property_eq(property, "white-space")
                 {
                     return true;
                 }
@@ -1650,6 +1705,7 @@ impl Document {
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("initial"))
         {
             style.color = w3cos_std::Color::BLACK;
+            style.color_rgba = None;
         }
         let declared_property_value = |properties: &[&str]| {
             author_declarations
@@ -2216,7 +2272,8 @@ impl Document {
                 | Display::Contents
                 | Display::Flex
                 | Display::Grid
-                | Display::Table => style.display,
+                | Display::Table
+                | Display::ListItem => style.display,
                 Display::InlineFlex => Display::Flex,
                 Display::InlineTable => Display::Table,
                 _ => Display::Block,
@@ -2282,6 +2339,13 @@ impl Document {
                 style.background_attachment = parent.background_attachment.clone();
                 style.background_blend_mode = parent.background_blend_mode.clone();
             }
+        }
+        if let Some((property, value)) = declared_property_value(&["outline", "outline-width", "outlineWidth"])
+            && css_property_eq(property, "outline-width")
+            && split_css_tokens(value).len() == 1
+            && let Some(width) = relative_border_width_px(value, &style)
+        {
+            style.outline_width = width;
         }
         if let Some(parent) = inherited {
             if let Some((_, value)) = declared_property_value(&["text-indent", "textIndent"]) {
@@ -2389,6 +2453,13 @@ impl Document {
                 bottom: padding_edges[2],
                 left: padding_edges[3],
             };
+            // Inheritance copies the parent's absolute outline width even
+            // when its outline-style suppresses painting (original WPT096).
+            if declared_property_value(&["outline", "outline-width", "outlineWidth"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.outline_width = parent.outline_width;
+            }
             if declared_property_value(&["direction"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
@@ -2431,15 +2502,12 @@ impl Document {
             if inherits_background_longhand("background-blend-mode") {
                 style.background_blend_mode = parent.background_blend_mode.clone();
             }
-            // Inherit the browser-computed width, not the retained authored
-            // length used when this element's own line style later changes.
-            // Chromium141 resolves none/hidden edges to zero (V2461/V2462).
+            // none/hidden suppress the parent's used paint width, not the
+            // absolute length inherited by a descendant. Chrome155 original
+            // WPT and computed-style diagnostics (V3738/V3748) retain that
+            // length, even across a non-painting intermediate element.
             let inherited_border_widths: [Option<f32>; 4] = std::array::from_fn(|side| {
-                Some(if parent.border_styles[side].is_some_and(|line| line.is_visible()) {
-                    parent.computed_border_widths[side].unwrap_or(3.0)
-                } else {
-                    0.0
-                })
+                Some(parent.computed_border_widths[side].unwrap_or(3.0))
             });
             if declared_property_value(&["border"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
@@ -3123,12 +3191,10 @@ impl Document {
                 // generated value in the cascade.
                 return None;
             }
-            if keyword.eq_ignore_ascii_case("inherit")
-                && self.inherited_element_content_value(id).is_none()
-            {
-                // Inheriting the initial `normal` value is also a valid,
-                // non-generating result rather than invalid syntax eligible
-                // for fallback.
+            if keyword.eq_ignore_ascii_case("inherit") {
+                // Blink does not import content data through ApplyInherit.
+                // A winning inherit is non-generating, not invalid syntax
+                // that can fall back to an earlier string declaration.
                 return None;
             }
             if let Some(content) =
@@ -3182,7 +3248,8 @@ impl Document {
                 | Display::Contents
                 | Display::Flex
                 | Display::Grid
-                | Display::Table => style.display,
+                | Display::Table
+                | Display::ListItem => style.display,
                 Display::InlineFlex => Display::Flex,
                 Display::InlineTable => Display::Table,
                 _ => Display::Block,
@@ -3239,7 +3306,52 @@ impl Document {
         }
         normalize_css_table_internal_used_style(&mut style);
         let (_, content) = selected_content?;
+        if style.display == w3cos_std::style::Display::ListItem {
+            // A list-item pseudo has a principal box and a marker, exactly
+            // like an authored list item. Its content runs inherit text, not
+            // the principal's margin/border/position or list-item display.
+            let mut inherited = CSSStyleDeclaration::new().to_style();
+            inherit_text_style(&mut inherited, &style, "", |_| false);
+            inherited.visibility = style.visibility;
+            let mut children = content.into_iter().map(|item| match item {
+                GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text) => {
+                    let mut run = inherited.clone();
+                    run.display = w3cos_std::style::Display::Inline;
+                    w3cos_std::Component::text(text, run)
+                }
+                GeneratedContentItem::Image(source) => {
+                    let mut run = inherited.clone();
+                    run.display = w3cos_std::style::Display::InlineBlock;
+                    w3cos_std::Component::image(source, run)
+                }
+            }).collect::<Vec<_>>();
+            if let Some(marker) = self.list_marker_component_for_pseudo(id, &style, Some(pseudo_element)) {
+                style.custom_properties.get_or_insert_with(Default::default).insert(
+                    "--w3cos-internal-list-item".into(), "1".into());
+                children.insert(0, marker);
+            }
+            style.display = w3cos_std::style::Display::Block;
+            return Some(w3cos_std::Component::boxed(style, children));
+        }
         match content.as_slice() {
+            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
+                if matches!(style.display,
+                    w3cos_std::style::Display::Table | w3cos_std::style::Display::InlineTable) =>
+            {
+                // A table pseudo owns an atomic principal box. Its string is
+                // an improper table child, not a table-shaped text leaf that
+                // can be folded into adjacent authored inline content.
+                let mut inherited = w3cos_std::style::Style::default();
+                inherit_text_style(&mut inherited, &style, "", |_| false);
+                w3cos_std::inline_text::copy_used_decoration(&mut inherited, &style);
+                inherited.visibility = style.visibility;
+                inherited.display = w3cos_std::style::Display::Inline;
+                let children = fixup_css_table_children(
+                    &style,
+                    vec![w3cos_std::Component::text(text.clone(), inherited)],
+                );
+                Some(w3cos_std::Component::boxed(style, children))
+            }
             [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
                 if style.display == w3cos_std::style::Display::Inline
                     && is_only_css_whitespace(text) =>
@@ -3365,13 +3477,27 @@ impl Document {
         id: NodeId,
         origin_style: &w3cos_std::style::Style,
     ) -> Option<w3cos_std::Component> {
+        self.list_marker_component_for_pseudo(id, origin_style, None)
+    }
+
+    fn list_marker_component_for_pseudo(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+        pseudo_element: Option<&str>,
+    ) -> Option<w3cos_std::Component> {
         let mut marker_type = None;
         let mut position = None;
         let mut current = Some(id);
+        let mut pseudo_layer = pseudo_element;
         while let Some(node_id) = current {
             let mut declared_type = None;
             let mut declared_position = None;
-            for (name, value) in stylesheet::matching_declarations_for_node(self, node_id)
+            let declarations = if let Some(pseudo) = pseudo_layer {
+                stylesheet::matching_pseudo_declarations_for_node(self, node_id, pseudo)
+                    .into_iter().map(|(name, value, _)| (name, value)).collect::<Vec<_>>()
+            } else {
+                stylesheet::matching_declarations_for_node(self, node_id)
                 .into_iter()
                 .map(|(name, value, _)| (name, value))
                 .chain(
@@ -3380,7 +3506,9 @@ impl Document {
                         .iter()
                         .cloned(),
                 )
-            {
+                .collect()
+            };
+            for (name, value) in declarations {
                 if css_property_eq(&name, "list-style") {
                     if value.trim().eq_ignore_ascii_case("inherit") {
                         declared_type = None;
@@ -3395,7 +3523,11 @@ impl Document {
                     }
                 } else if css_property_eq(&name, "list-style-type") {
                     declared_type = (!value.trim().eq_ignore_ascii_case("inherit"))
-                        .then(|| value.trim().to_ascii_lowercase());
+                        .then(|| {
+                            let value = value.trim();
+                            if value.starts_with(['\'', '"']) { value.to_string() }
+                            else { value.to_ascii_lowercase() }
+                        });
                 } else if css_property_eq(&name, "list-style-position") {
                     declared_position = (!value.trim().eq_ignore_ascii_case("inherit"))
                         .then(|| value.trim().to_ascii_lowercase());
@@ -3403,6 +3535,7 @@ impl Document {
             }
             if marker_type.is_none() {
                 marker_type = declared_type.or_else(|| {
+                    if pseudo_layer.is_some() { return None; }
                     let tag = self.get_node(node_id).tag.as_str();
                     if tag.eq_ignore_ascii_case("ol") {
                         Some("decimal".to_string())
@@ -3419,7 +3552,9 @@ impl Document {
             if marker_type.is_some() && position.is_some() {
                 break;
             }
-            current = self.get_node(node_id).parent;
+            if pseudo_layer.take().is_none() {
+                current = self.get_node(node_id).parent;
+            }
         }
         let mut style = CSSStyleDeclaration::new().to_style();
         style.display = w3cos_std::style::Display::Inline;
@@ -3459,19 +3594,24 @@ impl Document {
         }
         // Unavailable/broken images use the authored marker type. A type of
         // none suppresses only this fallback, not a successfully loaded image.
-        let marker = match marker_type.as_deref().unwrap_or("disc") {
+        let strings = parse_css_string_list(marker_type.as_deref().unwrap_or("disc"));
+        let marker_kind = if strings.len() == 1 { "string" }
+            else { marker_type.as_deref().unwrap_or("disc") };
+        let marker = match marker_kind {
             "disc" => "•".to_string(),
             "circle" => "◦".to_string(),
             "square" => "▪".to_string(),
             "decimal" => format!(
                 "{}. ",
-                self.counter_snapshot_at(id, "::marker").value("list-item")
+                self.counter_snapshot_at(id, pseudo_element.unwrap_or("::marker")).value("list-item")
             ),
             "none" => return None,
+            "string" => strings.into_iter().next()?,
             _ => return None,
         };
+        if marker_kind == "string" { style.white_space = w3cos_std::style::WhiteSpace::Pre; }
         if position.as_deref() != Some("inside") {
-            let marker_type = marker_type.as_deref().unwrap_or("disc");
+            let marker_type = marker_kind;
             style.position = w3cos_std::style::Position::Absolute;
             style.custom_properties.get_or_insert_with(Default::default).insert(
                 "--w3cos-internal-outside-list-marker".into(), marker_type.into());
@@ -3486,6 +3626,14 @@ impl Document {
                 if marker_type == "circle" {
                     style.border_width = 1.0;
                     style.border_color = style.color;
+                    // This is generated symbol ink, not an authored CSS
+                    // border with initial line-style:none and zero used edges.
+                    style.border_styles = [Some(w3cos_std::style::BorderLineStyle::Solid); 4];
+                    style.computed_border_widths = [Some(1.0); 4];
+                    style.border_top_width = None;
+                    style.border_right_width = None;
+                    style.border_bottom_width = None;
+                    style.border_left_width = None;
                 } else { style.background = style.color; }
                 return Some(w3cos_std::Component::boxed(style, vec![]));
             }
@@ -3720,8 +3868,8 @@ impl Document {
             current = self.get_node(candidate).parent;
         }
         vec![
-            ("\"".to_string(), "\"".to_string()),
-            ("'".to_string(), "'".to_string()),
+            ("“".to_string(), "”".to_string()),
+            ("‘".to_string(), "’".to_string()),
         ]
     }
 
@@ -3855,13 +4003,19 @@ impl Document {
                 return Some(snapshot);
             }
             if scopes.len() > scopes_before_child {
-                let new_sibling_scope = scopes.pop().expect("retained sibling counter scope");
+                let mut new_sibling_scope = scopes.pop().expect("retained sibling counter scope");
+                // A reset in the child shadows an inherited parent instance
+                // only for that child's subtree. Following siblings inherit
+                // their parent's instance; a newly created counter without
+                // such an instance still continues across those siblings.
+                new_sibling_scope.retain(|name, _| !scopes[..sibling_scope_base]
+                    .iter().any(|scope| scope.contains_key(name)));
                 for prior_scope in &mut scopes[sibling_scope_base..] {
                     for name in new_sibling_scope.keys() {
                         prior_scope.remove(name);
                     }
                 }
-                scopes.push(new_sibling_scope);
+                if !new_sibling_scope.is_empty() { scopes.push(new_sibling_scope); }
             }
         }
         scopes.truncate(child_scope_base);
@@ -3901,8 +4055,7 @@ impl Document {
             return None;
         }
         if value.eq_ignore_ascii_case("inherit") {
-            let inherited = self.inherited_element_content_value(id)?;
-            return self.resolve_generated_content_items(id, pseudo_element, &inherited);
+            return None;
         }
 
         let mut output = Vec::new();
@@ -4086,32 +4239,6 @@ impl Document {
             }
         }
         Some(output)
-    }
-
-    fn inherited_element_content_value(&self, id: NodeId) -> Option<String> {
-        let mut current = Some(id);
-        while let Some(node_id) = current {
-            let declared = stylesheet::matching_declarations_for_node(self, node_id)
-                .into_iter()
-                .filter(|(property, _, _)| css_property_eq(property, "content"))
-                .map(|(_, value, _)| value)
-                .last();
-            match declared.as_deref().map(str::trim) {
-                Some(value) if value.eq_ignore_ascii_case("inherit") => {
-                    current = self.get_node(node_id).parent;
-                }
-                Some(value)
-                    if value.eq_ignore_ascii_case("normal")
-                        || value.eq_ignore_ascii_case("none")
-                        || value.eq_ignore_ascii_case("initial") =>
-                {
-                    return None;
-                }
-                Some(value) => return Some(value.to_string()),
-                None => return None,
-            }
-        }
-        None
     }
 
     fn inline_ends_with_collapsible_space(&self, id: NodeId) -> bool {
@@ -4736,7 +4863,6 @@ impl Document {
             }
 
             let mut component = self.node_to_component(child_id, ancestors, Some(parent_style));
-            self.apply_anonymous_table_boundary(child_id, &mut component);
             if component.style.display == w3cos_std::style::Display::Contents {
                 components.extend(std::mem::take(&mut component.children));
                 continue;
@@ -5576,6 +5702,7 @@ impl Document {
                             .collect::<String>();
                         let generated_style = &generated[0].style;
                         style.color = generated_style.color;
+                        style.color_rgba = generated_style.color_rgba;
                         style.font_size = generated_style.font_size;
                         style.font_weight = generated_style.font_weight;
                         style.font_family = generated_style.font_family.clone();
@@ -5630,11 +5757,16 @@ impl Document {
                         .iter()
                         .all(|child_id| self.get_node(*child_id).node_type == NodeType::Text)
                     {
+                        let mut source_ends = Vec::new();
+                        let mut source_offset = 0;
                         let text = child_ids
                             .iter()
                             .enumerate()
                             .map(|(index, _)| {
-                                self.rendered_text_content(&child_ids, index, ancestors, &style)
+                                let text = self.rendered_text_content(&child_ids, index, ancestors, &style);
+                                source_offset += text.len();
+                                source_ends.push(source_offset);
+                                text
                             })
                             .collect::<String>();
                         let text = if matches!(
@@ -5643,10 +5775,13 @@ impl Document {
                                 | w3cos_std::style::WhiteSpace::NoWrap
                         ) && text.chars().any(is_bidi_whitespace_format_control)
                         {
+                            source_ends = source_ends.into_iter().map(|end|
+                                collapse_css_whitespace(&text[..end], true, false).len()).collect();
                             collapse_css_whitespace(&text, true, true)
                         } else {
                             text
                         };
+                        w3cos_std::inline_text::set_fragment_ends(&mut style, &text, &source_ends);
                         if child_ids.len() == 1 {
                             // The text-only inline fast path uses the element's
                             // principal style, but its generated words still
@@ -6083,6 +6218,19 @@ impl Document {
                     }
                     style.custom_properties.get_or_insert_with(Default::default).insert(
                         "--w3cos-internal-list-item".into(), "1".into());
+                    if children.is_empty()
+                        && marker.style.position == w3cos_std::style::Position::Absolute
+                    {
+                        // An outside marker still creates the list item's
+                        // first font line, even without authored text. Keep
+                        // zero inline advance and no ink, but export its real
+                        // line baseline to enclosing atomic inline boxes.
+                        // This is box-tree content only; the DOM stays empty.
+                        let mut line = CSSStyleDeclaration::new().to_style();
+                        line.display = w3cos_std::style::Display::Inline;
+                        inherit_text_style(&mut line, &style, "", |_| false);
+                        children.push(w3cos_std::Component::text("\u{200b}", line));
+                    }
                     children.insert(0, marker);
                 }
                 if style.display == w3cos_std::style::Display::ListItem {
@@ -7396,6 +7544,20 @@ impl Document {
                             .or_else(|| fixed_offset(style.bottom).map(|value| -value))
                             .unwrap_or(0.0);
                         for child in &mut children {
+                            if child.style.position == w3cos_std::style::Position::Static
+                                && child.style.transform.is_identity()
+                                && child.style.opacity == 1.0
+                                && child.style.filter.is_none()
+                                && !child.style.will_change.promotes_layer()
+                            {
+                                // These are fragments of one auto-positioned
+                                // inline owner, not independently positioned
+                                // siblings. Authored descendant contexts keep
+                                // their own place in the real stacking context.
+                                child.style.custom_properties.get_or_insert_with(Default::default)
+                                    .insert("--w3cos-internal-positioned-inline-owner".into(),
+                                        format!("inline:{}",id.as_u32()));
+                            }
                             if child.style.float != w3cos_std::style::Float::None {
                                 // Relative positioning moves every descendant
                                 // fragment, including floats between blocks.
@@ -7777,12 +7939,33 @@ impl Document {
                     if !middle_inline.is_empty() {
                         fragments.push(fragment_row(false, false, false, middle_inline));
                     }
-                    fragments.push(fragment_row(
-                        !inline_start_is_left,
-                        inline_start_is_left,
-                        false,
-                        trailing,
-                    ));
+                    // A paint/edge-free inline ending immediately after a
+                    // block creates no trailing line box. A synthetic empty
+                    // Flex carrier would stop that block's bottom margin from
+                    // collapsing through its parent and enlarge table rows.
+                    // Percent/viewport spacing cannot be resolved here: its
+                    // containing block is not known yet. Only syntactic zero
+                    // (or inline auto, whose used value is zero) is empty.
+                    let zero_margin = |margin| matches!(margin,
+                        w3cos_std::style::Spacing::Px(value)
+                            | w3cos_std::style::Spacing::Em(value)
+                            | w3cos_std::style::Spacing::Rem(value)
+                            | w3cos_std::style::Spacing::Ch(value)
+                            | w3cos_std::style::Spacing::Percent(value)
+                            | w3cos_std::style::Spacing::Vw(value)
+                            | w3cos_std::style::Spacing::Vh(value) if value == 0.0)
+                        || matches!(margin, w3cos_std::style::Spacing::Auto);
+                    if !trailing.is_empty() || !passive_fragment
+                        || !zero_margin(style.margin.left) || !zero_margin(style.margin.right)
+                        || style.position != w3cos_std::style::Position::Static
+                    {
+                        fragments.push(fragment_row(
+                            !inline_start_is_left,
+                            inline_start_is_left,
+                            false,
+                            trailing,
+                        ));
+                    }
                     return boxed_split_inline_group(&style, fragments);
                 }
 
@@ -9302,7 +9485,7 @@ fn format_counter_value(value: i32, style: &str) -> String {
         "none" => String::new(),
         "disc" => "•".to_string(),
         "circle" => "◦".to_string(),
-        "square" => "▪".to_string(),
+        "square" => "■".to_string(),
         "decimal-leading-zero" if value < 0 && value > -10 => format!("-0{}", -value),
         "decimal-leading-zero" if value >= 0 && value < 10 => format!("0{value}"),
         "lower-alpha" | "lower-latin" => alphabetic_counter(
@@ -9455,6 +9638,7 @@ fn inherit_text_style(
 
     if !declares("color") && !form_control {
         style.color = parent.color;
+        style.color_rgba = parent.color_rgba;
     }
     if !declares("font-size") && !declares("font") && !form_control && !heading {
         style.font_size = parent.font_size;
@@ -10107,30 +10291,69 @@ fn cloned_text_fragment(
     fragment
 }
 
+fn first_letter_is_surrounding_punctuation(character: char) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    matches!(character.general_category(), GeneralCategory::OpenPunctuation
+        | GeneralCategory::ClosePunctuation | GeneralCategory::InitialPunctuation
+        | GeneralCategory::FinalPunctuation | GeneralCategory::OtherPunctuation)
+}
+
+// A first letter requires a typographic unit: a line containing only its
+// surrounding Ps/Pe/Pi/Pf/Po punctuation does not generate the pseudo-element.
+// Scan in-flow content across source boundaries without crossing a hard break.
+fn first_letter_line_eligibility(components: &[w3cos_std::Component]) -> Option<bool> {
+    for component in components {
+        if component.style.display == w3cos_std::style::Display::None
+            || component.style.float != w3cos_std::style::Float::None
+            || matches!(component.style.position, w3cos_std::style::Position::Absolute
+                | w3cos_std::style::Position::Fixed) {
+            continue;
+        }
+        if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+            for character in content.chars() {
+                if character == '\u{2028}' || (character == '\n' && matches!(
+                    component.style.white_space, w3cos_std::style::WhiteSpace::Pre
+                        | w3cos_std::style::WhiteSpace::PreWrap | w3cos_std::style::WhiteSpace::PreLine)) {
+                    return Some(false);
+                }
+                if !character.is_whitespace() && !first_letter_is_surrounding_punctuation(character) {
+                    return Some(true);
+                }
+            }
+        } else if let Some(found) = first_letter_line_eligibility(&component.children) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn first_letter_fragment_range(
     content: &str,
     letter_seen: &mut bool,
 ) -> (Option<std::ops::Range<usize>>, bool) {
     let mut start = None;
     let mut end = None;
-    for (index, character) in content.char_indices() {
+    use unicode_segmentation::UnicodeSegmentation;
+    for (index, grapheme) in content.grapheme_indices(true) {
+        let character = grapheme.chars().next().expect("nonempty grapheme");
+        let punctuation = first_letter_is_surrounding_punctuation(character);
         if start.is_none() {
             if !*letter_seen && character.is_whitespace() {
                 continue;
             }
-            if *letter_seen && (character.is_whitespace() || character.is_alphanumeric()) {
+            if *letter_seen && (character.is_whitespace() || !punctuation) {
                 return (None, true);
             }
             start = Some(index);
         }
-        if *letter_seen && (character.is_alphanumeric() || character.is_whitespace()) {
+        if *letter_seen && (!punctuation || character.is_whitespace()) {
             return (
                 Some(start.expect("first-letter fragment")..end.expect("fragment end")),
                 true,
             );
         }
-        end = Some(index + character.len_utf8());
-        *letter_seen |= character.is_alphanumeric();
+        end = Some(index + grapheme.len());
+        *letter_seen |= !punctuation && !character.is_whitespace();
     }
     (start.zip(end).map(|(start, end)| start..end), false)
 }
@@ -10140,6 +10363,9 @@ fn apply_first_letter_style(
     declarations: &[(String, String, u32)],
     origin_style: &w3cos_std::style::Style,
 ) -> bool {
+    if first_letter_line_eligibility(components) != Some(true) {
+        return false;
+    }
     let mut letter_seen = false;
     apply_first_letter_style_inner(components, declarations, &mut letter_seen, origin_style).0
 }
@@ -10169,7 +10395,15 @@ fn apply_first_letter_style_inner(
                 return (changed, true);
             }
             let letter_was_seen = *letter_seen;
-            let (range, done) = first_letter_fragment_range(content, letter_seen);
+            // Coalescing is a shaping optimization, not a change to the
+            // originating text-node boundary. Chrome stops a punctuation-only
+            // first-letter at that boundary (including generated content).
+            let source_end = w3cos_std::inline_text::fragment_ends(
+                content, &components[index].style,
+            ).and_then(|ends| ends.into_iter().find(|end| {
+                content[..*end].chars().any(|character| !character.is_whitespace())
+            })).unwrap_or(content.len());
+            let (range, done) = first_letter_fragment_range(&content[..source_end], letter_seen);
             let Some(range) = range else {
                 if done {
                     return (changed, true);
@@ -10235,11 +10469,7 @@ fn apply_first_letter_style_inner(
             }
             components.splice(index..=index, fragments);
             changed = true;
-            if done {
-                return (changed, true);
-            }
-            index += 1;
-            continue;
+            return (changed, true);
         }
 
         if !components[index].children.is_empty() {
@@ -10633,6 +10863,7 @@ fn equivalent_text_paint_style(
     right: &w3cos_std::style::Style,
 ) -> bool {
     left.color == right.color
+        && left.color_rgba == right.color_rgba
         && left.font_size == right.font_size
         && left.font_weight == right.font_weight
         && left.font_family == right.font_family
@@ -11208,8 +11439,13 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             && [child.style.border_top_left_radius, child.style.border_top_right_radius,
                 child.style.border_bottom_left_radius, child.style.border_bottom_right_radius]
                 .into_iter().all(|radius| radius.unwrap_or(0.0) == 0.0)
+            // currentColor belongs to the decorated owner, not an arbitrary
+            // glyph descendant. Same-color leaves can carry that decoration
+            // through the shared inline fragmentation path without rebinding
+            // it to a different color.
             && (!bordered || !child.style.border_current_color
-                .is_some_and(|flags| flags.into_iter().any(|flag| flag)))
+                .is_some_and(|flags| flags.into_iter().any(|flag| flag))
+                || child.children.iter().all(|text| text.style.color == child.style.color))
             // Removing the host must not remove an independently taller
             // font strut. The enclosing context already owns this strut.
             && (!bordered || child.style.font_size == component.style.font_size
@@ -11416,15 +11652,27 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             .flat_map(|word| {
                 let mut start = 0;
                 let mut segments = Vec::new();
-                for (index, _) in word.char_indices() {
-                    if let Some(end) = w3cos_std::inline_text::explicit_hyphen_break_end(word, index) {
+                for (index, character) in word.char_indices() {
+                    if character == '\u{2028}' {
+                        if start < index {
+                            segments.push((&word[start..index], false));
+                        }
+                        let end = index + character.len_utf8();
+                        segments.push((&word[index..end], false));
+                        start = end;
+                    } else if let Some(end) = w3cos_std::inline_text::explicit_hyphen_break_end(word, index) {
                         segments.push((&word[start..end], false));
                         start = end;
                     }
                 }
                 // Only an authored space separates distinct words. A hyphen
                 // ends its painted segment without an anonymous space box.
-                segments.push((&word[start..], true));
+                if start < word.len() {
+                    segments.push((&word[start..], true));
+                } else if let Some(last) = segments.last_mut() {
+                    // Preserve an authored space after a terminal break.
+                    last.1 = true;
+                }
                 segments
             })
             .collect::<Vec<_>>();
@@ -12916,6 +13164,16 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             let mut ends = Vec::new();
             let mut previous_source = None;
             w3cos_std::inline_text::append_source_fragment_ends(&mut ends, 0, previous_content, &previous.style, &mut previous_source);
+            // A bidi segment boundary is a used glyph origin even when both
+            // segments came from the same authored text node. Source identity
+            // must not erase that boundary while sharing visual text storage.
+            let bidi_level = |style: &w3cos_std::Style| style.custom_properties.as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-bidi-resolved-level"))
+                .and_then(|value| value.parse::<u8>().ok());
+            if bidi_level(&previous.style).map(|level| level % 2)
+                != bidi_level(&fragment.style).map(|level| level % 2) {
+                previous_source = None;
+            }
             w3cos_std::inline_text::append_source_fragment_ends(&mut ends, previous_content.len(), content, &fragment.style, &mut previous_source);
             previous_content.push_str(content);
             w3cos_std::inline_text::set_fragment_ends(&mut previous.style, previous_content, &ends);
@@ -13532,14 +13790,14 @@ fn hoist_floats_into_block_formatting_context(
                 // Wrappable inline content shares the outer line context even
                 // when its float is first. A first float in an unbroken nowrap
                 // run instead retains that run's source anchor. Keep every
-                // right-float encounter in a nowrap run, not only its first:
+                // float encounter in a nowrap run, not only its first:
                 // later coalescing must not replace a fitting prefix with the
                 // entire overflowing run when deciding float placement.
                 // Same-line float extraction may not cross an earlier forced
                 // break. Keep that float in its inline source context so the
                 // outer BFC can resolve its line-constrained placement.
                 let extract_child = !has_prior_forced_break
-                    && (child.style.float != w3cos_std::style::Float::Right
+                    && (child.style.float == w3cos_std::style::Float::None
                         || component.style.white_space != w3cos_std::style::WhiteSpace::NoWrap);
                 if let Some(child) = collect(
                     child,
@@ -14074,10 +14332,7 @@ fn fixup_css_table_children(
                         ));
                     }
                 };
-            for mut child in children {
-                if table_mutation::take_boundary(&mut child, "row") {
-                    flush_row(&mut fixed, &mut row_children);
-                }
+            for child in children {
                 if child.style.float != Float::None
                     || matches!(child.style.position, Position::Absolute | Position::Fixed)
                 {
@@ -14123,10 +14378,7 @@ fn fixup_css_table_children(
                         ));
                     }
                 };
-            for mut child in children {
-                if table_mutation::take_boundary(&mut child, "row") {
-                    flush_improper(&mut fixed, &mut improper);
-                }
+            for child in children {
                 if child.style.display == Display::TableRow {
                     flush_improper(&mut fixed, &mut improper);
                     fixed.push(child);
@@ -14165,10 +14417,7 @@ fn fixup_css_table_children(
                         ));
                     }
                 };
-            for mut child in children {
-                if table_mutation::take_boundary(&mut child, "table") {
-                    flush_table_run(&mut fixed, &mut table_run);
-                }
+            for child in children {
                 if is_table_internal(child.style.display) {
                     table_run.push(child);
                 } else {
@@ -14281,6 +14530,49 @@ mod generated_counter_format_tests {
     use super::*;
 
     #[test]
+    fn outside_circle_marker_retains_a_visible_used_stroke() {
+        let mut document = Document::new();
+        let item = document.create_element("li");
+        item.style_mut(&mut document).set_property("list-style-type", "circle");
+        document.body().append_child(&mut document, item);
+        let marker = document.list_marker_component(item.id, &document.computed_style_for(item.id)).unwrap();
+        let mut used = marker.style;
+        used.resolve_used_border_widths();
+        assert_eq!(used.border_width, 1.0, "the generated circle's stroke must not inherit CSS initial border-style:none");
+        assert!(used.border_styles.iter().all(|line| *line == Some(w3cos_std::style::BorderLineStyle::Solid)));
+        assert!([used.border_top_width, used.border_right_width, used.border_bottom_width,
+            used.border_left_width].iter().all(|width| width.unwrap_or(used.border_width) == 1.0));
+    }
+
+    #[test]
+    fn generated_list_item_has_its_own_marker_and_inherited_content_run() {
+        for pseudo in ["::before", "::after"] {
+            for (declaration, expected) in [("inherit", Some("square")), ("disc", Some("disc")), ("none", None)] {
+                crate::stylesheet::clear_rules();
+                crate::stylesheet::register_rule(&format!("div{pseudo}"), &[
+                    ("content", "\"Filler text\""), ("display", "list-item"),
+                    ("margin-left", "1em"), ("list-style-type", declaration),
+                ]);
+                let mut document = Document::new();
+                let origin = document.create_element("div");
+                origin.style_mut(&mut document).set_property("list-style-type", "square");
+                document.body().append_child(&mut document, origin);
+                let generated = document.generated_pseudo_component(origin.id, pseudo,
+                    &document.computed_style_for(origin.id)).unwrap();
+                assert_eq!(generated.style.display, w3cos_std::style::Display::Block);
+                let marker = generated.children.iter().find_map(|child| child.style.custom_properties.as_ref()
+                    .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker")));
+                assert_eq!(marker.map(String::as_str), expected);
+                let text = generated.children.iter().find(|child| matches!(child.kind,
+                    w3cos_std::ComponentKind::Text { ref content } if content == "Filler text")).unwrap();
+                assert_eq!(text.style.display, w3cos_std::style::Display::Inline);
+                assert_eq!(text.style.margin.left, w3cos_std::style::Spacing::Px(0.0));
+                crate::stylesheet::clear_rules();
+            }
+        }
+    }
+
+    #[test]
     fn loaded_list_image_precedes_none_type_and_unavailable_image_uses_fallback() {
         fn dimensions(source: &str) -> Option<(u32, u32)> {
             (source == "loaded.png").then_some((10, 6))
@@ -14330,6 +14622,26 @@ mod generated_counter_format_tests {
         assert_eq!(image(&document), "none");
         item.style_mut(&mut document).set_property("list-style-image", "unset");
         assert_eq!(image(&document), "url('Diamond.PNG')");
+    }
+
+    #[test]
+    fn string_list_markers_decode_escapes_and_preserve_case_and_spacing() {
+        for (value,expected) in [(r#""\2022""#,"•"),(r#""PASS ""#,"PASS "),("'AbC'","AbC")] {
+            for position in ["inside","outside"] {
+                let mut document = Document::new();
+                let item = document.create_element("div");
+                item.style_mut(&mut document).set_property("display","list-item");
+                item.style_mut(&mut document).set_property("list-style-type",value);
+                item.style_mut(&mut document).set_property("list-style-position",position);
+                let style = document.computed_style_for(item.id);
+                let marker = document.list_marker_component(item.id,&style).expect("CSS string marker");
+                assert!(matches!(&marker.kind,w3cos_std::ComponentKind::Text { content } if content==expected));
+                assert_eq!(marker.style.white_space,w3cos_std::style::WhiteSpace::Pre);
+                let kind = marker.style.custom_properties.as_ref().and_then(|properties|
+                    properties.get("--w3cos-internal-outside-list-marker")).map(String::as_str);
+                assert_eq!(kind,if position=="outside" { Some("string") } else { None });
+            }
+        }
     }
 
     #[test]
@@ -14416,6 +14728,33 @@ mod generated_counter_format_tests {
     }
 
     #[test]
+    fn sibling_reset_shadows_but_does_not_replace_an_inherited_parent_counter() {
+        crate::stylesheet::clear_rules();
+        for parent_reset in [false, true] {
+            for display in ["inline", "block"] {
+                let mut document = Document::new();
+                let parent = document.create_element("div");
+                if parent_reset { parent.style_mut(&mut document).set_property("counter-reset", "c"); }
+                document.body().append_child(&mut document, parent);
+                let children = (0..5).map(|index| {
+                    let child = document.create_element("span");
+                    child.style_mut(&mut document).set_property("display", display);
+                    child.style_mut(&mut document).set_property("counter-increment", "c");
+                    if index == 2 { child.style_mut(&mut document).set_property("counter-reset", "c 48"); }
+                    parent.append_child(&mut document, child);
+                    child
+                }).collect::<Vec<_>>();
+                let values = children.iter().map(|child|
+                    document.counter_snapshot_at(child.id, "::marker").value("c")).collect::<Vec<_>>();
+                // Chrome155 DOMSnapshot fixture v3308; both display modes agree.
+                assert_eq!(values, if parent_reset { vec![1, 2, 49, 3, 4] }
+                    else { vec![1, 2, 49, 50, 51] }, "parent_reset={parent_reset}, display={display}");
+            }
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn outside_list_symbols_are_out_of_flow_and_inherit_marker_color() {
         for marker_type in ["disc", "circle", "square"] {
             let mut document = Document::new();
@@ -14484,6 +14823,15 @@ mod generated_counter_format_tests {
                 .value("list-item"),
             1
         );
+    }
+
+    #[test]
+    fn generated_square_counter_uses_the_css_counter_style_symbol() {
+        // Original content-counter-004 Chrome155 DOMSnapshot v3310.
+        // Generated counter text is not the UA's geometric list marker.
+        for value in [-7, 0, 1, 42] {
+            assert_eq!(format_counter_value(value, "square"), "\u{25a0}");
+        }
     }
 
     #[test]
@@ -14774,8 +15122,31 @@ mod image_component_tests {
     }
 
     #[test]
+    fn fractional_foreground_inherits_and_blocks_integer_color_coalescing() {
+        use w3cos_std::{Component, Style};
+        let mut declaration = crate::css_style::CSSStyleDeclaration::new();
+        declaration.set_property("color", "rgb(0%,50%,0%)");
+        let parent = declaration.inner;
+        let mut inherited = Style::default();
+        inherit_text_style(&mut inherited, &parent, "span", |_| false);
+        assert_eq!(inherited.color_rgba, Some([0.0,0.5,0.0,1.0]));
+        inherited.display = Display::Inline;
+        let mut integer = inherited.clone();
+        integer.color_rgba = None;
+        inherit_text_style(&mut integer, &parent, "span", |property| property == "color");
+        assert_eq!(integer.color_rgba, None);
+        let mut row = Component::row(Style::default(), vec![
+            Component::text("half", inherited), Component::text("green", integer),
+        ]);
+        coalesce_passive_inline_text_children(&mut row);
+        assert_eq!(row.children.len(),2,
+            "equal quantized colors must not erase distinct paint precision");
+    }
+
+    #[test]
     fn bidi_level_boundaries_survive_passive_coalescing() {
         use w3cos_std::{Component, Style};
+        for source in [None, Some("text:1")] {
         let mut normal = Style::default();
         normal.display = Display::Inline;
         let children = [("(Force bidi: ", "0"), ("א", "1"), (")", "0")]
@@ -14784,6 +15155,10 @@ mod image_component_tests {
                 mark_bidi_visual_order(&mut style);
                 style.custom_properties.as_mut().unwrap().insert(
                     "--w3cos-internal-bidi-resolved-level".into(), level.into());
+                if let Some(source) = source {
+                    style.custom_properties.as_mut().unwrap().insert(
+                        w3cos_std::inline_text::SOURCE_RUN.into(), source.into());
+                }
                 Component::text(content, style)
             }).collect();
         let mut row = Component::row(Style::default(), children);
@@ -14792,6 +15167,7 @@ mod image_component_tests {
         let ComponentKind::Text { content } = &row.children[0].kind else { panic!("text run") };
         assert_eq!(w3cos_std::inline_text::fragment_ends(content, &row.children[0].style),
             Some(vec![13, 15, 16]), "used run boundaries must survive shared storage");
+        }
     }
 
     #[test]
@@ -14856,14 +15232,14 @@ mod image_component_tests {
     }
 
     #[test]
-    fn css_whitespace_collapses_across_bidi_format_controls() {
+    fn css_whitespace_preserves_sequences_separated_by_bidi_controls() {
         assert_eq!(
             collapse_css_whitespace("x \u{202e} x \u{202c} x", false, false),
-            "x \u{202e}x \u{202c}x",
+            "x \u{202e} x \u{202c} x",
         );
         assert_eq!(
             collapse_css_whitespace("a \u{202a}  b", false, false),
-            "a \u{202a}b",
+            "a \u{202a} b",
         );
 
         crate::stylesheet::clear_rules();
@@ -14879,7 +15255,7 @@ mod image_component_tests {
             runs.iter()
                 .map(|(text, _)| text.as_str())
                 .collect::<String>(),
-            "x \u{202e}x \u{202c}x",
+            "x \u{202e} x \u{202c} x",
             "{runs:?}"
         );
 
@@ -14897,7 +15273,7 @@ mod image_component_tests {
             runs.iter()
                 .map(|(text, _)| text.as_str())
                 .collect::<String>(),
-            "x \u{202e}x \u{202c}x",
+            "x \u{202e} x \u{202c} x",
             "{runs:?}"
         );
     }
@@ -17072,8 +17448,12 @@ mod image_component_tests {
 
         let mut first = floating_box(Float::Left);
         first.style.clear = w3cos_std::style::Clear::Left;
+        first.style.width = Dimension::Px(30.0);
+        first.style.height = Dimension::Px(20.0);
         let mut cleared = floating_box(Float::Left);
         cleared.style.clear = w3cos_std::style::Clear::Left;
+        cleared.style.width = Dimension::Px(30.0);
+        cleared.style.height = Dimension::Px(20.0);
         let fixed =
             hoist_floats_into_block_formatting_context(&context_style, vec![first, cleared]);
         assert_eq!(fixed.len(), 2);
@@ -17081,13 +17461,31 @@ mod image_component_tests {
             component.style.display == Display::Flex
                 && component.style.float == Float::Left
                 && component.style.clear == w3cos_std::style::Clear::Left
-                && component.style.width == Dimension::Percent(100.0)
-                && matches!(component.children.as_slice(), [child] if child.style.float == Float::Left)
+                // This floated synthetic owner shrink-wraps its authored
+                // float; a 100% owner would exclude the whole parent band.
+                && component.style.width == Dimension::Auto
+                && component.style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.get("--w3cos-internal-cleared-float-wrapper")
+                        .is_some_and(|value| value == "1"))
+                && matches!(component.children.as_slice(), [child]
+                    if child.style.float == Float::Left
+                        && child.style.width == Dimension::Px(30.0)
+                        && child.style.height == Dimension::Px(20.0)
+                        && child.style.flex_shrink == 0.0)
         }));
     }
 
     #[test]
     fn floated_boxes_in_anonymous_nowrap_rows_do_not_flex_shrink() {
+        fn collect_floats<'a>(nodes: &'a [w3cos_std::Component], side: Float,
+            output: &mut Vec<&'a w3cos_std::Component>) {
+            for node in nodes {
+                if node.style.float == side {
+                    output.push(node);
+                }
+                collect_floats(&node.children, side, output);
+            }
+        }
         for side in [Float::Left, Float::Right] {
             for nested in [false, true] {
                 let inline_style = w3cos_std::style::Style {
@@ -17121,16 +17519,21 @@ mod image_component_tests {
                     &w3cos_std::style::Style::default(),
                     children,
                 );
-                let float = fixed
-                    .iter()
-                    .find(|child| child.style.float == side)
-                    .unwrap();
+                // NoWrap encounters remain inside their source inline;
+                // locate the actual float without requiring hoisting.
+                let mut floats = Vec::new();
+                collect_floats(&fixed, side, &mut floats);
+                assert_eq!(floats.len(), 1, "side={side:?}, nested={nested}");
+                let float = floats[0];
                 assert_eq!(float.style.width, Dimension::Ch(5.0));
                 assert_eq!(
                     float.style.flex_shrink, 0.0,
                     "side={side:?}, nested={nested}"
                 );
-                if side == Float::Right && nested {
+                if nested {
+                    assert_eq!(fixed.len(), 1);
+                    assert_eq!(fixed[0].children.len(), 2);
+                    assert_eq!(fixed[0].children[1].style.float, side);
                     assert!(!fixed.iter().any(|child| matches!(&child.kind,
                         ComponentKind::Text { content } if content == " ")));
                 }
@@ -17211,6 +17614,29 @@ mod image_component_tests {
         );
         assert_eq!(fixed.len(), 1);
         assert_eq!(fixed[0].children[0].style.float, Float::Right);
+    }
+
+    #[test]
+    fn nowrap_left_float_preserves_its_inline_encounter_position() {
+        use w3cos_std::style::{Style, WhiteSpace};
+        let inline = Style { display: Display::Inline,
+            white_space: WhiteSpace::NoWrap, ..Style::default() };
+        for leading in [false, true] {
+            let mut children = vec![];
+            if !leading {
+                children.push(w3cos_std::Component::text("2222", inline.clone()));
+            }
+            children.push(w3cos_std::Component::boxed(Style { float: Float::Left,
+                width: Dimension::Px(72.0), height: Dimension::Px(10.0),
+                ..inline.clone() }, vec![]));
+            children.push(w3cos_std::Component::text("3333", inline.clone()));
+            let expected = children.len();
+            let fixed = hoist_floats_into_block_formatting_context(&Style::default(),
+                vec![w3cos_std::Component::boxed(inline.clone(), children)]);
+            assert_eq!(fixed.len(), 1, "nowrap float retains source position, leading={leading}");
+            assert_eq!(fixed[0].children.len(), expected);
+            assert_eq!(fixed[0].children[usize::from(!leading)].style.float, Float::Left);
+        }
     }
 
     #[test]
@@ -17478,7 +17904,7 @@ mod image_component_tests {
     }
 
     #[test]
-    fn block_only_inline_block_uses_its_bottom_edge_baseline() {
+    fn block_only_inline_block_defers_content_baseline_to_layout() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("#host", &[("display", "inline-block")]);
         crate::stylesheet::register_rule("#block", &[("display", "block")]);
@@ -17494,7 +17920,12 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let host = tree.children.first().expect("inline-block host");
-        assert_eq!(host.style.align_self, AlignSelf::FlexEnd);
+        // A nonempty block descendant exports its last in-flow line. DOM
+        // lowering cannot replace that baseline with the atomic bottom edge;
+        // the parsed runtime matrix independently checks the used geometry.
+        assert_eq!(host.style.align_self, AlignSelf::Auto);
+        assert_eq!(host.children.len(), 1);
+        assert_eq!(host.children[0].style.display, Display::Block);
         crate::stylesheet::clear_rules();
     }
 
@@ -17579,6 +18010,75 @@ mod image_component_tests {
     }
 
     #[test]
+    fn punctuation_only_first_line_has_no_first_letter() {
+        for text in ["\"\"", "«»", "...", "\u{0387}"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("div::first-letter", &[("color", "green")]);
+            let mut document = Document::new();
+            let block = document.create_element("div");
+            let node = document.create_text_node(text);
+            block.append_child(&mut document, node);
+            document.body().append_child(&mut document, block);
+            let tree = document.to_component_tree();
+            for (_, style) in descendant_text_runs(&tree) {
+                assert_ne!(style.color, w3cos_std::Color::from_named("green").unwrap(), "{text:?}");
+            }
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_letter_keeps_a_nonpunctuation_grapheme_as_one_unit() {
+        for (text, first, rest) in [("$T", "$", "T"), ("-T", "-", "T"),
+            ("_T", "_", "T"), ("☀T", "☀", "T"), ("A\u{0308}B", "A\u{0308}", "B")] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("div::first-letter", &[("color", "green")]);
+            let mut document = Document::new();
+            let block = document.create_element("div");
+            let node = document.create_text_node(text);
+            block.append_child(&mut document, node);
+            document.body().append_child(&mut document, block);
+            let tree = document.to_component_tree();
+            let runs = descendant_text_runs(&tree);
+            assert_eq!(runs[0].0, first, "{text:?}");
+            assert_eq!(runs[1..].iter().map(|run| run.0.as_str()).collect::<String>(), rest);
+            assert_eq!(runs[0].1.color, w3cos_std::Color::from_named("green").unwrap());
+            assert!(runs[1..].iter().all(|run| run.1.color != runs[0].1.color));
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_letter_does_not_extend_a_punctuation_only_text_fragment() {
+        for generated in [false, true] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("div::first-letter", &[("color", "green")]);
+            if generated {
+                crate::stylesheet::register_rule("span::before", &[("content", "'\"'")]);
+            }
+            let mut document = Document::new();
+            let block = document.create_element("div");
+            let span = document.create_element("span");
+            if !generated {
+                let quote = document.create_text_node("\"");
+                span.append_child(&mut document, quote);
+            }
+            let text = document.create_text_node("This is text\"");
+            span.append_child(&mut document, text);
+            block.append_child(&mut document, span);
+            document.body().append_child(&mut document, block);
+            let tree = document.to_component_tree();
+            let runs = descendant_text_runs(&tree);
+            assert_eq!(runs[0].0, "\"", "generated={generated}");
+            assert_eq!(runs[0].1.color, w3cos_std::Color::from_named("green").unwrap());
+            for run in &runs[1..] {
+                assert_ne!(run.1.color, runs[0].1.color, "next source fragment, generated={generated}");
+            }
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn first_letter_splits_only_the_initial_typographic_unit() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("p::first-letter", &[("color", "green")]);
@@ -17590,15 +18090,16 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
-        assert_eq!(
-            runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(),
-            ["T", "his is text"]
-        );
+        assert_eq!(runs[0].0, "T");
+        assert_eq!(runs[1..].iter().map(|run| run.0.as_str()).collect::<String>(), "his is text");
         assert_eq!(
             runs[0].1.color,
             w3cos_std::Color::from_named("green").unwrap()
         );
-        assert_ne!(runs[1].1.color, runs[0].1.color);
+        for run in &runs[1..] {
+            assert_ne!(run.1.color, runs[0].1.color, "only the initial unit receives first-letter color");
+        }
+        assert_eq!(text.text_content(&document), Some("This is text"));
         crate::stylesheet::clear_rules();
     }
 
@@ -17613,12 +18114,13 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
-        assert_eq!(
-            runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(),
-            ["F", "iller Text"]
-        );
+        assert_eq!(runs[0].0, "F");
+        assert_eq!(runs[1..].iter().map(|run| run.0.as_str()).collect::<String>(), "iller Text");
         assert_eq!(runs[0].1.font_size, 98.0);
-        assert_ne!(runs[1].1.font_size, 98.0);
+        for run in &runs[1..] {
+            assert_eq!(run.1.font_size, 16.0, "generated remainder keeps the originating block font");
+        }
+        assert!(document.children_ids(block.id).is_empty(), "generated content must not become DOM children");
         crate::stylesheet::clear_rules();
     }
 
@@ -17964,19 +18466,26 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
-        let first = runs
-            .iter()
-            .find(|run| run.0 == "first line")
-            .expect("first line");
-        let second = runs
-            .iter()
-            .find(|run| run.0 == "second line")
-            .expect("second line");
-        assert_eq!(
-            first.1.color,
-            w3cos_std::Color::from_named("fuchsia").unwrap()
-        );
-        assert_ne!(second.1.color, first.1.color);
+        // Word fragmentation is an implementation detail. Assert every
+        // fragment from each authored text node, not a single unsplit leaf.
+        let normal_color = document.computed_style_for(paragraph.id).color;
+        let first_color = w3cos_std::Color::from_named("fuchsia").unwrap();
+        assert_ne!(normal_color, first_color);
+        for (id, text, color) in [
+            (first.id, "first line", first_color),
+            (second.id, "second line", normal_color),
+        ] {
+            let source = format!("text:{}", id.as_u32());
+            let fragments = runs.iter().filter(|(_, style)| {
+                style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties.get(w3cos_std::inline_text::SOURCE_RUN) == Some(&source)
+                })
+            }).collect::<Vec<_>>();
+            assert!(!fragments.is_empty(), "missing source {source}");
+            assert_eq!(fragments.iter().map(|(text, _)| text.as_str()).collect::<String>(), text);
+            assert!(fragments.iter().all(|(_, style)| style.color == color),
+                "wrong first-line color on source {source}");
+        }
         crate::stylesheet::clear_rules();
     }
 
@@ -18319,7 +18828,29 @@ mod image_component_tests {
             .into_iter()
             .map(|run| run.0)
             .collect::<String>();
-        assert_eq!(rendered, "\"Foo\"<1>0</1>");
+        // Chrome155's default quote pairs are typographic, not ASCII (the
+        // pinned dynamic002 actual/reference captures both establish this).
+        assert_eq!(rendered, "“Foo”<1>0</1>");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn default_quote_pairs_preserve_nested_depth_and_authored_override() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let outer = document.create_element("q");
+        let inner = document.create_element("q");
+        let text = document.create_text_node("text");
+        inner.append_child(&mut document, text);
+        outer.append_child(&mut document, inner);
+        document.body().append_child(&mut document, outer);
+        let tree = document.to_component_tree();
+        let rendered = descendant_text_runs(&tree).into_iter().map(|run| run.0).collect::<String>();
+        assert_eq!(rendered, "“‘text’”");
+        outer.style_mut(&mut document).set_property("quotes", "'<' '>' '[' ']'");
+        let tree = document.to_component_tree();
+        let rendered = descendant_text_runs(&tree).into_iter().map(|run| run.0).collect::<String>();
+        assert_eq!(rendered, "<[text]>");
         crate::stylesheet::clear_rules();
     }
 
@@ -18537,6 +19068,28 @@ mod image_component_tests {
     }
 
     #[test]
+    fn split_inline_words_exposes_forced_break_before_a_word() {
+        use w3cos_std::{Component, style::Style};
+        let inline = Style { display: Display::Inline, ..Style::default() };
+        for text in ["\u{2028}Filler Text", "Filler\u{2028}Text More"] {
+            let mut row = Component::row(Style { display: Display::Inline,
+                flex_wrap: w3cos_std::style::FlexWrap::Wrap,
+                custom_properties: Some(std::collections::HashMap::from([(
+                    "--w3cos-internal-inline-formatting-context".into(), "1".into(),
+                )])),
+                ..Style::default() }, vec![Component::text("Before", inline.clone()),
+                    Component::text(text, inline.clone())]);
+            split_padded_inline_text_fragments(&mut row);
+            let runs = descendant_text_runs(&row);
+            let parts = runs.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>();
+            assert!(parts.contains(&"\u{2028}"), "forced break remains embedded in a word: {parts:?}");
+            assert_eq!(parts.concat(), format!("Before{text}"));
+            assert!(!parts.windows(2).any(|pair| pair == ["\u{2028}", " "]),
+                "splitting a forced break must not invent an authored space");
+        }
+    }
+
+    #[test]
     fn marked_block_inline_context_splits_words_beside_replaced_content() {
         use w3cos_std::{
             Component,
@@ -18596,6 +19149,42 @@ mod image_component_tests {
             }
             split_padded_inline_text_fragments(&mut guarded);
             assert_eq!(guarded.children.len(), 2, "guard {variant}");
+        }
+    }
+
+    #[test]
+    fn current_color_inline_fragments_keep_the_decoration_owner_color() {
+        use w3cos_std::{Component, style::{FlexWrap, Style}};
+        for different_text_color in [false, true] {
+            let owner = Style {
+                display: Display::Inline,
+                color: w3cos_std::Color::rgb(0, 128, 0),
+                border_width: 3.0,
+                border_current_color: Some([true; 4]),
+                ..Style::default()
+            };
+            let text = Style {
+                border_width: 0.0,
+                border_current_color: None,
+                color: if different_text_color { w3cos_std::Color::rgb(255, 0, 0) } else { owner.color },
+                ..owner.clone()
+            };
+            let mut root = Component::row(Style {
+                display: Display::Flex,
+                flex_wrap: FlexWrap::Wrap,
+                custom_properties: Some(std::collections::HashMap::from([
+                    ("--w3cos-internal-inline-formatting-context".into(), "1".into())
+                ])),
+                ..Style::default()
+            }, vec![Component::row(owner, vec![Component::text("a b c", text)])]);
+            split_padded_inline_text_fragments(&mut root);
+            if different_text_color {
+                assert_eq!(root.children.len(), 1, "a different glyph color cannot own currentColor borders");
+                assert!(!root.children[0].children.is_empty());
+            } else {
+                assert!(root.children.len() > 1, "same-color text must expose inline break opportunities");
+                assert!(root.children.iter().all(|child| child.children.is_empty()));
+            }
         }
     }
 
@@ -20944,6 +21533,34 @@ mod image_component_tests {
     }
 
     #[test]
+    fn preformatted_anonymous_cell_preserves_spaces_around_improper_inline_element() {
+        // Reconstruct the independently retained strict table-199 content
+        // oracle. This is not an alias of the significant-text-node control:
+        // the spaces here are separate nodes beside an improper inline span.
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let row = document.create_element("span");
+        row.style_mut(&mut document).set_property("display", "table-row");
+        row.style_mut(&mut document).set_property("white-space", "pre");
+        for (text, display) in [("a", Some("table-cell")), (" ", None),
+            ("bc", Some("inline")), (" ", None), ("d", Some("table-cell"))] {
+            if let Some(display) = display {
+                let child = document.create_element("span");
+                child.style_mut(&mut document).set_property("display", display);
+                child.set_text_content(&mut document, text);
+                row.append_child(&mut document, child);
+            } else {
+                let child = document.create_text_node(text);
+                row.append_child(&mut document, child);
+            }
+        }
+        document.body().append_child(&mut document, row);
+        let content = descendant_text_runs(&document.to_component_tree()).iter()
+            .map(|(text,_)|text.as_str()).collect::<String>();
+        assert_eq!(content,"a bc d","strict table-199 content expectation; browser comparison remains separate");
+    }
+
+    #[test]
     fn preformatted_anonymous_cell_keeps_significant_text_edge_spaces() {
         let parent = w3cos_std::style::Style {
             display: Display::TableRow,
@@ -21162,11 +21779,24 @@ mod image_component_tests {
 
         let style = document.computed_style_for(row.id);
         let pseudo = document.generated_pseudo_component(row.id, "::before", &style);
-        assert!(matches!(pseudo, Some(w3cos_std::Component {
-            kind: ComponentKind::Text { ref content },
-            style: w3cos_std::style::Style { display: Display::InlineBlock, .. },
-            ..
-        }) if content.is_empty()));
+        // Missing attr() generates an empty non-replaced inline, not an
+        // atomic inline-block. Chrome observations: empty-attr-browser-v4404.
+        let pseudo = pseudo.expect("empty attr still generates a pseudo box");
+        assert!(matches!(pseudo.kind, ComponentKind::Box));
+        assert_eq!(pseudo.style.display, Display::Inline);
+        assert!(pseudo.children.is_empty());
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#row::before",
+            &[("content", "attr(missing)"), ("display", "inline-block")],
+        );
+        let atomic = document.generated_pseudo_component(row.id, "::before", &style)
+            .expect("explicit inline-block still generates a box");
+        assert_eq!(atomic.style.display, Display::InlineBlock);
+        assert!(matches!(atomic.kind, ComponentKind::Text { ref content } if content.is_empty()));
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#row::before", &[("content", "none")]);
+        assert!(document.generated_pseudo_component(row.id, "::before", &style).is_none());
         crate::stylesheet::clear_rules();
     }
 
@@ -21248,27 +21878,19 @@ mod image_component_tests {
         );
 
         reorder_explicit_bidi_inline_rows(&mut line);
-        let visual = line
-            .children
-            .iter()
-            .filter_map(|child| match &child.kind {
-                ComponentKind::Text { content } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
+        let runs = descendant_text_runs(&line);
+        let visual = runs.iter().map(|(text, _)| text.as_str()).collect::<String>();
         assert_eq!(visual, "abcdefghijklm");
-        assert!(line.children.iter().any(|child| {
-            matches!(child.kind, ComponentKind::Text { ref content } if content == "fgh")
-        }));
-        let aqua_fragments = line
-            .children
-            .iter()
-            .filter(|child| child.style.border_width == 3.0)
-            .collect::<Vec<_>>();
+        // Resolved bidi levels can split f/g/h while preserving their paint
+        // order. Do not require one old direct-child text storage packet.
+        assert_eq!(runs.iter().filter(|(_,style)|style.border_width==0.0)
+            .map(|(text,_)|text.as_str()).collect::<String>(), "afghlm");
+        let aqua_fragments = runs.iter().filter(|(_,style)|style.border_width==3.0)
+            .map(|(_,style)|style).collect::<Vec<_>>();
         assert_eq!(aqua_fragments.len(), 7);
-        assert_eq!(aqua_fragments[0].style.border_left_width, Some(3.0));
-        assert_eq!(aqua_fragments[1].style.border_left_width, Some(3.0));
-        assert_eq!(aqua_fragments[2].style.border_left_width, Some(0.0));
+        assert_eq!(aqua_fragments[0].border_left_width, Some(3.0));
+        assert_eq!(aqua_fragments[1].border_left_width, Some(3.0));
+        assert_eq!(aqua_fragments[2].border_left_width, Some(0.0));
     }
 
     #[test]
@@ -21651,7 +22273,7 @@ mod image_component_tests {
     }
 
     #[test]
-    fn explicit_bidi_reorders_each_estimated_wrapped_line_independently() {
+    fn explicit_bidi_preserves_wrapped_line_content_and_decorations() {
         let plain = |content: &str| {
             let mut style = w3cos_std::style::Style::default();
             style.display = Display::Inline;
@@ -21677,16 +22299,17 @@ mod image_component_tests {
         );
 
         reorder_explicit_bidi_inline_rows(&mut line);
-        let visual = line
-            .children
-            .iter()
-            .fold(String::new(), |mut visual, child| {
-                if let ComponentKind::Text { content } = &child.kind {
-                    visual.push_str(content);
-                }
-                visual
-            });
-        assert_eq!(visual, "AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO");
+        let runs = descendant_text_runs(&line);
+        let visual = runs.iter().map(|(text,_)|text.as_str()).collect::<String>();
+        assert_eq!(visual, "AAABBBCCCDDDEEEFFFGGGHHHIII JJJKKKLLLMMMNNNOOO");
+        let decorated:Vec<_> = runs.iter().filter(|(_,style)|style.border_width==2.0).collect();
+        assert_eq!(decorated.len(),2);
+        assert_eq!(decorated[0].0,"AAABBBCCC");
+        assert_eq!(decorated[1].0,"GGGHHHIII");
+        assert_eq!(decorated[0].1.padding_lengths().left,16.0);
+        assert_eq!(decorated[0].1.padding_lengths().right,0.0);
+        assert_eq!(decorated[1].1.padding_lengths().left,0.0);
+        assert_eq!(decorated[1].1.padding_lengths().right,16.0);
     }
 
     #[test]
@@ -23231,7 +23854,54 @@ mod computed_style_cache_tests {
     }
 
     #[test]
-    fn nonpainting_parent_border_width_inherits_browser_zero() {
+    fn outline_width_inherits_absolute_length_from_nonpainting_parent() {
+        for (line_style,width,expected) in [("none","20px",20.0),("solid","20px",20.0),("none","2em",32.0)] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#parent", &[
+                ("font-size","16px"),("outline-style",line_style),("outline-width",width),
+            ]);
+            crate::stylesheet::register_rule("#child", &[
+                ("font-size","32px"),("outline-style","solid"),("outline-width","inherit"),
+            ]);
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            parent.set_attribute(&mut document,"id","parent");
+            let child = document.create_element("div");
+            child.set_attribute(&mut document,"id","child");
+            parent.append_child(&mut document,child);
+            document.body().append_child(&mut document,parent);
+            assert_eq!(document.computed_style_for(child.id).outline_width,expected,
+                "{line_style}/{width}: inherit copies the parent's absolute width, not the child's initial width");
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn hidden_border_inheritance_retains_absolute_length_across_font_sizes() {
+        for line_style in ["none", "hidden"] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule("#parent", &[
+                ("font-size", "16px"), ("border-width", "2em"), ("border-style", line_style),
+            ]);
+            crate::stylesheet::register_rule("#child", &[
+                ("font-size", "32px"), ("border-width", "inherit"), ("border-style", "solid"),
+            ]);
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            parent.set_attribute(&mut document, "id", "parent");
+            let child = document.create_element("p");
+            child.set_attribute(&mut document, "id", "child");
+            parent.append_child(&mut document, child);
+            document.body().append_child(&mut document, parent);
+            assert_eq!(document.computed_style_for(parent.id).border_top_width, Some(0.0));
+            assert_eq!(document.computed_style_for(child.id).border_top_width, Some(32.0),
+                "{line_style}: inherited absolute width is neither the parent's used zero nor 2em at the child's font size");
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn nonpainting_parent_border_width_inherits_retained_length() {
         for (line_style, inherited_width) in
             [("none", "2em"), ("hidden", "2em"), ("hidden", "medium")]
         {
@@ -23268,9 +23938,9 @@ mod computed_style_cache_tests {
             let parent_style = document.computed_style_for(parent.id);
             let child_style = document.computed_style_for(child.id);
             let grandchild_style = document.computed_style_for(grandchild.id);
-            // Chromium141 V2461 resolves none/hidden parent widths to zero
-            // before inheritance. Keep the contradictory WPT reference red.
-            let expected = 0.0;
+            // Current Chrome155 preserves the absolute inheritance length;
+            // the parent's used width remains zero (V3738/V3748).
+            let expected = if inherited_width == "medium" { 3.0 } else { 32.0 };
             assert_eq!(
                 parent_style.border_left_width,
                 Some(0.0),
@@ -23291,7 +23961,7 @@ mod computed_style_cache_tests {
     }
 
     #[test]
-    fn inherited_width_stays_non_painting_through_hidden_intermediate() {
+    fn inherited_width_survives_a_nonpainting_intermediate() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
             "#parent",
@@ -23324,13 +23994,13 @@ mod computed_style_cache_tests {
         );
         assert_eq!(
             document.computed_style_for(grandchild.id).border_left_width,
-            Some(0.0)
+            Some(32.0)
         );
         crate::stylesheet::clear_rules();
     }
 
     #[test]
-    fn hidden_relative_border_left_width_inherits_browser_zero() {
+    fn hidden_relative_border_left_width_inherits_retained_length() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
             "#parent",
@@ -23360,7 +24030,7 @@ mod computed_style_cache_tests {
         );
         assert_eq!(
             document.computed_style_for(child.id).border_left_width,
-            Some(0.0)
+            Some(32.0)
         );
         crate::stylesheet::clear_rules();
     }

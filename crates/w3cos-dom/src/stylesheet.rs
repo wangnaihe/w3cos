@@ -39,6 +39,9 @@ pub struct SelectorContext {
     pub attributes: Vec<(String, String)>,
     pub is_first_child: bool,
     pub is_root: bool,
+    pub is_focused: bool,
+    pub is_focus_visible: bool,
+    pub is_focus_within: bool,
     pub previous_siblings: Vec<Rc<SelectorContext>>,
     /// HTML defines a small set of enumerated attribute values as ASCII
     /// case-insensitive. XML/XHTML attribute values remain case-sensitive.
@@ -57,6 +60,9 @@ impl SelectorContext {
             attributes: Vec::new(),
             is_first_child: false,
             is_root: false,
+            is_focused: false,
+            is_focus_visible: false,
+            is_focus_within: false,
             previous_siblings: Vec::new(),
             html_document: true,
             html_element: true,
@@ -79,6 +85,13 @@ impl SelectorContext {
 
     pub fn with_previous_siblings(mut self, previous_siblings: Vec<SelectorContext>) -> Self {
         self.previous_siblings = previous_siblings.into_iter().map(Rc::new).collect();
+        self
+    }
+
+    pub fn with_focus_state(mut self, focused: bool, visible: bool, within: bool) -> Self {
+        self.is_focused = focused;
+        self.is_focus_visible = focused && visible;
+        self.is_focus_within = within;
         self
     }
 
@@ -128,6 +141,9 @@ enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    Focus,
+    FocusVisible,
+    FocusWithin,
     Dir(String),
     Lang(String),
     Has(String),
@@ -255,6 +271,9 @@ impl CompoundSelector {
             && self.pseudo_classes.iter().all(|pseudo| match pseudo {
                 PseudoClass::FirstChild => ctx.is_first_child,
                 PseudoClass::Root => ctx.is_root,
+                PseudoClass::Focus => ctx.is_focused,
+                PseudoClass::FocusVisible => ctx.is_focus_visible,
+                PseudoClass::FocusWithin => ctx.is_focus_within,
                 _ => false,
             })
     }
@@ -1272,6 +1291,9 @@ fn pseudo_matches_node(
                     .any(|(name, _)| name.as_str().eq_ignore_ascii_case("href"))
         }
         PseudoClass::Visited => false,
+        PseudoClass::Focus => document.is_focused(node),
+        PseudoClass::FocusVisible => document.is_focus_visible(node),
+        PseudoClass::FocusWithin => document.is_focus_within(node),
         PseudoClass::Target => target_id.is_some_and(|target_id| {
             dom_node
                 .attributes
@@ -1545,6 +1567,7 @@ fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext
     SelectorContext::new(&node.tag.as_str(), id_attribute, &class_refs)
         .with_attributes(&attribute_refs)
         .with_tree_state(is_first_child, is_root)
+        .with_focus_state(document.is_focused(id), document.is_focus_visible(id), document.is_focus_within(id))
         .with_html_document(document.is_html_document())
         .with_html_element(document.is_html_document() && node.is_html_element)
 }
@@ -2048,10 +2071,13 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                         compound.pseudo_classes.push(PseudoClass::Disabled)
                     }
                     (false, false, "checked") => compound.pseudo_classes.push(PseudoClass::Checked),
+                    (false, false, "focus") => compound.pseudo_classes.push(PseudoClass::Focus),
+                    (false, false, "focus-visible") => compound.pseudo_classes.push(PseudoClass::FocusVisible),
+                    (false, false, "focus-within") => compound.pseudo_classes.push(PseudoClass::FocusWithin),
                     (
                         false,
                         false,
-                        "active" | "focus" | "focus-visible" | "focus-within" | "hover"
+                        "active" | "hover"
                         | "indeterminate" | "placeholder-shown",
                     ) => compound.unsupported = true,
                     (

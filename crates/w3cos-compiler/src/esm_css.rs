@@ -981,18 +981,6 @@ fn parse_declarations_raw(block: &str) -> Vec<(String, String)> {
         if segment.is_empty() {
             continue;
         }
-        // CSS2 treats an in-declaration @media block and the text up to the
-        // next top-level semicolon as one malformed declaration.
-        if segment
-            .get(..6)
-            .is_some_and(|name| name.eq_ignore_ascii_case("@media"))
-            && segment[6..]
-                .chars()
-                .next()
-                .is_none_or(|ch| ch.is_ascii_whitespace() || ch == '{')
-        {
-            continue;
-        }
         let mut delimiters = Vec::new();
         let mut quote = None;
         let mut escaped = false;
@@ -1331,6 +1319,24 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
 fn css_url_token_end(bytes: &[u8], mut pos: usize) -> usize {
     while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
         pos += 1;
+    }
+    // Only a leading quote turns url( into a function containing a string.
+    // An unquoted URL (including a bad-URL token) consumes through the first
+    // unescaped ')'; quotes/braces/open parentheses inside it are not blocks.
+    if !bytes.get(pos).is_some_and(|byte| matches!(byte, b'\'' | b'"')) {
+        while pos < bytes.len() {
+            if bytes[pos] == b')' {
+                return pos + 1;
+            }
+            if bytes[pos] == b'\\'
+                && bytes.get(pos + 1).is_some_and(|byte| !matches!(byte, b'\n' | b'\r' | b'\x0c'))
+            {
+                pos = css_escape_end(bytes, pos);
+            } else {
+                pos += 1;
+            }
+        }
+        return pos;
     }
     let mut delimiters = vec![b')'];
     let mut quote = None;
@@ -1707,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_media_at_rule_does_not_recover_a_trailing_declaration() {
+    fn malformed_media_and_import_follow_browser_declaration_recovery() {
         let sheet = parse_css_source(
             "#c { color: green; @media { #c { color: red !important } } color: red; }
              #d { color: red; @media { #d { color: red !important } }; color: green; }
@@ -1715,9 +1721,11 @@ mod tests {
             "malformed-declaration.css",
         );
         assert_eq!(sheet.rules.len(), 3);
+        // Chrome recovers the declaration after the closed nested block;
+        // the malformed nested import still cannot become a sheet import.
         assert_eq!(
             sheet.rules[0].declarations,
-            vec![("color".into(), "green".into())]
+            vec![("color".into(), "green".into()), ("color".into(), "red".into())]
         );
         assert_eq!(
             sheet.rules[1].declarations.last(),
@@ -1727,6 +1735,24 @@ mod tests {
             sheet.rules[2].declarations,
             vec![("color".into(), "green".into())]
         );
+        assert!(sheet.imports.is_empty());
+    }
+
+    #[test]
+    fn trailing_declaration_after_nested_media_matches_browser_recovery() {
+        let sheet = parse_css_source(
+            "#c { color: green; @media { #c { color: red !important } } color: red; }
+             #d { color: red; @media { #c { color: red !important } }; color: green; }
+             #a { color: green; @import 'red.css' color: red; }",
+            "browser-nested-media-recovery.css",
+        );
+        assert_eq!(sheet.rules.len(), 3);
+        assert_eq!(sheet.rules[0].declarations.last(),
+            Some(&("color".into(), "red".into())),
+            "a closed nested conditional block must not swallow the following declaration");
+        assert_eq!(sheet.rules[1].declarations.last(),
+            Some(&("color".into(), "green".into())));
+        assert_eq!(sheet.rules[2].declarations, vec![("color".into(), "green".into())]);
         assert!(sheet.imports.is_empty());
     }
 
@@ -1867,6 +1893,15 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_bad_url_stops_at_first_unescaped_right_parenthesis() {
+        for source in ["foo\"bar) } next", "() } next", "}{\"\"{)}); next", "[()); next"] {
+            assert_eq!(css_url_token_end(source.as_bytes(), 0), source.find(')').unwrap() + 1, "{source}");
+        }
+        let escaped = r"bad\)url) next";
+        assert_eq!(css_url_token_end(escaped.as_bytes(), 0), escaped.rfind(')').unwrap() + 1);
+    }
+
+    #[test]
     fn bad_url_braces_do_not_capture_following_rules() {
         let sheet = parse_css_source(
             "p { color: red; border: solid red; background: red url( { test ); border: solid green; } p { color: green; }",
@@ -1885,26 +1920,29 @@ mod tests {
 
     #[test]
     fn bad_url_recovery_preserves_only_reachable_following_rules() {
+        // CSS Syntax 3 §4.3.15: unquoted bad URLs end at the first unescaped ')'.
+        // Chrome CSSOM observations for these exact fixtures are retained in
+        // bad-url-browser-v4401.json; don't reinstate CSS2-era quote swallowing.
         let cases = [
             (
                 "#three { background-color: green; } #foo { background: url(foo\"bar) }\n#three { background-color: red; }",
                 "#three",
-                "green",
+                vec!["green", "red"],
             ),
             (
                 "#foo { background: url(foo\"bar) }\n) }\n#four { background-color: green; }",
                 "#four",
-                "green",
+                vec![],
             ),
             (
                 "#twelve { background: url(}{\"\"{)}); background-color: green; }",
                 "#twelve",
-                "green",
+                vec![],
             ),
             (
                 "#fourteen { background-color: green; } #foo { background: url(() }\n#fourteen { background-color: red; }",
                 "#fourteen",
-                "green",
+                vec!["green", "red"],
             ),
         ];
         for (source, selector, expected) in cases {
@@ -1919,7 +1957,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 values,
-                [expected],
+                expected,
                 "source={source}\nrules={:#?}",
                 sheet.rules
             );

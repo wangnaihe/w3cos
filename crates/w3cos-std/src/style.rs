@@ -209,6 +209,10 @@ pub struct Style {
     #[serde(default)]
     pub background_blend_mode: Option<String>,
     pub color: Color,
+    /// Unquantized CSS foreground RGBA, in normalized sRGB channels. The
+    /// integer color remains the computed/legacy value; paint retains precision.
+    #[serde(default)]
+    pub color_rgba: Option<[f32; 4]>,
     pub font_size: f32,
     pub font_weight: u16,
     pub border_radius: f32,
@@ -398,6 +402,7 @@ impl Default for Style {
             background_attachment: None,
             background_blend_mode: None,
             color: Color::WHITE,
+            color_rgba: None,
             font_size: 16.0,
             font_weight: 400,
             border_radius: 0.0,
@@ -556,6 +561,7 @@ impl Style {
             background_attachment,
             background_blend_mode,
             color,
+            color_rgba,
             font_size,
             font_weight,
             border_radius,
@@ -674,6 +680,7 @@ impl Style {
             background_attachment: background_attachment_b,
             background_blend_mode: background_blend_mode_b,
             color: color_b,
+            color_rgba: color_rgba_b,
             font_size: font_size_b,
             font_weight: font_weight_b,
             border_radius: border_radius_b,
@@ -790,6 +797,7 @@ impl Style {
             && background_attachment == background_attachment_b
             && background_blend_mode == background_blend_mode_b
             && color == color_b
+            && color_rgba == color_rgba_b
             && font_size == font_size_b
             && font_weight == font_weight_b
             && border_radius == border_radius_b

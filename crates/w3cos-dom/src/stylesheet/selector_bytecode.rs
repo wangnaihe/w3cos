@@ -173,6 +173,9 @@ fn encode_pseudo(out: &mut Vec<u8>, pseudo: &PseudoClass) {
         PseudoClass::NthLastChild(value) => (19, Some(value.as_str())),
         PseudoClass::NthOfType(value) => (20, Some(value.as_str())),
         PseudoClass::NthLastOfType(value) => (21, Some(value.as_str())),
+        PseudoClass::Focus => (22, None),
+        PseudoClass::FocusVisible => (23, None),
+        PseudoClass::FocusWithin => (24, None),
     };
     out.push(kind);
     if let Some(argument) = argument {
@@ -204,6 +207,9 @@ fn decode_pseudo(decoder: &mut Decoder<'_>) -> Option<PseudoClass> {
         19 => PseudoClass::NthLastChild(decoder.string()?),
         20 => PseudoClass::NthOfType(decoder.string()?),
         21 => PseudoClass::NthLastOfType(decoder.string()?),
+        22 => PseudoClass::Focus,
+        23 => PseudoClass::FocusVisible,
+        24 => PseudoClass::FocusWithin,
         _ => return None,
     })
 }

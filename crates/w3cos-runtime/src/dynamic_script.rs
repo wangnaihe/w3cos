@@ -4417,10 +4417,6 @@ impl ScriptLoader {
                     crate::dom::mark_dom_dirty();
                     self.resolve_image_decode_waiters(node);
                     crate::jsdom::dispatch_element_lifecycle_event(node, "load");
-                    let onload = element.get_property("onload");
-                    if !onload.is_null() && !onload.is_undefined() {
-                        onload.call(element, vec![]);
-                    }
                 }
                 Err(error) => {
                     set_image_element_state(&element, true, &selection.source, 0, 0);
@@ -4611,6 +4607,8 @@ impl ScriptLoader {
     fn dispatch_image_error(&self, element: &Value, message: &str) {
         if let Some(node) = crate::jsdom::node_id_of(element) {
             crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+            // The lifecycle dispatcher invokes both listeners and onerror.
+            return;
         }
         let onerror = element.get_property("onerror");
         if !onerror.is_null() && !onerror.is_undefined() {
@@ -4887,6 +4885,12 @@ impl ScriptLoader {
                         }
                     }
                 }
+                // Start already-demanded deferred faces before finishing this
+                // batch's ready cycle. Otherwise ready can resolve in the gap
+                // between sequential font batches and capture fallback metrics.
+                if graph.font_only {
+                    self.activate_deferred_stylesheet_fonts();
+                }
                 let mark_ready_if_idle = if graph.font_loading_started {
                     crate::font_face::FontFaceSet::global().mark_ready();
                     let (loaded, failed): (Vec<_>, Vec<_>) =
@@ -4906,7 +4910,6 @@ impl ScriptLoader {
                     true
                 };
                 if graph.font_only {
-                    self.activate_deferred_stylesheet_fonts();
                     if mark_ready_if_idle {
                         crate::font_face::FontFaceSet::global().mark_ready_if_idle();
                     }
@@ -7667,10 +7670,6 @@ impl ScriptLoader {
                     crate::dom::mark_dom_dirty();
                     self.resolve_image_decode_waiters(node);
                     crate::jsdom::dispatch_element_lifecycle_event(node, "load");
-                    let onload = fetch.element.get_property("onload");
-                    if !onload.is_null() && !onload.is_undefined() {
-                        onload.call(fetch.element.clone(), vec![]);
-                    }
                 }
                 Err(error) => {
                     crate::image_loader::reserve_browser_source(&fetch.request.source);
@@ -10165,6 +10164,10 @@ fn hex_digit(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "dynamic_font_readiness_tests.rs"]
+mod font_readiness_tests;
 
 #[cfg(test)]
 mod tests {

@@ -314,6 +314,12 @@ pub(crate) fn resolve_float_text_layouts(
                 })
             && matches!(nodes[*line].0, ComponentKind::Row)
             && nodes[*line].1.float == WFloat::None
+            // Only the synthetic Flex row borrows its containing block's
+            // content box. A real Block (including an anonymous block line)
+            // owns its own width/padding and is resolved by the block path.
+            && nodes[*line].1.display == WDisplay::Flex
+            && nodes[*line].1.custom_properties.as_ref().is_some_and(|properties|
+                properties.contains_key("--w3cos-internal-inline-formatting-context"))
             && let [text] = children_by_parent[*line].as_slice()
             && matches!(nodes[*text].0, ComponentKind::Text { .. })
             && children_by_parent[*group].len() >= 2
@@ -1361,7 +1367,27 @@ fn component_max_content_width(component: &Component) -> f32 {
                     padding.left + padding.right
                 } else { 0.0 };
         }
-        let intrinsic_width = component_max_content_width(child);
+        let intrinsic_width = if component.style.display == WDisplay::TableCell
+            && component.children.len() == 1
+            && child.style.display == WDisplay::Inline
+            && child.children.is_empty()
+            && matches!(child.style.white_space, WWhiteSpace::Normal | WWhiteSpace::NoWrap)
+            && let ComponentKind::Text { content } = &child.kind
+        {
+            // A cell's sole inline run begins and ends its own line. Source
+            // boundary whitespace is retained for DOM/paint provenance but
+            // cannot enlarge the table's preferred content width.
+            let used = content.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{000c}'));
+            if used.len() != content.len() {
+                let mut measured = child.clone();
+                measured.kind = ComponentKind::Text { content: used.to_owned() };
+                component_max_content_width(&measured)
+            } else {
+                component_max_content_width(child)
+            }
+        } else {
+            component_max_content_width(child)
+        };
         let ratio = match &child.kind {
             ComponentKind::Image { src } => image_intrinsic_ratio(src),
             ComponentKind::Canvas { width, height } if *height > 0 => {
@@ -3084,7 +3110,9 @@ fn is_simple_wrapping_text_packet(component: &Component, available_width: f32) -
                     ComponentKind::Text { content } => child.children.is_empty()
                         && matches!(child.style.white_space, WWhiteSpace::Normal | WWhiteSpace::PreLine)
                         && child.style.display == WDisplay::Inline
-                        && (content == " " || !content.chars().any(char::is_whitespace)),
+                        && (content == " " || !content.chars().any(char::is_whitespace)
+                            || content.strip_suffix(' ').is_some_and(|word|
+                                !word.is_empty() && !word.chars().any(char::is_whitespace))),
                     // Replaced leaves contribute their intrinsic horizontal
                     // advance to the same CSS line. Their presence must not
                     // disable collapse of a separator starting a soft line.
@@ -3128,6 +3156,8 @@ fn inline_leading_separator_flags(
             width + margin_left + margin_right
                 + if child.style.box_sizing == WBoxSizing::ContentBox {
                     padding_left + padding_right
+                        + child.style.border_left_width.unwrap_or(child.style.border_width)
+                        + child.style.border_right_width.unwrap_or(child.style.border_width)
                 } else { 0.0 }
         }).unwrap_or_else(|| component_max_content_width(child));
         let separator = matches!(&child.kind, ComponentKind::Text { content } if content == " ")
@@ -3196,6 +3226,8 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
 #[derive(PartialEq, Eq, Hash)]
 struct FontUnitKey {
     family: Option<String>,
+    standard: bool,
+    language: Option<String>,
     size: u32,
     weight: u16,
     slant: u8,
@@ -3213,7 +3245,13 @@ thread_local! {
 
 pub(crate) fn install_font_unit_provider() {
     fn zero_advance(style: &w3cos_std::style::Style) -> Option<f32> {
-        let key = FontUnitKey { family: style.font_family.clone(), size: style.font_size.to_bits(),
+        let standard = style.custom_properties.as_ref().is_some_and(|properties|
+            properties.get(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY)
+                .is_some_and(|value| value == "1"));
+        let language = style.custom_properties.as_ref().and_then(|properties|
+            properties.get(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY)).cloned();
+        let key = FontUnitKey { family: style.font_family.clone(), standard,
+            language: language.clone(), size: style.font_size.to_bits(),
             weight: style.font_weight, slant: style.font_style as u8,
             kerning: style.font_kerning, feature_kern: style.font_feature_kern,
             direction: style.direction as u8,
@@ -3225,16 +3263,28 @@ pub(crate) fn install_font_unit_provider() {
         }
         // Font units are not authored text fragments. Avoid carrying source
         // shaping metadata, box edges, tracking or transforms into the zero.
+        // Standard-face and language metadata still select the actual font;
+        // strip fragment metadata without replacing HTML's face by the host
+        // embedding font. These contexts also belong to the cache identity.
+        let mut font_context = HashMap::new();
+        if standard {
+            font_context.insert(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(), "1".into());
+        }
+        if let Some(language) = language {
+            font_context.insert(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(), language);
+        }
         let font_style = w3cos_std::style::Style {
             font_family: style.font_family.clone(), font_size: style.font_size,
             font_weight: style.font_weight, font_style: style.font_style,
             font_kerning: style.font_kerning, font_feature_kern: style.font_feature_kern,
-            direction: style.direction, ..w3cos_std::style::Style::default()
+            direction: style.direction,
+            custom_properties: (!font_context.is_empty()).then_some(font_context),
+            ..w3cos_std::style::Style::default()
         };
         #[cfg(test)]
         CH_ADVANCE_MEASUREMENTS.with(|count| count.set(count.get() + 1));
         #[cfg(feature = "skia")]
-        let advance = crate::render_skia::measure_skia_text_intrinsic_size("0", &font_style).0;
+        let advance = crate::render_skia::measure_skia_font_zero_advance(&font_style);
         #[cfg(not(feature = "skia"))]
         let advance = layout_font().metrics('0', font_style.font_size).advance_width;
         if advance.is_finite() && advance >= 0.0 {
@@ -3262,7 +3312,7 @@ fn percentage_spacing_for_layout(percentage_basis: f32, value: f32) -> f32 {
     w3cos_std::style::used_box_spacing(resolved)
 }
 
-fn resolve_spacing_for_layout(
+pub(crate) fn resolve_spacing_for_layout(
     spacing: WSpacing,
     percentage_basis: f32,
     font_style: &w3cos_std::style::Style,
@@ -4103,6 +4153,7 @@ impl LayoutEngine {
         project_anonymous_float_group_following_image(&mut results, flat, viewport_w, viewport_h);
         project_bottom_aligned_float_inline_rows(&mut results, flat, viewport_w, viewport_h);
         project_staggered_float_inline_bands(&mut results, flat, viewport_w, viewport_h);
+        project_inline_block_atomic_line_descent(&mut results, root);
         project_indented_inline_after_leading_float(&mut results, flat, viewport_w, viewport_h);
         project_block_after_floated_inline_line(&mut results, flat);
         project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
@@ -4113,7 +4164,7 @@ impl LayoutEngine {
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         table_replaced_baseline::project(&mut results, root, flat, viewport_w, viewport_h);
-        project_table_rows_after_content_settlement(&mut results, flat, viewport_w, viewport_h);
+        project_table_rows_after_content_settlement(&mut results, root, flat, viewport_w, viewport_h);
         project_auto_table_child_heights(&mut results, root, flat, viewport_w, viewport_h);
         crate::table_grid::project_rowspan_extents(&mut results, flat);
         align_table_cell_baselines_with_resolved_borders(&mut results, root, flat, viewport_w, viewport_h);
@@ -4133,7 +4184,12 @@ impl LayoutEngine {
         );
 
         project_terminal_preserved_tabs(&mut results, flat);
-        crate::list_marker::project(&mut results, flat);
+        crate::list_marker::project(&mut results, flat, viewport_w, viewport_h);
+        column_fragment_plan::project(&mut results,flat,viewport_w,viewport_h);
+        if flat.iter().any(|node| matches!(node.style.height,WDim::Auto)
+            && establishes_column_context(node.style)) {
+            project_absolute_insets_from_final_containing_blocks(&mut results,flat,viewport_w,viewport_h);
+        }
         refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
@@ -4347,6 +4403,7 @@ pub fn compute_with_scroll_details(
     project_anonymous_float_group_following_image(&mut results, &flat, viewport_w, viewport_h);
     project_bottom_aligned_float_inline_rows(&mut results, &flat, viewport_w, viewport_h);
     project_staggered_float_inline_bands(&mut results, &flat, viewport_w, viewport_h);
+    project_inline_block_atomic_line_descent(&mut results, root);
     project_indented_inline_after_leading_float(&mut results, &flat, viewport_w, viewport_h);
     project_block_after_floated_inline_line(&mut results, &flat);
     project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
@@ -4357,7 +4414,7 @@ pub fn compute_with_scroll_details(
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
     table_replaced_baseline::project(&mut results, root, &flat, viewport_w, viewport_h);
-    project_table_rows_after_content_settlement(&mut results, &flat, viewport_w, viewport_h);
+    project_table_rows_after_content_settlement(&mut results, root, &flat, viewport_w, viewport_h);
     project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h);
     crate::table_grid::project_rowspan_extents(&mut results, &flat);
     align_table_cell_baselines_with_resolved_borders(&mut results, root, &flat, viewport_w, viewport_h);
@@ -4377,7 +4434,12 @@ pub fn compute_with_scroll_details(
     );
 
     project_terminal_preserved_tabs(&mut results, &flat);
-    crate::list_marker::project(&mut results, &flat);
+    crate::list_marker::project(&mut results, &flat, viewport_w, viewport_h);
+    column_fragment_plan::project(&mut results,&flat,viewport_w,viewport_h);
+    if flat.iter().any(|node| matches!(node.style.height,WDim::Auto)
+        && establishes_column_context(node.style)) {
+        project_absolute_insets_from_final_containing_blocks(&mut results,&flat,viewport_w,viewport_h);
+    }
     refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
 
@@ -5013,12 +5075,19 @@ fn project_collapsible_line_end_whitespace(
         if !wraps_before_next || whitespace.width <= f32::EPSILON {
             continue;
         }
+        // Collapse the glyph advance, not the authored inline's paint edges.
+        let padding = node.style.padding_lengths();
+        let decoration = padding.left + padding.right
+            + node.style.border_left_width.unwrap_or(node.style.border_width)
+            + node.style.border_right_width.unwrap_or(node.style.border_width);
+        let retained_width = decoration.max(0.0).min(whitespace.width);
+        let removed_width = whitespace.width - retained_width;
         let shift = match parent.style.justify_content {
-            WJustify::Center => whitespace.width / 2.0,
-            WJustify::FlexEnd => whitespace.width,
+            WJustify::Center => removed_width / 2.0,
+            WJustify::FlexEnd => removed_width,
             _ => 0.0,
         };
-        layouts[position].0.width = 0.0;
+        layouts[position].0.width = retained_width;
         if shift <= f32::EPSILON {
             continue;
         }
@@ -5080,7 +5149,7 @@ fn project_table_cell_inline_vertical_padding(
                 .border_top_width
                 .unwrap_or(flat[parent_index].style.border_width)
             + parent_padding.top
-            + (crate::layout::inline_style_line_height(&node.style) - inline_font_height(node.style)) * 0.5;
+            + inline_upper_leading(inline_style_line_height(node.style), inline_font_height(node.style));
         let current_content_top = layouts[position].0.y
             + node
                 .style
@@ -5548,6 +5617,9 @@ fn align_inline_table_first_row_baselines(
             .find(|(offset, descendant)| {
                 let index = table + 1 + offset;
                 let in_first_row = first_row.is_none_or(|row| {
+                    if index == row {
+                        return true;
+                    }
                     let mut ancestor = flat[index].parent;
                     while let Some(parent) = ancestor {
                         if parent == row {
@@ -5695,6 +5767,7 @@ fn project_collapsed_table_row_rects(
 
 fn project_table_rows_after_content_settlement(
     layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
     flat: &[FlatNodeInfo<'_>],
     viewport_w: f32,
     viewport_h: f32,
@@ -5706,6 +5779,21 @@ fn project_table_rows_after_content_settlement(
     for (position, &(_, index)) in layouts.iter().enumerate() {
         positions[index] = Some(position);
     }
+    let line_positions: HashMap<_,_> = positions.iter().enumerate()
+        .filter_map(|(index,position)| position.map(|position|(index,position))).collect();
+    let mut cell_content_heights = vec![None; flat.len()];
+    fn collect_cell_lines(component: &Component, index: usize,
+        layouts: &[(LayoutRect,usize)], positions: &HashMap<usize,usize>, heights: &mut [Option<f32>]) {
+        if component.style.display == WDisplay::TableCell {
+            heights[index] = crate::inline_line_metrics::natural_content_height(component,index,layouts,positions);
+        }
+        let mut child_index = index+1;
+        for child in &component.children {
+            collect_cell_lines(child,child_index,layouts,positions,heights);
+            child_index += count_nodes(child);
+        }
+    }
+    collect_cell_lines(root,0,layouts,&line_positions,&mut cell_content_heights);
     let mut subtree_end = (1..=flat.len()).collect::<Vec<_>>();
     for index in (0..flat.len()).rev() {
         if let Some(parent) = flat[index].parent {
@@ -5757,7 +5845,18 @@ fn project_table_rows_after_content_settlement(
             && !flat[table].style.border_collapse
             && cells.iter().all(|cell| matches!(flat[*cell].style.height, WDim::Auto)
                 && matches!(flat[*cell].style.min_height, WDim::Auto));
-        let mut used_row_height = 0.0_f32;
+        // Anonymous rows transfer authored cell heights into a minimum row
+        // floor. Settled text font boxes must not erase that floor when the
+        // cells themselves have already been lowered to auto height.
+        let minimum = if matches!(style.min_height, WDim::Percent(_))
+            && matches!(flat[table].style.height, WDim::Auto) {
+            None
+        } else {
+            style.min_height.resolve(
+                positions[table].map_or(0.0, |position| layouts[position].0.height),
+                ROOT_FONT_SIZE, style.font_size, viewport_w, viewport_h)
+        };
+        let mut used_row_height = minimum.unwrap_or(0.0).max(0.0);
         for cell in &cells {
             let Some(cell_position) = positions[*cell] else {
                 continue;
@@ -5776,6 +5875,12 @@ fn project_table_rows_after_content_settlement(
             };
             let top_edge = edge(cell_style.padding.top, cell_style.border_top_width);
             let bottom_edge = edge(cell_style.padding.bottom, cell_style.border_bottom_width);
+            if let Some(content_height) = cell_content_heights[*cell] {
+                // CSS cell height is a floor, not a clip for its actual IFC.
+                // Reuse resolved line metrics; glyph/padding paint rectangles
+                // cannot safely stand in for this flow contribution.
+                used_row_height = used_row_height.max(top_edge+content_height+bottom_edge);
+            }
             let content_bottom = (*cell + 1..subtree_end[*cell])
                 .filter(|child| flat[*child].parent == Some(*cell))
                 .filter(|child| {
@@ -6097,8 +6202,23 @@ fn project_auto_table_child_heights(
             padding.bottom + border_bottom + collapsed_floors[table].2
         };
         let old_height = layouts[table_position].0.height;
-        let content_height =
+        let mut content_height =
             (child_bottom - table_y + bottom_edge).max(minimum_height(table, layouts));
+        if node.style.display == WDisplay::InlineTable
+            && !children[table].is_empty()
+            && children[table].iter().all(|child| {
+                let leaf = &flat[*child];
+                leaf.style.display == WDisplay::Inline && leaf.style.line_height_is_normal
+                    && leaf.style.float == WFloat::None && leaf.style.position == WPos::Static
+                    && matches!(leaf.kind, ComponentKind::Text { content }
+                        if !content.contains(['\n', '\r', '\u{2028}']))
+            })
+        {
+            // Raw inline-table fallback owns an anonymous cell's settled
+            // line box. Its direct text rects expose font boxes; shrinking
+            // back to their ink extent drops the containing strut descent.
+            content_height = content_height.max(old_height);
+        }
         // A specified table height is a floor, not a clip for a taller grid.
         // Auto tables may still contract their internal fallback height.
         let height = if matches!(node.style.height, WDim::Auto) {
@@ -6187,7 +6307,7 @@ fn project_auto_table_child_heights(
                     .max(minimum_height(parent, layouts));
                 if required > cell_rect.height + 0.01 {
                     layouts[parent_position].0.height = required;
-                    project_table_rows_after_content_settlement(layouts, flat, viewport_w, viewport_h);
+                    project_table_rows_after_content_settlement(layouts, root, flat, viewport_w, viewport_h);
                 }
                 break;
             }
@@ -9148,10 +9268,16 @@ fn project_simple_float_margin_boxes(
                             layout_position.get(&previous_index).copied()
                     {
                         let prior = layouts[previous_position].0;
-                        let leading = (previous_child.style.font_size
-                            * previous_child.style.line_height
-                            - previous_child.style.font_size)
-                            * 0.5;
+                        // A normal text rectangle can already be the full
+                        // strut, rather than the glyph box with split leading.
+                        // Its bottom is then the next line's top; adding the
+                        // glyph's trailing leading would count it twice.
+                        let leading = if previous_child.style.line_height_is_normal
+                            && (prior.height - inline_style_line_height(&previous_child.style)).abs() < 0.01
+                        { 0.0 } else {
+                            (inline_style_line_height(&previous_child.style)
+                                - previous_child.style.font_size) * 0.5
+                        };
                         let mut y = prior.y - relative_shift(&previous_child.style).1
                             + prior.height
                             + leading;
@@ -9570,6 +9696,30 @@ fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
             ))
 }
 
+fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
+    matches!(style.display, WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
+        && !style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                || properties.contains_key("--w3cos-internal-anonymous-float-group")
+        })
+}
+
+/// The BFC used by each box's contents. Floats participate in their parent's
+/// context, while their own contents and real flex/grid items are isolated.
+pub(crate) fn float_content_contexts(flat: &[FlatNodeInfo<'_>]) -> Vec<usize> {
+    let mut contexts = vec![0; flat.len()];
+    for (index, node) in flat.iter().enumerate() {
+        contexts[index] = if establishes_float_bfc(node.style, node.parent.is_none())
+            || node.parent.is_some_and(|parent| genuine_float_track_container(flat[parent].style))
+        {
+            index
+        } else {
+            node.parent.map_or(index, |parent| contexts[parent])
+        };
+    }
+    contexts
+}
+
 fn clear_applies_to_display(display: WDisplay) -> bool {
     !matches!(
         display,
@@ -9588,7 +9738,7 @@ fn clear_applies_to_display(display: WDisplay) -> bool {
     )
 }
 
-fn relative_flow_offset(
+pub(crate) fn relative_flow_offset(
     style: &w3cos_std::style::Style,
     parent_style: &w3cos_std::style::Style,
     containing: LayoutRect,
@@ -11280,17 +11430,54 @@ fn project_absolute_insets_from_final_containing_blocks(
     }
     for index in 0..flat.len() {
         let style = flat[index].style;
-        if style.position != WPos::Absolute
-            || (matches!(style.top, WDim::Auto)
-                && matches!(style.bottom, WDim::Auto)
-                && matches!(style.left, WDim::Auto)
-                && matches!(style.right, WDim::Auto))
-        {
+        if style.position != WPos::Absolute {
             continue;
         }
         let Some(position) = positions[index] else {
             continue;
         };
+        if matches!(style.top, WDim::Auto) && matches!(style.bottom, WDim::Auto)
+            && matches!(style.left, WDim::Auto) && matches!(style.right, WDim::Auto)
+        {
+            if let Some(parent) = flat[index].parent
+                && flat[parent].style.display == WDisplay::InlineBlock
+                && matches!(style.display, WDisplay::Block | WDisplay::FlowRoot
+                    | WDisplay::Flex | WDisplay::Grid | WDisplay::Table | WDisplay::ListItem)
+                && !(parent + 1..index).any(|sibling| flat[sibling].parent == Some(parent)
+                    && flat[sibling].style.display != WDisplay::None
+                    && flat[sibling].style.float == WFloat::None
+                    && !matches!(flat[sibling].style.position, WPos::Absolute | WPos::Fixed)
+                    && !matches!(flat[sibling].kind, ComponentKind::Text { content }
+                        if content.chars().all(|c| matches!(c,' '|'\t'|'\n'|'\r'|'\u{000c}'))))
+                && let Some(parent_position) = positions[parent]
+            {
+                // The first block static placeholder starts at this atomic
+                // box's content edge, not its positioned ancestor's line.
+                // Re-evaluate after the atomic's baseline has settled.
+                let parent_rect = layouts[parent_position].0;
+                let parent_style = flat[parent].style;
+                let padding = parent_style.padding_lengths();
+                let margin = style.margin_lengths();
+                let original = layouts[position].0;
+                let x = if parent_style.direction == w3cos_std::style::TextDirection::Rtl {
+                    parent_rect.x + parent_rect.width - padding.right
+                        - parent_style.border_right_width.unwrap_or(parent_style.border_width)
+                        - original.width - margin.right
+                } else {
+                    parent_rect.x + padding.left
+                        + parent_style.border_left_width.unwrap_or(parent_style.border_width) + margin.left
+                };
+                let y = parent_rect.y + padding.top
+                    + parent_style.border_top_width.unwrap_or(parent_style.border_width) + margin.top;
+                for descendant in index..ends[index] {
+                    if let Some(position) = positions[descendant] {
+                        layouts[position].0.x += x - original.x;
+                        layouts[position].0.y += y - original.y;
+                    }
+                }
+            }
+            continue;
+        }
         let mut ancestor = flat[index].parent;
         let mut owner = None;
         while let Some(parent) = ancestor {
@@ -11303,7 +11490,20 @@ fn project_absolute_insets_from_final_containing_blocks(
         let Some(owner) = owner else {
             continue;
         };
-        if flat[owner].style.display == WDisplay::Inline {
+        if flat[owner].style.display == WDisplay::Inline
+            && (owner + 1..ends[owner]).any(|child| {
+                flat[child].parent == Some(owner)
+                    && flat[child].style.float == WFloat::None
+                    && flat[child].style.position == WPos::Static
+                    && matches!(flat[child].style.display,
+                        WDisplay::Block | WDisplay::FlowRoot | WDisplay::Flex
+                            | WDisplay::Grid | WDisplay::Table | WDisplay::ListItem)
+            })
+        {
+            // Block-split inline containing blocks still need their fragment
+            // geometry from the initial projection. Unsplit inline padding
+            // boxes, however, must reanchor inset descendants after a static
+            // float ancestor moves; that float is not the containing block.
             continue;
         }
         let Some(owner_position) = positions[owner] else {
@@ -11323,12 +11523,29 @@ fn project_absolute_insets_from_final_containing_blocks(
         let bottom = owner_style
             .border_bottom_width
             .unwrap_or(owner_style.border_width);
-        let containing = LayoutRect {
+        let mut containing = LayoutRect {
             x: owner_rect.x + left,
             y: owner_rect.y + top,
             width: (owner_rect.width - left - right).max(0.0),
             height: (owner_rect.height - top - bottom).max(0.0),
         };
+        if owner_style.display == WDisplay::Inline
+            && (owner + 1..ends[owner]).filter(|child| flat[*child].parent == Some(owner))
+                .all(|child| flat[child].style.display == WDisplay::None
+                    || flat[child].style.float != WFloat::None
+                    || matches!(flat[child].style.position, WPos::Absolute | WPos::Fixed))
+        {
+            let padding = owner_style.padding_lengths();
+            let font_height = inline_font_height(owner_style);
+            if (containing.height - padding.top - padding.bottom - font_height).abs() < 0.01 {
+                // Final inline paint geometry can be the font box rather
+                // than the empty line's strut. Undo the rounded upper leading
+                // once; a retained line-height-sized box needs no conversion.
+                let line_height = inline_style_line_height(owner_style);
+                containing.y -= inline_upper_leading(line_height, font_height);
+                containing.height = line_height + padding.top + padding.bottom;
+            }
+        }
         let original = layouts[position].0;
         let replaced = matches!(
             flat[index].kind,
@@ -11513,35 +11730,19 @@ fn project_shared_bfc_float_collisions(
     for (position, (_, index)) in layouts.iter().enumerate() {
         positions[*index] = Some(position);
     }
-    let mut owners = vec![None; flat.len()];
+    let contexts = float_content_contexts(flat);
+    let owners = flat.iter().map(|node| node.parent.map(|parent| contexts[parent]))
+        .collect::<Vec<_>>();
     let mut visible = vec![true; flat.len()];
     let mut depths = vec![0; flat.len()];
     let mut ends = vec![flat.len(); flat.len()];
     let mut stack = Vec::<usize>::new();
-    let genuine_tracks = |style: &w3cos_std::style::Style| {
-        matches!(
-            style.display,
-            WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
-        ) && !style.custom_properties.as_ref().is_some_and(|properties| {
-            properties.contains_key("--w3cos-internal-inline-formatting-context")
-                || properties.contains_key("--w3cos-internal-anonymous-float-group")
-        })
-    };
+    let genuine_tracks = genuine_float_track_container;
     for index in 0..flat.len() {
         visible[index] = flat[index].style.display != WDisplay::None
             && flat[index].parent.is_none_or(|parent| visible[parent]);
         if let Some(parent) = flat[index].parent {
             depths[index] = depths[parent] + 1;
-            let track_item = flat[parent]
-                .parent
-                .is_some_and(|grandparent| genuine_tracks(flat[grandparent].style));
-            owners[index] = if track_item
-                || establishes_float_bfc(flat[parent].style, flat[parent].parent.is_none())
-            {
-                Some(parent)
-            } else {
-                owners[parent]
-            };
         }
         while stack
             .last()
@@ -11905,7 +12106,7 @@ fn project_shared_bfc_float_collisions(
                 value.resolve(parent_rect.height, ROOT_FONT_SIZE, style.font_size, vw, vh)
             }
         };
-        let (rx, ry) = if style.position == WPos::Relative {
+        let (mut rx, mut ry) = if style.position == WPos::Relative {
             let x = if parent_style.direction == w3cos_std::style::TextDirection::Rtl {
                 resolve_x(style.right)
                     .map(|value| -value)
@@ -11922,6 +12123,21 @@ fn project_shared_bfc_float_collisions(
         } else {
             (0.0, 0.0)
         };
+        // Placement uses the containing block's static float band. Inline
+        // ancestors do not establish that band, but their relative offsets
+        // still move the float visually. Remove those offsets while testing
+        // collisions and retain them when shifting the descendant subtree.
+        let mut ancestor = parent;
+        while ancestor != containing {
+            let Some(container) = flat[ancestor].parent else { break; };
+            if let Some(container_position) = positions[container] {
+                let offset = relative_flow_offset(flat[ancestor].style,
+                    flat[container].style, layouts[container_position].0, vw, vh);
+                rx += offset.0;
+                ry += offset.1;
+            }
+            ancestor = container;
+        }
         let rect = layouts[position].0;
         let margin_box = LayoutRect {
             x: rect.x - ml - rx,
@@ -11933,7 +12149,7 @@ fn project_shared_bfc_float_collisions(
         let mut x = margin_box.x;
         let mut y = margin_box.y;
         if containing != parent
-            && style.float == WFloat::Right
+            && style.float != WFloat::None
             && flat[parent].style.white_space == WWhiteSpace::NoWrap
             && let Some(prefix) = (parent + 1..index).rev().find(|candidate| {
                 flat[*candidate].parent == Some(parent)
@@ -12214,6 +12430,47 @@ fn project_nonadjoining_bfc_margin_separation(
         let Some(float_index) = preceding_float else {
             continue;
         };
+        // Only an adjoining, collapse-through branch can carry this later
+        // margin into the earlier float. A height/min-height, block edge or
+        // preceding in-flow content interrupts that chain.
+        let mut child = float_index;
+        let mut ancestor = flat[child].parent;
+        let mut adjoining = true;
+        while let Some(current) = ancestor.filter(|current| *current != owner) {
+            let style = flat[current].style;
+            let parent = flat[current].parent;
+            let basis = parent.and_then(|parent| positions[parent])
+                .map_or(vh, |position| layouts[position].0.height);
+            let containing_width = parent.and_then(|parent| positions[parent])
+                .map_or(vw, |position| layouts[position].0.width);
+            let positive_height = |dimension: WDim| {
+                if matches!(dimension, WDim::Percent(_))
+                    && parent.is_some_and(|parent| matches!(flat[parent].style.height,WDim::Auto)) {
+                    return false;
+                }
+                dimension.resolve(basis,ROOT_FONT_SIZE,style.font_size,vw,vh)
+                    .is_some_and(|height| height > 0.01)
+            };
+            let preceding_content = flat.iter().enumerate().any(|(index,node)| {
+                index < child && node.parent == Some(current)
+                    && node.style.display != WDisplay::None
+                    && node.style.float == WFloat::None
+                    && !matches!(node.style.position,WPos::Absolute|WPos::Fixed)
+                    && positions[index].is_some_and(|position| layouts[position].0.height > 0.01)
+            });
+            if positive_height(style.height) || positive_height(style.min_height)
+                || style.border_top_width.unwrap_or(style.border_width) > 0.01
+                || style.border_bottom_width.unwrap_or(style.border_width) > 0.01
+                || resolve_spacing_for_layout(style.padding.top,containing_width,style,vw,vh) > 0.01
+                || resolve_spacing_for_layout(style.padding.bottom,containing_width,style,vw,vh) > 0.01
+                || preceding_content {
+                adjoining = false;
+                break;
+            }
+            child = current;
+            ancestor = parent;
+        }
+        if !adjoining { continue; }
         let float_rect = layouts[positions[float_index].unwrap()].0;
         let exclusion = FloatExclusion {
             side: flat[float_index].style.float,
@@ -12221,6 +12478,8 @@ fn project_nonadjoining_bfc_margin_separation(
         };
         let band = float_line_band(
             parent_rect,
+            // Collision projection may already have cleared the BFC. Its
+            // final band cannot decide whether the margin was adjoining.
             float_rect.y,
             layouts[position].0.height,
             &[exclusion],
@@ -13315,6 +13574,48 @@ fn project_inline_block_atomic_line_descent(layouts: &mut [(LayoutRect, usize)],
             && let Some(position) = positions.get(&component_index) {
             layouts[*position].0.height += accumulated;
         }
+        // A mixed block/inline ordinary container gets provisional float
+        // height from Taffy's block stack. Once its inline baselines settle,
+        // only in-flow boxes contribute to auto height. Existing block-flow
+        // propagation above carries this change to ancestors and siblings.
+        let in_flow = children.iter().filter(|(child,_)| child.style.float == WFloat::None
+            && child.style.display != WDisplay::None
+            && !matches!(child.style.position,WPos::Absolute|WPos::Fixed)).collect::<Vec<_>>();
+        let inline = |child: &Component| matches!(child.style.display,
+            WDisplay::Inline|WDisplay::InlineBlock|WDisplay::InlineFlex|WDisplay::InlineTable);
+        if matches!(component.style.display,WDisplay::Block|WDisplay::ListItem)
+            && !establishes_float_bfc(&component.style,component_index==0)
+            && component.style.height == WDim::Auto
+            && !matches!(component.style.min_height,WDim::Percent(_))
+            && !matches!(component.style.max_height,WDim::Percent(_))
+            && children.iter().any(|(child,_)|child.style.float != WFloat::None)
+            && in_flow.iter().any(|(child,_)|!inline(child))
+            && in_flow.iter().any(|(child,_)|inline(child))
+            && in_flow.iter().all(|(child,_)|child.style.position==WPos::Static
+                && child.style.margin_lengths().top==0.0 && child.style.margin_lengths().bottom==0.0
+                && (!inline(child) || child.children.is_empty()
+                    && matches!(child.kind,ComponentKind::Text{..}|ComponentKind::Image{..})
+                    && inline_leaf_alignment_keyword(child)=="baseline"
+                    && inline_leaf_baseline_offset(child)==0.0))
+            && let Some(position)=positions.get(&component_index)
+        {
+            let parent=layouts[*position].0;
+            let strut=inline_style_line_height(&component.style);
+            let descent=strut-inline_font_baseline_from_line_top(&component.style,strut);
+            let bottom=in_flow.iter().filter_map(|(child,index)|{
+                let rect=layouts[*positions.get(index)?].0;
+                let leading=if inline(child) && matches!(child.kind,ComponentKind::Text{..}) {
+                    let height=inline_style_line_height(&child.style);
+                    height-inline_font_height(&child.style)
+                        -inline_upper_leading(height,inline_font_height(&child.style))
+                } else if inline(child) { descent } else { 0.0 };
+                Some(rect.y+rect.height+leading)
+            }).fold(parent.y,f32::max);
+            let natural=bottom-parent.y+component.style.padding_lengths().bottom
+                +component.style.border_bottom_width.unwrap_or(component.style.border_width);
+            layouts[*position].0.height=crate::inline_line_metrics::projected_height(
+                &component.style,parent.height,natural,None);
+        }
         if !matches!(component.style.display, WDisplay::InlineBlock | WDisplay::Block)
             || component.style.height != WDim::Auto
             || children.iter().any(|(child, _)| {
@@ -13345,26 +13646,30 @@ fn project_inline_block_atomic_line_descent(layouts: &mut [(LayoutRect, usize)],
         let content_bottom =
             parent.y + parent.height - border_bottom - component.style.padding_lengths().bottom;
         let strut_height = crate::layout::inline_style_line_height(&component.style);
-        let needs_descent = children.iter().any(|(child, index)| {
-            matches!(
+        let strut_descent = (strut_height
+            - inline_font_baseline_from_line_top(&component.style, strut_height)).max(0.0);
+        let descent = children.iter().filter_map(|(child, index)| {
+            if !matches!(
                 child.style.display,
                 WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
-            ) && matches!(
+            ) || !matches!(
                 child.style.align_self,
                 WAlignSelf::Auto | WAlignSelf::Baseline
-            ) && positions.get(index).is_some_and(|position| {
-                let rect = layouts[*position].0;
-                if matches!(child.style.position, WPos::Absolute | WPos::Fixed) {
-                    return false;
-                }
-                let margin_bottom = child.style.margin_lengths().bottom;
-                rect.height > strut_height + 0.5
-                    && (rect.y + rect.height + margin_bottom - content_bottom).abs() <= 0.5
-            })
-        });
-        if needs_descent {
-            let descent = (strut_height
-                - inline_font_baseline_from_line_top(&component.style, strut_height)).max(0.0);
+            ) || matches!(child.style.position, WPos::Absolute | WPos::Fixed) {return None;}
+            let rect=layouts[*positions.get(index)?].0;
+            let margin_bottom=child.style.margin_lengths().bottom;
+            if rect.height <= strut_height + 0.5
+                || (rect.y + rect.height + margin_bottom - content_bottom).abs() > 0.5 {return None;}
+            // Content-bearing atomics export a line baseline, not their
+            // bottom edge. Decoration and content below that baseline already
+            // reserve descent; add only a missing containing-strut remainder.
+            let baseline=if child.style.display==WDisplay::InlineTable {
+                crate::inline_table_baseline::first_row(child,*index,layouts,positions)
+            } else {last_text_baseline(child,*index,layouts,positions)}
+                .unwrap_or(rect.y + rect.height + margin_bottom);
+            Some((strut_descent - (content_bottom-baseline).max(0.0)).max(0.0))
+        }).fold(0.0_f32,f32::max);
+        if descent > 0.01 {
             layouts[*parent_position].0.height += descent;
             let atomic_baseline = children
                 .iter()
@@ -14354,6 +14659,13 @@ fn image_text_packets_have_shared_baselines(
     let Some(lines) = image_text_line_packets(component, component_index, layouts, positions)
     else { return false; };
     lines.iter().all(|line| {
+        // Equal baselines establish ownership only when every item uses
+        // baseline alignment. A lone text beside a bottom/top-aligned atomic
+        // trivially agrees with itself even before the strut was projected.
+        // Mixed alignment must pass the complete is_projected check above.
+        if line.iter().any(|(child, _)| inline_leaf_alignment_keyword(child) != "baseline") {
+            return false;
+        }
         let baseline = line.iter().find_map(|(child, index)| {
             (matches!(child.kind, ComponentKind::Text { .. })
                 && inline_leaf_alignment_keyword(child) == "baseline")
@@ -14716,6 +15028,67 @@ fn project_forced_break_lines_with_constraints(layouts: &mut [(LayoutRect, usize
         let Some(parent_position) = layout_position.get(&component_index).copied() else {
             return;
         };
+        // A synthetic break after a full-width empty atomic reserves the
+        // enclosing strut, but exports no baseline from the atomic. Its box
+        // aligns against that line, including its margin box and font strut.
+        let mut first_atomic_line_height = None;
+        if (matches!(component.style.display, WDisplay::Block | WDisplay::InlineBlock)
+            || component.style.display == WDisplay::Flex
+                && component.style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")))
+            && let Some(child) = component.children.first()
+            && child.style.display == WDisplay::InlineBlock
+            && child.style.position == WPos::Static && child.style.float == WFloat::None
+            && matches!(inline_leaf_alignment_keyword(child), "baseline" | "top" | "bottom" | "middle")
+            && inline_leaf_baseline_offset(child) == 0.0
+            && child.children.is_empty()
+            && let Some(line_break) = component.children.get(1)
+            && matches!(&line_break.kind, ComponentKind::Text { content }
+                if content == "\u{2028}")
+            && line_break.style.custom_properties.as_ref().is_some_and(|properties|
+                properties.get("--w3cos-internal-full-width-atomic-line-break")
+                    .is_some_and(|value| value == "1"))
+            && let Some(position) = layout_position.get(&(component_index + 1)).copied()
+            && layouts[position].0.height == 0.0
+        {
+            let parent = layouts[parent_position].0;
+            let padding = component.style.padding_lengths();
+            let line_top = parent.y + padding.top
+                + component.style.border_top_width.unwrap_or(component.style.border_width);
+            let strut = inline_used_line_height(inline_style_line_height(&component.style));
+            let strut_ascent = inline_font_baseline_from_line_top(&component.style, strut);
+            let strut_descent = strut - strut_ascent;
+            let margin = child.style.margin_lengths();
+            let outer_height = margin.top + margin.bottom;
+            let alignment = inline_leaf_alignment_keyword(child);
+            let (height, top) = match alignment {
+                "top" => (strut.max(outer_height), margin.top),
+                "bottom" => {
+                    let height = strut.max(outer_height);
+                    (height, height - margin.bottom)
+                }
+                "middle" => {
+                    let mut x_height = component.style.font_size * 0.5;
+                    #[cfg(feature = "skia")]
+                    if let Some(resolved) = crate::render_skia::resolved_font_x_height(&component.style) {
+                        x_height = resolved;
+                    }
+                    let relative_top = -x_height * 0.5 - outer_height * 0.5;
+                    let ascent = strut_ascent.max(-relative_top);
+                    let descent = strut_descent.max(relative_top + outer_height);
+                    (ascent + descent, ascent + relative_top + margin.top)
+                }
+                _ => {
+                    let ascent = strut_ascent.max(outer_height);
+                    (ascent + strut_descent, ascent - margin.bottom)
+                }
+            };
+            first_atomic_line_height = Some(height);
+            // Font x-height can retain sub-LayoutUnit precision; the used
+            // atomic position, like the used line advance, does not.
+            let delta = inline_used_line_height(line_top + top) - layouts[position].0.y;
+            shift_subtree(layouts, layout_position, component_index + 1, count_nodes(child), 0.0, delta);
+        }
         if project_image_text_lines_with_constraints(component, component_index, layouts, layout_position,
             constraints.get(&component_index).copied()) {
             return;
@@ -14731,11 +15104,12 @@ fn project_forced_break_lines_with_constraints(layouts: &mut [(LayoutRect, usize
                 + padding.left,
             |origin| origin.content_left,
         );
-        let mut line_top = None::<f32>;
+        let mut line_top = first_atomic_line_height.map(|_| parent_rect.y + padding.top
+            + component.style.border_top_width.unwrap_or(component.style.border_width));
         // Baselines already use LayoutUnit struts. Continuations must use
         // the same used height rather than accumulate the computed CSS float.
         let strut_height = inline_used_line_height(crate::layout::inline_style_line_height(&component.style));
-        let mut line_height = strut_height;
+        let mut line_height = first_atomic_line_height.unwrap_or(strut_height);
         let mut child_index = component_index + 1;
         let children = component
             .children
@@ -15737,14 +16111,7 @@ fn project_inline_block_vertical_align_keywords(
     propagate_height_deltas(root, 0, layouts, &positions, &original_rects);
 }
 
-fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
-    let positions = layouts
-        .iter()
-        .enumerate()
-        .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
-
-    fn last_text_baseline(
+fn last_text_baseline(
         component: &Component,
         component_index: usize,
         layouts: &[(LayoutRect, usize)],
@@ -15777,6 +16144,36 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
             });
         }
         let own = match &component.kind {
+            ComponentKind::Row | ComponentKind::Box
+                if component.style.display == WDisplay::Inline
+                    && component.children.is_empty()
+                    && ({let padding=component.style.padding_lengths();
+                            [padding.top,padding.right,padding.bottom,padding.left]
+                                .into_iter().any(|value|value!=0.0)}
+                        || component.style.border_width > 0.0
+                        || [component.style.border_top_width,component.style.border_right_width,
+                            component.style.border_bottom_width,component.style.border_left_width]
+                            .into_iter().flatten().any(|width|width>0.0)) =>
+            {
+                // A decorated empty non-replaced inline still creates a line
+                // with its primary font strut. Its border-box bottom is not
+                // the baseline exported by the containing inline-block.
+                positions.get(&component_index).map(|position| {
+                    layouts[*position].0.y
+                        + component.style.border_top_width.unwrap_or(component.style.border_width)
+                        + component.style.padding_lengths().top
+                        + inline_font_content_ascent(&component.style)
+                })
+            }
+            ComponentKind::TextInput { .. } if component.style.custom_properties.as_ref()
+                .and_then(|properties| properties.get(w3cos_dom::user_agent::TEXTAREA_PROPERTY))
+                .is_some_and(|value| value == "1") =>
+            {
+                positions.get(&component_index).map(|position| {
+                    let rect = layouts[*position].0;
+                    rect.y + rect.height + component.style.margin_lengths().bottom
+                })
+            }
             ComponentKind::Button { .. } | ComponentKind::TextInput { .. } => {
                 positions.get(&component_index).map(|position| {
                     layouts[*position].0.y
@@ -15790,13 +16187,26 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
                     && !matches!(component.style.position, WPos::Absolute | WPos::Fixed) =>
             {
                 positions.get(&component_index).map(|position| {
-                    // A forced break can be retained inside one text leaf. Its
-                    // layout rect starts at the first line, while the
-                    // inline-block baseline comes from the last line box.
+                    // One leaf can retain both forced and soft line breaks.
+                    // Its rect starts at the first content box, not the final
+                    // line whose baseline is exported by the inline-block.
+                    #[cfg(feature = "skia")]
+                    {
+                        let rect = layouts[*position].0;
+                        return rect.y + crate::render_skia::measure_skia_wrapped_text_last_baseline(
+                            content,
+                            rect.width - component.style.border_left_width.unwrap_or(component.style.border_width)
+                                - component.style.border_right_width.unwrap_or(component.style.border_width),
+                            &component.style,
+                        );
+                    }
+                    #[cfg(not(feature = "skia"))]
+                    {
                     let last_line = content.matches('\u{2028}').count() as f32;
                     layouts[*position].0.y
                         + last_line * crate::layout::inline_style_line_height(&component.style)
                         + inline_font_content_ascent(&component.style)
+                    }
                 })
             }
             _ => None,
@@ -15811,6 +16221,13 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
             }
         })
     }
+
+fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
@@ -17390,6 +17807,19 @@ pub(crate) fn used_column_width(
     Some(((width + gap) / count - gap).max(0.0))
 }
 
+#[path = "layout/column_fragment_plan.rs"]
+mod column_fragment_plan;
+
+pub(crate) use column_fragment_plan::ColumnFragmentPlan;
+
+pub(crate) fn resolve_column_fragment_plans(
+    nodes: &[(&w3cos_std::style::Style, Option<usize>)],
+    rects: &[Option<LayoutRect>],
+    viewport: Option<(f32, f32)>,
+) -> Vec<Option<ColumnFragmentPlan>> {
+    column_fragment_plan::resolve(nodes,rects,viewport)
+}
+
 /// Resolve fixed-height column fragmentainer heights from the final logical
 /// flow, before paint/hit consumers slice boxes. Continuous flow balancing is
 /// a lower-bound plan; text/forced break opportunities need separate placement.
@@ -17398,53 +17828,8 @@ pub(crate) fn resolve_column_fragment_heights(
     rects: &[Option<LayoutRect>],
     viewport: Option<(f32, f32)>,
 ) -> Vec<Option<f32>> {
-    use w3cos_std::style::ColumnFill;
-    let mut contexts = vec![None; nodes.len()];
-    let mut owners = vec![None; nodes.len()];
-    let mut excluded = vec![false; nodes.len()];
-    let mut flow_ends = vec![0.0_f32; nodes.len()];
-    for (index, &(style, parent)) in nodes.iter().enumerate() {
-        excluded[index] = style.display == WDisplay::None
-            || matches!(style.position, WPos::Absolute | WPos::Fixed)
-            || parent.is_some_and(|parent| excluded[parent]);
-        if excluded[index] { continue; }
-        let Some(rect) = rects[index] else { continue; };
-        let (vw, vh) = viewport.unwrap_or((rect.width, rect.height));
-        let padding = style.padding_lengths();
-        let left = style.border_left_width.unwrap_or(style.border_width) + padding.left;
-        let right = style.border_right_width.unwrap_or(style.border_width) + padding.right;
-        let top = style.border_top_width.unwrap_or(style.border_width) + padding.top;
-        let bottom = style.border_bottom_width.unwrap_or(style.border_width) + padding.bottom;
-        let content_width = (rect.width - left - right).max(0.0);
-        if let Some(column_width) = used_column_width(style, content_width, vw, vh) {
-            let height = rect.height - top - bottom;
-            if !matches!(style.height, WDim::Auto) && height.is_finite() && height > 0.0 {
-                contexts[index] = Some((content_width, column_width, height, rect.y + top));
-            }
-        }
-        let owner = parent.and_then(|parent| {
-            if contexts[parent].is_some() { Some(parent) } else { owners[parent] }
-        });
-        owners[index] = owner;
-        if let Some(owner) = owner {
-            let (width, _, _, origin) = contexts[owner].unwrap();
-            let margin = resolve_spacing_for_layout(style.margin.bottom, width,
-                &style, vw, vh);
-            flow_ends[owner] = flow_ends[owner].max(rect.y + rect.height + margin - origin);
-        }
-    }
-    contexts.iter().enumerate().map(|(index, context)| {
-        let (width, column_width, available, _) = (*context)?;
-        let style = nodes[index].0;
-        if style.column_fill == ColumnFill::Auto { return Some(available); }
-        let gap = style.column_gap.unwrap_or(style.font_size).max(0.0);
-        let stride = column_width + gap;
-        let count = if stride > 0.0 { ((width + gap) / stride).round().max(1.0) } else { 1.0 };
-        // Round upwards to a CSS layout unit so the requested count fits the
-        // measured flow; retain explicit principal height as a ceiling.
-        let balanced = (flow_ends[index].max(0.0) / count * 64.0).ceil() / 64.0;
-        Some(balanced.max(1.0 / 64.0).min(available))
-    }).collect()
+    resolve_column_fragment_plans(nodes,rects,viewport)
+        .into_iter().map(|plan| plan.map(|plan| plan.height)).collect()
 }
 
 /// Word fragments still belong to one CSS shaping run. Resolve their
@@ -17464,6 +17849,10 @@ mod replaced_baseline_tests;
 #[cfg(all(test, feature = "skia"))]
 #[path = "layout/form_control_tests.rs"]
 mod form_control_tests;
+
+#[cfg(all(test, feature = "skia"))]
+#[path = "layout/nested_inline_wrap_tests.rs"]
+mod nested_inline_wrap_tests;
 
 #[path = "layout/intrinsic_text_indent.rs"]
 mod intrinsic_text_indent;
@@ -17496,8 +17885,6 @@ fn quote_word_fragment_advances(
             && child.style.margin == w3cos_std::style::Edges::ZERO && child.style.border_width == 0.0
             && child.style.custom_properties.as_ref().is_some_and(|properties|
                 properties.contains_key("--w3cos-internal-unbroken-inline-word"))
-            && child.children.iter().any(|part| part.style.custom_properties.as_ref()
-                .is_some_and(|properties| properties.contains_key("--w3cos-internal-generated-quote")))
             && child.children.iter().all(|part| part.children.is_empty()
                 && is_plain_inline_word_fragment(&part.kind, &part.style))
     };
@@ -17568,7 +17955,13 @@ fn inline_fragment_shaped_advances_for_width(
 ) -> Vec<Option<f32>> {
     let mut widths = vec![None; component.children.len()];
     if !matches!(component.style.display, WDisplay::Block | WDisplay::Flex | WDisplay::Inline)
-        || component.style.direction != w3cos_std::style::TextDirection::Ltr
+        || (component.style.direction != w3cos_std::style::TextDirection::Ltr
+            && (component.children.is_empty() || !component.children.iter().all(|child|
+                child.children.is_empty()
+                    && is_plain_inline_word_fragment(&child.kind, &child.style)
+                    && child.style.custom_properties.as_ref().is_some_and(|properties|
+                        properties.contains_key("--w3cos-internal-bidi-resolved-level")
+                            && properties.contains_key("--w3cos-internal-bidi-visual-order")))))
         || !component.style.custom_properties.as_ref().is_some_and(|properties| {
             properties.contains_key("--w3cos-internal-inline-formatting-context")
         })
@@ -17588,6 +17981,19 @@ fn inline_fragment_shaped_advances_for_width(
             // decoration is laid out separately, not a per-word font boundary.
             style.padding = w3cos_std::style::Edges::ZERO;
             style.margin = w3cos_std::style::Edges::ZERO;
+            style.text_decoration = w3cos_std::style::TextDecoration::None;
+            crate::inline_shaping::remove_generated_border_edges(&mut style);
+        } else if style.custom_properties.as_ref().is_some_and(|properties|
+            properties.contains_key("--w3cos-internal-split-inline-edge"))
+            && style.border_left_width.unwrap_or(style.border_width) == 0.0
+            && style.border_right_width.unwrap_or(style.border_width) == 0.0
+        {
+            // Top/bottom slice borders do not suppress the glyph advance.
+            // Keep the actual fragment's decoration; only its shaping clone
+            // is edge-free so overflowing words retain their intrinsic width.
+            style.border_width = 0.0;
+            style.border_top_width = Some(0.0);
+            style.border_bottom_width = Some(0.0);
         }
         (child.children.is_empty() && is_plain_inline_word_fragment(&child.kind, &style))
             .then_some(style)
@@ -17604,30 +18010,46 @@ fn inline_fragment_shaped_advances_for_width(
             let ComponentKind::Text { content } = &child.kind else { unreachable!() };
             content.as_str()
         }).collect::<Vec<_>>();
-        if fragments.len() >= 3 && fragments.contains(&" ")
-            && let Some(mut advances) = crate::inline_shaping::authored_word_groups(
-                &fragments, first_style,
-            ).map(|groups| groups.into_iter().flat_map(|(_, advances)| advances).collect::<Vec<_>>())
+        let eligible = fragments.len() >= 3 && fragments.contains(&" ");
+        let authored = eligible.then(|| crate::inline_shaping::authored_word_groups(
+            &fragments, first_style,
+        )).flatten().map(|groups|
+            groups.into_iter().flat_map(|(_, advances)| advances).collect::<Vec<_>>());
+        let interior = (eligible && authored.is_none()).then(||
+            crate::inline_shaping::authored_fragment_word_advances(&fragments, first_style)
+        ).flatten();
+        let interior_endpoints = interior.is_some();
+        if eligible
+            && let Some(mut advances) = authored.or(interior)
                 .or_else(|| crate::render_skia::measure_skia_inline_fragment_advances(
                     &fragments, first_style,
                 ))
         {
-            // A font change starts a new shaping run. Its layout origin uses
-            // the completed run's LayoutUnit advance, while glyph positions
+            // A font change or the final authored source completes a shaping
+            // run. Its used width occupies LayoutUnits, while glyph positions
             // inside the run retain their original fractional precision.
-            if component.children.get(end).is_some_and(|next|
+            if !interior_endpoints && ((end == component.children.len()
+                && first_style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)))
+                || component.children.get(end).is_some_and(|next|
                 next.children.is_empty() && next.style.display == WDisplay::Inline
                     && next.style.position == WPos::Static && next.style.float == WFloat::None
                     && matches!(&next.kind, ComponentKind::Text { content } if !content.is_empty())
-                    && (next.style.font_family != first_style.font_family
+                    && (first_style.custom_properties.as_ref()
+                            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
+                            .is_some_and(|source| next.style.custom_properties.as_ref()
+                                .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
+                                != Some(source))
+                        || next.style.font_family != first_style.font_family
                         || next.style.font_size != first_style.font_size
                         || next.style.font_weight != first_style.font_weight
                         || next.style.font_style != first_style.font_style
-                        || next.style.font_variant != first_style.font_variant))
+                        || next.style.font_variant != first_style.font_variant)))
             {
                 // A soft wrap discards the previous line's fractional run
                 // advance. Snap only the final line slice before the font
-                // changes, never the complete unwrapped source text.
+                // changes or an authored source ends, never the complete
+                // unwrapped source text when the source continues on a new line.
                 let advance = if let Some(limit) = available_width
                     .filter(|width| is_simple_wrapping_text_packet(component, *width))
                 {
@@ -17664,6 +18086,8 @@ fn inline_fragment_shaped_advances_for_width(
                 let padding = style.padding_lengths();
                 *width = Some(advance + if style.box_sizing == WBoxSizing::BorderBox {
                     padding.left + padding.right
+                        + style.border_left_width.unwrap_or(style.border_width)
+                        + style.border_right_width.unwrap_or(style.border_width)
                 } else { 0.0 });
             }
         }
@@ -17728,6 +18152,15 @@ fn build_taffy_tree(
     };
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    if comp.style.float != WFloat::None && style.display == Display::Block {
+        // CSS floats establish a BFC, even with authored overflow:visible.
+        // Taffy's block interface has no float/BFC flag; its non-scrolling
+        // hidden overflow boundary suppresses parent/child margin collapse.
+        // This is layout-only: native CSS overflow and paint clips are intact.
+        if style.overflow.x == taffy::Overflow::Visible {
+            style.overflow.x = taffy::Overflow::Hidden;
+        }
+    }
     let zero_line_with_empty_out_of_flow = comp.style.line_height == 0.0
         && (comp.style.display == WDisplay::Block
             || comp.style.display == WDisplay::Flex
@@ -18432,7 +18865,7 @@ fn build_taffy_tree(
             || margin.right > 0.0
     };
     let establishes_inline_formatting_context = ((matches!(comp.kind, ComponentKind::Row)
-        && comp.style.display == WDisplay::Block)
+        && matches!(comp.style.display,WDisplay::Block|WDisplay::FlowRoot))
         || matches!(
             comp.style.display,
             WDisplay::TableCell | WDisplay::TableCaption
@@ -18448,7 +18881,7 @@ fn build_taffy_tree(
             )
         });
     let mixed_inline_block_formatting_context = (matches!(comp.kind, ComponentKind::Row)
-        && comp.style.display == WDisplay::Block
+        && matches!(comp.style.display,WDisplay::Block|WDisplay::FlowRoot)
         || comp.style.display == WDisplay::InlineBlock)
         && normal_flow_children.clone().any(|child| {
             matches!(
@@ -18741,6 +19174,9 @@ fn build_taffy_tree(
             });
     let leading_block_margin_child = if (mixed_inline_block_flex_fallback
         || leading_float_before_flow)
+        // A mixed inline-block still establishes a BFC: its first block
+        // child's margin is contained, even when internal flow uses Flex.
+        && matches!(comp.style.display, WDisplay::Block | WDisplay::ListItem)
         && comp.style.float == WFloat::None
         && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed)
         && comp.style.resolved_overflow_x() == WOverflow::Visible
@@ -19016,7 +19452,7 @@ fn build_taffy_tree(
             .iter()
             .filter(|width| !width.is_sign_negative())
             .sum::<f32>();
-        if track_width > 0.0 {
+        if tracks.iter().any(|width| !width.is_sign_negative()) {
             let horizontal_edges = style
                 .padding
                 .left
@@ -19228,7 +19664,28 @@ fn build_taffy_tree(
                         comp.style.resolved_overflow_y(),
                         WOverflow::Hidden | WOverflow::Scroll | WOverflow::Auto
                     );
-                    if shrink_to_fit
+                    if passive_inline_edges && parent_display == Some(WDisplay::Inline)
+                        && !nowrap
+                        && comp.style.custom_properties.as_ref().is_none_or(|properties|
+                            !properties.contains_key(w3cos_std::inline_text::SOURCE_RUN))
+                    {
+                        // A raw nested inline can retain one unsplit text
+                        // leaf. Its normal text fits the containing line,
+                        // while its min-content floor preserves long words.
+                        // Authored DOM source fragments already carry their
+                        // shared shaping/line-fitting plan; do not resize
+                        // those fragments independently of that plan.
+                        let padding = comp.style.padding_lengths();
+                        let edges = padding.left + padding.right
+                            + comp.style.border_left_width.unwrap_or(comp.style.border_width)
+                            + comp.style.border_right_width.unwrap_or(comp.style.border_width);
+                        let width = shrink_to_fit_used_width_with_available(comp, containing_width);
+                        let content_width = if comp.style.box_sizing == WBoxSizing::ContentBox {
+                            (width - edges).max(0.0)
+                        } else { width };
+                        let dim = Dimension::length(content_width);
+                        (dim, dim)
+                    } else if shrink_to_fit
                         || (nowrap
                             && !clips_overflow
                             && !matches!(
@@ -19776,8 +20233,9 @@ fn build_taffy_tree(
                     }
                 }
                 if comp.style.display == WDisplay::TableCell
-                    && inherited_cell_tracks.is_some()
-                    && child_containing_width > 0.0
+                    && inherited_cell_tracks.is_some_and(|tracks|
+                        tracks.iter().any(|width| !width.is_sign_negative()))
+                    && child_containing_width >= 0.0
                     // Replaced boxes keep intrinsic/ratio-based sizing;
                     // the cell track is not an authored width or max-width.
                     && !matches!(c.kind, ComponentKind::Image { .. }
@@ -20223,7 +20681,7 @@ fn build_taffy_tree(
                                 && (c.style.white_space != WWhiteSpace::PreLine
                                     || !content.chars().any(|ch| matches!(ch, '\n' | '\r'))))
                     && source_index > 0
-                    && child_containing_width > 0.0
+                    && child_containing_width >= 0.0
                     && (leading_separators[source_index]
                         || (comp.children[source_index - 1]
                         .style
@@ -20292,6 +20750,33 @@ fn build_taffy_tree(
                             ..Style::default()
                         })?;
                         separator_breaks.push((c.style.order, source_index, line_break));
+                    }
+                }
+                if is_simple_wrapping_text_packet(comp, child_containing_width)
+                    && source_index > 0
+                    && matches!(&c.kind, ComponentKind::Text { content } if content == " ")
+                    && c.style.margin.left == WSpacing::Px(0.0)
+                    && c.style.margin.right == WSpacing::Px(0.0)
+                    && inline_line_filled_by_previous_items(
+                        &comp.children[..source_index], child_containing_width)
+                {
+                    // Keep decoration at the completed line's edge while
+                    // its collapsed glyph advance does not consume a row.
+                    let mut child_style = tree.style(node)?.clone();
+                    if child_style.display != taffy::Display::None {
+                        let edges = resolve_spacing_for_layout(c.style.padding.left,
+                            child_containing_width, &c.style, viewport_w, viewport_h)
+                            + resolve_spacing_for_layout(c.style.padding.right,
+                                child_containing_width, &c.style, viewport_w, viewport_h)
+                            + c.style.border_left_width.unwrap_or(c.style.border_width)
+                            + c.style.border_right_width.unwrap_or(c.style.border_width);
+                        child_style.size.width = Dimension::length(edges);
+                        child_style.min_size.width = Dimension::length(edges);
+                        child_style.max_size.width = Dimension::length(edges);
+                        child_style.flex_basis = Dimension::length(edges);
+                        child_style.box_sizing = BoxSizing::BorderBox;
+                        child_style.margin.right = LengthPercentageAuto::length(-edges);
+                        tree.set_style(node, child_style)?;
                     }
                 }
                 if matches!(comp.style.display, WDisplay::Flex | WDisplay::InlineFlex)
@@ -20955,11 +21440,17 @@ fn collect_layouts_fast(
                     && !matches!(info.kind, ComponentKind::Text { .. })
                     && info.style.align_self == WAlignSelf::FlexEnd
                 {
-                    // The layout container accommodates tall descendants,
-                    // but the inline paint box is its own bottom-aligned em
-                    // box. Descendants retain the original layout origin.
+                    // A bottom-aligned child group exports its bottom as the
+                    // owner's baseline. Place the owner's font box by ascent,
+                    // not by its height; its descent may extend below the
+                    // children. Descendants retain the original layout origin.
+                    let owner_baseline = if info.style.align_items == WAlign::FlexEnd {
+                        inline_font_content_ascent(info.style) + half_leading
+                    } else {
+                        line_height
+                    };
                     passive_inline_alignment_offset =
-                        (layout.content_box_height() - line_height).max(0.0);
+                        (layout.content_box_height() - owner_baseline).max(0.0);
                 }
                 passive_inline_top_edge = padding.top
                     + info
@@ -21184,8 +21675,13 @@ fn collect_layouts_fast(
                                     let leading = if style.display == WDisplay::Inline
                                         && matches!(flat[*index].kind, ComponentKind::Text { .. })
                                     {
-                                        (crate::layout::inline_style_line_height(&style) - inline_font_height(style))
-                                            * 0.5
+                                        // Recover the line origin using the same
+                                        // rounded upper leading that positioned
+                                        // the glyph box, not the fractional half.
+                                        inline_upper_leading(
+                                            inline_style_line_height(style),
+                                            inline_font_height(style),
+                                        )
                                     } else {
                                         0.0
                                     };
@@ -22618,10 +23114,15 @@ mod tests {
                 margin: w3cos_std::style::Edges { left: WSpacing::Ch(-2.0),
                     ..w3cos_std::style::Edges::ZERO }, ..s() };
             let zero = style.ch_advance();
-            assert_eq!(style.padding_lengths().left, zero);
-            assert_eq!(style.margin_lengths().left, -2.0 * zero);
-            assert_eq!(resolve_spacing_for_layout(WSpacing::Ch(1.0), 800.0, &style, 800.0, 600.0), zero);
-            assert_eq!(to_taffy_spacing(WSpacing::Ch(1.0), &style, 800.0, 600.0), LengthPercentage::length(zero));
+            // Glyph advances retain shaping precision; used box edges are
+            // separate LayoutUnits. Chrome's16px monospace has zero advance
+            // 9.6015625 but used1ch padding9.59375, not the unquantized width.
+            let used_zero = w3cos_std::style::used_box_spacing(zero);
+            assert_eq!(style.padding_lengths().left, used_zero);
+            assert_eq!(style.margin_lengths().left,
+                w3cos_std::style::used_box_spacing(-2.0 * zero));
+            assert_eq!(resolve_spacing_for_layout(WSpacing::Ch(1.0), 800.0, &style, 800.0, 600.0), used_zero);
+            assert_eq!(to_taffy_spacing(WSpacing::Ch(1.0), &style, 800.0, 600.0), LengthPercentage::length(used_zero));
             assert_eq!(to_taffy_dim(WDim::Ch(3.0), &style, 800.0, 600.0), Dimension::length(3.0 * zero));
             assert_eq!(to_taffy_auto(WDim::Ch(3.0), &style, 800.0, 600.0), LengthPercentageAuto::length(3.0 * zero));
             if family == "Ahem" { assert_eq!(zero, 16.0); }
@@ -22630,6 +23131,36 @@ mod tests {
             assert_eq!(style.ch_advance(), zero, "tracking is not part of a font-relative CSS unit");
             style.font_size = 24.0;
             assert!(style.padding_lengths().left > zero, "font changes must not reuse stale pixels");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn character_units_keep_standard_font_context_and_cache_isolation() {
+        install_font_unit_provider();
+        let embedding = Style { font_size: 10.0, ..s() };
+        let mut standard = embedding.clone();
+        standard.custom_properties = Some(HashMap::from([(
+            w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(), "1".into(),
+        )]));
+        let expected = crate::render_skia::measure_skia_font_zero_advance(&standard);
+        assert_eq!(expected, 6.0, "Chrome's 10px standard Times gives 12ch = 72px");
+        for reverse in [false, true] {
+            CH_ADVANCE_CACHE.with(|cache| cache.borrow_mut().clear());
+            let styles = if reverse { [&standard, &embedding] } else { [&embedding, &standard] };
+            for style in styles {
+                assert_eq!(style.ch_advance(),
+                    crate::render_skia::measure_skia_font_zero_advance(style),
+                    "font units must keep the glyph painter's face; reverse={reverse}");
+            }
+        }
+        for language in ["en", "zh-CN"] {
+            let mut localized = standard.clone();
+            localized.custom_properties.as_mut().unwrap().insert(
+                w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(), language.into());
+            assert_eq!(localized.ch_advance(),
+                crate::render_skia::measure_skia_font_zero_advance(&localized),
+                "language context participates in font-unit resolution: {language}");
         }
     }
 
@@ -23169,14 +23700,17 @@ mod tests {
 
     #[test]
     fn multicol_count_gap_and_positioned_containing_blocks_remain_distinct() {
-        for (display, width, count, gap, expected) in [
-            (WDisp::Block, WDim::Auto, Some(3), Some(0.0), 100.0),
-            (WDisp::Block, WDim::Px(100.0), Some(2), Some(0.0), 150.0),
-            (WDisp::Block, WDim::Auto, Some(2), Some(20.0), 140.0),
-            (WDisp::Block, WDim::Auto, Some(2), None, 142.0),
-            (WDisp::Block, WDim::Em(5.0), None, Some(0.0), 100.0),
-            (WDisp::Flex, WDim::Px(100.0), Some(3), Some(0.0), 300.0),
-            (WDisp::Grid, WDim::Px(100.0), Some(3), Some(0.0), 300.0),
+        // Chrome first-fragment widths use layout-unit padding, not a
+        // continuous expected * 0.8 approximation (142px -> 113.625px).
+        // The abspos containing block remains the unfragmented principal box.
+        for (display, width, count, gap, expected, padding, content_width) in [
+            (WDisp::Block, WDim::Auto, Some(3), Some(0.0), 100.0, 10.0, 80.0),
+            (WDisp::Block, WDim::Px(100.0), Some(2), Some(0.0), 150.0, 15.0, 120.0),
+            (WDisp::Block, WDim::Auto, Some(2), Some(20.0), 140.0, 14.0, 112.0),
+            (WDisp::Block, WDim::Auto, Some(2), None, 142.0, 14.1875, 113.625),
+            (WDisp::Block, WDim::Em(5.0), None, Some(0.0), 100.0, 10.0, 80.0),
+            (WDisp::Flex, WDim::Px(100.0), Some(3), Some(0.0), 300.0, 30.0, 240.0),
+            (WDisp::Grid, WDim::Px(100.0), Some(3), Some(0.0), 300.0, 30.0, 240.0),
         ] {
             let root = Component::column(Style {
                 display,
@@ -23216,8 +23750,9 @@ mod tests {
             ]);
             let layouts = compute(&root, 800.0, 600.0).unwrap();
             let rect = |index| layouts.iter().find(|(_, i)| *i == index).unwrap().0;
-            assert!((rect(1).width - expected).abs() < 0.01, "{display:?} {layouts:?}");
-            assert!((rect(2).width - expected * 0.8).abs() < 0.01, "{layouts:?}");
+            assert_eq!(rect(1).width, expected, "{display:?} {layouts:?}");
+            assert_eq!(rect(2).x, padding, "{display:?} {layouts:?}");
+            assert_eq!(rect(2).width, content_width, "{display:?} {layouts:?}");
             assert_eq!(rect(3).width, 150.0, "abspos must use principal box: {layouts:?}");
         }
     }
@@ -23500,6 +24035,28 @@ mod tests {
     }
 
     #[test]
+    fn soft_wrap_after_inline_edge_discards_separator_with_trailing_source_space() {
+        let plain = Style {display:WDisp::Inline,font_family:Some("Ahem".into()),
+            font_size:20.0,line_height:1.0,line_height_is_normal:false,..Style::default()};
+        for border in [false,true] {
+            let mut decorated=plain.clone();
+            if border { decorated.border_left_width=Some(50.0); }
+            else { decorated.padding.left=WSpacing::Px(50.0); }
+            let mut host=Style {display:WDisp::Block,width:WDim::Px(80.0),
+                flex_wrap:WWrap::Wrap,..plain.clone()};
+            host.custom_properties.get_or_insert_with(Default::default).insert(
+                "--w3cos-internal-inline-formatting-context".into(),"1".into());
+            let root=Component::row(host,vec![Component::text("xx ",plain.clone()),
+                Component::text("x",decorated),Component::text(" ",plain.clone()),
+                Component::text("xx",plain.clone())]);
+            let layouts=compute(&root,800.0,600.0).unwrap();
+            let last=layouts.iter().find(|(_,index)|*index==4).unwrap().0;
+            assert_eq!(last.x,0.0,"border={border}: {layouts:?}");
+            assert_eq!(last.y,40.0,"border={border}: {layouts:?}");
+        }
+    }
+
+    #[test]
     fn soft_wrap_keeps_the_boundary_before_a_narrow_following_word() {
         let plain = Style { display: WDisp::Inline, font_size: 16.0, ..Style::default() };
         let first_width = text_intrinsic_size_for_taffy("MMMM", &plain).0;
@@ -23633,27 +24190,33 @@ mod tests {
 
     #[test]
     fn inline_wrap_discards_separator_with_only_vertical_decoration() {
+        // Standards-mode Chrome uses the same 23px image line in all three
+        // variants. Horizontal decoration hangs at the completed line edge;
+        // it preserves its box width, not another fitting advance/line.
+        let font_style = Style {
+            font_family: Some("Arial".into()),
+            font_size: 20.0,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            ..Style::default()
+        };
         let build = |separator: Option<f32>| {
             let image = || Component::image("white.png", Style {
                 display: WDisp::InlineBlock,
                 width: WDim::Px(130.0),
                 height: WDim::Px(20.0),
-                font_size: 20.0,
-                line_height: 1.0,
-                ..Style::default()
+                ..font_style.clone()
             });
             let mut children = vec![image()];
             if let Some(horizontal_padding) = separator {
                 let mut style = Style {
                     display: WDisp::Inline,
-                    font_size: 20.0,
-                    line_height: 1.0,
                     border_width: 10.0,
                     border_left_width: Some(0.0),
                     border_right_width: Some(0.0),
                     padding: w3cos_std::style::Edges::xy(0.0, 20.0),
                     margin: w3cos_std::style::Edges::xy(0.0, 20.0),
-                    ..Style::default()
+                    ..font_style.clone()
                 };
                 style.padding.left = WSpacing::Px(horizontal_padding);
                 children.push(Component::text(" ", style));
@@ -23663,9 +24226,7 @@ mod tests {
                 display: WDisp::Flex,
                 flex_wrap: WWrap::Wrap,
                 width: WDim::Px(130.0),
-                font_size: 20.0,
-                line_height: 1.0,
-                ..Style::default()
+                ..font_style.clone()
             };
             style.custom_properties.get_or_insert_with(Default::default).insert(
                 "--w3cos-internal-inline-formatting-context".into(), "1".into());
@@ -23674,14 +24235,27 @@ mod tests {
             let last = root.children.len();
             let following = layout.iter().find(|(_, index)| *index == last).unwrap().0;
             let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+            if let Some(padding) = separator {
+                let decoration = layout.iter().find(|(_, index)| *index == 2);
+                if padding == 0.0 {
+                    // Transparent collapsed text without horizontal edges is
+                    // omitted from the paint-layout output, not another line.
+                    assert!(decoration.is_none(), "zero-width separator: {layout:?}");
+                } else {
+                    assert_eq!(decoration.unwrap().0,
+                        LayoutRect {x:130.0,y:-28.0,width:padding,height:82.0},
+                        "the hanging decoration retains its full paint box");
+                }
+            }
             (following, parent)
         };
         let control = build(None);
+        assert_eq!(control.0.y, 23.0);
+        assert_eq!(control.1.height, 46.0);
         let collapsed = build(Some(0.0));
         assert_eq!(collapsed, control, "vertical decoration adds a phantom line");
         let horizontal = build(Some(1.0));
-        assert!(horizontal.0.y > control.0.y,
-            "horizontal decoration must retain inline advance: {horizontal:?}, {control:?}");
+        assert_eq!(horizontal, control, "the decoration hangs on the completed line");
     }
 
     #[test]
@@ -28154,9 +28728,13 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(texts.len(), 3, "{inner_align}: {texts:?}");
             let large = texts.iter().find(|(content, _)| *content == "p").unwrap().1;
+            // Anonymous text shares the owner's baseline. Chrome keeps it
+            // at the tall child's top for vertical-align:top, but 80px below
+            // that child for vertical-align:bottom; these are not equivalent.
+            let small_offset = if inner_align == "top" { 0.0 } else { 80.0 };
             for (_, small) in texts.iter().filter(|(content, _)| *content == "X") {
                 assert!(
-                    (small.y - (large.y + 80.0)).abs() < 1.0,
+                    (small.y - (large.y + small_offset)).abs() < 0.01,
                     "{inner_align}: {texts:?}"
                 );
             }
@@ -28744,8 +29322,12 @@ mod tests {
                 "X",
                 Style {
                     display: WDisp::Inline,
+                    // Exact20px em geometry belongs to Ahem, not the
+                    // unspecified native embedding face.
+                    font_family: Some("Ahem".into()),
                     font_size: 20.0,
                     line_height: 1.0,
+                    line_height_is_normal: false,
                     ..Style::default()
                 },
             )
@@ -28756,8 +29338,10 @@ mod tests {
                     display: WDisp::InlineBlock,
                     height: WDim::Auto,
                     border_width: 20.0,
+                    font_family: Some("Ahem".into()),
                     font_size: 20.0,
                     line_height: 1.0,
+                    line_height_is_normal: false,
                     align_self: alignment,
                     ..Style::default()
                 },
@@ -31615,6 +32199,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
     fn wrapped_inline_lines_stay_at_block_start_in_a_fixed_height_container() {
         let image = || {
             Component::image(
@@ -31627,23 +32212,26 @@ mod tests {
                 },
             )
         };
-        let layout = compute(
-            &Component::boxed(
-                Style {
-                    display: WDisp::Block,
-                    width: WDim::Px(100.0),
-                    height: WDim::Px(200.0),
-                    ..Style::default()
-                },
-                vec![image(), image()],
-            ),
-            800.0,
-            600.0,
-        )
-        .unwrap();
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                height: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![image(), image()],
+        );
+        let flat = pre_flatten(&root);
+        for layout in [compute(&root, 800.0, 600.0).unwrap(),
+            LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
 
-        assert_eq!(layout[1].0.y, 0.0);
-        assert_eq!(layout[2].0.y, 20.0);
+            assert_eq!(layout[1].0.y, 0.0);
+            // V3669 binds Chrome to the exact Inter bytes used by the unit
+            // embedding's intrinsic measurer. Its baseline line retains4.1875px
+            // below the20px image; fixed parent height does not stretch the rows.
+            assert_eq!(layout[2].0.y, 24.1875, "{layout:?}");
+            assert_eq!(layout[0].0.height, 200.0);
+        }
     }
 
     #[test]
@@ -34307,13 +34895,16 @@ mod tests {
             .iter()
             .position(|node| node.style.clear == WClear::Right)
             .unwrap();
-        assert!(
-            rect(bfc_index).height >= 100.0,
+        assert_eq!(
+            rect(bfc_index).height, 100.0,
             "auto-height overflow BFC must include cleared descendant: {:?}",
             rect(bfc_index)
         );
-        assert!(
-            (rect(clear_index).y - 71.2).abs() < 0.01,
+        let right_float = flat.iter().position(|node| node.style.float == WFloat::Right).unwrap();
+        assert_eq!(rect(right_float).y, 54.0);
+        assert_eq!(rect(clear_index).y, rect(right_float).y + rect(right_float).height);
+        assert_eq!(
+            rect(clear_index).y, 74.0,
             "clearance must remain below the right float: {:?}",
             rect(clear_index)
         );
@@ -35483,19 +36074,20 @@ mod tests {
             let layout = compute(&root, 800.0, 600.0).unwrap();
             let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
             let expected = if overflow == WOverflow::Visible {
-                19.2
+                // The used line height is truncated to a 1/64px LayoutUnit.
+                19.1875
             } else {
                 56.0
             };
-            assert!(
-                (get(1).height - expected).abs() < 0.01,
-                "overflow={overflow:?}, height={}",
-                get(1).height
-            );
-            assert!(
-                (get(4).y - get(1).y - expected).abs() < 0.01,
-                "overflow={overflow:?}, sibling_y={}",
-                get(4).y
+            assert_eq!(get(1).height, expected, "overflow={overflow:?}");
+            assert_eq!(get(4).y, get(1).y + expected, "overflow={overflow:?}");
+            assert_eq!(get(2).y, get(1).y, "overflow={overflow:?}");
+            assert_eq!(get(2).height, 48.0, "overflow={overflow:?}");
+            // compute's root establishes a BFC, even when its child does not.
+            assert_eq!(
+                get(0).height,
+                (expected + 10.0).max(56.0),
+                "overflow={overflow:?}"
             );
         }
     }
@@ -35597,7 +36189,10 @@ mod tests {
         let float = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
         assert_eq!(float.y, 24.0);
-        assert_eq!(following.y, 80.0);
+        // The following normal block is not clear/BFC and flows beside
+        // the leading float; that float's margins do not move its origin.
+        assert_eq!(following.y, 8.0);
+        assert_eq!(following.height, 96.0);
     }
 
     #[test]
@@ -36668,10 +37263,13 @@ mod tests {
 
     #[test]
     fn table_cell_inline_padding_does_not_move_the_content_line() {
+        // Chrome155: serif16/1.2 has an18px font box at the cell's
+        // content top; 160px inline padding must not move that text.
+        let text_style = Style { font_family: Some("serif".into()), ..Style::default() };
         let root = Component::row(
             Style {
                 display: WDisp::TableCell,
-                ..Style::default()
+                ..text_style.clone()
             },
             vec![Component::row(
                 Style {
@@ -36680,9 +37278,9 @@ mod tests {
                         top: WSpacing::Px(160.0),
                         ..w3cos_std::style::Edges::ZERO
                     },
-                    ..Style::default()
+                    ..text_style.clone()
                 },
-                vec![Component::text("control", Style::default())],
+                vec![Component::text("control", text_style)],
             )],
         );
         let flat = pre_flatten(&root);
@@ -36692,7 +37290,7 @@ mod tests {
                     x: 8.0,
                     y: 192.0,
                     width: 200.0,
-                    height: 16.0,
+                    height: 19.1875,
                 },
                 0,
             ),
@@ -36701,7 +37299,7 @@ mod tests {
                     x: 8.0,
                     y: 112.0,
                     width: 200.0,
-                    height: 176.0,
+                    height: 178.0,
                 },
                 1,
             ),
@@ -36710,7 +37308,7 @@ mod tests {
                     x: 8.0,
                     y: 272.0,
                     width: 200.0,
-                    height: 16.0,
+                    height: 18.0,
                 },
                 2,
             ),
@@ -37245,15 +37843,21 @@ mod tests {
         .unwrap();
         let first = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         let second = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
-        let expected_line_height = 16.0 * 1.2;
+        let parent = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        // Chrome's used line box truncates 19.2px to 19.1875px. The inline
+        // text rect is a font box, not that line box; its metrics depend on
+        // the embedding font. Measure the anonymous line from the parent's
+        // content start to the following block, independently of glyph size.
+        let expected_line_height = 19.1875;
+        assert_eq!(second.height, expected_line_height);
+        assert_eq!(second.y - (parent.y + 2.0), expected_line_height);
+        assert_eq!(parent.height, expected_line_height * 2.0 + 4.0);
+        assert_eq!(first.x, parent.x + 2.0);
+        assert_eq!(second.x, first.x);
+        assert_eq!(second.width, parent.width - 4.0);
         assert!(
-            (first.height - expected_line_height).abs() < 0.01
-                && (second.height - expected_line_height).abs() < 0.01,
-            "generated Latin line boxes should use CSS line-height {expected_line_height}: first={first:?}, second={second:?}"
-        );
-        assert!(
-            (second.y - (first.y + first.height)).abs() < 0.01,
-            "block child should follow the anonymous generated line without a gap: first={first:?}, second={second:?}"
+            first.width > 0.0 && first.height > 0.0,
+            "the generated anonymous line must retain its inline text: {first:?}"
         );
     }
 
@@ -38021,7 +38625,7 @@ mod tests {
     }
 
     #[test]
-    fn block_table_wrapper_em_margins_use_the_parent_font() {
+    fn block_table_wrapper_em_margins_use_the_table_font() {
         let em_margin = |value| w3cos_std::style::Edges {
             top: WSpacing::Em(value),
             right: WSpacing::Em(value),
@@ -38066,8 +38670,10 @@ mod tests {
 
         let table = layout_for(child(WDisp::Table, WFloat::None, em_margin(1.0)));
         let floating = layout_for(child(WDisp::Block, WFloat::Left, float_margin));
-        assert_eq!(table.y, 16.0);
-        assert_eq!(table.y, floating.y);
+        // Independent Chrome155: the table's1em is32px, while the
+        // float's0.5em is16px. The16px parent does not resolve either.
+        assert_eq!(table.y, 32.0);
+        assert_eq!(floating.y, 16.0);
         assert_eq!(table.x, 32.0);
         assert_eq!(table.x, floating.x);
     }
@@ -39130,6 +39736,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_inline_block_contains_its_leading_block_margin() {
+        let atom = |display, width| Component::boxed(
+            Style {
+                display,
+                width: WDim::Px(width),
+                height: WDim::Px(20.0),
+                margin: w3cos_std::style::Edges::all(3.2),
+                padding: w3cos_std::style::Edges::all(3.2),
+                border_width: 1.0,
+                ..Style::default()
+            },
+            vec![],
+        );
+        let root = Component::boxed(
+            Style { display: WDisp::Block, ..Style::default() },
+            vec![Component::boxed(
+                Style { display: WDisp::InlineBlock, ..Style::default() },
+                vec![atom(WDisp::Block, 192.0), atom(WDisp::InlineBlock, 128.0),
+                    atom(WDisp::InlineBlock, 64.0)],
+            )],
+        );
+        let layouts = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layouts.iter().find(|(_, node)| *node == index).unwrap().0;
+        // Chrome155: the inline-block is a BFC. The child's 3.2px margin
+        // becomes 3.1875px in LayoutUnits; it cannot escape the containing box.
+        assert_eq!(rect(2).y - rect(1).y, 3.1875, "{layouts:?}");
+        assert_eq!(rect(2).width, 200.375, "{layouts:?}");
+        assert_eq!(rect(3).y, rect(4).y, "{layouts:?}");
+    }
+
+    #[test]
     fn shrink_wrapped_inline_block_keeps_adjacent_fractional_width_atoms_on_one_row() {
         let atom = |width: f32| {
             Component::boxed(
@@ -39176,10 +39813,13 @@ mod tests {
         );
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let rect = |index| layout.iter().find(|(_, node)| *node == index).unwrap().0;
-        assert!(
-            (rect(2).width - 200.4).abs() < 0.01,
-            "the preceding block keeps its specified content width: {layout:?}"
-        );
+        // Independent Chrome155 geometry (image-line-browser-v3547) uses
+        // LayoutUnits for each 3.2px padding/margin: 3.1875px, not 3.2px.
+        assert_eq!(rect(2).width, 200.375, "{layout:?}");
+        assert_eq!(rect(1).width, 221.5, "{layout:?}");
+        assert_eq!(rect(3).width, 136.375, "{layout:?}");
+        assert_eq!(rect(4).width, 72.375, "{layout:?}");
+        assert_eq!(rect(4).x - rect(3).x - rect(3).width, 6.375, "{layout:?}");
         assert!(
             (rect(3).y - rect(4).y).abs() < 0.01,
             "fractional-width atoms must share the row: {layout:?}"
@@ -40231,7 +40871,7 @@ mod tests {
             let rect = |y, height| LayoutRect { x: 0.0, y, width: 232.0, height };
             let mut layout = vec![(rect(0.0, 16.0),0),(rect(0.0,16.0),1),
                 (rect(0.0,16.0),2),(rect(-1.0,178.0),3)];
-            project_table_rows_after_content_settlement(&mut layout, &pre_flatten(&table), 800.0, 600.0);
+            project_table_rows_after_content_settlement(&mut layout, &table, &pre_flatten(&table), 800.0, 600.0);
             assert_eq!(layout[1].0.height, 16.0, "marked={marked}");
             assert_eq!(layout[2].0.height, 16.0, "marked={marked}");
         }
@@ -40257,7 +40897,7 @@ mod tests {
             layouts.extend([(rect(59.0), row_index), (rect(59.0), row_index + 1),
                 (rect(22.0), row_index + 2), (rect(54.0), row_index + 3),
                 (rect(22.0), row_index + 4)]);
-            project_table_rows_after_content_settlement(&mut layouts, &pre_flatten(&table), 800.0, 600.0);
+            project_table_rows_after_content_settlement(&mut layouts, &table, &pre_flatten(&table), 800.0, 600.0);
             let at = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
             assert_eq!(at(row_index).height, 59.0);
             assert_eq!(at(row_index + 3).height, 59.0,
@@ -40634,7 +41274,7 @@ mod tests {
                 (rect(0.0, 50.0), row_index), (rect(0.0, 50.0), cell_index),
                 (rect(relative, 54.0), ifc_index), (rect(50.0, 20.0), following),
             ]);
-            project_table_rows_after_content_settlement(&mut layout, &flat, 800.0, 600.0);
+            project_table_rows_after_content_settlement(&mut layout, &root, &flat, 800.0, 600.0);
             project_auto_table_child_heights(&mut layout, &root, &flat, 800.0, 600.0);
             let at = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
             assert_eq!(at(cell_index).height, 54.0, "grouped={grouped}");
@@ -40999,20 +41639,51 @@ mod tests {
     }
 
     #[test]
+    fn inline_table_text_rows_export_first_line_baseline() {
+        let style = Style {
+            display: WDisp::TableRow,
+            font_family: Some("Ahem".into()),
+            font_size: 50.0,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            ..Style::default()
+        };
+        let table = Component::row(
+            Style { display: WDisp::InlineTable, ..style.clone() },
+            vec![Component::text("X", style.clone()), Component::text("X", style)],
+        );
+        let rect = |y, height| LayoutRect { x: 0.0, y, width: 50.0, height };
+        let layout = vec![(rect(10.0, 100.0), 0), (rect(10.0, 50.0), 1), (rect(60.0, 50.0), 2)];
+        let positions = layout.iter().enumerate().map(|(position, (_, index))| (*index, position)).collect();
+        assert_eq!(crate::inline_table_baseline::first_row(&table, 0, &layout, &positions),
+            Some(50.0), "a text-bearing row represents an anonymous cell, not an empty table");
+    }
+
+    #[test]
     fn inline_table_uses_its_first_cell_text_as_the_sibling_baseline() {
+        // Pin the font and integral half-leading: Chrome Ahem16/20 places
+        // all three glyph boxes at 63 for a cell starting at 48 with 4+9
+        // top decoration. An unspecified face cannot assume a 16px font box.
+        let text_style = Style {
+            font_family: Some("Ahem".into()),
+            font_size: 16.0,
+            line_height: 1.25,
+            line_height_is_normal: false,
+            ..Style::default()
+        };
         let inline = |content| {
             Component::text(
                 content,
                 Style {
                     display: WDisp::Inline,
-                    ..Style::default()
+                    ..text_style.clone()
                 },
             )
         };
         let table = Component::row(
             Style {
                 display: WDisp::InlineTable,
-                ..Style::default()
+                ..text_style.clone()
             },
             vec![Component::text(
                 "bcd",
@@ -41020,14 +41691,14 @@ mod tests {
                     display: WDisp::TableCell,
                     padding: w3cos_std::style::Edges::xy(0.0, 9.0),
                     border_top_width: Some(4.0),
-                    ..Style::default()
+                    ..text_style.clone()
                 },
             )],
         );
         let root = Component::row(
             Style {
                 display: WDisp::Block,
-                ..Style::default()
+                ..text_style.clone()
             },
             vec![inline("a"), table, inline("e")],
         );
@@ -41048,8 +41719,11 @@ mod tests {
 
         align_inline_table_first_row_baselines(&mut layout, &flat);
 
-        assert!((layout[1].0.y - 62.6).abs() < 0.01);
-        assert!((layout[4].0.y - 62.6).abs() < 0.01);
+        assert!((layout[1].0.y - 63.0).abs() < 0.00001);
+        assert!((layout[4].0.y - 63.0).abs() < 0.00001);
+        let aligned = layout.clone();
+        align_inline_table_first_row_baselines(&mut layout, &flat);
+        assert_eq!(layout, aligned, "first-row baseline projection is idempotent");
     }
 
     #[test]
@@ -41159,11 +41833,13 @@ mod tests {
                 vec![Component::text("x", text_style)],
             )],
         );
-        let direct_height = compute(&direct, 800.0, 600.0).unwrap()[0].0.height;
-        let nested_height = compute(&nested, 800.0, 600.0).unwrap()[0].0.height;
+        let direct_layout = compute(&direct, 800.0, 600.0).unwrap();
+        let nested_layout = compute(&nested, 800.0, 600.0).unwrap();
+        let direct_height = direct_layout[0].0.height;
+        let nested_height = nested_layout[0].0.height;
         assert!(
             (direct_height - nested_height).abs() < 0.01,
-            "plain nested block adds a spurious normal-line strut: direct={direct_height}, nested={nested_height}"
+            "plain nested block adds a spurious normal-line strut: direct={direct_height}, nested={nested_height}, direct_layout={direct_layout:?}, nested_layout={nested_layout:?}"
         );
     }
 
@@ -42511,6 +43187,41 @@ mod tests {
     }
 
     #[test]
+    fn cleared_float_wrappers_preserve_authored_width_and_clearance() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/cleared-floats.html").unwrap();
+        // This inert parser host does not install embedded stylesheets.
+        // Use equivalent inline CSS so the fixture exercises real floats.
+        parser.write("<!doctype html><body style='margin:0'>\
+            <div style='width:200px'>\
+            <div style='float:left;clear:left;width:30px;height:20px;background:blue'></div>\
+            <div style='float:left;clear:left;width:30px;height:20px;background:blue'></div>\
+            </div></body>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        for layout in [compute(&root, 800.0, 600.0).unwrap(),
+            LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+            let floats = flat.iter().enumerate().filter(|(_,node)|
+                node.style.float == WFloat::Left && node.style.width == WDim::Px(30.0))
+                .map(|(index,_)| layout.iter().find(|(_,item)| *item==index).unwrap().0)
+                .collect::<Vec<_>>();
+            assert_eq!(floats.len(), 2);
+            // Independent Chrome155 V3631: width remains30 in a200px
+            // containing block; clear:left starts the second float at20.
+            for (index,rect) in floats.iter().enumerate() {
+                assert_eq!((rect.x,rect.y,rect.width,rect.height),
+                    (0.0,index as f32*20.0,30.0,20.0), "{layout:?}");
+            }
+        }
+    }
+
+    #[test]
     fn unbroken_inline_run_places_full_width_float_below_its_text_line() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
@@ -42556,9 +43267,19 @@ mod tests {
         );
         assert_eq!(
             float_y,
-            text_y("2222") + 10.0,
-            "the deferred float follows the earlier inline line box"
+            18.0,
+            "the deferred float follows the earlier inline line box; layout={layout:?}; nodes={:?}",
+            flat.iter().enumerate().map(|(index, node)| (
+                index, node.kind, node.style.display, node.style.font_size,
+                node.style.line_height, node.style.line_height_is_normal,
+                node.style.white_space, &node.style.custom_properties, node.parent,
+            )).collect::<Vec<_>>()
         );
+        // Chrome155 V3600 measures glyph tops at6 and the deferred float
+        // at18: the float follows the 8px line origin plus10px used height,
+        // not the 6px font-box origin plus10. Keep both independently exact.
+        assert_eq!(text_y("1111"), 6.0);
+        assert_eq!(text_y("2222"), 6.0);
     }
 
     #[test]
@@ -43488,13 +44209,13 @@ mod tests {
             .find(|(_, node)| node.style.float == WFloat::Left)
             .map(|(index, _)| rect(index))
             .unwrap();
-        assert!((red.y - floating.y).abs() < 0.01);
-        assert!(
-            (red.y - 51.2).abs() < 0.01,
+        assert_eq!(red.y, floating.y);
+        assert_eq!(
+            red.y, 54.0,
             "red={red:?}, float={floating:?}"
         );
-        assert!(
-            (red.height - 100.0).abs() < 0.01,
+        assert_eq!(
+            red.height, 100.0,
             "red={red:?}, float={floating:?}"
         );
     }
@@ -43936,6 +44657,38 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn mixed_float_auto_height_keeps_bfc_constraints_and_following_siblings() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for (sizing,expected_height) in [("",133.0),("overflow:auto",148.0),
+            ("display:flow-root",148.0),("height:200px",210.0),
+            ("min-height:160px",170.0),("max-height:100px",110.0)] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser=StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost),"https://example.test/mixed-float-height.html").unwrap();
+            parser.write(&format!("<!doctype html><div style='width:700px;border:5px solid black;{sizing}'>\
+                <div>Filler Text 1</div><span>Filler Text 2</span>\
+                <img src='blue.png' style='width:96px;height:96px'>\
+                <span style='float:left;width:96px;height:96px;margin-top:10px;padding-top:10px;background:orange'></span>\
+                </div><div style='height:10px;background:lime'></div>")).unwrap();
+            parser.finish().unwrap();
+            let root=crate::dom::to_component_tree();
+            let flat=pre_flatten(&root);
+            let outer=flat.iter().position(|n|n.style.border_width==5.0).unwrap();
+            let sibling=flat.iter().position(|n|n.style.background==w3cos_std::Color::rgb(0,255,0)).unwrap();
+            for layout in [compute(&root,800.0,600.0).unwrap(),
+                LayoutEngine::new().compute(&root,&flat,800.0,600.0).unwrap().layout_cache] {
+                let rect=|index|layout.iter().find(|(_,node)|*node==index).unwrap().0;
+                assert_eq!(rect(outer).height,expected_height,"sizing={sizing}; {layout:?}");
+                assert_eq!(rect(sibling).y,8.0+expected_height,"sizing={sizing}; {layout:?}");
+            }
+        }
+    }
+
+    #[test]
     fn tall_baseline_image_after_inline_text_aligns_text_to_its_bottom() {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
@@ -43973,14 +44726,24 @@ mod tests {
             .find(|(_, node)| node.style.float == WFloat::Left)
             .map(|(index, _)| rect(index))
             .unwrap();
-        assert!(
-            (text.y + 16.0 * 0.8 - image.y - image.height).abs() < 2.0,
-            "text={text:?}, image={image:?}, floating={floating:?}, layout={layout:?}"
-        );
+        let text_node = flat.iter().find(|node|
+            matches!(node.kind, ComponentKind::Text { content } if content == "Filler Text 2")).unwrap();
+        assert_eq!(text.y + inline_font_content_ascent(text_node.style), image.y + image.height,
+            "baseline uses the resolved font, not an estimated0.8em: {layout:?}");
         assert!(
             floating.x < image.x,
             "text={text:?}, image={image:?}, floating={floating:?}"
         );
+        #[cfg(all(feature = "skia", target_os = "macos"))]
+        {
+            // Chrome155 V3639 independently measures these exact font-box
+            // and float positions; ordinary blocks exclude float overflow.
+            assert_eq!((text.x,text.y,text.width,text.height), (109.0,114.0,88.4375,22.0));
+            assert_eq!((image.x,image.y,image.width,image.height), (197.4375,35.0,96.0,96.0));
+            assert_eq!((floating.x,floating.y,floating.width,floating.height), (13.0,45.0,96.0,106.0));
+            let outer = flat.iter().position(|node| node.style.border_width == 5.0).unwrap();
+            assert_eq!(rect(outer).height, 133.0, "ordinary auto-height excludes the float: {layout:?}");
+        }
     }
 
     #[test]
@@ -44317,10 +45080,11 @@ mod tests {
             .filter_map(|(index, _)| rects.iter().find(|(_, node)| *node == index)
                 .map(|(rect, _)| *rect)).collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
-        assert!(
-            (lines[1].y - lines[0].y - 19.2).abs() < 0.1,
-            "two 19.2px lines must stack without a gap: {lines:?}"
-        );
+        // Independent Chrome155 normal font boxes occupy y8 and y30.
+        assert_eq!(lines[0].y, 8.0);
+        assert_eq!(lines[0].height, 22.0);
+        assert_eq!(lines[1].y, 30.0);
+        assert_eq!(lines[1].height, 22.0);
     }
 
     #[test]
@@ -44705,9 +45469,19 @@ mod tests {
             })
             .map(|(index, _)| rect(index))
             .unwrap();
-        let text = flat.iter().enumerate().find(|(_, node)|
-            matches!(node.kind, ComponentKind::Text { content } if content == "Filler Text Filler Text"))
-            .map(|(index, _)| rect(index)).unwrap();
+        // Lowering splits a source run into shaping fragments. Verify every
+        // word and their union rather than requiring the old unsplit leaf.
+        let words = flat.iter().enumerate().filter_map(|(index, node)| {
+            let ComponentKind::Text { content } = node.kind else { return None; };
+            (!content.trim().is_empty()).then(|| (content.trim(), rect(index)))
+        }).collect::<Vec<_>>();
+        assert_eq!(words.iter().flat_map(|(word, _)| word.split_whitespace()).collect::<Vec<_>>(),
+            ["Filler", "Text", "Filler", "Text"], "{words:?}");
+        let left = words.iter().map(|(_, rect)| rect.x).fold(f32::INFINITY, f32::min);
+        let top = words.iter().map(|(_, rect)| rect.y).fold(f32::INFINITY, f32::min);
+        let right = words.iter().map(|(_, rect)| rect.x + rect.width).fold(f32::NEG_INFINITY, f32::max);
+        let bottom = words.iter().map(|(_, rect)| rect.y + rect.height).fold(f32::NEG_INFINITY, f32::max);
+        let text = LayoutRect {x:left,y:top,width:right-left,height:bottom-top};
         let image = flat
             .iter()
             .enumerate()
@@ -44729,11 +45503,28 @@ mod tests {
             "inner={inner:?}, text={text:?}, image={image:?}, floating={floating:?}, props={float_props:?}, layout={layout:?}"
         );
         assert!(
-            (floating.y - 29.2).abs() < 0.01
+            (floating.y - 33.0).abs() < 0.01
                 && (image.y - floating.y).abs() < 0.01
-                && (text.y + 12.8 - image.y - image.height).abs() < 0.01,
+                && (text.y + 14.0 - image.y - image.height).abs() < 0.01,
             "text={text:?}, image={image:?}, floating={floating:?}, layout={layout:?}"
         );
+        assert_eq!(inner, LayoutRect {x:23.0,y:29.0,width:550.0,height:0.0});
+        assert_eq!(text, LayoutRect {x:119.0,y:67.0,width:137.171875,height:18.0});
+        assert_eq!(image, LayoutRect {x:256.171875,y:33.0,width:96.0,height:48.0});
+        assert_eq!(floating, LayoutRect {x:23.0,y:33.0,width:96.0,height:48.0});
+        let mut projected = layout.clone();
+        project_forced_break_lines(&mut projected, &root);
+        let atomic_index = flat.iter().position(|node|
+            node.style.display == WDisp::InlineBlock && node.style.width == WDim::Px(550.0)).unwrap();
+        assert_eq!(projected.iter().find(|(_, index)| *index == atomic_index).unwrap().0, inner,
+            "empty-atomic baseline projection must be idempotent");
+        // A forced-break pass emits line tops; later baseline passes complete
+        // text geometry. Compare the complete cached pipeline, including reuse.
+        let mut engine = LayoutEngine::new();
+        for _ in 0..2 {
+            let cached = engine.compute(&root, &flat, 800.0, 600.0).unwrap();
+            assert_eq!(cached.layout_cache, layout, "cached and stateless geometry must agree");
+        }
     }
 
     #[test]
@@ -45091,6 +45882,15 @@ mod tests {
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
 
+        // Chrome's UA Times face and the generic serif face have different
+        // metrics on macOS. V4602 records both; keep their fixtures distinct.
+        for (font, expected) in [
+            ("", vec![(0.0,55.0,13.0),(56.0,50.0,13.0),(107.0,50.0,13.0),
+                (158.0,85.0,43.0),(244.0,80.0,43.0)]),
+            ("font:16px/normal serif", vec![(0.0,54.0,16.0),(55.0,50.0,16.0),
+                (106.0,50.0,16.0),(157.0,84.0,46.0),(242.0,80.0,46.0)]),
+        ] {
+        w3cos_dom::stylesheet::clear_rules();
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         let mut parser = StreamingDocumentParser::new_with_script_host(
@@ -45099,13 +45899,13 @@ mod tests {
         ).unwrap();
         // The inert parser does not install stylesheet text; encode the
         // original declarations inline so this control tests layout, not CSS loading.
-        parser.write("<!doctype html><body>
+        parser.write(&format!("<!doctype html><body style='{font}'>
             <section style='margin-bottom:1px'><div style='display:inline-block;padding-bottom:20px'><div style='width:30px;height:30px;overflow:hidden;display:inline-block'></div></div> XX</section>
             <section style='margin-bottom:1px'><div style='display:inline-block;padding-bottom:20px'><div style='width:30px;height:30px;overflow:hidden'></div></div> XX</section>
             <section style='margin-bottom:1px'><div style='display:inline-block;padding-bottom:20px'><div style='width:30px;height:30px;overflow:hidden'>XX</div></div> XX</section>
             <section style='margin-bottom:1px'><div style='display:inline-block;padding-bottom:20px'><div style='width:30px;height:30px;overflow:hidden;display:inline-block;margin-bottom:30px'>XX</div></div> XX</section>
             <section style='margin-bottom:30px'><div style='display:inline-block;padding-bottom:20px'><div style='width:30px;height:30px;overflow:hidden;margin-bottom:30px'>XX</div></div> XX</section>
-        ").unwrap();
+        ")).unwrap();
         parser.finish().unwrap();
         let root = crate::dom::to_component_tree();
         let flat = pre_flatten(&root);
@@ -45123,16 +45923,14 @@ mod tests {
             rows.push((row_rect.y - body.y, row_rect.height, external.y - row_rect.y));
             index += count_nodes(row);
         }
-        // Chromium141 original DOM geometry, not native test/reference equality.
-        assert_eq!(rows, vec![
-            (0.0, 54.0, 16.0), (55.0, 50.0, 16.0), (106.0, 50.0, 16.0),
-            (157.0, 84.0, 46.0), (242.0, 80.0, 46.0),
-        ], "clipped descendants must not export an internal text baseline through their BFC; nodes={:?}",
+        assert_eq!(rows, expected, "font={font}: clipped descendants must not export an internal text baseline through their BFC; nodes={:?}",
             flat.iter().enumerate().map(|(index, node)| (
                 index, &node.kind, node.style.display, node.style.align_self,
                 node.style.overflow, node.style.overflow_x, node.style.overflow_y,
                 rect(index),
             )).collect::<Vec<_>>());
+        }
+        w3cos_dom::stylesheet::clear_rules();
     }
 
     #[test]
@@ -45240,6 +46038,7 @@ mod tests {
             font_family: Some("serif".into()),
             font_size: 10.0,
             line_height: 1.0,
+            line_height_is_normal: false,
             ..Style::default()
         };
         for (height, bottom_margin) in [(5.0, 0.0), (10.0, 0.0), (20.0, 0.0), (10.0, 2.0), (10.0, -2.0)] {
@@ -45267,11 +46066,21 @@ mod tests {
                 (LayoutRect { x:8.0,y:8.0,width:5.0,height:13.0 }, 1),
                 (LayoutRect { x:13.0,y:8.0+line_height-height-bottom_margin,width:10.0,height }, 2),
             ];
+            let positions = layouts.iter().enumerate()
+                .map(|(position, (_, index))| (*index, position)).collect();
+            let expected_text_y = 8.0 + line_height - 10.0
+                + ((10.0 - inline_font_height(&text_style)) * 0.5).floor();
+            assert_eq!(image_text_packets_have_shared_baselines(&root, 0, &layouts, &positions),
+                (layouts[1].0.y - expected_text_y).abs() < 0.01,
+                "a lone baseline text establishes ownership only at the resolved strut position");
             align_inline_block_last_line_baselines(&mut layouts, &root);
-            let expected_text_y = 8.0 + line_height - 10.0 + (10.0 - inline_font_height(&text_style)) * 0.5;
             assert!((layouts[1].0.y - expected_text_y).abs() < 0.01,
                 "height={height}, margin={bottom_margin}: {layouts:?}, expected text y={expected_text_y}");
             assert!((layouts[2].0.y + height + bottom_margin - (8.0 + line_height)).abs() < 0.01);
+            assert!(image_text_packets_have_shared_baselines(&root, 0, &layouts, &positions));
+            let projected = layouts.clone();
+            align_inline_block_last_line_baselines(&mut layouts, &root);
+            assert_eq!(layouts, projected, "a projected mixed-alignment line stays unchanged");
         }
     }
 
@@ -45280,7 +46089,7 @@ mod tests {
     fn short_empty_atomic_uses_font_strut_not_taffy_bottom_baseline() {
         let text_style = Style { display: WDisp::Inline,
             font_family: Some("serif".into()), font_size: 100.0,
-            line_height: 1.0, ..Style::default() };
+            line_height: 1.0, line_height_is_normal: false, ..Style::default() };
         let root = Component::row(
             Style { display: WDisp::Flex, width: WDim::Px(300.0),
                 custom_properties: Some(HashMap::from([(
@@ -45295,8 +46104,10 @@ mod tests {
             (rect(188.0, 70.0, 100.0, 115.0), 1),
             (rect(288.0, 130.0, 20.0, 20.0), 2)];
         align_inline_block_last_line_baselines(&mut layouts, &root);
-        assert_eq!(layouts[1].0.y, 42.5);
-        assert_eq!(layouts[2].0.y, 112.5);
+        // Independent Chrome155 serif100/100 geometry at line top50:
+        // the115px font box has floored upper leading -8, not -7.5.
+        assert_eq!(layouts[1].0.y, 42.0);
+        assert_eq!(layouts[2].0.y, 112.0);
     }
 
     #[test]
@@ -45451,7 +46262,20 @@ mod tests {
             assert_eq!(layouts[0].0.height, 36.0);
             let mut authored = root.clone();
             authored.style.custom_properties = None;
-            assert!(!project_image_text_lines(&authored, 0, &mut layouts, &positions));
+            let projected = layouts.clone();
+            // An ordinary block with inline children still owns inline line
+            // metrics without an internal marker. Authored Flex must not be
+            // treated as a lowered inline context; an unmarked Inline is
+            // resolved in its containing line rather than by this packet.
+            assert_eq!(
+                project_image_text_lines(&authored, 0, &mut layouts, &positions),
+                display == WDisp::Block,
+                "authored display={display:?}"
+            );
+            assert_eq!(
+                layouts, projected,
+                "authored display={display:?}: projection is idempotent or skipped"
+            );
         }
     }
 
@@ -45695,20 +46519,161 @@ mod tests {
         let mut parser = StreamingDocumentParser::new_with_script_host(
             Rc::new(InertParserScriptHost), "https://example.test/float-font-box.html",
         ).unwrap();
-        parser.write("<!doctype html><style>body{margin:0;font:16px serif}</style>\
-            <div style='float:left;padding-left:100px'>Filler Text</div>").unwrap();
+        // The inert host does not process STYLE checkpoints. V3681 proves
+        // this equivalent inline fixture has identical browser pixels.
+        parser.write("<!doctype html><body style='margin:0;font:16px serif'>\
+            <div style='float:left;padding-left:100px'>Filler Text</div></body>").unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let floating = flat.iter().position(|node| node.style.float == WFloat::Left).unwrap();
+        let text = flat.iter().position(|node| matches!(&node.kind,
+            ComponentKind::Text { content } if content == "Filler Text")).unwrap();
+        assert_eq!(flat[text].style.font_family.as_deref(), Some("serif"));
+        for layouts in [compute(&root, 800.0, 600.0).unwrap(),
+            LayoutEngine::new().compute(&root, &flat, 800.0, 600.0).unwrap().layout_cache] {
+            let rect = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+            assert_eq!((rect(text).x, rect(text).y, rect(text).width, rect(text).height),
+                (100.0, 0.0, 66.59375, 18.0), "{layouts:?}");
+            assert_eq!((rect(floating).x, rect(floating).y, rect(floating).width, rect(floating).height),
+                (0.0, 0.0, 166.59375, 18.0), "{layouts:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn nonfitting_bfc_below_float_keeps_min_height_collapsed_margin() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/min-height.html").unwrap();
+        parser.write("<!doctype html><div style='min-height:2em;margin:1em 0'>\
+            <div></div><div></div><div style='margin-bottom:5em'>\
+            <div style='float:left'>Filler Text</div></div></div>\
+            <div style='border:1px inset;overflow:hidden;margin:.5em 0'></div>").unwrap();
         parser.finish().unwrap();
         let root = crate::dom::to_component_tree();
         let flat = pre_flatten(&root);
         let layouts = compute(&root, 800.0, 600.0).unwrap();
         let rect = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
-        let floating = flat.iter().position(|node| node.style.float == WFloat::Left).unwrap();
-        let text = flat.iter().position(|node| matches!(&node.kind,
-            ComponentKind::Text { content } if content == "Filler Text")).unwrap();
-        assert_eq!(rect(text).height, 18.0);
-        assert_eq!(rect(floating).height, 18.0);
-        assert!((rect(text).y - rect(floating).y).abs() < 0.01,
-            "text={:?}, float={:?}", rect(text), rect(floating));
+        let parent = flat.iter().position(|node| node.style.min_height == WDim::Em(2.0)).unwrap();
+        let following = flat.iter().position(|node|
+            node.style.overflow == WOverflow::Hidden).unwrap();
+        assert_eq!(rect(parent).y, 80.0);
+        assert_eq!(rect(parent).height, 32.0);
+        assert_eq!(rect(following).y, 128.0);
+    }
+
+    #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn hidden_inline_source_boundaries_keep_fractional_text_advances() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost), "https://example.test/hidden-inline.html").unwrap();
+        parser.write("<!doctype html><body style='margin:8px'>\
+            <div style='line-height:1.25'>Filler Text1\
+            <span style='visibility:hidden'>Filler Text2</span>Filler Text3</div></body>")
+            .unwrap();
+        parser.finish().unwrap();
+        let root = crate::dom::to_component_tree();
+        let flat = pre_flatten(&root);
+        let layouts = compute(&root, 800.0, 600.0).unwrap();
+        let starts = flat.iter().enumerate().filter_map(|(index, node)| {
+            matches!(&node.kind, ComponentKind::Text { content } if content == "Filler")
+                .then(|| layouts.iter().find(|(_, item)| *item == index).unwrap().0.x)
+        }).collect::<Vec<_>>();
+        // Chrome155 original XHTML Text Ranges, V3395: authored source
+        // advances are 79.921875 and 83.109375, not the sum of rounded words.
+        assert_eq!(starts, vec![8.0, 87.921875, 171.03125],
+            "synthetic no-break wrappers must not add a LayoutUnit at each source boundary");
+    }
+
+    #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn bordered_inline_relative_text_keeps_the_containing_font_strut() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        const OWNER: u64 = 2026100903336;
+        struct FontFixture;
+        impl Drop for FontFixture {
+            fn drop(&mut self) { crate::font_face::FontRegistry::global().clear_owner(OWNER); }
+        }
+        crate::font_face::FontRegistry::global().register_for_owner(OWNER,
+            crate::font_face::FontFace { family: "Ahem".into(),
+                src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf"))),
+                ..Default::default() }).unwrap();
+        let _fixture = FontFixture;
+        for relative in [false, true] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/relative-inline.html").unwrap();
+            parser.write(&format!("<!doctype html>\
+                <div><span style='font:20px/1 Ahem;color:orange;border:2px solid blue'>\
+                &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\
+                <span style='color:yellow;{}'>XXXXXX</span>XXXXXX</span></div>",
+                if relative { "position:relative;left:-6em" } else { "" })).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let layouts = compute(&root, 800.0, 600.0).unwrap();
+            let rect = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+            let outer = flat.iter().position(|node|
+                node.style.border_left_width.unwrap_or(node.style.border_width) == 2.0)
+                .unwrap_or_else(|| panic!("missing bordered inline: {:?}", flat.iter().map(|node|
+                    (node.kind, node.style.border_width, node.style.border_left_width,
+                        node.style.font_family.as_deref())).collect::<Vec<_>>()));
+            let yellow = flat.iter().position(|node| node.style.color.r == 255
+                && node.style.color.g == 255 && node.style.color.b == 0).unwrap();
+            // Original Chrome155 V3335: outer is 1px above its block's line
+            // origin; its Ahem text is 1px below, regardless of paint offset.
+            let block = flat[outer].parent.unwrap();
+            assert_eq!(rect(outer).y, rect(block).y - 1.0, "relative={relative}");
+            assert_eq!(rect(outer).height, 24.0, "relative={relative}");
+            assert_eq!(rect(yellow).y, rect(block).y + 1.0, "relative={relative}");
+            assert_eq!(rect(yellow).x, rect(outer).x + 2.0
+                + if relative { 0.0 } else { 120.0 }, "relative={relative}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn textarea_line_descent_is_inside_its_block_with_float_or_absolute_sibling() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        for positioning in ["float:right", "position:absolute;right:0"] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost), "https://example.test/textarea-line.html",
+            ).unwrap();
+            parser.write(&format!("<!doctype html><html lang='en'><body>\
+                <div style='width:600px;border:1px solid;position:relative'>\
+                <div style='{positioning};width:18%;height:10em'></div>\
+                <div style='background:lime;width:80%'>\
+                <textarea style='box-sizing:border-box;width:100%;height:10em'></textarea>\
+                </div></div></body></html>" )).unwrap();
+            parser.finish().unwrap();
+            let root = crate::dom::to_component_tree();
+            let flat = pre_flatten(&root);
+            let layouts = compute(&root, 800.0, 600.0).unwrap();
+            let block = flat.iter().position(|node| node.style.background == w3cos_std::Color::rgb(0,255,0))
+                .unwrap_or_else(|| panic!("missing styled block: {:?}", flat.iter().map(|node| (node.kind, node.style.background)).collect::<Vec<_>>()));
+            let input = flat.iter().position(|node| matches!(node.kind, ComponentKind::TextInput { .. })).unwrap();
+            let rect = |index| layouts.iter().find(|(_, item)| *item == index).unwrap().0;
+            assert!((rect(block).height - rect(input).height - 4.0).abs() < 0.01,
+                "Chrome155 baseline descent belongs inside .a: {positioning}, block={:?}, input={:?}", rect(block), rect(input));
+        }
     }
 
     #[test]
@@ -47001,10 +47966,53 @@ mod tests {
                 .0
         };
         assert_eq!(rect(6).x, rect(0).x, "{layout:?}");
-        assert_eq!(rect(6).y, rect(1).y + 20.0, "{layout:?}");
+        // Chrome155 independently measured in image-line-browser-v3547:
+        // baseline images retain the Ahem strut's 4px descent. The space
+        // collapses horizontally; it does not remove that vertical descent.
+        assert_eq!(rect(6).y, rect(1).y + 24.0, "{layout:?}");
+        assert_eq!(rect(0).height, 48.0, "{layout:?}");
+        for index in 1..=4 {
+            assert_eq!(rect(index).x, rect(0).x + (index - 1) as f32 * 20.0, "{layout:?}");
+            assert_eq!(rect(index).y, rect(1).y, "{layout:?}");
+            assert_eq!((rect(index).width, rect(index).height), (20.0, 20.0), "{layout:?}");
+        }
     }
 
     #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
+    fn collapsed_image_line_separator_keeps_its_authored_font_strut() {
+        let image = || Component::image("inline.png", Style {
+            display: WDisp::InlineBlock,
+            width: WDim::Px(20.0), height: WDim::Px(20.0), flex_shrink: 0.0,
+            ..Style::default()
+        });
+        let space = || Component::text(" ", Style {
+            display: WDisp::Inline, font_family: Some("Ahem".into()),
+            font_size: 20.0, line_height: 1.2, white_space: WWhiteSpace::Normal,
+            ..Style::default()
+        });
+        let root = Component::row(Style {
+            display: WDisp::Flex, width: WDim::Px(80.0), flex_wrap: WWrap::Wrap,
+            font_family: Some("Times".into()), font_size: 16.0, line_height: 1.2,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(), "1".into(),
+            )])), ..Style::default()
+        }, vec![image(), image(), image(), image(), space(),
+            image(), image(), image(), image(), space(), image()]);
+        let flat = pre_flatten(&root);
+        for layout in [compute(&root, 200.0, 200.0).unwrap(),
+            LayoutEngine::new().compute(&root, &flat, 200.0, 200.0).unwrap().layout_cache] {
+            let rect = |index| layout.iter().find(|(_, id)| *id == index).unwrap().0;
+            // Independent Chrome155 V3671: horizontal collapse does not
+            // discard this authored Ahem20/1.2 inline's 6px descent.
+            assert_eq!((rect(6).x, rect(6).y), (0.0, 26.0), "{layout:?}");
+            assert_eq!((rect(11).x, rect(11).y), (0.0, 52.0), "{layout:?}");
+            assert_eq!(rect(0).height, 77.1875, "{layout:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
     fn each_full_inline_image_line_discards_its_trailing_space() {
         let image = || {
             Component::image(
@@ -47055,16 +48063,19 @@ mod tests {
                 image(),
             ],
         );
-        let layout = compute(&root, 200.0, 200.0).unwrap();
-        let rect = |index| {
-            layout
-                .iter()
-                .find(|(_, candidate)| *candidate == index)
-                .unwrap()
-                .0
-        };
-        assert_eq!(rect(11).x, 0.0, "{layout:?}");
-        assert_eq!(rect(11).y, 40.0, "{layout:?}");
+        let flat = pre_flatten(&root);
+        for layout in [compute(&root, 200.0, 200.0).unwrap(),
+            LayoutEngine::new().compute(&root, &flat, 200.0, 200.0).unwrap().layout_cache] {
+            let rect = |index| {
+                layout.iter().find(|(_, candidate)| *candidate == index).unwrap().0
+            };
+            assert_eq!(rect(11).x, 0.0, "{layout:?}");
+            // V3669: the Ahem20/1.2 separators retain6px line descent, while
+            // the final line retains the actual unit embedding Inter strut.
+            assert_eq!(rect(6).y, 26.0, "{layout:?}");
+            assert_eq!(rect(11).y, 52.0, "{layout:?}");
+            assert_eq!(rect(0).height, 76.1875, "{layout:?}");
+        }
     }
 
     #[test]
@@ -47144,10 +48155,15 @@ mod tests {
                 .0
         };
         let first = rect("XXXX");
-        let next = rect(" X");
+        // DOM lowering splits the collapsible separator from its word. Test
+        // the browser's used word geometry, not the former source-leaf shape.
+        let next = rect("X");
+        assert_eq!(first.width, 80.0, "{layout:?}");
+        assert_eq!(first.height, 20.0, "{layout:?}");
         assert_eq!(next.x, first.x, "{layout:?}");
-        assert!(next.y >= first.y + 20.0, "{layout:?}");
+        assert_eq!(next.y, first.y + 20.0, "{layout:?}");
         assert_eq!(next.width, 20.0, "{layout:?}");
+        assert_eq!(next.height, 20.0, "{layout:?}");
     }
 
     #[test]
@@ -48194,8 +49210,10 @@ mod tests {
         assert_eq!(get(0).height, 75.0);
         // The content rect excludes half-leading; its edge is not necessarily
         // the line-box edge when the loaded font's height differs from 1em.
-        let top = get(0).y + (60.0 - inline_font_height(&root.children[0].style)) * 0.5;
-        let bottom = get(0).y + (75.0 - inline_font_height(&root.children[1].style)) * 0.5;
+        // Chrome assigns integral upper leading even when it is negative:
+        // serif60/75 gives font boxes69/86 and tops-5/-6, not-4.5/-5.5.
+        let top = get(0).y + ((60.0 - inline_font_height(&root.children[0].style)) * 0.5).floor();
+        let bottom = get(0).y + ((75.0 - inline_font_height(&root.children[1].style)) * 0.5).floor();
         assert_eq!(get(1).y, top, "top-aligned text keeps its line-edge content origin");
         assert_eq!(get(2).y, bottom, "bottom-aligned text keeps its own half-leading");
         assert_eq!(get(3).y, top, "the trailing text keeps its line-edge content origin");
@@ -48203,55 +49221,68 @@ mod tests {
 
     #[test]
     fn bottom_aligned_inline_box_uses_its_em_box_without_shifting_children() {
-        let text = |value, size| {
-            Component::text(
-                value,
+        for owner_line_height in [1.0, 2.0] {
+            let text = |value, size| {
+                Component::text(
+                    value,
+                    Style {
+                        display: WDisp::Inline,
+                        font_family: Some("Ahem".into()),
+                        font_size: size,
+                        line_height: 1.0,
+                        line_height_is_normal: false,
+                        align_self: WAlignSelf::FlexEnd,
+                        ..Style::default()
+                    },
+                )
+            };
+            let inline = Component::row(
                 Style {
                     display: WDisp::Inline,
-                    font_size: size,
-                    line_height: 1.0,
+                    font_family: Some("Ahem".into()),
+                    font_size: 20.0,
+                    line_height: owner_line_height,
+                    line_height_is_normal: false,
                     align_self: WAlignSelf::FlexEnd,
+                    align_items: WAlign::FlexEnd,
                     ..Style::default()
                 },
-            )
-        };
-        let inline = Component::row(
-            Style {
-                display: WDisp::Inline,
-                font_size: 20.0,
-                line_height: 1.0,
-                align_self: WAlignSelf::FlexEnd,
-                align_items: WAlign::FlexEnd,
-                ..Style::default()
-            },
-            vec![text("X", 20.0), text("p", 100.0), text("X", 20.0)],
-        );
-        let root = Component::row(
-            Style {
-                display: WDisp::Flex,
-                width: WDim::Px(200.0),
-                align_items: WAlign::FlexEnd,
-                font_size: 20.0,
-                line_height: 1.0,
-                ..Style::default()
-            },
-            vec![inline],
-        );
-        let layout = compute(&root, 800.0, 600.0).unwrap();
-        let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
-        assert_eq!(get(1).height, 20.0);
-        assert_eq!(
-            get(1).y,
-            80.0,
-            "the inline paint box follows bottom alignment"
-        );
-        assert_eq!(get(2).y, 80.0);
-        assert_eq!(
-            get(3).y,
-            0.0,
-            "the tall descendant keeps its original layout origin"
-        );
-        assert_eq!(get(4).y, 80.0);
+                vec![text("X", 20.0), text("p", 100.0), text("X", 20.0)],
+            );
+            let root = Component::row(
+                Style {
+                    display: WDisp::Flex,
+                    // This is the internal inline packet, not authored flex:
+                    // a browser flex item would blockify the outer span.
+                    custom_properties: Some(HashMap::from([(
+                        "--w3cos-internal-inline-formatting-context".into(), "1".into(),
+                    )])),
+                    font_family: Some("Ahem".into()),
+                    width: WDim::Px(200.0),
+                    align_items: WAlign::FlexEnd,
+                    font_size: 20.0,
+                    line_height: 1.0,
+                    line_height_is_normal: false,
+                    ..Style::default()
+                },
+                vec![inline],
+            );
+            let layout = compute(&root, 800.0, 600.0).unwrap();
+            let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+            assert_eq!(get(1).height, 20.0);
+            assert_eq!(
+                get(1).y,
+                84.0,
+                "Chrome positions the parent font box by its baseline, not the descendant bottom"
+            );
+            assert_eq!(get(2).y, 80.0);
+            assert_eq!(
+                get(3).y,
+                0.0,
+                "the tall descendant keeps its original layout origin"
+            );
+            assert_eq!(get(4).y, 80.0);
+        }
     }
 
     #[test]
@@ -48431,6 +49462,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "skia", target_os = "macos"))]
     fn tall_float_after_inline_keeps_the_text_strut_and_float_line_top() {
         let text_style = Style {
             display: WDisp::Inline,
@@ -48481,14 +49513,45 @@ mod tests {
         );
         let layout = compute(&root, 800.0, 600.0).unwrap();
         let get = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
-        assert!(
-            (get(1).y - get(0).y - 1.6).abs() < 0.01,
-            "text={:?}",
-            get(1)
-        );
-        assert!((get(2).y - get(0).y).abs() < 0.01, "float={:?}", get(2));
-        assert!((get(3).y - get(1).y).abs() < 0.01);
-        assert!((get(0).height - 50.0).abs() < 0.01);
+        // V3683 binds Chrome to the unit intrinsic measurer's Inter bytes:
+        // its20px font box has-1px upper leading within the19.1875px strut.
+        // This is an embedding font context, not an HTML default-family rule.
+        assert_eq!(inline_style_line_height(&root.children[0].style),19.1875);
+        assert_eq!(get(1).y,get(0).y-1.0,"text={:?}",get(1));
+        assert_eq!(get(1).height,20.0);
+        assert_eq!(get(1).x,get(0).x+50.0);
+        assert_eq!(get(2).y,get(0).y,"float={:?}",get(2));
+        assert_eq!(get(3).y,get(1).y);
+        assert_eq!(get(0).height,50.0);
+    }
+
+    #[test]
+    fn explicit_ahem_tall_float_retains_used_strut_and_glyph_box() {
+        let text=Style{display:WDisplay::Inline,font_size:16.0,line_height:1.2,
+            font_family:Some("Ahem".into()),..Style::default()};
+        let mut float=Style{display:WDisplay::Block,float:WFloat::Left,
+            width:WDim::Px(50.0),height:WDim::Px(50.0),..text.clone()};
+        float.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-left-float-after-inline".into(),"1".into());
+        let mut parent=Style{display:WDisplay::Flex,width:WDim::Px(400.0),
+            flex_wrap:WWrap::Wrap,align_items:w3cos_std::style::AlignItems::Baseline,
+            overflow:WOverflow::Auto,..text.clone()};
+        parent.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-inline-formatting-context".into(),"1".into());
+        let root=Component::row(parent,vec![Component::text("Hello",text.clone()),
+            Component::row(float,vec![]),Component::text("Kitty",text)]);
+        let flat=pre_flatten(&root);
+        for layout in [compute(&root,800.0,600.0).unwrap(),
+            LayoutEngine::new().compute(&root,&flat,800.0,600.0).unwrap().layout_cache] {
+            let rect=|index|layout.iter().find(|(_,item)|*item==index).unwrap().0;
+            assert_eq!((rect(1).x,rect(1).y,rect(1).width,rect(1).height),
+                (50.0,1.0,80.0,16.0),"{layout:?}");
+            assert_eq!((rect(3).x,rect(3).y,rect(3).width,rect(3).height),
+                (130.0,1.0,80.0,16.0),"{layout:?}");
+            assert_eq!((rect(2).x,rect(2).y,rect(2).width,rect(2).height),
+                (0.0,0.0,50.0,50.0),"{layout:?}");
+            assert_eq!(rect(0).height,50.0);
+        }
     }
 
     #[test]
@@ -49108,7 +50171,12 @@ mod tests {
         assert_eq!(flows[0].text_index, 3);
         assert_eq!(flows[0].bands[0].x, 118.0);
         assert_eq!(flows[0].bands[0].width, 90.0);
-        assert!(flows[0].used_height >= 38.4 - 0.01);
+        // Two used 19.1875px lines, independently measured with the same
+        // explicit 16px/1.2 browser line-height; do not widen a tolerance.
+        assert_eq!(flows[0].used_height, 38.375);
+        assert_eq!(flows[0].bands.len(), 2);
+        assert_eq!(flows[0].bands[1].x, 118.0);
+        assert_eq!(flows[0].bands[1].width, 90.0);
     }
 
     #[test]
@@ -49181,9 +50249,46 @@ mod tests {
         ];
         let flows = resolve_float_text_layouts(&nodes, &rects, 800.0, 600.0);
         assert_eq!(flows.len(), 1, "{flows:?}");
+        assert_eq!(flows[0].parent_index, 5, "the ordinary block owns its text flow");
         assert_eq!(flows[0].text_index, 6);
-        assert!((flows[0].bands[0].x - 197.0).abs() < 0.01, "{flows:?}");
-        assert!((flows[0].bands[1].x - 117.0).abs() < 0.01, "{flows:?}");
+        assert_eq!(flows[0].bands.len(), 3);
+        assert_eq!(flows[0].bands[0].x, 197.0);
+        // The fixture's literal 19.2px float is still active at the second
+        // 19.1875px line top. Release it only after its actual bottom, not
+        // with a tolerance that erases this short overlap.
+        assert_eq!(flows[0].bands[1].x, 197.0);
+        assert_eq!(flows[0].bands[2].x, 117.0);
+        assert_eq!(flows[0].bands[0].width, 64.0);
+        assert_eq!(flows[0].bands[2].width, 144.0);
+
+        let mut padded = line.clone();
+        padded.padding.left = WSpacing::Px(8.0);
+        padded.padding.right = WSpacing::Px(4.0);
+        let mut padded_nodes = nodes.clone();
+        padded_nodes[5].1 = &padded;
+        let padded_flows = resolve_float_text_layouts(&padded_nodes, &rects, 800.0, 600.0);
+        assert_eq!(padded_flows.len(), 1);
+        assert_eq!(padded_flows[0].parent_index, 5);
+        assert_eq!(padded_flows[0].content.x, 45.0);
+        assert_eq!(padded_flows[0].content.width, 212.0);
+        assert_eq!(padded_flows[0].bands[0].width, 60.0);
+
+        let mut authored_flex = line.clone();
+        authored_flex.display = WDisp::Flex;
+        let mut authored_nodes = nodes.clone();
+        authored_nodes[5].1 = &authored_flex;
+        assert!(resolve_float_text_layouts(&authored_nodes, &rects, 800.0, 600.0).is_empty());
+
+        let mut synthetic = authored_flex.clone();
+        synthetic.custom_properties = Some(HashMap::from([(
+            "--w3cos-internal-inline-formatting-context".into(), "1".into(),
+        )]));
+        let mut synthetic_nodes = nodes.clone();
+        synthetic_nodes[5].1 = &synthetic;
+        let synthetic_flows = resolve_float_text_layouts(&synthetic_nodes, &rects, 800.0, 600.0);
+        assert_eq!(synthetic_flows.len(), 1);
+        assert_eq!(synthetic_flows[0].parent_index, 0);
+        assert_eq!(synthetic_flows[0].content.width, 224.0);
     }
 
     #[test]

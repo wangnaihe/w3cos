@@ -51,7 +51,8 @@ fn marker(component: &Component, name: &str) -> bool {
 
 impl Line {
     fn collect(&mut self, component: &Component, index: usize, parent: &Style,
-        shift: f32, relative_y: f32, layouts: &[(LayoutRect, usize)], positions: &HashMap<usize, usize>) -> Option<()> {
+        shift: f32, relative_y: f32, relative_x: f32,
+        layouts: &[(LayoutRect, usize)], positions: &HashMap<usize, usize>) -> Option<()> {
         let style = &component.style;
         // Positioned descendants (including outside markers) are not line
         // participants. Their own positioning pass retains their geometry.
@@ -60,10 +61,21 @@ impl Line {
             || style.direction != TextDirection::Ltr { return None; }
         // Relative positioning displaces paint, not the line's ascent or
         // descent. Carry the displacement separately from vertical-align.
-        // Keep unresolved percentage/viewport insets and horizontal shifts
-        // on the general layout path: its line-fitting coordinates differ.
+        // Use undisplaced horizontal coordinates for line membership while
+        // retaining the already-displaced paint rectangles. Unresolved
+        // percentage/viewport insets remain on the general layout path.
+        let absolute = |value| match value {
+            Dimension::Auto => Some(0.0),
+            Dimension::Px(value) => Some(value),
+            Dimension::Em(value) => Some(value * style.font_size),
+            Dimension::Rem(value) => Some(value * crate::layout::ROOT_FONT_SIZE),
+            _ => None,
+        };
+        let relative_x = relative_x + if style.position == Position::Relative {
+            if style.left != Dimension::Auto { absolute(style.left)? }
+            else { -absolute(style.right)? }
+        } else { 0.0 };
         let relative_y = relative_y + if style.position == Position::Relative {
-            if style.left != Dimension::Auto || style.right != Dimension::Auto { return None; }
             match (style.top, style.bottom) {
                 (Dimension::Px(value), _) => value,
                 (Dimension::Auto, Dimension::Px(value)) => -value,
@@ -76,7 +88,7 @@ impl Line {
         if transparent {
             let mut child_index = index + 1;
             for child in &component.children {
-                self.collect(child, child_index, parent, shift, relative_y, layouts, positions)?;
+                self.collect(child, child_index, parent, shift, relative_y, relative_x, layouts, positions)?;
                 child_index += count_nodes(child);
             }
             return Some(());
@@ -111,7 +123,9 @@ impl Line {
             && matches!(component.kind, ComponentKind::Row | ComponentKind::Box)
             && style.display == Display::InlineBlock;
         let table = style.display == Display::InlineTable;
-        let atomic_box = image || empty_atomic || table;
+        let textarea = matches!(component.kind, ComponentKind::TextInput { .. })
+            && marker(component, w3cos_dom::user_agent::TEXTAREA_PROPERTY);
+        let atomic_box = image || empty_atomic || table || textarea;
         // A lowered single-line inline-block text leaf exports its line's
         // font baseline, not the bottom of the glyph/line rectangle. Leave
         // explicit heights, scrolling and decorated atomic boxes to the
@@ -133,7 +147,7 @@ impl Line {
         if !atomic_box && ((!atomic_text && style.display != Display::Inline)
             || (!container && !decorated_text && (padding.top != 0.0 || padding.bottom != 0.0))
             || (!text && !container && (padding.left != 0.0 || padding.right != 0.0))
-            || !decorated_text && (style.border_width != 0.0
+            || !decorated_text && !container && (style.border_width != 0.0
             || [style.border_top_width, style.border_bottom_width, style.border_left_width,
                 style.border_right_width].into_iter().flatten().any(|v| v != 0.0))
             || !container && (margin.left != 0.0 || margin.right != 0.0)) { return None; }
@@ -166,7 +180,11 @@ impl Line {
                 // The candidate line height uses LayoutUnits. Compare the
                 // wrapping measurement in those same units, not raw f32 px:
                 // 19.2 versus 19.1875 otherwise rejects an actual single line.
-                || inline_used_line_height(crate::layout::wrapped_text_height(content,
+                || !(content.chars().all(|ch| matches!(ch, ' ' | '\t'))
+                    && matches!(style.white_space, w3cos_std::style::WhiteSpace::Normal
+                        | w3cos_std::style::WhiteSpace::NoWrap
+                        | w3cos_std::style::WhiteSpace::PreLine))
+                    && inline_used_line_height(crate::layout::wrapped_text_height(content,
                     rect.width - style.border_left_width.unwrap_or(style.border_width)
                         - style.border_right_width.unwrap_or(style.border_width), style))
                     > height.max(font_height)
@@ -207,21 +225,23 @@ impl Line {
                 else if atomic_text { 0.0 }
                 else { text_baseline - inline_font_content_ascent(style)
                     - if decorated_text { padding.top + border_top }
-                        else if container { padding.top } else { 0.0 } },
+                        else if container { padding.top + border_top } else { 0.0 } },
             font_height: (!atomic_box && !atomic_text).then_some(font_height
                 + if decorated_text { vertical_edges }
-                    else if container { padding.top + padding.bottom } else { 0.0 }) });
+                    else if container { vertical_edges } else { 0.0 }) });
         if container {
             // Horizontal decoration consumes line width, but does not create
             // a separate baseline for the non-replaced inline's descendants.
-            self.width += padding.left + padding.right + margin.left + margin.right;
+            self.width += padding.left + padding.right + margin.left + margin.right
+                + style.border_left_width.unwrap_or(style.border_width)
+                + style.border_right_width.unwrap_or(style.border_width);
             let mut child_index = index + 1;
             for child in &component.children {
-                self.collect(child, child_index, style, total_shift, relative_y, layouts, positions)?;
+                self.collect(child, child_index, style, total_shift, relative_y, relative_x, layouts, positions)?;
                 child_index += count_nodes(child);
             }
         } else {
-            let x = rect.x - margin.left;
+            let x = rect.x - margin.left - relative_x;
             // A wrapped item can restart at exactly the previous item's
             // start. Later negative margins must not turn that established
             // break into a single line merely because the final sum fits.
@@ -264,7 +284,10 @@ fn resolve(component: &Component, index: usize, layouts: &[(LayoutRect, usize)],
     // context even when lowering retains the authored Inline display.
     let positioned_inline = component.style.display == Display::Inline
         && matches!(component.style.position, Position::Absolute | Position::Fixed);
-    if !internal_top_line && !positioned_inline && !matches!(component.style.display, Display::Block | Display::InlineBlock | Display::TableCell)
+    // Raw InlineTable components can still carry direct inline content in
+    // the anonymous-cell fallback. Resolve that content's font strut too;
+    // collect rejects real table rows/cells and block descendants below.
+    if !internal_top_line && !positioned_inline && !matches!(component.style.display, Display::Block | Display::InlineBlock | Display::TableCell | Display::InlineTable)
         && !(component.style.display == Display::Flex
             && marker(component, "--w3cos-internal-inline-formatting-context")) { return None; }
     let height = inline_used_line_height(crate::layout::inline_style_line_height(&component.style));
@@ -274,7 +297,7 @@ fn resolve(component: &Component, index: usize, layouts: &[(LayoutRect, usize)],
         width: 0.0, first_x: f32::INFINITY, last_x: f32::NEG_INFINITY, last_advance: 0.0 };
     let mut child_index = index + 1;
     for child in &component.children {
-        line.collect(child, child_index, &component.style, 0.0, 0.0, layouts, positions)?;
+        line.collect(child, child_index, &component.style, 0.0, 0.0, 0.0, layouts, positions)?;
         child_index += count_nodes(child);
     }
     let style = &component.style;
@@ -330,22 +353,36 @@ fn soft_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usize
     let mut lines = vec![fresh()];
     let mut child_index = index + 1;
     for child in &component.children {
-        // A collapsed, undecorated separator may have no layout rectangle.
-        // It must not prevent the adjoining replaced items forming lines.
+        // A collapsed separator has no horizontal advance, but its authored
+        // inline font strut still participates in the preceding line.
         let margin = child.style.margin_lengths();
         if !positions.contains_key(&child_index)
             && matches!(&child.kind, ComponentKind::Text { content }
                 if content.is_empty() || content.chars().all(|c| matches!(c, ' ' | '\t'))
                     && matches!(child.style.white_space, w3cos_std::style::WhiteSpace::Normal
                         | w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::PreLine))
-            && child.style.padding == w3cos_std::style::Edges::ZERO
-            && [margin.top, margin.bottom, margin.left, margin.right].into_iter()
-                .all(|value| value == 0.0)
-            && child.style.border_width == 0.0
-            && [child.style.border_top_width, child.style.border_bottom_width,
-                child.style.border_left_width, child.style.border_right_width].into_iter()
-                .flatten().all(|width| width == 0.0)
-        { child_index += count_nodes(child); continue; }
+            // Vertical edges/margins on non-replaced inlines do not alter
+            // line fitting. A discarded zero-width decoration still contributes
+            // its font strut, just like an undecorated collapsed separator.
+            && child.style.padding_lengths().left == 0.0
+            && child.style.padding_lengths().right == 0.0
+            && margin.left == 0.0 && margin.right == 0.0
+            && child.style.border_left_width.unwrap_or(child.style.border_width) == 0.0
+            && child.style.border_right_width.unwrap_or(child.style.border_width) == 0.0
+        {
+            if let ComponentKind::Text { content } = &child.kind
+                && !content.is_empty() && !lines.last()?.items.is_empty()
+            {
+                if inline_leaf_alignment_keyword(child) != "baseline"
+                    || inline_leaf_baseline_offset(child) != 0.0 { return None; }
+                let (height, baseline) = baseline_text_metrics(style, &child.style);
+                let line = lines.last_mut()?;
+                line.ascent = line.ascent.max(baseline);
+                line.descent = line.descent.max(height - baseline);
+            }
+            child_index += count_nodes(child);
+            continue;
+        }
         let rect = layouts[*positions.get(&child_index)?].0;
         let previous = lines.last()?.items.last().map(|item| layouts[item.position].0);
         if let Some(previous) = previous
@@ -353,7 +390,22 @@ fn soft_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usize
                 || (rect.x - previous.x).abs() <= 0.01 && previous.width > 0.01)
             && rect.y > previous.y + 0.01
         { lines.push(fresh()); }
-        lines.last_mut()?.collect(child, child_index, style, 0.0, 0.0, layouts, positions)?;
+        let parent = layouts[*positions.get(&index)?].0;
+        let padding = style.padding_lengths();
+        let available = parent.width - padding.left - padding.right
+            - style.border_left_width.unwrap_or(style.border_width)
+            - style.border_right_width.unwrap_or(style.border_width);
+        let hanging_separator = matches!(&child.kind, ComponentKind::Text { content }
+            if content == " " && matches!(child.style.white_space,
+                w3cos_std::style::WhiteSpace::Normal | w3cos_std::style::WhiteSpace::PreLine))
+            && (lines.last()?.width - available).abs() <= 0.01;
+        let fitted_width = lines.last()?.width;
+        lines.last_mut()?.collect(child, child_index, style, 0.0, 0.0, 0.0, layouts, positions)?;
+        if hanging_separator {
+            // The trailing collapsed space's decorated paint box hangs
+            // from this completed line; it is not another fitting advance.
+            lines.last_mut()?.width = fitted_width;
+        }
         child_index += count_nodes(child);
     }
     let parent = layouts[*positions.get(&index)?].0;
@@ -421,7 +473,7 @@ fn forced_lines(component: &Component, index: usize, layouts: &[(LayoutRect, usi
                 line.descent = line.descent.max(height - baseline);
             }
         } else {
-            lines.last_mut()?.collect(component, index, parent, 0.0, 0.0, layouts, positions)?;
+            lines.last_mut()?.collect(component, index, parent, 0.0, 0.0, 0.0, layouts, positions)?;
         }
         Some(())
     }
@@ -524,6 +576,20 @@ pub(crate) fn projected_height(style: &Style, previous: f32, natural: f32,
     if let Some(fixed) = constraints.fixed { return fixed; }
     let height = constraints.maximum.map_or(natural, |maximum| natural.min(maximum));
     constraints.minimum.map_or(height, |minimum| height.max(minimum))
+}
+
+/// Natural IFC content extent, independent of the principal box's authored
+/// height and vertical decoration. Table rows use it as a cell-height floor.
+pub(crate) fn natural_content_height(component: &Component, index: usize,
+    layouts: &[(LayoutRect, usize)], positions: &HashMap<usize, usize>) -> Option<f32> {
+    if let Some(lines) = forced_lines(component, index, layouts, positions)
+        .or_else(|| soft_lines(component, index, layouts, positions)) {
+        return Some(lines.iter().map(|line| line.metrics().0).sum());
+    }
+    if let Some((_, height, _, _)) = preserved_text(component, index, layouts, positions) {
+        return Some(height);
+    }
+    resolve(component, index, layouts, positions).map(|line| line.metrics().0)
 }
 
 pub(crate) fn project(component: &Component, index: usize, layouts: &mut [(LayoutRect, usize)],

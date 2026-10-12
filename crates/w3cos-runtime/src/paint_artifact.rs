@@ -354,6 +354,30 @@ fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
     ordinals
 }
 
+fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
+    node.style.custom_properties.as_ref()?
+        .get("--w3cos-internal-positioned-inline-owner")
+        .map(String::as_str).filter(|owner| !owner.is_empty())
+}
+
+fn positioned_inline_fragment_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
+    let mut ordinals = logical_paint_ordinals(nodes);
+    let mut groups = std::collections::HashMap::new();
+    for (index,node) in nodes.iter().enumerate() {
+        if let Some(owner) = split_positioned_inline_owner(node) {
+            groups.entry((node.parent,owner))
+                .and_modify(|first: &mut usize| *first = (*first).min(ordinals[index]))
+                .or_insert(ordinals[index]);
+        }
+    }
+    for (index,node) in nodes.iter().enumerate() {
+        if let Some(owner) = split_positioned_inline_owner(node) {
+            ordinals[index] = groups[&(node.parent,owner)];
+        }
+    }
+    ordinals
+}
+
 fn background_position_uses_relative_basis(position: &str) -> bool {
     position.split_ascii_whitespace().any(|token| {
         token.contains('%')
@@ -2346,7 +2370,7 @@ impl PaintArtifact {
         annotate_separated_table_background_fragments(&mut nodes, &rect_by_index);
         media_controls::append(&mut nodes, &mut rect_by_index);
         let mut artifact = Self {
-            logical_paint_ordinals: logical_paint_ordinals(&nodes),
+            logical_paint_ordinals: positioned_inline_fragment_ordinals(&nodes),
             body_index,
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
@@ -2370,10 +2394,17 @@ impl PaintArtifact {
         }) {
             let column_nodes: Vec<_> = artifact.nodes.iter()
                 .map(|node| (&node.style, node.parent)).collect();
-            let fragment_heights = crate::layout::resolve_column_fragment_heights(
+            let fragment_plans = crate::layout::resolve_column_fragment_plans(
                 &column_nodes, &artifact.rect_by_index, viewport);
+            for (index,plan) in fragment_plans.iter().enumerate() {
+                if let Some(plan) = plan.as_ref().filter(|plan| plan.auto_height)
+                    && let Some(rect) = artifact.rect_by_index[index].as_mut()
+                {
+                    rect.height = plan.principal_height;
+                }
+            }
             artifact.column_fragments = (0..artifact.nodes.len())
-                .map(|index| artifact.build_column_fragments(index, viewport, &fragment_heights))
+                .map(|index| artifact.build_column_fragments(index, viewport, &fragment_plans))
                 .collect();
         }
 
@@ -2383,11 +2414,14 @@ impl PaintArtifact {
         artifact
     }
 
-    fn build_column_fragments(&self, index: usize, viewport: Option<(f32, f32)>, fragment_heights: &[Option<f32>]) -> Vec<ColumnFragment> {
+    fn build_column_fragments(&self, index: usize, viewport: Option<(f32, f32)>, plans: &[Option<crate::layout::ColumnFragmentPlan>]) -> Vec<ColumnFragment> {
         use w3cos_std::style::TextDirection;
         let Some(rect) = self.rect_by_index[index] else { return Vec::new(); };
         if rect.height <= 0.0 || !rect.height.is_finite() { return Vec::new(); }
         let mut ancestor = self.nodes[index].parent;
+        let mut fragments = vec![ColumnFragment {visual_rect:rect,translate_x:0.0,translate_y:0.0,
+            clip_top:f32::NEG_INFINITY,clip_bottom:f32::INFINITY}];
+        let mut fragmented = false;
         if matches!(self.nodes[index].style.position, Position::Absolute | Position::Fixed) {
             return Vec::new();
         }
@@ -2401,33 +2435,54 @@ impl PaintArtifact {
             let content_width = (principal.width - left - right).max(0.0);
             let (vw, vh) = viewport.unwrap_or((principal.width, principal.height));
             if let Some(column_width) = crate::layout::used_column_width(style, content_width, vw, vh) {
-                let Some(height) = fragment_heights[owner] else { return Vec::new(); };
+                let Some(plan) = plans[owner].as_ref() else {
+                    ancestor = self.nodes[owner].parent;
+                    continue;
+                };
+                let height = plan.height;
                 if !height.is_finite() || height <= 0.0 { return Vec::new(); }
                 let gap = style.column_gap.unwrap_or(style.font_size).max(0.0);
                 let stride = column_width + gap;
                 let origin_y = principal.y + top;
-                let first = ((rect.y - origin_y) / height).floor().max(0.0) as usize;
-                let last = ((rect.y + rect.height - origin_y) / height).ceil().max(1.0) as usize;
                 let rtl = style.direction == TextDirection::Rtl;
                 let first_offset = if rtl { content_width - column_width } else { 0.0 };
-                return (first..last).filter_map(|column| {
-                    let band_top = origin_y + column as f32 * height;
-                    let start = rect.y.max(band_top);
-                    let end = (rect.y + rect.height).min(band_top + height);
-                    if end <= start { return None; }
+                let mut projected = Vec::new();
+                for fragment in &fragments {
+                  for (column,band) in plan.bands.iter().enumerate() {
+                    let rect = fragment.visual_rect;
+                    let start = rect.y.max(band.start);
+                    // A deferred complete line leaves a blank tail in its
+                    // block decoration. Do not paint clipped glyphs there,
+                    // but retain the box fragment up to fragmentainer capacity.
+                    let band_end=if plan.continues_in_parent
+                        && !matches!(self.nodes[index].kind,ComponentKind::Text{..}) {
+                        band.start+height
+                    } else {band.end};
+                    let end = (rect.y + rect.height).min(band_end).min(band.start+height);
+                    if end <= start { continue; }
+                    let (column,set)=if plan.continues_in_parent {
+                        (column%plan.columns_per_set,column/plan.columns_per_set)
+                    } else {(column,0)};
+                    let set_origin=origin_y+set as f32*height;
                     let translate_x = first_offset + column as f32 * stride * if rtl { -1.0 } else { 1.0 };
-                    let translate_y = -(column as f32 * height);
-                    Some(ColumnFragment {
+                    let translate_y = set_origin-band.start;
+                    projected.push(ColumnFragment {
                         visual_rect: LayoutRect { x: rect.x + translate_x, y: start + translate_y,
                             width: rect.width, height: end - start },
-                        translate_x, translate_y, clip_top: origin_y, clip_bottom: origin_y + height,
-                    })
-                }).collect();
+                        translate_x:fragment.translate_x+translate_x,
+                        translate_y:fragment.translate_y+translate_y,
+                        clip_top:(fragment.clip_top+translate_y).max(set_origin),
+                        clip_bottom:(fragment.clip_bottom+translate_y).min(set_origin+height),
+                    });
+                  }
+                }
+                fragments = projected;
+                fragmented = true;
             }
             if matches!(style.position, Position::Absolute | Position::Fixed) { break; }
             ancestor = self.nodes[owner].parent;
         }
-        Vec::new()
+        if fragmented {fragments} else {Vec::new()}
     }
 
     fn append_node(&mut self, index: usize) {
@@ -2569,7 +2624,11 @@ impl PaintArtifact {
                 // `css/CSS2/ui/overflow-applies-to-009.xht` leaks the 5 px of
                 // `border: 5px solid transparent`, and a 20 px border leaks 20.
                 rect: self.rect_by_index[index].map(|rect| {
-                    overflow_clip_rect(&node.style, table_grid_paint_rect(&node.style, rect))
+                    // Caption insets delimit table background/border paint,
+                    // not the wrapper's descendant overflow clip. Chrome clips
+                    // grid descendants against the wrapper padding box while
+                    // captions retain their separate inherited clip chain.
+                    overflow_clip_rect(&node.style, rect)
                 }),
             });
         }
@@ -2683,7 +2742,8 @@ impl PaintArtifact {
             .and_then(|parent| self.paint_context_prefix(parent))
             .unwrap_or_default();
         key.push(self.local_paint_order_level(index));
-        if establishes_stacking_context(node) || is_positioned(&node.style) {
+        if establishes_stacking_context(node) || is_positioned(&node.style)
+            || split_positioned_inline_owner(node).is_some() {
             // A context's own background is the first item inside that
             // context. Descendant keys extend the prefix before adding their
             // local CSS2 paint phase.
@@ -2695,9 +2755,11 @@ impl PaintArtifact {
     fn paint_context_prefix(&self, index: usize) -> Option<Vec<PaintOrderLevel>> {
         let node = self.nodes.get(index)?;
         if node.parent.is_none() || establishes_stacking_context(node) || is_positioned(&node.style)
+            || split_positioned_inline_owner(node).is_some()
         {
             let mut key = self.paint_order.get(index)?.clone();
-            if establishes_stacking_context(node) || is_positioned(&node.style) {
+            if establishes_stacking_context(node) || is_positioned(&node.style)
+                || split_positioned_inline_owner(node).is_some() {
                 key.pop();
             }
             return Some(key);
@@ -2713,12 +2775,23 @@ impl PaintArtifact {
             .get(index)
             .copied()
             .unwrap_or(index);
+        if split_positioned_inline_owner(node).is_some() {
+            // A lowered static float can have a zero visual offset. It still
+            // belongs to its positioned inline owner, without changing flow.
+            return (4, 0, ordinal);
+        }
         if is_positioned(&node.style) {
             return match node.style.z_index.cmp(&0) {
                 std::cmp::Ordering::Less => (0, node.style.z_index, ordinal),
                 std::cmp::Ordering::Equal => (4, 0, ordinal),
                 std::cmp::Ordering::Greater => (5, node.style.z_index, ordinal),
             };
+        }
+        if node.parent.is_some() && establishes_stacking_context(node) {
+            // Transform/opacity contexts participate at stack level zero,
+            // after normal inline ink, even when their box is a static float.
+            // A non-positioned box does not gain authored z-index semantics.
+            return (4, 0, ordinal);
         }
 
         let collapsed_table_part_border = node.style.border_collapse
@@ -4180,7 +4253,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_top_caption_does_not_expand_table_overflow_clip() {
+    fn empty_top_caption_margin_is_inside_table_wrapper_overflow_clip() {
         let node = |display, parent: Option<usize>| PaintNode {
             kind: ComponentKind::Box,
             style: Style {
@@ -4253,7 +4326,11 @@ mod tests {
             1,
         );
         let clip = artifact.node_properties[0].clip;
-        assert_eq!(artifact.properties.clips[clip].rect.unwrap().y, 61.0);
+        // Chrome155 V4149 clips contents at the wrapper even when an empty
+        // caption's margin moves the row down. Background still uses the grid.
+        assert_eq!(artifact.properties.clips[clip].rect, artifact.rect_by_index[0]);
+        assert_eq!(table_grid_paint_rect(&artifact.nodes[0].style,
+            artifact.rect_by_index[0].unwrap()).y, 61.0);
         assert_eq!(
             artifact.node_properties[1].clip, 0,
             "caption lives outside table grid"
@@ -5159,6 +5236,50 @@ mod tests {
 
         assert!(artifact.paint_order_key(1) < artifact.paint_order_key(3));
         assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
+    }
+
+    #[test]
+    fn split_positioned_inline_fragments_precede_independently_positioned_descendant() {
+        let node = |style, parent| PaintNode {
+            kind: ComponentKind::Text {content:"B".into()},
+            style, parent, sticky_counter_signal: None,
+        };
+        let mut fragment = Style {display:Display::Inline,
+            position:Position::Relative,..Style::default()};
+        fragment.custom_properties.get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-positioned-inline-owner".into(),"inline:17".into());
+        let descendant = Style {position:Position::Relative,
+            float:w3cos_std::style::Float::Right,..Style::default()};
+        let artifact = PaintArtifact::build([
+            node(Style::default(),None),
+            node(fragment.clone(),Some(0)),
+            node(descendant,Some(0)),
+            node(fragment,Some(0)),
+        ], &[(rect(0.0),0),(rect(0.0),1),(rect(0.0),2),(rect(0.0),3)],1);
+        assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2),
+            "the trailing fragment belongs to its original positioned owner, not a later sibling context: fragment={:?}, descendant={:?}",
+            artifact.paint_order_key(3),artifact.paint_order_key(2));
+    }
+
+    #[test]
+    fn transformed_static_float_paints_in_zero_level_stacking_phase() {
+        let node = |kind, style, parent| PaintNode {
+            kind, style, parent, sticky_counter_signal: None,
+        };
+        let mut floating = Style::default();
+        floating.float = w3cos_std::style::Float::Left;
+        floating.transform.translate_x = 40.0;
+        // z-index does not apply to this static, non-flex/grid float.
+        floating.z_index = -10;
+        let artifact = PaintArtifact::build([
+            node(ComponentKind::Column,Style::default(),None),
+            node(ComponentKind::Row,floating,Some(0)),
+            node(ComponentKind::Text {content:"A".into()},
+                Style {display:Display::Inline,..Style::default()},Some(0)),
+        ], &[(rect(0.0),0),(rect(0.0),1),(rect(0.0),2)],1);
+        assert!(artifact.paint_order_key(2) < artifact.paint_order_key(1),
+            "transformed static float establishes a zero-level stacking context after normal inline ink: inline={:?}, float={:?}",
+            artifact.paint_order_key(2),artifact.paint_order_key(1));
     }
 
     #[test]

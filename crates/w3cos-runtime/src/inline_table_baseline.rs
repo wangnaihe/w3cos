@@ -51,6 +51,13 @@ pub(crate) fn first_row(component: &Component, index: usize,
     }
     fn row(component: &Component, index: usize, layouts: &[(LayoutRect, usize)],
         positions: &HashMap<usize, usize>) -> Option<f32> {
+        // DOM lowering can retain a text-only row as one leaf instead of
+        // materializing its anonymous cell/inline wrappers. That leaf still
+        // exports its first text line, not the table's bottom-edge fallback.
+        if matches!(&component.kind, ComponentKind::Text { content }
+            if content.chars().any(|character| !character.is_whitespace())) {
+            return content(component, index, layouts, positions);
+        }
         let mut child_index = index + 1;
         let mut baseline: Option<f32> = None;
         for child in &component.children {

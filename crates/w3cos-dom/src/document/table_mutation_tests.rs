@@ -221,7 +221,7 @@ fn after_pseudo_does_not_revive_discarded_table_cell_source_glue() {
 }
 
 #[test]
-fn removal_preserves_anonymous_table_wrapper_boundary() {
+fn removal_rebuilds_one_anonymous_table_wrapper_from_current_siblings() {
     let mut document = Document::new();
     let parent = document.create_element("div");
     parent
@@ -241,13 +241,13 @@ fn removal_preserves_anonymous_table_wrapper_boundary() {
     parent.remove_child(&mut document, &separator);
     assert_eq!(
         count_display(&document.to_component_subtree(parent.id), Display::Table),
-        2,
-        "removal must preserve the two existing anonymous table wrappers"
+        1,
+        "V4028 Chrome merges adjacent proper table children after removing the separator"
     );
 }
 
 #[test]
-fn removal_preserves_anonymous_row_boundary_within_row_group() {
+fn removal_rebuilds_one_anonymous_row_within_row_group() {
     let mut document = Document::new();
     let parent = element(&mut document, "table-row-group", "");
     document.body().append_child(&mut document, parent);
@@ -264,8 +264,8 @@ fn removal_preserves_anonymous_row_boundary_within_row_group() {
     parent.remove_child(&mut document, &separator);
     assert_eq!(
         count_display(&document.to_component_subtree(parent.id), Display::TableRow),
-        2,
-        "removing a row must not merge its neighboring anonymous rows"
+        1,
+        "V4028 Chrome merges adjacent improper cells after removing the intervening row"
     );
 }
 
@@ -313,7 +313,7 @@ fn removing_improper_group_child_does_not_split_its_anonymous_row() {
 }
 
 #[test]
-fn replacing_separator_text_with_whitespace_retains_table_boundary() {
+fn replacing_separator_text_with_whitespace_rejoins_the_table_run() {
     let mut document = Document::new();
     let parent = document.create_element("div");
     parent
@@ -326,10 +326,12 @@ fn replacing_separator_text_with_whitespace_retains_table_boundary() {
     for child in [first, separator, last] {
         parent.append_child(&mut document, child);
     }
+    assert_eq!(count_display(&document.to_component_subtree(parent.id), Display::Table), 2);
     separator.set_text_content(&mut document, " ");
     assert_eq!(
         count_display(&document.to_component_subtree(parent.id), Display::Table),
-        2
+        1,
+        "V4028 source whitespace is not a retained anonymous-table separator"
     );
 }
 

@@ -68,13 +68,13 @@ mod tests {
             let style=document.computed_style_for(table.id);
             assert_eq!(style.box_sizing,BoxSizing::BorderBox);
             assert_eq!(style.border_width,width,"border={attribute:?}");
-            assert_eq!(style.border_color,Color::rgb(128,128,128));
+            assert_eq!(style.border_color,Color::BLACK);
             let cell=document.computed_style_for(cell.id);
             assert_eq!(cell.border_width,if width>0.0 {1.0}else{0.0});
             if width>0.0 {
                 assert_eq!(style.border_styles,[Some(BorderLineStyle::Outset);4]);
                 assert_eq!(cell.border_styles,[Some(BorderLineStyle::Inset);4]);
-                assert_eq!(cell.border_color,Color::rgb(128,128,128));
+                assert_eq!(cell.border_color,Color::BLACK);
             }
         }
     }

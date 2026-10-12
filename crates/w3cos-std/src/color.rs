@@ -252,6 +252,29 @@ impl Color {
         None
     }
 
+    /// Retain functional CSS color precision only when quantization loses a
+    /// channel. Named/hex and exact byte colors keep their existing paint path.
+    pub fn fractional_css_rgba(value: &str) -> Option<[f32; 4]> {
+        let color = Self::from_css(value)?;
+        let value = value.trim().to_ascii_lowercase();
+        let arguments = value.strip_prefix("rgb(").or_else(|| value.strip_prefix("rgba("))?
+            .strip_suffix(')')?;
+        let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
+        let normalized = |value: &str, maximum: f32| -> Option<f32> {
+            let (number, divisor) = match value.strip_suffix('%') {
+                Some(percent) => (percent.parse::<f32>().ok()?, 100.0),
+                None => (value.parse::<f32>().ok()?, maximum),
+            };
+            number.is_finite().then(|| (number / divisor).clamp(0.0,1.0))
+        };
+        let rgba = [normalized(channels[0],255.0)?, normalized(channels[1],255.0)?,
+            normalized(channels[2],255.0)?,
+            channels.get(3).map_or(Some(1.0), |alpha| normalized(alpha,1.0))?];
+        let bytes = [color.r,color.g,color.b,color.a];
+        rgba.iter().zip(bytes).any(|(channel, byte)|
+            (*channel * 255.0 - byte as f32).abs() > 0.00001).then_some(rgba)
+    }
+
     pub const WHITE: Self = Self::rgb(255, 255, 255);
     pub const BLACK: Self = Self::rgb(0, 0, 0);
     pub const TRANSPARENT: Self = Self::rgba(0, 0, 0, 0);

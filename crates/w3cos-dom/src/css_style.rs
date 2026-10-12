@@ -7,6 +7,7 @@ use w3cos_std::style::{
 };
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
+pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
 pub const TEXT_DECORATION_COLOR_PROPERTY: &str = w3cos_std::inline_text::DECORATION_COLOR;
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -85,6 +86,10 @@ impl CSSStyleDeclaration {
             return;
         }
         if !valid_multicol_declaration(name, value) {
+            return;
+        }
+        if name == "resize" && !matches!(value.trim().to_ascii_lowercase().as_str(),
+            "none" | "both" | "horizontal" | "vertical" | "block" | "inline" | "initial" | "unset") {
             return;
         }
         self.inline_declarations
@@ -420,6 +425,13 @@ impl CSSStyleDeclaration {
             }
 
             "overflow" => self.inner.overflow = parse_overflow(value),
+            "resize" => {
+                let value = value.trim().to_ascii_lowercase();
+                self.inner.custom_properties.get_or_insert_with(Default::default)
+                    .insert(RESIZE_PROPERTY.into(), if matches!(value.as_str(), "initial" | "unset") {
+                        "none".into()
+                    } else { value });
+            }
             "clip" => {
                 if let Some(clip) = parse_clip(value) {
                     self.inner.clip = clip;
@@ -469,7 +481,8 @@ impl CSSStyleDeclaration {
             }
             "color" => {
                 if let Some(color) = Color::from_css(value) {
-                    self.inner.color = color
+                    self.inner.color = color;
+                    self.inner.color_rgba = Color::fractional_css_rgba(value);
                 }
             }
             "font-size" | "fontSize" => {
@@ -1204,6 +1217,9 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
+            "resize" => self.inner.custom_properties.as_ref()
+                .and_then(|properties| properties.get(RESIZE_PROPERTY)).cloned()
+                .unwrap_or_else(|| "none".into()),
             "clip" => self.inner.clip.map_or_else(
                 || "auto".to_string(),
                 |clip| {
@@ -4062,6 +4078,18 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn resize_keywords_round_trip_and_invalid_values_keep_the_valid_declaration() {
+        let mut declaration = super::CSSStyleDeclaration::new();
+        assert_eq!(declaration.get_property("resize"), "none");
+        for value in ["both", "horizontal", "vertical", "block", "inline", "none"] {
+            declaration.set_property("resize", value);
+            assert_eq!(declaration.get_property("resize"), value);
+            declaration.set_property("resize", "sideways");
+            assert_eq!(declaration.get_property("resize"), value, "invalid resize must not replace its winner");
+        }
+    }
+
+    #[test]
     fn explicit_decoration_color_is_independent_of_text_color() {
         let mut declaration = super::CSSStyleDeclaration::new();
         declaration.set_property("color", "green");
@@ -4252,6 +4280,20 @@ mod tests {
                     .then_some(value),
             );
         }
+    }
+
+    #[test]
+    fn percentage_foreground_color_retains_fractional_paint_channels() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("color", "rgb(0%, 50%, 0%)");
+        assert_eq!(declaration.inner.color, Color::rgb(0,128,0));
+        assert_eq!(declaration.inner.color_rgba, Some([0.0,0.5,0.0,1.0]));
+        declaration.set_property("color", "not-a-color");
+        assert_eq!(declaration.inner.color_rgba, Some([0.0,0.5,0.0,1.0]),
+            "invalid declaration must not clear used paint precision");
+        declaration.set_property("color", "green");
+        assert_eq!(declaration.inner.color_rgba, None,
+            "explicit named color replaces inherited fractional precision");
     }
 
     #[test]

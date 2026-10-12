@@ -1,5 +1,858 @@
 # Raw Web Platform Tests
 
+## 2026-10-10 intrinsic embedding font-strut repair and focused RED closure
+
+V3680 retains the inert-host float-font RED. V3681 proves browser pixels and
+geometry are identical for embedded CSS and equivalent inline CSS. The fixture
+now actually applies its serif style through the inert host; V3682 passes the
+exact text(100,0,66.59375,18) and float(0,0,166.59375,18) checks on both layout
+paths. This is a fixture repair, not an original-WPT rendering fix.
+
+V3669 binds Chrome to the actual Inter bytes used by the unit intrinsic
+measurer. The old image20/40 and fallback-em strut assumptions are invalid:
+fixed-height rows advance24.1875; Ahem20/1.2 separators advance26/52; final
+Inter image line gives76.1875 auto height. V3683 independently binds the same
+Inter bytes for the tall float: text y-1, height20; float y0, parent height50.
+V3684 preserves all3 strengthened RED rather than marking changed assertions
+green: fixed row25.3875, final height77.3875, text y1/height16.
+
+Native unspecified-font metrics now use the same intrinsic primary face as
+existing width measurement instead of guessing0.8em. HTML standard-font marker
+and explicit serif still take their existing distinct resolution paths; the
+native style does not acquire an HTML generic default. V3685 passes8 focused
+tests after the repair. V3686 passes10 tests including the new generic
+metric-source guard and stronger two-layout-path image checks. Inter numeric
+oracles are explicitly macOS/Skia-bound; no other-platform pixel acceptance is
+claimed. V3687 passes13 adjacent float/font/cache controls; V3688 retains35/35
+DOM PASS. Known internal RED3 to0, not a global6548 zero-failure claim.
+
+Runtime build18.06s and runner build1m54s succeed. V3689/V3691 recapture19
+original pinned WPT cases:19/19 Chrome/native pixel exact, no script errors.
+Strict-reference failures remain recorded, not waived. V3693 binds source,
+binaries, RED/GREEN, geometry and pixels. git diff --check passes; root size
+gate still has6 unrelated outside-vendor violations, baseline unchanged.
+Product Agent knowledge unaffected by generic rendering/test changes. No
+commit/push. Next entry: full-current-parity-v3694.mjs, original fixed6548
+manifest, native census followed by all reftest browser comparisons. Until its
+final census exists, full-suite closure is unproven and global remaining UNKNOWN.
+
+## 2026-10-10 collapsed image-line separator strut repair
+
+V3669 binds the unit embedding's actual Inter font bytes and independently
+measures Chrome155 geometry, with PingFang/Ahem contexts kept separate. The
+fixed-height Inter image row advances24.1875, not the old20px oracle. With
+Ahem20/1.2 trailing separators the image rows advance26 and52; horizontal
+collapse does not discard the authored inline strut. V3671 independently
+measures an explicit Times parent:26/52 rows and77.1875 auto height. V3670
+retains the new exact geometry RED (native25.1875/50.375), on a deterministic
+font context rather than substituting it for unspecified-font acceptance.
+
+Soft-line metrics now retain a collapsed, undecorated baseline separator's
+authored font ascent/descent on its preceding nonempty line without adding
+horizontal advance or a paint item. Empty source text remains inert; unsupported
+alignment remains on the general path. V3672 passes5 focused tests including
+the new fixture on both layout paths. V3673 retains the2 original image RED:
+full-line positions are now26/52, but its old40 assertion and unresolved
+default-font final height are not waived. Fixed-height default row25.3875
+still differs from embedding Inter24.1875.
+
+V3680 passes6 controls and discovers one additional float-font RED22 vs18.
+Its InertParserScriptHost::finish_parser_style is a no-op; the fixture uses
+embedded body CSS rather than actually applying its intended serif font.
+V3681 proves original embedded-style and equivalent inline-style fixtures
+have identical Chrome geometry and screenshot (text/float height18). Fixture
+repair is still pending, so expanded known internal RED is3, not2. V3674
+retains35/35 DOM PASS. V3675/V3677 recapture19 original pinned WPT cases:
+19/19 browser pixel exact, no script errors, strict-reference failures retained
+without waiver. V3679 binds source/binaries, RED/GREEN, diagnostics and pixels.
+Runtime build17.52s, runner build1m54s; git diff --check passes. Root size gate
+still has6 unrelated outside-vendor violations, baseline unchanged. Product
+Agent knowledge unaffected by generic rendering/test changes. Full current6548
+NOT_RUN; global remaining UNKNOWN. No commit/push. Next: apply the equivalent
+inert-host fixture repair, then resolve default embedding font-strut ownership
+for the2 original image regressions before full-suite rerun.
+
+## 2026-10-10 rounded upper-leading float source-origin repair
+
+V3656/V3657 independently measure explicit Ahem 16px/1.2 in Chrome155:
+computed line-height19.2px, used19.1875px, glyph top1px and float top0px.
+The original1.6px glyph oracle was invalid; strengthening it to the actual
+used strut and checking the float position exposes a genuine -0.59375px float
+origin defect. V3658 preserves both the original and new explicit-Ahem RED.
+The fitting left-float source-origin conversion now uses the same rounded
+upper leading that positioned its preceding glyph box, rather than the
+fractional half-leading. This does not change lower-leading calculations or
+genuine flex alignment. Explicit-Ahem geometry is not claimed as unspecified
+embedding-font whole-page pixel acceptance.
+
+V3659 passes5 focused runtime tests, V3668 passes7 adjacent float controls,
+and V3661 retains35/35 DOM PASS. V3660 includes an empty selector and is
+retained as INVALID_EMPTY_SELECTION; the valid V3667 replay passes the two
+float regressions and4 controls, retaining the2 image-wrapping RED. Known
+internal failing selectors4 to2 (the two closed float selectors share one
+defect). Runtime build17.51s; runner build1m55s. V3662 and V3664 recapture
+3 original pinned float cases and16 adjacent controls:19/19 Chrome/native
+pixel exact, no script errors. Strict-reference failures remain recorded,
+not waived. V3666 binds RED/GREEN, geometry and pixel receipts to current
+source/binaries. Full current6548 NOT_RUN; global remaining UNKNOWN.
+git diff --check passes; root size gate still has6 unrelated outside-vendor
+violations, baseline unchanged. Product Agent knowledge semantics unaffected
+by generic rendering/test changes. No commit/push. Next: diagnose the two
+remaining image-wrap strut/row-position failures against browser geometry.
+
+## 2026-10-10 mixed normal-flow auto-height and flow-root repair
+
+V3644 independently measures six height/sibling cases in Chrome155: ordinary
+133/141, overflow:auto148/156, flow-root148/156, fixed210/218, min170/178 and
+max110/118. V3645 retains the strengthened ordinary-height RED and the new
+six-case runtime RED. Supported mixed block/inline ordinary auto-height now
+uses settled in-flow extents, excluding floats; existing constraints and
+block-flow propagation preserve min/max sizes and following sibling positions.
+The settlement is repeated after float projection before BFC containment.
+Unsupported relative/decorated inline containers and percentage constraints
+retain their general path rather than guessing their line extent.
+
+V3646 passes the repaired ordinary-height selector and three controls, but
+retains a newly exposed flow-root RED: its inline descendants are incorrectly
+block-stacked, producing266 instead of148. Taffy lowering now recognizes
+FlowRoot as both an inline and mixed formatting-context owner without changing
+its CSS BFC identity. V3647 passes14 focused runtime tests, including all six
+height/sibling cases on both layout paths and9 flow-root controls. V3652 passes
+6 further BFC/font/cache controls. V3648 rechecks prior4 RED plus the new matrix:
+2 PASS,3 FAIL. V3649 retains35/35 DOM PASS. Known internal RED4 to3; matrix RED
+closed separately, not counted as an extra original-WPT repair.
+
+Runner rebuild succeeds in1m57s. V3650 captures original pinned floats-030,
+floats-wrap-bfc-outside-001 and floats-line-wrap-shifted-001:3/3 browser pixel
+exact, actual/reference native-browser0. V3653 captures16 adjacent original WPT
+controls:16/16 browser pixel exact, no script errors. All strict-reference
+failures remain recorded (including nowrap1700 identically in Chrome/native),
+not waived. V3655 binds current source/binaries, RED/GREEN, independent geometry
+and19 pixel comparisons. Full current6548 NOT_RUN; global remaining UNKNOWN.
+git diff --check passes; same six unrelated root size violations, baseline
+unchanged. Product Agent knowledge semantics unchanged; no commit/push.
+
+## 2026-10-10 tall-image baseline versus ordinary-block height diagnosis
+
+Independent Chrome155 V3639 measures the original synthetic regression with
+only diagnostic IDs and a decoded96px image placeholder. Default and explicit
+PingFang contexts have identical text(109,114,88.4375,22), image(197.4375,35,96,96)
+and float(13,45,96,106), all already exact in native. Explicit Times is recorded
+separately, not substituted for the default context. The old0.8em baseline
+estimate is replaced by the resolved-font ascent shared with glyph painting.
+
+The regression is strengthened rather than simply declared GREEN: Chrome's
+ordinary bordered block height is133, while native reports148. V3640 retains
+that real height RED after exact baseline/child geometry checks pass. Float
+overflow must not inflate this non-BFC auto-height. The original pinned
+floats-030 has a fixed150px height; this synthetic auto-height diagnosis is not
+claimed as an original-WPT failure or acceptance result.
+
+V3641 rechecks all4 known runtime RED, all remain; two cleared/nowrap float
+controls pass. V3642 retains35/35 DOM PASS. V3643 binds source/binaries, browser
+geometry and the strengthened height failure. Next: settle mixed block/inline
+normal-flow height while retaining BFC containment, sizing constraints and
+sibling placement. No production repair is claimed by this diagnostic batch.
+WPT pixel recapture/full current6548 NOT_RUN; global remaining UNKNOWN; strict
+reference failures retained. git diff --check passes; same six unrelated root
+size violations, baseline unchanged. Product Agent knowledge unchanged; no
+commit/push.
+
+## 2026-10-10 cleared-float and retained-descendant oracle repairs
+
+V3626 retains both expanded DOM RED. Cleared synthetic floated wrappers use
+Auto width to shrink-wrap their authored float, not100% of the containing band.
+The structural regression now checks that intent, the wrapper marker and exact
+30x20 authored dimensions with flex-shrink0. The nowrap shrink test recursively
+locates exactly one float, retaining width/shrink checks and adding source-order
+checks for both float sides, instead of requiring top-level hoisting. These are
+internal oracle corrections, not production renderer changes.
+
+Independent Chrome155 V3631/V3634 measures two30x20 clear:left floats in a200px
+parent at(0,0) and(0,20). The new runtime regression checks identical geometry
+through both compute and LayoutEngine. Its initial V3633 fixture matched zero
+floats: InertParserScriptHost.finish_parser_style is a no-op, so embedded CSS
+was never installed. The equivalent inline-CSS fixture passes in V3635; that
+fixture setup failure is preserved and not counted as a renderer defect.
+
+V3636 passes35/35 DOM tests including both repaired selectors. V3635 passes8/8
+runtime tests for cleared-float geometry, nowrap anchors and font/cache controls.
+V3637 explicitly rechecks all4 retained runtime RED, all remain. V3638 binds
+current source/binaries, independent geometry and RED/GREEN: tracked internal
+RED6 to4 through two oracle repairs. Test-only batch: current-source WPT pixels
+NOT_RECAPTURED; prior source-bound17 browser-exact comparisons remain historical
+evidence, not a current full-suite claim. Strict-reference ledger retained;
+full current6548 NOT_RUN, global remaining UNKNOWN. git diff --check passes;
+same six unrelated root size violations, baseline unchanged. Product Agent
+knowledge semantics unchanged; no commit/push.
+
+## 2026-10-10 nested nowrap left-float source anchoring repair
+
+V3618 adds a DOM RED: extracting a left float from a nowrap inline promotes it
+before its source prefix. The inline collector now retains encounters for both
+float sides, as it already did for right floats. V3619 confirms preserved text
+returns to browser y6 while the float still incorrectly stays at8; three
+runtime controls pass. The nested nowrap prefix-floor placement now handles
+left as well as right floats. V3620 passes4/4 runtime tests with exact glyph
+top6 and float top18. The old font-box-top-plus10 expectation is corrected to
+the independently measured line-box-origin8 plus used height10 (V3600).
+
+V3622 rechecks the prior5 runtime RED:1 PASS,4 FAIL. V3627 passes3 font/cache
+controls. Expanded DOM testing discovers two additional RED: cleared synthetic
+wrapper width still expected100%, and float-shrink test searches only top-level
+children rather than preserved descendants. They are retained for separate
+repair, not omitted from the ledger. V3621 includes an empty selector and is
+INVALID, not GREEN. Corrected selectors in V3625 produce33 passing DOM tests
+and one RED; V3626 explicitly retains both additional DOM failures. Current
+tracked internal RED is4 runtime plus2 DOM (6), not a global WPT count.
+
+Runner rebuild succeeds in1m58s. Original pinned floats-line-wrap-shifted-001
+V3623 is actual/reference native-browser pixel exact0, closing its prior1728
+browser gap. Strict actual/reference1700 persists identically in Chrome/native
+and remains separately retained. V3628 runs16 adjacent original WPT controls:
+16/16 browser pixel exact, no script errors; all strict-reference failures remain
+recorded. V3630 binds current source/binaries, RED/GREEN and17 pixel comparisons.
+Full current6548 NOT_RUN; global remaining UNKNOWN. git diff --check passes;
+root size check has the same six unrelated outside-vendor violations, baseline
+unchanged. Product Agent knowledge semantics unchanged; no commit/push.
+
+## 2026-10-10 font-unit measurement context repair
+
+V3608 retains the new ch RED: stripped measuring style selects the embedding
+face (zero advance6.665039) rather than HTML's standard face (6). The font-unit
+provider now carries HTML standard-font and language context into measurement
+and its bounded cache key. V3611 passes3 focused tests, including both cache
+warmup orders, language variants, font-size and loaded-face identity controls.
+
+V3609 also retains an adjacent spacing assertion RED: glyph advance9.6015625
+is not used padding9.59375. Independent Chrome155 V3610 measures serif,
+monospace and pinned Ahem spacing, confirming used-box 1/64px quantization.
+Only the internal used-spacing oracle is corrected; raw dimension assertions
+and tracking/cache checks remain. No WPT fixture or tolerance is changed.
+
+V3612 rechecks5 existing runtime RED plus2 newly resolved items:2 PASS,5 FAIL.
+V3613 passes29/29 DOM tests. Runner rebuild succeeds in1m57s. Original pinned
+floats-line-wrap-shifted-001 V3615 remains a browser pixel gap1728; its reference
+is native/browser exact0. Strict actual/reference remains1700 in Chrome and1879
+in native, separately retained, not waived. Font context is fixed, but deferred
+nested-float source placement is not. V3616 preserves the pixel classification;
+V3617 validates current source/binaries and binds RED/GREEN/geometry/pixel
+receipts. Known internal RED stays5; current full6548 NOT_RUN, global remaining
+UNKNOWN. Product Agent knowledge semantics unchanged; no commit/push.
+
+## 2026-10-10 nobr UA repair and unresolved deferred-float diagnostics
+
+Independent Chrome155 V3600 captures the original runtime regression HTML
+with only diagnostic IDs added: nowrap text before/after the nested float
+shares y6, containing width72 (12ch), float top18. This is geometry evidence,
+not original WPT pixel acceptance. V3601 adds and retains a DOM RED: nobr is
+incorrectly Block. HTML UA defaults now classify nobr as Inline with NoWrap;
+computed-style inheritance retains that UA white-space unless user/author
+cascade overrides it. The new test checks inherited10px/1 font context,
+author normal/block and explicit white-space inheritance. V3603 passes29
+focused DOM tests (the UA group grows from22 to23).
+
+V3602 shows the runtime text now shares a line, but the float still incorrectly
+starts at8. V3604 enriches that retained failure with component/rect evidence:
+native containing width79.98047, float top8 and text y16. Font-unit measurement
+constructs a stripped style without HTML_STANDARD_FONT_PROPERTY; the renderer
+uses that marker to distinguish the standard browser face from the embedding
+primary font. Its cache identity and nested-float source anchoring remain the
+next investigation, not claimed fixes. The old text-y-plus10 expectation also
+must be checked against the line-box origin, without accepting the wrong top8.
+
+V3605 rechecks all5 known runtime RED, all remain. V3606 retains29/29 DOM PASS;
+V3607 binds current source/binaries, UA RED/GREEN and browser/runtime diagnostics.
+No internal failure is closed by this partial batch. Runner rebuild/current
+pixel acceptance and full6548 NOT_RUN; global remaining UNKNOWN. Strict-reference
+failures remain retained. git diff --check passes; same six unrelated root size
+violations, baseline unchanged. Product Agent knowledge unchanged; no commit/push.
+
+## 2026-10-10 inline font-box background oracle correction
+
+V3590 retains the old borderless inline background RED, which incorrectly
+requires blue pixels in the line's leading. Independent Chrome155 V3595 uses
+an explicit16px Ahem font box with19.2px computed line-height: the font box is
+16px high; y20/y38 pixels remain white and y22/y36 are blue. Browser y21.59375
+differs from the direct fixture's literal y21.6, so this evidence supports
+interior/exterior semantics, not fractional-edge screenshot equivalence.
+
+The internal test is renamed from covers_the_line_band to
+does_not_paint_line_leading, with explicit RED/GREEN name lineage. It now
+checks leading stays white, all15 interior rows stay blue and both horizontal
+outside edges stay white. No production paint code changes. V3596 passes the
+renamed test plus four controls for short/long leading, translucent fragment
+paint and registered Ahem glyph coverage. V3597 rechecks prior6 RED using the
+verified renamed selector:1 PASS,5 FAIL, no empty selections. V3598 retains
+28/28 DOM PASS. V3599 validates current source/binaries, original RED, renamed
+PASS and independent oracle: internal RED6 to5 via one oracle correction.
+Current-source WPT pixel recapture/full6548 NOT_RUN; global remaining UNKNOWN.
+Earlier source-bound pixel receipts and strict-reference failures remain
+retained. git diff --check passes; root size gate has the same six unrelated
+outside-vendor violations. Product Agent knowledge unchanged; no commit/push.
+
+## 2026-10-10 synthetic float-row ownership repair
+
+V3586 retains the strengthened duplicate-flow RED: one ordinary block text
+leaf gets both root and inner-block FloatTextLayout owners. The shared-parent
+shortcut now requires a marked synthetic Flex row. Ordinary Blocks (including
+anonymous block lines) use their own content box and height owner; real authored
+Flex is not treated as CSS inline flow. Regression assertions verify one owner,
+independent block padding/width, authored Flex rejection and synthetic Flex
+preservation. Literal fixture float height19.2 still overlaps the second
+19.1875px line; exact band checks retain that overlap and release it on the
+third band rather than hiding it with a tolerance.
+
+V3587 passes the repaired ownership test and four controls, but discovers an
+adjacent old used-height assertion expecting at least38.39. Independent Chrome155
+V3588 measures two explicit16px/1.2 lines at38.375 under serif and Arial; the
+assertion now checks exact38.375 and both exclusion bands. V3589 passes all6
+focused tests. V3590 rechecks prior7 RED and the discovered item:2 PASS,6 FAIL.
+V3591 retains28/28 DOM PASS. This closes one known production ownership defect
+plus one newly discovered oracle defect; it is not two claimed WPT repairs.
+
+Runner rebuild finishes in1m54s. V3592 captures original pinned c414-flt-fit-000,
+c5525-fltblck-000 and inline-formatting-context-015:3/3 browser pixel exact,
+actual/reference native-browser differences0 and both strict comparisons0
+for every case, no script errors. V3594 binds current source, binaries, RED,
+focused units, independent browser geometry and original WPT receipts. Known
+internal RED7 to6. Full current6548 NOT_RUN; global remaining UNKNOWN; earlier
+strict-reference failures remain separately retained. git diff --check passes;
+root size gate has the same six outside-vendor violations, baseline unchanged.
+Product Agent knowledge semantics unchanged; no commit or push.
+
+## 2026-10-10 ordinary block versus authored flex line ownership
+
+V3572 retains the marked_block_image_text_wrap_uses_shared_line_struts RED.
+Independent Chrome155 V3580 confirms ordinary block children form two inline
+lines (parent36px, second text18px below first), whereas true authored flex
+retains a single18px flex row. The old test incorrectly rejected all unmarked
+containers, including an ordinary block with inline children. The assertion
+now accepts that block, still rejects authored Flex/unmarked Inline packet
+projection, and verifies every branch leaves already-projected geometry
+unchanged. No production renderer eligibility or WPT expectation is changed.
+
+V3581 passes that test plus baseline-offset and following-block-descent controls.
+V3582 independently measures explicit-font image rows: serif16/1.2 has second
+image y25.1875, Ahem20/1 has y24, and PingFang SC16/1.2 has y24.1875. These are
+not equivalent to direct Component's unspecified embedding font: its two
+image-row RED remain retained, not assigned guessed browser metrics. V3583
+rechecks prior8 RED plus two controls:3 PASS,7 FAIL. V3584 retains28/28 DOM PASS.
+V3585 validates oracle and same-source receipts/binary hashes; internal RED8
+to7 through one oracle correction, not a claimed rendering repair.
+Current-source pixel recapture/full6548 NOT_RUN; global remaining UNKNOWN.
+Earlier pixel receipts and all strict-reference failures remain source-bound
+and retained. git diff --check passes; size gate retains the same six unrelated
+outside-vendor violations. Product Agent knowledge unchanged; no commit/push.
+
+## 2026-10-10 current-source input and textarea pixel recapture
+
+The runner rebuild completes in1m55s after the scoped textfield UA border fix
+and subsequent test-oracle corrections. V3575 recaptures the original pinned
+floats-wrap-bfc-outside-001 textarea page: native/browser actual and reference
+pixels both0; both strict-reference comparisons also0. V3577 recaptures three
+original input-containing cases: blocks-026, units-005 and
+text-transform-bicameral-001. All3 native/browser actual and reference captures
+are pixel exact, without script errors. V3578 separately retains blocks-026's
+strict actual/reference difference:8715 pixels in both browser and native.
+This is not waived or counted as strict WPT PASS. The other two strict cases
+have0 differences. This scope validates author border override and original
+text-input consumers, not all input types or every form-control capability.
+
+V3579 validates current source, fixed revision, runner hash, suite/result hashes
+and the four browser-exact captures. Internal RED remains8 from V3574; this
+pixel-only batch does not claim additional rendering repairs or test closure.
+All earlier strict-reference failures remain retained in their own receipts.
+Full current6548 NOT_RUN; global remaining UNKNOWN. git diff --check passes;
+root size gate retains the same six outside-vendor violations, baseline unchanged.
+Product Agent knowledge semantics unchanged; no commit or push.
+
+## 2026-10-10 anonymous line and float overflow oracle corrections
+
+V3565 retains both original RED. Independent Chrome155 V3567 measures the
+generated anonymous line under serif, sans-serif and Arial: computed19.2px,
+used19.1875px, following block y29.1875, parent height42.375. Inline text
+rectangles vary by font and are not line boxes. The internal assertion now
+checks exact line distance, following block size, parent height and horizontal
+alignment instead of conflating glyph height with line height. V3568 passes
+that test and three adjacent generated-line controls.
+
+V3569 measures visible/auto/hidden/scroll float containers with serif and Arial.
+V3570 retains an intermediate RED from a newly added root-height assertion:
+the diagnostic's ordinary root block is not equivalent to compute's root BFC.
+V3571 uses an equivalent flow-root and independently confirms root height56
+for visible overflow,66 otherwise; child heights19.1875/56 and sibling positions
+remain unchanged. The final test uses exact assertions for every overflow
+branch plus float position/height and root BFC containment; no tolerance is
+increased. V3572 rechecks the prior10 RED plus four controls:6 PASS,8 FAIL.
+V3573 retains28/28 DOM PASS. V3574 validates same-source receipts and binary
+hashes: internal RED10 to8 via two browser-grounded oracle corrections, not
+production rendering repairs. No WPT fixture or strict-reference expectation
+is changed. Full current6548 and current-source pixel recapture NOT_RUN;
+global remaining UNKNOWN. Strict-reference failures retained, not waived.
+git diff --check passes; root size gate has the same six outside-vendor
+violations. Product Agent knowledge semantics unchanged; no commit or push.
+
+## 2026-10-10 DOM oracle and textfield default border closure
+
+V3560 independently captures Chrome155 computed styles: text inputs keep a
+2px inset border when author background/radius disables automatic theme
+painting; explicit author borders override it. First-letter source DOM text
+remains unchanged. Two internal first-letter tests now assert the initial
+typographic unit, concatenated remainder and every remainder fragment's
+color/font size rather than requiring a private two-fragment representation.
+This is an oracle correction, not a claimed production rendering repair.
+
+V3561 retains the missing inset-border RED. V3562 passes the intermediate
+broad input candidate, but V3563 independently shows other input types have
+different browser borders. The final computed-style fix therefore applies
+only to the existing textfield classification before author cascade; it does
+not claim all non-textfield control defaults are correct. V3564 passes all28
+focused DOM tests on that scoped candidate. Rebuilt runtime tests V3565 retain
+all10 previously known runtime RED. V3566 validates same-source receipts and
+binary hashes: known internal RED13 to10, through two oracle corrections and
+one actual UA-style repair. Original RED evidence is retained.
+
+Current-source WPT pixel recapture and full6548 are NOT_RUN; global remaining
+is UNKNOWN. Strict-reference failures remain separately retained, not waived.
+The root size gate still reports six unrelated outside-vendor violations;
+baseline is not raised. No Product Agent knowledge/authority semantics change.
+No commit or push.
+
+## 2026-10-10 independent browser oracle corrections
+
+This batch changes internal test assertions, not production renderer behavior.
+The independent V3547 Chrome155 Ahem fixture measures second image-row y24 and
+container height48; the old y20 expectation removed the containing strut's4px
+descent. That assertion now uses exact y24/height48 and checks the first row's
+four positions and20x20 sizes. The same browser receipt independently measures
+fractional block width200.375 and shrink-wrap width221.5. The old200.4±0.01
+expectation ignored per-edge LayoutUnit truncation; exact widths200.375,
+136.375/72.375 and sibling margin gap6.375 now strengthen that test. No tolerance
+is increased and no WPT/strict-reference expected result is changed.
+
+V3552 retains both original RED assertions; V3555 passes the corrected Ahem
+test while retaining the fractional RED. V3556 passes six focused tests;
+V3557 rechecks12 prior runtime assertions (2 PASS,10 FAIL), and V3558 retains
+all3 DOM failures. V3559 validates the independent browser oracle fields,
+hashes it, and binds current source/binaries: internal RED15→13 through two
+oracle corrections, not two claimed rendering repairs. The anonymous float
+group ownership/line-band RED remains open: two flows target one text leaf,
+but their parent-height responsibilities must be checked before deduplicating.
+Other unresolved font/default-profile assertions are not blanket waived.
+Earlier pixel captures are historical source-bound evidence; full current6548
+NOT_RUN and global remaining UNKNOWN. git diff --check passes; root size gate
+retains six unrelated violations, baseline unchanged. Test-only corrections
+do not change Product Agent knowledge semantics. No commit or push.
+
+## 2026-10-10 mixed inline-block leading margin containment
+
+V3547 records four controlled Chrome155 geometry fixtures, not WPT acceptance.
+The Ahem full-image row agrees with native: second row y24 and parent height48,
+not the old assertion's y20. Fractional box width also agrees at200.375, not
+the old assertion's200.4. Neither old assertion is changed or waived. Other
+diagnostic fixtures use serif/normal whereas direct Component defaults have
+an unspecified embedding font and explicit1.2 line-height; their vertical
+metrics are not equivalent and cannot prove native/browser agreement.
+
+The fractional fixture also exposes a real independent defect: the first block
+child's top margin escaped its mixed inline-block BFC. V3548 adds and retains
+the browser-grounded RED (native relative y0, Chrome3.1875). Leading-child
+margin collapse now applies only to eligible block/list-item containers, not
+an inline-block lowered internally to Flex. V3549 passes the new assertion
+and six controls for sibling margins, float/clear flow and fixed-height atoms.
+The runner rebuild finishes in2m00s; V3550 captures three original pinned WPT
+cases margin-collapse-014/015/015a:3/3 browser exact, both strict comparisons0
+for each. V3552 and V3553 recheck the remaining12 runtime and3 DOM failures;
+all15 remain independently retained. V3554 binds current source/binaries and
+focused acceptance. Full6548 NOT_RUN; global remaining UNKNOWN. No old test
+expectation, WPT fixture, tolerance, parent pin or authority path is changed.
+Root size gate retains six unrelated violations; git diff --check passes.
+No Product Agent knowledge semantics change; no commit or push.
+
+## 2026-10-10 image lifecycle and reduced-feature realm audit
+
+V3540 retains the ImageDecoder realm and two image event-count RED assertions.
+Reduced-feature unit builds construct codec objects directly, but reset_bridge
+previously skipped their cleanup when advanced graphics globals were disabled.
+Cleanup now includes cfg(test), without enabling production advanced globals.
+V3542 passes all three ImageDecoder tests and the WebCodecs realm control.
+The two image failures are duplicate property callbacks, not duplicate HTTP
+requests: dispatch_element_lifecycle_event already calls onload/onerror, then
+the image loader called them again. Network and blob image success now use
+only unified dispatch; image errors return after unified dispatch, preserving
+the non-node fallback. Original expected event counts remain unchanged.
+
+V3543 executes14 image/WebCodecs tests, all PASS, including successful/failed
+network decode, blob URLs, detached Image(), XHTML images and realm disposal.
+V3544 rechecks the15 known runtime assertions:3 now PASS,12 remain FAIL.
+V3545 independently retains the3 DOM failures. V3546 binds these receipts to
+current source and binaries: known internal RED18→15. Previous17/17 pixel
+acceptance at V3541 belongs to its earlier source; current-source browser
+recapture and full6548 remain NOT_RUN, global remaining UNKNOWN. Strict
+reference failures are not waived. git diff --check passes; root size gate
+retains six unrelated outside-vendor violations without baseline increases.
+No business authority or Product Agent knowledge semantics change; no push.
+
+## 2026-10-10 resize raster-effect sampling and textarea pixel closure
+
+V3523–V3526 retain mesh/interpolation and GPU diagnostics, not acceptance.
+The proposed fitted 1/128 interpolation grid was rejected: device interpolation
+evidence supports the existing 1/256 grid. V3527 isolates CSS resize on/off in
+Chrome155; V3529 shows that a resizable peer changes the textarea corner only
+inside the shared raster effect, not across a will-change isolated layer.
+Sampling therefore follows the artifact effect group rather than control type.
+The analytic rounded-rectangle path tests triangle inclusion at four rotated
+device samples and interpolates coverage at pixel center, retaining the same
+mesh and coverage equations. This is not a universal GPU render-pass emulator;
+cross-draw sample correlation, raster-tile culling and all transforms remain
+outside this focused acceptance.
+
+The shared/isolated peer and repeated retained replay test is RED at V3530 and
+GREEN at V3531. V3531 executes13 runtime tests, all PASS; V3538 executes23
+DOM/UA tests, all PASS. The rebuilt V3532 original actual and reference both
+reach0 browser/native pixels (previously4), and both strict comparisons are0.
+V3534 preserves16/16 adjacent browser-exact comparisons, with six independent
+strict-reference failures retained. V3541 binds these17 rows to source diff
+`26a2cee6fb07d25a63d8e7e6481793d0fc90e5e24661febd99e84382236ecc51`.
+
+V3537 is explicitly invalid because three DOM selectors were dispatched to
+the runtime binary and executed no tests; it is retained, not accepted as a
+complete audit. Corrected V3540 executes15 runtime tests with15 failures;
+V3539 executes the three DOM failures separately. The current known internal
+RED count is18, not the remaining WPT-case count. Full current6548 NOT_RUN;
+global remaining UNKNOWN. Root size check retains six unrelated outside-vendor
+violations without a raised baseline. No Product Agent knowledge or business
+authority semantics change; no commit, push, WPT edit or parent pin change.
+
+## 2026-10-09 non-AA rounded-control fill snapping
+
+The next candidate follows the local Skia0.93.1 Graphite `Device::drawRRect`
+and `snap_rect_to_pixels`: non-AA round rectangles snap straight device edges
+while retaining curved-edge AA. The analytic implementation previously ignored
+this paint flag. Fill bounds9.5/9.5 now snap to10/10, explaining the original
+asymmetric white fill without a textarea-size or pixel-coordinate branch.
+V3513 retains the outer-corner RED and passes the input/button and analytic
+transform controls. V3514 adds all three fixed samples to the failure message
+without changing expectations: the top-adjacent92/148/92 and inner106/199/106
+samples match Chrome155, while the outer20/232/20 still differs21/231/21.
+The new device-transform invariant verifies that non-AA fill equals an AA
+round rectangle at the explicitly snapped device bounds and preserves matrix
+state. A rebuilt original-page receipt is required before reporting pixel
+reduction. Source and runtime compilation are kept frozen during captures.
+Full current6548 NOT_RUN; global remaining UNKNOWN; no publication.
+
+V3515's rebuilt original actual/reference captures each reduce17→4 browser
+pixels; both strict comparisons remain0. V3517 hashes and decodes those
+captures: residuals are only the four outer corners, each differing by one
+channel value (three corners20/232/20 versus21/231/21; lower-right green232
+versus231 with red/blue101 already matching). V3518's16 adjacent comparisons
+remain browser exact, with six separate strict-reference rows retained.
+V3520 executes12 runtime tests:11 PASS, the unchanged colored-corner assertion
+FAIL; the new snapping/transform test, resize-none, layout, input/button and
+five media controls all pass. V3521 executes23 DOM/UA tests, all PASS.
+`textarea-checkpoint-v3522.json` binds the final source and binary hashes,
+current17 comparison rows, and the earlier19 unresolved internal assertions
+as historical—not all newly rerun. `git diff --check` passes; root size gate
+retains six outside-vendor violations without a raised baseline. No Product
+Agent knowledge or business-authority semantic changes are introduced.
+
+## 2026-10-09 textarea resize coverage candidate
+
+V3496 decodes the immutable original browser/native captures: the47 residual
+pixels comprise17 theme-corner pixels and30 resize-indicator pixels. V3497
+retains the missing CSS resize-value RED; V3501 passes its keyword/invalid-value
+test and22 UA tests. CSS-wide inherit/revert behavior, pointer resizing,
+generic container overlay ordering and transformed/RTL acceptance remain open;
+this is not a claim of full CSS resize support.
+
+V3498/V3502 retain the indicator RED. V3503 switches only the indicator to
+ordinary SrcOver: unchanged binary102 grayscale pixels, candidate reverted.
+Local Skia `SkDraw.cpp` confirms that a1px stroke can become a CPU hairline.
+V3504 explicitly expands its stroke into fill geometry: intermediate coverage
+returns, but the first sample244 still differs from Chrome217, so that candidate
+was replaced. V3505 evaluates butt-capped stroke geometry at four rotated
+device samples: the unchanged Chrome samples and resize:none assertion pass,
+as does the textarea layout-descent control. The separate colored-corner RED
+remains20/232/20 versus21/231/21. Four-sample agreement is observed evidence,
+not proof of Chrome155's internal backend. The algorithm is scoped to the
+resize overlay, not arbitrary CSS/SVG antialiasing. Subsequent original-page
+capture must bind the rebuilt source; old47-pixel receipts are not current
+candidate acceptance. Full6548 NOT_RUN, global remaining UNKNOWN. No push,
+WPT change, tolerance relaxation or parent pin change.
+
+V3506 rebuilds and captures both original pages: browser/native differences
+fall47→17 on each side, and both strict comparisons remain0. All30 indicator
+pixels are cleared; the17 corner pixels remain. V3508 repeats16 adjacent
+controls:16/16 browser exact, with six strict-reference rows independently
+retained. V3510 reruns four runtime tests on final guarded source: indicator,
+textarea descent and input/button corners PASS, colored textarea corner FAIL.
+V3511 passes23 DOM/UA executions. `textarea-checkpoint-v3512.json` binds the
+final source/runner/unit hashes and17 original comparisons. The earlier19
+internal failures remain listed as historical unresolved items, not all
+freshly rerun; the newly added indicator RED is now closed. Root size gate
+still reports six outside-vendor violations; baseline unchanged. These
+generic rendering changes do not alter Product Agent knowledge or authority.
+
+## 2026-10-09 textarea geometry and automatic-theme RED
+
+V3474/V3479 inspect original test/reference in Chrome155: textarea480x133.328125
+at9/9; its lime containing block is137.328125 high, including4px baseline
+descent. Both original browser pages are identical. V3475/V3476 bind native
+layout diagnostics: textarea133.33333 high; containing block133.33333 high,
+and the reference outer border lacks4px. The original pixel RED remains
+actual1968/reference2480 at V3449.
+
+V3477 retains the UA padding RED (top/bottom1 instead of2). V3478/V3480/V3481
+are invalid layout fixtures: streaming-parser stylesheet declarations were not
+applied, so no styled block exists. They are not accepted semantic RED evidence.
+V3482 uses equivalent inline declarations and exposes a misplaced single-line
+input baseline. V3483 additionally records the theme corner RED over lime:
+native118/118/118, Chrome21/231/21. No expected sample is changed.
+
+The current candidate separates textarea metadata from appearance, restores
+UA2px padding and overflow:auto, and uses bottom-margin-edge atomic metrics.
+V3485's English-language fixture (same language as original XHTML) passes
+float and absolute sibling variants. V3484 records that an unspecified fixture
+language selects a different font strut; it is not original-page pixel proof.
+Input/button corner control remains green. A direct raster-AA theme candidate
+returns0/255/0 at the first corner (V3485) and was rejected and reverted. The
+analytic theme's first corner differs by one channel value (20/232/20 rather
+than21/231/21, V3484); its strict corner RED is retained. V3488 remeasures the
+original test/reference on the rebuilt candidate: each browser/native side
+is47 pixels apart (down from1968/2480), and native/reference strict pixels are
+now0. Residuals are confined to theme corners/fill and the resize indicator;
+the entire case remains browser RED. V3491's sixteen adjacent image/float
+controls remain pixel exact. V3490's `textarea-checkpoint-v3490.json` binds
+these17 comparisons, six independent strict-reference difference rows and
+current runtime/DOM receipts to source and binary hashes. Historical strict
+differences outside this scope are not newly rerun or waived.
+
+V3487 passes the new UA test and22 user-agent tests; its form-control scope
+finds a separate old input-border expectation (1 versus actual2). HEAD already
+contains input2px geometry; this assertion is unchanged and remains open,
+with runtime baseline causality not newly established. V3493 retains the ten
+runtime failures in246 executions; V3494 retains the original five, and V3495
+retains the two DOM first-letter failures. With the newly exposed input test
+and retained textarea paint RED, nineteen distinct internal assertions are
+recorded; this is not a WPT case count. V3486 keeps the textarea geometry and
+input/button paint controls green while retaining the corner RED. The root
+size gate still reports the same six outside-vendor violations.
+
+[Chromium NativeThemeBase](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/ui/native_theme/native_theme_base.cc)
+was inspected for its separate textfield background/border draws. Current main
+is algorithm research, not proof of Chrome155's exact paint path; original
+browser captures remain authoritative. Full current6548 NOT_RUN; global
+remaining UNKNOWN. Existing internal failures are not waived. No publication,
+upstream edits, tolerance change or parent pin change. Generic control geometry
+has no Product Agent knowledge or business-authority semantic impact.
+
+## 2026-10-09 opaque image bilinear precision candidate
+
+V3447 runs the same decoded17x17 bitmap through three alpha representations:
+Premul255, Opaque255 and Unpremul253 at image x8/y0. Only the floating linear
+path matches the original Chrome155 sample253; no cubic filter is needed.
+Opaque textures now request that float path without changing pixel data.
+Transparent textures retain premultiplied interpolation and shared decoded
+pixels remain unmodified. The temporary representation diagnostic was removed.
+
+V3448 passes the target RED, crisp image coverage, raster background controls
+and41 SVG tests. The expanded image filter executes92 tests with seven failures
+in loading/decoder and layout tests; their causal baseline is pending and none
+is waived. V3457 retains151/154 previous runtime passes and the original three
+failures. V3461 removes only the opaque sampling production change and rebuilds
+the runtime: the same seven image failures remain, plus the retained sampling
+RED (255 instead of253). V3462 restores the exact candidate source, rebuilds,
+and passes the sampling RED while preserving those same seven failures. This
+isolates their preexistence relative to this sampling change, not their earlier
+origin; all seventeen distinct internal failures remain open.
+
+Fresh candidate runner comparisons clear c414-flt-fit-006 actual/reference
+from2144 to0 differing pixels. Historical targets pass11/12, relative-inline8/8,
+nowrap9/9, counters23/23, image/source-order controls16/16 and primary6/6.
+These74 comparisons include overlaps and are not a global census. The remaining
+browser gap is floats-wrap-bfc-outside-001 (actual1968/reference2480 pixels).
+V3463's `image-sampling-checkpoint-v3463.json` binds all six pixel scopes, unit
+receipts and causal comparison to candidate source and runner hashes; it retains
+39 strict-reference difference rows independently, without waiving them.
+The exact production source was restored after baseline capture. Full current
+6548 NOT_RUN; global remaining UNKNOWN. Root size gate still has six unrelated
+outside-vendor violations, with no baseline increase. Product Agent knowledge
+has no impact: this is generic texture sampling, not business authority or
+tool semantics.
+No change to WPT, assertions, tolerance, parent pin or publication.
+
+## 2026-10-09 float-fit image sampling RED; cubic candidates rejected
+
+V3438-3441 inspect original c414-flt-fit-006 and its reference: image positions
+and160x16 destination sizes match Chrome155. V3436's2144 actual/reference
+differences are within scaled bitmap edges, with maximum channel difference8,
+not float placement. The fixed17x17 palette PNG is retained unchanged. V3442
+adds a renderer RED using the browser sample at image x8/y0: native linear255
+versus browser253. Mitchell produces251, and Catmull-Rom254. Neither is accepted;
+both production sampling candidates were reverted. V3443 also records an empty
+fractional_svg filter and is INVALID_EMPTY_SELECTION, not a passing regression.
+V3444/3445's svg filter actually executes41 passing tests, and crisp replaced
+edge coverage passes. Restored linear redraw still reproduces the target RED.
+
+`target/wpt-targeted/baseline-font-position-20261003/image-sampling-diagnostic-v3446.json`
+binds diagnostics, the existing pixel baseline, rejected candidates and restored
+unit RED separately. This turn adds a failing regression for an existing known
+pixel gap, not a completed repair or new distinct WPT failure. The previous
+two scoped pixel gaps and ten internal failures remain open; the additional
+sampling assertion maps to c414-flt-fit-006. Next inspect raster bilinear
+precision/pre-scaling; a global cubic switch is disproven by measured samples.
+No assertions, tolerance, WPT, parent pin or publication changes.
+
+## 2026-10-09 horizontal rule UA and below-float BFC: local RED chain
+
+V3412-3415 inspect original margin-collapse-min-height-001 and its reference.
+Text geometry and hr top128 match Chrome155, but native hr is an unpainted
+zero-height row. The1568 missing pixels are its784x2 browser border, not text
+or margin differences. V3416 records computed UA border1px inset, gray128,
+vertical margin8px and overflow hidden. V3417 preserves the missing-border
+DOM RED. The initial UA candidate exposes a second RED V3418: generic text
+inheritance overwrites hr's own gray declaration. Its UA color now wins over
+implicit inheritance; explicit author inherit still wins, and author border
+and margin overrides remain effective.
+
+V3419's intermediate candidate clears the reference but worsens the actual
+to10582 pixels. This is retained as a failed candidate, not acceptance. V3421
+shows the below-float BFC correction incorrectly shifts the whole branch
+from y80 to16. Its exclusion band was queried at the float's top rather than
+the following BFC's actual top. V3422 reproduces this in a generic parsed
+fixture with authored inset border/hidden overflow, independent of hr defaults.
+The band is now evaluated at the BFC's own y; V3423 passes this fixture and
+the previous fractional-source fixture. V3424 still has151/154 runtime passes
+and three original failures; V3426 retains the other five runtime failures.
+V3425 passes88 DOM executions including UA overrides and explicit inheritance;
+V3427 retains two first-letter failures. Runner rebuild3m49s. V3428 clears
+original min-height actual/reference1568 ->0 and improves the historical
+window9/12 ->10/12. V3430 adjacent8/8, V3432 counters23/23 and V3434 nowrap9/9
+remain browser-exact. The two scoped gaps are still c414-flt-fit-006
+actual/ref2144 and floats-wrap-bfc-outside-001 actual1968/ref2480.
+`target/wpt-targeted/baseline-font-position-20261003/hr-checkpoint-v3436.json`
+binds source1b58bc5c to52 fresh scoped comparisons and all current unit receipts;
+33 nonzero strict-reference rows remain independent. These comparisons include
+overlapping paths, not a global census. Full current6548 NOT_RUN and global
+remaining UNKNOWN. No tolerances, WPT or assertions are weakened. Changes are
+local/uncommitted/unpushed; parent pin remains untouched. The root size gate
+retains six outside-vendor violations, with no baseline increase. Generic UA
+and layout changes have no Product Agent knowledge/authority impact.
+
+## 2026-10-09 bordered-inline causal baseline and hidden source advance RED
+
+V3392 records a controlled pre-border production baseline: only this batch's
+line-metrics and resolved-border paint changes were temporarily removed;
+fixtures and other dirty changes remained. V3388 reproduces the three expanded
+runtime failures with exactly the same assertions as restored V3390. They
+predate this border batch, but their earlier origin remains unproven and none
+is waived. The two new border fixtures independently fail on that baseline
+and pass after exact file-byte restoration. Ten internal failures remain open.
+
+V3394/V3395 compare original position-relative-032-ref native layout and
+Chrome155 Text Ranges. The second source starts at87.9375 versus87.921875;
+the third at171.0625 versus171.03125. Generated no-break wrappers split an
+authored source's fractional advances. V3396 uses a different explicit generic
+font context and is fixture setup evidence, not the target RED. V3397 retains
+the original UA font context and reproduces exactly these LayoutUnit offsets.
+The local candidate permits ordinary transparent no-break words, not only
+generated quote words, to participate in authored-source advance recovery.
+V3398 passes the new fixture and both border controls. V3399 retains151/154
+runtime passes and the same three failures; V3402 retains the other five runtime
+failures. Runner rebuild2m12s; V3400 original032 reference148 ->0 and the
+adjacent family8/8 browser-exact. V3404 nowrap9/9 and V3408 counters23/23
+remain exact. V3406's historical twelve-case window remains9/12; the three
+open gaps are c414-flt-fit-006, floats-wrap-bfc-outside-001 and
+margin-collapse-min-height-001. The immutable local checkpoint is
+`target/wpt-targeted/baseline-font-position-20261003/hidden-inline-checkpoint-v3410.json`;
+it binds all four fresh pixel scopes and runtime receipts to source57a6c9a0
+and runner17630d79. Strict reference differences remain independently recorded,
+including browser-exact tests and mismatch relations. Older scopes are not
+silently promoted to proof for this changed source.
+
+No WPT, assertion tolerance, parent pin or publication changes. Full current
+6548 NOT_RUN and global remaining UNKNOWN. Root size check still reports six
+outside-vendor violations; baseline unchanged. This generic layout work has
+no Product Agent knowledge/authority impact.
+
+## 2026-10-09 bordered relative inline: browser geometry and border origin repaired locally
+
+V3334/V3335 show position-relative-033's horizontal geometry already matches
+Chrome155, but the native Ahem font/border boxes are1px too high. V3336-3338
+are fixture setup failures, not target RED: the inert parser does not install
+the stylesheet rules. The equivalent inline-style fixture produces genuine
+V3339 RED (border top6 versus7). Shared line metrics now admit bordered inline
+containers and horizontally displaced relative text, using undisplaced source
+coordinates for line membership while retaining displaced paint coordinates.
+Borders decorate the principal font box rather than enlarging the line strut.
+
+V3340 passes the parsed fixture and20 line-metrics tests. V3346 improves the
+original actual/reference1458 ->484; V3348 confirms layout now matches the
+browser. V3349 independently reproduces the renderer's second failure: its
+decoration union snaps the resolved border from y75/h24 to parent y76/h23.
+Single-line font/edge boxes now retain their own paint geometry; larger
+multiline principal rectangles keep continuation unioning. V3378 clears033
+actual/reference484 ->0, and7/8 adjacent cases are browser-exact. Only032's
+reference retains148 pixels. Historical V2287 already recorded a032 reference
+gap on Chrome141 (48 pixels), which is not a same-browser current baseline
+and cannot alone establish present regression causality.
+
+V3350's twelve-case window improves8 ->9 exact. Remaining c414-flt-fit-006,
+floats-wrap-bfc-outside-001 and margin-collapse-min-height-001 differences stay
+2144/2144,1968/2480 and1568/1568 respectively. V3352 counters23/23, V3354
+nowrap9/9, V3356 controls16/16, V3358 primary6/6, V3360 inheritance4/4, V3362
+language5/5 and V3364 historical12/12 remain exact. Runner rebuild2m49s.
+`target/wpt-targeted/baseline-font-position-20261003/relative-inline-checkpoint-v3386.json`
+binds source376ecd59 against cff504d and runner64a8267d to95 scoped comparisons
+and50 independently retained nonzero strict-reference rows. Full current6548
+NOT_RUN; global remaining UNKNOWN; scoped gaps are not a global census.
+
+V3375's expanded154 runtime executions have151 passes and three failures:
+shrink_wrapped_inline_block_keeps_adjacent_fractional_width_atoms_on_one_row,
+wrapped_inline_lines_stay_at_block_start_in_a_fixed_height_container, and
+borderless_inline_container_background_covers_the_line_band. Their causal
+baseline is not yet established; they remain open, not waived or asserted to
+be introduced by this repair. V3376 retains the earlier five runtime failures;
+V3381 DOM87 passes, V3382 retains two DOM failures. Next: isolate the expanded
+three-test baseline, then continue the four scoped browser gaps (including032).
+All changes remain local/uncommitted/unpushed; parent pin, WPT and tolerances
+unchanged. Root size gate retains six outside-vendor violations, baseline
+unchanged. Generic rendering has no Product Agent knowledge/authority impact.
+
+## 2026-10-09 counters: browser scope and generated square gaps cleared locally
+
+V3306 remeasures all23 fixed-suite generated-content counter cases:19 exact,
+four browser gaps. V3308 Chrome155 DOMSnapshot independently proves a child's
+counter-reset shadows an inherited parent instance only within that subtree;
+following siblings resume the parent's counter. A genuinely new counter with
+no inherited instance still continues across siblings. V3309 preserves RED.
+The traversal now exports only newly created sibling counter names, preserving
+parent instances. V3310 measures original content-counter-004's generated
+square text as U+25A0; V3312 preserves the U+25AA versus U+25A0 RED. Only
+generated counter formatting changes; the default list-marker path is untouched.
+
+V3313 passes87 DOM executions; V3314 passes115 runtime executions. V3315/V3333
+retain the same five runtime and two DOM failures without expectation changes.
+DOM rebuild28.36s, runtime38.70s, runner2m15s. V3316 is23/23 browser-exact:
+content-counter-004/006/007/008 actual1800/372/2961/4019 ->0, references remain0.
+Native/reference differences are retained at1800/586/3221/4523 respectively,
+matching the browser's strict differences rather than waiving those outcomes.
+
+V3318's twelve-case window improves6 ->8 exact; four remaining browser gaps
+are unchanged: c414-flt-fit-006 actual/ref2144, floats-wrap-bfc-outside-001
+actual1968/ref2480, margin-collapse-min-height-001 actual/ref1568, and
+position-relative-033 actual/ref1458. V3320 inheritance4/4, V3322 nowrap9/9,
+V3324 language5/5, V3326 controls16/16, V3328 primary6/6 and V3330 historical12/12
+remain exact. `target/wpt-targeted/baseline-font-position-20261003/counter-checkpoint-v3332.json`
+binds frozen source afe449c1 against cff504d and runner fc31881d to87 scoped
+comparisons; all46 nonzero strict-reference rows remain separate, including
+duplicate paths and mismatch relations. These scopes are not a full census.
+Full current6548 NOT_RUN; global remaining UNKNOWN. Counter changes remain
+local uncommitted/unpushed; parent pin, WPT and tolerances unchanged. Root size
+gate retains six unrelated outside-vendor violations, baseline unchanged.
+Generic counter rendering has no Product Agent knowledge/authority impact.
+
 ## 2026-10-09 publication scope: accepted nowrap, language and padding repairs
 
 The staged production/test patch exactly matches the accepted V3304 source
@@ -24528,3 +25381,3483 @@ recorded even where native/browser pixels match. Full 6,548 cases NOT_RUN for
 this checkpoint; current global remaining count UNKNOWN. Next: source-bound
 runner build, nine original border cases, then bidi and relevant controls.
 Product Agent knowledge unaffected: generic text/raster behavior only.
+
+### 2026-10-10 currentColor inline fragmentation checkpoint (V3704-V3710)
+
+Pinned WPT revision remains `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+All receipts below live in `target/wpt-targeted/baseline-font-position-20261003/`.
+The completed V3694 census has 6,548 native cases (5,654 PASS / 894 FAIL),
+6,178 browser comparisons (6,054 exact / 116 gaps / 8 resource-protocol
+unverified), and 1,783 separately retained strict-reference difference rows.
+These are distinct counts, not additive failures or full closure.
+
+The nested text sizing candidate V3701 increased border-color-012 from 1,520
+to 1,750 differing pixels and has been removed without reverting unrelated
+dirty edits. V3704 checks the baseline after that removal: the two adjacent
+runtime failures `normal_inline_inside_pre_block_can_wrap_after_a_full_line`
+and `nowrap_inline_siblings_wrap_without_an_extra_line_gap` remain failures,
+as does the new raw-component nested normal-inline wrapping regression.
+They are unresolved and not attributed to the removed sizing candidate.
+
+DOM fragmentation previously rejected every currentColor border. V3705 is
+the minimal RED for same-color text failing to expose line break fragments.
+The new guard permits fragmentation only when all leaves retain the owner's
+color; differently colored descendants preserve the decorated wrapper.
+V3706 passes four targeted DOM checks. V3709 executes 54 directed tests,
+all passing, including 51 border tests and three inline fragmentation checks.
+The same-source WPT runner rebuild completes in 2m18s.
+
+V3707 original pinned tests and fresh Chrome comparison retain strict rows:
+
+| Original test | Native/browser actual pixels | Browser strict pixels | Native strict pixels |
+| --- | ---: | ---: | ---: |
+| border-color-010 | 0 | 8,063 | 8,063 |
+| border-color-011 | 0 | 0 | 0 |
+| border-color-012 | 1,177 | 0 | 1,177 |
+
+V3708 binds the three-case browser receipt and exact source/runner hashes.
+012's borders and wrapping now match visually, but the remaining difference
+is glyph ink in bounds [155,12,780,28], max channel difference 73. This is
+still RED, not a pixel pass. V3710 retains the new headless layout diagnostic.
+Next investigate decorated generated word pieces in `inline_shaping::build`:
+the plain-word classifier excludes their borders, preventing shared glyph
+positions. Any shaping extension must also preserve independently painted
+border fragments; the shaped-fragment replay branch currently bypasses the
+ordinary text decoration path. Do not accept glyph sharing that loses borders.
+
+No new full rerun, commit or push. The latest verified browser-gap count
+remains 116, plus eight unverified resources. Product Agent knowledge is
+unaffected because these changes concern generic DOM/raster internals only.
+
+### 2026-10-10 decorated inline glyph closure (V3711-V3723)
+
+V3711 is the minimal runtime RED: three generated bordered pieces do not
+enter a shared glyph plan. Shaping now ignores generated paint-only border
+slice widths for eligibility/style comparison while preserving source identity,
+contiguous resolved line geometry, and the existing cluster-safety validation.
+Glyph origins use content boxes; border replay still paints each edge box.
+The layout classifier is unchanged. V3713 passes 12 directed runtime checks;
+V3716 passes nine additional directed checks (overlapping filters, not a
+disjoint full runtime census). V3712 remains a failed candidate receipt: its
+border sample used a transparent default border color before correcting the
+fixture to a visible green border.
+
+V3714/V3715 first confirm border-color-012 at zero native/browser pixels.
+The stronger underline scope test is RED in V3717 because the shared span
+includes the logical border edges. Shared decoration extents and replay
+baselines now use the content boxes consistently. V3718 passes 25 checks:
+eight shared shaping, eight text-decoration, and nine related inline paints.
+The final source-bound runner build completes in 1m54s, with existing warnings.
+
+V3719/V3720 confirm all three original border cases browser-exact. V3722/V3723
+extend that qualification to text-decoration-applies-to-001/002/005/006:
+all seven browser actual/reference comparisons have zero differing pixels,
+with no resource or comparison-unverified rows. Six native strict cases pass;
+border-color-010 retains 8,063 native/reference and browser/reference pixels
+as a separate strict failure, unchanged from baseline. No waiver.
+
+The structured incremental queue `browser-pending-v3721.json` removes only
+the proven border-color-012 from V3694's known browser gaps: 115 pending
+browser-gap paths plus eight resource-protocol-unverified paths remain.
+This is an incremental known-failure count, not a fresh complete-source census.
+No new 6,548-case full run, commit, or push. The unrelated raw-component
+nested wrapping RED and the two baseline runtime failures remain unresolved.
+Next batch: the 14 known border-top/bottom-width cases with matching 212-pixel
+native/browser differences in both actual and reference, then border-width-011
+and border-width-012. Product Agent knowledge remains unaffected.
+
+### 2026-10-10 authored border-source layout closure (V3724-V3738)
+
+V3724/V3725 recheck the 14 known border-top/bottom-width cases on the current
+candidate: each remains browser RED at 104 pixels (old V3694 was 212), while
+native/reference and browser/reference are exact. V3726 is the new layout
+RED: generated border words are excluded from shared advance measurement.
+Layout now uses the same generated-edge normalization as paint shaping, with
+the original box edges retained separately. V3727 passes 18 directed checks.
+
+V3728/V3729 qualify 21 pinned originals: seven existing controls remain
+browser-exact, the 14 targets fall to three pixels each. The remaining pixels
+are a single three-pixel border column at x244, not glyph ink. V3731/V3732
+retain layout diagnostics: first source width is 231.16774, second start
+244.49586. V3738 independently reads Chrome155 DOM geometry: first span width
+231.171875 and second span start244.5. V3733 is the strengthened source-end
+LayoutUnit RED. Quantization now applies when an authored source ends, without
+rounding its internal glyph positions. V3734 passes 18 directed checks.
+
+Final source-bound runner build completes in 1m55s. V3735/V3736 qualify all
+21 originals browser-exact, with zero actual/reference native-browser pixels
+and no resource/comparison-unverified rows. Twenty native strict cases pass;
+border-color-010 retains its independent 8,063 strict pixels unchanged.
+`browser-pending-v3737.json` binds the incremental known-failure queue:
+101 browser-gap paths plus eight resource-protocol-unverified paths remain.
+No new full 6,548 run, commit, or push. Product Agent knowledge is unaffected.
+
+Next inspect horizontal edge accounting for generated border-box pieces before
+widening layout qualification (NOT_RUN). Then repair border-width-011/012:
+V3738 proves Chrome155 computes parent none/hidden width0 but child inherited
+solid width32; the Chromium141 zero-inheritance test is not a current oracle.
+Do not waive the original pinned fixtures or change tests without new RED.
+
+### 2026-10-10 border-box guard and retained inheritance (V3739-V3749)
+
+V3739 is a real layout RED: shared measurement omits the horizontal logical
+border edges of generated border-box words. Shared used widths now add those
+edges for border-box sizing while keeping content-box advances unchanged.
+The first V3740 attempt was rejected by the source-drift guard after a DOM
+test was added; it generated no receipt and is not a passing execution.
+The frozen V3740 replay passes 18 checks. Final-source V3749 also passes
+those 18 runtime checks after the inheritance change.
+
+V3743 records the new DOM RED for a none/hidden parent: the solid child gets
+zero instead of the retained32px length; its different font size must not
+re-resolve the inherited2em. The fresh source-bound runner build (1m59s) and
+V3741/V3742 original pinned tests reproduce 52,153 native/browser and native
+strict pixels in each of border-width-011 and border-width-012, with zero
+reference-native/browser and browser strict differences.
+
+V3748 independently probes Chrome155's computed-style behavior: none/hidden
+parent used0, solid child32; hidden medium child3; none intermediate used0
+but solid grandchild32; relative hidden left12em at20px passes240px; a32px
+child font retains the parent's absolute32px rather than recomputing64px.
+Inheritance now copies the retained absolute widths, leaving used widths
+conditional on the receiving element's line style. Three Chromium141-based
+unit expectations are explicitly replaced using this current browser proof,
+not weakened to accept zero and nonzero. V3744 passes 53 DOM checks.
+
+Final source-bound runner rebuild takes1m58s. V3745/V3746 qualify23 pinned
+original cases, all browser-exact; both new inheritance targets and all21
+prior controls have zero actual/reference native-browser differences. Native
+strict is22 PASS/1 FAIL: border-color-010's separate8,063px strict failure is
+retained, not waived. No resource or comparison-unverified rows in this scope.
+The incremental queue `browser-pending-v3747.json` now has99 known browser
+gaps plus8 resource-protocol-unverified paths; untested baseline rows are not
+current-source passing proof. No full6,548 rerun, commit, or push.
+
+Next batch: first-letter dynamic/punctuation failures in the selectors queue.
+The previously documented raw nested-inline wrapping RED and two baseline
+runtime failures remain unresolved. Product Agent knowledge is unaffected:
+these changes concern generic layout and CSS inheritance only.
+
+### First-letter source-boundary browser parity (V3750–V3760)
+
+Fixed revision `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`;
+HEAD `cff504d09b617d6aea0c43c3da83387fee999a61`, existing dirty tree preserved.
+V3750/V3751 freshly reproduced all19 selectors browser gaps. Quote002–005
+each differed by52 pixels: Chrome155 colors the punctuation-only first source
+fragment, but not the following source's T. The strict reference colors both.
+Both captures and strict comparisons are retained, not rewritten or waived.
+
+New DOM RED `first_letter_does_not_extend_a_punctuation_only_text_fragment`
+covers adjacent authored text nodes and generated before-content. V3752 failed;
+the initial candidate V3753 still failed because the text-only fast path lost
+authored boundaries before pseudo styling. That fast path now retains existing
+`FRAGMENT_ENDS` metadata (including whitespace-collapse offsets), and first-letter
+lowering stops at the first nonempty source fragment. Same-source quote+letter
+behavior remains covered by the original quote001 browser control.
+
+V3754 first-letter units:6/6 PASS. V3757 is INVALID_EMPTY_SELECTION and is not
+accepted as a green receipt; corrected V3758 has18 directed DOM executions PASS
+(coalescing, generated before/inline content, passive inline handling).
+Runner build completed in1m58s; `git diff --check` passed. Root file-size check
+retains the same6 unrelated violations outside vendor; no baseline increase.
+
+V3755/V3756 checks44 original cases:29 BROWSER_PIXEL_EXACT /15 BROWSER_PIXEL_GAP,
+zero resource/comparison-unverified rows. Quote002–005 are now actual/reference
+native-browser exact; all23 previous border/decoration controls remain exact.
+The four quote strict failures remain52px each in both native and Chrome155;
+border-color-010 remains8,063px in both. These5 strict failures are retained.
+Dynamic001 improved106→20px, but is not cleared; dynamic002 and13 punctuation
+cases remain browser gaps. Punctuation test/reference agree within each engine,
+so their remaining work belongs to shared text rendering rather than selection.
+
+V3759 produces incremental queue `browser-pending-v3760.json`:95 known browser
+gaps plus8 resource-protocol-unverified paths (21 cleared since V3694). This is
+not a current-source full-suite passing census. No full6,548 rerun, commit or
+push. Existing raw nested-inline and two baseline runtime REDs remain unresolved.
+Next entry: dynamic001's20px residual and shared punctuation fallback/shaping.
+Product Agent knowledge is unaffected by these generic text-lowering internals.
+
+### Default quote glyph parity (V3761–V3766)
+
+Same fixed WPT revision and HEAD as V3760; existing dirty changes preserved.
+The current dynamic002 RED in V3755/V3756 is313px on actual and reference:
+native renders ASCII `"Foo"`, Chrome155 renders typographic `“Foo”`; the authored
+`<1>0</1>` second paragraph already agrees. The default quote pair fallback now
+uses `“…”` / `‘…’`. Explicit author pairs and quote-depth accounting are unchanged.
+This proves the tested default/English context, not full language-dependent
+`quotes:auto` coverage.
+
+V3761 preserves the default-glyph unit RED. The nested fixture initially used
+element-local fallback text; it was corrected to an authored text node, matching
+the original WPT DOM path. No fallback-text production behavior was changed or
+claimed fixed. V3762 executes10 quote-related plus6 first-letter checks, all PASS,
+including nested default depth and inherited author override. The old ASCII
+expectation in `q_uses_generated_quote_content_and_authored_quote_pairs` was
+updated against the actual/reference Chrome155 captures, not to waive a RED.
+
+Runner build completed in1m58s. V3763/V3764 checks59 pinned original cases
+(prior44 plus15 quote controls):45 BROWSER_PIXEL_EXACT /14 BROWSER_PIXEL_GAP,
+zero resource/comparison-unverified rows. Dynamic002 is now exact on both
+actual/reference captures, with native/browser strict0px. Previous border,
+decoration and quote002–005 browser controls remain exact. Strict8 rows are
+retained: border-color-0108,063px; quote002–00552px each; quotes-035/035a419px each;
+quotes-0363,446px. Native and Chrome155 agree on these strict differences;
+no reference or fixture was changed.
+
+V3765 produces `browser-pending-v3766.json`:94 known browser gaps plus8 resource
+protocol-unverified paths,22 cleared since V3694. Dynamic001 remains20px, and
+the13 punctuation gaps remain unchanged. `git diff --check` passed. Root size
+check still has6 unrelated outside-vendor violations, baseline unchanged.
+No full6,548 rerun, commit or push; no whole-source green census claimed.
+Next entry: punctuation-only first-letter eligibility in dynamic001, then
+shared punctuation shaping/font fallback. Product Agent knowledge is unchanged.
+
+### First-letter Unicode eligibility and grapheme boundaries (V3767–V3775)
+
+Same pinned revision/HEAD, dirty worktree preserved. Dynamic001's remaining20px
+was the opening quote on a punctuation-only empty paragraph, incorrectly green
+in native. Chrome155 diagnostic V3767 compares pseudo-enabled vs disabled
+captures: quotes, guillemets, periods and U+0387 remain black; dash, underscore,
+currency and text symbols can generate a first letter. V3768 confirms5 synthetic
+actual/reference pairs exactly: `$T`, `-T`, `_T`, sun+T, A+combining-diaeresis+B.
+These diagnostics are distinct from pinned WPT acceptance.
+
+V3769 stores two RED units for punctuation-only eligibility and nonpunctuation
+grapheme boundaries. Lowering now uses Unicode Ps/Pe/Pi/Pf/Po rather than treating
+every nonalphanumeric character as surrounding punctuation. It requires a
+typographic unit in the in-flow first line and extracts complete grapheme clusters,
+retaining the source-boundary semantics from V3755. DOM adds exact direct versions
+of already-resolved `unicode-properties=0.1.4` (general-category only) and
+`unicode-segmentation=1.13.3`; no dependency version was upgraded. Focused binding
+also records Cargo.lock/DOM-manifest hashes and checks them for drift.
+
+V3770:19 directed executions PASS (8 first-letter,1 punctuation-only,10 quote;
+the punctuation unit is deliberately repeated). Runner build1m58s. V3771/V3772:
+59 pinned originals,46 BROWSER_PIXEL_EXACT /13 BROWSER_PIXEL_GAP, zero unverified
+rows. Dynamic001 is now0px on both actual/reference native-browser comparisons
+and both strict comparisons. All prior controls remain browser-exact. The same8
+strict rows from V3764 are retained, not waived. V3773 produces incremental queue
+`browser-pending-v3774.json`:93 known browser gaps +8 resource-protocol-unverified
+paths,23 cleared since V3694. Broader first-letter coverage and the full6,548
+current-source corpus remain unverified; no full rerun, commit or push.
+
+V3775's explicit-font Chrome155 CDP diagnostic confirms PingFang SC supplies one
+glyph with18px advance for U+0387 and36px for U+232A, matching their canonical
+counterparts' widths. These are font-selection leads, not native repair proof.
+Next entry: broader first-letter regression, then native nominal-cmap vs shaped
+coverage before fallback. The13 punctuation browser gaps remain RED.
+`git diff --check` passed; root size check retains6 unrelated outside-vendor
+violations without raising baseline. Product Agent knowledge is unchanged.
+
+### Canonical single-glyph coverage before font fallback (V3776–V3784)
+
+Fixed revision/HEAD unchanged; only vendor changes, existing dirty state preserved.
+Before changing font coverage, V3776/V3777 revalidates all369 pinned
+`selectors/first-letter-*` cases plus37 previous controls (406 total):393 browser
+exact /13 known gaps, no unverified rows. Native strict397 PASS/9 FAIL. The added
+selector-028 strict row is1px in both native and Chrome155, unchanged from V3694;
+all strict differences remain separate, not waived. This closes the previous
+broader first-letter-regression evidence gap, not full-suite acceptance.
+
+New runtime RED `font_fallback_retains_single_glyph_canonical_coverage` is stored
+in V3778. PingFang SC lacks the nominal U+0387 cmap entry but already shapes it
+to the existing U+00B7 glyph with18px advance. The old multi-glyph-only check
+incorrectly selected Helvetica. U+232A likewise shapes to U+3009 at36px. The
+coverage probe now accepts a nonzero single non-space shaped glyph, while still
+excluding missing glyphs and single synthetic-space fallback. No source text,
+clusters, CSS or WPT fixture was rewritten; normal nominal-cmap/cache paths stay
+unchanged. V3779:11 targeted runtime tests PASS, covering canonical aliases,
+multi-glyph decomposition, RTL fallback, shared glyph slices and fallback metrics.
+
+Runner build1m55s. V3780/V3781 repeats the same406 originals:395 browser exact /
+11 gaps, zero unverified rows. Punctuation010 and106 are0px for actual/reference
+native-browser and both strict comparisons. There are no new browser gaps vs
+V3777. The369 first-letter subset is358 exact/11 gap. Native strict remains
+397 PASS/9 FAIL; those9 strict rows are retained. V3782 produces incremental
+queue `browser-pending-v3783.json`:91 known browser gaps +8 resource-protocol
+unverified paths,25 cleared since V3694. No full6,548 rerun, commit or push.
+
+V3784 stores explicit-font Chrome155 diagnostics for the remaining punctuation:
+Geeza Pro for U+060D/U+061F, Noto Sans Syriac for U+0708–070A, Noto Sans Kharoshthi
+for the selected U+10A5x characters, with measured advances. This is diagnostic
+evidence only, not a native repair. Next entry: compare native fallback families,
+advances and completed font/style-run origins against those records before
+altering snapping. Existing raw nested-inline and baseline runtime REDs remain.
+`git diff --check` passed; root size gate still reports6 unrelated outside-vendor
+violations with no baseline increase. Product Agent knowledge is unaffected.
+
+### Same-source bidi shaping boundaries (V3785–V3798)
+
+Fixed WPT revision and HEAD unchanged; dirty vendor state preserved. V3785 browser
+prefix geometry and V3786 native fallback-family/advance diagnostics agree for
+the eleven remaining first-letter punctuation characters. Actual component layout
+V3787/V3788 remains RED: same-source transparent coalescing erases the directional
+segment ends, while the visual-order marker correctly prevents a second bidi pass.
+V3789 extends the existing DOM boundary unit with same-source input and records
+RED. The repair retains fragment ends at LTR/RTL parity transitions without
+rewriting source text or disabling ordinary contextual shaping. V3790 has two
+directed DOM tests PASS; V3791 has the eleven-character actual-layout regression
+and fallback-font regression PASS. V3794: bidi 18/21 PASS, coalescing 9/9 PASS;
+the three other bidi unit REDs are retained pending pre-candidate reproduction.
+
+V3792/V3793 first candidate: 404/406 browser exact, original eleven gaps cleared
+but punctuation126/127 newly fail at46 pixels each. Equal-direction levels must
+not create a rounding boundary. The revised parity-only condition is verified in
+V3795/V3796 on the identical406 original cases:406 BROWSER_PIXEL_EXACT, zero gaps
+or unverified rows. All369 first-letter cases are browser exact. The nine strict
+reference rows remain separate and unwaived; this is not strict-suite closure.
+Both runner builds completed successfully (1m57s,1m59s). V3797 updates the queue
+in `browser-pending-v3798.json`:80 known browser gaps +8 resource-protocol-unverified
+paths,36 cleared since V3694. No full6,548 census, commit or push. Next entry:
+pre-candidate reproduction of the three bidi unit REDs, then the next known pixel
+failure batch. `git diff --check` passed; root size gate's six outside-vendor
+violations remain unrelated. Generic renderer work does not alter Product Agent
+concepts, authority or tools, so no derived product knowledge change is needed.
+
+V3799 temporarily removes only the parity-boundary candidate and reproduces the
+same three existing bidi unit failures (identical actual/expected values); the
+new same-source boundary unit also returns RED. Candidate restored byte-for-byte:
+tracked source diff matches V3795 binding. V3800 confirms the repaired boundary
+unit PASS, bidi18/21 and coalescing9/9; the three existing unit failures remain
+listed, not waived or attributed to this candidate. V3801/V3802 starts the next
+batch with all27 pinned background-root cases:26 browser exact/1 gap, no resource
+or comparison-unverified rows. background-root-016 reproduces1380 pixels with
+maximum channel difference1 on actual and reference; both strict comparisons
+remain0px. PNG inspection finds an indexed17x17 tile with palette128/255 and no
+gamma/ICC chunks, narrowing the next investigation to fractional repeat-image
+sampling/rounding rather than root box placement. No image candidate applied,
+no queue decrement, full census, commit or push. Next entry: shared raster image
+sampling RED and browser/native half-pixel color evidence before changing paint.
+
+V3803–V3809 correct the direction of the color diagnostic above: the comparator's
+array ordering must not be inferred from its field name. Raw PNG audit V3809
+decodes the immutable V3801 browser/native captures independently, preserving
+their hashes: browser RGB191, native RGB192 (not the reverse). V3803's synthetic
+2x1 CSS repeated image gives browser191 at half phase; V3805–V3808 use the original
+17x17 indexed PNG, canvas reencoding,800x600 viewport and root margins/borders;
+all likewise give191. No ICC/gamma chunks are present in the original tile or
+the captures. This rules out changing the global expected midpoint to192. A
+temporary unexecuted unit expectation change was restored; there is no new
+production candidate. The recently built runtime unit binary contains that
+discarded expectation and must be rebuilt before further use. Next investigation
+is native17x17 float image sampling versus its existing2x1 midpoint test, not
+browser decoding or a relaxed comparison. Known queue remains80+8; no commit/push.
+
+### Translation versus scaled raster sampling (V3810–V3815)
+
+V3810 adds the shared17x17 centered-repeat RED and also revalidates the existing
+2x1 midpoint test: both native192/browser191. Transparent premultiplication and
+non-repeating edge snapping controls PASS. The candidate selects the ordinary
+premultiplied-byte representation for pure translation at intrinsic raster size,
+retaining the float representation for resizing or a non-translation canvas
+matrix. It changes no decoded pixels, dimensions, WPT resources or tolerance.
+Texture cache keys include the representation and invalidation removes both
+variants; the bounded cache and reuse counters remain active.
+
+V3811:6 directed runtime tests PASS, including both midpoint REDs, the existing
+anisotropic scaling253 sample, transparent data immutability, crisp non-repeating
+images and texture reuse. Runner build succeeds in1m57s. V3812/V3813 runs all27
+pinned background-root originals plus the previous image-sampling scopes (98
+unique cases):98 BROWSER_PIXEL_EXACT, zero gaps or unverified rows. Root016 is0px
+on actual/reference and strict comparisons, down from1380px; c414-flt-fit-006
+stays browser exact. The38 strict-reference difference rows in this scope are
+retained, not waived. V3814 merges focused evidence with the prior incremental
+queue rather than resurrecting previously cleared paths: `browser-pending-v3815.json`
+has79 known browser gaps +8 resource-protocol-unverified,37 cleared since V3694.
+No full6,548 census, commit or push. Root size gate retains the same six unrelated
+outside-vendor violations; no baseline increase. Product Agent knowledge is
+unaffected by generic raster sampling. Next entry: cache-variant invalidation
+and transformed-image controls, then next known browser failure batch.
+
+V3816 closes the sampling-cache follow-up:6 directed runtime tests PASS. The new
+unit proves distinct Premul/Unpremul texture reuse, invalidation of both variants,
+decoded-data immutability, and selection by canvas scaling even at intrinsic CSS
+size. Existing midpoint, anisotropic253, transparency and crisp-image controls
+remain green. Runner rebuilt successfully in1m57s. V3817/V3818 revalidates all10
+pinned specificity cases:10 browser exact and strict exact, including the old
+specificity-011 gap. No selector or text production change was needed; this is
+new verification of an earlier repair, not a newly attributed cascade fix.
+V3819 merges this evidence into `browser-pending-v3820.json`:78 known browser gaps
++8 resources,38 cleared since V3694. The updater's initial output filename collided
+with an existing immutable receipt and was rejected by `wx`; its destination was
+corrected to a new version, preserving the previous receipt.
+
+V3821/V3822 revalidates all29 pinned box-display/block-in-inline cases:25 exact,
+4 RED, no unverified rows. Actual/reference native-browser pixels respectively:
+00166/0,00266/0,007599/0,relpos0022/0. Strict differences remain separate: browser
+001/00266px while native0;007 browser0/native599;relpos002 browser63/native62.
+The001/002 gap is a3x22 strip atx56..58/y59..80, pointing to inline decoration
+extent inside the first table cell rather than selector precedence.007 spans
+left-column letter ink only; font/line metrics need actual-tree inspection.
+No layout candidate applied, no further queue decrement or full census. Next
+entry: focused DOM/layout evidence for those inline fragments and inherited
+monospace metrics. No WPT edits, tolerance change, commit or push.
+
+### Passive split-inline decoration (V3823–V3832)
+
+V3823/V3824 revalidates001 and007 RED; parent-worker stderr contains only progress,
+so it is not layout evidence. V3825 invokes the same binary's isolated render
+worker directly and retains full bound diagnostics.001's split carrier and text
+leaf are46.265625px wide, whereas "Line 1" itself advances43.078125px; the carrier
+is a full-line Flex box marked split-inline-fragment. Its inline background must
+not fill unused line width.007's font sizes are all13px; its gap boundsx22..30
+are the right pre column, correcting the earlier left-column/font lead. Right
+pre box y76.5,height169 and text rect y75.5,height15 need further vertical-layout
+inspection; no font-size candidate is justified.
+
+V3826 records a shared painter RED for a marked full-width carrier. The candidate
+normalizes only passive split-inline carriers to inline paint semantics, retaining
+their layout rect and restricting decoration to the measured text fragment.
+V3827/V3828 each pass4 directed tests: the RED, coincident fragments, translucent
+paint-once and registered-font split-background order. Final runner build1m54s.
+V3829/V3830 repeats all29 originals:27 browser exact/2 gaps, no new browser gaps
+or unverified rows.001/002 now0px on both native-browser comparisons, but both
+native and browser strict comparisons retain66px; browser parity is prioritized,
+not mistaken for strict-reference PASS. Remaining007599px andrelpos0022px are
+unchanged. Five strict-difference rows in this family are retained separately.
+V3831 updates `browser-pending-v3832.json`:76 known browser gaps +8 resources,
+40 cleared since V3694. `git diff --check` PASS; size gate still has six unrelated
+outside-vendor violations, unchanged baseline. Generic paint semantics do not
+alter Product Agent knowledge. No full census, commit or push. Next entry:
+right-pre middle alignment/line geometry for007, then relpos002 glyph origin.
+
+### Empty trailing passive inline carrier (V3833–V3845)
+
+V3833 reads unchanged pinned007 actual/reference browser DOM geometry: the left
+outer block and right pre are both169px high, their A–G text ranges align. Native
+diagnostics instead show a182px left outer block and an empty trailing split
+carrier after G. The additional13px height moves the middle-aligned right pre
+down6.5px; this is not a font-size mismatch. V3834 records the182-vs169 RED in
+`split_inline_ending_in_block_has_no_empty_trailing_line`, covering stateless and
+cached layout paths. DOM lowering now omits an empty trailing fragment only when
+it is passive, statically positioned, and has zero horizontal used margins.
+The final guard recognizes explicit syntactic zeros and inline auto, preserving
+unresolved percentage/viewport margins rather than treating them as zero.
+
+Initial candidate V3835 passes5 directed units. V3836 completes152 native cases,
+but its browser selection incorrectly includes8 testharness cases and rejects the
+scope before acceptance. Its artifacts remain immutable. V3838/V3839 resumes only
+the144 reftests and records140 exact/4 known gaps. After tightening the margin
+guard, V3840 passes the same5 units; the final runner builds in1m56s. V3842/V3843
+repeats152 originals:8/8 native testharness PASS,144 browser comparisons with140
+exact/4 gaps and no unverified rows.007 actual/reference native-browser and both
+strict comparisons are0px, down from599 actual pixels. Remaining gaps are relpos002,
+normal-flow align001, float-between001 and insert017; all occur in the prior
+known-failure queue. Eight strict-difference rows in this scope are retained,
+not waived. No tolerance changes or WPT edits.
+
+V3844 merges final-source evidence with V3832 into `browser-pending-v3845.json`:
+75 known browser gaps +8 resource-protocol-unverified,41 cleared since V3694.
+This is an incremental queue, not a current full6,548 census. Size gate still
+reports the same six unrelated outside-vendor violations; baseline unchanged.
+Generic DOM fragmentation does not alter Product Agent knowledge. No commit or
+push. Next entry: relpos002's2px glyph-edge difference and the remaining three
+normal-flow gaps; retain existing unit REDs and strict-reference failures.
+
+### Relative inline ancestry during float placement (V3846–V3854)
+
+V3846 invokes isolated workers on both original float-between001 documents. The
+actual is already browser exact; the reference has692 differing pixels. Its
+relative inline parent is atx108 while its floated text remains atx8. Shared-BFC
+collision projection walks past inline ancestors to the containing block, but
+previously removed only the float's own relative offset when computing its
+static margin box. V3847 records a DOM-backed runtime RED: expected floatx108,
+actualx8. An existing synthetic float-exclusion unit passes because its input
+already assumes correctly displaced float rectangles; it is not end-to-end
+evidence for placement.
+
+The candidate accumulates relative offsets of intervening inline ancestors,
+removes them from collision coordinates, and retains them in subtree movement.
+V3848 passes6 directed units, including stateless/cached DOM layout, nested
+exclusion, own relative offsets, percentage margins, clearance, and007. Runner
+build succeeds in1m54s. V3849/V3850 repeats152 originals:8/8 testharness PASS,
+141/144 browser pixel exact,3 existing gaps, no unverified rows. Float-between001
+now has0px actual/reference native-browser and both strict comparisons. The
+remaining relpos0022px, align001120px and insert017314/364px gaps are unchanged.
+Seven strict-difference rows in this scope remain separately retained.
+
+V3851 merges into `browser-pending-v3852.json`:74 known browser gaps +8 resource
+paths,42 cleared since V3694; no new full census. V3853/V3854 checks7 additional
+float-positioning originals:6 browser exact,1 existing abspos-float-with-inline-
+container gap of10800px (also10800 in V3694, still in the queue), no unverified
+rows. This does not waive that remaining failure. Size gate retains the same six
+outside-vendor violations. No baseline increase, Product Agent semantic change,
+WPT modification, tolerance relaxation, commit or push. Next entry: remaining
+normal-flow and relpos gaps, plus stronger multi-ancestor/vertical-offset controls
+for this shared placement path.
+
+### Zero-width decorated continuation RED (V3855–V3859)
+
+V3855 retains isolated actual/reference render diagnostics for unchanged pinned
+insert017. Native actual body height66px has a/b at the same line; reference
+height110px allocates a22px line to the collapsible space between a/b. Browser
+V3856 DOM/range diagnostics show both documents at88px: a at y30, b at y52,
+c at y74. This is separate default-browser geometry evidence, not a replacement
+for profile-bound pixel receipts (V3849 actual314px/reference364px RED).
+
+V3857/V3858 preserve unsuccessful unit-fixture iterations: Document::new did not
+provide the parsed document's html/body hierarchy or inline span defaults, so
+those assertions did not reproduce the intended containing-block path. V3859
+uses an explicit html/body hierarchy, inline span defaults and22px line-height,
+and reproduces the actual66-vs88 RED in both layout entry paths (the first
+assertion fails before the cached path can execute). The prior float-ancestor
+and empty-tail units both remain PASS. No production candidate applied yet.
+
+Next inspect generated split-inline-edge fragments, which lack SOURCE_RUN and
+retain vertical borders; the shared shaping classifier currently rejects their
+edges, leaving zero-width word rectangles. Separately inspect the positive-width
+guards in separator collapse before extending zero-width semantics. These are
+source leads, not established fixes. Queue remains74 +8 resources; no full census,
+commit or push. Size check retains six unrelated outside-vendor violations.
+
+### Zero-width continuation repair and retained control RED (V3860–V3867)
+
+The shaping clone for generated split-inline-edge text now ignores top/bottom
+slice borders when both horizontal borders are zero; the actual paint style is
+unchanged. V3860 moves the actual fixture from66px to110px, proving the missing
+word advance was recovered but exposing the phantom separator line. Separator
+collapse now includes a zero-width containing interval. V3861 passes6 directed
+units, including the88px stateless/cached RED, prior float and empty-tail repairs,
+coincident decoration and translucent paint-once. Runner build2m37s. V3862/V3863
+repeats152 originals:8/8 testharness PASS;142/144 browser exact,2 existing gaps,
+no unverified rows. Insert017 actual/reference browser comparisons and both
+strict comparisons are0px (previously314/364 browser pixels). Remaining relpos002
+and align001 gaps are unchanged. Six strict-difference rows remain separately
+retained, not waived.
+
+V3866 supplemental units are5/6 PASS. The existing vertical-decoration-only
+separator unit fails with identical following-box/parent heights20/40 vs23/46.
+V3867 temporarily removes only this batch's two edits, rebuilds the unit binary,
+and reproduces that same failure; the new zero-width unit also returns to66-vs88
+RED. Candidate source is restored exactly to the V3862-bound hash, with untracked
+source/dependency/runner guards checked by the updater. The remaining vertical
+decoration unit is a confirmed pre-existing RED, not waived or counted as PASS.
+The most recently rebuilt unit executable is the baseline diagnostic binary;
+rebuild before using it for future candidate tests. Candidate PASS evidence is
+V3861/V3866, not that baseline binary.
+
+V3864 updates `browser-pending-v3865.json`:73 known browser gaps +8 resource
+paths,43 cleared since V3694. No new full6,548 census. `git diff --check` PASS;
+size gate still reports six unrelated outside-vendor violations. Product Agent
+knowledge is unaffected by generic inline fitting. No WPT edits, tolerance
+changes, commit or push. Next entry: retained vertical-decoration unit and the
+two remaining block-in-inline pixel gaps, followed by further known failures.
+
+### Browser-bound decorated separator diagnosis (V3868–V3871)
+
+Independent Chrome155 V3868 checks two130x20 inline images inside a130px-wide
+Arial20/20 or Times20/20 container, with no separator, vertical-only decoration,
+or1px horizontal padding. V3870 repeats with decoded inline SVG image resources
+and verifies naturalWidth130 before reading geometry. Arial is23px second-image
+top/46px container height for all three variants; Times is24/48. Horizontal
+padding preserves the2px painted span width atx130, not a third line. These are
+diagnostic CSS documents, not modified WPT originals or acceptance receipts.
+
+The historical vertical-only unit uses implicit font/normal-line-height defaults
+and expects its control's40px height; that assertion cannot replace independent
+browser geometry. It remains retained unchanged. A new explicit Arial20/20
+pure-image unit passes both stateless/cached paths (V3869/V3871), so the broad
+claim that all pure-image lines lose their containing strut is not supported.
+Initial test compilation exposed a Taffy-vs-CSS Style namespace mismatch; it was
+corrected before execution. No production change in this batch.
+
+V3871 records a new explicit CSS RED for a decorated collapsible separator:
+native second-image y40/parent60 instead of browser23/46. Its native whitespace
+rect isx0,y-11,width0,height82, whereas browser decoration stays atx130 with2px
+width. The pure-image control and prior zero-width continuation unit pass. Next
+entry is this separator's line membership/paint advance, preserving vertical
+strut semantics rather than forcing the historical40px control. Known WPT queue
+remains73 +8 resources; the new diagnostic unit is separately retained and does
+not imply an extra fixed-corpus WPT row. No full census, commit or push.
+
+### Font zero metric for CSS ch units (V3872–V3879)
+
+V3872 preserves original align001 actual/reference worker geometry; native20ch
+and10ch boxes are191.99982/95.99991px. Independent Chrome155 V3873 measures192/96
+on the unchanged documents. V3874 records the same20ch precision RED. Font units
+previously reused text shaping, including its HarfBuzz fixed-point truncation.
+The new shared zero-advance measurement uses the selected face's SkFont metric,
+keeping standard/language/fallback selection, synthetic Ahem behavior and the
+existing bounded loaded-face-aware cache. Text glyph shaping is unchanged; no
+pixel tolerance or box-coordinate epsilon was introduced.
+
+V3875 passes5 directed units: the exact192px RED, standard/language cache context,
+character spacing consistency, font-size/loaded-face invalidation and prior
+zero-width continuation. Existing font-unit oracle assertions now compare the
+font zero metric rather than shaped text advance;10px standard zero remains6px.
+Runner build2m37s. V3876/V3877 runs165 pinned originals: block-in-inline families
+plus the17 corpus documents directly declaring numeric ch lengths.11/11 native
+testharness PASS;153/154 browser exact,1 existing relpos0022px gap, no unverified
+rows. Align001 actual/reference and both strict comparisons are0px, down from120
+browser pixels.14 strict-difference rows in this expanded scope remain retained.
+
+V3878 updates `browser-pending-v3879.json`:72 known browser gaps +8 resource
+paths,44 cleared since V3694. This is still an incremental queue, not a new full
+6,548 census. Size gate retains six unrelated outside-vendor violations; baseline
+unchanged. Generic font-unit semantics do not alter Product Agent knowledge.
+No WPT edits, commit or push. Next entry: relpos002 glyph-edge origin, then the
+other known WPT families; browser-bound decorated separator RED remains separate.
+
+### Static stacking-context paint phase (V3880–V3890)
+
+V3880/V3882 retain relpos002 worker geometry and pinned Ahem outlines. A/B
+outlines are identical and unhinted; the font-raster controls pass2/2 in V3881.
+V3883 adds registered-Ahem tracing under the existing headless-layout switch:
+the failing glyph has integer origin71/101, baseline117 and identity matrix.
+Trace-only actual/reference PNG hashes remain unchanged. Different picture
+recording bounds do not cause the gap: V3884 passes3 controls, and direct/wide/
+narrow recording all produce the same shared-edge samples.
+
+V3885 records a minimal paint-order RED: a static transformed float establishes
+a stacking context but sorts in float phase2, before normal inline phase3.
+The generic repair places non-root static transform/opacity contexts in stack
+level-zero phase4; authored z-index still does not apply to a static non-flex/
+grid float. Positioned contexts retain their existing negative/zero/positive
+rules. V3886 passes5 units, including the RED, nested/fixed contexts, ordinary
+float descendants and the Ahem picture-boundary control.
+
+V3887/V3888 runs171 unchanged pinned originals: the prior block-in-inline/ch
+scope plus the full CSS2 stacking-context family.11/11 native testharness pass;
+159/160 browser comparisons are pixel-exact, with no unverified rows. Relpos002
+improves from2 to1 differing pixel at70/100; browser blue is[0,0,255,255], native
+is[8,8,247,255]. Its reference remains exact. The14 strict-reference difference
+rows remain retained, including relpos002 browser/native strict63/63; no waiver
+or tolerance adjustment. V3890 retains72 known gaps +8 resource/protocol paths.
+
+Next entry is the passive relative-inline split's paint-group ownership:
+lowering distributes relative offsets to fragments, but independently positioned
+descendants must keep their ordering relationship to the original inline owner.
+Do not erase the remaining glyph fringe by snapping/clipping or changing Ahem
+geometry. No fresh6548 census, commit or push. Size gate remains the same six
+unrelated outside-vendor violations; no baseline increase. These generic renderer
+rules do not alter Product Agent concepts or tool/authority semantics.
+
+### Passive positioned-inline fragment ownership (V3891–V3896)
+
+V3891 records the remaining ordering RED independently of raster geometry:
+the trailing fragment's phase4 ordinal3 sorts after the independently positioned
+descendant's ordinal2, although both normal fragments belong to the earlier
+auto-positioned inline owner. DOM lowering now records that private owner on
+ordinary fragments before distributing relative offsets. Authored positioned,
+transform/opacity/filter/will-change descendant contexts remain independent.
+The float's flow position and authored position are unchanged.
+
+PaintArtifact resolves the owner's earliest logical sibling ordinal after bidi
+order recovery, scoped to the component parent. Fragments share the zero-level
+owner slot while independently positioned descendants retain their own slot.
+The marker also preserves ownership when a lowered static float has zero visual
+offset; it does not manufacture a CSS position or change layout metrics.
+Initial compilation exposed a missing HashMap qualification, corrected before
+test execution. V3892 passes6 directed units including the exact ordering RED,
+the prior transformed-float repair, nested/fixed contexts, ordinary float phases
+and the direct-vs-recorded Ahem raster control.
+
+V3893/V3894 rechecks the same171 pinned originals:160/160 browser comparisons
+are now pixel-exact,11/11 native testharness pass, no unverified rows. Relpos002
+actual/reference browser gaps both reach0; browser/native strict63/63 remain
+retained alongside the other13 strict-difference rows. No glyph snapping,
+special-case coordinate, pixel tolerance or WPT modification was introduced.
+Runner build2m47s. V3895 produces `browser-pending-v3896.json`:71 known browser
+gaps +8 resource/protocol paths,45 cleared since V3694. This remains incremental
+evidence, not a fresh full6548 census. Size gate remains six unrelated outside-
+vendor violations, baseline unchanged; diff check passes. Product Agent knowledge
+is unaffected by this private renderer metadata. No commit or push.
+
+Next entry: remaining float/BFC browser gaps, with separate browser-bound
+decorated-separator unit REDs and strict-reference failures still retained.
+
+### Non-adjoining BFC margin separation (V3897–V3914)
+
+V3897 retains the original float-family RED census:98/104 browser comparisons
+exact, six gaps. The prior passive-inline repair also reverified
+float-inside-inline-between-blocks-1 as exact; V3900 therefore had70 known gaps.
+V3901 retains isolated worker geometry for all four new-fc-separates-from-float
+originals. V3902 records the new stateless/cached layout RED and the existing
+nonfitting-BFC unit RED. Testing the float band at its already-cleared final y
+incorrectly treated the BFC as fitting, allowing its margin to pull the earlier
+float down or enlarge the containing BFC.
+
+The initial band-only candidate passed the new RED but broke a min-height
+control (V3903); it was rejected. V3904 reverified that control on baseline and
+retained the separate pre-existing clearance unit RED (54 vs51.2), unchanged.
+The final repair probes the original adjoining float band and requires an
+unbroken collapse-through ancestor chain: definite positive height/min-height,
+vertical borders, used padding and preceding in-flow content interrupt it.
+Percentage/viewport padding uses the actual containing width and viewport,
+including the zero-resolved percentage case; it is not approximated as zero.
+
+V3910 passes11/11 directed units. V3911/V3912 rechecks123 unchanged pinned
+originals:17/17 native testharness pass,102/106 browser comparisons pixel-exact,
+four remaining gaps, no unverified rows and no previously exact-row regression.
+All four new-fc cases have zero actual-browser, reference-browser, browser-strict
+and native-strict differing pixels. The22 strict-difference rows in this scope
+remain retained, not waived. V3914 records66 known browser gaps +8 resource/
+protocol-unverified paths,50 cleared from the116-gap baseline. This is an
+incremental queue, not a fresh6548 census. No WPT edits or pixel tolerances.
+
+Next entry: tiny-font next-line float placement and nested multicol float
+fragmentation. V3915 isolated workers completed successfully and retain their
+geometry/PNG hashes as diagnostics, not acceptance. Size gate remains the same
+six unrelated outside-vendor violations; no baseline increase. Generic renderer
+changes do not affect Product Agent knowledge or authority semantics. No commit
+or push.
+
+### Normal text strut before a next-line float (V3915–V3922)
+
+V3915 isolates floats-placement-vertical-004: the blue float starts at16 while
+its preceding normal text box already spans8..15. V3916 browser geometry puts
+both original and reference floats at15. V3917 records the original parser/
+layout RED (next float offset8 instead of7). The generic next-line projection
+now avoids adding trailing leading again when a normal text rectangle already
+contains the full strut; glyph-box/explicit-line-height paths retain their
+leading. V3918 passes7/7 directed units, including stateless/cached original
+geometry, explicit/Ahem/same-line float controls and the four-BFC repair.
+
+Runner build2m07s. V3919/V3920 rechecks the same123 pinned originals:17/17
+native testharness pass,103/106 browser comparisons exact, three gaps, no
+unverified rows and no previously exact-row regression. Vertical004 actual/
+reference/browser-strict/native-strict differences all reach0 (previous actual
+gap200). The21 remaining strict-difference rows stay retained, not waived.
+V3922 records65 browser gaps +8 resource/protocol-unverified paths,51 cleared
+from116; no fresh full6548 census. An updater initially attempted an existing
+immutable receipt filename and was rejected by wx; corrected to new V3922,
+without overwriting V3914. No WPT modification, tolerance, commit or push.
+
+Next entry: nested multicol balancing/fragmentation. V3916 shows browser footer
+x87/y8 vs V3915 native x8/y30; the existing continuous-flow fragment-height
+resolver only enables explicit-height columns, so auto-height balancing needs
+real break opportunities and nested-context propagation, not paint translation
+of this one test. Size gate remains six unrelated outside-vendor violations;
+Product Agent knowledge is unaffected by these generic layout rules.
+
+### Auto-height nested column planning RED (V3923–V3926)
+
+This batch does not change production rendering and does not remove a queue row.
+The new nested-auto-height unit expects inner/outer fragment height22 but the
+current resolver returnsNone. Initial test compilation selected Taffy's Style
+through the parent import; it was corrected to w3cos_std::Style before execution.
+V3923 retains that RED, two passing fixed-height artifact controls, and a separate
+existing percentage-geometry unit RED (actual x14.1875/width113.625).
+
+V3924 captures five independent Chrome155 complete-line controls with source
+bytes and physical client rects.22px lines in two columns produce heights22/44/44
+for2/3/4 lines with zero margins;16px inter-block margins produce heights30/60
+for2/3 lines, with the margin discarded at the next column's top. Thus extent/
+count supplies only an initial lower bound; a height33 would cut the second
+line, and constant-height coordinate division cannot represent ragged breaks or
+discarded margins. V3925 retains two new auto-height REDs, the old percentage
+geometry RED, two passing fixed-height controls and the passing previous normal-
+strut float repair (3 pass/3 fail). Runtime unit build22.95s.
+
+V3926 binds those receipts, original486-pixel nested-multicol gap, earlier worker
+PNG hash and browser geometry to the current production diff and untracked test
+hash. Its state is ROOT_CAUSE_RED_RECORDED_NOT_REPAIRED. The next implementation
+must retain legal break offsets/margin discard, propagate nested balanced height,
+compose nested translations, and share the plan with layout principal dimensions,
+paint and hit testing. The model boundary follows
+[CSS Multicol](https://www.w3.org/TR/css-multicol-1/); browser controls determine
+the exact target in the known cross-browser-divergent original. No one-case
+paint translation or simple auto-height slicing candidate was adopted.
+
+Known browser queue remains65 +8 resource/protocol-unverified; no fresh6548 run,
+WPT edits, tolerance, commit or push. Strict-reference failures remain retained.
+Size gate still has six unrelated outside-vendor violations, baseline unchanged;
+Product Agent knowledge remains unaffected. Continue from V3926 and the two
+auto-height REDs rather than rerunning the previous float repair.
+
+### Shared column plans and physical height settlement (V3927–V3942)
+
+V3927 re-establishes the two auto-height REDs against the new flow-band API.
+The planner uses an initial continuous-flow lower bound, legal complete-line
+breaks and LayoutUnit binary search, recording nonuniform source band offsets
+for ragged columns and discarded leading margins. Nested principal heights are
+resolved bottom-up. V3928 passes five controls; V3929 separately confirms that
+Chrome's indefinite-height column-fill:auto keeps three22px lines in one66px
+column. Fixed-height auto/balance sizing remains explicit.
+
+V3930 retains a physical-fragment RED: the last line stays atx0/y44 instead of
+x158/y0. PaintArtifact now consumes real band offsets, composes nested fragment
+translations/clips and retains source identity. Its physical principal height
+and existing hit-region expansion share the plan. V3931 passes seven controls.
+V3932/V3933 synthetic-parser fixture lookups were invalid (no matching styled
+owner), not valid layout REDs; they remain archived. The equivalent typed
+component fixture isolates layout and V3934 records a valid66-vs44 height RED.
+
+Both stateless and cached paths now settle automatic column principal heights,
+following normal siblings and auto ancestors before final scroll geometry. The
+same planner feeds painting. Complete struts, not only glyph ink, protect line
+breaks; otherwise three22px Times lines would wrongly balance at42. V3935 passed
+seven controls but exposed inconsistent default1.2 text style in the earlier
+nested22px-rectangle fixture. Its font/normal-line style was corrected to the
+recorded browser16px/normal22 facts without changing expected heights. V3936
+passes9/9 controls, including physical/ragged margins, normal-flow propagation,
+nested heights, fixed-column hits and prior float/BFC repairs. A FlatNodeInfo
+type-name compile error was corrected before final compilation.
+
+Runner build2m07s. V3937/V3938 rechecks123 unchanged pinned originals:17/17
+native testharness pass,103/106 browser comparisons exact, three known gaps,
+no unverified rows and no prior-exact regression. Nested-multicol is NOT CLEARED:
+actual gap remains486; native ink bounds are86..119/y12..25, browser165..198/
+y12..25. Its physical height and vertical ink position are now aligned, but the
+text still occupies the inner second column instead of the outer next column.
+V3940 therefore keeps65 known browser gaps +8 resource/protocol-unverified.
+The21 strict-difference rows remain retained; the original's mismatch relation
+is still satisfied (both versions are nonblank), not converted into a match.
+
+V3941 isolated workers and V3942 instrumented canonical HTTP/profile browser
+capture bind the next defect. Main has two outer fragments atx8 and166. Footer
+has fragments atx87 and166; its child has a first fragment atx87/y24/height6
+after16px top margin, and a second complete22px fragment atx166/y8. Earlier
+file geometry only recorded the union bounding box atx87; it was not sufficient
+to locate the painted text. The canonical instrumentation reproduces the same
+486-pixel gap, not a changed browser target. Initial diagnostic script syntax
+errors were corrected before capture; no existing receipt was overwritten.
+
+Next entry: retain the float child's non-collapsing16px top margin and pass outer
+fragmentainer capacity into nested column layout, allowing the complete line to
+continue into the outer next column. Do not add a one-case horizontal offset.
+No fresh6548 census, WPT edit, tolerance, commit or push. Diff check passes;
+size gate remains six unrelated outside-vendor violations, baseline unchanged.
+Generic layout planning does not alter Product Agent knowledge/authority.
+
+### Floating BFC child-margin containment (V3943–V3949)
+
+V3943 retains a typed stateless/cached RED: a floating parent wrongly moved
+down16px and stayed22px tall, with its child's top margin collapsed through it.
+Taffy's block style has no float/BFC flag. The layout mapping now uses its
+non-scrolling hidden-overflow boundary for a floated block's visible x overflow
+to prevent that collapse; authored CSS overflow and paint clipping are unchanged.
+V3944 passes10/10 focused controls, including the new38px float containment
+and the preceding automatic/fixed column, hit-region and float/BFC regressions.
+
+Runner build completed in2m06s. V3945/V3946 rechecks the same123 pinned originals:
+17/17 native testharness pass and103/106 browser comparisons exact. No prior
+exact result regressed. The two CSS1 margin gaps remain11/10 pixels and nested
+multicol remains486;21 strict-difference rows are retained without waiver.
+V3948 keeps65 known browser gaps +8 resource/protocol-unverified. This is an
+incremental queue, not a new6548 census.
+
+V3949 isolated geometry confirms the float now contains the16px margin:
+footer y30/height38, child/text y46/height22. The current planner still treats
+the float/nested context as indivisible and raises outer height to38 rather
+than the canonical browser's22. The next repair must carry outer fragmentainer
+capacity into nested balancing and continue the complete text line to x166/y8;
+correcting BFC containment alone does not clear the original pixel RED.
+
+V3950 adds the canonical nested-capacity regression with unchanged browser
+expectations. After fixing the fixture's explicit Vec<PaintNode> type needed
+by collect, compilation passes and the test gives the expected RED: outer
+height38 versus22. Its later physical-line assertion requires x166/y8 and will
+be reached once height planning is repaired. The BFC containment control still
+passes. Pixel receipt V3945 predates this test-only addition; no rendering source
+changed after its capture. Continue from the V3950 RED rather than weakening
+the browser target or counting the margin control as original-case closure.
+
+No WPT modifications, tolerance change, commit or push. Root file-size gate
+retains six unrelated outside-vendor violations. Product Agent knowledge is
+unaffected by this generic layout correction.
+
+### Nested column capacity and outer continuation (V3950–V3958)
+
+V3950 retains the canonical nested-capacity RED (outer38 instead of22).
+The shared plan now evaluates nested automatic column sets under each candidate
+outer fragmentainer height. Complete line/atomic ranges determine feasibility;
+exhausted inner sets resume in outer flow rather than overflowing horizontally.
+Plan metadata records columns per set and parent continuation, consumed by the
+same physical-fragment projection for paint and hit regions.
+
+V3951 advances height to22 but retains the text-position RED (x87 instead of166).
+Its evidence identifies a missing legal boundary at the floating BFC's start:
+the child's retained margin was being skipped as ordinary inter-block space.
+The planner keeps that start, while paint distinguishes the deferred complete
+line from its block decoration's empty tail. V3952 passes11/11 controls.
+V3953 additionally checks both22px footer fragments and the child's6px empty
+tail atx87/y24 followed by its complete22px fragment atx166/y8;11/11 pass.
+Numeric-vector and closure-index inference errors were fixed before successful
+compilation; they are not layout REDs.
+
+Runner build2m38s. V3954/V3955 uses131 pinned originals, adding eight fixed-height
+multicol/clear regressions to the previous123 scope. Native testharness17/17
+pass; browser112/114 exact, two gaps, no unverified comparisons. All eight added
+controls are exact; no previous exact row regresses. The original nested-multicol
+actual and reference comparisons are both zero pixels. Its intended mismatch
+against blank remains satisfied: browser/native strict differences are both243
+with identical ink bounds165..198/y12..25. Strict differences are retained, not
+turned into matching-reference failures or waived.
+
+V3957 updates the incremental queue to64 known browser gaps +8 resource/protocol
+unverified,52 cleared from116. The remaining gaps in this focused scope are the
+CSS1 margin cases at11 and10 pixels. This is not a new6548 census. V3958 binds
+isolated geometry to the same source/runner for follow-up diagnostics.
+No WPT edits, tolerances, commit or push. Diff check passes; size gate retains
+six unrelated outside-vendor violations. Generic column fragmentation does not
+change Product Agent knowledge, product authority or business contracts.
+
+### Fractional negative-margin glyph coverage diagnostics (V3959–V3967)
+
+V3959 isolated native workers and V3960 canonical browser geometry reproduce
+the two CSS1 margin gaps at11/10 pixels. The millimeter margin becomes the
+browser LayoutUnit19.984375; final browser paragraphs start294.984375/324.984375.
+Native text painting uses294.9921875/324.9921875 after font-box centering. The
+differences are confined to overlapping glyph fringes, not broad box edges.
+CSS2 Appendix E [painting order](https://www.w3.org/TR/CSS22/zindex.html) was
+reviewed; no global phase reorder or tolerance change was adopted.
+
+V3961–V3963 primitive, folded-block and retained-frame controls produce the
+canonical single right-edge RGBA18/249/237/255. Drawing the same glyph twice
+after the background instead produces35/243/220/255, the observed browser overlap
+color. This is a diagnostic pattern, NOT proof that production duplicates a
+run. V3964/V3965 could not locate the styled negative-margin paragraph: the
+first used an HTML parser for XHTML, and the inert parser host does not install
+author stylesheets. These are invalid fixture executions, not renderer REDs.
+
+The control now uses the XML navigation parser and registers unchanged embedded
+CSS through the same compiler/owner rule API as the loader. It cleans up that
+owner before assertions. V3966/V3967 also add body/viewport artifact construction
+and table/bidi replay. The original fixture control remains single-edge exact;
+V3967 passes4/4 with registered-font, nested-column and BFC controls. Its800x340
+unit viewport does not yet prove parity with the800x600 real-navigation worker.
+Next entry at that time: compare those viewport/recording contexts, followed by the live
+navigation font registration and replay inputs. Do not infer that a generic
+background algorithm needs changing from the matching primitive control.
+
+Only test code and diagnostic artifacts changed in this batch. Original pixel
+REDs remain open, queue64 +8 resource/protocol-unverified (V3957), no fresh6548
+census, commit or push. Diff check passes; size gate retains six unrelated
+outside-vendor violations. Product Agent knowledge remains unaffected.
+
+### Negative-margin navigation controls (V3968–V3971)
+
+V3968 passes the original XML fixture at800x600. V3969 also invokes the live
+headless entry, including layout scroll details and headless scroll/clip inputs;
+the canonical right fringe remains18/249/237/255. V3970 loads the unchanged
+original XHTML and its unchanged linked Ahem CSS/font through an ephemeral
+HTTP server and DocumentLoader, waits for document.fonts.ready, and captures
+through the live headless entry. V3971 repeats that navigation with the worker's
+minimum-font preferences0/12. Both navigation controls pass.
+
+The V3971 headless replay/Ahem traces match all77 V3959 worker records after
+normalizing only debug HashMap key ordering. This excludes viewport, inert
+stylesheet setup, scroll inputs and font navigation as sufficient explanations
+of the original RED. The next entry refreshes the production runner and only
+the two original margin cases, with new source/binary bindings; no production
+paint algorithm has been changed or inferred correct from a unit control.
+
+Queue remains64 browser RED +8 resource/protocol-unverified. Strict-reference
+differences remain separately retained. No new6548 census, commit or push.
+Diff check passes; size gate again reports the same six outside-vendor
+violations. These renderer diagnostics do not change Product Agent knowledge.
+
+V3972/V3973 refresh the production runner (successful wpt build2m18s) and only
+the two unchanged original margin tests. Browser actual gaps remain11/10;
+both references are browser-exact0; strict actual/reference differences remain
+849/919 in both engines. New receipts bind the current source, untracked module,
+dependency and runner hashes. V3974 preserves the77-record diagnostic match
+as a separate receipt; it is not pixel acceptance. Thus rebuilding does not
+clear these REDs. The then-proposed production/test font comparison was
+superseded by the V3975–V3978 comparison-direction audit below. The original
+pixel failure remains the acceptance criterion, not the passing unit fixture.
+
+### Folded block paint-phase correction (V3975 onward)
+
+The comparison direction was previously misread: browser-pixels-v99 compares
+indices[0,2], where0 is browser and2 is native. Thus browser actual is
+35/243/220/255 and native is18/249/237/255 at83/295, not the reverse. Direct
+V3959 worker bytes also contain18/249/237/255. V3975 confirms that selecting the
+production intrinsic face in the test still gives18; that temporary test-only
+font candidate was restored. The earlier passing coverage fixtures prove
+interleaved rendering behavior, not browser correctness for overlapping blocks.
+
+CSS2 block decorations precede inline foregrounds. Folded decorated BlockText
+had been painted as background+text together, allowing a later paragraph's
+background to erase an earlier glyph fringe. The candidate separates those
+phases in shared Skia replay while retaining client geometry and property
+identity. Float, atomic-inline and positioned group keys are not lifted into
+the enclosing context. Existing table/bidi replay order is preserved.
+The navigation assertion now uses the actual browser double-coverage value.
+No WPT source, pixel threshold or strict-reference requirement was changed.
+
+V3976 passes5/5 focused navigation, overlap, font, nested-column and float-BFC
+controls with the separated phases. V3981 passes4/4 table replay and atomic
+float/inline-block paint controls. Production runner build succeeds2m45s.
+V3972/V3973 remain the bound pre-candidate original pixel RED11/10; the updated
+browser-valued assertion does not turn those original failures into a waiver.
+
+V3977/V3978 original regression scope passes114/114 browser exact and17/17
+native testharness controls across131 cases. Both margin cases now have actual
+and reference browser gaps0. Strict margins remain849/919 in both engines;
+the native aggregate remains113pass/18fail and21 focused strict-difference rows
+are retained, not waived. Previously exact floats and all8 multicol/clear
+controls remain exact. V3979/V3980 update the incremental known-failure queue
+to62 browser RED +8 resource/protocol-unverified,54 cleared from116.
+This is not a new6548 census. Only vendor code/diagnostics were changed; no
+WPT edits, tolerances, commit or push. Diff check passes; the size gate retains
+six unrelated outside-vendor violations. Product Agent knowledge is unaffected.
+
+### Empty list-item line and zero table-track diagnostics (V3982 onward)
+
+V3982/V3983 refresh92 original list applicability/position and generated-marker
+cases:82 browser exact,10 gaps, no resource/protocol-unverified. V3984 browser
+geometry and V3985 native workers locate the empty outside-marker discrepancy:
+atomic-inline list items are0px high natively versus22px in the browser;
+the native symbol is at86/80 instead of86/63. V3986 records a focused unit RED.
+
+The candidate retains a zero-advance/no-ink first font line for an otherwise
+empty outside-marker item, without changing its DOM text. Float blockification
+also preserves ListItem instead of erasing its marker-producing identity,
+consistent with [CSS2.2 display/position/float relationships](https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo).
+V3988/V3989 clear the four atomic-inline marker gaps and image005, but expose
+two position005/006 regressions: a resolved0px table cell has an automatic
+descendant incorrectly stretched688px. That intermediate candidate is not
+accepted as a clean batch and is not used to decrement the queue.
+
+V3990–V3992 bind fresh geometry; browser empty table principal/cell widths
+are0px, while native cell is0px but its descendant is688px. V3993 records
+the zero-track descendant unit RED784px in its isolated fixture. The table
+allocator now distinguishes a resolved nonnegative zero track from absent or
+collapsed tracks, and constrains ordinary automatic descendants at0px too.
+Authored widths and replaced/out-of-flow boxes retain their existing behavior.
+
+The isolated Document fixture has no HTML root; its browser-font assertions
+now explicitly install the HTML standard-face context, and marker offsets use
+the same exact pixel-rounding rule as projection. Earlier21px/default-font and
+absolute-document-offset assertions were fixture mismatches, not a reason to
+change the production font or add pixel tolerances. V3994 passes the zero-track
+test and three table sizing controls; its remaining marker expectation lacked
+the documented pixel snap and is corrected for the next focused receipt.
+Original WPT pixels remain the acceptance criterion. No new6548 census or
+commit/push. Product Agent knowledge is unchanged by these renderer fixes.
+
+V3999 passes11/11:8 marker controls including the new empty-font-line and
+zero-track descendants, plus3 table width/height/float-ancestor controls.
+Marker expectations use exact pixel snapping, not an epsilon or pixel waiver.
+The final production source is rebuilt before V3995/V3996 original pixel
+acceptance, which includes both margin and nested-column regression controls.
+Until those receipts finish, the last accepted queue remains V3980 at62 +8.
+
+Final production rebuild succeeds2m54s. V3995/V3996 finish95 originals with
+90 browser exact and5 unchanged known gaps. The four empty atomic-inline
+square cases and image005 are browser/strict exact. The two intermediate
+position005/006 regressions are now browser exact0. Both margin controls and
+nested multicol remain browser exact. Native total is88pass/7fail:5 current
+marker REDs plus2 retained margin strict-reference failures. No strict rows
+are waived or folded into browser exactness.
+
+V3997/V3998 bind the incremental queue to57 browser RED +8 resource/protocol
+unverified,59 cleared from116. This is not a fresh6548 census. Next marker
+entry: generated ListItem pseudo principals currently bypass marker lowering;
+outside markers beside preceding floats still anchor at the principal border
+instead of the first-line float band. Preserve32/32 and36/240/36 REDs for
+those five originals and retain the95-case controls. No commit/push or WPT
+source/tolerance changes. Diff check passes; six size-gate failures remain
+unrelated and outside vendor. Product Agent knowledge is unaffected.
+
+### Generated list-item pseudo principal (V4000 onward)
+
+V4000 records a minimal DOM RED: generated `::before`/`::after` list-item
+content was returned as a Text leaf with ListItem display, without marker
+lowering. V3995/V3996 retain the two original32-pixel browser REDs.
+The candidate constructs a principal block with anonymous inherited text or
+image runs and the shared list marker. The marker cascade starts with the
+pseudo's own declarations before its originating element and ancestors;
+explicit none suppresses the marker, while inherit preserves the origin's
+type. Principal margins do not leak into anonymous text runs. Ordinal lookup
+uses the pseudo's counter snapshot rather than the origin marker snapshot.
+
+V4001 passes13 generated-content/counter module tests, including both pseudo
+positions with explicit disc, inherited square and none. Browser pixel
+acceptance is still pending a rebuilt production runner and original WPT
+regression scope; the accepted queue remains V3998 at57 +8 until then.
+No commit/push, full6548 run or WPT source/tolerance changes. Product Agent
+knowledge is unaffected by this generic CSS box-tree change. The root size
+gate still reports six unrelated violations outside vendor.
+
+Production rebuild succeeds2m28s. V4002/V4003 bind95 original WPT tests to
+the current source, dependency inputs and runner hashes:92 browser exact,
+3 browser gaps,0 resource/protocol or comparison-unverified. Both original
+before/after-content-display-003 cases move32pixels to0, including strict
+reference equality. No old-exact regression appears in this scope. Native
+totals90pass/5fail: the remaining3 float-adjacent marker originals and2
+margin strict-reference failures retained separately. The nested multicol
+mismatch relation remains browser exact and is not a strict failure.
+
+V4004/V4005 update the incremental known queue to55 browser RED +8
+resource/protocol-unverified,61 cleared from116. This is not a new6548 census.
+Next focused entry remains list-style[-image/-type]-applies-to-017:
+36/240/36pixels, with first-line float-band marker placement rather than
+principal border-edge placement. V4003 preserves their current-source RED.
+Diff check passes; no commit/push or full-suite execution.
+
+### Outside list marker first-line float bands (V4006 onward)
+
+V4003 retains original36/240/36-pixel RED for the three list-style[-image/-type]
+applies-to-017 tests. V4006 adds a shared-layout RED: the marker has0px shift
+instead of104px beside a96px float with8px end margin. The candidate derives
+the first line's exclusion band from preceding float margin boxes in the same
+BFC, preserving the item's border-edge anchor independently of padding and
+text indentation. Hidden boxes, later floats, expired floats and separate
+formatting contexts do not contribute. Directional start/end works for RTL.
+
+The content-context lookup is shared with BFC float collision projection,
+retaining real flex/grid-item isolation and anonymous inline wrappers. V4007
+passes11 marker/BFC/band controls. V4008 then records an added relative-float
+RED: visual translation incorrectly expands the104px flow exclusion to144px.
+The corrected candidate removes relative offsets in flow coordinates and
+restores the list item's visual translation only after resolving its band.
+Percentage/font/viewport margin units use the shared spacing resolver.
+
+V4009 passes16 targeted tests:9 list marker controls,3 shared BFC collision
+controls and4 relative/float-band controls. The new matrix covers both LTR/RTL
+with sibling, nested, isolated, expired, following, hidden, relative-float and
+relative-item cases. Original browser pixel acceptance awaits the production
+rebuild and V4010/V4011 scope; V4005 at55 +8 remains the accepted queue.
+No WPT source/tolerance changes, full6548 run or commit/push. Product Agent
+knowledge is unchanged; root size gate retains six unrelated outside-vendor
+violations. Existing dirty state remains preserved.
+
+Production rebuild succeeds2m07s. V4010/V4011 extend the95 list/margin/multicol
+originals with4 new-fc isolation controls and the already-pending CSS1 c563
+circle marker diagnostic:100 originals,99 browser exact,1 gap,0 unverified.
+All three017 originals move36/240/36pixels to0 with strict equality; the four
+new-fc controls remain browser exact. Native98pass/2fail retain the two margin
+strict-reference failures. c563 still has120pixels in both actual and reference
+browser comparisons, despite native strict equality: both native circle
+markers are absent, so native-reference equality alone cannot close this RED.
+
+V4012/V4013 bind the known queue to52 browser RED +8 resource/protocol
+unverified,64 cleared from116. No full6548 census, WPT mutation or commit/push.
+The next focused entry is c563 circle marker used-border visibility; first
+preserve a DOM/used-style RED before changing the shared marker constructor.
+
+V4014 records the circle marker DOM RED: `resolve_used_border_widths()` turns
+the generated1px border into0 because CSSStyleDeclaration's initial line
+style is none. V4015 passes14 generated-content/counter controls after the
+marker constructor explicitly supplies a solid1px symbol stroke and clears
+initial zero used-edge overrides. This changes only generated circle ink,
+not authored CSS borders or list principal geometry. V4011 retains the120px
+original browser RED; pixel coverage acceptance awaits V4016/V4017 against
+the rebuilt runner. The known queue remains V4013 at52 +8 until acceptance.
+
+V4016/V4017 retain99/100 browser exact and the120px c563 gap. The marker now
+paints, but maximum channel difference is51 rather than255: legacy raster
+stroke coverage still differs from Graphite. V4018 adds a raster RED from the
+unaltered browser first circle's complete8x8 RGBA block; no tolerance or native
+reference substitution. The shared circular stroke path reuses the analytic
+round-rect mesh and admits ordinary circular interiors using Graphite's
+`opposite_insets_intersect` condition (stroke radius +2AA < circle radius).
+Complex/nonuniform unsupported geometry retains the existing fallback.
+This follows the pinned Skia `AnalyticRRectRenderStep.cpp` and fragment/vertex
+coverage source; it is not a c563-specific paint branch.
+
+V4019 passes17 runtime controls: the full browser-derived64-pixel circle block,
+3 analytic round-rect controls, filled-circle coverage,9 list marker controls
+and3 shared BFC collision controls. Final WPT acceptance still awaits the
+rebuilt V4020/V4021 original100-case scope. No full6548 run or commit/push.
+
+Final production rebuild succeeds2m23s. V4020/V4021 complete100/100 original
+browser pixel-exact comparisons,0 browser gaps and0 unverified. c563 moves
+120pixels to0 in both actual/native and reference/native browser comparisons,
+with strict equality. The three017 originals remain exact; no old-exact
+regression appears in the list/margin/multicol/new-fc scope. Native98pass/2fail
+retain only the two margin strict-reference failures (849/919pixels), and the
+multicol mismatch relation remains distinct from strict failures.
+
+V4022/V4023 bind the incremental known-failure queue to51 browser RED +8
+resource/protocol-unverified,65 cleared from116. This is not a fresh6548 run.
+This goal turn clears4 original REDs (three float-adjacent markers and c563),
+with both DOM and raster REDs and focused controls preserved. Diff check
+passes; no WPT mutation, pixel tolerance, commit/push or full-gate execution.
+Next focused entry: refresh the12 pending table-anonymous-objects originals
+on this source/runner before diagnosing dynamic table fixup and track sizing.
+
+### Anonymous table mutation reconstruction — V4024 onward
+
+V4024/V4025 refresh20 originals: eight neighboring controls are browser
+pixel-exact and all12 pending anonymous-table originals remain RED, with
+zero resource/protocol-unverified. V4026/V4027 geometry isolates distinct
+anonymous wrappers and column tracks after separator deletion (125: native
+608.53125/655.3125px wrappers versus one browser655.3125px table).
+V4028 checks rows, cells and row groups with and without forced pre-mutation
+layout: Chrome reconstructs adjacent anonymous runs after deletion or raw
+separator text becoming whitespace. Historical wrapper identity does not
+justify preserving a split, even after layout has materialized.
+
+V4029 preserves three DOM RED tests against the old retained-boundary path.
+The candidate removes that mutation-history map, hooks and synthetic style
+key; current-DOM table fixup and source-whitespace helpers remain authoritative.
+V4030 passes13 table-mutation and14 generated-counter controls (27/27).
+Browser original acceptance awaits rebuilt V4031/V4032; the accepted queue
+remains51 browser RED +8 unverified until those receipts are inspected.
+No full6548 census, reference waiver, WPT mutation or commit/push.
+
+V4033 passes four additional DOM controls (one collapsed-border and three
+replaced-table cases). Production runner rebuild succeeds in2m34s.
+V4031/V4032 accepts20/20 original browser pixel-exact comparisons, including
+all12 refreshed REDs; both actual/native and reference/native differences
+are zero and no resources are unverified. Neighbor156 retains its96-pixel
+strict-reference difference in both Chrome and native, not a waived failure.
+V4034/V4035 therefore reduce the incremental known-failure queue from51 to39
+browser RED, with8 resource/protocol-unverified unchanged (77/116 cleared).
+This remains focused evidence, not a new full6548 census. No commit/push.
+
+V4036/V4037 extends regression to all154 anonymous-table originals in the
+pinned corpus:154/154 browser pixel-exact, zero browser gaps and unverified.
+Native strict results are121 pass/33 fail; those33 reference differences
+also occur in Chrome and remain retained independently. V4038/V4039 bind
+the unchanged39 browser RED +8 unverified queue to this broader scope.
+All31 DOM controls and diff check pass. Root files:size:check still reports
+the six unrelated outside-vendor violations; no baseline increase or edit
+outside vendor/w3cos. Product Agent knowledge is unaffected by this generic
+DOM/table rendering correction. Next focused entry is the eight remaining
+border-collapse-dynamic originals, refreshed against this rebuilt runner.
+The full6548 census and zero-failure objective are still outstanding.
+
+### Collapsed dynamic border shading — V4040 onward
+
+V4040/V4041 refresh20 original dynamic-border cases:12 browser pixel-exact,
+eight RED and zero unverified. Test and reference have identical browser/native
+gaps, despite strict equality, isolating the shared paint path rather than
+mutation execution. Original cell-001 bright green edge samples are Chrome
+(0,212,0) versus native(0,128,0), a3240-pixel gap. V4042 preserves a failing
+unit for collapsed three-dimensional light-band color. The candidate applies
+the light/dark pair to collapsed edges without changing authored conflict
+priority or the separate box-border contrast rule. V4043 passes nine runtime
+controls: seven border-paint tests plus fractional square paint and row/group
+geometry. Browser acceptance awaits V4044/V4045 and the rebuilt runner; the
+accepted queue remains39 RED +8 unverified. No full6548 or commit/push.
+
+Production runner rebuild succeeds in2m12s. V4044/V4045 compares all20
+dynamic-border originals plus separate groove/ridge controls:22/22 browser
+pixel-exact, zero browser gaps or unverified. All eight refreshed dynamic
+REDs become exact in both actual/native and reference/native comparisons,
+with strict equality. The two separate controls keep their matching Chrome
+and native4400-pixel reference differences on the separate ledger.
+V4046/V4047 reduce the incremental known-failure queue to31 browser RED +8
+resource/protocol-unverified (85/116 cleared). Pinned WPT checkout remains
+unchanged and diff check passes. Root files:size:check still has the same
+six unrelated outside-vendor violations; no baseline change. This generic
+border paint change does not affect Product Agent knowledge. No full6548
+census or commit/push. Next focused entry: inline line-break border/padding
+originals and the inline-border CSS1 case, preserving fresh RED evidence.
+
+### Inline line-break decoration — V4048 onward
+
+V4048/V4049 refresh three originals: the inline border and padding line-break
+cases each have852 browser/native differing pixels (their references are
+exact); CSS1 c5512 has50 differing pixels in both actual and reference.
+V4050 worker geometry shows the third line's leading separator retaining20px
+advance and moving its final xx from the line origin. The source's preceding
+text is `xx `, which excluded the sequence from separator collapse. Contextual
+line fitting also omitted border edges when a glyph advance was available.
+V4051 preserves a runtime RED for trailing source space plus50px inline
+padding/border. The candidate admits a single trailing collapsed source space
+and includes inline borders in the content-box line-fitting contribution.
+V4052 passes seven soft-wrap/content-box controls; original acceptance awaits
+the rebuilt V4053/V4054. CSS1 right-edge rounding remains a separate RED.
+No queue reduction, full6548 census or commit/push before pixel acceptance.
+
+Production rebuild succeeds2m08s. V4053/V4054 accepts both inline line-break
+originals with zero actual/native, reference/native and strict differences;
+c5512 retains its50-pixel actual/reference browser gap. V4055/V4056 updates
+the incremental queue to29 browser RED +8 unverified (87/116 cleared).
+V4057's whitespace directory selection was empty and the runner rejected
+it; this is invalid coverage, not passing evidence. V4059/V4060 selects121
+actual pinned corpus white-space paths across text/generated-content for
+the follow-up regression. Original corpus files are not altered.
+
+V4059/V4060 completes121/121 original browser pixel-exact comparisons,
+zero browser gaps and unverified. Native strict29 pass/92 fail is retained
+separately; those reference differences also occur in Chrome. V4061/V4062
+binds the unchanged29 RED +8 unverified queue to this regression scope.
+Diff check passes; the root size gate retains six unrelated outside-vendor
+violations. No Product Agent knowledge impact from this generic inline
+layout correction, no corpus changes, tolerance, full6548 or commit/push.
+Next focused entry is c5512's remaining50-pixel right-border rounding gap;
+V4050 geometry and V4053 original screenshots provide the current evidence.
+
+### Inline decoration advance precision — V4063 onward
+
+V4063 refreshes c5512 browser geometry: Chrome and native use the same
+305.5px border box at(8,13), but its right edge has a50-pixel paint gap.
+The inline decoration path remeasures raw shaping advances instead of CSS
+layout-unit geometry. V4064 preserves a raster RED at a raw301.49997px
+advance with3px left/1px right edges: Chrome paints column313, not312.
+The candidate quantizes only the decoration advance through the existing
+inline_layout_advance helper, retaining unsnapped glyph and Canvas measures.
+V4065 passes47 runtime tests (two raster controls and45 text-layout tests).
+Production rebuild and V4066/V4067 original89-case CSS1 border/inline scope
+are pending; the accepted queue remains29 browser RED +8 unverified.
+No full6548 census, WPT mutation, tolerance or commit/push.
+
+V4066/V4067 original89-case regression completes88 browser pixel-exact,
+one known c5525 float gap (51pixels), zero unverified. c5512-ibrdr-rw becomes
+exact in both browser/native comparisons and strict reference comparison;
+inline-box border/padding line-break cases remain exact. Native45 pass/44
+fail and all44 strict-reference rows stay separate from browser parity.
+V4068/V4069 reduces the incremental queue to28 browser RED +8 unverified
+(88/116 cleared). Production build succeeds2m15s. Diff check passes, pinned
+corpus is unchanged; root size gate retains six unrelated outside-vendor
+violations. Generic text decoration geometry has no Product Agent knowledge
+impact. No full6548 census or commit/push. Next focused entry is c5525's
+fresh51-pixel float/matching-cross-section gap on this source/runner.
+
+### Centered inline advance — V4070 onward
+
+V4070/V4071 diagnoses c5525's51-pixel RED: float and reference-table boxes
+agree; only Blue glyph pixels differ. Browser range begins at221.78125px
+with32.4375px width; raw native center origin is221.78403px. V4072 preserves
+the runtime RED for the origin and the original browser(217,217,255) pixel.
+The candidate centers using the existing snapped layout advance, keeping
+internal glyph positions raw as in the right-alignment path. V4073 contains
+an empty test filter and is INVALID_EMPTY_SELECTION, not complete acceptance.
+V4078 reruns five actual center/right/RTL/inherited-alignment controls and
+passes5/5. Production rebuild and V4074/V4075 original97-case CSS1/text-align
+scope remain pending; queue stays28 browser RED +8 unverified until inspected.
+No full6548 census, corpus mutation, tolerance or commit/push.
+
+Production rebuild succeeds2m39s. V4074/V4075 compares97 originals with
+97/97 browser pixel-exact, zero gaps and unverified. c5525 is exact in both
+actual/native and reference/native comparisons, also strict equality.
+Native46 pass/51 fail retains the51 strict-reference rows independently;
+the same reference differences occur in Chrome. V4076/V4077 reduces the
+incremental queue to27 browser RED +8 unverified (89/116 cleared).
+Diff check passes; root size gate still reports six unrelated outside-vendor
+violations. Generic text alignment has no Product Agent knowledge impact.
+No WPT alteration, full6548 census or commit/push. Next focused entry is the
+three inline-block/inline-table valign originals with fresh source-bound RED.
+
+### Table currentColor and bevel softening — V4079 onward
+
+V4079/V4080 preserves three valign browser REDs (988,788,804 actual pixels).
+V4082/V4083 geometry confirms the actual baselines and boxes already agree;
+the default HTML table frame colors do not. Chrome155.0.8059.39 V4084/V4085
+diagnostics distinguish table currentColor black168/84 from ordinary box
+currentColor fallback238/154, and authored green light212. Blink's current
+BorderSideColor uses actual currentColor for table display types, and its
+CalculateInsetOutsetColor softens very dark colors twice on the light face.
+The candidate restores table UA currentColor provenance and implements the
+current luminance thresholds without changing layout or corpus tolerances.
+V4086 DOM and V4087 two paint tests retain RED. V4088 paint controls pass8/8;
+V4089 catches the border=0 transparent UA default and is not acceptance.
+V4092 reruns both table presentation tests after the correction:2/2 passed.
+The first production build was explicitly interrupted before the correction;
+its artifacts are not accepted. Replacement build and V4090/V4091 original
+three plus22 existing collapsed/groove/ridge controls remain pending. Queue
+stays27 browser RED +8 resource/protocol unverified until pixels are inspected.
+Strict differences remain separate; no full6548 census or commit/push.
+
+Replacement production build succeeds2m40s. V4090/V4091 completes25 original
+cases:23 browser pixel-exact,2 gaps,0 unverified. All22 prior collapsed and
+groove/ridge controls remain exact. inline-block-valign-001 clears both pixel
+comparisons and strict equality. The002 and inline-table001 actual pages are
+now exact, but each reference page retains219 pixel differences and therefore
+remains RED, not waived as reference-only. V4093/V4094 updates the incremental
+queue to26 browser RED +8 unverified (90/116 cleared). Next entry is those two
+reference-page geometry differences. Diff check passes. Root size gate has the
+same six unrelated outside-vendor violations; no Product Agent knowledge
+impact from generic DOM/painter changes. Full6548 census and commit/push have
+not occurred.
+
+### Content-bearing atomic line descent — V4095 onward
+
+V4095 fresh reference-worker geometry locates both remaining219-pixel REDs:
+the parent paragraph is5px too high (113 instead of108;117 instead of112),
+while text and atomic boxes already agree. The bottom-edge descent projection
+was treating a content-bearing atomic as if its baseline were the bottom
+margin edge. V4096 retains a minimal runtime RED (113 versus108). The candidate
+shares the existing last-line baseline lookup and uses the inline table's
+first-row baseline, adding only the missing containing-strut descent.
+V4097 exposes an existing empty-box unit discrepancy83 versus84. V4100 restores
+the legacy full-descent calculation for an isolated diagnostic and reproduces
+the same83-versus84 failure, as well as the new113-versus108 RED. This is not
+waived or changed to green. The candidate is restored; V4101 actual content,
+forced-break, clipped-overflow and descendant-baseline controls pass4/4.
+Production rebuild and V4098/V4099 pixels remain pending:three valign originals,
+four height controls and22 prior border controls. Queue stays26+8 until verified;
+strict-reference rows remain retained, and no full6548 census or commit/push.
+
+Production rebuild succeeds2m20s. V4098/V4099 validates29 originals with29/29
+browser pixel-exact,0 gaps and0 unverified. Both former219-pixel reference REDs
+now have exact actual/native, reference/native and strict match comparisons.
+All four height controls and22 prior border controls remain exact. Groove and
+ridge keep their original mismatch relations and4400-pixel differences in both
+engines; these are not converted into equality claims. V4102/V4103 reduces the
+incremental queue to24 browser RED +8 unverified (92/116 cleared). The existing
+empty-box83-versus84 unit failure remains explicitly recorded in V4097/V4100;
+V4101 is a four-test focused PASS, not an all-runtime claim. Diff check passes;
+root size gate still has six unrelated outside-vendor violations. No generic
+layout change affects Product Agent knowledge. No full6548 census or push.
+
+### Sequential stylesheet font ready cycle — V4104 onward
+
+V4104/V4105 retains two fresh content-height REDs:004 has600 actual pixels,
+005 has250; both reference pages are exact. V4106/V4107 geometry records a1px
+shift and incorrect fallback widths on004, and Times fallback instead of the
+second primary face on005. V4108 isolated two-family empty-inline test confirms
+that ready resolves after the first font batch while the second demanded face
+is still loading. The candidate activates demanded deferred faces before
+finishing the outgoing batch's ready cycle, not after it. V4109 five readiness,
+empty-decoration, demand and WOFF2/owner-cleanup tests pass5/5. No glyphs are
+invented and unused font subsets remain lazy. Production build and V4110/V4111
+original pixel verification are pending (five content-height originals and the
+two still-pending font-family/font-applies originals); queue stays24 browser RED
++8 unverified.
+Root size gate still has six unrelated outside-vendor violations. Generic font
+loading has no Product Agent knowledge impact. No full6548 census or push.
+
+Production rebuild succeeds2m27s. V4110/V4111 completes seven originals:four
+browser exact,three gaps,zero unverified. All content-height001–004 are exact;
+004's former600-pixel RED clears.005 still has250 actual pixels despite the high
+face now loading; V4114 fresh geometry shows the empty decorated inline-block
+baseline is synthesized from the box bottom, not the empty inline's font strut
+(high span y61 versus Chrome y53). This is the next targeted entry, not a claim
+of glyph raster drift. font-applies017 retains43 actual pixels and font-family
+002a retains44 on both pages; its9006-pixel strict mismatch remains separately
+retained in both engines. V4112/V4113 updates the queue to23 browser RED +8
+unverified (93/116 cleared). Diff check passes. No full6548 census, reference
+waiver, tolerance change or commit/push.
+
+### Empty decorated inline content baseline — V4115 onward
+
+V4115 retains the missing-baseline unit RED (None versus the font-box ascent).
+The candidate exports a primary-font baseline for empty decorated non-replaced
+inline Row/Box nodes, keeping undecorated zero-width empties absent. V4116 has
+three passing content/clipping controls and two failing empty-atomic controls:
+short-empty42 versus42.5 and bottom-aligned text8 versus6.5. These failures are
+retained and not converted into PASS or changed expectations; both fixtures
+contain only Inline Text and InlineBlock Box nodes, so the new Inline Row/Box
+branch is not entered by them. One intermediate compile used the wrong Edges
+type and failed; corrected runtime compilation succeeds29s. Production build
+and V4117/V4118 fourteen-original pixel scope remain pending. Queue remains23
+browser RED +8 unverified; no full6548 census or commit/push.
+
+Production rebuild succeeds2m36s. V4117/V4118 completes14 originals:12 exact,
+2 gaps,0 unverified. content-height001–005 are now all browser pixel-exact;
+005 retains its original mismatch relation with200 strict pixels in both
+engines. Four atomic-height and three valign controls remain exact. The two
+font originals retain43 and44 browser differences. V4119/V4120 updates the
+incremental queue to22 browser RED +8 unverified (94/116 cleared). V4116's two
+empty-atomic unit failures remain explicitly retained, not an all-unit PASS.
+Diff check passes; root size gate has six unrelated outside-vendor violations.
+Generic baseline work has no Product Agent knowledge impact. No full6548
+census, reference mutation, tolerance adjustment or commit/push.
+
+### Trailing forced break paint shaping — V4123–V4128
+
+V4123 captures a fresh unit RED: a final word carrying U+2028 excludes the
+whole three-piece source from shared glyph shaping. The paint-only candidate
+classifies and shapes the terminal word without its break character, while
+retaining the layout classifier and terminating the paint group at that break.
+V4124 passes all nine inline-shaping tests. Production rebuild succeeds2m09s.
+V4125/V4126 completes14 originals:13 browser exact,one gap,zero unverified.
+font-applies-to-017 clears its43-pixel actual gap; content-height and atomic
+height/valign controls remain exact. font-family-rule-002a retains44 pixels on
+both pages and its9006-pixel strict difference; content-height005 retains200
+strict pixels in both engines. V4127/V4128 updates the incremental queue to21
+browser RED +8 resource/protocol unverified (95/116 cleared). Earlier empty
+atomic unit failures remain retained. Root size gate still reports six unrelated
+outside-vendor violations. Generic glyph paint work has no Product Agent
+knowledge impact. No full6548 census, waiver, tolerance change or commit/push.
+
+### Decorated source layout advance — V4129–V4134
+
+V4129 retains a fresh unit RED: underlined generated words receive no shared
+contextual widths, leaving their source endpoint independently rounded per
+piece. The candidate clears text decoration only in the generated source's
+measurement style clone; authored paint styles and decoration remain intact.
+V4130 passes15 targeted units covering shared glyph/decoration painting,
+authored source endpoints, font boundaries, wrapped line endpoints and padding.
+Production rebuild succeeds2m19s. V4131/V4132 completes14 originals,all browser
+pixel-exact,zero unverified. font-family-rule-002a clears44 pixels on each page;
+its9006-pixel strict mismatch remains separately retained in both engines
+(required White Space font is absent in the browser environment), not waived.
+content-height005's200 strict pixels also remain retained. V4133/V4134 updates
+the incremental queue to20 browser RED +8 resource/protocol unverified
+(96/116 cleared). Previous empty atomic unit failures remain retained.
+Diff check passes. Root size gate retains six unrelated outside-vendor
+violations. Generic text measurement has no Product Agent knowledge impact.
+No full6548 census, reference change, tolerance adjustment or commit/push.
+
+### Embedded forced break word fragmentation — V4135–V4148
+
+V4135/V4136 retains four fresh browser REDs: inline color416 pixels and three
+CSS21 empty-caption overflow originals200 pixels each. V4137/V4138 records
+native and browser geometry. Inline color keeps a leading U+2028 embedded in
+the first word, leaving subsequent words on the preceding line; the table
+cases have matching geometry but a separate clipping/strict-reference issue.
+The DOM candidate exposes forced breaks as standalone fragments during word
+splitting, without inventing spaces at those boundaries. Hyphen and authored
+space splitting remain intact. V4139's initial fixture lacked IFC prerequisites;
+V4140 captures the valid missing-marker RED. V4141 exposed a nested-wrapper
+test traversal problem; V4144 records the ensuing test-only type compile error.
+V4145 with the corrected recursive traversal revalidates the RED against the
+legacy splitting algorithm, and also reproduces the pre-existing first-line
+unit failure. V4146 passes the new break unit and four fragment/decoration/RTL
+controls, retaining that one first-line failure unchanged (not all-unit PASS).
+Production rebuild succeeds2m21s. V4142/V4143 completes15 originals,all browser
+pixel-exact. color-applies-to-008 clears416 pixels; prior font,content-height and
+atomic controls remain exact. Strict9006/200 differences stay separately retained
+in both engines. V4147/V4148 updates the incremental queue to19 browser RED +8
+unverified (97/116 cleared). The three table clipping REDs remain pending;
+no table painting change was mixed into this batch. Diff check passes; root
+size gate has six unrelated outside-vendor violations. Generic DOM fragmentation
+has no Product Agent knowledge impact. No full6548 census,waiver or commit/push.
+
+### Table caption wrapper overflow clip — V4149–V4161
+
+V4149 records Chrome155.0.8059.39 caption height/margin variants: grid contents
+clip at the wrapper padding edge, independently of the grid background rect.
+V4158/V4159 additionally record wide-caption horizontal scans (auto/fixed table
+variants both expand the measured table to100px; these are diagnostics, not
+original acceptance). V4150/V4151 retains the complete nine-original family
+RED:three200-pixel browser gaps,six exact. The old empty-caption unit's grid
+clip expectation was corrected against that browser evidence; V4152 retains
+its RED (grid y61/h20 versus wrapper y51/h30). The production candidate removes
+caption background insets only from descendant overflow clipping, retaining
+grid background/border geometry and captions' independent inherited clip chain.
+V4153 passes seven clip,background and border units. Production rebuild
+succeeds2m27s. V4154/V4155 completes all nine originals browser pixel-exact.
+Strict differences remain independently retained in both engines:001/008/009
+200 pixels each,0021000,003/004800 each. No references or tolerance changed.
+V4156/V4157 updates the incremental queue to16 browser RED +8 unverified
+(100/116 cleared). V4160/V4161 freshly remeasures the next four generated-content
+originals;all four remain browser gaps (1315,640,144,922 respectively),not PASS.
+Earlier first-line and empty-atomic unit failures remain retained. Diff check
+passes; root size gate has six unrelated outside-vendor violations. Generic
+paint clipping has no Product Agent knowledge impact. No full6548 census or
+commit/push. Next entry: generated inline-table pseudo and centered attr text.
+
+### HTML text alignment presentational hint — V4162–V4173
+
+V4162/V4163 binds native/browser geometry for the four generated-content REDs.
+content042's actual and reference both omit HTML align=center from native
+computed text alignment (Start), explaining their640-pixel browser gaps.
+V4164 retains a missing-hint unit RED. V4165/V4166 records Chrome155 attribute
+value/tag diagnostics, correcting initial assumptions about whitespace and
+generic HTML tags: spaced center is accepted,exact middle aliases center,
+while table/replaced/control-specific align behavior is not a text hint.
+A separate text_presentation module contributes used text alignment through
+the existing presentation/author cascade; it does not reposition test boxes.
+V4167 and source/untracked/binary-bound V4173 pass three units for inheritance,
+author/inline precedence,user-important precedence and invalid/special tags.
+This validates used text alignment,not blanket acceptance of Blink's legacy
+block-child alignment distinctions. Production rebuild succeeds2m40s.
+V4168/V4169 completes13 originals:10 exact,three gaps,zero unverified.
+content042 clears640 pixels on both pages;all nine caption controls remain
+exact with their strict differences retained. The other generated-content
+originals remain1315,144 and922 pixels. V4171/V4172 updates the incremental
+queue to15 browser RED +8 unverified (101/116 cleared). V4170 additionally
+records computed-content evidence for the next inherit case:Chrome ::after
+is none on both test tables despite native resolving PASSED strings;this is
+diagnostic,not acceptance or a reference waiver. Prior first-line/empty-atomic
+unit failures remain retained. Diff check passes; root size gate has six
+unrelated outside-vendor violations. Generic HTML presentation has no Product
+Agent knowledge impact. No full6548 census,tolerance change or commit/push.
+
+### Non-generating content inheritance — V4174–V4184
+
+Chrome155 computed-content diagnostic V4170 and Blink's Content::ApplyInherit
+no-op identify native ancestor-string import as the browser parity gap.
+V4174/V4175 retain two failing inheritance units and one explicit-string control.
+The candidate treats a winning content:inherit as non-generating without falling
+back to an earlier declaration; it removes the ancestor-content lookup rather
+than adding a table-specific exception. V4176 initially detects an empty-attr
+control failure. Legacy-source V4177 and source/untracked/binary-bound V4182
+reproduce that failure before the candidate; its assertion remains unchanged.
+V4183/V4184 pass three new inheritance units and two existing controls, retaining
+the one legacy empty-attr failure separately (five passed,one failed).
+Production rebuild succeeds2m34s. V4178/V4179 completes13 original pages:
+11 browser pixel-exact,two gaps,zero unverified. content-inherit002 clears its
+922-pixel browser gap on the actual page; its reference is also exact. Browser
+and native strict-reference differences both remain922 pixels,not waived.
+All nine caption controls and content042 stay exact; before-content-display007
+and content050 remain1315 and144 pixels respectively. V4180/V4181 updates the
+incremental queue to14 browser RED +8 unverified (102/116 cleared). This is not
+a current full6548 census. Diff check passes; root size gate retains the same
+six unrelated outside-vendor violations. Generic generated-content behavior
+has no Product Agent knowledge impact. No tolerance/reference change or
+commit/push. Next entry: preserve generated inline-table atomic structure.
+
+### Generated table principal box — V4185–V4193
+
+V4185 retains a failing DOM structure test: single-string inline-table pseudo
+has no anonymous cell and folds with adjacent authored text. The candidate
+preserves Table/InlineTable principal boxes for single generated strings and
+passes their inherited text through existing CSS table-child fixup. It does
+not alter general anonymous-table coalescing or table-track measurement.
+V4186 and source/untracked/binary-bound V4189 pass six tests,including anonymous
+table text coalescing and generated table-cell word-break controls. Production
+rebuild succeeds2m48s. V4187/V4188 measures13 originals:12 browser pixel-exact,
+one144-pixel content050 gap,zero unverified. before-content-display007 clears
+1315 pixels;both actual and reference are browser-exact and strict-exact.
+V4190/V4191 additionally measures the34 before/after display family originals:
+all34 browser pixel-exact,zero gaps,zero unverified. Existing caption and
+content-inherit strict-reference differences remain independently retained.
+V4192/V4193 updates the incremental queue to13 browser RED +8 unverified
+(103/116 cleared),not current full6548 proof. Diff check passes. Root size
+gate's six unrelated outside-vendor violations were verified in the preceding
+batch; no new outside-vendor edits or baseline changes. Generic DOM box lowering
+has no Product Agent knowledge impact. Prior unit failures remain retained.
+No reference/tolerance change or commit/push. Next entry: anonymous-cell trailing
+collapsible whitespace and content050 intrinsic width.
+
+### Table-cell single-run line-edge intrinsic width — V4194–V4205
+
+V4194 binds current content050 geometry: anonymous cell's single inline text
+is "1 " and native track width11.75px includes the collapsed line-end space.
+V4195 selects an obsolete default unit binary and is INVALID_EMPTY_SELECTION,
+not acceptance. Explicit current runtime binary V4196 retains the new unit RED
+(normal single-run max-content45.28125 versus55.953125 with edge spaces).
+The candidate measures a cell's sole normal/nowrap inline text with collapsed
+line-edge spaces excluded,retaining original DOM/paint text and all internal
+spaces. The unit also preserves preformatted edge spaces. V4197 runs22 units:
+20 pass,two nested-wrap controls fail. Legacy-source V4202 verifies the same
+two failures before the candidate,plus the new unit's RED (19pass/3fail).
+Candidate source is restored exactly to its production pixel binding afterward;
+these two control assertions are not changed or reported green.
+Production rebuild succeeds3m10s. V4198/V4199 measures13 originals:all13 browser
+pixel-exact,zero unverified. content050 clears144 pixels on each actual/reference
+page;strict comparison stays zero. Caption and content-inherit strict-reference
+differences remain separately retained. V4204/V4205 rechecks34 generated-display
+family originals:all34 browser pixel-exact,zero gaps,zero unverified.
+V4200/V4201 updates the known queue to12 browser RED +8 unverified (104/116
+cleared),not current full6548 proof. Diff check passes. The same six unrelated
+outside-vendor size violations remain outside this task's edit scope. Generic
+intrinsic layout has no Product Agent knowledge impact. No references,tolerances,
+commit or push changed. Next entry: remaining positioning originals and their
+inline containing-block geometry.
+
+### Final unsplit inline containing-block insets — V4206–V4220
+
+V4206/V4207 freshly measures the three positioning RED originals:abspos024
+805 actual/372 reference pixels,float-with-inline-container10800 pixels,
+inline00780 pixels. V4208/V4209 binds native and Chrome155 geometry:the float
+case's absolute box starts x-92 rather than x8;inline007's auto-static box
+starts y18 rather than y14,while its explicit top/bottom anchors are exact.
+V4210 retains the new final-projection unit RED. The candidate reanchors inset
+descendants against unsplit positioned inline padding boxes after static float
+ancestors move;block-split inline fragment geometry is still retained.
+V4211 passes three units but exposes an empty-inline strut regression;this is
+not accepted as all-green. Initial production V4212/V4213 clears the float's
+pixels but does not waive that unit failure. The refined candidate converts
+an empty inline's final font-height paint rectangle back to its line strut,
+undoing rounded upper leading only when needed. V4216 passes all four focused
+units,including the empty-inline,padding-edge and RTL static-edge controls.
+Final production rebuild succeeds2m28s. V4217/V4218 runs seven originals:
+six pixel comparisons yield four exact/two gaps;the inline-container-in-inline-
+block testharness has one passing assertion. float-with-inline-container is
+pixel-exact on both pages with zero strict difference. content050 remains exact;
+content-inherit and inline008 retain strict differences922 and3751 respectively.
+abspos024 and inline007 remain RED,not closure. V4219/V4220 updates the known
+queue to11 browser RED +8 unverified (105/116 cleared),not current full6548 proof.
+Diff check passes;root size gate verifies the same six unrelated outside-vendor
+violations. Generic containing-block layout has no Product Agent knowledge
+impact. Prior unit failures are retained. No references/tolerance,commit or
+push changed. Next entry:inline007's first absolute child static fallback;
+inline_absolute_static_rect excludes InlineBlock from block_static_container,
+which is a hypothesis to test rather than an accepted fix.
+
+### Inline-block first block static placeholder — V4221–V4233
+
+V4221's isolated inline fixture passes without reproducing the original shared
+line,not RED evidence. The expanded outer-line fixture V4222 and real-Ahem
+font-owner fixture V4223 retain the static child/content-top RED. A test-only
+E0382 fixture ownership error during expansion was corrected before testing.
+Adding InlineBlock to the early block_static_container predicate is insufficient:
+V4224 retains the new unit failure with four controls passing;V4225/V4226 still
+has the original80-pixel inline007 gap. That ineffective production change is
+reverted. The final candidate revisits fully-auto first block placeholders
+inside inline-blocks after baseline settlement,using their actual content edge;
+in-flow predecessor and other containing-box/inset paths are not reset.
+V4227 passes the new full-layout unit and four focused controls,with source,
+untracked inputs and runtime binary bound. Final production rebuild succeeds
+2m11s. V4228/V4229 runs seven originals:six pixel comparisons yield five exact
+and one RTL gap;the inline-container assertion passes. inline007 clears80 pixels
+with both pages and strict comparison exact. The float and generated-content
+controls stay exact;strict content-inherit922 and inline0083751 remain retained.
+V4230/V4231 expands regression to57 abspos family originals:55 pixel comparisons
+yield54 exact/one gap(abspos024),zero unverified;both testharness assertions pass.
+abspos024 remains805 actual/372 reference browser pixels,not closure.
+V4232/V4233 updates the known queue to10 browser RED +8 unverified (106/116
+cleared),not current full6548 proof. Diff check passes. The six unrelated
+outside-vendor size violations remain outside scope. Generic static-position
+layout has no Product Agent knowledge impact. No reference/tolerance,commit or
+push changed. Prior unit failures remain retained. Next entry:abspos024 RTL
+text/border geometry and its independent reference gap.
+
+### Terminal authored source endpoint — V4234–V4244
+
+The existing Chrome paragraph geometry V4209 confirms the reference's used
+text origin at334.609375px. V4234/V4235 isolates actual/reference native text;
+the reference's final bold source kept raw48.91194px instead of48.921875px.
+V4236's explicit Times fixture lands exactly on the LayoutUnit grid,so its
+fixture guard fails and it is not valid RED evidence. After adopting the
+original HTML-standard font path,V4237 retains the intended terminal-source
+RED (48.91194 vs48.921875). A test-only nonexistent FontWeight enum error was
+corrected to the existing numeric700 before execution.
+
+The candidate completes the final authored SOURCE_RUN at a LayoutUnit endpoint
+in shared inline advances,without rounding internal glyph positions or changing
+unmarked synthetic fragments. V4238 executes five focused units,all PASS,
+including authored-boundary and hidden-source controls. Production rebuild
+succeeds in2m44s. V4239/V4240 repeats57 original abspos cases:55 pixel comparisons
+yield54 exact/one gap,zero unverified;both testharness assertions pass. abspos024
+reference browser gap clears372->0;actual RTL gap remains805 pixels. Browser
+strict180 and native strict985 remain retained,not waived. This is a partial
+repair,not case closure. V4241 fresh worker confirms the actual paragraph
+still has direction RTL while its resolved text children are LTR;the shared
+advance helper's parent-LTR guard excludes this path. That is the next diagnostic
+entry,not authorization to remove the guard globally. The merged text's stored
+fragment checksum/57-byte boundaries are valid,not stale metadata.
+
+V4243/V4244 binds the incremental queue to current source/runner:10 browser RED
+and8 resource/protocol unverified,106/116 baseline browser gaps cleared. Untested
+baseline passing rows are not current proof;full6548 has not rerun. Diff check
+passes;root size check retains the same six unrelated outside-vendor violations.
+Generic layout/font handling has no Product Agent knowledge impact. Earlier
+unit failures remain retained. No reference,tolerance,commit or push changed.
+
+### Resolved RTL word advances — V4245–V4255
+
+V4245 retains a new shared-advance RED:resolved visual LTR word leaves inside
+an RTL IFC return allNone,while the same LTR container returns contextual
+advances. The candidate permits the RTL parent only when all children are
+plain LTR text leaves carrying resolved-level and visual-order metadata;empty,
+unresolved or non-text RTL structures keep the original guard. A temporarily
+mis-targeted patch at another direction guard was corrected before compilation;
+that unrelated guard remains unchanged. V4246 runs six focused units,all PASS,
+including the unresolved-child negative control and authored/source boundaries.
+Production rebuild succeeds2m17s. V4247/V4248 repeats57 original abspos cases:
+55 pixel comparisons yield54 exact/one gap;both harness assertions pass.
+abspos024 actual browser pixels improve805->371,reference stays0. Browser
+strict180/native strict447 are retained,not waived. V4249/V4250 repeats all105
+bidi-text originals:105 browser pixel-exact,zero gaps/unverified;strict original
+differences are retained. This is a partial abspos024 repair,not closure.
+
+V4251's fresh actual worker places regular visual text at334.60934px and bold
+at743.0782px;Chrome V4209 starts its separate period at334.59375px and regular
+LTR source at338.828125px. Remaining text metadata has valid source boundaries
+1,56,57,including the direction boundary inside the generated'.Test'word.
+authored_word_groups requires each boundary to align with a generated word and
+rejects the interior period boundary,so layout still uses one combined raw
+advance. Next entry:retain cluster-safe source LayoutUnit endpoints even when
+they fall inside a generated word,without erasing bidi/ligature boundaries or
+changing original passive-coalescing tests.
+
+V4252–V4255 binds both focused receipts into the queue:10 browser RED +8 resource
+unverified,106/116 cleared;untested baseline rows remain historical,not current
+passing evidence. No full6548 run,commit or push. Diff check passes;the same six
+outside-vendor size violations remain untouched. Generic text/layout handling
+has no Product Agent knowledge impact. Previously recorded unit failures remain.
+
+### Interior source LayoutUnit endpoints — V4256–V4272
+
+V4256 retains a new RED for a source boundary inside generated'.Test':used
+93.53587px vs independently occupied source endpoints93.546875px. The candidate
+recovers authored fragment boundaries in the complete shaping context,validates
+both source and generated-word partitions against glyph clusters,then assigns
+each source's LayoutUnit remainder to its containing generated word. It never
+independently reshapes text or cuts an unsafe cluster. Existing word-aligned
+authored groups retain their path. V4257 runs14 focused units,all PASS.
+Initial production rebuild succeeds2m16s. V4258/V4259 retains abspos02477 actual
+browser pixels (reference0),down from371;V4260/V4261 keeps105 bidi originals
+pixel-exact. V4262's fresh worker isolates the remaining one-letter gap:source
+endpoints were already occupied,but floating-point accumulation was rounded a
+second time at the font boundary (regular408.5001px instead of408.484375px).
+
+V4263 retains the independent double-snap RED408.5 vs408.48438. The final
+candidate skips that second whole-run snap only when the interior-source helper
+already supplied validated endpoints;ordinary raw/word-aligned paths retain
+their prior completion logic. V4264 runs15 focused units,all PASS. Final
+production rebuild succeeds2m13s. V4265/V4266 repeats57 abspos originals:all55
+pixel comparisons are browser-exact and both testharness assertions PASS.
+abspos024 actual/reference browser gaps are both0;browser strict180/native
+strict180 remain retained,not waived. V4267/V4268 repeats105 bidi-text originals:
+105 pixel-exact,zero gaps or unverified. All originals/references/tolerances
+remain unchanged. Earlier unit failures remain separately retained.
+
+V4269–V4272 binds both final receipts into the known queue:9 browser RED +8
+resource/protocol unverified,107/116 baseline browser gaps cleared. Untested
+baseline passing rows are historical,not current-source proof. Full6548 remains
+unrun after these candidates. Diff check passes;root size gate retains the same
+six unrelated outside-vendor violations. Generic font/layout repair has no
+Product Agent knowledge impact. No commit/push. Next entry:remaining syntax
+colors-001/declarations-009 originals,with fresh RED and browser geometry before
+choosing the parser/layout/paint boundary.
+
+### Remaining syntax RED diagnosis — V4273–V4275
+
+V4273/V4274 freshly reruns the two known syntax originals on the current runner:
+colors-001 has158 actual browser pixels (max channel difference1),reference0;
+declarations-009 has1349 actual browser pixels,reference0. Both native strict
+comparisons remain0 while browser strict158/1349 are retained,not waived. No
+case is cleared by matching only its old reference. V4275's independently
+captured browser geometry confirms identical paragraph/div rectangles and
+computed rgb(0,128,0) for both color pages;the158 pixels occur only in green
+antialiased text coverage. This excludes a box-model or computed integer-color
+mismatch. The native Color model stores u8 channels and percentage RGB parsing
+rounds to u8 early;retaining paint precision is the next hypothesis to verify,
+not an accepted fix or permission to change named-color rendering globally.
+
+For declarations-009,Chrome computes only the third paragraph (#c) red,while
+the reference and other five paragraphs are green. Current esm_css explicitly
+discards an in-declaration @media block through the next top-level semicolon;
+its existing malformed_media_at_rule_does_not_recover_a_trailing_declaration
+unit encodes the CSS2-era green expectation. Next entry is a fresh parser RED
+for the browser's trailing-declaration recovery,with nested conditional-rule
+boundaries and that legacy unit recorded separately. No test assertion was
+changed or production candidate applied in this diagnostic batch. Queue stays
+9 browser RED +8 unverified,full6548 unrun. Diff check passes;the same six
+outside-vendor size violations remain untouched. No Product Agent knowledge
+impact,commit or push.
+
+### Nested media trailing declaration recovery — V4276–V4285
+
+V4276 retains a new compiler RED for declarations-009's browser recovery:
+following a closed in-declaration @media block,#c's final declaration is green
+instead of red. The legacy malformed_media_at_rule_does_not_recover_a_trailing_declaration
+and unknown-at-rule control both PASS before the candidate. The candidate removes
+the explicit CSS2-era @media swallowing special case,using the existing balanced
+block/trailing identifier recovery. Nested-rule execution is not implemented by
+this change and complete CSS nesting is not claimed.
+
+V4277 runs all40 esm_css tests:39 PASS,one FAIL. The failed legacy CSS2 green
+expectation is retained unchanged and independently reported,not reclassified as
+passing. The new browser recovery test and every other parser control PASS.
+Production rebuild succeeds2m57s. V4278/V4279 runs the two original syntax REDs:
+declarations-009 actual/reference browser pixels are both0;browser strict1349
+and native strict1349 remain retained. colors-001 remains158 actual/0 reference
+pixels,max channel difference1. V4280/V4281 extends to30 original at-rule and
+malformed-declaration controls:30 browser pixel-exact,zero gaps/unverified.
+A wrapper-only invalid regex escaping error occurred before execution/artifact
+creation and was corrected to prefix selection before this accepted run.
+
+V4282–V4285 binds both pixel receipts into the known queue:8 browser RED +8
+resource/protocol unverified,108/116 baseline browser gaps cleared. Untested
+baseline rows remain historical,not current-source proof. Full6548 remains
+unrun. Diff check passes;the same six outside-vendor size violations remain.
+No reference/tolerance,test-assertion,commit or push changed. Generic CSS parser
+recovery has no Product Agent knowledge impact. Prior unit failures plus the
+newly evidenced legacy CSS2 expectation remain separately tracked. Next entry:
+colors-001 percentage channel precision through style inheritance and text paint.
+
+### Fractional foreground precision partial repair — V4286–V4292
+
+Style now has optional normalized sRGB color_rgba,with serde defaultNone and
+explicit PartialEq handling. The existing u8 color remains the computed/legacy
+value. A temporary exhaustive Style-pattern E0027 compile error was repaired by
+including the new field in both patterns and equality;it was not test RED.
+V4286 retains the intended DOM RED:rgb(0%,50%,0%) has computed green128 but no
+fractional paint channels. Color::fractional_css_rgba reuses existing validity
+checks and retains functional colors only when channel quantization loses
+precision. Named/hex/exact byte colors keep the original path. CSS setter
+preserves prior precision for invalid values and clears it for explicit named
+color replacement;initial/inheritance/generated-text copies and passive text
+paint equivalence now carry the typed field. It is foreground precision,not a
+claim of complete fractional background/border/decoration or AOT-literal coverage.
+
+Both normal text and shared glyph slices use text_color_paint with Color4f;
+fractional source values are finite/range/quantized-color checked before use,
+so stale precision cannot override another computed color. V4287 executes two
+DOM parse/inheritance/coalescing controls,all PASS. V4288 executes16 runtime
+paint/source/shaping controls,all PASS. Production rebuild succeeds2m50s.
+V4289/V4290 repeats22 original color/syntax/RTL cases:21 browser pixel-exact,
+one remaining colors-001 gap. Its actual browser pixels improve158->130,still
+max channel difference1;reference remains0. Browser strict158/native strict84
+remain retained. Every19 color-family original and repaired declarations009 /
+abspos024 control stays browser-exact. This is partial precision progress,not
+case closure. Next entry:compare the float foreground's standard SrcOver,
+CSS_SRC_OVER and opacity-style float UNORM8 conversion with the browser glyph
+coverage;do not round the source back to u8 or increase tolerance.
+
+V4291/V4292 binds the current known queue:8 browser RED +8 resource/protocol
+unverified,108/116 baseline gaps cleared. Full6548 is still unrun and historical
+passing rows are not current-source proof. Diff check passes;root size check
+retains the same six outside-vendor violations. Earlier unit failures,including
+the legacy CSS2 media expectation,remain retained. Generic rendering precision
+has no Product Agent knowledge impact. No reference/tolerance,commit or push.
+
+### Fractional foreground compositor diagnostics — V4293–V4299
+
+The ignored frozen-browser test is diagnostic RED, not a passing WPT result.
+V4295 rejects the identity runtime color filter:standard SrcOver remains158
+pixels and custom CSS SrcOver remains130. Constant-color shaders change the
+glyph mask (358 pixels), so they are not production candidates. Local Skia
+SkRasterPipelineBlitter.cpp shows known SrcOver may pre-scale A8 coverage,
+whereas a custom blender blends first and then interpolates coverage.
+
+V4296/V4297 tests floating raster surfaces without changing production:RGBAF16
+gives82 differences with either blender;RGBAF32 gives130 with either. This
+rejects framebuffer precision alone as a complete fix. V4298 adds per-channel
+statistics:current N32 differences are [0,130,0,0] for RGBA, so the unresolved
+gap is green-channel compositing, not glyph geometry. V4299 checks exact
+half-channel arithmetic inferred from the browser's red coverage:floor,ceil,
+and ties-to-even leave154,158,and130 differences respectively. None is a valid
+replacement rule;do not introduce color-specific epsilon or tolerance changes.
+
+V4298/V4299 bind the external browser PNG SHA256
+88b4f5300eccadba2e3c4892a5fe0a9e7403fba843a3dcca9647cec79273b2ed
+alongside fixed WPT revision,source diff,untracked source,and binary hashes.
+The PNG remains the original V4289 actual-page artifact. Diagnostic builds
+succeed (30–33s);the explicitly selected ignored test fails as intended at130.
+The same six root file-size violations are outside vendor and remain unchanged.
+Known accepted queue remains8 browser RED +8 resource/protocol unverified;
+full6548 is not rerun and strict-reference differences are retained. Next entry:
+inspect per-coverage green rounding and Skia's color-space/premultiplication
+pipeline against the frozen browser artifact before proposing production code.
+Only diagnostic tests and receipts changed;no Product Agent knowledge impact,
+no commit or push,and no claim of case closure.
+
+V4300/V4302 extend the frozen-color diagnostic with CPU float arithmetic,
+using the already-matching red channel to infer coverage. With reciprocal
+multiplication,the post/pre/FMA/destination formulations and even/away rounding
+leave [130,132,105,132,105,132,158,158] green differences;with direct division
+they leave [130,158,102,158,102,158,133,158]. All remain diagnostic hypotheses,
+not production fixes. V4301's uniform-gain identity filter still gives158 with
+known SrcOver and130 with the custom blender. Skia's blitter source confirms
+constant color pipelines are folded and opaque SrcOver strength-reduced to
+Src,so this filter does not isolate the pre-coverage path. Each receipt binds
+the frozen input SHA;production color rendering and known queue are unchanged.
+
+### Outline width inheritance repair — V4303–V4310
+
+Fresh production RED V4303/V4304 reproduces outline-width-096 at32240
+actual-page browser differences,reference0;browser strict0/native strict32240.
+The initial 093–097 selection contains only096 in the fixed6548 corpus,not
+five tests. V4305 executes the new DOM inheritance test:nonpainting parent
+outline20px gives child0 rather than20. The first candidate passes20px cases
+but V4306 retains a second RED for2em:parent's relative longhand still computes
+as0 rather than32. Two existing border inheritance controls remain PASS.
+
+Document computed style now resolves a single relative outline-width longhand
+against the element's specified font before font readability minima;explicit
+inherit copies the parent's absolute outline width even if its style is none.
+This does not claim complete outline shorthand/color/style CSS-wide support.
+V4309 executes the new three-scenario outline test and both border controls:
+3 tests PASS,no empty selection. Production rebuild succeeds2m41s.
+
+V4307/V4308 binds all30 original outline-width-family cases,including applies-to
+controls:30 browser pixel-exact,0 gaps,0 unverified. Both actual/reference
+native-browser comparisons and browser/native strict comparisons are0 for
+every row. The repaired096 now has0 differing pixels;no test source,reference,
+assertion or tolerance is waived. V4310 advances the incremental known queue
+to7 browser RED +8 resource/protocol unverified,109/116 original gaps cleared.
+This remains incremental evidence,not a current full6548 result. Color130 RED
+and earlier conflicting unit assertions remain retained. Diff check passes;
+generic CSS computation has no Product Agent knowledge impact. No commit/push.
+Next entry:continue the seven pixel cases and eight resource/protocol items,
+then run the original fixed6548 suite before any zero-failure completion claim.
+
+### String list marker and refreshed overflow parity — V4311–V4324
+
+Fresh V4311/V4312 reproduces height-applies-to-010a at258 pixels on both
+actual/reference browser comparisons. Overflow-applies-to-001 is already
+browser-exact on current source;its browser/native strict640 differences are
+retained,not waived. The string list-style-type declaration was unsupported:
+V4313 is DOM RED because no string marker component is generated.
+
+DOM lowering now decodes a single CSS string with the existing escape parser,
+preserves its case and whitespace,and emits a text marker. It does not replace
+the quoted bullet with the geometric disc marker. Shared outside-marker layout
+uses text advance and first-line baseline,like decimal text markers. V4314
+executes5 DOM controls,all PASS;V4315 executes10 marker-layout controls,all PASS.
+Production candidate builds3m07s. V4316/V4317 is retained candidate RED:markers
+appear but remain255 pixels different,vertically shifted because painting adds
+line leading again to the baseline-projected content box.
+
+V4320 is the leading RED;the selected new test expects0 but observes-7 for its
+font fixture. Renderer now skips the second leading allocation only for outside
+string/decimal text markers. Ordinary blockified/floating/absolute text keeps
+its existing path. V4321 executes13 tests:12 PASS,1 FAIL. The unchanged
+blockified_inline_text_retains_its_line_box_half_leading assertion expects45
+but observes41 on a style without marker metadata;it is retained separately,
+not rewritten or reported green. The marker tests and metric-based ordinary
+block baseline control pass. Final production build succeeds2m28s.
+
+V4322/V4323 repeats both original pages:both browser-exact,height258->0;
+overflow strict640 remains. V4318/V4319 covers158 fixed-corpus list/height/
+overflow originals:156 browser-exact,0 gaps,2 resource/protocol unverified
+(list-style-image-004 and007). Native strict is157 passed/1 failed,not158 PASS;
+that failure is the retained overflow strict difference. V4324 binds the known
+queue:5 browser RED +8 resource/protocol unverified,111/116 original gaps cleared.
+Full6548 remains unrun;earlier strict/reference/unit failures remain retained.
+Diff check passes;root size check retains six outside-vendor violations.
+No tolerance/reference changes,no commit/push,and no Product Agent knowledge
+impact from generic CSS marker/layout computation. Next entry:remaining color,
+table baseline,two line-height and focus-preservation pixel cases,then resources
+and the original full6548 acceptance cycle.
+
+### Primary strut unicode-range diagnosis — V4325–V4329
+
+V4325/V4326 refreshes three originals on the latest production runner:
+line-height-203 is browser-exact (strict280 retained);line-height-206 actual
+is exact but reference differs196 pixels;table-vertical-align-baseline-009
+remains4162 actual pixels with reference0,browser strict302/native strict4203.
+These are source/binary-bound pixel receipts,not full6548 results.
+
+V4327 browser geometry isolates206:actual high-a-only includes U+0020 and
+has height126;reference has the same font family but only U+0061 and height142.
+Actual deep-b-only/high-a-only is height147. Native reference's bottom-edge
+gap is196 pixels. Blink PrimarySimpleFontDataWithSpace queries U+0020;
+DeterminePrimarySimpleFontDataCore skips segmented fonts whose unicode-range
+does not include the lookup character. Primary sources inspected2026-10-11:
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/platform/fonts/font_fallback_list.h
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/platform/fonts/font_fallback_list.cc
+These main-branch sources explain the mechanism;the installed-browser geometry
+is the pixel acceptance evidence,not a claim that main matches its build SHA.
+
+V4329 executes the new strut subset unit and the existing glyph subset control.
+The included-space scenario passes;excluded-space is RED:custom-face geometry
+(100,25,8) is used instead of HTML fallback(106,34,0). Glyph subset control
+passes. The new test verifies custom glyph a remains eligible while the strut
+must select independently. No production font resolution was changed yet.
+The diagnostic native-only V4328 run is not browser parity proof.
+
+Next entry:separate primary-strut selection from glyph selection. Use U+0020
+unicode-range eligibility without requiring its cmap glyph (Blink's primary
+lookup does not require a glyph);preserve weight/style,stack order,system-font
+shadowing and generic boundaries. If no declared face qualifies,use the HTML
+standard fallback. Share the selected baseline with layout/paint,and verify
+206 plus custom font/subset controls before advancing the queue. Accepted
+V4324 remains5 RED +8 unverified;203's refresh is green but no new queue bound
+to the post-unit source has been generated. Strict/reference/unit failures
+remain retained;no tolerance changes,commit,push or full-suite claim.
+
+### Primary strut space selection repair — V4330–V4336
+
+FontRegistry now shares render-stack resolution with a separate eligibility
+mode:primary struts query U+0020's unicode-range eligibility without requiring
+its cmap glyph;ordinary shaping still requires both eligibility and glyph.
+Weight/style fallback,reverse declaration selection,system-family shadowing
+and generic cascade boundaries remain shared. Renderer font geometry and text
+baselines select the strut face;generic unresolved stacks use the HTML standard
+fallback when no declared strut face qualifies. Unregistered Ahem's synthetic
+metrics remain available,but a registered subset excluding space is not
+mistaken for an unregistered Ahem face. No character-specific pixel offsets.
+
+V4330 turns the V4329 subset RED green and passes3 glyph/marker/baseline
+controls. After the final Ahem guard,production rebuild succeeds2m50s and unit
+rebuild succeeds37s. V4335 executes17 font-face tests plus4 targeted controls:
+21 PASS,0 FAIL,0 empty selections. Existing unrelated unit failures,including
+the41-vs45 blockified text assertion,remain unchanged and retained.
+
+V4331/V4332 repeats the three diagnostic originals:203/206 actual and reference
+both browser-exact,206 reference196->0. Their strict280/256 differences remain.
+Table-baseline009 remains4162 actual pixels,reference0,strict302/4203.
+V4333/V4334 regresses166 original font and line-height pages:166 browser-exact,
+0 gaps,0 resource/protocol or comparison unverified. This is NOT166 WPT PASS:
+native strict results are138 passed/28 failed. Thirty rows have nonzero strict
+pixel differences,all equal between browser and native;including the mismatch
+relations,strict status remains independently retained,not normalized away.
+
+V4336 advances the incremental known browser queue to3 RED +8 resource/protocol
+unverified,113/116 original gaps cleared. Pending pixel paths are colors-001,
+table-vertical-align-baseline-009 and focus-preserve-render. Full6548 remains
+unrun;no historical green is promoted to current full-suite evidence. Diff
+check passes;root size check retains the same six outside-vendor violations.
+Generic font geometry/resolution has no Product Agent knowledge impact.
+No reference/assertion/tolerance changes,commit or push. Next entry:continue
+the remaining pixel/resource cases,retain strict failures,and run full6548 only
+after the known browser queue is exhausted.
+
+### Focus-state selector repair — V4337–V4347
+
+V4337/V4338 records a fresh RED for the original focus-preserve-render page:
+actual and reference each differ from Chrome by712 pixels,while both native
+and browser strict reference comparisons are0. Missing green outline pixels
+identify a shared rendering omission,not proof that moveBefore lost focus.
+V4339 adds a bridge-to-computed-style regression:activeElement is correct but
+the focused text input outline is0 instead of2px;the existing focus identity
+control passes. This RED is retained with source and binary hashes.
+
+Document now stores focused identity and a separate focus-indication decision.
+Focus changes invalidate document-scoped styles and rendering,including
+ancestor/sibling/relational dependencies. Selector contexts,DOM matching and
+selector bytecode support :focus,:focus-visible and :focus-within. Native
+keyboard/pointer input controls indication modality;synthetic keyboard event
+dispatch does not. Text inputs and editable controls indicate focus even in
+pointer modality,and script focus transfers retain prior indication. The
+runtime selector fallback now recognizes :focus-visible before :focus to
+avoid stripping the shorter prefix. This is not an assertion that all shadow
+tree,platform preference or focusability semantics are complete.
+
+V4340 passes the original new regression and focus identity control. V4341
+retains two additional REDs exposing the runtime selector fallback omission.
+After that correction,V4342 passes5 focused units covering cached outline,
+moveBefore ancestor focus matching,trusted versus synthetic modality,existing
+focus identity and shared-root move constraints. Production rebuild succeeds
+in3m02s. V4343/V4344 verifies original actual and reference browser differences
+712->0,with both strict differences0. V4345/V4346 runs all46 original moveBefore
+cases:46 native PASS,0 FAIL;the2 reftests are each browser-exact,0 unverified.
+Testharness success is kept separate from those2 pixel comparisons.
+
+V4347 updates the incremental known queue to2 browser RED +8 resource/protocol
+unverified,114/116 original browser gaps cleared. Remaining pixel paths are
+colors-001 and table-vertical-align-baseline-009. Full6548 is NOT_RUN_AFTER_CANDIDATE;
+strict reference failures remain independently retained,not waived. Diff check
+passes;the root size gate retains six outside-vendor violations. Generic focus
+rendering has no Product Agent knowledge impact. No reference/assertion/tolerance
+changes,commit or push. Next entry:remaining color/table pixels,then resource
+verification and full fixed-revision validation.
+
+### Text-bearing anonymous row baseline repair — V4348–V4362
+
+V4348/V4349 refreshes table-vertical-align-baseline-009 on the current runner:
+actual/browser4162 pixels,reference/browser0;strict browser302/native4203.
+The source-bound V4352 layout diagnostic shows text-only TableRow leaves at
+y54/y104,while the neighboring inline X and bottom-positioned X both paint at
+y114,and the float is110px tall. Browser geometry instead has a100px float,
+the neighboring X at54 and bottom-positioned X at104. A text-only TableRow
+represents a lowered anonymous cell,but the shared first-row baseline exporter
+searched only explicit child cells and fell back to the table bottom. The flat
+post-alignment lookup also excluded the first row node itself from its text
+search. No screenshot-specific offset is needed.
+
+V4353 adds inline_table_text_rows_export_first_line_baseline RED:expected50,
+actual110 in the translated Ahem fixture. The existing sibling-baseline unit
+also fails before the repair;its assertion is not changed. The shared exporter
+now accepts the text-bearing row's first line,and the flat first-row search
+includes the row itself. V4354 passes the new test and2 border/whitespace
+controls;the pre-repair sibling-baseline unit remains FAIL,retained separately.
+This is NOT a fully green unit suite. Production rebuild succeeds2m57s.
+
+V4355/V4356 verifies original actual and reference browser differences0.
+Strict native4203->302,matching the browser's retained302;this strict failure
+is not waived. V4357/V4358 regresses10 original table baseline pages:10 exact,
+0 gaps/unverified;strict native9 PASS/1 FAIL. V4360/V4361 separately regresses154
+original anonymous-table pages:154 browser-exact,0 gaps/unverified. Strict
+native121 PASS/33 FAIL,and33 independently retained strict rows have equal
+browser/native differences. Browser parity does not convert those to WPT PASS.
+
+V4359 and V4362 update the incremental queue to1 browser RED +8 resource/protocol
+unverified,115/116 original browser gaps cleared. colors-001 is the remaining
+known browser pixel path. Full6548 remains NOT_RUN_AFTER_CANDIDATE. The next
+entry is the fractional foreground color blend diagnosis,then explicit resource
+verification and fixed-revision full validation. Diff check passes;root size
+gate has the same six outside-vendor violations. Generic anonymous-row baseline
+semantics have no Product Agent knowledge impact. No reference/assertion/tolerance
+changes,commit or push.
+
+### Fractional coverage/order diagnostics — V4363–V4369
+
+V4363/V4364 refreshes colors-001 on the current production runner:130 actual
+browser pixels,reference0,strict browser158/native84. The browser PNG retains
+SHA25688b4f5300eccadba2e3c4892a5fe0a9e7403fba843a3dcca9647cec79273b2ed.
+V4365 groups the fresh native/browser glyph pixels by red-channel coverage:
+all130 differences are green-only;every observed red value has exactly one
+browser green value. V4366 compares arithmetic variants without a production
+change. Float32 coverage division,source pre-scaling and separately rounded
+addition,followed by UNORM conversion without a float32 multiply-by255,explains
+all sampled browser colors. Half precision does not provide an exact solution.
+This mathematical match is diagnostic,not production closure.
+
+The ignored frozen-input renderer test now additionally checks independent
+float-framebuffer conversion and independently rendered coverage masks.
+V4367 float32 framebuffers with double-precision final UNORM conversion reduce
+130 to65,but are still rejected. V4368's black-mask candidate changes the glyph
+coverage and fails346 pixels;that RED is retained. V4369 preserves the authored
+paint luminance while extracting coverage from its zero-red channel:the
+calibrated-mask/pre-scaled SrcOver diagnostic is0 pixels/all channels. The mask
+comes from newly rendered native glyphs,not browser/reference pixel lookup.
+The test still FAILS at its unchanged current-production equality assertion:
+130 !=0. No diagnostic result is promoted to a production fix.
+
+Next entry:validate a general glyph-mask path retaining paint-luminance gamma
+and existing transforms/clips,then integrate pre-scaled compositing only after
+it has independent color/alpha/background controls. The current diagnostic is
+bounded to this opaque fractional foreground on white and a zero-red source;
+it cannot be copied as a universal renderer. Production remains1 known browser
+RED +8 resource/protocol unverified;strict failures retained and full6548 unrun.
+Unit builds succeed33s/32s/33s;frozen-input receipts4367–4369 intentionally stay
+FAIL. Diff check passes;size gate retains six outside-vendor violations. Only
+test/diagnostic evidence changed,with no Product Agent knowledge impact. No
+production claim,reference/tolerance change,commit or push.
+
+### Fractional glyph coverage production candidate — V4370–V4381
+
+V4370/V4371 independently rendered Alpha8 coverage with the authored paint
+luminance and pre-scaled SrcOver matches the frozen browser glyph exactly.
+The production candidate uses a glyph-bounded Alpha8 mask, preserves the
+original transform, and composites through the existing clip and opacity
+blender. Ordinary font-stack runs and shared shaped fragments both use this
+path. Byte-exact/stale metadata and unsupported paint effects retain their
+original path. No browser/reference pixel lookup or destination readback is
+used; GPU/perspective capability is not claimed by these raster checks.
+
+V4373 retains the controls' initial FAIL: 2 passed/1 failed. The transform
+control hardcoded 179 for 0.7_f32 while the independent final UNORM formula
+yields 178. Its expectation now derives from that same explicitly specified
+float-to-UNORM arithmetic, rather than accepting the measured image. V4374
+passes all three color/alpha/background, transform/clip/state, and fallback
+controls. V4377 passes the unchanged frozen browser equality assertion.
+
+The production runner builds in 2m52s. V4375/V4376 verifies the original
+colors-001 page: actual and reference native/browser differences are both0;
+strict browser/native differences are both158 and remain retained. V4378/
+V4379 verifies all22 original color-family/syntax/bidi controls exactly;
+eight strict reference failures remain unwaived. V4381 updates the incremental
+queue to0 known browser pixel gaps,116/116 cleared,8 resource/protocol
+unverified. This does not prove the unrerun full6548 corpus or eliminate
+retained strict/unit failures. Next entry: resolve the eight protocol/resource
+items, then repeat the fixed-revision full scope with strict failures separate.
+
+Diff check passes. Root size gate retains the same six outside-vendor
+violations. These generic raster changes do not change Product Agent semantic
+knowledge. Existing dirty state is preserved; no commit or push.
+
+### Explicit missing-resource protocol — V4382–V4389
+
+V4382/V4383 reruns all eight resource-unverified originals on the current
+runner. Seven have zero differences in all four comparisons; uri-013 has
+67532 actual/browser pixels despite zero native strict pixels. The prior
+missing-resource classification concealed that browser RED, not a renderer
+repair. Authored missing images and valid-but-missing URIs require ordinary
+404 responses, not successful fabricated resource bytes.
+
+The browser resource adapter now returns status404, text/plain, body
+"not found" and response hashes for ENOENT, matching native server.rs.
+Non-missing read errors still throw, and route/path/external checks remain.
+Successful responses explicitly record status200. The missing-resource test
+first failed ENOENT; all six protocol tests now pass, bound in V4389. The new
+browser wrapper forwards response.status and records each404 without turning
+it into an observation failure. No per-test path allowlist or tolerance waiver
+is used.
+
+V4385/V4386 confirms7 browser-exact originals,1 browser gap,0 resource or
+comparison unverified. V4388 moves the remaining URI case into the pixel queue:
+1 RED (uri-013,67532 pixels),0 resource/protocol unverified,116 original pixel
+gaps cleared. The additional RED comes from resolving a previously unverified
+case. Strict failures remain separate; full6548 remains unrerun. Next entry:
+uri-013 malformed URL parsing/cascade against browser, then fixed full scope.
+Diff check passes. Only the browser evidence adapter/tests changed in this
+batch; the production raster runner was not rebuilt because no Rust changed.
+Product Agent knowledge is unaffected; no commit or push.
+
+### Unquoted bad-URL recovery — V4390–V4397
+
+V4390 preserves a focused parser RED: an interior quote made the previous
+URL scanner consume the entire tail instead of stopping at its closing ')'.
+The scanner now distinguishes initially quoted functions from unquoted URL
+tokens. An unquoted/bad URL consumes to its first unescaped right parenthesis
+or EOF, retaining valid escape consumption. This follows CSS Syntax 3
+section4.3.15: https://drafts.csswg.org/css-syntax-3/#consume-remnants-of-bad-url.
+
+V4391 verifies the new boundary, bad-URL brace control and escaped-parenthesis
+data import. Its overall FAIL remains explicit: the old recovery test expects
+the following #three red rule to be swallowed, conflicting with current
+browser behavior. That existing assertion is unchanged and unwaived.
+
+V4392/V4393 original uri-013 actual/reference browser differences are0;
+browser/native strict differences both67532 remain retained. V4394/V4395
+passes all18 original URI-family pixel comparisons; two strict reference
+failures remain. V4397 updates known incremental gaps to0 and resource/protocol
+unverified to0;116 baseline browser gaps plus the formerly unverified URI
+gap have focused clearance. Full6548 is still NOT_RUN_AFTER_CANDIDATE.
+Next entry: fixed full-scope rerun, with browser parity primary and strict
+reference/unit conflicts separate. Generic CSS changes do not alter Product
+Agent knowledge; dirty state preserved, no commit or push.
+
+### Full frozen-source browser parity — V4398–V4399
+
+V4398 completed the canonical 6548-case suite at fixed WPT revision
+fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0. All370 testharness cases pass;
+native profile reftests report5315 pass/863 fail. Fresh Chrome155.0.8059.39
+comparison covers all6178 reftests: actual and reference native/browser
+pixels are identical for every case, with0 resource/protocol or comparison
+unverified and no recorded script errors. Source/dependency/untracked hashes
+and runner SHA remain bound throughout; this is not an incremental queue claim.
+
+V4399 independently verifies canonical unique membership, source/binary/input
+bindings and24712 PNG file hashes. Relation-aware strict reference parity has
+864 unique failing match cases on both native/browser sides. content-177 has
+4712 differing pixels/max55, within its existing profile allowance55/5000,
+so it passes that profile but remains zero-tolerance strict RED. Twelve
+successful mismatch cases are separate; nonzero pixels are expected there.
+The original V4398 flat strict list is retained unchanged (1752 side rows,
+including these12 mismatch cases); do not treat its length as failed cases.
+
+Receipts under target/wpt-targeted/baseline-font-position-20261003:
+full-current-census-v4398.json and full-parity-audit-v4399.json. Browser pixel
+queue is0; strict reference864 and previously recorded unit assertion REDs
+remain unwaived. No claim of raw WPT all-green or goal completion. Next entry:
+reconcile retained unit assertions against browser/spec evidence with focused
+regressions; do not alter browser-correct rendering to satisfy stale references.
+Root files:size:check retains six unrelated outside-vendor violations; no
+baseline raised. Product Agent knowledge unaffected; no commit or push.
+
+### Bad-URL assertion reconciliation — V4400–V4402
+
+V4400 freshly reproduces the retained bad_url_recovery unit RED. V4401
+evaluates all four exact source fixtures through Chrome155 CSSStyleSheet:
+the first/fourth selectors preserve green then red; second/third target
+declarations are unreachable. CSS Syntax3 section4.3.15 agrees with stopping
+at the first unescaped right parenthesis. The old all-green expectation was
+not browser-compatible. Only this test's expected vectors/comments changed;
+no production parser or raster logic changed and original RED is retained.
+Compiler test build completes; V4402 passes all four selected recovery,
+token-boundary, brace and escaped-import controls. git diff --check passes.
+V4398/V4399 remains frozen-source full evidence, not a full rerun after this
+test-only edit. Other recorded unit REDs and strict864 remain separate.
+Next entry: another retained unit RED with direct browser/spec evidence.
+Product Agent knowledge unaffected; dirty state preserved, no commit/push.
+
+### Missing-attr empty pseudo assertion — V4403–V4405
+
+V4403 freshly reproduces missing_attr_content_keeps_an_empty_pseudo_box RED:
+the old test requires an atomic InlineBlock text leaf. V4404 Chrome155
+observations instead show missing attr content as empty string/display inline,
+explicit inline-block as inline-block, and content none as non-generating.
+The test now requires the existing empty non-replaced inline Box with no
+children, and separately checks explicit atomic content and none suppression.
+No production DOM/layout/paint code changed. V4405 passes4/4 focused pseudo
+box, principal-box, table-cell and inherited-border controls; DOM test build
+and git diff --check pass. Original RED and browser evidence remain retained.
+Full V4398/V4399 receipts are frozen-source evidence, not rerun after test-only
+edits. Other unit REDs and strict864 remain unwaived; next entry is the retained
+forced-break first-line test. Root size gate retains six outside-vendor
+violations. Product Agent knowledge unaffected; no commit or push.
+
+### Forced-break first-line assertion — V4406–V4410
+
+V4406 reproduces the retained first_line_stops_at_a_forced_break RED before
+color assertions. V4407 reveals word-fragmented first/space/line (all fuchsia),
+U+2028, then second/space/line (all ordinary color). The old test incorrectly
+requires one unsplit text leaf. It now aggregates by authored SOURCE_RUN,
+checks exact text preservation and verifies every fragment color on each side
+of the break. No production lowering/layout/raster behavior changed.
+V4408 captures Chrome155's exact fixture and explicit first-line-color
+reference:0 differing pixels, both PNG hashes retained. V4409 targeted
+controls pass; V4410 first_line_ group passes11/11. DOM test compilation and
+git diff --check pass. Original REDs remain retained; current test-only source
+changes do not rewrite V4398/V4399 frozen full receipts. Strict864 and other
+unit REDs remain separate. Next entry: retained runtime inline layout REDs.
+Product Agent knowledge unaffected; no commit or push.
+
+### Concrete-font half-leading assertions — V4411–V4413
+
+V4411 freshly reproduces two runtime unit REDs: unspecified embedding font
+half-leading is41px, while old em-box fixtures require45px. Adjacent block
+baseline control passes. V4412 Chrome155 measures Ahem and serif across
+block, absolute, fixed and float placement. Ahem has30px font box,45px upper
+leading and69px baseline; serif has36px font box,42px upper leading and70px
+baseline. Placement preserves each concrete face's baseline, not one generic
+em-height estimate. Browser receipt retains all eight geometry controls.
+Only tests change: explicitly select Ahem for exact-em45px assertions, verify
+the69px baseline, and add unspecified/serif/sans concrete-font baseline
+consistency across blockified placements. Production font/layout/paint code
+is unchanged. Runtime test compilation completes in27.79s; V4413 passes5/5
+focused tests. Original RED and structured browser/regression receipts remain
+under target/wpt-targeted/baseline-font-position-20261003. git diff --check
+and diagnostic script syntax check pass. V4398/V4399 stays frozen-source full
+evidence, not a rerun of current test-only changes. Strict864 is retained and
+other unit REDs have not been waived. Root size gate still has six unrelated
+outside-vendor violations; no baseline increase or outside-vendor edits.
+Next entry: retained nested-inline wrapping/atomic baseline REDs. Product
+Agent knowledge is unaffected by these generic runtime test corrections.
+Dirty worktree preserved; no commit/push; overall zero-failure goal remains open.
+
+### Short empty atomic baseline assertion — V4414–V4416
+
+V4414 freshly reproduces five retained runtime REDs: decorated collapsible
+separator (40/60 versus23/46), raw nested normal text escaping300px,
+short empty atomic (42 versus42.5), auto inline-block (83 versus84), and
+inline-table sibling baseline. These are distinct cases, not a full unit census.
+V4415 Chrome155 independently measures serif100/100 at line top50: text
+top42, font box115, atomic top112 and line height100. The previous half-pixel
+expectation is incompatible with browser upper-leading allocation. Only the
+short-empty test changes: declare explicit line height and require browser
+42/112 coordinates. Production layout/paint is untouched. Runtime test build
+completes23.97s; V4416 passes4/4 short-empty, concrete-font, decorated-empty
+and wrapped-line-local baseline controls. RED, browser and regression JSON
+receipts retain the fixed WPT revision under the existing targeted directory.
+The other four V4414 failures stay open, as do strict864 and other uncounted
+unit REDs. Frozen V4398/V4399 full evidence is not rewritten or described as
+a current rerun. Root size gate retains six unrelated outside-vendor failures;
+git diff --check and browser helper syntax check pass. No Product Agent
+knowledge impact, outside-vendor changes, commit or push.
+Next entry: decorated collapsible separator's real three-line projection RED.
+
+### Decorated separator fitting versus baseline grouping — V4417–V4420
+
+V4417 retains the first production candidate's unchanged40/60 RED. Its
+negative fitting margin did not cancel content-box padding. V4418 confirms
+the raw fixture is eligible for simple wrapping and the preceding image fills
+exactly130px; temporary test diagnostics are removed afterward. V4419 freshly
+repeats six independent Chrome155 controls with decoded SVG images: Arial
+second image23/parent46 and Times24/48 for absent, vertical-only and1px
+horizontal decoration. The decorated trailing span remainsx130/width2.
+V4420's border-box candidate restores spanx130/width2 and removes the third
+flex line, but later baseline projection incorrectly merges both images at
+y-33, with parent40. Pure-image control remains green. This is not a fix.
+Both production candidates were removed with scoped patches. Current tracked
+crates/tools diff SHA is restored to
+e7b6fae9de81027aac2eafb5f14d9eab515fdc62a091623ed47ef55672f9bec9;
+the untracked nested-inline test SHA is restored to its pre-diagnostic value.
+The latest unit executable still contains the rejected candidate: rebuild it
+before future tests, do not use it as current baseline evidence. All RED and
+browser JSON receipts remain retained; git diff --check passes. No failures
+are waived, no full rerun/commit/push occurs. Next entry is baseline grouping
+of a hanging decorated inline: paint extent must not merge separate lines.
+Root size gate retains six unrelated outside-vendor violations. Generic
+diagnostic work has no Product Agent knowledge impact.
+
+### Hanging separator shared-line candidate — V4421–V4424
+
+V4421 retains the rejected shared-line-width candidate: pure-image control
+passes but decorated separator still reaches the legacy merged-line fallback.
+The shared collector's wrap-height recheck incorrectly treats a collapsed
+space in a2px decoration box as multiline. The candidate excludes collapsible
+space/tab-only runs from that recheck (preserved whitespace remains checked),
+retains their authored strut and hanging paint item, and excludes a separator
+after an exactly full line from that line's fitting-width sum. The Taffy
+border-box hanging advance retains inline edges without adding a flex row.
+V4422 passes22/22 tests including the original23/46 geometry and20 shared-line
+metric controls. An added independent browser paint-box assertion catches a
+remaining V4423 RED: final whitespace projection clears2px decoration width.
+It now removes only glyph advance, retaining horizontal padding/border and
+using only removed width for alignment adjustment. V4424 passes24/24 tests,
+including both stateless/cached paths, spanx130/y-28/width2/height82, parent46,
+second-image23, leading separator and short-atomic controls. Runtime test
+build succeeds19.99s; git diff --check passes. Source/binary/revision receipts
+remain under the existing targeted directory. This is a production candidate,
+not WPT pixel acceptance: the production runner must be rebuilt and focused
+original inline/white-space/image cases compared against Chrome next.
+V4398/V4399 is frozen earlier-source evidence, not current-candidate all-green.
+Strict864 and remaining unit REDs are unwaived. Six unrelated root size-gate
+violations remain; no outside-vendor edits, Product Agent knowledge impact,
+commit or push. Overall zero-failure goal remains active.
+
+### Hanging separator production parity acceptance — V4425–V4427
+
+Fresh production runner build succeeds2m07s. V4425 runs319 pinned originals:
+the full linebox family plus every canonical white-space-named case. Native
+script tests pass7/7; original reference profile yields90 pass/229 fail.
+Fresh Chrome155 actual/reference comparisons pass312/312 pixel-exact, with
+zero browser gaps, resource-protocol or comparison-unverified rows. Strict
+reference failures remain229 in this scope, not waived. V4426 additionally
+passes4/4 line-leading and full-line trailing-separator controls. V4427 audits
+source/untracked/dependency/runner binding, all319 report rows and624 native
+PNGs against the frozen V4398 run: zero changed report rows or captures.
+Current production runner SHA is
+65087170201a8481cf3684e706ad5c91fa2cf69471ccc488acc4313d3f81b88a;
+tracked crates/tools diff SHA is
+ba7dcf22468bc985d746427e4b8fe27a0c6e3513d9429489f1dede8a1376600f.
+The new hanging-decoration synthetic RED is cleared with browser-bound full
+box geometry in both layout paths and focused canonical pixel regressions;
+this does not claim any original strict reference failure was fixed. Full6548
+has not been rerun after the production candidate, so global strict864 and
+global browser0 remain earlier-source evidence only. git diff --check and
+new orchestration-script syntax checks pass. Preserve dirty scope, six
+unrelated root size-gate failures and original REDs. No Product Agent knowledge
+impact, outside-vendor changes, commit or push. Next entry: retained raw
+nested normal wrapping/nowrap unit RED, then atomic/table baseline assertions.
+
+### Raw nested inline wrapping candidate — V4428–V4430
+
+V4428 freshly reproduces the retained nested_normal_inline_text unit RED:
+normal sentence escapes its300px containing line at704.7656px, height22.
+V4429 Chrome155 independent nested-span fixtures verify normal sentence
+three-line wrapping (max glyph width298.03125, block height57.5625), nowrap
+and pre single-line704.765625px, and a long unbroken normal word overflowing
+on one line. This diagnostic is not original WPT acceptance.
+The candidate gives a raw unsplit passive inline text leaf under another
+inline its containing-width-constrained preferred size, retaining its
+min-content floor and existing nowrap/pre paths. It does not cap unbroken
+words or rewrite DOM lowering. V4430 passes5/5 tests: the RED's four text
+variants in both stateless/cached layout paths, hanging separator, nested
+normal under outer pre, later pre continuation and nested nowrap continuation.
+Runtime test build succeeds22.40s; git diff --check and browser diagnostic
+syntax checks pass. Source/binary/revision JSON receipts are retained under
+the existing targeted directory. Production runner rebuild is started;
+pixel regression is pending and V4425/V4427 describes the preceding candidate,
+not this source. Strict references, unrelated unit REDs and full6548 objective
+remain open. Six outside-vendor size-gate failures are unchanged. No Product
+Agent knowledge impact, outside-vendor edits, commit or push.
+Next entry: finish the active production build, then rerun focused original
+white-space/linebox and nested-inline mixed-flow browser comparisons.
+
+### Nested-wrap expanded regression and source-plan boundary — V4431–V4434
+
+Production build succeeds1m59s. V4431 runs470 pinned originals: linebox,
+white-space-named cases and both block-in-inline families. Script tests pass
+15/15; Chrome155 comparisons yield454/455 exact, one genuine new browser gap
+in white-space-mixed001 actual4209px (reference0). Native reference profile
+is235 pass/235 fail. V4432 independently checks source/dependency/runner binding,
+1820 image hashes, canonical selected membership and910 native PNGs: one
+changed original actual capture/report row, all others identical to V4398.
+The candidate is therefore not accepted. Its new width branch can resize
+authored DOM text fragments independently of their shared shaping/line plan.
+The refined candidate excludes SOURCE_RUN-marked fragments, preserving that
+existing authority; only raw unmarked unsplit inline text takes the new path.
+V4434 passes5/5 focused wrapping/nowrap/continuation controls after this change;
+unit compilation succeeds22.34s. New production runner rebuild is active
+(tool session84851); first next action is poll that same handle, then rerun
+white-space-mixed001 and the expanded focused scope with new receipt versions.
+V4431/V4432 is preserved RED evidence, not silently relabeled or overwritten.
+V4433 also reconfirms the two retained auto-inline-block and inline-table
+baseline unit REDs. Current tracked crates/tools diff SHA is
+85f1e9635ba98d47cd21cf81fb7abc331a1c87ad3bb9e23309b0630b8e323214.
+Current pixel clearance is pending; strict235 in this scope and full6548
+objective remain open. git diff --check and new helper syntax checks pass;
+six unrelated root size violations remain. No Product Agent knowledge impact,
+outside-vendor changes, commit or push.
+
+### Mixed white-space regression clearance — V4435–V4438
+
+Refined production build completes2m04s. V4435 reruns only the original
+white-space-mixed001: actual and reference both browser pixel-exact. Native
+strict reference still fails125715 pixels, equal to Chrome strict; do not
+waive it. V4438 independently binds source/runner/native report and four image
+hashes, confirming the V4431 actual4209-pixel RED is now0 and reference remains0.
+V4437 passes4/4 authored source endpoint/shaping controls. The refined raw
+inline unit candidate remains green in V4434; this is not full-suite closure.
+V4436 starts the same470-case expanded canonical scope after single-case
+clearance, with frozen current source85f1e9635ba98d47cd21cf81fb7abc331a1c87ad3bb9e23309b0630b8e323214.
+It is currently live (tool session96810), native progress100/470 observed.
+Resume that same handle next; do not restart from a progress counter or infer
+its final result. Expanded pixel acceptance and full6548 remain pending.
+Original RED receipts remain unchanged. Root size check still reports six
+unrelated outside-vendor violations; helper syntax and git diff --check pass.
+No Product Agent knowledge impact, outside-vendor edits, commit or push.
+
+### Expanded acceptance completed and atomic fixture reconciliation — V4436–V4443
+
+The previously live V4436 process completed with exit0. V4439 independently
+audits470 canonical cases,1820 image hashes and binding to production source
+85f1e9635ba98d47cd21cf81fb7abc331a1c87ad3bb9e23309b0630b8e323214:
+455/455 Chrome pixel-exact,15/15 harness pass, zero changed native report
+rows and910 native PNGs identical to frozen V4398. Strict reference235 remains
+retained, not waived. The full6548 suite has not run after this candidate;
+global strict864/browser0 remains earlier-source evidence, not current closure.
+
+V4441 freshly retains the auto-inline-block83vs84 RED. V4440 Chrome Ahem20/20
+independently proves wrapper84, atomic top28 and text top52. Only that test's
+font/explicit line-height fixture changes; original geometry assertions remain.
+Runtime unit build succeeds20.70s; V4442 passes4/4 relevant leading/atomic
+controls. Its source ea3ef5742d5cf4ad6ea4069c20bed1fbe8a0730a28a9bf90d99d2b4d5aa0472c
+differs from accepted production only in the test fixture. V4443 freshly
+retains inline_table_uses_its_first_cell_text_as_the_sibling_baseline RED;
+no global unit inventory or all-green claim is made.
+
+### Inline-table fixed-font diagnostic — V4444–V4447
+
+V4444 rejects a fractional Ahem16/1.2 assumption: Chrome glyph boxes snap to
+62 rather than62.6. Preserve that diagnostic failure, do not reinterpret it as
+canonical pixel acceptance. V4445 uses integral Ahem16/20 leading and proves
+cell top48 plus border4/padding9 gives glyph top63 for the first cell and both
+inline siblings. The unit fixture now pins this font/line-height and tests
+the browser-bound63 projection plus idempotence; production is unchanged.
+V4446 exposes floating-point63.000004 and an empty filter selection, so it is
+INVALID_EMPTY_SELECTION, not PASS. Assertions now use0.00001 tolerance,
+stricter than the original0.01; the empty filter will be replaced by real
+first-row baseline controls. V4447 freshly retains another RED:
+bottom_aligned_inline_box_uses_its_em_box_without_shifting_children,
+height25 vs expected20. It remains the next repair entry after table regression.
+Root size check reports the same six unrelated outside-vendor violations.
+No Product Agent knowledge impact, outside-vendor edits, commit or push.
+
+V4448 closes the table fixture RED:5/5 nonempty distinct first-row baseline
+controls pass, including border exclusion, whitespace and empty-table fallback.
+The rebuilt unit binary completed19.43s; source diff SHA is
+85a03754b17ba9ffd845054aaa7c2b304bcebb49bb8b52bf56b1df5c494ee264.
+Browser V4445 and original RED V4443 remain separately discoverable under
+target/wpt-targeted/baseline-font-position-20261003. git diff --check passes.
+No production change or new canonical full-suite acceptance is claimed;
+V4447 bottom-aligned inline is the next retained RED, not a completed repair.
+
+### Bottom-aligned inline owner baseline candidate — V4449–V4456
+
+V4449 rejects the old80px owner-top assumption. Chrome155 V4450/V4451 and
+asserted V4455-1/V4455-2 fixtures show Ahem20 owner height20/top84 with its
+bottom-aligned children at80/0/80, for both20px and40px owner line heights.
+An authored flex control blockifies that owner to height100: the raw layout
+unit explicitly marks its internal inline formatting packet instead of
+pretending those authored-flex semantics are equivalent.
+V4452 retains a browser-bound native RED: owner80 versus Chrome84. The
+candidate exports the bottom-aligned child group's bottom as owner baseline,
+projects its font box by ascent plus signed half-leading, and leaves children
+at their original layout positions. Non-bottom child groups keep the prior
+path. No case names, pixel tolerances or reference waivers enter production.
+
+V4453 reveals three neighboring unit REDs. The production candidate is
+temporarily removed and V4454 independently reproduces all three unchanged:
+mixed_font_inline_centering_preserves_explicit_line_edge_alignment(-5vs-4.5),
+bottom_aligned_inline_places_anonymous_text_on_the_large_child_line(top variant),
+empty_bottom_aligned_atomic_keeps_font_strut_baseline(8vs6.5).
+They are preexisting retained failures, not accepted or discarded controls.
+The candidate is restored; V4456 passes4/4 distinct targeted units, including
+both owner leading variants, tall grouped siblings, table and hanging separator.
+Runtime unit build succeeds20.25s. Source diff SHA is
+1b89c250fcd3e4824d78fad3e57cb9f6d5af5557196d0aa9b9d3a3dbdd254dd9.
+Production rebuild is active(tool session80556); next poll the same handle,
+then run V4457 expanded470-original parity and V4458 independent image audit.
+Canonical pixel acceptance is pending. Full6548/global strict864 remains open.
+Root size gate has six unrelated outside-vendor failures. Helpers and
+git diff --check pass; no Product Agent knowledge impact, commit or push.
+
+### Bottom-owner focused pixel acceptance completed — V4457/V4458
+
+The preceding production build completes2m05s. V4457's single process
+(session16892) completes exit0,470 canonical cases:455/455 Chrome pixel-exact,
+zero unverified comparisons and15/15 harness pass. Native profile is235pass/
+235fail; relation-aware strict235 remains retained, not waived.
+V4458 independently verifies1820 image hashes, exact canonical membership,
+source/untracked/dependency/runner/native-JSON binding, zero changed report
+rows and910 native PNGs identical to frozen V4398. Accepted production source
+diff SHA is1b89c250fcd3e4824d78fad3e57cb9f6d5af5557196d0aa9b9d3a3dbdd254dd9;
+runner SHA is2327d234b534be9407213130e1184d25f9b366e28a37624407aa7a84ce129ead.
+This clears the raw bottom-owner browser-bound RED without changing originals'
+existing pixels; it does not clear any original strict reference failure.
+The full6548 suite has not run after this source; global strict864/browser0
+remains prior-source evidence only. The three independently confirmed old
+unit REDs in V4454 remain open; next entry is mixed-font fractional leading,
+then anonymous nested alignment and empty bottom atomic projection.
+All referenced processes are terminal. git diff --check and helper syntax
+checks pass. Preserve all dirty scope, original REDs and six unrelated root
+size-gate violations. No Product Agent knowledge impact, outside-vendor
+changes, commit or push; the zero-failure goal remains active.
+
+### Mixed leading and anonymous-text fixture reconciliation — V4459–V4466
+
+V4459 freshly retains mixed-font RED(-5vs-4.5). V4460 Chrome155 independently
+proves serif60/75 font boxes69/86, parent height75 and glyph tops-5/-6/-5.
+Only the unit expectation changes to integral signed upper leading; production
+already agrees. Runtime unit rebuild succeeds20.60s. V4463 passes4/4 controls.
+
+V4461 rejects another old assumption: anonymous X text around a100px child
+does not stay80px below that child for both top and bottom alignment.
+V4462 diagnostics and asserted V4464 Chrome fixtures prove top variant offset0
+and bottom variant offset80. The existing unit now distinguishes the two
+semantic cases and tightens tolerance from1px to0.01px; production is unchanged.
+Rebuild succeeds19.47s. V4465 passes4/4 distinct leading, anonymous/grouped
+alignment and owner-projection controls. Current source diff SHA is
+6874d17ef1646d266930e8b67bab92e32e4a64d972e2b01e220a6c96bbdb6351;
+the two changes after V4457 pixel acceptance are test-only. Original REDs
+remain unchanged; diagnostic and asserted receipts are separate.
+
+V4466 freshly retains empty_bottom_aligned_atomic_keeps_font_strut_baseline:
+manual text y8 vs legacy expected6.5 at height5/margin0. This is next entry;
+first verify browser signed-leading and the early shared-baseline ownership
+guard, not merely rewrite that expected value. No exhaustive unit inventory
+or fresh full6548 is claimed. Original strict235(focused)/864(prior full)
+remains retained. Root file-size check still reports six unrelated violations.
+No Product Agent knowledge impact, outside-vendor edits, commit or push.
+
+### Empty-bottom atomic ownership candidate — V4467–V4472
+
+V4467 independently proves Chrome155 serif10/10 text tops6/6/16/8/6 for
+height/margin pairs(5,0),(10,0),(20,0),(10,2),(10,-2), with exact line heights
+10/10/20/12/10 and bottom margin edges. The test pins explicit line-height
+and integral signed leading; V4468 still fails native text8 versus browser6.
+The actual defect is the legacy shared-baseline guard: one baseline text
+trivially agrees with itself beside a bottom atomic, incorrectly proving
+whole-line ownership before the strut is projected. Mixed-alignment packets
+now require the full inline-line-metrics is_projected check; the legacy
+equal-baseline fallback only applies when every item is baseline-aligned.
+No WPT case names, reference waivers or pixel tolerance changes enter production.
+
+V4469 passes5/5 targeted units including all five atomic height/margin variants,
+unprojected/projected ownership and idempotence. V4472 passes23/23 distinct
+shared line metrics, baseline-offset, unbroken-word and wrapped packet controls.
+Runtime unit build succeeds19.62s. Source diff SHA is
+7e93c0b5edb3cdffae2beb0541896123ecc7ad72207bc47cd180cd09b57f8b70.
+Production rebuild completed1m59s(session7164 exit0); V4470 expanded470-original
+pixel comparison is active(session31879). Resume this same comparison handle,
+then run V4471 independent hash audit. Pixel acceptance remains pending;
+V4457/V4458 covers the previous candidate.
+Root size gate retains six unrelated violations; git diff --check and helpers
+pass. No Product Agent knowledge impact, outside-vendor changes, commit or push.
+The previously identified three runtime REDs have focused clearance, not an
+exhaustive unit-suite claim. The legacy malformed_media compiler RED remains
+the next historical entry to freshly verify; strict235/prior-global864 and
+full6548 completion remain open.
+
+### Empty-atomic pixel acceptance and next compiler RED — V4470–V4474
+
+V4470(session31879) completes exit0:455/455 Chrome pixel-exact,15/15 harness
+pass, zero gaps/unverified comparisons. V4471 independently checks1820 image
+hashes, canonical membership and source/runner/native-JSON binding; all910
+native PNGs and470 report rows equal frozen V4398. Strict235 is retained.
+Accepted production source diff SHA is
+7e93c0b5edb3cdffae2beb0541896123ecc7ad72207bc47cd180cd09b57f8b70;
+runner SHA isc2a996c6792f91124f5191e94fb72c45a8374cf567716d03d3a6e73cbc747819.
+Full6548 has not run after this candidate; prior-global strict864/browser0
+does not prove current full closure. Original RED and reference lists persist.
+
+Fresh compiler build succeeds1m17s. V4473 reproduces the retained malformed
+media legacy unit RED(green+red declarations versus green only); both trailing
+declaration and unknown-at-rule recovery controls pass. V4474 Chrome155
+independently confirms red/green/green for its exact three selector fixtures.
+After the pixel process and audit terminate, only this test is renamed to
+malformed_media_and_import_follow_browser_declaration_recovery and its first
+declaration vector corrected to green+red. The other two declarations and
+invalid-import rejection remain asserted. Production parser is unchanged.
+Compiler test rebuild is active(session30486); resume it, then run a focused
+new-name/recovery/bad-URL regression with a new receipt. Do not count a stale
+binary or empty renamed filter as PASS. Preserve existing dirty worktree;
+no outside-vendor edits, knowledge impact, commit or push.
+
+V4475 completes the corrected compiler regression5/5; V4476 runs the affected
+esm_css module41/41, zero failures. Rebuild completes43.76s. The source diff
+SHA iscdc7fd49748ec73eecf310fe0fb179574356093f6e825cf67527d30913fbe585;
+the only change after accepted V4470/V4471 is the compiler test reconciliation.
+All processes in this batch are terminal. git diff --check and helper syntax
+checks pass. Existing root size violations remain six, outside this scope.
+The identified three runtime unit REDs and legacy-media compiler RED now have
+focused clearance; this is not an exhaustive old-RED inventory or full-suite
+closure. Next entry: reconcile the retained unit receipt frontier before the
+requested full6548 cycle. Strict reference failures remain separately retained,
+and the goal stays active with no commit or push.
+
+### Historical unit frontier reconciliation — V4477–V4483
+
+V4477 reads1254 soft-wrap unit receipts, hashes each input and normalizes
+unmarked runtime binaries/standalone probes to unique current test names.
+The legacy media rename is explicit and bound to V4473/V4474/V4475, not a
+silent deletion of its RED. The normalized last-observation frontier is34:
+26 listed current tests and8 not-listed entries requiring source audit.
+This is a receipt frontier, NOT a current full-suite failure census.
+Runtime unit rebuild succeeds33.10s; DOM unit build is current0.06s.
+V4478/V4479/V4480 freshly rerun only those26 formerly failed tests, not all
+tests: runtime12fail/1pass, DOM7fail/1pass, compiler5fail/0pass.
+The formerly failed table-cell collapsible-edge and DOM float-order tests
+pass now. The other24 have fresh RED receipts and are not claimed fixed.
+Compiler failures include stale generated-code pattern assumptions and a
+test harness using Value::Number as a Rust pattern after it became an
+associated function; classification does not waive the failure.
+
+V4481 Chrome155 independently verifies authored inline-table display,
+Before/Part/End/After order and its first-row baseline shared with neighboring
+text. Only the old DOM test's InlineFlex expectation changes to InlineTable;
+production lowering remains unchanged. DOM unit rebuild succeeds27.04s.
+V4482 passes3/3 principal-display/table-row/float-order controls.
+V4483 refreshes the frontier from1258 receipts:31 retained entries, comprising
+23 freshly failing listed tests(runtime12,DOM6,compiler5) and8 not-listed
+entries(runtime6,DOM2), still requiring source/rename verification.
+Current source diff SHA is
+f4777dd9da5be2a817e9cac83f2126fc4361cd7e8cfb57919177300088d995d4.
+The one change after V4470 pixel acceptance is test-only; do not substitute
+the cleared three-runtime batch for closure of the historical inventory.
+Next entry: inline_wrap_discards_separator_with_only_vertical_decoration
+(fresh20/40 vs control23/46 geometry), then the remaining exact frontier.
+Full6548 has not rerun; original strict reference failures remain separately
+retained. Root size gate retains six unrelated outside-vendor violations.
+All batch processes are terminal; git diff --check and helper syntax pass.
+No Product Agent knowledge impact, outside-vendor edits, commit or push.
+
+### Collapsed vertical decoration font strut — V4484–V4492
+
+V4484's new browser diagnostic accidentally omitted doctype and observed
+quirks-mode40px; it remains a failed diagnostic, not standards acceptance.
+V4485 repeats the exact left-padding variants with doctype and an explicit
+CSS1Compat assertion. Standards-mode Chrome155 places the following image
+at23px and the parent at46px for no separator, zero padding and1px left padding.
+Nonzero decoration hangs at x130,y-28 with height82; it adds no fitting advance.
+The runtime fixture now explicitly uses Arial20/20 with normal-leading false,
+and checks zero-width omission separately from the nonzero paint rectangle.
+V4486 retains the newly exposed missing-zero-width-layout assertion RED.
+V4488 then reproduces the real20/40 versus23/46 line-metric RED with that
+output boundary respected; the horizontal-decoration control still passes.
+
+Production soft_lines previously rejected a discarded separator merely for
+vertical padding, border or margin, disabling both replaced lines' font struts.
+The missing-layout separator branch now requires zero horizontal edges and
+margins, while retaining the existing collapsed-whitespace/alignment guards.
+Vertical decoration does not contribute fitting width or inline line height;
+the authored font strut still participates. No case-specific fallback is added.
+Runtime unit builds succeed33.60s,18.97s and19.44s respectively.
+V4489 passes22/22 separator and shared-line-metric controls.
+V4492 hashes1261 receipts and retains30 unresolved entries:
+22 freshly failing listed tests(runtime11,DOM6,compiler5) and8 not-listed
+entries requiring source audit. Source diff SHA:
+276c591581bb12a20b0f404596cbbbadd6bf7d83ef8ad64cfaf7e7f2314851cd.
+The production pixel runner rebuild succeeds2m02s. V4490 covers470 pinned
+linebox/white-space/block-in-inline originals:455/455 Chrome pixel-exact,
+15/15 harness pass,235 strict-reference failures retained without waiver.
+V4491 independently verifies1820 image hashes, source/dependency/runner
+bindings and membership; all470 native rows and910 native PNGs are unchanged
+from V4398. Runner SHA:
+383085f02193d92219b6bdb1254e8b53fa91178431c3d913a9b5fa6ba423f65a.
+Both batch processes are terminal. Full6548 has not rerun after this candidate;
+the earlier864 strict-reference failures remain separately retained.
+Next entry: compiler generated_async_entry_waits_for_runtime_tla_and_propagates_rejection
+(V4480 retains E0164 in the generated test harness's Value::Number pattern).
+Root size gate retains six unrelated outside-vendor violations.
+No Product Agent knowledge impact, outside-vendor edits, commit or push.
+
+### Generated module execution fixture reconciliation — V4493–V4498
+
+V4493 freshly retains E0164 in the runtime-TLA fixture: Value::Number is now
+a Core associated constructor, not an enum pattern. Use as_number() while
+retaining the initial Pending, fulfilled7 and rejected runtime-tla-failed checks.
+Compiler unit rebuild succeeds44.27s. V4494 executes that generated program
+successfully and freshly retains the same E0164 in the runtime live-slot fixture.
+Its numeric assertion likewise uses as_number(), preserving result2 and exactly
+one runtime-module evaluation. Rebuild succeeds44.03s; V4495 passes both programs.
+
+V4496 freshly retains the other three compiler REDs. Native module-init
+property assignment is coalesced into an AOT segment, not the old set_property
+call spelling; preserve the coalesced live-binding checks and enforce Core-only
+output, then execute the editor fixture and assert result4. Its numeric pattern
+also uses as_number(). Native TLA uses intrinsics::await_value rather than the
+retired __w3cos_async_function_await helper spelling; keep evaluation caching,
+Promise rejection and entry sequencing checks. Strengthen the rejection fixture
+by assigning reached="main" inside main(), so reached="before" proves neither
+the post-await continuation nor main ran. No production generator is changed.
+Compiler rebuild succeeds44.21s. V4497 compiles and executes all five generated
+programs successfully: editor4, ordered SDA4, rejection tla-failed with before,
+runtime-TLA pending/7/rejection, and live-slot2 with one cached evaluation.
+
+V4498 hashes1266 unit receipts. Remaining frontier:25 retained entries,
+17 freshly failing listed tests(runtime11,DOM6,compiler0) plus8 not-listed
+entries(runtime6,DOM2) requiring source audit. Source diff SHA:
+ba5a26fc7af8f39e4ba28aeb9dfb6180c4c3b8e963543eee0132e7292c7c72e7.
+Compiler binary SHA:
+5567982b219a21c83927dbffc7b9706ce9a5d37989910337d6c39373eaf4219a.
+Next entry: normal_inline_inside_pre_block_can_wrap_after_a_full_line
+(V4478 retains an absent-layout unwrap; verify whether collapsed whitespace
+or actual geometry is the failing boundary before changing the expectation).
+No pixel rerun for these test-only changes; V4490/V4491 is prior production
+pixel acceptance, not a fresh full6548 result. Strict864 remains independently
+retained. All batch processes are terminal; git diff --check passes.
+Root size gate still has six unrelated outside-vendor violations.
+No Product Agent knowledge impact, outside-vendor edits, commit or push.
+
+### Pre/normal fragments and full-width empty atomic — V4499 onward
+
+V4499 freshly retains the pre/normal test's missing old " X" leaf RED.
+V4500 independently checks standards-mode Chrome155 with pinned Ahem:
+80px/pre owner with normal continuation places X at8/28, parent40;
+pre and nowrap controls keep X at108/8, parent20, as does120px/normal.
+The test selects the actual lowered word X and tightens its exact20px line
+advance, width and height; production is unchanged for this repair.
+Runtime rebuild succeeds33.41s; V4501 passes4/4 pre/normal/separator controls.
+
+V4502 freshly retains the full-width atomic fixture's old unsplit-text lookup
+RED. V4503 records independent Chrome geometry; V4504 corrects the last-word
+range and asserts full rectangles: empty atomic23/29/550/0, text119/67/
+137.171875/18, image256.171875/33/96/48, float23/33/96/48, parent18/10/560/80.
+The test now verifies source-word order and the union of shaped fragments,
+not one unsplit leaf. V4505/V4506 expose a genuine zero-height atomic baseline
+RED: native y15 versus Chrome29; following text/image/float already agree.
+This box is invisible, so prior pixel parity did not prove its geometry.
+
+The first production candidate incorrectly expected the synthetic break
+inside the atomic; V4507 retains its failed RED plus four passing controls.
+Source lowering shows an adjacent sibling break. The corrected projection
+places the first empty baseline-aligned InlineBlock preceding that marked
+full-width break on the enclosing font strut's baseline. It derives font
+metrics and content top, not a hard-coded14px displacement. V4508 passes
+five geometry/float/forced-break/pre controls after the correction.
+V4509 retains a diagnostic failure from comparing an intermediate forced-line
+pass with final baseline-projected text geometry; its other24 controls pass.
+The test now checks the owned empty-atomic projection's idempotence and both
+initial and reused complete LayoutEngine results against stateless layout.
+V4513 passes25/25 controls, including the atomic's own projection idempotence
+and initial/reused complete LayoutEngine geometry. Runtime rebuild succeeds
+28.23s. The source is frozen at
+8f686903ee567cf62f7e03e32fe0503903538838e0775d9b7b091e422dcf56c2;
+the final runner rebuild succeeds2m09s (earlier candidate build2m18s).
+V4510 covers470 pinned originals:455/455 Chrome pixel-exact,15/15 harness
+pass,235 strict-reference failures retained. V4511 independently verifies
+1820 image hashes and source/runner/dependency/membership binding; all470
+native rows and910 native PNGs remain identical to frozen V4398.
+Runner SHA: bf8731414a621d9dba5aab285e702efe93d30308b5c49235063cd0e4b77618f6.
+V4514 hashes1275 unit receipts and retains23 frontier entries:
+15 freshly failing listed tests(runtime9,DOM6) plus8 not-listed entries
+requiring source audit. All batch processes are terminal; diff checks pass.
+Next entry: empty-atomic margin/alignment boundary controls, then
+table_cell_inline_padding_does_not_move_the_content_line (fresh31.59375vs32).
+No full6548 closure, reference waiver, Product Agent knowledge impact,
+outside-vendor edits, commit or push. Root size gate has six unrelated violations.
+
+### Empty atomic margin/alignment boundaries — V4515–V4526
+
+V4515 records seven independent standards-mode Chrome155 geometries;
+V4516 independently asserts exact atomic/image/float/text/parent rectangles.
+Controls cover baseline, positive top/bottom margins, negative top margin,
+top, bottom and middle alignment. V4517 preserves four boundary RED cases.
+The production projection derives the first line's ascent/descent and used
+height from the parent strut and atomic margin box; top/bottom/middle use
+their own alignment semantics. V4518 preserves the remaining middle RED:
+native25.410156 versus Chrome25.40625. Truncating the used atomic position
+at the existing LayoutUnit boundary fixes this without changing font metrics
+or introducing a pixel tolerance. V4519 passes24/24 targeted tests, including
+all seven browser-derived boundary variants and20 inline metrics controls.
+
+The frozen production runner rebuild succeeds2m32s. Source diff SHA:
+469657af8af2c5d08c394a0daf224c10e1c3106e57c976f27ad6d929a501d268.
+Runner SHA:
+00c5804a4943f35973584514fc03f4d53c3b1b3a84a7a83d98170057b10872b0.
+V4520 executes470 pinned originals:15/15 harness pass; native profile
+235 pass/235 fail. Chrome reports454/455 exact and one246-pixel gap in
+white-space-processing-014.xht, located in the introductory paragraph.
+V4521 verifies1820 image hashes, membership and source/runner/dependency
+binding: all470 native result rows and910 native PNGs are unchanged from
+V4398. The original browser capture has236 strict-reference failing cases;
+this differs from the prior235 and is retained, not silently overwritten.
+
+V4525 repeats only that failing original in three independent Chrome sessions;
+all three are pixel-exact against the unchanged native image and have zero
+strict-reference pixels. V4526 independently verifies12 image hashes and
+the binding, preserving the original246-pixel gap. Browser capture variation
+is observed; its root cause is UNPROVEN. These repeats do not turn the V4520
+batch into a clean455/455 receipt or erase its strict failure record.
+
+V4522 freshly preserves table_cell_inline_padding_does_not_move_the_content_line
+RED31.59375 versus old32. V4524 checks real standards-mode table DOM with
+serif/sans-serif and0/160px top padding: padding does not move text or grow
+the cell. Chrome serif text/inline y192, padded inline y32; sans-serif text
+y190, padded inline y30; cell height19.1875 in all four controls. This is
+independent browser evidence, not proof of the synthetic projection fixture's
+coordinates. Next entry: verify table projection's floating half-leading
+against browser used upper-leading, then repair the proven minimal boundary.
+V4523 hashes1279 unit receipts and retains23 entries:15 listed RED and8
+not-listed source-audit entries; the cleared new atomic matrix adds no RED.
+All processes are terminal; no full6548 closure, reference waiver, Product
+Agent knowledge impact, outside-vendor edits, commit or push. Root size gate
+still fails on six unrelated outside-vendor files; baseline is unchanged.
+
+### Table inline padding used leading and local em margins — V4527–V4538
+
+The first new test build fails because the test used the wrong Text variant
+field; this is repaired before execution. V4527 preserves the initial inert
+parser fixture failure: its stylesheet block was not applied in that entry,
+so its default-style geometry is not target rendering evidence. Equivalent
+inline styles are independently browser-checked in V4528: all four serif/
+sans-serif and0/160px-padding coordinates match V4524 exactly. V4529 retains
+the diagnostic comparison of a200px native text layout slot with a shaped
+DOM Range width. The new unit now compares cell geometry and vertical font
+box coordinates, keeping zero tolerance rather than conflating slot and ink.
+Both stateless and retained complete layouts already match the four vertical
+controls. The old synthetic test implicitly assumed a16px font box although
+its actual default font geometry is different; it now explicitly uses the
+browser-proven serif16/1.2,18px font box and19.1875px cell line.
+
+V4530 retains the real direct projection RED: inline y32.59375 versus
+Chrome32. The production correction uses the existing inline_upper_leading
+helper instead of a floating half-leading in
+project_table_cell_inline_vertical_padding. V4531 passes24/24 tests including
+the direct projection, four parsed-font/padding variants in both pipelines,
+row-height, empty-atomic controls and20 inline metrics tests. Runtime unit
+builds succeed27.16s/25.65s/29.94s/24.30s across fixture/candidate stages.
+
+The production runner rebuild succeeds2m12s, frozen source diff SHA:
+78875c400fd4d6d33f4a4764ad08744a787939e3ddbf10c1c6ad51c389101f4a.
+Runner SHA:
+37aae20de3800eead2ef1b4fe70f3548649260ebc7c72c9fa0f60ed2a78cb2b0.
+V4532 selects166 pinned table originals with padding/inline/baseline coverage
+plus the retained white-space-processing-014 browser-gap control. All167
+are Chrome pixel-exact; native profile137 pass/30 fail, with30 strict-reference
+failures retained. V4533 independently verifies668 image hashes and all
+source/runner/dependency/membership bindings. All167 native rows and334 PNGs
+remain identical to V4398. The former browser-gap control is exact here;
+the original V4520 failed capture and unproven root cause remain retained.
+
+V4534 retains22 unit frontier entries (14 listed RED plus8 source-audit).
+V4535 freshly reproduces the old table-em test's32-versus16 RED. Independent
+V4536 browser controls show em margins use the child's computed font size:
+table32px/1em gives x32/y32; float32px/0.5em1em gives x32/y16, not equal y.
+The table test is renamed to use_the_table_font and asserts these exact
+positions; production is unchanged in this second repair. V4537 passes4/4
+controls after a24.87s unit rebuild. V4538 explicitly maps the old test name
+to its replacement with RED/browser/PASS evidence and hashes1285 receipts:
+21 retained entries,13 listed RED plus8 not-listed source-audit entries.
+V4532's pixel binding predates this test-only edit, not a new current-source
+full receipt. Next entry: clearance_separates_collapsing_margin_from_prior_float
+and related clear/margin controls. Diff checks pass; all processes terminal.
+No full6548 run or closure, strict-reference waiver, Product Agent knowledge
+impact, outside-vendor edits, commit or push. Root size gate still has six
+unrelated outside-vendor violations, with no baseline increase.
+
+### Clear/margin browser geometry controls — V4539–V4545
+
+V4539 freshly preserves three old RED units: adjoining clearance y54 versus
+old51.2; clear:right descendant y74 versus old71.2; normal block following
+a leading float y8 versus old80. V4540's browser helper fails when attempting
+HTML document.open after XML navigation; no receipt is produced and no
+rendering conclusion is taken from that failure. V4541 uses explicit MIME
+navigation for both HTML and XHTML and records all three original fixtures.
+V4542 independently asserts all16 paragraph/div rectangles, preserving
+CSS1Compat and the exact XML self-closing structure where applicable.
+
+Chrome155 agrees with the native geometry. The paragraph's actual normal
+line is22px, not the old19.2px assumption: adjoining red/float y54 with100px
+enclosing height and cleared block y104; overflow BFC y54/height100 with
+right float y54/height20 and cleared descendant y74/height80. The leading
+float remains y24/height40 while the following non-clearing normal block
+flows from y8/height96; it is not forced below the float margin box.
+Only the tests change: exact browser coordinates replace the obsolete
+values, the BFC height assertion is tightened from>=100 to==100, and the
+clear:right descendant is asserted at the right float's bottom. Production
+layout is unchanged; no new canonical pixel run is claimed for these edits.
+
+Runtime unit rebuild succeeds23.12s. V4543 passes7/7 targeted clear/margin
+controls, including the three repaired tests and four neighboring clearance
+and enclosing-height controls. Source diff SHA:
+318fc7622abedeef139dc35d7ab067d5a15dc2d22dd6b9e4f5be14d498d24e9b.
+Unit binary SHA:
+21db06139d712788240c2ec70fd7cb5c74ba35486f17a7ba405c7a426f859e33.
+V4544 hashes1287 unit receipts and retains18 entries:10 listed RED plus8
+not-listed source-audit entries. This is not a current full6548 census.
+V4545 freshly preserves the next two line-height RED units: inline-table
+direct19 versus nested21; nowrap siblings occupy y8/y30 with22px font boxes,
+contrary to their old19.2px stacking expectation. Next entry: independently
+compare those normal-line/font-box fixtures with Chrome before deciding
+production repair versus test correction. Diff checks pass; all processes
+terminal. No full6548 closure, strict-reference waiver, Product Agent knowledge
+impact, outside-vendor edits, commit or push. Root size gate remains six
+unrelated outside-vendor violations; existing baseline is not increased.
+
+### Normal inline-table line boxes — V4546–V4556
+
+V4546 records the parsed direct/nested inline-table and nowrap fixture in
+Chrome155 for initial, serif and sans-serif families; V4547 independently
+asserts the full rectangle matrix. V4548 preserves the two old RED units
+while the new parsed fixture passes. Nowrap expectations change to the
+browser's exact22px normal font boxes at y8/y30; production nowrap is
+unchanged. The raw inline-table fallback was separately contracting its
+anonymous-cell strut to the direct text's font box. Inline line projection
+now recognizes that direct-inline fallback, and auto table child-height
+settlement preserves its resolved normal line box. Actual rows/cells and
+non-inline children do not enter that fallback preservation branch.
+
+V4549–V4552 retain intermediate failures and diagnostics: direct20 versus
+nested21. A provisional-text-height relaxation does not repair the failure
+and is reverted. V4553 passes27/27 runtime controls, including direct/nested
+height equality, three-family parsed geometry, nowrap siblings, table br,
+baseline and20 inline line-metric controls. Source diff SHA:
+5ca93e58de9d79002593fc397d8f2bc81162914e09c4c16d19f9448386f1b9f9.
+Production runner rebuild succeeds2m18s; runner SHA:
+4c5ade350e943d4fa00c6a55e72cda5fe1641a60021176941576f62ee393c89b.
+
+V4554 runs365 unmodified pinned originals:198 linebox,166 related table
+cases and the preserved white-space-processing-014 browser-gap control.
+Native198 pass/167 fail; Chrome358/358 pixel-exact, zero gaps or unverified
+comparisons, harness7/7 pass. V4555 independently verifies1432 image hashes,
+all365 native result rows and716 native PNGs against the previous V4398
+full run: no row or PNG changes. Strict167 reference failures remain
+RETAINED_NOT_WAIVED. This is focused regression, not a current full6548 run.
+V4556 hashes1294 unit receipts and retains16 frontier entries:8 listed RED
+and8 not-listed historical tests requiring source audit. Frontier counts
+are not the full WPT failure census. Subsequent test-only changes must not
+be represented as covered by the frozen V4554 production source binding.
+
+### Multicol layout-unit expectation — V4557–V4562
+
+V4557 preserves a fresh RED: a142px column has113.625px inner content,
+outside the old0.01 tolerance of142*0.8. V4558 records the original seven
+fixtures using bounding rectangles: fragmented multi-column bounds span
+several columns and must not be compared with the logical flow's single
+track width. V4559 records first client fragments instead; V4560 independently
+asserts all seven track/content widths and padding offsets, plus exact
+principal-box absolute geometry. Chrome155 confirms the142px column's
+14.1875px side padding and113.625px content, with absolute width150px.
+Fragmented heights are deliberately not claimed as logical-height parity.
+
+Only the old test changes: exact browser-derived widths and x offsets replace
+the continuous approximation and tolerance. Production multicol is unchanged.
+Unit rebuild succeeds24.63s. V4561 passes9/9 controls: six multicol tests and
+three normal inline-table/nowrap checks. Source diff SHA:
+85b8214d20d6212cd41302485ecd0d0b5bc8fb5a9d4ce7d54dabe34ed0c58a65.
+Runtime unit binary SHA:
+6f05ec9055cbc7146eb9482d81b09030b4e89706bc27d3bda73acb8b919eeac3.
+V4562 hashes1296 unit receipts and retains15 frontier entries:7 listed RED
+plus8 not-listed historical tests requiring source audit; this is not the
+full WPT failure census.
+Next entry: remaining font-size precision and DOM bidi/generated-content
+REDs, with source-audit entries still retained. No full6548 clearance,
+strict-reference waiver, outside-vendor edit, commit or push. Product Agent
+knowledge is unaffected by generic rendering/test changes. Root size check
+still fails on the same six unrelated outside-vendor violations; no baseline
+increase or unrelated repair is made.
+
+### Inline shaping versus Canvas measurement — V4563–V4570
+
+V4563 preserves the font-size precision RED: shaped advance623.945251px
+versus the old Canvas623.945068px expectation. V4564 records current Chrome155
+Canvas, element and DOM Range measurements for Courier/monospace at10pt,
+13.33px and16px. The old Canvas number remains correct and is not rewritten.
+V4565 adds temporary diagnostics and retains the RED: native Skia's raw
+nominal widths are7.999302px, its unsnapped measure_str total623.9457px,
+the16.16 callback-shaped total623.945251px, and snapped inline623.953125px.
+The temporary diagnostic is subsequently removed.
+
+V4566 independently records all78 individual browser glyph measurements
+for each fixture. V4567 asserts all six matrices: fractional-size glyph
+width7.999298095703125px, precise glyph sum623.94525146484375px, separate
+Canvas total623.945068359375px and DOM Range/element623.953125px. Integer16px
+controls agree at748.921875px. These boundaries are not interchangeable.
+The old inline-run test changes only its incorrect Canvas comparison:
+78 exact cluster advances, exact precise run total and exact snapped DOM
+Range width replace it; computed/effective font-size assertions remain.
+Production shaping and Canvas implementations are unchanged. This is not
+a Canvas implementation acceptance or a new original WPT pixel run.
+
+Unit rebuild succeeds24.14s. V4568 passes8/8 font precision controls, including
+prefix invariance, nominal callback, synthetic styles and justification.
+Source diff SHA:
+9228d76663c509855b6741f5cbf6ee42e008210a26368b2e97aeaeaab05a4b0e.
+Runtime unit binary SHA:
+11e87608d1fe7b5c963ae55924300bfca3255e45ccf1a793dba364c3289d086d.
+V4569 freshly retains three DOM REDs: generated pseudo content tree order,
+misparented table cells' anonymous height, and block-only inline-block
+baseline metadata. V4570 hashes1300 unit receipts and retains14 frontier
+entries:6 listed DOM RED plus8 not-listed historical tests requiring source
+audit. This is not the6548 failure census and does not reduce its retained
+strict-reference failures. Next: trace the fresh DOM REDs into parsed runtime
+and browser geometry before choosing implementation repair versus obsolete
+structural expectation. Diff checks pass; processes terminal. No full6548
+closure, reference waiver, Product Agent knowledge impact, outside-vendor
+edit, commit or push. Size check retains six unrelated root violations.
+
+### Generated string/attr ordered runs — V4571–V4581
+
+The original V4569 generated-content RED assumes three direct Text leaves.
+Current lowering keeps generated principal boxes and anonymous inline line
+wrappers: CSS content items are not required to coincide with those wrapper
+boundaries. V4571 records Chrome155 generated and equivalent authored-span
+fixtures: both inline-blocks at x8/y8,width144.828125,height18; before text
+green, after text black, source DOM still only body. V4574 captures both
+Chrome fixtures: their PNG bytes are identical. This is a browser fixture
+equivalence proof, not a native pixel acceptance claim.
+
+A parsed runtime regression initially leaks stylesheet rules into its
+reference fixture. V4572–V4573 preserve that harness RED, including the
+duplicated text diagnostic; V4573 identifies generated=false as the failing
+iteration. Each fixture now clears stylesheet state and uses the same distinct
+item/reference ids as Chrome. V4575 passes parsed generated/reference geometry
+through stateless and retained layout. No production duplication bug is
+claimed from that contaminated fixture.
+
+The first DOM test correction still assumes pseudo-boundary wrapper grouping;
+V4576 retains59/60 and V4577 records the actual colored leaves: before-space
+green, attr value green, body black and after black, in correct order.
+The final test compares all four ordered colored leaves rather than wrapper
+grouping. Temporary diagnostic is removed; production DOM lowering is unchanged.
+V4578 passes60/60 generated-content controls after32.30s DOM rebuild.
+V4579 passes10/10 runtime controls after44.31s rebuild, including the parsed
+generated/reference matrix with green/black text ranges, the previous normal
+table/nowrap matrix and eight font precision checks. Source diff SHA:
+7b7fe16807097e9a6c01b288b767c4d5e091eb4a64232719b80cd9fe0ab6de15.
+Untracked nested inline test SHA:
+0080246431a5aecad4c93b3ec55e1728b5b098229b6452271d151d276407bac0.
+
+V4580 verifies current source, untracked inputs, both unit binaries and six
+evidence hashes, including the identical Chrome PNGs. V4581 hashes1307 unit
+receipts and retains13 frontier entries:5 listed DOM RED plus8 not-listed
+historical tests requiring source audit. This does not update the full6548
+failure count. Next: anonymous-table height semantics and inline-block baseline,
+then the three bidi REDs. No fresh original WPT/native pixel run, strict-reference
+waiver, Product Agent knowledge impact, outside-vendor edit, commit or push.
+Root size check retains the same six unrelated violations; baseline unchanged.
+
+### Anonymous row height floors — V4582–V4588, PARTIAL / RED retained
+
+V4582 freshly reproduces both old DOM anonymous-height and inline-block
+baseline REDs. V4583 records Chrome155 anonymous cells versus explicit CSS
+table/row fixtures: authored heights100/80/60 resolve to100px shared cells;
+60/120/80 resolve to120px; all0px still require18px text lines. All six
+fixtures have the same cell x/width matrix43.53125,33.765625,33.765625 at
+x8,51.53125,85.296875. Their union width is111.0625px. This is browser
+geometry evidence, not native screenshot acceptance.
+
+The new parsed runtime matrix has genuine RED in V4584: the table reserves
+100px but its anonymous row is18px. V4585 shows the lowering contract:
+anonymous table height100px, row height auto/min-height100px, cells auto.
+Authored constraints are transferred to floors, not retained as identical
+cell height fields; the earlier intended structural explanation alone was
+insufficient to establish correct layout. Settled row reconciliation now
+honors its minimum-height floor, retaining the existing indefinite-percent
+boundary for auto-height tables. No DOM test is corrected or waived yet.
+
+V4586 confirms anonymous and explicit100px/120px cases through stateless and
+retained paths, and three neighboring row-height controls pass. The complete
+matrix remains FAIL: zero-height cells expose18px text but the row/table remain
+0px. V4587 retains the full diagnostic geometry. The reconciliation filter
+currently excludes direct inline text to avoid treating decoration/paint
+extent as flow height; the next repair must retain actual text line-box
+contributions without reintroducing padding/half-leading inflation. The
+temporary diagnostic remains intentionally in the incomplete regression;
+remove it after resolving the next RED and rebuilding the final unit binary.
+
+Current candidate source diff SHA:
+660e4ec12be18dccab170fbf03feb4a6581901a62e1ce50391077ed7cfc5aee3.
+Untracked nested inline test SHA:
+5d54da729315244175383b377ab869abe106d9239d35d0e386d2ded553abade2.
+V4588 hashes1312 receipts and retains14 unit frontier entries:6 listed RED
+(five prior DOM plus this new parsed regression),8 not-listed source-audit
+entries. No failure is hidden by dropping the zero-height control. Planned
+focused original scope:173 CSS2 table height/anonymous cases; production
+runner has not been rebuilt for this candidate and that pixel run is NOT_RUN.
+Diff check passes; all current sessions terminal. Full6548 closure remains
+unproven; strict references retained. No outside-vendor edit, Product Agent
+knowledge impact, commit or push; six unrelated root size violations unchanged.
+
+### Natural IFC cell-height contribution — V4589–V4592
+
+The zero-height RED is repaired using existing inline line resolution, not
+glyph rectangle height. New natural_content_height exposes resolved forced,
+soft, preserved or single-line content extents independently of the principal
+box's authored height and vertical decoration. Row settlement reads those
+natural IFC extents for each cell and adds the cell's own edges once. This
+retains the minimum-row-floor repair while allowing actual text lines to grow
+cells authored at0px. Unsupported content retains the existing settlement
+path. The temporary anonymous-height diagnostic is removed.
+
+V4589 passes26/26 focused runtime tests after23.92s rebuild. The three height
+matrices, anonymous/explicit forms and stateless/retained paths all agree
+with V4583 browser geometry. Controls include nested/shrinking rows, declared
+height without strut-descent inflation, vertical inline padding origin and
+20 inline line-metric tests. Source diff SHA:
+c772b1b9595f5a68d1e49c79a29929d0ac206e8b7d208ccda2a674cda336a516.
+Untracked nested inline test SHA:
+918b7985d41de1ed6fca4ecb39d13a27ea067ee91c5d7f9fd10551b391c92eaf.
+
+Production runner rebuild succeeds2m24s; SHA:
+1bcc32da7a3be71053b9eabff0591b0fda9e2d5f31c7f32ca4eed76d25ba2701.
+V4590 runs173 unmodified pinned CSS2 table height/anonymous originals:
+native140 pass/33 fail, Chrome173/173 pixel-exact, zero gaps or unverified
+comparisons; no harness cases in this selection. V4591 independently verifies
+692 image hashes and compares all173 result rows plus346 native PNGs with
+the V4398 full run: no row or PNG changes. Strict33 reference failures remain
+RETAINED_NOT_WAIVED; this focused acceptance does not change the last full6548
+failure count or prove a fresh full closure.
+
+V4592 hashes1313 unit receipts and retains13 frontier entries:5 old DOM RED
+plus8 not-listed historical tests requiring source audit. The new parsed RED
+is cleared; the old standalone DOM anonymous-height expectation is not yet
+reclassified. Next: inspect its actual computed/normalized height contract,
+then inline-block baseline and the three bidi REDs. Diff checks pass, all
+sessions terminal; Product Agent knowledge unaffected. No outside-vendor edit,
+commit or push. Root size check retains six unrelated violations, unchanged.
+
+### Soft-wrapped inline-block final baseline — V4593–V4606
+
+V4593 distinguishes DOM computed cell heights100/80/60 from normalized row
+height Auto/min-height100; the table retains height100. The old standalone
+DOM test incorrectly required row.height100. It now checks the actual floor
+and preserves all three computed heights. V4594:18/18 DOM controls pass.
+This is a test-contract correction, not another production table repair.
+
+V4595 records four independent Chrome155 geometries; V4598 audits them:
+nonempty180px inline-blocks with auto/80px inner block heights export their
+last text line (Probe y26), not unused block bottom. Empty equivalents export
+the bottom (Probe y8/y74). V4596 retains the old DOM Auto-vs-FlexEnd RED.
+V4597 adds the parsed runtime RED:36px two-line content exported first-line
+baseline (Probe y8 rather than26). Do not clear the DOM RED based only on its
+metadata; this regression demonstrates the real layout gap.
+
+The production candidate replaces forced-break-only baseline counting with
+the same shaped soft/forced lines used for Skia height measurement. It sums
+preceding line heights and exports the last content baseline, accounting for
+per-line font ascent changes without adding first-line leading twice. Height
+measurement uses a const false specialization and skips the new baseline-only
+metric work. The non-Skia fallback is unchanged and is not accepted here.
+
+V4599 retains the first candidate regression (fallback leading counted twice).
+V4600 fixes that regression; the remaining clipped-block control stays RED.
+V4601 temporarily disables only the new baseline consumption:the four-case
+parsed test becomes RED again and the clipped-control output is unchanged.
+V4602 independently records Chrome's two relevant font fixtures:UA Times
+matches the current native clipped geometry; explicit16px generic serif
+matches the old expected geometry. The control now preserves and checks both
+fixtures, rather than conflating default Times with generic serif. No browser
+expectation was inferred from native pixels.
+
+V4603:28/28 runtime controls pass, including the four-case baseline matrix
+through stateless and fresh retained layout, explicit breaks, nested blocks,
+clipped blocks in both font fixtures, per-line progression,20 line-metric
+controls, and the six-case anonymous row-height matrix. Source diff SHA:
+80026839e0ab12cb85abc7de48558b63e470f21211440145878fcef936c6a9e3.
+Runtime unit binary SHA:
+979c2becbd705ed66f626d35d3ab9f0d0b7530098ef6886e772b2cd0cef9a805.
+
+Production runner rebuild succeeds2m20s; SHA:
+b2545be89ad2e3d0bccdcae4948c94add947366ee7088f1176127af1557d45b4.
+V4604 launches exactly319 pinned linebox/white-space originals (312 reftests,
+7 harness cases), not the470 cases of a different earlier selector. At this
+entry's creation, the run is live (node PID12894, native coordinator12940,
+terminal session46153); final native/browser receipts and V4605 image audit
+are pending. Continue that same session; no current pixel clearance claimed.
+
+V4606 hashes1321 unit receipts;12 frontier entries remain:4 listed DOM RED
+(old block-only baseline plus three bidi tests),8 not-listed source-audit
+entries. This is not a full WPT census. Last complete V4398 result remains
+5685 pass/863 fail out of6548. Root size check has the same six unrelated
+outside-vendor violations; diff check passes. Generic renderer/test work does
+not affect Product Agent knowledge. Existing dirty scope preserved; no
+outside-vendor edit, commit, push, or full6548 rerun.
+
+V4604 subsequently completes:90 native pass/229 fail;312/312 Chrome pixel-exact,
+zero gaps or unverified comparisons,7/7 harness pass. V4605 verifies1248 image
+hashes; all319 native rows and624 native PNGs are unchanged from V4398. The
+229 strict reference failures remain RETAINED_NOT_WAIVED. No original failure
+count is subtracted merely because the additional four-case regression passes.
+
+After the pixel audit, the old DOM baseline test is renamed
+block_only_inline_block_defers_content_baseline_to_layout and checks Auto plus
+its retained block child. V4607 fresh DOM build32.01s:19 baseline/anonymous-table
+controls pass, three bidi controls remain RED (receipt overall FAIL, not PASS).
+The two bidi visual-string tests only collect direct text leaves; current
+results are empty/single-space and require subtree/paint inspection before a
+semantic conclusion. The whitespace test still preserves spaces around bidi
+controls where the old expectation removes them. Next:browser-proof those
+three cases and identify presentation-versus-runtime ownership before editing.
+
+V4608 preserves the exact old-to-new baseline alias with RED4596/4597/4601,
+browser4598, runtime4603, pixel4605, DOM4607 evidence. It audits1322 unit receipts
+and retains11 frontier entries (3 listed bidi RED,8 not-listed source audits).
+The final source diff is5e70fcacb00120f5ad23578fbf99cd12cf681811ca0a609b33be879fc2820fb1;
+only the DOM test contract changed after production pixel acceptance. No fresh
+full6548 result is claimed. All build/test/browser sessions terminal; diff
+checks pass. The full failure census remains863 (V4398), not11 or229.
+
+### Browser-proved bidi test contracts — V4609–V4616
+
+V4607 retains three original bidi REDs. V4609 adds temporary descendant-tree
+diagnostics without changing their assertions:the full visual characters are
+present under nested inline packets, while the old collectors see only direct
+text children. The temporary diagnostics are removed after evidence capture.
+
+V4610 independently records eight Chrome155 character-Range fixtures. V4611
+audits exact visual order and width:cross-box overrides produceabcdefghijklm;
+the wrapped override preservesAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO
+and two decorated span fragments. Literal bidi controls separate whitespace
+sequences:the x/RLO/PDF example is40px wide, versus32px when the spaces after
+controls are dropped. The embedding example is23.109375px with the preserved
+space versus19.109375px after deletion. One node and five split source nodes
+have identical visible character geometry. Two adjacent spaces collapse to
+one, but the control-separated sequences are not merged with each other.
+
+Only test contracts change in this batch; production bidi/collapse algorithms
+are untouched. The cross-box test now walks descendant text, verifies the
+exact character sequence, keeps the seven decorated content fragments and
+their left-border edge assertions, and checks unborderedafghlm without requiring
+one oldfgh storage packet. The wrapping test preserves the source boundary
+space for later shaped line-edge collapse, verifies both decorated text pieces
+and the16px first/last padding edges, and is truthfully renamed
+explicit_bidi_preserves_wrapped_line_content_and_decorations. The whitespace
+test is renamedcss_whitespace_preserves_sequences_separated_by_bidi_controls
+and checks the browser-proved control-separated sequences for contiguous and
+split source nodes. No production semantics are changed to satisfy old tests.
+
+V4612:3/3 formerly RED contracts pass. V4613:37/37 controls pass (21 bidi and16
+anonymous-table tests; non-overlapping filters). DOM unit binary SHA:
+aeb57067301c2c273de2ff1428f52ea51b9693a0d856f0bff0b1b01de19dcf66.
+Source diff SHA:
+4edee1847536c46eb3c935cc8e738f98ef325016a994f80b0d8c125888dc12d9.
+
+Production rebuild succeeds2m19s; runner SHA remains
+b2545be89ad2e3d0bccdcae4948c94add947366ee7088f1176127af1557d45b4.
+V4614 runs105 unmodified pinned bidi originals:34 native pass/71 fail and
+105/105 Chrome pixel-exact, zero gaps/unverified cases. V4615 verifies420 image
+hashes, all105 result rows and210 native PNGs unchanged from fullV4398. Strict
+71 reference failures remainRETAINED_NOT_WAIVED; no full6548 rerun or clearance
+is inferred from this test-only repair.
+
+V4616 preserves both new old-to-new test aliases with original RED, descendant
+diagnostic, browser geometry/audit, focused green and original pixel evidence.
+All three listed current DOM REDs are cleared; eight NOT_LISTED_REQUIRES_SOURCE_AUDIT
+entries remain. Next:verify their replacement test identity and original
+browser evidence, rerun those exact current controls, and retain any unresolved
+alias rather than deleting it. Candidate source matches the current receipt;
+all sessions terminal, diff check passes. Root size gate retains six unrelated
+outside-vendor violations, unchanged. Product Agent knowledge unaffected by
+generic renderer tests. Dirty scope preserved; no commit, push, or outside-
+vendor edit. The last full census is still863 failed out of6548, not8 or71.
+
+### Historical identity audit and live full recapture — V4617–V4626
+
+Six of the eight unlisted historical failures have verified current test
+identities:pre-text mixed-space browser soft break, authored-font fixed-point
+advance, first-line ignored pseudo length with retained authored wrapper,
+direct/parsed top-aligned font-box versus baseline-image geometry, and inline
+background excluding line leading. V4617 freshly builds runtime43.69s and
+passes11 controls, including the five runtime identities plus conservative
+glyph clipping, scroll reentry and non-intersecting picture-bound coverage.
+V4618 passes11 DOM controls, including first-line and significant text-node
+spaces, without treating those two assertions as interchangeable fixtures.
+
+The significant-text-node test is NOT an alias of
+preformatted_anonymous_cell_preserves_spaces_around_improper_inline_element:
+both names occur in V1713, the former PASS and the latter RED. The latter is
+reconstructed under its original name with separate spaces around an ordinary
+inline bc inside a preformatted table row. V4620 retains its fresh strict RED:
+native textabcd, strict content oraclea bc d; the distinct significant-node
+control still passes. V4619 independently observes Chrome155 sourcea bc d but
+innerTexta\tbcd; both source spaces have zero client rectangles. Do not change
+production or make this strict test green by silently adopting another fixture.
+
+The registered-glyph surrounding-clip equality test is an exploratory diagnostic,
+not a valid browser-conformance invariant. V2570's132-pixel contrast remains
+FAILED/passed:false in a separate retired-diagnostic entry, not aliased to a
+different green test. Its genuine vertical-align synthetic-overflow-clip RED
+and repair are V2571/V2572; current first-line012 pixel acceptance is recaptured
+alongside clipping controls. Neither diagnostic retirement nor browser parity
+waives the canonical strict WPT failures.
+
+Production runner rebuild2m21s, SHA:
+87656d05f9adcd1039498751b7c8586d951422641c7f62ab7c842a9e78e5751d.
+V4621 runs10 unmodified pinned original anchors:6 native pass/4 fail;10/10 Chrome
+pixel-exact. V4622's actual receipt filename ishistory-audit-audit-v4622.json;
+it verifies40 image hashes and all10 rows/20 native PNGs unchanged from V4398.
+Strict4 remainRETAINED_NOT_WAIVED, including table-anonymous-objects199.
+
+V4623 has incorrect audit-filename metadata and is superseded by V4626, not
+overwritten. V4626 validates alias evidence files, maps only the six confirmed
+identities, keeps the strict improper-inline RED in frontier/strict_conflicts,
+and keeps the132-pixel diagnostic separately inretired_diagnostics. Unknown
+historical test identities:0; retained strict unit conflict:1; retired diagnostic:1.
+This is a unit-history classification, not a full WPT failure count. Only the
+reconstructed strict test is added this batch; no production algorithm changes.
+
+The full launcher initially stops before process creation because the audit
+receipt path is wrong; after correcting it and validating V4626, exactly one
+full recapture starts at2026-10-11T16:43:03.772Z. Native runs4 isolated workers;
+wrapper PID58791, coordinator PID58849, terminal session65301. Started receipt:
+full-current-started-v4624.json. Current source diff SHA:
+f4bf34aeb4004c8861aa7b26972ae86097bad943671a746feb14efef50f38675.
+The source, untracked crate inputs, dependencies, acceptance ledgers and runner
+remain frozen through native and browser capture. At this entry's creation the
+process is verified live with100/6548 progress, not completed. Continue the same
+session; do not restart on silence or infer success from the progress counter.
+
+Next:wait for full-current-native-v4624/results.json, then the same wrapper's
+6178 browser comparisons and370 harness results; audit with
+full-parity-audit-v4625.mjs only after all are terminal. Its strict-failure
+ledger remains separate and goal_complete remainsfalse. Full current zero
+failure is NOT proven; the last terminal full result is V4398's5685/863.
+Diff check passes; the root size gate retains six unrelated outside-vendor
+violations, unchanged. Product Agent knowledge unaffected. No commit, push,
+outside-vendor edit, reference/tolerance modification or failure waiver.
+
+### Full recapture terminal audit — V4624/V4625 (2026-10-12)
+
+The V4624 process completed without restarting or changing its frozen source.
+Pinned WPT revision: `fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0`.
+The user explicitly confirmed browser pixel consistency first, with strict
+reference failures retained separately; this does not make strict WPT green.
+
+- Native: 6,548 unique cases, 5,685 pass / 863 fail; no status changes from V4398.
+- Chrome: 6,178/6,178 pixel-exact on both actual and reference captures;
+  zero browser gaps, resource-protocol or comparison-unverified cases.
+- Testharness: 370/370 pass.
+- V4625 audits 24,712 image hashes and exact suite membership.
+- Zero-tolerance strict reference: 864 failing cases, retained, not waived.
+  `content-177.xht` accounts for the extra case: 4,712 pixels / max difference
+  55 passes the original profile tolerance but fails zero tolerance.
+- The 863 native failures also match Chrome on both sides; changing them merely
+  to match the original references would break the selected browser criterion.
+
+Local evidence under `target/wpt-targeted/baseline-font-position-20261003/`:
+`full-current-native-v4624/results.json`,
+`full-current-browser-v4624/receipt.json`, `full-current-census-v4624.json`,
+and `full-parity-audit-v4625.json`. These ignored artifacts remain local;
+the tracked summary is not a substitute for reproducing the captures.
+
+The user authorized committing and pushing this vendor batch to main.
+No parent-repository pin update, deployment, other-browser coverage or general
+interaction acceptance is implied. Product Agent knowledge is unaffected by
+these generic renderer fixes. The root size gate still has six unrelated
+outside-vendor violations; no baseline is raised.

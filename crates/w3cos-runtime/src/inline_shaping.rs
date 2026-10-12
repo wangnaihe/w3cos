@@ -21,6 +21,18 @@ struct SourceDecoration {
     runs: Vec<GlyphSlice>,
 }
 
+pub(crate) fn remove_generated_border_edges(style: &mut Style) {
+    if style.custom_properties.as_ref().is_some_and(|properties|
+        properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)) {
+        // Logical slice edges affect fitting and painting, not font shaping.
+        style.border_width = 0.0;
+        style.border_top_width = Some(0.0);
+        style.border_right_width = Some(0.0);
+        style.border_bottom_width = Some(0.0);
+        style.border_left_width = Some(0.0);
+    }
+}
+
 pub(crate) struct Fragment {
     source_x: f32,
     ascent: f32,
@@ -58,6 +70,30 @@ pub(crate) fn authored_word_groups(
     Some(groups)
 }
 
+/// Keep source endpoints that fall inside a generated word. Both partitions
+/// must be cluster-safe in the same complete shaping context; only used layout
+/// advances gain the source's fractional remainder, never the glyph positions.
+pub(crate) fn authored_fragment_word_advances(texts: &[&str], style: &Style) -> Option<Vec<f32>> {
+    let text = texts.concat();
+    let ends = w3cos_std::inline_text::fragment_ends(&text, style)?;
+    let mut advances = render_skia::measure_skia_inline_fragment_advances(texts, style)?;
+    let mut start = 0;
+    let sources = ends.iter().map(|end| {
+        let source = &text[start..*end];
+        start = *end;
+        source
+    }).collect::<Vec<_>>();
+    let source_advances = render_skia::measure_skia_inline_fragment_advances(&sources, style)?;
+    let mut word_ends = Vec::with_capacity(texts.len());
+    let mut offset = 0;
+    for word in texts { offset += word.len(); word_ends.push(offset); }
+    for (end, advance) in ends.into_iter().zip(source_advances) {
+        let word = word_ends.partition_point(|word_end| *word_end < end);
+        *advances.get_mut(word)? += crate::text_layout::inline_layout_advance(advance) - advance;
+    }
+    Some(advances)
+}
+
 impl Fragment {
     pub(crate) fn decoration_span(&self, rect: LayoutRect,
         kind: w3cos_std::style::TextDecoration) -> (f32, f32) {
@@ -85,7 +121,7 @@ impl Fragment {
     }
 
     pub(crate) fn paint(&self, canvas: &Canvas, rect: LayoutRect, style: &Style) {
-        let paint = render_skia::color_paint(style.color, style.opacity);
+        let paint = render_skia::text_color_paint(style, style.opacity);
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let trace = *TRACE.get_or_init(|| std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some());
         for run in &self.runs {
@@ -100,8 +136,12 @@ impl Fragment {
                     self.source_x, x, run.face.family_name(), run.glyphs.len(), run.positions.first(), canvas.local_clip_bounds());
             }
             if !visible { continue; }
-            skia_text_run::visit_glyph_fonts(&font, &run.glyph_font_sizes, run.glyphs.len(), |font, range|
-                canvas.draw_glyphs_at(&run.glyphs[range.clone()], &run.positions[range], (x, baseline), font, &paint));
+            skia_text_run::visit_glyph_fonts(&font, &run.glyph_font_sizes, run.glyphs.len(), |font, range| {
+                let ink = skia_text_run::geometric_ink_bounds(font,&run.glyphs[range.clone()],&run.positions[range.clone()])
+                    .map(|bounds| bounds.with_offset((x,baseline)));
+                render_skia::draw_fractional_text(canvas,style,&paint,ink,|target,paint|
+                    target.draw_glyphs_at(&run.glyphs[range.clone()],&run.positions[range.clone()],(x,baseline),font,paint));
+            });
         }
     }
 }
@@ -131,6 +171,11 @@ pub(crate) fn build(
         let a = &artifact.nodes[first];
         let b = &artifact.nodes[current];
         if a.style == b.style { return true; }
+        let mut edge_free_a = a.style.clone();
+        let mut edge_free_b = b.style.clone();
+        remove_generated_border_edges(&mut edge_free_a);
+        remove_generated_border_edges(&mut edge_free_b);
+        if edge_free_a == edge_free_b { return true; }
         if ![a.parent, b.parent].into_iter().flatten().any(|parent|
             quote_words.contains(&parent)) { return false; }
         // The no-break wrapper assigns flex-shrink:0 to its children for
@@ -174,8 +219,16 @@ pub(crate) fn build(
                             // Decoration is paint-only for generated pieces of
                             // one source. Do not relax the layout classifier.
                             style.text_decoration = w3cos_std::style::TextDecoration::None;
+                            remove_generated_border_edges(&mut style);
                         }
-                        crate::layout::is_plain_inline_word_fragment(&node.kind, &style)
+                        // A forced break terminates layout, but contributes no
+                        // glyph to the preceding word's shaping context.
+                        let paint_kind = match &node.kind {
+                            ComponentKind::Text { content } if content.ends_with('\u{2028}') =>
+                                ComponentKind::Text { content: content.strip_suffix('\u{2028}').unwrap().into() },
+                            _ => node.kind.clone(),
+                        };
+                        crate::layout::is_plain_inline_word_fragment(&paint_kind, &style)
                     }
             })
         };
@@ -188,6 +241,10 @@ pub(crate) fn build(
             }
             let mut end = start + 1;
             while end < children.len() {
+                if matches!(&artifact.nodes[children[end - 1]].kind,
+                    ComponentKind::Text { content } if content.ends_with('\u{2028}')) {
+                    break;
+                }
                 let previous = artifact.rect_by_index[children[end - 1]].unwrap();
                 let current = children[end];
                 if !eligible(current)
@@ -223,8 +280,10 @@ fn share_source_decoration(fragments: &mut [(usize, Fragment)], artifact: &Paint
             && artifact.ancestor_text_decorations(*first_index).is_empty()) { return; }
     let Some(first) = fragments.iter().position(|(index, _)| clients.contains(index)) else { return; };
     let last = fragments.iter().rposition(|(index, _)| clients.contains(index)).unwrap();
-    let start = artifact.rect_by_index[*first_index].unwrap();
-    let end = artifact.rect_by_index[fragments.last().unwrap().0].unwrap();
+    let start = render_skia::text_content_box(artifact.rect_by_index[*first_index].unwrap(), style);
+    let last_index = fragments.last().unwrap().0;
+    let end = render_skia::text_content_box(artifact.rect_by_index[last_index].unwrap(),
+        &artifact.nodes[last_index].style);
     let source = Arc::new(SourceDecoration { x: start.x, width: end.x + end.width - start.x,
         runs: fragments.iter().flat_map(|(_, fragment)| fragment.runs.iter().cloned()).collect() });
     for (position, (_, fragment)) in fragments.iter_mut().enumerate() {
@@ -244,7 +303,7 @@ fn shape_group(
             let ComponentKind::Text { content } = &artifact.nodes[*index].kind else {
                 unreachable!()
             };
-            content.as_str()
+            content.strip_suffix('\u{2028}').unwrap_or(content.as_str())
         })
         .collect::<Vec<_>>();
     if texts.len() < 3 || !texts.contains(&" ") {
@@ -259,14 +318,15 @@ fn shape_group(
         boundaries.push(boundaries.last()? + part.len());
     }
     let ascent = render_skia::text_baseline(0.0, style.font_size, face, style, &text);
-    let origin = artifact.rect_by_index[group[0]]?.x;
+    let origin = render_skia::text_content_box(artifact.rect_by_index[group[0]]?, style).x;
     let mut fragments = group
         .iter()
         .map(|index| {
             Some((
                 *index,
                 Fragment {
-                    source_x: artifact.rect_by_index[*index]?.x,
+                    source_x: render_skia::text_content_box(artifact.rect_by_index[*index]?,
+                        &artifact.nodes[*index].style).x,
                     ascent,
                     runs: Vec::new(),
                     decoration: None,
@@ -320,7 +380,8 @@ fn shape_group(
                 let run_delta = f64::from(run_origin) - f64::from(origin);
                 let base = *source_cursor_bases.entry(range.start)
                     .or_insert(run_delta + cluster_origins.get(cluster)?);
-                slice.origin_x = artifact.rect_by_index[group[range.start]]?.x;
+                slice.origin_x = render_skia::text_content_box(artifact.rect_by_index[group[range.start]]?,
+                    &artifact.nodes[group[range.start]].style).x;
                 slice.positions.push(Point::new(
                     (run_delta + f64::from(position.x) - base) as f32, position.y));
             } else {
@@ -345,6 +406,88 @@ mod tests {
     use super::*;
     use crate::paint_artifact::PaintNode;
     use skia_safe::{AlphaType, Color, ColorType, FontMgr, FontStyle, ImageInfo, Surface};
+
+    #[test]
+    fn trailing_forced_break_keeps_the_last_word_in_shared_shaping() {
+        let face = FontMgr::default().match_family_style("Arial", FontStyle::normal()).unwrap();
+        let style = Style { display: Display::Inline, font_family: Some("sans-serif".into()),
+            font_size: 16.0, ..Style::default() };
+        let parent = Style { display: Display::Inline, custom_properties: Some(HashMap::from([
+            ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
+        ])), ..Style::default() };
+        let words = ["Filler", " ", "Text"];
+        let advances = render_skia::measure_skia_inline_fragment_advances(&words, &style).unwrap();
+        let mut nodes = vec![PaintNode { kind: ComponentKind::Row, style: parent,
+            parent: None, sticky_counter_signal: None }];
+        let mut layouts = vec![(LayoutRect { x: 8.0, y: 8.0, width: 200.0, height: 22.0 }, 0)];
+        let mut x = 8.0;
+        for (position, (word, width)) in words.iter().zip(advances).enumerate() {
+            let content = if position == 2 { format!("{word}\u{2028}") } else { (*word).into() };
+            nodes.push(PaintNode { kind: ComponentKind::Text { content }, style: style.clone(),
+                parent: Some(0), sticky_counter_signal: None });
+            layouts.push((LayoutRect { x, y: 8.0, width, height: 22.0 }, position + 1));
+            x += width;
+        }
+        let artifact = PaintArtifact::build(nodes, &layouts, 1);
+        let slices = build(&artifact, [1, 2, 3].into_iter(), &face);
+        assert_eq!(slices.len(), 3, "a final forced line break must not split glyph shaping");
+        assert_eq!(slices[&3].runs[0].origin_x, 8.0);
+    }
+
+    #[test]
+    fn generated_border_pieces_share_glyph_positions_without_losing_edges() {
+        let face = FontMgr::default().match_family_style("Arial", FontStyle::normal()).unwrap();
+        let style = Style { display: Display::Inline, font_family: Some("sans-serif".into()),
+            font_size: 16.0, border_width: 3.0,
+            color: w3cos_std::Color::rgb(0, 128, 0),
+            border_color: w3cos_std::Color::rgb(0, 128, 0),
+            border_styles: [Some(w3cos_std::style::BorderLineStyle::Solid); 4],
+            custom_properties: Some(HashMap::from([
+                (w3cos_std::inline_text::SOURCE_RUN.into(), "text:1".into()),
+            ])), ..Style::default() };
+        let parent = Style { display: Display::Flex, custom_properties: Some(HashMap::from([
+            ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
+        ])), ..Style::default() };
+        let mut nodes = vec![PaintNode { kind: ComponentKind::Row, style: parent,
+            parent: None, sticky_counter_signal: None }];
+        let mut layouts = vec![(LayoutRect { x: 8.0, y: 8.0, width: 400.0, height: 22.0 }, 0)];
+        let words = ["green", " ", "border"];
+        let advances = render_skia::measure_skia_inline_fragment_advances(&words, &style).unwrap();
+        let mut x = 8.0;
+        for (position, (word, advance)) in words.iter().zip(advances).enumerate() {
+            let mut piece = style.clone();
+            piece.border_left_width = Some(if position == 0 { 3.0 } else { 0.0 });
+            piece.border_right_width = Some(if position == 2 { 3.0 } else { 0.0 });
+            let width = advance + piece.border_left_width.unwrap() + piece.border_right_width.unwrap();
+            let index = nodes.len();
+            nodes.push(PaintNode { kind: ComponentKind::Text { content: (*word).into() },
+                style: piece, parent: Some(0), sticky_counter_signal: None });
+            layouts.push((LayoutRect { x, y: 5.0, width, height: 28.0 }, index));
+            x += width;
+        }
+        let artifact = PaintArtifact::build(nodes, &layouts, 1);
+        assert_eq!(build(&artifact, [1,2,3].into_iter(), &face).len(), 3,
+            "generated paint edges must not split one authored glyph run");
+        let input = layouts[1..].iter().map(|(rect,index)|
+            (*index,*rect,&artifact.nodes[*index].kind,&artifact.nodes[*index].style)).collect::<Vec<_>>();
+        let mut renderer = render_skia::SkiaRasterizer::new_host().unwrap();
+        let pixels = renderer.render_frame(420,60,&input,crate::layout::layout_font(),
+            &[],&HashMap::new(),None,w3cos_std::Color::WHITE,
+            Some(&artifact),None,1.0).unwrap();
+        assert_ne!(&pixels[(5*420+20)*4..(5*420+20)*4+4], &[255;4], "shared glyphs must retain the top border");
+        assert_ne!(&pixels[(15*420+8)*4..(15*420+8)*4+4], &[255;4], "shared glyphs must retain the start border");
+        let mut decorated_nodes = artifact.nodes.clone();
+        for node in &mut decorated_nodes[1..] {
+            node.style.text_decoration = w3cos_std::style::TextDecoration::Underline;
+        }
+        let decorated = PaintArtifact::build(decorated_nodes, &layouts, 2);
+        let slices = build(&decorated, [1,2,3].into_iter(), &face);
+        let first = render_skia::text_content_box(layouts[1].0, &decorated.nodes[1].style);
+        let last = render_skia::text_content_box(layouts[3].0, &decorated.nodes[3].style);
+        let (start, width) = slices[&1].decoration_span(first, w3cos_std::style::TextDecoration::Underline);
+        assert!((start-first.x).abs() < 0.001 && (width-(last.x+last.width-first.x)).abs() < 0.001,
+            "text decoration excludes the logical border edges: start={start}, width={width}");
+    }
 
     #[test]
     fn quote_word_wrapper_keeps_the_adjacent_text_source_shaped_together() {

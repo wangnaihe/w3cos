@@ -281,8 +281,10 @@ thread_local! {
     static DOCUMENT_VISIBILITY: RefCell<String> = RefCell::new("visible".to_string());
     static DOCUMENT_READY_STATE: RefCell<String> = RefCell::new("complete".to_string());
     static EVENT_COUNTS: RefCell<HashMap<String, u64>> = RefCell::new(initial_event_counts());
-    /// Bridge-side focus tracking (no real input focus exists yet).
+    /// Focus identity shared with native keyboard routing.
     static ACTIVE_ELEMENT: RefCell<Option<u32>> = RefCell::new(None);
+    /// Only trusted host input updates modality; synthetic dispatchEvent does not.
+    static KEYBOARD_FOCUS_MODALITY: Cell<bool> = const { Cell::new(true) };
     /// Lazily-created <html> / <head> elements.
     static HTML_ID: RefCell<Option<u32>> = RefCell::new(None);
     static HEAD_ID: RefCell<Option<u32>> = RefCell::new(None);
@@ -1621,6 +1623,7 @@ fn matches_simple(selector: &str, node: u32, scope: Option<u32>) -> bool {
         ":popover-open",
         ":modal",
         ":focus-within",
+        ":focus-visible",
         ":focus",
     ] {
         if !compound.contains(pseudo) {
@@ -1659,6 +1662,9 @@ fn matches_simple(selector: &str, node: u32, scope: Option<u32>) -> bool {
             ":popover-open" => popover_is_open(node),
             ":modal" => dialog_is_modal(node),
             ":focus-within" => element_has_focus_within(node),
+            ":focus-visible" => dom::with_document(|document| {
+                document.is_focus_visible(NodeId::from_u32(node))
+            }),
             ":focus" => element_has_focus(node),
             _ => false,
         };
@@ -12397,6 +12403,7 @@ fn blur_element(node: u32) {
     if !was_active {
         return;
     }
+    dom::with_document_mut(|document| document.set_focus_state(None, false));
     dispatch_sync(node, EventType::Blur, EventData::Focus);
     dispatch_sync(node, EventType::FocusOut, EventData::Focus);
 }
@@ -12406,12 +12413,33 @@ fn focus_element(node: u32) {
     if previous == Some(node) {
         return;
     }
+    let previous_visible = previous.is_some_and(|previous| {
+        dom::with_document(|document| document.is_focus_visible(NodeId::from_u32(previous)))
+    });
     if let Some(previous) = previous {
         blur_element(previous);
     }
     ACTIVE_ELEMENT.with(|active| *active.borrow_mut() = Some(node));
+    update_focus_style(node, previous_visible || KEYBOARD_FOCUS_MODALITY.with(Cell::get));
     dispatch_sync(node, EventType::Focus, EventData::Focus);
     dispatch_sync(node, EventType::FocusIn, EventData::Focus);
+}
+
+fn update_focus_style(node: u32, indicate: bool) {
+    let tag = dom::tag_name(node);
+    let text_input = if tag.eq_ignore_ascii_case("input") {
+        let kind = dom::get_attribute(node, "type").unwrap_or_else(|| "text".into());
+        !matches!(kind.to_ascii_lowercase().as_str(),
+            "button" | "checkbox" | "color" | "file" | "hidden" | "image" |
+            "radio" | "range" | "reset" | "submit")
+    } else {
+        tag.eq_ignore_ascii_case("textarea")
+    };
+    dom::with_document_mut(|document| {
+        let id = NodeId::from_u32(node);
+        let editable = document.editable_root(id).is_some();
+        document.set_focus_state(Some(id), indicate || text_input || editable);
+    });
 }
 
 fn blur_focus_for_standard_reparent(node: u32) {
@@ -12502,6 +12530,14 @@ pub(crate) fn dispatch_native_focus(target: u32, focused: bool) -> bool {
             *active.borrow_mut() = None;
         }
     });
+    if focused {
+        update_focus_style(target, KEYBOARD_FOCUS_MODALITY.with(Cell::get));
+    } else {
+        let active = ACTIVE_ELEMENT.with(|active| *active.borrow());
+        if active.is_none() {
+            dom::with_document_mut(|document| document.set_focus_state(None, false));
+        }
+    }
     dispatch_sync(
         target,
         if focused {
@@ -12752,6 +12788,10 @@ pub(crate) fn dispatch_native_pointer(
         _ => return false,
     };
     if phase == "down" {
+        KEYBOARD_FOCUS_MODALITY.with(|modality| modality.set(false));
+        if let Some(focused) = active_element_id() {
+            update_focus_style(focused, false);
+        }
         if let Some(previous) =
             POINTER_CAPTURE.with(|capture| capture.borrow_mut().remove(&pointer_id))
         {
@@ -12980,6 +13020,12 @@ pub(crate) fn dispatch_native_key(
     shift_key: bool,
     pressed: bool,
 ) -> bool {
+    if pressed && !alt_key && !ctrl_key && !meta_key {
+        KEYBOARD_FOCUS_MODALITY.with(|modality| modality.set(true));
+        if let Some(focused) = active_element_id() {
+            update_focus_style(focused, true);
+        }
+    }
     !dispatch_sync(
         target,
         if pressed {
@@ -19546,6 +19592,7 @@ pub fn reset_bridge() {
     AUTHOR_STYLE_SHEETS.with(|sheets| sheets.borrow_mut().clear());
     LIVE_RANGES.with(|ranges| ranges.borrow_mut().clear());
     ACTIVE_ELEMENT.with(|a| *a.borrow_mut() = None);
+    KEYBOARD_FOCUS_MODALITY.with(|modality| modality.set(true));
     HTML_ID.with(|h| *h.borrow_mut() = None);
     HEAD_ID.with(|h| *h.borrow_mut() = None);
     CANVAS_CONTEXTS.with(|c| c.borrow_mut().clear());
@@ -19585,7 +19632,9 @@ pub fn reset_bridge() {
         crate::media_source_web::reset();
     }
     crate::payment_web::reset();
-    #[cfg(feature = "web-graphics-advanced")]
+    // Unit tests may construct codec host objects directly even when the
+    // advanced globals are not installed in the test feature profile.
+    #[cfg(any(test, feature = "web-graphics-advanced"))]
     crate::webcodecs_web::reset();
     crate::navigator_web::reset();
     crate::midi_web::reset();
@@ -19609,7 +19658,7 @@ pub fn reset_bridge() {
     crate::animations_web::reset();
     #[cfg(feature = "web-media-advanced")]
     crate::audio_web::reset();
-    #[cfg(feature = "web-graphics-advanced")]
+    #[cfg(any(test, feature = "web-graphics-advanced"))]
     crate::image_decoder_web::reset();
     #[cfg(feature = "web-media-advanced")]
     crate::webrtc_web::reset();
@@ -26222,6 +26271,95 @@ try {
         assert!(doc.get_property("activeElement") == input);
         input.call_method("blur", vec![]);
         assert!(doc.get_property("activeElement") == doc.get_property("body"));
+    }
+
+    #[test]
+    fn focused_text_input_outline_survives_state_preserving_move() {
+        setup();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            ":focus-visible",
+            &[("outline", "2px solid green")],
+        );
+        let document = document_value();
+        let origin = create_in_body("div");
+        let destination = create_in_body("div");
+        let movable = document.call_method("createElement", vec![Value::string("div")]);
+        let input = document.call_method("createElement", vec![Value::string("input")]);
+        movable.call_method("appendChild", vec![input.clone()]);
+        origin.call_method("appendChild", vec![movable.clone()]);
+        let input_id = NodeId::from_u32(node_id_of(&input).unwrap());
+        let outline_width = || {
+            dom::with_document(|tree| tree.computed_style_for(input_id).outline_width)
+        };
+        assert_eq!(outline_width(), 0.0);
+        input.call_method("focus", vec![]);
+        assert!(document.get_property("activeElement") == input);
+        assert_eq!(outline_width(), 2.0, "focused text input must match :focus-visible");
+        destination.call_method("moveBefore", vec![movable, Value::Null]);
+        assert!(document.get_property("activeElement") == input);
+        assert_eq!(outline_width(), 2.0, "moveBefore must preserve focus styling");
+        input.call_method("blur", vec![]);
+        assert_eq!(outline_width(), 0.0, "blur must invalidate cached focus styling");
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn focus_selectors_update_ancestors_after_state_preserving_move() {
+        setup();
+        let document = document_value();
+        let origin = create_in_body("div");
+        let destination = create_in_body("div");
+        let input = document.call_method("createElement", vec![Value::string("input")]);
+        origin.call_method("appendChild", vec![input.clone()]);
+        let matches = |element: &Value, selector: &str| {
+            element.call_method("matches", vec![Value::string(selector)]).to_bool()
+        };
+        assert!(!matches(&input, ":focus"));
+        input.call_method("focus", vec![]);
+        assert!(matches(&input, ":focus:focus-visible"));
+        assert!(matches(&origin, ":focus-within"));
+        assert!(!matches(&destination, ":focus-within"));
+        destination.call_method("moveBefore", vec![input.clone(), Value::Null]);
+        assert!(matches(&input, ":focus"));
+        assert!(!matches(&origin, ":focus-within"));
+        assert!(matches(&destination, ":focus-within"));
+        input.call_method("blur", vec![]);
+        assert!(!matches(&input, ":focus-visible"));
+        assert!(!matches(&destination, ":focus-within"));
+    }
+
+    #[test]
+    fn focus_visible_tracks_trusted_modality_not_synthetic_input() {
+        setup();
+        let button = create_in_body("button");
+        let input = create_in_body("input");
+        let button_id = node_id_of(&button).unwrap();
+        let visible = |element: &Value| {
+            element.call_method("matches", vec![Value::string(":focus-visible")]).to_bool()
+        };
+        button.call_method("focus", vec![]);
+        assert!(visible(&button), "initial programmatic focus indicates focus");
+        dispatch_native_pointer(button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1,
+            0.5, true, false, false, false, false);
+        dispatch_native_focus(button_id, true);
+        assert!(!visible(&button), "pointer-focused button does not indicate focus");
+        dispatch_sync(button_id, EventType::KeyDown, EventData::Keyboard(
+            w3cos_dom::events::KeyboardEventData {
+                key: "a".into(), code: "KeyA".into(), ctrl_key: false,
+                shift_key: false, alt_key: false, meta_key: false,
+                repeat: false, location: 0,
+            },
+        ));
+        assert!(!visible(&button), "synthetic keyboard dispatch must not change modality");
+        dispatch_native_key(button_id, "a", "KeyA", false, false, false, false, false, true);
+        assert!(visible(&button), "trusted keyboard input indicates existing focus");
+        dispatch_native_pointer(button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1,
+            0.5, true, false, false, false, false);
+        input.call_method("focus", vec![]);
+        assert!(visible(&input), "text inputs indicate focus even in pointer modality");
+        button.call_method("focus", vec![]);
+        assert!(visible(&button), "script focus transfer preserves prior indication");
     }
 
     #[test]

@@ -143,7 +143,10 @@ pub(crate) fn inline_fragment_background_box(
     crate::layout::LayoutRect {
         x: line.x - left,
         y: line.y - top,
-        width: advance.max(0.0) + left + right,
+        // Decoration is layout geometry. A raw shaping float just below a
+        // half-pixel must not move the border to a different device column.
+        // Glyph positions and Canvas text measurements remain unsnapped.
+        width: inline_layout_advance(advance.max(0.0)) + left + right,
         height: line.height + top + bottom,
     }
 }

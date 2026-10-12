@@ -11,3 +11,5 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 unicode-bidi = { workspace = true }
 unicode-bidi-mirroring = { workspace = true }
+unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"] }
+unicode-segmentation = "=1.13.3"

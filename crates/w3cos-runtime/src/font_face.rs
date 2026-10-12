@@ -264,17 +264,18 @@ impl LoadedFont {
 
     /// Whether this face is eligible for and contains a glyph for `character`.
     pub(crate) fn supports_character(&self, character: char) -> bool {
+        self.permits_character(character) && self.parsed
+            .as_ref()
+            .is_some_and(|font| font.chars().contains_key(&character))
+    }
+
+    // Primary strut lookup checks CSS subset eligibility, not cmap coverage.
+    fn permits_character(&self, character: char) -> bool {
         let codepoint = character as u32;
-        if self
+        !self
             .unicode_ranges
             .as_ref()
             .is_some_and(|ranges| !ranges.iter().any(|range| range.contains(codepoint)))
-        {
-            return false;
-        }
-        self.parsed
-            .as_ref()
-            .is_some_and(|font| font.chars().contains_key(&character))
     }
 
     #[cfg(feature = "skia")]
@@ -715,11 +716,30 @@ impl FontRegistry {
         )
     }
 
+    /// Blink's primary line strut queries U+0020 without requiring its glyph.
+    pub(crate) fn resolve_style_for_strut(&self, style: &w3cos_std::style::Style) -> Option<LoadedFont> {
+        let family = style.font_family.as_deref()?;
+        let face_style = match style.font_style {
+            w3cos_std::style::FontStyle::Normal => FontFaceStyle::Normal,
+            w3cos_std::style::FontStyle::Italic => FontFaceStyle::Italic,
+            w3cos_std::style::FontStyle::Oblique => FontFaceStyle::Oblique,
+        };
+        self.resolve_render_stack_with_eligibility(family, FontWeight(style.font_weight),
+            face_style, Some(' '), false)
+    }
+
     /// Resolve render faces without promoting installed fonts into document
     /// registrations. A generic family is a cascade boundary handled by the
     /// renderer's platform defaults, not an alias for a later named family.
     fn resolve_render_stack(
         &self, stack: &str, weight: FontWeight, style: FontFaceStyle, character: Option<char>,
+    ) -> Option<LoadedFont> {
+        self.resolve_render_stack_with_eligibility(stack, weight, style, character, true)
+    }
+
+    fn resolve_render_stack_with_eligibility(
+        &self, stack: &str, weight: FontWeight, style: FontFaceStyle,
+        character: Option<char>, require_glyph: bool,
     ) -> Option<LoadedFont> {
         for raw in stack.split(',') {
             let raw = raw.trim();
@@ -731,7 +751,7 @@ impl FontRegistry {
             let family = raw.trim_matches(['"', '\'']);
             let (registered, shadows_system) = {
                 let fonts = self.fonts.lock().unwrap();
-                (resolve_family(&fonts, family, weight, style, character),
+                (resolve_family_with_eligibility(&fonts, family, weight, style, character, require_glyph),
                     fonts.keys().any(|key| key.family.eq_ignore_ascii_case(family)))
             };
             if let Some(font) = registered { return Some(font); }
@@ -739,7 +759,9 @@ impl FontRegistry {
             // missing coverage falls through to the next CSS family, not a
             // system face with the same name.
             if !shadows_system && let Some(font) = system_fonts::resolve(family, weight, style)
-                && character.is_none_or(|character| font.supports_character(character))
+                && character.is_none_or(|character| if require_glyph {
+                    font.supports_character(character)
+                } else { font.permits_character(character) })
             { return Some(font); }
         }
         None
@@ -943,8 +965,18 @@ fn resolve_family(
     style: FontFaceStyle,
     character: Option<char>,
 ) -> Option<LoadedFont> {
+    resolve_family_with_eligibility(fonts, family, weight, style, character, true)
+}
+
+fn resolve_family_with_eligibility(
+    fonts: &HashMap<FontKey, Vec<(u64, LoadedFont)>>,
+    family: &str, weight: FontWeight, style: FontFaceStyle,
+    character: Option<char>, require_glyph: bool,
+) -> Option<LoadedFont> {
     let eligible =
-        |font: &LoadedFont| character.is_none_or(|character| font.supports_character(character));
+        |font: &LoadedFont| character.is_none_or(|character| if require_glyph {
+            font.supports_character(character)
+        } else { font.permits_character(character) });
     let exact = FontKey {
         family: family.to_string(),
         weight,

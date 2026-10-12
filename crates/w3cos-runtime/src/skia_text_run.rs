@@ -535,9 +535,17 @@ mod precision_tests {
         let style = Style { font_family: Some("monospace".into()),
             font_size: (10.0_f64 * 96.0 / 72.0) as f32, ..Style::default() };
         let text = " The   spacing  on      these         two  sentences need to be the    same!  ";
-        let run = shape_visual_run(text, &face, &style).unwrap();
-        // Chromium141 Canvas measurement for the original WPT sentence.
-        assert_eq!(run.advance, 623.945068359375_f32);
+        let run = shape_visual_run_with_clusters(text, &face, &style).unwrap();
+        // Chrome155: all 78 Courier glyphs measure 7.999298095703125px.
+        // Their precise inline sum is not Canvas's separately accumulated
+        // 623.945068359375px total. Keep the glyph and DOM Range boundaries
+        // exact; do not substitute a Canvas measurement for this inline run.
+        assert_eq!(run.clusters.len(), 78);
+        for (_, advance) in &run.clusters {
+            assert_eq!(*advance, 7.999298095703125_f32);
+        }
+        assert_eq!(run.advance, 623.94525146484375_f32);
+        assert_eq!(crate::text_layout::inline_layout_advance(run.advance), 623.953125);
     }
 
     #[test]

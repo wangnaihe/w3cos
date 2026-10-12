@@ -20,6 +20,22 @@ test('ordinary CSS uses its default media type', async t => {
   assert.equal(response.protocol.sidecar_sha256, null);
 });
 
+test('missing resource is an explicit native-compatible 404 response', async t => {
+  const path = await fixture(t, 'png');
+  await rm(path);
+  const response = await resourceResponse(path);
+  assert.equal(response.status, 404);
+  assert.equal(response.protocol.status, 404);
+  assert.equal(response.headers['content-type'], 'text/plain');
+  assert.equal(response.body.toString(), 'not found');
+  assert.equal(response.protocol.sidecar_sha256, null);
+});
+
+test('non-missing read errors remain protocol errors', async t => {
+  const path = await fixture(t, 'css');
+  await assert.rejects(resourceResponse(join(path, 'child')), { code: 'ENOTDIR' });
+});
+
 test('WPT sidecar overrides CSS extension without changing response bytes', async t => {
   const path = await fixture(t, 'css', 'Content-Type: text/plain\n');
   const response = await resourceResponse(path);

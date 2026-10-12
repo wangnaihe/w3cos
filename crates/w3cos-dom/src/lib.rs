@@ -1312,20 +1312,23 @@ mod tests {
         doc.body().append_child(&mut doc, item);
 
         let tree = doc.to_component_tree();
-        let children = &tree.children[0].children;
-        assert!(matches!(
-            &children[0].kind,
-            w3cos_std::ComponentKind::Text { content } if content == "before value"
-        ));
-        assert_eq!(children[0].style.color, w3cos_std::Color::rgb(0, 128, 0));
-        assert!(matches!(
-            &children[1].kind,
-            w3cos_std::ComponentKind::Text { content } if content == "body"
-        ));
-        assert!(matches!(
-            &children[2].kind,
-            w3cos_std::ComponentKind::Text { content } if content == " after"
-        ));
+        // Multiple content items retain their principal pseudo-element box.
+        // Anonymous line wrappers need not coincide with pseudo boundaries;
+        // ordered content and each run's inherited paint style must survive.
+        fn runs(component: &w3cos_std::Component, out: &mut Vec<(String, w3cos_std::Color)>) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                out.push((content.clone(), component.style.color));
+            }
+            for child in &component.children { runs(child, out); }
+        }
+        let mut actual = Vec::new();
+        runs(&tree.children[0], &mut actual);
+        let green = w3cos_std::Color::rgb(0, 128, 0);
+        let black = w3cos_std::Color::rgb(0, 0, 0);
+        assert_eq!(actual, [
+            ("before ".into(), green), ("value".into(), green),
+            ("body".into(), black), (" after".into(), black),
+        ]);
         crate::stylesheet::clear_rules();
     }
 
@@ -2020,9 +2023,12 @@ mod tests {
         let tree = doc.to_component_tree();
         let host = &tree.children[0];
         assert_eq!(host.style.display, w3cos_std::style::Display::Flex);
+        // The inline packet does not turn an authored atomic table into
+        // flex. Keep its principal display so the runtime exports the first
+        // row's baseline, as Chrome does beside Before/After text.
         assert_eq!(
             host.children[1].style.display,
-            w3cos_std::style::Display::InlineFlex
+            w3cos_std::style::Display::InlineTable
         );
         crate::stylesheet::clear_rules();
     }
@@ -2118,7 +2124,13 @@ mod tests {
         assert_eq!(table.style.height, w3cos_std::style::Dimension::Px(100.0));
         let row = &table.children[0];
         assert_eq!(row.style.display, w3cos_std::style::Display::TableRow);
-        assert_eq!(row.style.height, w3cos_std::style::Dimension::Px(100.0));
+        // A transferred cell height is a row floor, not a fixed height;
+        // taller line content must still grow the anonymous row.
+        assert_eq!(row.style.height, w3cos_std::style::Dimension::Auto);
+        assert_eq!(row.style.min_height, w3cos_std::style::Dimension::Px(100.0));
+        assert_eq!(doc.children_ids(host.id).into_iter()
+            .map(|id|doc.computed_style_for(id).height).collect::<Vec<_>>(),
+            [100.0,80.0,60.0].map(w3cos_std::style::Dimension::Px));
         assert_eq!(row.children.len(), 3);
         assert!(row.children.iter().all(|cell| {
             cell.style.display == w3cos_std::style::Display::TableCell
@@ -3164,7 +3176,11 @@ mod tests {
 
         let tree = doc.to_component_tree();
         assert_eq!(tree.children[0].style.background, w3cos_std::Color::WHITE);
-        assert_eq!(tree.children[0].style.border_width, 1.0);
+        // Chrome155 computed UA geometry, independently recorded in
+        // dom-oracle-browser-v3560: author decoration retains 2px inset.
+        assert_eq!(tree.children[0].style.border_width, 2.0);
+        assert_eq!(tree.children[0].style.border_styles,
+            [Some(w3cos_std::style::BorderLineStyle::Inset); 4]);
 
         crate::stylesheet::register_rule(
             "input",
@@ -3176,7 +3192,15 @@ mod tests {
             w3cos_std::Color::rgb(18, 52, 86)
         );
         assert_eq!(tree.children[0].style.border_radius, 8.0);
-        assert_eq!(tree.children[0].style.border_width, 1.0);
+        assert_eq!(tree.children[0].style.border_width, 2.0);
+        assert_eq!(tree.children[0].style.border_styles,
+            [Some(w3cos_std::style::BorderLineStyle::Inset); 4]);
+        input.style_mut(&mut doc).set_property("border", "3px solid red");
+        let tree = doc.to_component_tree();
+        assert_eq!(tree.children[0].style.border_width, 3.0);
+        assert_eq!(tree.children[0].style.border_styles,
+            [Some(w3cos_std::style::BorderLineStyle::Solid); 4]);
+        assert_eq!(tree.children[0].style.border_color, w3cos_std::Color::rgb(255, 0, 0));
         crate::stylesheet::clear_rules();
     }
 

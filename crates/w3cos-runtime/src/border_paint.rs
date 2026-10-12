@@ -148,7 +148,19 @@ fn border_bands(
         (_, line_style) => line_style,
     };
     // Keep keyword provenance separate from the resolved computed RGB color.
-    let base = if style.border_current_color.is_some_and(|mask| mask[side]) {
+    // Blink resolves initial 3D border color against actual currentColor for
+    // table display types; other boxes retain the historical #eee fallback.
+    let table_display = matches!(style.display,
+        w3cos_std::style::Display::Table | w3cos_std::style::Display::InlineTable
+        | w3cos_std::style::Display::TableRowGroup
+        | w3cos_std::style::Display::TableHeaderGroup
+        | w3cos_std::style::Display::TableFooterGroup
+        | w3cos_std::style::Display::TableRow
+        | w3cos_std::style::Display::TableColumnGroup
+        | w3cos_std::style::Display::TableColumn
+        | w3cos_std::style::Display::TableCell
+        | w3cos_std::style::Display::TableCaption);
+    let base = if !table_display && style.border_current_color.is_some_and(|mask| mask[side]) {
         Color::rgb(238, 238, 238)
     } else {
         colors[side]
@@ -156,12 +168,14 @@ fn border_bands(
     if base.a == 0 {
         return Vec::new();
     }
-    let dark = shade(base, true);
-    let contrast = (luminance(base) + 0.05) / (luminance(dark) + 0.05);
-    let light = if base.r < 150 && base.g < 92 && contrast < 1.75 {
-        shade(base, false)
+    // Chromium's current inset/outset softening matches WebKit. Very dark
+    // colors need two lightening steps to distinguish both bevel faces.
+    let brightness = luminance(base);
+    let (dark, light) = if brightness <= 0.014443844 {
+        let dark=shade(base,false);
+        (dark,shade(dark,false))
     } else {
-        base
+        (shade(base,true),if brightness > 0.83077 {base}else{shade(base,false)})
     };
     let top_or_left = side == 0 || side == 3;
     let outer_dark = match line_style {
@@ -288,6 +302,55 @@ pub(crate) fn three_dimensional_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_three_dimensional_edges_use_browser_light_color() {
+        // V4040 original cell-001: Chrome's collapsed green edge is (0,212,0),
+        // while the prior box-border contrast heuristic kept (0,128,0).
+        let rect = LayoutRect { x: 43.0, y: 35.0, width: 42.0, height: 36.0 };
+        for line in [BorderLineStyle::Inset, BorderLineStyle::Outset,
+            BorderLineStyle::Groove, BorderLineStyle::Ridge] {
+            let style = Style { border_collapse: true,
+                display: w3cos_std::style::Display::TableCell,
+                border_styles: [Some(line); 4], ..Style::default() };
+            for side in 0..4 {
+                let bands = border_bands(&style, rect, [10.0; 4], [Color::rgb(0,128,0); 4], side);
+                assert_eq!(bands[0].color, Color::rgb(0,212,0), "{line:?}, side={side}");
+            }
+        }
+    }
+
+    #[test]
+    fn separate_three_dimensional_border_uses_browser_light_color() {
+        let style = Style { border_styles: [Some(BorderLineStyle::Groove);4],
+            ..Style::default() };
+        let rect = LayoutRect {x:20.0,y:30.0,width:40.0,height:30.0};
+        for side in 0..4 {
+            let bands=border_bands(&style,rect,[10.0;4],[Color::rgb(0,128,0);4],side);
+            assert_eq!(bands[0].color,Color::rgb(0,212,0));
+        }
+    }
+
+    #[test]
+    fn table_current_color_border_softens_black_without_box_fallback() {
+        // Chrome 155 V4084: table outset top=168 and right=84. Ordinary
+        // currentColor outset retains the legacy 238/154 paint fallback.
+        let rect=LayoutRect {x:8.0,y:8.0,width:100.0,height:100.0};
+        for display in [w3cos_std::style::Display::Table,
+            w3cos_std::style::Display::InlineTable,
+            w3cos_std::style::Display::TableCell] {
+            let style=Style {display,border_current_color:Some([true;4]),
+                border_styles:[Some(BorderLineStyle::Outset);4],..Style::default()};
+            let top=border_bands(&style,rect,[1.0;4],[Color::BLACK;4],0);
+            let right=border_bands(&style,rect,[1.0;4],[Color::BLACK;4],1);
+            assert_eq!(top[0].color,Color::rgb(168,168,168));
+            assert_eq!(right.last().unwrap().color,Color::rgb(84,84,84));
+        }
+        let style=Style {border_current_color:Some([true;4]),
+            border_styles:[Some(BorderLineStyle::Outset);4],..Style::default()};
+        assert_eq!(border_bands(&style,rect,[10.0;4],[Color::BLACK;4],0)[0].color,
+            Color::rgb(238,238,238));
+    }
 
     #[test]
     fn collapsed_layers_keep_each_edges_shading_together() {

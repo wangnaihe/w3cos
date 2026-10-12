@@ -11,7 +11,17 @@ const mime = {
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
 export async function resourceResponse(path) {
-  const body = await readFile(path);
+  let body;
+  try {
+    body = await readFile(path);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    body = Buffer.from('not found');
+    return { status: 404, body, headers: { 'content-type': 'text/plain' }, protocol: {
+      status: 404, content_type: 'text/plain', body_sha256: sha256(body),
+      sidecar_sha256: null,
+    } };
+  }
   const headers = { 'content-type': mime[extname(path)] ?? 'application/octet-stream' };
   let sidecar;
   try {
@@ -36,7 +46,8 @@ export async function resourceResponse(path) {
       headers[key] = value;
     }
   }
-  return { body, headers, protocol: {
+  return { status: 200, body, headers, protocol: {
+    status: 200,
     content_type: headers['content-type'], body_sha256: sha256(body),
     sidecar_sha256: sidecar === undefined ? null : sha256(sidecar),
   } };
