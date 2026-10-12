@@ -4,7 +4,8 @@
 Requires an existing release w3cos CLI and installed Python Playwright, Chromium,
 Git, Cargo and native build tools. Never installs prerequisites or browsers and
 never disables the Chromium sandbox. Normal builds may fetch Cargo dependencies;
---offline forbids fetching and requires those exact dependencies to be cached.
+--offline disables Cargo fetching and requires exact Cargo dependencies cached.
+Cargo offline mode does not sandbox network access by dependency build scripts.
 Only the two declared synchronous DOM script wall-time scenarios are measured.
 """
 import argparse
@@ -70,6 +71,8 @@ def preflight(args):
     repo = REPO
     environment = dict(os.environ)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Version probes must not trigger rustup's implicit toolchain installation.
+    environment["RUSTUP_AUTO_INSTALL"] = "0"
     if args.offline:
         environment["CARGO_NET_OFFLINE"] = "true"
     output = args.output_directory.expanduser().resolve()
@@ -79,7 +82,8 @@ def preflight(args):
               "output_directory": str(output), "offline": args.offline,
               "limitations": ["No browser is launched and no native code is compiled by preflight.",
                               "Native system libraries, the complete dependency cache and sandbox availability remain unverified.",
-                              "Default builds/fetch may download Cargo dependencies; --offline requires cached exact versions."]}
+                              "Default builds/fetch may download Cargo dependencies; --offline requires cached exact versions.",
+                              "Cargo offline mode does not prevent independent network access by dependency build scripts."]}
     context = {"repo": repo, "output": output, "cli": cli, "lockfile": lockfile,
                "environment": environment, "manifest_path": HERE / "manifest.json"}
 

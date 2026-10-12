@@ -85,6 +85,7 @@ class LocalRunnerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 1, "", "synthetic missing prerequisite")
             return subprocess.CompletedProcess(command, 0, text, "")
         self.assertEqual(kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(kwargs["env"]["RUSTUP_AUTO_INSTALL"], "0")
         stage = Path(command[1]).name if command[0] != "cargo" else "fetch"
         if self.interrupt:
             raise KeyboardInterrupt
@@ -164,6 +165,7 @@ class LocalRunnerTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["status"], "ready")
         self.assertFalse(self.output.exists())
         self.assertTrue(all(call[1].get("capture_output") for call in self.calls))
+        self.assertTrue(all(call[1]["env"]["RUSTUP_AUTO_INSTALL"] == "0" for call in self.calls))
         self.assertFalse(any(str(self.browser) in call[0] for call in self.calls))
         self.assertTrue(any(call[0][0] == "xcode-select" for call in self.calls))
 

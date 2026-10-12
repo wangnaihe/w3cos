@@ -63,7 +63,8 @@ target/perf-venv/bin/python tools/perf-paired/run_local.py \
 
 运行器会在 checkout 的同级目录创建独立输出目录（`../仓库名-perf-results/local-*`），构建原生 fixture，准备锁定依赖，保留原始构建记录后
 按指定锁离线重建，再在同一台机器上启动独立原生进程和浏览器进程，交替执行 8 对。
-首次运行默认允许 Cargo 获取锁定的构建依赖；`--offline` 禁止获取，缺缓存则明确失败。
+首次运行默认允许 Cargo 获取锁定的构建依赖；`--offline` 禁止 Cargo 获取，缺缓存则明确失败。
+Cargo 的离线模式不是网络沙箱，不能阻止依赖自身构建脚本另行联网。
 锁文件必须一致，不能为获得成功而让 Cargo 改成另一个版本。没有权限或不支持平台依赖
 时，保留错误交回处理。
 
