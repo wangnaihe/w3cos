@@ -293,6 +293,7 @@ thread_local! {
     /// objects cannot leak into the next navigation.
     static DOCUMENT_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static WINDOW_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static LOCATION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static SELECTION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static IDLE_DEADLINE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DOM_PARSER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -989,6 +990,7 @@ fn collection_value(
     provider: CollectionProvider,
     static_items: Option<Rc<Vec<Value>>>,
     class_name: &'static str,
+    child_nodes_root: Option<u32>,
 ) -> Value {
     let generation = realm_generation();
     let snapshot_provider = provider.clone();
@@ -1050,6 +1052,10 @@ fn collection_value(
             if let Ok(index) = key.parse::<usize>() {
                 return if let Some(items) = get_static_items.as_ref() {
                     items.get(index).cloned().unwrap_or(Value::Undefined)
+                } else if let Some(node) = child_nodes_root {
+                    child_node_at(node, index)
+                        .map(element_value)
+                        .unwrap_or(Value::Undefined)
                 } else {
                     get_provider()
                         .get(index)
@@ -1075,12 +1081,16 @@ fn collection_value(
                 return inherited;
             }
             match key {
-                "length" => Value::Number(
-                    get_static_items
-                        .as_ref()
-                        .map_or_else(|| get_provider().len(), |items| items.len())
-                        as f64,
-                ),
+                "length" => {
+                    let length = if let Some(items) = get_static_items.as_ref() {
+                        items.len()
+                    } else if let Some(node) = child_nodes_root {
+                        child_node_count(node)
+                    } else {
+                        get_provider().len()
+                    };
+                    Value::Number(length as f64)
+                }
                 _ => target.get_property(key),
             }
         })
@@ -1184,15 +1194,16 @@ pub(crate) fn node_list(items: Vec<Value>) -> Value {
         }),
         Some(items),
         "NodeList",
+        None,
     )
 }
 
 fn live_node_list(provider: impl Fn() -> Vec<Value> + 'static) -> Value {
-    collection_value(Rc::new(provider), None, "NodeList")
+    collection_value(Rc::new(provider), None, "NodeList", None)
 }
 
 fn html_collection(provider: impl Fn() -> Vec<Value> + 'static) -> Value {
-    collection_value(Rc::new(provider), None, "HTMLCollection")
+    collection_value(Rc::new(provider), None, "HTMLCollection", None)
 }
 
 fn element_or_null(node: Option<u32>) -> Value {
@@ -1202,11 +1213,49 @@ fn element_or_null(node: Option<u32>) -> Value {
     }
 }
 
+// Read the current sibling chain without allocating a full child snapshot or
+// materializing unrelated JS wrappers. Returning the ID releases the document
+// borrow before element_value builds or retrieves the selected wrapper.
+fn child_node_at(node: u32, index: usize) -> Option<u32> {
+    dom::with_document(|document| {
+        let mut child = document.get_node(NodeId::from_u32(node)).first_child;
+        let mut remaining = index;
+        while let Some(id) = child {
+            if remaining == 0 {
+                return Some(id.as_u32());
+            }
+            remaining -= 1;
+            child = document.get_node(id).next_sibling;
+        }
+        None
+    })
+}
+
+fn child_node_count(node: u32) -> usize {
+    dom::with_document(|document| {
+        let mut child = document.get_node(NodeId::from_u32(node)).first_child;
+        let mut count = 0;
+        while let Some(id) = child {
+            count += 1;
+            child = document.get_node(id).next_sibling;
+        }
+        count
+    })
+}
+
 fn child_nodes_value(node: u32) -> Value {
     if let Some(list) = get_expando(node, "childNodes") {
         return list;
     }
-    let list = live_node_list(move || dom::children(node).into_iter().map(element_value).collect());
+    // Only arena-backed childNodes can use direct sibling traversal. Other
+    // live lists (including global/virtual Document children) retain their
+    // providers, as do this list's snapshot and reflection operations.
+    let list = collection_value(
+        Rc::new(move || dom::children(node).into_iter().map(element_value).collect()),
+        None,
+        "NodeList",
+        Some(node),
+    );
     set_expando(node, "childNodes", list.clone());
     list
 }
@@ -16433,6 +16482,18 @@ fn navigator_value() -> Value {
 }
 
 fn location_value() -> Value {
+    if let Some(value) = LOCATION_VALUE.with(|slot| slot.borrow().clone()) {
+        return value;
+    }
+    // Do not hold the cache borrow while constructing host objects/prototypes.
+    // Only the current top-level Realm uses this facade; installed frame
+    // documents keep their own explicit location objects.
+    let value = build_location_value();
+    LOCATION_VALUE.with(|slot| *slot.borrow_mut() = Some(value.clone()));
+    value
+}
+
+fn build_location_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     for (name, getter) in [
         ("href", crate::history::get_href as fn() -> String),
@@ -17322,6 +17383,23 @@ fn build_window_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
 
     props.insert("document".to_string(), document_value());
+    // ESM globals resolve through this window. Reuse the core console sink so
+    // compiled console calls have the same opt-in diagnostic output as direct
+    // core calls, rather than silently calling a missing window property.
+    props.insert(
+        "console".to_string(),
+        Value::object(
+            ["log", "info", "warn", "error", "debug"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        Value::function(move |_, args| w3cos_core::console.call_method(name, args)),
+                    )
+                })
+                .collect(),
+        ),
+    );
     props.insert("String".to_string(), string_compat_class());
     props.insert("Number".to_string(), number_compat_class());
     props.insert("Boolean".to_string(), boolean_compat_class());
@@ -19695,6 +19773,9 @@ pub fn reset_bridge() {
     DOCUMENT_VALUE.with(|value| {
         value.borrow_mut().take();
     });
+    LOCATION_VALUE.with(|value| {
+        value.borrow_mut().take();
+    });
     SELECTION_VALUE.with(|value| {
         value.borrow_mut().take();
     });
@@ -19759,6 +19840,45 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    #[test]
+    fn window_console_routes_esm_diagnostics_to_core_sink() {
+        const PROBE: &str = "W3COS_TEST_WINDOW_CONSOLE_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            setup();
+            let console = window_value().get_property("console");
+            assert!(console.strict_eq(&window_value().get_property("console")));
+            for name in ["log", "info", "warn", "error", "debug"] {
+                assert!(console.get_property(name).is_callable());
+                assert!(console
+                    .call_method(name, vec![Value::string("console-bridge-probe")])
+                    .is_undefined());
+            }
+            return;
+        }
+        // Configure only the child process; never mutate the environment of
+        // concurrently running tests. Verify both the opt-in sink and silence.
+        for enabled in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "jsdom::tests::window_console_routes_esm_diagnostics_to_core_sink", "--nocapture"])
+                .env(PROBE, "1")
+                .env_remove("W3COS_JS_CONSOLE");
+            if enabled {
+                command.env("W3COS_JS_CONSOLE", "1");
+            }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            for name in ["log", "info", "warn", "error", "debug"] {
+                assert_eq!(
+                    stderr.contains(&format!("[js.console.{name}] console-bridge-probe")),
+                    enabled,
+                    "{stderr}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -20729,6 +20849,213 @@ mod tests {
         assert!(iterator.next().is_none());
     }
 
+    fn assert_child_nodes_contents(list: &Value, expected: &[Value]) {
+        assert_eq!(list.get_property("length").to_u32() as usize, expected.len());
+        let object = list.as_object().expect("childNodes must be an object");
+        let keys = object
+            .borrow()
+            .own_keys()
+            .iter()
+            .map(|key| key.to_js_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            (0..expected.len())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+        );
+        for (index, node) in expected.iter().enumerate() {
+            let key = index.to_string();
+            assert!(list.get_property(&key).strict_eq(node));
+            assert!(
+                list.call_method("item", vec![Value::Number(index as f64)])
+                    .strict_eq(node)
+            );
+            assert!(Value::string(&key).js_in(list).to_bool());
+            let descriptor = object.borrow().get_own_property_descriptor(&key);
+            assert!(descriptor.get_property("value").strict_eq(node));
+            assert!(!descriptor.get_property("writable").to_bool());
+            assert!(descriptor.get_property("enumerable").to_bool());
+            assert!(descriptor.get_property("configurable").to_bool());
+        }
+        let missing = expected.len().to_string();
+        assert!(list.get_property(&missing).is_undefined());
+        assert!(
+            list.call_method("item", vec![Value::Number(expected.len() as f64)])
+                .is_null()
+        );
+        assert!(!Value::string(&missing).js_in(list).to_bool());
+        assert!(
+            object
+                .borrow()
+                .get_own_property_descriptor(&missing)
+                .is_undefined()
+        );
+        assert!(
+            object
+                .borrow()
+                .get_own_property_descriptor("length")
+                .is_undefined()
+        );
+    }
+
+    #[test]
+    fn child_nodes_retained_list_tracks_mixed_mutations_and_reparenting() {
+        setup();
+        let document = document_value();
+        let parent = create_in_body("div");
+        let destination = create_in_body("section");
+        let list = parent.get_property("childNodes");
+        let destination_list = destination.get_property("childNodes");
+        assert!(list.strict_eq(&parent.get_property("childNodes")));
+        assert_child_nodes_contents(&list, &[]);
+        assert_child_nodes_contents(&destination_list, &[]);
+
+        let text = document.call_method("createTextNode", vec![Value::string("text")]);
+        let comment = document.call_method("createComment", vec![Value::string("comment")]);
+        let first = document.call_method("createElement", vec![Value::string("span")]);
+        let second = document.call_method("createElement", vec![Value::string("b")]);
+        let replacement = document.call_method("createElement", vec![Value::string("i")]);
+        for node in [&text, &first, &comment] {
+            parent.call_method("appendChild", vec![node.clone()]);
+        }
+        assert_child_nodes_contents(&list, &[text.clone(), first.clone(), comment.clone()]);
+        assert!(!list.try_set_property("0", Value::string("blocked")));
+        assert!(list.get_property("0").strict_eq(&text));
+
+        parent.call_method("insertBefore", vec![second.clone(), first.clone()]);
+        assert_child_nodes_contents(
+            &list,
+            &[text.clone(), second.clone(), first.clone(), comment.clone()],
+        );
+        parent.call_method("appendChild", vec![text.clone()]);
+        assert_child_nodes_contents(
+            &list,
+            &[second.clone(), first.clone(), comment.clone(), text.clone()],
+        );
+        parent.call_method("replaceChild", vec![replacement.clone(), first.clone()]);
+        assert_child_nodes_contents(
+            &list,
+            &[second.clone(), replacement.clone(), comment.clone(), text.clone()],
+        );
+        destination.call_method("appendChild", vec![comment.clone()]);
+        assert_child_nodes_contents(&list, &[second.clone(), replacement.clone(), text.clone()]);
+        assert_child_nodes_contents(&destination_list, &[comment.clone()]);
+        parent.call_method("removeChild", vec![second]);
+        assert_child_nodes_contents(&list, &[replacement, text]);
+
+        parent.call_method("replaceChildren", vec![first.clone(), comment.clone()]);
+        assert_child_nodes_contents(&list, &[first, comment]);
+        assert_child_nodes_contents(&destination_list, &[]);
+        parent.set_property("textContent", Value::string("replacement text"));
+        let replacement_text = parent.get_property("firstChild");
+        assert_eq!(replacement_text.get_property("nodeType").to_u32(), 3);
+        assert_eq!(
+            replacement_text.get_property("data").to_js_string(),
+            "replacement text"
+        );
+        assert_child_nodes_contents(&list, &[replacement_text]);
+        parent.call_method("replaceChildren", vec![]);
+        assert_child_nodes_contents(&list, &[]);
+        assert!(list.strict_eq(&parent.get_property("childNodes")));
+    }
+
+    #[test]
+    fn child_nodes_retained_fragment_list_drains_and_refills() {
+        setup();
+        let document = document_value();
+        let parent = create_in_body("div");
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        let parent_list = parent.get_property("childNodes");
+        let fragment_list = fragment.get_property("childNodes");
+        let first = document.call_method("createElement", vec![Value::string("span")]);
+        let text = document.call_method("createTextNode", vec![Value::string("text")]);
+        let comment = document.call_method("createComment", vec![Value::string("comment")]);
+        for node in [&first, &text, &comment] {
+            fragment.call_method("appendChild", vec![node.clone()]);
+        }
+        assert_child_nodes_contents(
+            &fragment_list,
+            &[first.clone(), text.clone(), comment.clone()],
+        );
+        assert_child_nodes_contents(&parent_list, &[]);
+        parent.call_method("appendChild", vec![fragment.clone()]);
+        assert_child_nodes_contents(&fragment_list, &[]);
+        assert_child_nodes_contents(
+            &parent_list,
+            &[first.clone(), text.clone(), comment.clone()],
+        );
+
+        fragment.call_method("appendChild", vec![text.clone()]);
+        assert_child_nodes_contents(&fragment_list, &[text.clone()]);
+        assert_child_nodes_contents(&parent_list, &[first.clone(), comment.clone()]);
+        parent.call_method("insertBefore", vec![fragment.clone(), first.clone()]);
+        assert_child_nodes_contents(&parent_list, &[text, first, comment]);
+        assert_child_nodes_contents(&fragment_list, &[]);
+        assert!(fragment_list.strict_eq(&fragment.get_property("childNodes")));
+    }
+
+    #[test]
+    fn child_nodes_direct_reads_only_materialize_the_selected_raw_child() {
+        setup();
+        let parent_id = dom::create_element("div");
+        let parent = element_value(parent_id);
+        let list = parent.get_property("childNodes");
+        assert_eq!(list.get_property("length").to_u32(), 0);
+
+        let first = dom::create_element("span");
+        let second = dom::create_text_node("raw text");
+        // Mutate the underlying arena directly: these reads must observe the
+        // tree without relying on a bridge mutation-generation notification.
+        dom::with_document_mut(|document| {
+            document.append_child(NodeId::from_u32(parent_id), NodeId::from_u32(first));
+            document.append_child(NodeId::from_u32(parent_id), NodeId::from_u32(second));
+        });
+        let wrappers_absent = || {
+            ELEMENT_VALUES.with(|values| {
+                let values = values.borrow();
+                !values.contains_key(&first) && !values.contains_key(&second)
+            })
+        };
+        assert!(wrappers_absent());
+        assert_eq!(list.get_property("length").to_u32(), 2);
+        assert!(list.get_property(&usize::MAX.to_string()).is_undefined());
+        assert!(
+            wrappers_absent(),
+            "length and missing indices must not materialize children"
+        );
+
+        let selected = list.get_property("1");
+        assert_eq!(node_id_of(&selected), Some(second));
+        assert!(selected.get_property("parentNode").strict_eq(&parent));
+        assert!(selected.strict_eq(&element_value(second)));
+        assert!(ELEMENT_VALUES.with(|values| !values.borrow().contains_key(&first)));
+        dom::with_document_mut(|document| {
+            document.remove_child(NodeId::from_u32(parent_id), NodeId::from_u32(first));
+        });
+        assert_eq!(list.get_property("length").to_u32(), 1);
+        assert!(list.get_property("0").strict_eq(&selected));
+        assert!(list.get_property("1").is_undefined());
+    }
+
+    #[test]
+    fn child_nodes_length_preserves_own_and_inherited_property_precedence() {
+        setup();
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("span")]);
+        parent.call_method("appendChild", vec![child]);
+        let list = parent.get_property("childNodes");
+        let prototype = dom_collection_class("NodeList").get_property("prototype");
+        assert_eq!(list.get_property("length").to_u32(), 1);
+        prototype.set_property("length", Value::Number(17.0));
+        assert_eq!(list.get_property("length").to_u32(), 17);
+        list.set_property("length", Value::Number(23.0));
+        assert_eq!(list.get_property("length").to_u32(), 23);
+        list.delete_property("length");
+        prototype.set_property("length", Value::Undefined);
+        assert_eq!(list.get_property("length").to_u32(), 1);
+    }
+
     #[test]
     fn composed_events_cross_shadow_boundary_and_retarget_to_host() {
         setup();
@@ -20862,6 +21189,222 @@ mod tests {
         assert_eq!(popstate_calls.get(), 2);
         assert_eq!(states.borrow().as_slice(), ["null", "route-state"]);
         assert_eq!(history.get_property("state").to_js_string(), "route-state");
+    }
+
+    #[test]
+    fn location_cache_shares_identity_in_every_construction_order() {
+        for order in 0..3 {
+            setup();
+            let first = match order {
+                0 => document_value().get_property("location"),
+                1 => window_value().get_property("location"),
+                _ => location_value(),
+            };
+            let document = document_value();
+            let window = window_value();
+            assert!(first.strict_eq(&document.get_property("location")));
+            assert!(first.strict_eq(&document.get_property("location")));
+            assert!(first.strict_eq(&window.get_property("location")));
+            assert!(first.strict_eq(&location_value()));
+            assert!(w3cos_core::class::instance_of(&first, &window.get_property("Location")));
+        }
+    }
+
+    #[test]
+    fn location_cache_keeps_history_and_component_reads_live() {
+        setup();
+        let document = document_value();
+        let location = document.get_property("location");
+        let window = window_value();
+        location.call_method("assign", vec![Value::string("https://example.test:8000/base?x=1#old")]);
+        assert_eq!(location.get_property("hash"), Value::string("#old"));
+        for (name, input, expected) in [
+            ("protocol", "http", "http:"),
+            ("host", "next.test:8001", "next.test:8001"),
+            ("hostname", "final.test", "final.test"),
+            ("port", "8080", "8080"),
+            ("pathname", "orders", "/orders"),
+            ("search", "q=2", "?q=2"),
+            ("hash", "new", "#new"),
+        ] {
+            document.get_property("location").set_property(name, Value::string(input));
+            assert_eq!(location.get_property(name), Value::string(expected));
+            assert_eq!(window.get_property("location").get_property(name), Value::string(expected));
+        }
+        assert_eq!(location.get_property("origin"), Value::string("http://final.test:8080"));
+        let before_replace = crate::history::get_length();
+        location.call_method("replace", vec![Value::string("/replaced#replacement")]);
+        assert_eq!(crate::history::get_length(), before_replace);
+        assert_eq!(location.get_property("hash"), Value::string("#replacement"));
+        location.set_property("href", Value::string("https://new.test/end#last"));
+        assert_eq!(location.get_property("hostname"), Value::string("new.test"));
+        assert_eq!(location.call_method("toString", vec![]), location.get_property("href"));
+        assert!(crate::history::back());
+        assert_eq!(location.get_property("hash"), Value::string("#replacement"));
+        assert!(crate::history::forward());
+        assert_eq!(location.get_property("hash"), Value::string("#last"));
+        crate::history::reset();
+        assert!(location.strict_eq(&document.get_property("location")));
+        assert_eq!(location.get_property("href"), Value::string("w3cos://app/"));
+    }
+
+    #[test]
+    fn location_cache_invalidates_old_handles_and_releases_each_realm() {
+        setup();
+        let old = location_value();
+        let old_weak = weak_realm_object(&old);
+        let getter = old.get_property("__w3cos_getter_hash");
+        let href_getter = old.get_property("__w3cos_getter_href");
+        let setter = old.get_property("__w3cos_setter_href");
+        let assign = old.get_property("assign");
+        let replace = old.get_property("replace");
+        old.set_property("__page_marker", Value::Bool(true));
+        crate::dom_constructors::prototype("Location").set_property("__page_marker", Value::Bool(true));
+        reset_bridge();
+        assert!(LOCATION_VALUE.with(|slot| slot.borrow().is_none()));
+        assert!(old_weak.upgrade().is_none(), "old arena object must be invalidated");
+        crate::history::reset();
+        let next = location_value();
+        assert!(next.get_property("__page_marker").is_undefined());
+        for method in [getter, href_getter, setter, assign, replace] {
+            assert!(method.call(old.clone(), vec![Value::string("https://stale.test/#bad")]).is_undefined());
+        }
+        old.set_property("hash", Value::string("bad"));
+        assert_eq!(next.get_property("href"), Value::string("w3cos://app/"));
+        assert!(old.get_property("href").is_undefined());
+        drop(old);
+        drop(next);
+        reset_bridge();
+        let baseline = w3cos_core::heap::heap_snapshot();
+        for _ in 0..3 {
+            let location = location_value();
+            let weak = weak_realm_object(&location);
+            drop(location);
+            reset_bridge();
+            assert!(LOCATION_VALUE.with(|slot| slot.borrow().is_none()));
+            assert!(weak.upgrade().is_none(), "reset must release the cached facade");
+            let after = w3cos_core::heap::heap_snapshot();
+            assert_eq!(after.live_objects, baseline.live_objects);
+            assert_eq!(after.live_functions, baseline.live_functions);
+            assert_eq!(after.live_arrays, baseline.live_arrays);
+            assert_eq!(after.live_bytes, baseline.live_bytes);
+        }
+    }
+
+    #[test]
+    fn location_cache_repeated_reads_do_not_allocate_core_facades() {
+        setup();
+        let document = document_value();
+        let window = window_value();
+        let location = document.get_property("location");
+        let window_location = window.get_property("location");
+        assert_eq!(location.get_property("hash"), Value::string(""));
+        let before = w3cos_core::heap::heap_snapshot();
+        for _ in 0..128 {
+            let current = document.get_property("location");
+            assert!(current.strict_eq(&location));
+            assert!(current.strict_eq(&window_location));
+            assert_eq!(current.get_property("hash"), Value::string(""));
+        }
+        let after = w3cos_core::heap::heap_snapshot();
+        assert_eq!(after.total_allocations, before.total_allocations);
+        assert_eq!(after.total_allocated_bytes, before.total_allocated_bytes);
+        assert_eq!(after.live_objects, before.live_objects);
+        assert_eq!(after.live_functions, before.live_functions);
+        // These are Core estimates, not a claim about Rust/native allocations.
+    }
+
+    #[test]
+    fn location_cache_preserves_frame_and_detached_document_independence() {
+        setup();
+        let parent = document_value();
+        let parent_location = parent.get_property("location");
+        parent_location.set_property("href", Value::string("https://example.test/#parent-target"));
+        let parent_target = create_in_body("div");
+        parent_target.set_property("id", Value::string("parent-target"));
+        let iframe = create_in_body("iframe");
+        let frame = parse_frame_document(
+            "<html><body><div id='child-target' class='active'></div></body></html>",
+            "text/html",
+            "https://example.test/frame#child-target",
+        );
+        install_frame_document(node_id_of(&iframe).unwrap(), frame.clone(), "https://example.test/frame#child-target");
+        let child_location = frame.get_property("location");
+        assert!(!child_location.strict_eq(&parent_location));
+        assert!(child_location.strict_eq(&iframe.get_property("contentWindow").get_property("location")));
+        let child = frame.call_method("getElementById", vec![Value::string("child-target")]);
+        assert!(child.get_property("ownerDocument").strict_eq(&frame));
+        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        assert_eq!(parent_target.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        parent_location.set_property("hash", Value::string("other-parent"));
+        assert_eq!(child_location.get_property("hash"), Value::string("#child-target"));
+        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        child_location.set_property("hash", Value::string("#different-child"));
+        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(false));
+        assert_eq!(parent_location.get_property("hash"), Value::string("#other-parent"));
+        let detached = parse_document("<html><body></body></html>", "text/html");
+        assert!(detached.get_property("location").is_null());
+    }
+
+    #[test]
+    fn location_cache_preserves_authored_property_precedence() {
+        setup();
+        let document = document_value();
+        let window = window_value();
+        let location = document.get_property("location");
+        location.set_property("marker", Value::Number(42.0));
+        assert_eq!(window.get_property("location").get_property("marker"), Value::Number(42.0));
+        let replacement = Value::object(HashMap::from([("hash".into(), Value::string("#override"))]));
+        document.set_property("location", replacement.clone());
+        assert!(document.get_property("location").strict_eq(&replacement));
+        assert!(window.get_property("location").strict_eq(&location));
+        document.delete_property("location");
+        assert!(document.get_property("location").strict_eq(&location));
+        location.set_property("assign", func(|_, _| Value::Number(17.0)));
+        assert_eq!(document.get_property("location").call_method("assign", vec![]), Value::Number(17.0));
+        window.get_property("location").delete_property("assign");
+        assert!(document.get_property("location").get_property("assign").is_undefined());
+        window.delete_property("location");
+        assert!(window_value().get_property("location").is_undefined());
+        assert!(document.get_property("location").strict_eq(&location));
+    }
+
+    #[test]
+    fn location_cache_keeps_matches_getters_and_error_order_observable() {
+        setup();
+        let document = document_value();
+        let element = create_in_body("div");
+        element.set_property("className", Value::string("active"));
+        let reads = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&reads);
+        let original = document.get_property("__w3cos_getter_location");
+        document.set_property("__w3cos_getter_location", func(move |_, _| {
+            observed.set(observed.get() + 1);
+            w3cos_core::throw_value(Value::string("authored location getter"))
+        }));
+        let missing = w3cos_core::catch_js(|| element.call_method("matches", vec![])).unwrap_err();
+        assert_eq!(missing.get_property("name"), Value::string("TypeError"));
+        assert_eq!(missing.get_property("message"), Value::string("matches requires one argument"));
+        assert_eq!(reads.get(), 0);
+        let error = w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")])).unwrap_err();
+        assert_eq!(error, Value::string("authored location getter"));
+        assert_eq!(reads.get(), 1);
+        document.set_property("__w3cos_getter_location", original);
+        let invalid = w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")])).unwrap_err();
+        assert_eq!(invalid.get_property("name"), Value::string("SyntaxError"));
+        assert_eq!(invalid.get_property("message"), Value::string("Invalid selector"));
+        let hash_reads = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&hash_reads);
+        document.set_property("location", Value::object(HashMap::from([(
+            "__w3cos_getter_hash".into(),
+            func(move |_, _| {
+                observed.set(observed.get() + 1);
+                Value::string("")
+            }),
+        )])));
+        assert_eq!(element.call_method("matches", vec![Value::string(".active")]), Value::Bool(true));
+        assert_eq!(element.call_method("matches", vec![Value::string(".inactive")]), Value::Bool(false));
+        assert_eq!(hash_reads.get(), 2, "even simple selectors must retain observable property reads");
     }
 
     #[test]
@@ -24554,6 +25097,7 @@ try {
         let old_dataset = old_element.get_property("dataset");
         let old_class_list = old_element.get_property("classList");
         let old_children = old_document.get_property("body").get_property("children");
+        let old_child_nodes = old_document.get_property("body").get_property("childNodes");
         let old_node_constructor = window_value().get_property("Node");
         let old_node_constructor_identity = old_node_constructor.identity_hash();
         old_node_constructor
@@ -24579,6 +25123,8 @@ try {
         assert!(old_element.get_property("nodeType").is_undefined());
         assert!(old_children.get_property("length").is_undefined());
         assert!(old_children.get_property("0").is_undefined());
+        assert!(old_child_nodes.get_property("length").is_undefined());
+        assert!(old_child_nodes.get_property("0").is_undefined());
 
         old_element.set_property("id", Value::string("stale-direct-write"));
         old_set_attribute.call(

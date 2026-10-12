@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use taffy::prelude::*;
 use taffy::util::ResolveOrZero;
 use w3cos_std::component::EventAction;
@@ -19,8 +18,6 @@ use crate::text_layout;
 pub(crate) const ROOT_FONT_SIZE: f32 = 16.0;
 /// Typical mobile content width for pre-wrap intrinsic sizing.
 const DEFAULT_TEXT_WRAP_WIDTH: f32 = 360.0;
-
-static LAYOUT_FONT: OnceLock<fontdue::Font> = OnceLock::new();
 
 const TEXT_MEASURE_CACHE_CAPACITY: usize = 4096;
 
@@ -69,7 +66,9 @@ thread_local! {
 }
 
 pub(crate) fn layout_font() -> &'static fontdue::Font {
-    LAYOUT_FONT.get_or_init(|| crate::font_face::host_ui_font().font.clone())
+    // The host font is already immutable and process-static. Borrow it rather
+    // than retaining a second deep copy of its glyph vectors and lookup maps.
+    &crate::font_face::host_ui_font().font
 }
 
 pub(crate) fn inline_font_height(style: &w3cos_std::style::Style) -> f32 {
@@ -23086,6 +23085,13 @@ mod tests {
 
     fn s() -> Style {
         Style::default()
+    }
+
+    #[test]
+    fn layout_font_reuses_immutable_host_font() {
+        let font = layout_font();
+        assert!(std::ptr::eq(font, &crate::font_face::host_ui_font().font));
+        assert!(std::ptr::eq(font, layout_font()));
     }
 
     #[test]

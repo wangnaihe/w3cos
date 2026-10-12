@@ -1,0 +1,14 @@
+{
+  "schema": "w3cos-paired-manifest-v1",
+  "fixture": "scenarios.ts",
+  "metric": "synchronous-dom-script-wall-ms-v1",
+  "reset": "fresh-process-fixed-node-pools-v1",
+  "parameters": {"nodes": 256, "rounds": 32, "warmup": 3, "samples": 7},
+  "viewport": {"width": 1024, "height": 768, "dpr": 1},
+  "scenarios": ["append-remove-pool", "class-matches"],
+  "pairs": 8,
+  "native_ratio_limit": 0.95,
+  "bootstrap_resamples": 10000,
+  "family_alpha": 0.05,
+  "random_seed": 0
+}

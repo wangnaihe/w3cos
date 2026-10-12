@@ -28,7 +28,7 @@ mod selector_filter;
 mod selector_parse_cache;
 
 use rule_set::RuleSet;
-use selector_filter::AncestorBloom;
+use selector_filter::{AncestorBloom, LazyAncestorBloom};
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
 #[derive(Debug, Clone, Default)]
@@ -697,7 +697,10 @@ pub fn matching_declarations_for_context(
     ctx: &SelectorContext,
     ancestors: &[SelectorContext],
 ) -> Vec<(String, String, u32)> {
-    let ancestor_bloom = AncestorBloom::for_contexts(ancestors);
+    let ancestor_bloom = LazyAncestorBloom::new(
+        || AncestorBloom::for_contexts(ancestors),
+        ancestors.is_empty(),
+    );
     RULES.with(|rules| {
         let rules = rules.borrow();
         let mut matched: Vec<&Rule> = rules
@@ -737,7 +740,10 @@ fn ancestor_filtered_candidate_rule_count_for_context(
     ctx: &SelectorContext,
     ancestors: &[SelectorContext],
 ) -> usize {
-    let ancestor_bloom = AncestorBloom::for_contexts(ancestors);
+    let ancestor_bloom = LazyAncestorBloom::new(
+        || AncestorBloom::for_contexts(ancestors),
+        ancestors.is_empty(),
+    );
     RULES.with(|rules| {
         let rules = rules.borrow();
         rules
@@ -755,7 +761,7 @@ fn matched_property_value(
     document_scope: Option<NodeId>,
     property: &str,
 ) -> Option<String> {
-    let ancestor_bloom = AncestorBloom::for_node(document, node);
+    let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
     let mut declarations = rules
         .iter()
         .filter(|rule| rule.pseudo_element.is_none() && !rule_has_container_query(rule))
@@ -913,7 +919,7 @@ pub(crate) fn matching_cascade_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<CascadeDeclaration> {
-    let ancestor_bloom = AncestorBloom::for_node(document, node);
+    let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
@@ -970,7 +976,7 @@ pub fn matching_pseudo_declarations_for_node(
     node: NodeId,
     pseudo_element: &str,
 ) -> Vec<(String, String, u32)> {
-    let ancestor_bloom = AncestorBloom::for_node(document, node);
+    let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
@@ -1040,7 +1046,10 @@ pub fn selector_matches_context(
         .map(|single| parse_selector_chain_cached(&single))
         .collect::<Option<Vec<_>>>()
         .ok_or(())?;
-    let ancestor_bloom = AncestorBloom::for_contexts(ancestors);
+    let ancestor_bloom = LazyAncestorBloom::new(
+        || AncestorBloom::for_contexts(ancestors),
+        ancestors.is_empty(),
+    );
     Ok(parsed.into_iter().any(|parsed| {
         ancestor_bloom.might_contain(parsed.ancestor_filter)
             && selector_chain_matches_context(&parsed.chain, &parsed.combinators, ctx, ancestors)
@@ -1554,13 +1563,9 @@ fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext
         .iter()
         .map(|(name, value)| (name.as_str(), *value))
         .collect::<Vec<_>>();
-    let is_first_child = node.parent.is_some_and(|parent| {
-        document
-            .children_ids(parent)
-            .into_iter()
-            .find(|sibling| document.get_node(*sibling).node_type == NodeType::Element)
-            == Some(id)
-    });
+    let is_first_child = node.node_type == NodeType::Element
+        && node.parent.is_some()
+        && previous_element_sibling(document, id).is_none();
     let is_root = node
         .parent
         .is_none_or(|parent| document.get_node(parent).node_type == NodeType::Document);
@@ -2277,6 +2282,94 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic microbenchmark; run in release mode with --nocapture"]
+    fn ancestor_filter_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // This isolates stylesheet candidate filtering, not browser rendering
+        // or end-to-end frame latency. Compare the same test on both revisions.
+        for depth in [0, 32, 256] {
+            let ancestors = vec![SelectorContext::new("div", None, &["active"]); depth];
+            let target = SelectorContext::new("span", None, &["target"]);
+            for (scenario, selector) in [
+                ("simple", ".target"),
+                ("ancestor-hit", ".active .target"),
+                ("ancestor-miss", ".missing .target"),
+                ("no-candidates", ".other"),
+            ] {
+                setup();
+                register_rule(selector, &[("color", "red")]);
+                for _ in 0..1_000 {
+                    black_box(matching_declarations_for_context(&target, &ancestors));
+                }
+                let iterations = match depth {
+                    0 => 1_000_000,
+                    32 => 200_000,
+                    _ => 30_000,
+                };
+                for repetition in 0..5 {
+                    let started = Instant::now();
+                    for _ in 0..iterations {
+                        black_box(matching_declarations_for_context(
+                            black_box(&target),
+                            black_box(&ancestors),
+                        ));
+                    }
+                    println!(
+                        "ancestor-filter scenario={scenario} depth={depth} repetition={repetition} ns_per_op={:.2}",
+                        started.elapsed().as_nanos() as f64 / f64::from(iterations)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_ancestor_filter_observes_mutations_in_node_and_pseudo_cascades() {
+        setup();
+        register_rule("span", &[("color", "blue")]);
+        register_rule(".active span", &[("color", "red")]);
+        register_rule(".active span::before", &[("content", "'active'")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let target = document.create_element("span");
+        document.append_child(document.body().id, parent.id);
+        document.append_child(parent.id, target.id);
+
+        let initial = matching_declarations_for_node(&document, target.id);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].1, "blue");
+        assert!(matching_pseudo_declarations_for_node(&document, target.id, "::before").is_empty());
+
+        parent.set_attribute(&mut document, "class", "active");
+        let active = matching_declarations_for_node(&document, target.id);
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[1].1, "red");
+        assert_eq!(
+            matching_pseudo_declarations_for_node(&document, target.id, "::before")[0].1,
+            "'active'"
+        );
+
+        parent.set_attribute(&mut document, "class", "inactive");
+        assert_eq!(
+            matching_declarations_for_node(&document, target.id),
+            initial
+        );
+        assert!(matching_pseudo_declarations_for_node(&document, target.id, "::before").is_empty());
+
+        let active_parent = document.create_element("div");
+        active_parent.set_attribute(&mut document, "class", "active");
+        document.append_child(document.body().id, active_parent.id);
+        document.append_child(active_parent.id, target.id);
+        assert_eq!(matching_declarations_for_node(&document, target.id), active);
+        assert_eq!(
+            matching_pseudo_declarations_for_node(&document, target.id, "::before")[0].1,
+            "'active'"
+        );
+    }
+
+    #[test]
     fn selector_parse_cache_reuses_valid_and_invalid_results() {
         selector_parse_cache::clear_for_test();
         let target = SelectorContext::new("span", None, &["target"]);
@@ -2656,6 +2749,108 @@ mod tests {
         register_rule("div:fiRsT-cHiLd", &[("color", "green")]);
         let element = SelectorContext::new("div", None, &[]).with_tree_state(true, false);
         assert_eq!(matching_declarations_for_context(&element, &[]).len(), 1);
+    }
+
+    fn assert_node_first_child_state(document: &Document, expected: &[(NodeId, bool)]) {
+        for &(id, expected) in expected {
+            let node = document.get_node(id);
+            let reference = node.parent.is_some_and(|parent| {
+                document
+                    .children_ids(parent)
+                    .into_iter()
+                    .find(|sibling| document.get_node(*sibling).node_type == NodeType::Element)
+                    == Some(id)
+            });
+            let context = selector_context_for_node(document, id);
+            assert_eq!(context.is_first_child, expected, "node {id:?}");
+            assert_eq!(context.is_first_child, reference, "node {id:?}");
+            assert_eq!(document.matches_selector(id, ":first-child"), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn node_first_child_context_skips_text_and_comments_and_rejects_detached_nodes() {
+        setup();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let leading_text = document.create_text_node("before");
+        let leading_comment = document.create_comment("before");
+        let first = document.create_element("span");
+        let middle_text = document.create_text_node("between");
+        let middle_comment = document.create_comment("between");
+        let second = document.create_element("span");
+        let trailing_text = document.create_text_node("after");
+        first.set_class_name(&mut document, "item");
+        second.set_class_name(&mut document, "item");
+        assert_node_first_child_state(
+            &document,
+            &[(parent.id, false), (first.id, false), (leading_comment.id, false)],
+        );
+        for id in [
+            leading_text.id,
+            leading_comment.id,
+            first.id,
+            middle_text.id,
+            middle_comment.id,
+            second.id,
+            trailing_text.id,
+        ] {
+            document.append_child(parent.id, id);
+        }
+        let expected = [
+            (leading_text.id, false),
+            (leading_comment.id, false),
+            (first.id, true),
+            (middle_text.id, false),
+            (middle_comment.id, false),
+            (second.id, false),
+            (trailing_text.id, false),
+        ];
+        // A child in a detached subtree is still its parent's first element.
+        assert_node_first_child_state(&document, &expected);
+        document.append_child(document.body().id, parent.id);
+        assert_node_first_child_state(&document, &expected);
+        assert_eq!(document.matches_selector(first.id, ".item:first-child"), Ok(true));
+        assert_eq!(document.matches_selector(second.id, ".item:first-child"), Ok(false));
+    }
+
+    #[test]
+    fn node_first_child_context_tracks_reorder_removal_and_reparenting() {
+        setup();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let destination = document.create_element("section");
+        document.append_child(document.body().id, parent.id);
+        document.append_child(document.body().id, destination.id);
+        let leading_text = document.create_text_node("before");
+        let leading_comment = document.create_comment("before");
+        let first = document.create_element("span");
+        let middle_text = document.create_text_node("between");
+        let second = document.create_element("span");
+        for id in [leading_text.id, leading_comment.id, first.id, middle_text.id, second.id] {
+            document.append_child(parent.id, id);
+        }
+        let destination_comment = document.create_comment("destination");
+        let anchor = document.create_element("b");
+        document.append_child(destination.id, destination_comment.id);
+        document.append_child(destination.id, anchor.id);
+        assert_node_first_child_state(&document, &[(first.id, true), (second.id, false)]);
+
+        document.insert_before(parent.id, second.id, first.id);
+        assert_node_first_child_state(&document, &[(first.id, false), (second.id, true)]);
+        document.remove_child(parent.id, second.id);
+        assert_node_first_child_state(&document, &[(first.id, true), (second.id, false)]);
+        document.append_child(destination.id, second.id);
+        assert_node_first_child_state(&document, &[(anchor.id, true), (second.id, false)]);
+        document.insert_before(destination.id, first.id, anchor.id);
+        assert_node_first_child_state(
+            &document,
+            &[(first.id, true), (anchor.id, false), (second.id, false), (middle_text.id, false)],
+        );
+        document.remove_child(destination.id, first.id);
+        assert_node_first_child_state(&document, &[(first.id, false), (anchor.id, true)]);
+        document.remove_child(destination.id, anchor.id);
+        assert_node_first_child_state(&document, &[(anchor.id, false), (second.id, true)]);
     }
 
     #[test]
