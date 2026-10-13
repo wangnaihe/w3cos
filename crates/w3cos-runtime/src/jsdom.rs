@@ -10072,13 +10072,6 @@ pub(crate) fn sync_style_element(node: u32) {
         return;
     }
     let css = dom::get_descendant_text_content(node);
-    if std::env::var_os("W3COS_TEXT_TRACE").is_some() {
-        eprintln!(
-            "W3COS_STYLE owner={owner} bytes={} rules_before={}",
-            css.len(),
-            w3cos_dom::stylesheet::has_rules()
-        );
-    }
     register_author_sheet(owner, &css);
 }
 

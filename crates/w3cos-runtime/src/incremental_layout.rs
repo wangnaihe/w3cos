@@ -45,12 +45,14 @@ pub fn flush() -> bool {
     let mut ok = false;
     CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let reusable = slot
+        let structure_matches = slot
             .as_ref()
-            .is_some_and(|cache| cache.structure == structure && cache.cascade == cascade);
-        if reusable {
+            .is_some_and(|cache| cache.structure == structure);
+        if structure_matches {
             let cache = slot.as_mut().unwrap();
-            if patch_and_compute(cache, &dirty, viewport_w, viewport_h) {
+            let geometry_only = cache.cascade != cascade;
+            if patch_and_compute(cache, &dirty, viewport_w, viewport_h, geometry_only) {
+                cache.cascade = cascade;
                 ok = true;
                 return;
             }
@@ -80,7 +82,7 @@ fn rebuild(
         })
         .collect::<Vec<_>>();
     let mut engine = LayoutEngine::new();
-    engine.set_skip_projections(can_skip_projections(&component));
+    configure_engine(&mut engine, &component);
     let Ok(results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
         return false;
     };
@@ -95,8 +97,18 @@ fn rebuild(
     true
 }
 
-fn patch_and_compute(cache: &mut Cache, dirty: &[NodeId], viewport_w: f32, viewport_h: f32) -> bool {
+fn patch_and_compute(
+    cache: &mut Cache,
+    dirty: &[NodeId],
+    viewport_w: f32,
+    viewport_h: f32,
+    geometry_only: bool,
+) -> bool {
     if dirty.is_empty() {
+        // A cascade change with no dirty box can restyle descendants. Rebuild.
+        if geometry_only {
+            return false;
+        }
         return recompute(cache, viewport_w, viewport_h);
     }
     let mut styles = Vec::with_capacity(dirty.len());
@@ -104,6 +116,14 @@ fn patch_and_compute(cache: &mut Cache, dirty: &[NodeId], viewport_w: f32, viewp
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         if !style_patch_is_safe(&style) {
             return false;
+        }
+        if geometry_only {
+            let Some(old) = component_style(&cache.component, id.as_u32()).cloned() else {
+                return false;
+            };
+            if !geometry_only_change(&old, &style) {
+                return false;
+            }
         }
         styles.push((id.as_u32(), style));
     }
@@ -116,7 +136,7 @@ fn patch_and_compute(cache: &mut Cache, dirty: &[NodeId], viewport_w: f32, viewp
     if flat.len() != cache.node_ids.len() {
         return false;
     }
-    cache.engine.set_skip_projections(can_skip_projections(&cache.component));
+    configure_engine(&mut cache.engine, &cache.component);
     for (id, style) in &styles {
         let Some(index) = cache.node_ids.iter().position(|node| node == id) else {
             return false;
@@ -134,7 +154,7 @@ fn patch_and_compute(cache: &mut Cache, dirty: &[NodeId], viewport_w: f32, viewp
 
 fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     let flat = pre_flatten(&cache.component);
-    cache.engine.set_skip_projections(can_skip_projections(&cache.component));
+    configure_engine(&mut cache.engine, &cache.component);
     let Ok(results) = cache.engine.compute(&cache.component, &flat, viewport_w, viewport_h) else {
         return false;
     };
@@ -167,6 +187,38 @@ fn host_id(component: &Component) -> Option<u32> {
         EventAction::NativeHost { id, .. } => u32::try_from(id).ok(),
         _ => None,
     }
+}
+
+fn component_style(component: &Component, id: u32) -> Option<&w3cos_std::style::Style> {
+    if host_id(component) == Some(id) {
+        return Some(&component.style);
+    }
+    component
+        .children
+        .iter()
+        .find_map(|child| component_style(child, id))
+}
+
+/// Width and height edits can reuse the Taffy tree. Font, line box, and
+/// formatting-context edits restyle descendants, so those rebuild.
+fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    old.display == new.display
+        && old.position == new.position
+        && old.float == new.float
+        && old.clear == new.clear
+        && old.flex_direction == new.flex_direction
+        && old.flex_wrap == new.flex_wrap
+        && old.font_size == new.font_size
+        && old.font_weight == new.font_weight
+        && old.font_family == new.font_family
+        && old.font_style == new.font_style
+        && old.line_height == new.line_height
+        && old.line_height_is_normal == new.line_height_is_normal
+        && old.line_height_computed_px == new.line_height_computed_px
+        && old.white_space == new.white_space
+        && old.word_break == new.word_break
+        && old.letter_spacing == new.letter_spacing
+        && old.direction == new.direction
 }
 
 fn assign_layout_style(component: &mut Component, id: u32, style: &w3cos_std::style::Style) -> bool {
@@ -202,25 +254,30 @@ fn is_table(display: Display) -> bool {
     )
 }
 
-/// Post-Taffy projections repair floats, tables, and text-driven auto heights.
-/// A tree of definite boxes (and flex/grid containers of those boxes) already
-/// has its border boxes after `compute_layout`.
-fn can_skip_projections(root: &Component) -> bool {
-    fn needs_text_metric(component: &Component) -> bool {
-        if matches!(
-            component.style.position,
-            Position::Absolute | Position::Fixed
-        ) {
-            return false;
-        }
-        if matches!(component.style.height, Dimension::Px(_)) {
-            return false;
-        }
-        if matches!(component.kind, ComponentKind::Text { .. }) {
-            return true;
-        }
-        component.children.iter().any(needs_text_metric)
+fn configure_engine(engine: &mut LayoutEngine, root: &Component) {
+    engine.set_skip_projections(can_skip_projections(root));
+    engine.set_measure_text(needs_text_metric(root));
+}
+
+/// Px and out-of-flow boxes do not need a second text measure. An auto-height
+/// text leaf does, even when the projection walk is skipped.
+fn needs_text_metric(component: &Component) -> bool {
+    if matches!(component.style.position, Position::Absolute | Position::Fixed) {
+        return false;
     }
+    if matches!(component.style.height, Dimension::Px(_)) {
+        return false;
+    }
+    if matches!(component.kind, ComponentKind::Text { .. }) {
+        return true;
+    }
+    component.children.iter().any(needs_text_metric)
+}
+
+/// Post-Taffy projections repair floats, tables, and inline-block struts.
+/// Text-driven auto heights are measured in `update_text_leaf_heights` and do
+/// not by themselves need that projection walk.
+fn can_skip_projections(root: &Component) -> bool {
     fn walk(component: &Component) -> bool {
         let style = &component.style;
         if style.float != Float::None
@@ -228,12 +285,6 @@ fn can_skip_projections(root: &Component) -> bool {
             || style.column_count.is_some()
             || style.direction == TextDirection::Rtl
             || matches!(style.display, Display::InlineBlock | Display::InlineFlex)
-        {
-            return false;
-        }
-        if matches!(style.height, Dimension::Auto)
-            && matches!(style.display, Display::Block | Display::FlowRoot | Display::ListItem)
-            && needs_text_metric(component)
         {
             return false;
         }
