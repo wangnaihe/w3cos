@@ -92,8 +92,30 @@ impl CSSStyleDeclaration {
             "none" | "both" | "horizontal" | "vertical" | "block" | "inline" | "initial" | "unset") {
             return;
         }
-        self.inline_declarations
-            .push((name.to_string(), raw_value.to_string()));
+        // CSSOM setProperty replaces an existing declaration of the same name.
+        // Appending every write makes animated properties grow without bound
+        // and forces later cascade scans to walk the discarded values.
+        if let Some(index) = self
+            .inline_declarations
+            .iter()
+            .position(|(existing, _)| existing == name)
+        {
+            self.inline_declarations[index].1 = raw_value.to_string();
+            let mut kept = false;
+            self.inline_declarations.retain(|(existing, _)| {
+                if existing != name {
+                    return true;
+                }
+                if kept {
+                    return false;
+                }
+                kept = true;
+                true
+            });
+        } else {
+            self.inline_declarations
+                .push((name.to_string(), raw_value.to_string()));
+        }
         if name.starts_with("--") {
             self.inner
                 .custom_properties
@@ -4128,6 +4150,25 @@ mod tests {
             assert_ne!(declaration.inner, initial,
                 "{name}:{value} must affect layout style, not just CSSOM source text");
         }
+    }
+
+    #[test]
+    fn repeated_set_property_replaces_the_same_declaration() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("top", "1px");
+        declaration.set_property("left", "2px");
+        declaration.set_property("top", "4px");
+        declaration.set_property("top", "9px");
+        assert_eq!(declaration.inline_declarations.len(), 2);
+        assert_eq!(
+            declaration
+                .inline_declarations
+                .iter()
+                .find(|(name, _)| name == "top")
+                .map(|(_, value)| value.as_str()),
+            Some("9px")
+        );
+        assert_eq!(declaration.inline_declarations[0].0, "top");
     }
 
     #[test]
