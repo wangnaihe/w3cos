@@ -3212,11 +3212,6 @@ fn emit_block_instructions(
         .enumerate()
         .map(|(index, instruction)| {
             let proven = proven_string_keys(instructions, index);
-            if let Some(fused) =
-                fused_style_emission(instructions, index, &proven, &last_uses, plan)
-            {
-                return Ok(fused);
-            }
             emit_instruction(
                 instruction,
                 exception_target,
@@ -3256,148 +3251,6 @@ fn emit_block_instructions(
         output.push('\n');
     }
     Ok(output)
-}
-
-fn is_dom_style_property(name: &str) -> bool {
-    matches!(
-        name,
-        "width"
-            | "height"
-            | "top"
-            | "left"
-            | "right"
-            | "bottom"
-            | "display"
-            | "position"
-            | "flexWrap"
-            | "gridTemplateColumns"
-            | "background"
-            | "overflow"
-            | "margin"
-    )
-}
-
-/// `element.style.width = value` is a get of `"style"` immediately consumed by
-/// one set. Emit a direct element style write and drop the declaration object.
-fn fused_style_emission(
-    instructions: &[Instruction],
-    index: usize,
-    proven: &HashMap<u32, String>,
-    last_uses: &[HashSet<u32>],
-    plan: &EscapePlan,
-) -> Option<String> {
-    match &instructions[index] {
-        Instruction::GetProperty { dst, key, .. } => {
-            if proven.get(&key.0).map(String::as_str) != Some("style") {
-                return None;
-            }
-            style_element_for_set(instructions, style_set_index(instructions, index + 1, dst.0)?, dst.0, last_uses)?;
-            Some(String::new())
-        }
-        Instruction::SetProperty { object, key, value, .. } => {
-            let prop = proven.get(&key.0)?;
-            if !is_dom_style_property(prop) {
-                return None;
-            }
-            let element = style_element_for_set(instructions, index, object.0, last_uses)?;
-            Some(format!(
-                "w3cos_core::intrinsics::dom_set_element_style(&{}, {prop:?}, &{});",
-                emit_boxed_value(plan, element),
-                emit_boxed_value(plan, value.0)
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn style_set_index(instructions: &[Instruction], from: usize, style_reg: u32) -> Option<usize> {
-    let mut index = from;
-    while index < instructions.len() {
-        if read_registers(&instructions[index]).contains(&style_reg) {
-            return matches!(instructions[index], Instruction::SetProperty { object, .. } if object.0 == style_reg)
-                .then_some(index);
-        }
-        if written_register(&instructions[index]).is_some_and(|reg| reg.0 == style_reg) {
-            return None;
-        }
-        index += 1;
-    }
-    None
-}
-
-fn style_element_for_set(
-    instructions: &[Instruction],
-    index: usize,
-    style_reg: u32,
-    last_uses: &[HashSet<u32>],
-) -> Option<u32> {
-    if !last_uses.get(index)?.contains(&style_reg) {
-        return None;
-    }
-    let mut defined: Option<(usize, Option<(u32, u32)>)> = None;
-    for (slot, instruction) in instructions.iter().enumerate().take(index) {
-        if let Instruction::GetProperty { dst, object, key } = instruction {
-            if dst.0 == style_reg {
-                defined = Some((slot, Some((object.0, key.0))));
-            }
-        } else if written_register(instruction).is_some_and(|reg| reg.0 == style_reg) {
-            defined = Some((slot, None));
-        }
-    }
-    let (defined_at, Some((element, style_key))) = defined? else {
-        return None;
-    };
-    if proven_string_keys(instructions, index).get(&style_key).map(String::as_str) != Some("style")
-    {
-        return None;
-    }
-    for instruction in &instructions[defined_at + 1..index] {
-        if read_registers(instruction).contains(&style_reg) {
-            return None;
-        }
-    }
-    Some(element)
-}
-
-fn emit_dom_fast_call(
-    plan: &EscapePlan,
-    dst: u32,
-    object: u32,
-    method: &str,
-    arguments: &[w3cos_ir::Register],
-    proven_strings: &HashMap<u32, String>,
-) -> Option<String> {
-    let dst = val_index(plan, dst);
-    let object_expr = emit_boxed_value(plan, object);
-    match (method, arguments) {
-        ("createElement", [tag]) => {
-            let expr = if let Some(tag) = proven_strings.get(&tag.0) {
-                format!("w3cos_core::intrinsics::dom_create_element(&{object_expr}, {tag:?})")
-            } else {
-                format!(
-                    "w3cos_core::intrinsics::dom_create_element_value(&{object_expr}, &{})",
-                    emit_boxed_value(plan, tag.0)
-                )
-            };
-            Some(format!("self.registers[{dst}] = {expr};"))
-        }
-        ("createTextNode", [text]) => {
-            let expr = if let Some(text) = proven_strings.get(&text.0) {
-                format!("w3cos_core::intrinsics::dom_create_text(&{object_expr}, {text:?})")
-            } else {
-                format!(
-                    "w3cos_core::intrinsics::dom_create_text_value(&{object_expr}, &{})",
-                    emit_boxed_value(plan, text.0)
-                )
-            };
-            Some(format!("self.registers[{dst}] = {expr};"))
-        }
-        ("appendChild", [child]) => Some(format!(
-            "self.registers[{dst}] = w3cos_core::intrinsics::dom_append_child(&{object_expr}, &{});",
-            emit_boxed_value(plan, child.0)
-        )),
-        _ => None,
-    }
 }
 
 fn emit_native_sync_loop(
@@ -3730,22 +3583,7 @@ fn emit_instruction(
             if let Some(literal) = proven_strings.get(&key.0) {
                 let object_expr = emit_boxed_value(plan, object.0);
                 let value_expr = emit_boxed_value(plan, value.0);
-                let fallback = if *strict {
-                    format!(
-                        "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), __w3cos_assigned);"
-                    )
-                } else {
-                    format!("{object_expr}.set_property({literal:?}, __w3cos_assigned);")
-                };
-                if matches!(literal.as_str(), "id" | "className" | "textContent") {
-                    format!(
-                        "{{ let __w3cos_assigned = {value_expr}; if !w3cos_core::intrinsics::dom_set_data(&{object_expr}, {literal:?}, &__w3cos_assigned) {{ {fallback} }} }}"
-                    )
-                } else if is_dom_style_property(literal) {
-                    format!(
-                        "{{ let __w3cos_assigned = {value_expr}; if !w3cos_core::intrinsics::dom_set_style(&{object_expr}, {literal:?}, &__w3cos_assigned) {{ {fallback} }} }}"
-                    )
-                } else if *strict {
+                if *strict {
                     format!(
                         "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), {value_expr});"
                     )
@@ -4011,19 +3849,6 @@ fn emit_instruction(
             arguments,
         } => {
             if let Some(literal) = proven_strings.get(&key.0) {
-                if exception_target.is_none()
-                    && matches!(mode, EmissionMode::Sync)
-                    && let Some(fast) = emit_dom_fast_call(
-                        plan,
-                        dst.0,
-                        object.0,
-                        literal,
-                        arguments,
-                        proven_strings,
-                    )
-                {
-                    fast
-                } else {
                 let mut reads = vec![object.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
@@ -4039,7 +3864,6 @@ fn emit_instruction(
                     mode,
                     plan,
                 )
-                }
             } else {
                 let mut reads = vec![object.0, key.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));

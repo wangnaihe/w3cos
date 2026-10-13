@@ -883,7 +883,10 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
 }
 
 fn dom_handle(node: u32) -> Value {
-    Value::dom_node(node, realm_generation())
+    // A node ID alone cannot retain authored descriptors or a changed prototype.
+    // Keep the collectable/memoized wrapper until a fully guarded immediate
+    // representation can preserve the complete object state.
+    element_value(node)
 }
 
 fn dom_imm_get(node: u32, key: &str) -> Value {
@@ -3068,10 +3071,8 @@ fn shared_element_proxy() -> w3cos_core::ProxyHandler {
 
 fn build_element_proxy() -> w3cos_core::ProxyHandler {
     ProxyBuilder::new()
-        .get(|target, key, _receiver| {
-            let generation = target
-                .get_property("__w3cos_realm_generation")
-                .to_number() as u32;
+        .get(|target, key, receiver| {
+            let generation = target.get_property("__w3cos_realm_generation").to_number() as u32;
             let node = target.get_property("__node_id").to_number() as u32;
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
@@ -3087,6 +3088,15 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             // 1. JS expandos / bridge-cached sub-objects (style, classList).
             if let Some(v) = get_expando(node, key) {
                 return v;
+            }
+            // Own accessors shadow prototype data and computed DOM properties.
+            // Invoke only after the object borrow has ended, with the real
+            // wrapper as receiver; an undefined result is still authoritative.
+            let own_getter = target
+                .as_object()
+                .and_then(|object| object.borrow().own_getter(key));
+            if let Some(getter) = own_getter {
+                return getter.call(receiver.clone(), vec![]);
             }
             // 2. Stored props on the target snapshot (e.g. __node_id).
             let stored = target.get_property(key);
@@ -19543,9 +19553,10 @@ fn build_window_value() -> Value {
 
     let handler = ProxyBuilder::new()
         .get(|target, key, _| {
-            let has_stored_property = target
-                .as_object()
-                .is_some_and(|object| object.borrow().has_direct(key));
+            let has_stored_property = target.as_object().is_some_and(|object| {
+                let object = object.borrow();
+                object.has_direct(key) || object.own_getter(key).is_some()
+            });
             if has_stored_property {
                 target.get_property(key)
             } else {
@@ -19553,10 +19564,10 @@ fn build_window_value() -> Value {
             }
         })
         .has(|target, key| {
-            target
-                .as_object()
-                .is_some_and(|object| object.borrow().has_direct(key))
-                || window_named_property(key).is_some()
+            target.as_object().is_some_and(|object| {
+                let object = object.borrow();
+                object.has_direct(key) || object.own_getter(key).is_some()
+            }) || window_named_property(key).is_some()
         })
         .build();
     let window = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
@@ -20241,6 +20252,76 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    #[test]
+    fn own_element_getter_uses_real_receiver_and_can_return_undefined_once() {
+        setup();
+        let element = create_in_body("div");
+        let identity = element.clone();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let getter_calls = Rc::clone(&calls);
+        w3cos_core::class::define_property(
+            &element,
+            "reviewOwn",
+            &Value::object(HashMap::from([(
+                "get".into(),
+                func(move |receiver, _| {
+                    assert!(receiver.strict_eq(&identity));
+                    getter_calls.set(getter_calls.get() + 1);
+                    w3cos_core::class::define_property(
+                        &receiver,
+                        "side",
+                        &Value::object(HashMap::from([("value".into(), Value::Number(5.0))])),
+                    );
+                    Value::Undefined
+                }),
+            )])),
+        );
+        assert!(element.get_property("reviewOwn").is_undefined());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(element.get_property("side"), Value::Number(5.0));
+    }
+
+    #[test]
+    fn new_dom_handle_retains_own_properties_and_authored_prototype() {
+        setup();
+        let element = dom_handle(dom::create_element("div"));
+        w3cos_core::class::define_property(
+            &element,
+            "own",
+            &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+        );
+        let prototype = Value::object(HashMap::from([("inherited".into(), Value::Number(9.0))]));
+        w3cos_core::class::set_prototype_of(&element, &prototype);
+        assert_eq!(element.get_property("own"), Value::Number(7.0));
+        assert_eq!(element.get_property("inherited"), Value::Number(9.0));
+        assert!(w3cos_core::class::get_prototype_of(&element).strict_eq(&prototype));
+        assert!(element_value(node_id_of(&element).unwrap()).strict_eq(&element));
+    }
+
+    #[test]
+    fn document_method_accessor_shadows_the_forwarding_prototype() {
+        setup();
+        let document = document_value();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let getter_calls = Rc::clone(&calls);
+        w3cos_core::class::define_property(
+            &document,
+            "createElement",
+            &Value::object(HashMap::from([(
+                "get".into(),
+                func(move |_, _| {
+                    getter_calls.set(getter_calls.get() + 1);
+                    func(|_, _| Value::string("override"))
+                }),
+            )])),
+        );
+        assert_eq!(
+            document.call_method("createElement", vec![Value::string("div")]),
+            Value::string("override")
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

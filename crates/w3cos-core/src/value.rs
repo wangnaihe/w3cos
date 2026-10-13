@@ -1861,7 +1861,23 @@ impl Value {
             }
         }
         if let Some(o) = self.as_object() {
-            let value = o.borrow().get(key, self).clone();
+            // A get trap is user code and may mutate or redefine the receiver.
+            // Preserve the existing target snapshot but release the RefCell
+            // before invoking the trap. Its result (including undefined) is
+            // authoritative; a Proxy must not run an additional target getter.
+            let proxy_get = {
+                let object = o.borrow();
+                object.proxy_handler.as_ref().and_then(|handler| {
+                    handler
+                        .get
+                        .as_ref()
+                        .map(|trap| (Rc::clone(trap), object.target_value()))
+                })
+            };
+            if let Some((trap, target)) = proxy_get {
+                return trap(&target, key, self);
+            }
+            let value = o.borrow().get_direct(key);
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
@@ -4013,6 +4029,68 @@ mod tests {
         ))));
 
         assert!(proxy.try_set_property("textContent", Value::string("updated")));
+    }
+
+    #[test]
+    fn proxy_get_can_redefine_the_receiver_without_a_borrow() {
+        let handler = crate::ProxyBuilder::new()
+            .get(|target, key, receiver| {
+                if key == "probe" {
+                    crate::class::define_property(
+                        receiver,
+                        "side",
+                        &crate::js_object! { "value" => Value::Number(7.0) },
+                    );
+                    return Value::Number(3.0);
+                }
+                target.get_property(key)
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        assert_eq!(proxy.get_property("probe"), Value::Number(3.0));
+        assert_eq!(proxy.get_property("side"), Value::Number(7.0));
+    }
+
+    #[test]
+    fn proxy_get_undefined_does_not_fall_through_to_target_getter() {
+        let called = Rc::new(std::cell::Cell::new(0));
+        let getter_called = Rc::clone(&called);
+        let getter = Value::function(move |_, _| {
+            getter_called.set(getter_called.get() + 1);
+            Value::Number(9.0)
+        });
+        let handler = crate::ProxyBuilder::new()
+            .get(|_, _, _| Value::Undefined)
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::from([("__w3cos_getter_probe".into(), getter)]),
+            handler,
+        ))));
+        assert!(proxy.get_property("probe").is_undefined());
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn own_accessor_shadows_an_inherited_callable() {
+        let object = Value::object(HashMap::new());
+        let prototype = crate::js_object! {
+            "probe" => Value::function(|_, _| Value::string("inherited")),
+        };
+        crate::class::set_prototype_of(&object, &prototype);
+        crate::class::define_property(
+            &object,
+            "probe",
+            &crate::js_object! {
+                "get" => Value::function(|receiver, _| {
+                    receiver.set_property("side", Value::Bool(true));
+                    Value::function(|this, _| this.get_property("side"))
+                }),
+            },
+        );
+        assert_eq!(object.call_method("probe", vec![]), Value::Bool(true));
     }
 
     #[test]
