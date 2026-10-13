@@ -1968,6 +1968,21 @@ impl Value {
         Value::Imm(Immediate::from_object_handle(handle))
     }
 
+    /// Arena object with a shared proxy. Own properties are written directly
+    /// so the trap can read them without re-entering.
+    pub fn proxied_object(
+        entries: &[(&str, Value)],
+        handler: crate::proxy::ProxyHandler,
+    ) -> Self {
+        let mut object = crate::JsObject::new();
+        object.proxy_handler = Some(handler);
+        for (key, value) in entries {
+            object.set_direct(key, value.clone());
+        }
+        let handle = crate::page_arena::alloc_object(object);
+        Value::Imm(Immediate::from_object_handle(handle))
+    }
+
     pub(crate) fn collectable_object(props: HashMap<String, Value>) -> Self {
         Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
     }

@@ -499,6 +499,74 @@ pub fn promise_race(arguments: Vec<Value>) -> Value {
     crate::promise::race(arguments)
 }
 
+/// Direct DOM operations installed by the native runtime. AOT emits these
+/// instead of a `call_method` / proxy round trip for the hot element path.
+pub struct DomFast {
+    pub create_element: fn(&Value, &str) -> Value,
+    pub create_text: fn(&Value, &str) -> Value,
+    pub append_child: fn(&Value, &Value) -> Value,
+    pub set_data: fn(&Value, &str, &Value) -> bool,
+    pub set_style: fn(&Value, &str, &Value) -> bool,
+    pub set_element_style: fn(&Value, &str, &Value) -> bool,
+}
+
+static DOM_FAST: std::sync::OnceLock<DomFast> = std::sync::OnceLock::new();
+
+pub fn install_dom_fast(fast: DomFast) {
+    let _ = DOM_FAST.set(fast);
+}
+
+pub fn dom_create_element(object: &Value, tag: &str) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.create_element)(object, tag)
+    } else {
+        object.call_method("createElement", vec![Value::string(tag)])
+    }
+}
+
+pub fn dom_create_element_value(object: &Value, tag: &Value) -> Value {
+    dom_create_element(object, &tag.to_js_string())
+}
+
+pub fn dom_create_text(object: &Value, text: &str) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.create_text)(object, text)
+    } else {
+        object.call_method("createTextNode", vec![Value::string(text)])
+    }
+}
+
+pub fn dom_create_text_value(object: &Value, text: &Value) -> Value {
+    dom_create_text(object, &text.to_js_string())
+}
+
+pub fn dom_append_child(parent: &Value, child: &Value) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.append_child)(parent, child)
+    } else {
+        parent.call_method("appendChild", vec![child.clone()])
+    }
+}
+
+pub fn dom_set_data(object: &Value, name: &str, value: &Value) -> bool {
+    DOM_FAST.get().is_some_and(|fast| (fast.set_data)(object, name, value))
+}
+
+pub fn dom_set_style(object: &Value, name: &str, value: &Value) -> bool {
+    DOM_FAST.get().is_some_and(|fast| (fast.set_style)(object, name, value))
+}
+
+pub fn dom_set_element_style(element: &Value, name: &str, value: &Value) -> bool {
+    if let Some(fast) = DOM_FAST.get() {
+        if (fast.set_element_style)(element, name, value) {
+            return true;
+        }
+    }
+    let style = element.get_property("style");
+    style.set_property(name, value.clone());
+    true
+}
+
 /// ECMAScript `Await(value)` begins by applying the current realm's
 /// PromiseResolve semantics. Both native AOT and W3VM call this entry point
 /// before subscribing their resumable frames.

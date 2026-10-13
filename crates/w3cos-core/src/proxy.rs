@@ -28,6 +28,7 @@ type TrapBoolFn = dyn Fn(&Value) -> bool;
 ///   - `receiver`/`this_arg`: the proxy itself or the `this` binding
 ///   - return types match the spec (bool for invariant-checked traps, Value otherwise)
 #[allow(clippy::type_complexity)]
+#[derive(Clone)]
 pub struct ProxyHandler {
     pub get: Option<Rc<TrapGetFn>>,
     pub set: Option<Rc<TrapSetFn>>,
