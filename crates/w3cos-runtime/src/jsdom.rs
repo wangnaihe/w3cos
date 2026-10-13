@@ -866,7 +866,10 @@ pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &
 /// Extract the DOM node id carried by an element Value (`__node_id` hidden
 /// prop, read directly so the proxy trap is bypassed).
 pub fn node_id_of(value: &Value) -> Option<u32> {
-    let object = value.as_object()?;
+    if let Some(id) = value.live_dom_node() {
+        return Some(id);
+    }
+    let object = value.object_ref_raw()?;
     let object = object.borrow();
     let direct = object.get_direct("__node_id");
     let generation = object.get_direct("__w3cos_realm_generation");
@@ -879,6 +882,39 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
     None
 }
 
+fn dom_handle(node: u32) -> Value {
+    Value::dom_node(node, realm_generation())
+}
+
+fn dom_imm_get(node: u32, key: &str) -> Value {
+    if matches!(key, "__proto__" | "constructor") {
+        return dom_imm_materialize(node).get_property(key);
+    }
+    if let Some(value) = get_expando(node, key) {
+        return value;
+    }
+    let computed = element_computed_get(node, key);
+    if !computed.is_undefined() {
+        return computed;
+    }
+    element_prototype(node).get_property(key)
+}
+
+fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
+    if key == "__proto__" {
+        return dom_imm_materialize(node).try_set_property(key, value);
+    }
+    element_computed_set(node, key, value)
+}
+
+fn dom_imm_materialize(node: u32) -> Value {
+    element_value(node)
+}
+
+fn dom_node_of(value: &Value) -> Option<u32> {
+    node_id_of(value)
+}
+
 fn ensure_dom_fast() {
     w3cos_core::intrinsics::install_dom_fast(w3cos_core::intrinsics::DomFast {
         create_element: fast_create_element,
@@ -887,6 +923,13 @@ fn ensure_dom_fast() {
         set_data: fast_set_data,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
+    });
+    w3cos_core::intrinsics::install_dom_imm(w3cos_core::intrinsics::DomImmOps {
+        generation: realm_generation,
+        get: dom_imm_get,
+        set: dom_imm_set,
+        materialize: dom_imm_materialize,
+        node_of: dom_node_of,
     });
 }
 
@@ -917,20 +960,19 @@ fn fast_create_element(object: &Value, tag: &str) -> Value {
         tag.make_ascii_lowercase();
     }
     let id = dom::create_element(&tag);
-    let element = element_value(id);
     if tag == "template" {
         ensure_template_content(id);
     } else if tag == "script" {
         set_expando(id, "__w3cos_force_async", Value::Bool(true));
     }
-    crate::custom_elements_web::upgrade_created_element(&tag, element)
+    crate::custom_elements_web::upgrade_created_element(&tag, dom_handle(id))
 }
 
 fn fast_create_text(object: &Value, text: &str) -> Value {
     if !is_document_value(object) {
         return object.call_method("createTextNode", vec![Value::string(text)]);
     }
-    element_value(dom::create_text_node(text))
+    dom_handle(dom::create_text_node(text))
 }
 
 fn fast_append_child(parent: &Value, child: &Value) -> Value {
@@ -3070,6 +3112,34 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
         .build()
 }
 
+fn element_prototype(node: u32) -> Value {
+    let namespace_value = get_expando(node, "namespaceURI");
+    let has_explicit_namespace = namespace_value.is_some();
+    let namespace = namespace_value
+        .and_then(|namespace| (!namespace.is_null()).then(|| namespace.to_js_string()));
+    let local_name = get_expando(node, "localName")
+        .map(|name| name.to_js_string())
+        .unwrap_or_else(|| dom::tag_name(node));
+    if namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML") {
+        math_ml_element_class().get_property("prototype")
+    } else if namespace.as_deref() == Some(crate::html_parser_state::HTML_NAMESPACE)
+        && local_name.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        crate::dom_constructors::prototype("HTMLUnknownElement")
+    } else if has_explicit_namespace
+        && namespace.as_deref() != Some(crate::html_parser_state::HTML_NAMESPACE)
+        && namespace.as_deref() != Some("http://www.w3.org/2000/svg")
+    {
+        crate::dom_constructors::prototype("Element")
+    } else {
+        crate::dom_constructors::prototype_for_node(
+            dom::node_type(node),
+            &local_name,
+            namespace.as_deref() == Some("http://www.w3.org/2000/svg"),
+        )
+    }
+}
+
 fn build_element_value(node: u32) -> Value {
     let generation = realm_generation();
     let value = Value::proxied_host_object(
@@ -3260,7 +3330,7 @@ fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
             None => dom::append_child(parent, child),
         }
         pin_element_subtree(child);
-        if dom::is_connected(child) {
+        if dom::is_connected(child) && crate::custom_elements_web::has_definitions() {
             crate::custom_elements_web::connected_subtree(&element_value(child));
         }
         return;
@@ -3296,7 +3366,7 @@ fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
     crate::observers_web::notify_child_list(parent, &added, &[], previous, reference);
     for node in &added {
         pin_element_subtree(*node);
-        if dom::is_connected(*node) {
+        if dom::is_connected(*node) && crate::custom_elements_web::has_definitions() {
             crate::custom_elements_web::connected_subtree(&element_value(*node));
         }
     }
@@ -3334,7 +3404,7 @@ fn replace_child_or_fragment(parent: u32, child: u32, old_child: u32) {
     crate::observers_web::notify_child_list(parent, &added, &[old_child], previous, next);
     for node in &added {
         pin_element_subtree(*node);
-        if dom::is_connected(*node) {
+        if dom::is_connected(*node) && crate::custom_elements_web::has_definitions() {
             crate::custom_elements_web::connected_subtree(&element_value(*node));
         }
     }
@@ -3960,7 +4030,7 @@ fn parsed_document_value(
                     );
                 }
                 set_expando(node, "ownerDocument", document);
-                element_value(node)
+                dom_handle(node)
             }
         }),
     );
@@ -3988,7 +4058,7 @@ fn parsed_document_value(
         func(|document, args| {
             let node = dom::create_text_node(&arg(&args, 0).to_js_string());
             set_expando(node, "ownerDocument", document);
-            element_value(node)
+            dom_handle(node)
         }),
     );
     props.insert(
@@ -4504,7 +4574,7 @@ pub(crate) fn empty_document_value(content_type: &str, prototype_name: &str) -> 
         func(|document, args| {
             let node = dom::create_text_node(&arg(&args, 0).to_js_string());
             set_expando(node, "ownerDocument", document);
-            element_value(node)
+            dom_handle(node)
         }),
     );
     props.insert(
@@ -9782,7 +9852,9 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
                         ensure_tree_insertion(parent, *child);
                         dom::insert_before(parent, *child, node);
                         pin_element_subtree(*child);
-                        if dom::is_connected(*child) {
+                        if dom::is_connected(*child)
+                            && crate::custom_elements_web::has_definitions()
+                        {
                             crate::custom_elements_web::connected_subtree(&element_value(*child));
                         }
                     }
@@ -15888,7 +15960,7 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "createTextNode".to_string(),
-        func(|_, args| element_value(dom::create_text_node(&arg(&args, 0).to_js_string()))),
+        func(|_, args| dom_handle(dom::create_text_node(&arg(&args, 0).to_js_string()))),
     );
     props.insert(
         "createComment".to_string(),

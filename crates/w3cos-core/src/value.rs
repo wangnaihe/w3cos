@@ -133,6 +133,9 @@ impl Immediate {
     const TAG_OBJ: u64 = 6;
     const TAG_ARR: u64 = 7;
     const TAG_FN: u64 = 8;
+    /// DOM node id. Not a page-arena handle: the epoch slot stores the
+    /// realm generation so a reset cannot alias a recycled `NodeId`.
+    const TAG_DOM: u64 = 9;
     const TAG_MASK: u64 = 0xF;
     const HANDLE_SHIFT: u64 = 4;
     /// Bits 36..50 of a tagged handle word: page-arena epoch (15 bits).
@@ -322,6 +325,36 @@ impl Immediate {
             None
         }
     }
+
+    /// Pack a DOM node id. `generation` is masked to 15 bits, matching the
+    /// epoch field. Callers pass the bridge realm generation.
+    #[inline]
+    pub fn from_dom_node(node: u32, generation: u32) -> Self {
+        let epoch = (generation as u64) & Self::EPOCH_MASK;
+        Self(
+            Self::QNAN
+                | Self::TAG_DOM
+                | ((node as u64) << Self::HANDLE_SHIFT)
+                | (epoch << Self::EPOCH_SHIFT),
+        )
+    }
+
+    #[inline]
+    pub const fn is_dom_node(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_DOM
+    }
+
+    /// `(node id, masked generation)`.
+    #[inline]
+    pub fn dom_node_parts(self) -> Option<(u32, u32)> {
+        if self.is_dom_node() {
+            let node = (self.0 >> Self::HANDLE_SHIFT) as u32;
+            let epoch = ((self.0 >> Self::EPOCH_SHIFT) & Self::EPOCH_MASK) as u32;
+            Some((node, epoch))
+        } else {
+            None
+        }
+    }
 }
 
 impl PartialEq for Immediate {
@@ -402,13 +435,40 @@ impl Value {
     }
 
     /// Page-arena object handle or host `Rc` object.
+    ///
+    /// A DOM node immediate materializes its host wrapper here. Hot paths
+    /// that only need the node id use [`Self::live_dom_node`] instead.
     #[inline]
     pub fn as_object(&self) -> Option<JsObjectRef> {
+        if let Some(node) = self.live_dom_node() {
+            return crate::intrinsics::materialize_dom(node)
+                .and_then(|value| value.object_ref_raw());
+        }
+        self.object_ref_raw()
+    }
+
+    /// Object storage that does not materialize a DOM immediate.
+    #[inline]
+    pub fn object_ref_raw(&self) -> Option<JsObjectRef> {
         match self {
             Value::Imm(imm) => imm.object_handle().and_then(crate::page_arena::get_object),
             Value::Object(object) => Some(JsObjectRef::from_host(Rc::clone(object))),
             _ => None,
         }
+    }
+
+    /// Live DOM node id packed in this immediate, when the realm generation matches.
+    #[inline]
+    pub fn live_dom_node(&self) -> Option<u32> {
+        let (node, generation) = self.as_immediate()?.dom_node_parts()?;
+        let current = crate::intrinsics::dom_generation()? & 0x7FFF;
+        (generation == current).then_some(node)
+    }
+
+    /// DOM node that has not yet been given a host wrapper.
+    #[inline]
+    pub fn dom_node(node: u32, generation: u32) -> Self {
+        Value::Imm(Immediate::from_dom_node(node, generation))
     }
 
     /// Packed page-arena object handle, when this value is not a host `Rc`.
@@ -1013,6 +1073,15 @@ impl Value {
                 .and_then(crate::page_arena::get_function)
                 .map(ValueUnpack::Function)
                 .unwrap_or(ValueUnpack::Undefined),
+            Value::Imm(imm) if imm.is_dom_node() => {
+                if let Some(value) = self
+                    .live_dom_node()
+                    .and_then(crate::intrinsics::materialize_dom)
+                {
+                    return value.unpack();
+                }
+                ValueUnpack::Undefined
+            }
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
             Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(JsArrayRef::from_host(Rc::clone(a))),
@@ -1142,6 +1211,9 @@ impl Iterator for ValueIterator {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        if let Some(same) = crate::intrinsics::dom_nodes_equal(self, other) {
+            return same;
+        }
         if let (Some(left), Some(right)) = (self.as_js_string(), other.as_js_string()) {
             return left == right;
         }
@@ -1508,6 +1580,14 @@ impl Value {
     /// This is suitable for framework hook dependency comparison.
     pub fn identity_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
+        if let Some(id) = crate::intrinsics::dom_node_id(self) {
+            9_u8.hash(&mut hasher);
+            id.hash(&mut hasher);
+            if let Some(generation) = crate::intrinsics::dom_generation() {
+                generation.hash(&mut hasher);
+            }
+            return hasher.finish();
+        }
         if let Some(value) = crate::bigint::get(self) {
             8_u8.hash(&mut hasher);
             value.to_string().hash(&mut hasher);
@@ -1535,14 +1615,23 @@ impl Value {
             ValueUnpack::Array(value) => {
                 5_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
+                if let Some(generation) = crate::intrinsics::dom_generation() {
+                    generation.hash(&mut hasher);
+                }
             }
             ValueUnpack::Object(value) => {
                 6_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
+                if let Some(generation) = crate::intrinsics::dom_generation() {
+                    generation.hash(&mut hasher);
+                }
             }
             ValueUnpack::Function(value) => {
                 7_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
+                if let Some(generation) = crate::intrinsics::dom_generation() {
+                    generation.hash(&mut hasher);
+                }
             }
         }
         hasher.finish()
@@ -1550,6 +1639,9 @@ impl Value {
 
     /// ECMAScript `typeof` operator.
     pub fn type_of(&self) -> &'static str {
+        if self.live_dom_node().is_some() {
+            return "object";
+        }
         if crate::bigint::get(self).is_some() {
             return "bigint";
         }
@@ -1568,6 +1660,9 @@ impl Value {
 
     /// ECMAScript `ToBoolean`.
     pub fn to_bool(&self) -> bool {
+        if self.live_dom_node().is_some() {
+            return true;
+        }
         if let Some(zero) = crate::bigint::is_zero(self) {
             return !zero;
         }
@@ -1582,6 +1677,9 @@ impl Value {
 
     /// ECMAScript `ToNumber`.
     pub fn to_number(&self) -> f64 {
+        if self.live_dom_node().is_some() {
+            return f64::NAN;
+        }
         if let Some(value) = crate::bigint::get(self) {
             return value.to_string().parse().unwrap_or_else(|_| {
                 if value.sign() == num_bigint::Sign::Minus {
@@ -1609,6 +1707,9 @@ impl Value {
 
     /// ECMAScript `ToString`.
     pub fn to_js_string(&self) -> String {
+        if self.live_dom_node().is_some() {
+            return "[object Object]".into();
+        }
         if let Some(value) = crate::bigint::get(self) {
             return value.to_string();
         }
@@ -1693,7 +1794,8 @@ impl Value {
         matches!(self, Value::Imm(imm) if imm.is_bool())
     }
     pub fn is_object(&self) -> bool {
-        self.as_object().is_some() && crate::bigint::get(self).is_none()
+        (self.live_dom_node().is_some() || self.object_ref_raw().is_some())
+            && crate::bigint::get(self).is_none()
     }
     pub fn is_array(&self) -> bool {
         self.as_array().is_some()
@@ -1702,9 +1804,12 @@ impl Value {
         self.as_function().is_some()
     }
     pub fn is_callable(&self) -> bool {
+        if self.live_dom_node().is_some() {
+            return false;
+        }
         self.as_function().is_some()
             || self
-                .as_object()
+                .object_ref_raw()
                 .is_some_and(|object| object.borrow().call_slot().is_some())
     }
 
@@ -1750,6 +1855,11 @@ impl Value {
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(node) = self.live_dom_node() {
+            if let Some(value) = crate::intrinsics::dom_get(node, key) {
+                return value;
+            }
+        }
         if let Some(o) = self.as_object() {
             let value = o.borrow().get(key, self).clone();
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
@@ -1848,6 +1958,11 @@ impl Value {
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
     pub fn try_set_property(&self, key: &str, value: Value) -> bool {
+        if let Some(node) = self.live_dom_node()
+            && crate::intrinsics::dom_set(node, key, value.clone())
+        {
+            return true;
+        }
         if let Some(o) = self.as_object() {
             let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
             let canonical_index = key
@@ -3366,6 +3481,9 @@ impl Value {
 
     /// ECMAScript `===` (strict equality).
     pub fn strict_eq(&self, other: &Value) -> bool {
+        if let Some(equal) = crate::intrinsics::dom_nodes_equal(self, other) {
+            return equal;
+        }
         if let Some(equal) = crate::bigint::equals(self, other) {
             return equal;
         }
@@ -3392,6 +3510,9 @@ impl Value {
     /// compare by reference identity (`Rc` pointer), Function keys by shared
     /// closure identity (clones of one function value are the same key).
     pub fn same_value_zero(&self, other: &Value) -> bool {
+        if let Some(equal) = crate::intrinsics::dom_nodes_equal(self, other) {
+            return equal;
+        }
         if let Some(equal) = crate::bigint::equals(self, other) {
             return equal;
         }
@@ -3413,6 +3534,9 @@ impl Value {
 
     /// ECMAScript `==` (abstract equality — simplified).
     pub fn abstract_eq(&self, other: &Value) -> bool {
+        if self.live_dom_node().is_some() || other.live_dom_node().is_some() {
+            return self.strict_eq(other);
+        }
         match (self.unpack(), other.unpack()) {
             (ValueUnpack::Undefined, ValueUnpack::Undefined)
             | (ValueUnpack::Null, ValueUnpack::Null)
@@ -3499,6 +3623,9 @@ impl fmt::Display for Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(id) = self.live_dom_node() {
+            return write!(f, "Dom({id})");
+        }
         match self.unpack() {
             ValueUnpack::Undefined => write!(f, "undefined"),
             ValueUnpack::Null => write!(f, "null"),

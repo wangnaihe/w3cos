@@ -499,6 +499,63 @@ pub fn promise_race(arguments: Vec<Value>) -> Value {
     crate::promise::race(arguments)
 }
 
+/// Property access for a DOM node that is still a tagged immediate.
+pub struct DomImmOps {
+    pub generation: fn() -> u32,
+    pub get: fn(u32, &str) -> Value,
+    pub set: fn(u32, &str, Value) -> bool,
+    pub materialize: fn(u32) -> Value,
+    pub node_of: fn(&Value) -> Option<u32>,
+}
+
+static DOM_IMM: std::sync::OnceLock<DomImmOps> = std::sync::OnceLock::new();
+
+pub fn install_dom_imm(ops: DomImmOps) {
+    let _ = DOM_IMM.set(ops);
+}
+
+pub fn dom_generation() -> Option<u32> {
+    DOM_IMM.get().map(|ops| (ops.generation)())
+}
+
+pub fn dom_get(node: u32, key: &str) -> Option<Value> {
+    DOM_IMM.get().map(|ops| (ops.get)(node, key))
+}
+
+pub fn dom_set(node: u32, key: &str, value: Value) -> bool {
+    DOM_IMM.get().is_some_and(|ops| (ops.set)(node, key, value))
+}
+
+pub fn materialize_dom(node: u32) -> Option<Value> {
+    DOM_IMM.get().map(|ops| (ops.materialize)(node))
+}
+
+pub fn dom_node_id(value: &Value) -> Option<u32> {
+    if !might_be_dom(value) {
+        return None;
+    }
+    DOM_IMM.get().and_then(|ops| (ops.node_of)(value))
+}
+
+pub fn dom_nodes_equal(left: &Value, right: &Value) -> Option<bool> {
+    if !might_be_dom(left) || !might_be_dom(right) {
+        return None;
+    }
+    let ops = DOM_IMM.get()?;
+    match ((ops.node_of)(left), (ops.node_of)(right)) {
+        (Some(a), Some(b)) => Some(a == b),
+        _ => None,
+    }
+}
+
+fn might_be_dom(value: &Value) -> bool {
+    match value {
+        Value::Object(_) => true,
+        Value::Imm(imm) => imm.is_dom_node() || imm.is_object_handle(),
+        _ => false,
+    }
+}
+
 /// Direct DOM operations installed by the native runtime. AOT emits these
 /// instead of a `call_method` / proxy round trip for the hot element path.
 pub struct DomFast {

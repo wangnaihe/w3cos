@@ -3,6 +3,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
@@ -106,6 +107,43 @@ fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String
     current
 }
 
+fn shared_ua_style(tag: Atom) -> Arc<CSSStyleDeclaration> {
+    thread_local! {
+        static UA_STYLES: RefCell<HashMap<Atom, Arc<CSSStyleDeclaration>>> =
+            RefCell::new(HashMap::new());
+    }
+    UA_STYLES.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&tag) {
+            return Arc::clone(hit);
+        }
+        let style = tag.with_str(|name| {
+            Arc::new(CSSStyleDeclaration::from_style(user_agent::html_default_style(name)))
+        });
+        cache.borrow_mut().insert(tag, Arc::clone(&style));
+        style
+    })
+}
+
+fn remember_dirty(stamp: &mut Vec<u32>, epoch: u32, list: &mut Vec<NodeId>, id: NodeId) {
+    let idx = id.0 as usize;
+    if stamp.len() <= idx {
+        stamp.resize(idx + 1, 0);
+    }
+    if stamp[idx] == epoch {
+        return;
+    }
+    stamp[idx] = epoch;
+    list.push(id);
+}
+
+fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
+    *epoch = epoch.wrapping_add(1);
+    if *epoch == 0 {
+        stamp.fill(0);
+        *epoch = 1;
+    }
+}
+
 /// W3C Document — the root of the DOM tree.
 ///
 /// Performance characteristics (Chrome/Blink inspired):
@@ -116,7 +154,7 @@ fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String
 /// - Node freelist: bounded memory with slot recycling
 pub struct Document {
     nodes: Vec<Option<DomNode>>,
-    styles: Vec<CSSStyleDeclaration>,
+    styles: Vec<Arc<CSSStyleDeclaration>>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
     layout_rects: Vec<DOMRect>,
@@ -127,6 +165,11 @@ pub struct Document {
     /// Nodes whose own box changed. Layout scopes stay in `dirty`; this list
     /// is the precise set a persistent flex/grid tree can patch.
     precise_dirty: Vec<NodeId>,
+    /// `precise_stamp[id] == precise_epoch` means `id` is already in `precise_dirty`.
+    precise_epoch: u32,
+    precise_stamp: Vec<u32>,
+    scope_epoch: u32,
+    scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
     /// Bumps when inherited or selector-driven styles may have changed.
@@ -246,6 +289,10 @@ impl Document {
             free_list: Vec::new(),
             dirty: Vec::new(),
             precise_dirty: Vec::new(),
+            precise_epoch: 1,
+            precise_stamp: Vec::new(),
+            scope_epoch: 1,
+            scope_stamp: Vec::new(),
             structure_generation: 0,
             cascade_generation: 0,
             style_revision_clock: 0,
@@ -529,7 +576,7 @@ impl Document {
         new_node.next_sibling = None;
         new_node.prev_sibling = None;
 
-        let source_style = self.get_style(source).clone();
+        let source_style = Arc::clone(&self.styles[source.0 as usize]);
         let new_id = self.alloc_node(new_node);
         self.styles[new_id.0 as usize] = source_style;
 
@@ -633,8 +680,17 @@ impl Document {
     // -----------------------------------------------------------------------
 
     fn alloc_node(&mut self, mut node: DomNode) -> NodeId {
-        let initial_style =
-            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+        if self.free_list.is_empty() && self.nodes.len() == self.nodes.capacity() {
+            let extra = 128;
+            self.nodes.reserve(extra);
+            self.styles.reserve(extra);
+            self.layout_rects.reserve(extra);
+            self.scroll_offsets.reserve(extra);
+            self.style_revisions.reserve(extra);
+            self.precise_stamp.reserve(extra);
+            self.scope_stamp.reserve(extra);
+        }
+        let initial_style = shared_ua_style(node.tag);
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
         let style_revision = self.style_revision_clock;
         let id = if let Some(slot) = self.free_list.pop() {
@@ -813,11 +869,11 @@ impl Document {
     }
 
     pub fn get_style(&self, id: NodeId) -> &CSSStyleDeclaration {
-        &self.styles[id.0 as usize]
+        self.styles[id.0 as usize].as_ref()
     }
 
     pub fn get_style_mut(&mut self, id: NodeId) -> &mut CSSStyleDeclaration {
-        &mut self.styles[id.0 as usize]
+        Arc::make_mut(&mut self.styles[id.0 as usize])
     }
 
     // -----------------------------------------------------------------------
@@ -912,12 +968,18 @@ impl Document {
 
     fn record_layout_dirty(&mut self, id: NodeId) {
         let scope = self.find_layout_scope(id);
-        if !self.dirty.contains(&scope) {
-            self.dirty.push(scope);
-        }
-        if !self.precise_dirty.contains(&id) {
-            self.precise_dirty.push(id);
-        }
+        remember_dirty(
+            &mut self.scope_stamp,
+            self.scope_epoch,
+            &mut self.dirty,
+            scope,
+        );
+        remember_dirty(
+            &mut self.precise_stamp,
+            self.precise_epoch,
+            &mut self.precise_dirty,
+            id,
+        );
     }
 
     /// Tree shape or baked text metrics changed. A persistent layout tree
@@ -941,11 +1003,12 @@ impl Document {
     }
 
     pub fn take_precise_dirty(&mut self) -> Vec<NodeId> {
+        bump_dirty_epoch(&mut self.precise_epoch, &mut self.precise_stamp);
         std::mem::take(&mut self.precise_dirty)
     }
 
     pub fn precise_dirty_contains(&self, id: NodeId) -> bool {
-        self.precise_dirty.contains(&id)
+        self.precise_stamp.get(id.0 as usize).copied() == Some(self.precise_epoch)
     }
 
     /// Non-inherited inline edits: restyle this node only.
@@ -973,6 +1036,7 @@ impl Document {
     }
 
     pub fn take_dirty(&mut self) -> Vec<NodeId> {
+        bump_dirty_epoch(&mut self.scope_epoch, &mut self.scope_stamp);
         std::mem::take(&mut self.dirty)
     }
 
@@ -1018,17 +1082,42 @@ impl Document {
     fn invalidate_style_subtree(&mut self, root: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
         let revision = self.style_revision_clock;
-        let mut pending = vec![root];
+        thread_local! {
+            static INVALIDATE_STACK: std::cell::RefCell<Vec<NodeId>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut owned = INVALIDATE_STACK.with(|slot| {
+            slot.try_borrow_mut()
+                .ok()
+                .map(|mut pending| std::mem::take(&mut *pending))
+        });
+        let pending = owned.get_or_insert_with(Vec::new);
+        pending.clear();
+        pending.push(root);
         while let Some(id) = pending.pop() {
-            if self
-                .nodes
-                .get(id.0 as usize)
-                .is_none_or(|node| node.is_none())
-            {
+            let idx = id.0 as usize;
+            if self.nodes.get(idx).is_none_or(|node| node.is_none()) {
                 continue;
             }
-            self.style_revisions[id.0 as usize] = revision;
-            pending.extend(self.children_ids(id));
+            if let Some(slot) = self.style_revisions.get_mut(idx) {
+                *slot = revision;
+            }
+            let mut child = self.nodes[idx].as_ref().and_then(|node| node.first_child);
+            while let Some(cid) = child {
+                pending.push(cid);
+                child = self
+                    .nodes
+                    .get(cid.0 as usize)
+                    .and_then(|node| node.as_ref())
+                    .and_then(|node| node.next_sibling);
+            }
+        }
+        if let Some(pending) = owned {
+            INVALIDATE_STACK.with(|slot| {
+                if let Ok(mut scratch) = slot.try_borrow_mut() {
+                    *scratch = pending;
+                }
+            });
         }
     }
 
@@ -1223,7 +1312,7 @@ impl Document {
 
     pub fn descendant_text_content(&self, id: NodeId) -> String {
         let node = self.get_node(id);
-        let mut text = node.text_content.clone().unwrap_or_default();
+        let mut text = node.text_content.as_deref().unwrap_or("").to_string();
         for child in self.children_ids(id) {
             text.push_str(&self.descendant_text_content(child));
         }
@@ -9318,7 +9407,9 @@ impl Document {
         let target_id = text_node_id.unwrap_or(editable_id);
         {
             let node = self.get_node_mut(target_id);
-            let text = node.text_content.get_or_insert_with(String::new);
+            let text = node
+                .text_content
+                .get_or_insert_with(crate::node::CompactStr::new);
             match &input_type {
                 InputType::InsertText | InputType::InsertParagraph => {
                     if let Some(ref s) = inserted_text {
@@ -9327,15 +9418,21 @@ impl Document {
                 }
                 InputType::DeleteContentBackward => {
                     // Remove last char (respects multi-byte UTF-8)
-                    let mut chars = text.chars();
-                    chars.next_back();
-                    *text = chars.as_str().to_string();
+                    let next = {
+                        let mut chars = text.chars();
+                        chars.next_back();
+                        chars.as_str().to_string()
+                    };
+                    text.set(&next);
                 }
                 InputType::DeleteContentForward => {
                     if !text.is_empty() {
-                        let mut chars = text.chars();
-                        chars.next();
-                        *text = chars.as_str().to_string();
+                        let next = {
+                            let mut chars = text.chars();
+                            chars.next();
+                            chars.as_str().to_string()
+                        };
+                        text.set(&next);
                     }
                 }
                 _ => {}
@@ -9387,7 +9484,9 @@ impl Document {
             let target_id = text_node_id.unwrap_or(editable_id);
             {
                 let node = self.get_node_mut(target_id);
-                let text = node.text_content.get_or_insert_with(String::new);
+                let text = node
+                    .text_content
+                    .get_or_insert_with(crate::node::CompactStr::new);
                 text.push_str(data);
             }
             self.mark_text_dirty(target_id);

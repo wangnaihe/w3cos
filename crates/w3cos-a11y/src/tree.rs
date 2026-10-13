@@ -59,7 +59,7 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
         .iter()
         .find(|(k, _)| *k == aria_label_atom)
         .map(|(_, v)| v.clone())
-        .or_else(|| dom_node.text_content.clone())
+        .or_else(|| dom_node.text_content.as_ref().map(|text| text.to_string()))
         .or_else(|| {
             dom_node
                 .attributes

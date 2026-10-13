@@ -38,13 +38,19 @@ impl Atom {
     }
 
     pub fn as_str(&self) -> String {
+        self.with_str(|text| text.to_string())
+    }
+
+    /// Borrow the interned bytes for the duration of `f`.
+    pub fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
         INTERN_TABLE.with(|t| {
             let table = t.borrow();
-            table
+            let text = table
                 .strings
                 .get(self.0 as usize)
-                .cloned()
-                .unwrap_or_default()
+                .map(String::as_str)
+                .unwrap_or("");
+            f(text)
         })
     }
 

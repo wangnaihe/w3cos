@@ -1,4 +1,103 @@
+use std::ops::Deref;
+
 use crate::atom::Atom;
+
+/// Short DOM strings live in the node. Longer ones spill to the heap.
+#[derive(Clone, Debug)]
+pub struct CompactStr {
+    inline: [u8; 22],
+    /// `255` means `heap` owns the bytes.
+    len: u8,
+    heap: String,
+}
+
+impl CompactStr {
+    pub fn new() -> Self {
+        Self {
+            inline: [0; 22],
+            len: 0,
+            heap: String::new(),
+        }
+    }
+
+    pub fn set(&mut self, text: &str) {
+        if text.len() <= 22 {
+            self.heap = String::new();
+            self.inline[..text.len()].copy_from_slice(text.as_bytes());
+            self.len = text.len() as u8;
+        } else {
+            self.len = 255;
+            self.heap = text.to_string();
+        }
+    }
+
+    pub fn push_str(&mut self, extra: &str) {
+        if self.len != 255 {
+            let current = self.len as usize;
+            if current + extra.len() <= 22 {
+                self.inline[current..current + extra.len()].copy_from_slice(extra.as_bytes());
+                self.len = (current + extra.len()) as u8;
+                return;
+            }
+            let mut owned = self.as_str().to_string();
+            owned.push_str(extra);
+            self.len = 255;
+            self.heap = owned;
+            return;
+        }
+        self.heap.push_str(extra);
+    }
+
+    pub fn as_str(&self) -> &str {
+        if self.len == 255 {
+            self.heap.as_str()
+        } else {
+            std::str::from_utf8(&self.inline[..self.len as usize]).unwrap_or("")
+        }
+    }
+}
+
+impl Default for CompactStr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for CompactStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for CompactStr {
+    fn from(text: &str) -> Self {
+        let mut value = Self::new();
+        value.set(text);
+        value
+    }
+}
+
+impl From<String> for CompactStr {
+    fn from(text: String) -> Self {
+        if text.len() <= 22 {
+            Self::from(text.as_str())
+        } else {
+            Self {
+                inline: [0; 22],
+                len: 255,
+                heap: text,
+            }
+        }
+    }
+}
+
+impl From<&CompactStr> for String {
+    fn from(text: &CompactStr) -> Self {
+        text.as_str().to_string()
+    }
+}
 
 /// Unique identifier for a DOM node within a Document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,7 +168,7 @@ pub struct DomNode {
     pub id: NodeId,
     pub node_type: NodeType,
     pub tag: Atom,
-    pub text_content: Option<String>,
+    pub text_content: Option<CompactStr>,
     // LCRS tree pointers (replaces children: Vec<NodeId>)
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
@@ -104,7 +203,7 @@ impl DomNode {
         }
     }
 
-    pub fn new_text(id: NodeId, content: impl Into<String>) -> Self {
+    pub fn new_text(id: NodeId, content: impl Into<CompactStr>) -> Self {
         Self {
             id,
             node_type: NodeType::Text,
@@ -140,7 +239,7 @@ impl DomNode {
         }
     }
 
-    pub fn new_comment(id: NodeId, content: impl Into<String>) -> Self {
+    pub fn new_comment(id: NodeId, content: impl Into<CompactStr>) -> Self {
         Self {
             id,
             node_type: NodeType::Comment,
@@ -158,7 +257,7 @@ impl DomNode {
         }
     }
 
-    pub fn new_cdata_section(id: NodeId, content: impl Into<String>) -> Self {
+    pub fn new_cdata_section(id: NodeId, content: impl Into<CompactStr>) -> Self {
         Self {
             id,
             node_type: NodeType::CdataSection,
@@ -179,7 +278,7 @@ impl DomNode {
     pub fn new_processing_instruction(
         id: NodeId,
         target: impl AsRef<str>,
-        data: impl Into<String>,
+        data: impl Into<CompactStr>,
     ) -> Self {
         Self {
             id,
