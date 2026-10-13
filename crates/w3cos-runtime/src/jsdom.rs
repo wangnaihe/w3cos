@@ -228,6 +228,9 @@ thread_local! {
     /// properties it does not know, so reads of e.g. `lineHeight` would
     /// otherwise come back "".
     static STYLE_CACHE: RefCell<HashMap<(u32, String), String>> = RefCell::new(HashMap::new());
+    /// CSSStyleDeclaration object identity → element node. The AOT style
+    /// setter reads this instead of entering the declaration proxy.
+    static STYLE_OBJECT_NODES: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
     /// Active CSS animations/transitions sampled by CSSOM and geometry reads.
     /// The corresponding JS facades live in `animations_web::ANIMATIONS`.
     static CSS_MOTIONS: RefCell<Vec<CssMotion>> = const { RefCell::new(Vec::new()) };
@@ -862,18 +865,99 @@ pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &
 /// Extract the DOM node id carried by an element Value (`__node_id` hidden
 /// prop, read directly so the proxy trap is bypassed).
 pub fn node_id_of(value: &Value) -> Option<u32> {
-    if let Value::Object(obj) = value {
-        let object = obj.borrow();
-        let direct = object.get_direct("__node_id");
-        let generation = object.get_direct("__w3cos_realm_generation");
-        if direct.is_number()
-            && generation.is_number()
-            && bridge_realm_is_current(generation.to_u32())
-        {
-            return Some(direct.to_u32());
-        }
+    let object = value.as_object()?;
+    let object = object.borrow();
+    let direct = object.get_direct("__node_id");
+    let generation = object.get_direct("__w3cos_realm_generation");
+    if direct.is_number()
+        && generation.is_number()
+        && bridge_realm_is_current(generation.to_u32())
+    {
+        return Some(direct.to_u32());
     }
     None
+}
+
+fn ensure_dom_fast() {
+    w3cos_core::intrinsics::install_dom_fast(w3cos_core::intrinsics::DomFast {
+        create_element: fast_create_element,
+        create_text: fast_create_text,
+        append_child: fast_append_child,
+        set_data: fast_set_data,
+        set_style: fast_set_style,
+        set_element_style: fast_set_element_style,
+    });
+}
+
+fn is_document_value(object: &Value) -> bool {
+    document_value().as_object().is_some_and(|document| {
+        object.as_object().is_some_and(|candidate| document.ptr_eq(&candidate))
+    })
+}
+
+fn fast_create_element(object: &Value, tag: &str) -> Value {
+    if !is_document_value(object) {
+        return object.call_method("createElement", vec![Value::string(tag)]);
+    }
+    let mut tag = tag.to_string();
+    if !valid_element_name(&tag) {
+        dom_exception("The element name is not valid", "InvalidCharacterError");
+    }
+    if document_value().get_property("contentType").to_js_string() == "text/html" {
+        tag.make_ascii_lowercase();
+    }
+    let id = dom::create_element(&tag);
+    let element = element_value(id);
+    if tag == "template" {
+        ensure_template_content(id);
+    } else if tag == "script" {
+        set_expando(id, "__w3cos_force_async", Value::Bool(true));
+    }
+    crate::custom_elements_web::upgrade_created_element(&tag, element)
+}
+
+fn fast_create_text(object: &Value, text: &str) -> Value {
+    if !is_document_value(object) {
+        return object.call_method("createTextNode", vec![Value::string(text)]);
+    }
+    element_value(dom::create_text_node(text))
+}
+
+fn fast_append_child(parent: &Value, child: &Value) -> Value {
+    let Some(parent_id) = node_id_of(parent) else {
+        return parent.call_method("appendChild", vec![child.clone()]);
+    };
+    let Some(child_id) = node_id_of(child) else {
+        return parent.call_method("appendChild", vec![child.clone()]);
+    };
+    insert_child_or_fragment(parent_id, child_id, None);
+    child.clone()
+}
+
+fn fast_set_data(object: &Value, name: &str, value: &Value) -> bool {
+    let Some(node) = node_id_of(object) else {
+        return false;
+    };
+    element_computed_set(node, name, value.clone());
+    true
+}
+
+fn fast_set_style(object: &Value, name: &str, value: &Value) -> bool {
+    let Some(node) = object.as_object().and_then(|object| {
+        STYLE_OBJECT_NODES.with(|nodes| nodes.borrow().get(&object.identity()).copied())
+    }) else {
+        return false;
+    };
+    style_apply(node, &camel_to_kebab(name), &value.to_js_string());
+    true
+}
+
+fn fast_set_element_style(element: &Value, name: &str, value: &Value) -> bool {
+    let Some(node) = node_id_of(element) else {
+        return false;
+    };
+    style_apply(node, &camel_to_kebab(name), &value.to_js_string());
+    true
 }
 
 pub(crate) fn performance_now() -> f64 {
@@ -2917,17 +3001,26 @@ fn bar_prop_value() -> Value {
     value
 }
 
-fn build_element_value(node: u32) -> Value {
-    let generation = realm_generation();
-    let mut props = HashMap::new();
-    props.insert("__node_id".to_string(), Value::Number(node as f64));
-    props.insert(
-        "__w3cos_realm_generation".to_string(),
-        Value::Number(generation as f64),
-    );
+fn shared_element_proxy() -> w3cos_core::ProxyHandler {
+    thread_local! {
+        static PROXY: std::cell::RefCell<Option<w3cos_core::ProxyHandler>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    PROXY.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(build_element_proxy());
+        }
+        slot.borrow().clone().expect("element proxy")
+    })
+}
 
-    let handler = ProxyBuilder::new()
-        .get(move |target, key, _receiver| {
+fn build_element_proxy() -> w3cos_core::ProxyHandler {
+    ProxyBuilder::new()
+        .get(|target, key, _receiver| {
+            let generation = target
+                .get_property("__w3cos_realm_generation")
+                .to_number() as u32;
+            let node = target.get_property("__node_id").to_number() as u32;
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
             }
@@ -2951,7 +3044,11 @@ fn build_element_value(node: u32) -> Value {
             // 3. Computed DOM surface.
             element_computed_get(node, key)
         })
-        .set(move |_target, key, value, _receiver| {
+        .set(|target, key, value, _receiver| {
+            let generation = target
+                .get_property("__w3cos_realm_generation")
+                .to_number() as u32;
+            let node = target.get_property("__node_id").to_number() as u32;
             if bridge_realm_is_current(generation) {
                 element_computed_set(node, key, value)
             } else {
@@ -2960,9 +3057,21 @@ fn build_element_value(node: u32) -> Value {
                 true
             }
         })
-        .build();
+        .build()
+}
 
-    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
+fn build_element_value(node: u32) -> Value {
+    let generation = realm_generation();
+    let value = Value::proxied_object(
+        &[
+            ("__node_id", Value::Number(node as f64)),
+            (
+                "__w3cos_realm_generation",
+                Value::Number(generation as f64),
+            ),
+        ],
+        shared_element_proxy(),
+    );
     let namespace_value = get_expando(node, "namespaceURI");
     let has_explicit_namespace = namespace_value.is_some();
     let namespace = namespace_value
@@ -7563,47 +7672,27 @@ fn scroll_element_into_view(node: u32, options: Value) {
 }
 
 fn forced_scroll_size(node: u32) -> (f64, f64) {
-    let live = dom::with_document(|document| {
-        let element = Element::new(NodeId::from_u32(node));
-        (
-            element.scroll_width(document) as f64,
-            element.scroll_height(document) as f64,
-        )
-    });
+    let read = || {
+        dom::with_document(|document| {
+            let element = Element::new(NodeId::from_u32(node));
+            (
+                element.scroll_width(document) as f64,
+                element.scroll_height(document) as f64,
+            )
+        })
+    };
+    let live = read();
     if live.0 > 0.0 || live.1 > 0.0 {
         return live;
     }
 
     // CSSOM layout reads are synchronous in browsers. React relies on that
     // when it reads scrollHeight in an effect that can run before our first
-    // native paint, so compute an ephemeral layout rather than exposing zero.
-    let root = dom::to_component_tree();
-    let flat = crate::layout::pre_flatten(&root);
-    let Some(target_index) = flat.iter().position(|info| {
-        matches!(
-            info.on_click,
-            w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node)
-        )
-    }) else {
+    // native paint, so flush the persistent tree rather than exposing zero.
+    if !crate::incremental_layout::flush() {
         return live;
-    };
-    let (viewport_width, viewport_height, _) = viewport();
-    let Ok((layouts, scrollable, _)) =
-        crate::layout::compute_with_scroll(&root, viewport_width as f32, viewport_height as f32)
-    else {
-        return live;
-    };
-    let Some((rect, _)) = layouts.iter().find(|(_, index)| *index == target_index) else {
-        return live;
-    };
-    let extent = scrollable
-        .iter()
-        .find(|(index, _, _)| *index == target_index)
-        .map(|(_, _, extent)| *extent);
-    (
-        f64::from(rect.width + extent.map_or(0.0, |value| value.max_x)),
-        f64::from(rect.height + extent.map_or(0.0, |value| value.max_y)),
-    )
+    }
+    read()
 }
 
 fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
@@ -7695,67 +7784,91 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
         }
     }
 
-    // Geometry APIs synchronously flush pending style and layout in browsers.
-    // Compute a transient tree here so script reads observe parser styles and
-    // inline mutations even before the native render loop's next frame.
-    let root = dom::to_component_tree();
-    let flat = crate::layout::pre_flatten(&root);
-    let (viewport_width, viewport_height, _) = viewport();
-    let Ok(layouts) = crate::layout::compute(&root, viewport_width as f32, viewport_height as f32)
-    else {
-        return live;
-    };
-    // Geometry reads are synchronous, but a clean tree does not change until
-    // the next mutation. Store the raw boxes (motion is applied on read) so
-    // the next offsetHeight/getBoundingClientRect in this frame is a lookup.
-    dom::with_document_mut(|document| {
-        for (rect, index) in &layouts {
-            let Some(info) = flat.get(*index) else {
-                continue;
-            };
-            let w3cos_std::EventAction::NativeHost { id, .. } = info.on_click else {
-                continue;
-            };
-            let Ok(node_id) = u32::try_from(*id) else {
-                continue;
-            };
-            document.set_layout_rect(
-                NodeId::from_u32(node_id),
-                w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
-            );
-        }
-    });
-    dom::clear_document_dirty();
-    let rect_for_node = |candidate: u32| {
-        let index = flat.iter().position(|info| {
-            matches!(
-                info.on_click,
-                w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(candidate)
-            )
-        })?;
-        layouts
-            .iter()
-            .find(|(_, layout_index)| *layout_index == index)
-            .map(|(rect, _)| w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height))
-    };
-    if let Some(rect) = block_in_inline_fragment_bounds(node, rect_for_node) {
+    // A specified px border box does not depend on dirty descendants. Absolute
+    // `top` edits and sibling scroll offsets must not rebuild the tree.
+    if let Some(rect) = definite_independent_border_box(node, live) {
         return apply_css_motion_to_rect(node, rect);
     }
-    let Some(target_index) = flat.iter().position(|info| {
-        matches!(
-            info.on_click,
-            w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node)
-        )
-    }) else {
+
+    // Geometry APIs synchronously flush pending style and layout in browsers.
+    if !crate::incremental_layout::flush() {
         return live;
+    }
+    let stored = dom::bounding_rect(node);
+    if let Some(rect) =
+        block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
+    {
+        return apply_css_motion_to_rect(node, rect);
+    }
+    let rect = if stored.width != 0.0 || stored.height != 0.0 || stored.x != 0.0 || stored.y != 0.0
+    {
+        stored
+    } else {
+        live
     };
-    let rect = layouts
-        .iter()
-        .find(|(_, index)| *index == target_index)
-        .map_or(live, |(rect, _)| {
-            w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height)
-        });
     apply_css_motion_to_rect(node, rect)
+}
+
+/// Border box of a definite px width and height whose position is unchanged
+/// by the current dirty set. Returns `None` when layout must run.
+fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Option<w3cos_dom::DOMRect> {
+    if live.width == 0.0 && live.height == 0.0 && live.x == 0.0 && live.y == 0.0 {
+        return None;
+    }
+    if !dom::is_connected(node) {
+        return Some(w3cos_dom::DOMRect::new(0.0, 0.0, 0.0, 0.0));
+    }
+    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    if matches!(style.display, w3cos_std::style::Display::None) {
+        return Some(w3cos_dom::DOMRect::new(0.0, 0.0, 0.0, 0.0));
+    }
+    let w3cos_std::style::Dimension::Px(width) = style.width else {
+        return None;
+    };
+    let w3cos_std::style::Dimension::Px(height) = style.height else {
+        return None;
+    };
+    if !width.is_finite() || !height.is_finite() || width < 0.0 || height < 0.0 {
+        return None;
+    }
+    let blocked = dom::with_document(|document| {
+        let mut current = Some(NodeId::from_u32(node));
+        while let Some(id) = current {
+            if document.precise_dirty_contains(id) {
+                return true;
+            }
+            current = document.get_node(id).parent;
+        }
+        if !matches!(
+            style.position,
+            w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+        ) {
+            let mut sibling = document.get_node(NodeId::from_u32(node)).prev_sibling;
+            while let Some(id) = sibling {
+                if document.precise_dirty_contains(id) {
+                    return true;
+                }
+                sibling = document.get_node(id).prev_sibling;
+            }
+        }
+        false
+    });
+    if blocked {
+        return None;
+    }
+    let padding = style.padding_lengths();
+    let border_top = style.border_top_width.unwrap_or(style.border_width);
+    let border_right = style.border_right_width.unwrap_or(style.border_width);
+    let border_bottom = style.border_bottom_width.unwrap_or(style.border_width);
+    let border_left = style.border_left_width.unwrap_or(style.border_width);
+    let (box_width, box_height) = match style.box_sizing {
+        w3cos_std::style::BoxSizing::BorderBox => (width.max(0.0), height.max(0.0)),
+        w3cos_std::style::BoxSizing::ContentBox => (
+            (width + padding.left + padding.right + border_left + border_right).max(0.0),
+            (height + padding.top + padding.bottom + border_top + border_bottom).max(0.0),
+        ),
+    };
+    Some(w3cos_dom::DOMRect::new(live.x, live.y, box_width, box_height))
 }
 
 fn offset_parent_node(node: u32) -> Option<u32> {
@@ -11738,6 +11851,11 @@ fn style_value(node: u32) -> Value {
         HashMap::new(),
         handler,
     ))));
+    if let Some(object) = value.as_object() {
+        STYLE_OBJECT_NODES.with(|nodes| {
+            nodes.borrow_mut().insert(object.identity(), node);
+        });
+    }
     w3cos_core::class::set_prototype_of(
         &value,
         &css_style_declaration_class().get_property("prototype"),
@@ -15645,6 +15763,7 @@ fn node_filter_value() -> Value {
 
 /// The global `document` value (memoized thread-local singleton).
 pub fn document_value() -> Value {
+    ensure_dom_fast();
     if let Some(v) = DOCUMENT_VALUE.with(|d| d.borrow().clone()) {
         return v;
     }
@@ -19566,6 +19685,7 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
 /// Unset environment variables leave the document untouched, so ordinary
 /// headless executions keep their previous behavior.
 pub fn prepare_headless_entry() {
+    ensure_dom_fast();
     HEADLESS_ENTRY_MARK.with(|mark| {
         mark.set(Some(HeadlessEntryMark {
             start: Instant::now(),
@@ -19841,6 +19961,7 @@ pub fn reset_bridge() {
     SELECTOR_ID_CACHE.with(|cache| cache.borrow_mut().clear());
     SELECTOR_ID_CACHE_GENERATION.with(|generation| generation.set(0));
     STYLE_CACHE.with(|c| c.borrow_mut().clear());
+    STYLE_OBJECT_NODES.with(|nodes| nodes.borrow_mut().clear());
     CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
     DISCRETE_CSS_TRANSITIONS.with(|motions| motions.borrow_mut().clear());
     LISTENERS.with(|l| l.borrow_mut().clear());

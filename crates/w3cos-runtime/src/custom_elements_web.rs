@@ -538,6 +538,9 @@ fn run_constructor(element: &Value, constructor: &Value) {
 /// Upgrade an element created through the document bridge when its tag has a
 /// registered autonomous custom-element definition.
 pub fn upgrade_created_element(tag: &str, element: Value) -> Value {
+    if DEFINITIONS.with(|definitions| definitions.borrow().is_empty()) {
+        return element;
+    }
     if element
         .get_property("__w3cos_custom_element_upgraded")
         .to_bool()
