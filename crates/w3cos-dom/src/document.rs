@@ -9331,14 +9331,35 @@ impl Document {
 }
 
 fn css_property_eq(actual: &str, canonical: &str) -> bool {
-    let normalize = |value: &str| {
-        value
-            .chars()
-            .filter(|ch| *ch != '-')
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    normalize(actual) == normalize(canonical)
+    // Property names are ASCII. Skip dashes and compare without allocating a
+    // lowercased copy; computed style calls this for every declaration.
+    let mut left = actual.bytes().filter(|byte| *byte != b'-');
+    let mut right = canonical.bytes().filter(|byte| *byte != b'-');
+    loop {
+        match (left.next(), right.next()) {
+            (Some(actual), Some(canonical))
+                if actual.to_ascii_lowercase() == canonical.to_ascii_lowercase() => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod css_property_eq_tests {
+    use super::css_property_eq;
+
+    #[test]
+    fn property_equality_ignores_dashes_and_ascii_case() {
+        assert!(css_property_eq("grid-template-columns", "gridTemplateColumns"));
+        assert!(css_property_eq(
+            "GridTemplateColumns",
+            "gridtemplatecolumns"
+        ));
+        assert!(!css_property_eq("width", "height"));
+        assert!(!css_property_eq("top", "topx"));
+        assert!(css_property_eq("background-color", "backgroundColor"));
+    }
 }
 
 fn parse_css_string_list(value: &str) -> Vec<String> {
