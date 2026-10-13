@@ -3917,10 +3917,36 @@ fn pre_flatten_recursive<'a>(
 // LayoutEngine — persistent TaffyTree for incremental layout
 // ---------------------------------------------------------------------------
 
+fn index_taffy_nodes(tree: &TaffyTree<usize>, root: taffy::NodeId) -> Vec<taffy::NodeId> {
+    let mut indexed: Vec<Option<taffy::NodeId>> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(&idx) = tree.get_node_context(node) {
+            if indexed.len() <= idx {
+                indexed.resize(idx + 1, None);
+            }
+            indexed[idx] = Some(node);
+        }
+        if let Ok(children) = tree.children(node) {
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    indexed
+        .into_iter()
+        .map(|node| node.unwrap_or(root))
+        .collect()
+}
+
 pub struct LayoutEngine {
     tree: TaffyTree<usize>,
     root_node: Option<taffy::NodeId>,
+    /// Taffy node for each component preorder index (`get_node_context`).
+    node_index: Vec<taffy::NodeId>,
     tree_valid: bool,
+    /// Simple flex/grid/block trees can skip the post-Taffy projection passes.
+    skip_projections: bool,
     viewport: Option<(f32, f32)>,
     /// Taffy `compute_layout` calls issued by the most recent `compute()`.
     /// 1 means text-leaf heights were already clean and the historic second
@@ -3956,10 +3982,34 @@ impl LayoutEngine {
         Self {
             tree,
             root_node: None,
+            node_index: Vec::new(),
             tree_valid: false,
+            skip_projections: false,
             viewport: None,
             last_compute_layout_passes: 0,
         }
+    }
+
+    pub fn set_skip_projections(&mut self, skip: bool) {
+        self.skip_projections = skip;
+    }
+
+    /// Replace one node's Taffy style without rebuilding the tree.
+    pub fn patch_style(
+        &mut self,
+        index: usize,
+        style: &w3cos_std::style::Style,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> bool {
+        let Some(&node) = self.node_index.get(index) else {
+            return false;
+        };
+        if self.tree.get_node_context(node).copied() != Some(index) {
+            return false;
+        }
+        let taffy_style = to_taffy_style(style, viewport_w, viewport_h);
+        self.tree.set_style(node, taffy_style).is_ok()
     }
 
     pub fn invalidate(&mut self) {
@@ -4018,6 +4068,9 @@ impl LayoutEngine {
                 None,
             )?);
             self.tree_valid = true;
+            if let Some(root_node) = self.root_node {
+                self.node_index = index_taffy_nodes(&self.tree, root_node);
+            }
         }
 
         let root_node = self.root_node.unwrap();
@@ -4080,6 +4133,16 @@ impl LayoutEngine {
             &mut clip_only,
             &mut scroll_ancestor,
         );
+
+        if self.skip_projections {
+            results.extend(fixed_results);
+            return Ok(LayoutResults {
+                layout_cache: results,
+                scrollable_nodes: scrollable,
+                clip_only_nodes: clip_only,
+                scroll_ancestor,
+            });
+        }
 
         let inline_original_rects = flat.iter().any(|node|
             matches!(node.style.display, WDisplay::TableCell | WDisplay::TableCaption))

@@ -86,6 +86,7 @@ mod ios_input;
     not(target_env = "ohos")
 ))]
 pub mod ipc;
+pub mod incremental_layout;
 pub mod jsdom;
 pub mod launch_handler_web;
 pub mod layout;

@@ -124,6 +124,13 @@ pub struct Document {
     scroll_offsets: Vec<(f32, f32)>,
     free_list: Vec<u32>,
     dirty: Vec<NodeId>,
+    /// Nodes whose own box changed. Layout scopes stay in `dirty`; this list
+    /// is the precise set a persistent flex/grid tree can patch.
+    precise_dirty: Vec<NodeId>,
+    /// Bumps when the tree shape or baked text metrics change.
+    structure_generation: u64,
+    /// Bumps when inherited or selector-driven styles may have changed.
+    cascade_generation: u64,
     style_revision_clock: u64,
     style_revisions: Vec<u64>,
     focused_node: Option<NodeId>,
@@ -238,6 +245,9 @@ impl Document {
             scroll_offsets: Vec::new(),
             free_list: Vec::new(),
             dirty: Vec::new(),
+            precise_dirty: Vec::new(),
+            structure_generation: 0,
+            cascade_generation: 0,
             style_revision_clock: 0,
             style_revisions: Vec::new(),
             focused_node: None,
@@ -466,6 +476,7 @@ impl Document {
         // ancestor chain. Restyle the moved subtree without walking the
         // parent's existing siblings.
         self.invalidate_style_subtree(child);
+        self.note_structure_change();
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
@@ -473,6 +484,7 @@ impl Document {
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
         self.invalidate_style_subtree(child);
+        self.note_structure_change();
     }
 
     pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
@@ -580,6 +592,7 @@ impl Document {
         }
         self.mark_dirty(parent);
         self.invalidate_style_subtree(new_child);
+        self.note_structure_change();
     }
 
     fn insertion_would_create_cycle(&self, parent: NodeId, child: NodeId) -> bool {
@@ -873,13 +886,15 @@ impl Document {
         };
         self.invalidate_style_subtree(invalidation_root);
         self.record_layout_dirty(id);
+        self.note_cascade_change();
     }
 
     /// Inline declarations cannot change selector matching, but inherited
     /// values and custom properties require the complete descendant subtree.
-    pub(crate) fn mark_inline_style_dirty(&mut self, id: NodeId) {
+    pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
         self.invalidate_style_subtree(id);
         self.record_layout_dirty(id);
+        self.note_cascade_change();
     }
 
     /// Text mutations can change the parent's `:empty` state. Relational
@@ -892,6 +907,7 @@ impl Document {
         };
         self.invalidate_style_subtree(invalidation_root);
         self.record_layout_dirty(id);
+        self.note_structure_change();
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
@@ -899,6 +915,43 @@ impl Document {
         if !self.dirty.contains(&scope) {
             self.dirty.push(scope);
         }
+        if !self.precise_dirty.contains(&id) {
+            self.precise_dirty.push(id);
+        }
+    }
+
+    /// Tree shape or baked text metrics changed. A persistent layout tree
+    /// must be rebuilt rather than patched.
+    pub fn note_structure_change(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.cascade_generation = self.cascade_generation.wrapping_add(1);
+    }
+
+    /// Inherited or selector-matched styles may have changed below `id`.
+    pub fn note_cascade_change(&mut self) {
+        self.cascade_generation = self.cascade_generation.wrapping_add(1);
+    }
+
+    pub fn structure_generation(&self) -> u64 {
+        self.structure_generation
+    }
+
+    pub fn cascade_generation(&self) -> u64 {
+        self.cascade_generation
+    }
+
+    pub fn take_precise_dirty(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.precise_dirty)
+    }
+
+    pub fn precise_dirty_contains(&self, id: NodeId) -> bool {
+        self.precise_dirty.contains(&id)
+    }
+
+    /// Non-inherited inline edits: restyle this node only.
+    pub fn note_local_style(&mut self, id: NodeId) {
+        self.touch_style_revision(id);
+        self.record_layout_dirty(id);
     }
 
     /// Walk up from `id` to find the nearest ancestor with CSS `contain` set,

@@ -64,6 +64,7 @@ pub fn reset_document() {
     DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
+    crate::incremental_layout::invalidate();
 }
 
 // ---------------------------------------------------------------------------
@@ -312,12 +313,89 @@ pub fn get_descendant_text_content(node: u32) -> String {
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
     let old_value = get_attribute(node, "style");
     with_document_mut(|doc| {
-        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
-        el.style_mut(doc).set_property(prop, value);
+        let id = NodeId::from_u32(node);
+        doc.get_style_mut(id).set_property(prop, value);
+        if inline_style_change_is_local(prop) {
+            doc.note_local_style(id);
+        } else {
+            doc.mark_inline_style_dirty(id);
+        }
     });
     mark_dom_dirty();
-    let _ = (prop, value);
     crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
+}
+
+/// Known non-inherited properties. Everything else, including custom
+/// properties and `font`/`color`, still restyles the descendant subtree.
+fn inline_style_change_is_local(prop: &str) -> bool {
+    let prop = prop.trim().to_ascii_lowercase();
+    if prop.starts_with("--") || prop == "all" {
+        return false;
+    }
+    matches!(
+        prop.as_str(),
+        "width"
+            | "height"
+            | "min-width"
+            | "max-width"
+            | "min-height"
+            | "max-height"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "inset"
+            | "margin"
+            | "padding"
+            | "display"
+            | "position"
+            | "float"
+            | "clear"
+            | "z-index"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
+            | "flex"
+            | "flex-wrap"
+            | "flex-direction"
+            | "flex-grow"
+            | "flex-shrink"
+            | "flex-basis"
+            | "flex-flow"
+            | "justify-content"
+            | "align-items"
+            | "align-self"
+            | "align-content"
+            | "order"
+            | "gap"
+            | "row-gap"
+            | "column-gap"
+            | "grid"
+            | "grid-template"
+            | "grid-template-columns"
+            | "grid-template-rows"
+            | "grid-template-areas"
+            | "grid-column"
+            | "grid-row"
+            | "grid-auto-flow"
+            | "grid-auto-columns"
+            | "grid-auto-rows"
+            | "box-sizing"
+            | "object-fit"
+            | "object-position"
+            | "opacity"
+            | "transform"
+            | "background"
+            | "background-color"
+            | "vertical-align"
+    ) || prop.starts_with("margin-")
+        || prop.starts_with("padding-")
+        || prop.starts_with("border-")
+        || prop.starts_with("border")
+        || prop.starts_with("background-")
+        || prop.starts_with("outline")
+        || prop.starts_with("grid-")
+        || prop.starts_with("flex-")
 }
 
 pub fn class_list_add(node: u32, class: &str) {
