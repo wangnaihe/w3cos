@@ -537,28 +537,33 @@ def summarize_runs(workload, native_runs, browser_runs):
             add("update_ms", [run_median(run.get("result"), "update_ms") for run in ok_native if run_median(run.get("result"), "update_ms") is not None],
                 [run_median(run.get("result"), "update_ms") for run in ok_browser if run_median(run.get("result"), "update_ms") is not None])
         if workload == "frames":
-            native_frames = []
-            browser_frames = []
-            native_gaps = []
-            browser_gaps = []
+            def run_percentile(run, fraction, key="elapsed_ms"):
+                values = sample_values(run.get("result"), key)
+                if key == "elapsed_ms" and not values:
+                    values = sample_values(run.get("result"))
+                return percentile(values, fraction) if values else None
+
+            def gap_percentile(run, fraction):
+                result = run.get("result") or {}
+                gaps = [gap for gap in result.get("gaps") or [] if gap]
+                return percentile(gaps, fraction) if gaps else None
+
+            native_p50 = [value for run in ok_native if (value := run_percentile(run, 0.50)) is not None]
+            browser_p50 = [value for run in ok_browser if (value := run_percentile(run, 0.50)) is not None]
+            native_p95 = [value for run in ok_native if (value := run_percentile(run, 0.95)) is not None]
+            browser_p95 = [value for run in ok_browser if (value := run_percentile(run, 0.95)) is not None]
             native_pipeline = []
             for run in ok_native:
-                native_frames.extend(sample_values(run.get("result")))
-                result = run.get("result") or {}
-                native_gaps.extend(gap for gap in result.get("gaps") or [] if gap)
                 totals, _ = frame_totals(run.get("frames") or [])
-                native_pipeline.extend(totals[2:])
-            for run in ok_browser:
-                browser_frames.extend(sample_values(run.get("result")))
-                result = run.get("result") or {}
-                browser_gaps.extend(gap for gap in result.get("gaps") or [] if gap)
-            add("frame_work_p50_ms", [percentile(native_frames, 0.50)] if native_frames else [],
-                [percentile(browser_frames, 0.50)] if browser_frames else [])
-            add("frame_work_p95_ms", [percentile(native_frames, 0.95)] if native_frames else [],
-                [percentile(browser_frames, 0.95)] if browser_frames else [])
-            add("native_pipeline_p50_ms", [percentile(native_pipeline, 0.50)] if native_pipeline else [], [])
+                measured = totals[2:]
+                if measured:
+                    native_pipeline.append(percentile(measured, 0.50))
+            browser_gaps = [value for run in ok_browser if (value := gap_percentile(run, 0.50)) is not None]
+            add("frame_work_p50_ms", native_p50, browser_p50)
+            add("frame_work_p95_ms", native_p95, browser_p95)
+            add("native_pipeline_p50_ms", native_pipeline, [])
             rows[-1]["note"] = "Pipeline time is rAF callback plus tiny-skia raster. Browser gap is reported separately."
-            add("browser_raf_gap_p50_ms", [], [percentile(browser_gaps, 0.50)] if browser_gaps else [])
+            add("browser_raf_gap_p50_ms", [], browser_gaps)
         add("cpu_ms", [run["cpu_ms"] for run in ok_native if run.get("cpu_ms") is not None],
             [run["cpu_ms"] for run in ok_browser if run.get("cpu_ms") is not None])
         add("peak_rss_kb", [run["peak_rss_kb"] for run in ok_native if run.get("peak_rss_kb")],

@@ -60,5 +60,72 @@ isolation, and V8 optimizations stay at their headless defaults.
 
 ## Results
 
-Results are filled in after the pinned runs on this host. Until that table is
-updated, this document is the methodology only and is not a performance claim.
+Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, 15 GiB RAM, no `/dev/dri`.
+Rustc 1.99.0 (`b940084d7`, 2026-09-28). Google Chrome 154.0.8037.92. Native
+binary commit `ce74c90`, profile `opt-level=3`, LTO off, `codegen-units=16`,
+`cpu-render` (tiny-skia). Five processes per workload. Checksums matched on
+every paired run. Ratio is w3cos / Chromium after optimization; below 1 is a
+w3cos win.
+
+"Before" is the first five-run pass, already including the sibling-context
+cache, inline-declaration replacement, and forced-layout rect cache. The
+single-process smoke before those three changes is called out underneath,
+because layout and memory had not been through five runs yet. "After" adds
+allocation-free CSS property compares and skipping sibling restyles when no
+structural selector is registered.
+
+| workload | metric | w3cos before | w3cos after | Chromium | ratio after |
+| --- | --- | ---: | ---: | ---: | ---: |
+| startup | cold start ms | 62.5 | 52.0 (50.8–53.0) | 210 (196–240) | 0.25 |
+| startup | steady RSS | — | see other rows | ~940 MB tree | — |
+| dom-list | wall ms | 46.7 | 25.3 (25.2–25.8) | 0.90 (0.70–1.50) | 28 |
+| dom-list | steady RSS | 50.0 MB | 49.8 MB | 941 MB | 0.053 |
+| layout | wall ms | 955 | 306 (304–310) | 11.7 (10.8–14.2) | 26 |
+| layout | steady RSS | 79.0 MB | 79.3 MB | 1000 MB | 0.079 |
+| frames | work p50 ms | 40.7 | 5.63 (5.54–5.74) | 0.20 (0.20–0.30) | 28 |
+| frames | work p95 ms | 43.8 | 6.06 (5.72–6.58) | 0.30 (0.30–0.40) | 20 |
+| frames | steady RSS | 37.5 MB | 37.6 MB | 947 MB | 0.040 |
+| compute | wall ms | 194 | 191 (188–195) | 1.40 (1.40–1.50) | 136 |
+| compute | steady RSS | 16.8 MB | 16.6 MB | 941 MB | 0.018 |
+| memory | wall ms | 1023 | 358 (337–383) | 21.8 (19.7–25.6) | 16 |
+| memory | steady RSS | 133 MB | 133 MB | 961 MB | 0.14 |
+
+Cold start and every RSS sample are wins. DOM update time is 0.47 ms versus a
+Chromium median of 0.0 ms (max 0.1 ms), so the ratio is undefined and w3cos is
+slower. Frame p50/p95 above are the median of the five per-run percentiles.
+
+Before the first three optimizations, one native process measured layout at
+about 2.7 s per sample, frame work growing from 70 ms to 130 ms, and the 4000
+node memory workload still inside `to_component_tree` after 90 s. Compute was
+already about 200 ms. Startup's first process spent 421 ms in the first
+tiny-skia raster; the five-run medians above are after font caches are warm.
+
+### What still loses
+
+DOM creation (25 ms vs 0.9 ms), layout (306 ms vs 12 ms), frame work (5.6 ms
+vs 0.2 ms), the memory build (358 ms vs 22 ms), and the numeric loop (191 ms
+vs 1.4 ms) are still losses. Checksums match, so this is not skipped work.
+
+Layout and frames are the same cost. `offsetHeight` still rebuilds a component
+tree after every style write. Samples of that rebuild land in `computed_style`,
+`reorder_explicit_bidi_*` cloning `Component` trees, and
+`layout::compute_with_scroll_details` cloning the tree again before Taffy.
+Caching the rects removes the second read in a frame, which is why layout fell
+from 2.7 s to 306 ms and frame work from ~100 ms to 5.6 ms. It cannot remove
+the flush that the style write itself requires. Closing the rest of the gap
+needs an incremental style and layout tree; a full rebuild of a few hundred
+boxes is still about 25 ms on this host, and Blink does the same reflow in
+about 1 ms.
+
+DOM creation fell from 47 ms to 25 ms by not restyling every sibling on append
+when the stylesheet has no structural selector. The remaining ~25 µs per node
+is host-object construction through boxed values (element, text node, style
+declaration). Memory is that cost at 4000 nodes plus one full layout.
+
+Compute did not move. The 400000-iteration loop lowers to environment bindings
+(`RefCell<(Value, bool)>`) and a block-dispatch state machine. Straight-line
+`1 + 2 + 3` already uses `num_regs`, but `LoadBinding` is typed `Unknown`, and
+a loop is more than one block so it cannot use the direct-body emitter. At
+191 ms that is about 480 ns per iteration. V8 measures 3.5 ns. Unboxing the
+bindings would remove the `RefCell`, but the state machine would still sit far
+above a native `for` loop, which is what would be required to go under 1.4 ms.
