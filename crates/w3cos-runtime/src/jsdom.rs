@@ -7705,6 +7705,27 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     else {
         return live;
     };
+    // Geometry reads are synchronous, but a clean tree does not change until
+    // the next mutation. Store the raw boxes (motion is applied on read) so
+    // the next offsetHeight/getBoundingClientRect in this frame is a lookup.
+    dom::with_document_mut(|document| {
+        for (rect, index) in &layouts {
+            let Some(info) = flat.get(*index) else {
+                continue;
+            };
+            let w3cos_std::EventAction::NativeHost { id, .. } = info.on_click else {
+                continue;
+            };
+            let Ok(node_id) = u32::try_from(*id) else {
+                continue;
+            };
+            document.set_layout_rect(
+                NodeId::from_u32(node_id),
+                w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
+            );
+        }
+    });
+    dom::clear_document_dirty();
     let rect_for_node = |candidate: u32| {
         let index = flat.iter().position(|info| {
             matches!(
