@@ -186,7 +186,15 @@ fn main() -> Result<()> {
             target,
             devtools,
         } => {
-            let strip = if release || strip { Some(true) } else { None };
+            // Benchmark speed builds keep symbols unless the caller still asks
+            // to strip. Runtime speed is unchanged; profiles can see frames.
+            let strip = if std::env::var_os("W3COS_NO_STRIP").is_some() {
+                Some(false)
+            } else if release || strip {
+                Some(true)
+            } else {
+                None
+            };
             build(
                 &input,
                 &output,

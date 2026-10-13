@@ -19446,6 +19446,182 @@ pub fn has_pending_animation_frame() -> bool {
         || CSS_MOTIONS.with(|motions| !motions.borrow().is_empty())
 }
 
+#[derive(Clone, Copy)]
+struct HeadlessEntryMark {
+    start: Instant,
+    cpu_ms: f64,
+}
+
+thread_local! {
+    static HEADLESS_ENTRY_MARK: Cell<Option<HeadlessEntryMark>> = const { Cell::new(None) };
+}
+
+fn process_cpu_ms() -> f64 {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    let Some(end) = stat.rfind(')') else {
+        return 0.0;
+    };
+    let mut fields = stat[end + 1..].split_whitespace();
+    // Fields after `comm`: state is field 3, utime field 14, stime field 15.
+    let utime: u64 = fields.nth(11).and_then(|value| value.parse().ok()).unwrap_or(0);
+    let stime: u64 = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+    if ticks <= 0 {
+        return 0.0;
+    }
+    (utime + stime) as f64 * 1000.0 / ticks as f64
+}
+
+fn process_rss_kb() -> (u64, u64) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (0, 0);
+    };
+    let mut rss = 0u64;
+    let mut hwm = 0u64;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            rss = value.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("VmHWM:") {
+            hwm = value.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    (rss, hwm)
+}
+
+fn headless_viewport() -> (u32, u32) {
+    let width = std::env::var("W3COS_VIEWPORT_W")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024);
+    let height = std::env::var("W3COS_VIEWPORT_H")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(768);
+    (width, height)
+}
+
+fn emit_proc_stats(phase: &str) {
+    if std::env::var_os("W3COS_PERF_WORKLOAD").is_none()
+        && std::env::var_os("W3COS_HEADLESS_PUMP").is_none()
+    {
+        return;
+    }
+    let Some(mark) = HEADLESS_ENTRY_MARK.with(Cell::get) else {
+        return;
+    };
+    let (rss, hwm) = process_rss_kb();
+    println!(
+        "W3COS_PROC phase={phase} cpu_ms={:.3} wall_ms={:.3} rss_kb={rss} hwm_kb={hwm}",
+        process_cpu_ms() - mark.cpu_ms,
+        mark.start.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
+fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    {
+        let started = Instant::now();
+        let frame = crate::headless::render_document_rgba(width, height).map_err(|error| error.to_string())?;
+        let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut checksum = frame.rgba.len() as u64;
+        for (index, byte) in frame.rgba.iter().enumerate() {
+            checksum = checksum.wrapping_add((*byte as u64).wrapping_mul((index as u64 % 251) + 1));
+        }
+        return Ok((checksum, paint_ms));
+    }
+    #[cfg(not(any(feature = "skia", feature = "cpu-render")))]
+    {
+        let _ = (width, height);
+        Err("headless rasterizer is not compiled in".to_string())
+    }
+}
+
+/// Install benchmark controls before the generated bundle runs.
+///
+/// Unset environment variables leave the document untouched, so ordinary
+/// headless executions keep their previous behavior.
+pub fn prepare_headless_entry() {
+    HEADLESS_ENTRY_MARK.with(|mark| {
+        mark.set(Some(HeadlessEntryMark {
+            start: Instant::now(),
+            cpu_ms: process_cpu_ms(),
+        }))
+    });
+    let (width, height) = headless_viewport();
+    set_viewport(f64::from(width), f64::from(height));
+    if let Ok(workload) = std::env::var("W3COS_PERF_WORKLOAD") {
+        window_value().set_property("W3COS_PERF_WORKLOAD", Value::string(&workload));
+    }
+}
+
+/// Drain the headless task queue.
+///
+/// Without `W3COS_HEADLESS_PUMP` this matches the historical 16 timer turns.
+/// With the pump set, each queued animation frame is a real rendering
+/// opportunity: callbacks run, then the CPU/headless rasterizer produces a
+/// frame. The raster checksum is printed so the paint cannot be discarded.
+pub fn finish_headless_entry() -> Result<(), String> {
+    if std::env::var_os("W3COS_HEADLESS_PUMP").is_none() {
+        for _ in 0..16 {
+            drain_microtasks();
+            tick_timers();
+        }
+        emit_proc_stats("script");
+        return Ok(());
+    }
+
+    let (width, height) = headless_viewport();
+    let max_frames = std::env::var("W3COS_FRAME_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120);
+    emit_proc_stats("script");
+    let mut frames = 0u32;
+    let mut totals = Vec::new();
+    let mut paints = Vec::new();
+    loop {
+        drain_microtasks();
+        if has_pending_animation_frame() {
+            let started = Instant::now();
+            let ran = run_animation_frame();
+            drain_microtasks();
+            let (checksum, paint_ms) = raster_checksum(width, height)?;
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "W3COS_FRAME index={frames} total_ms={total_ms:.4} paint_ms={paint_ms:.4} ran={ran} checksum={checksum} width={width} height={height}"
+            );
+            totals.push(total_ms);
+            paints.push(paint_ms);
+            frames += 1;
+            if frames >= max_frames {
+                break;
+            }
+            continue;
+        }
+        if tick_timers() > 0 {
+            continue;
+        }
+        break;
+    }
+    if !totals.is_empty() {
+        println!(
+            "W3COS_FRAMES {}",
+            serde_json::json!({
+                "count": totals.len(),
+                "total_ms": totals,
+                "paint_ms": paints,
+            })
+        );
+    }
+    emit_proc_stats("done");
+    Ok(())
+}
+
 /// Queue a microtask (also used internally for thenable callbacks).
 pub fn queue_microtask_value(callback: Value) {
     w3cos_core::promise::queue_microtask(callback);

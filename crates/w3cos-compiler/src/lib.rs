@@ -286,7 +286,7 @@ fn compile_with_source_dir(
                 // W3COS_DOM_DUMP=1 additionally prints the body's outer HTML
                 // (truncated) — the headless smoke signal for DOM apps.
                 main_rs.push_str(
-                    "\nfn setup_dom() {\n    if w3cos_runtime::dom::get_element_by_id(\"root\").is_none() {\n        let root = w3cos_runtime::dom::create_element(\"div\");\n        w3cos_runtime::dom::set_attribute(root, \"id\", \"root\");\n        w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);\n    }\n    let _ = esm_bundle::run_entry_async();\n}\n\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(setup_dom) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        setup_dom();\n        for _ in 0..16 {\n            w3cos_runtime::jsdom::drain_microtasks();\n            w3cos_runtime::jsdom::tick_timers();\n        }\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
+                    "\nfn setup_dom() {\n    if w3cos_runtime::dom::get_element_by_id(\"root\").is_none() {\n        let root = w3cos_runtime::dom::create_element(\"div\");\n        w3cos_runtime::dom::set_attribute(root, \"id\", \"root\");\n        w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);\n    }\n    let _ = esm_bundle::run_entry_async();\n}\n\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(setup_dom) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        w3cos_runtime::jsdom::prepare_headless_entry();\n        setup_dom();\n        if let Err(error) = w3cos_runtime::jsdom::finish_headless_entry() {\n            eprintln!(\"W3COS_HEADLESS_ERROR {error}\");\n            std::process::exit(1);\n        }\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
                 );
             } else {
                 main_rs.push_str("\nfn main() {}\n");
@@ -749,15 +749,36 @@ edition = "2024"
             .unwrap_or_else(|| format!("{name} = {{ path = \"../../crates/{name}\" }}\n"))
     };
     let runtime_dependency = || {
-        let mut runtime_features = vec!["gpu"];
-        if flags.needs_web_graphics_advanced {
-            runtime_features.push("web-graphics-advanced");
+        let mut runtime_features = if let Ok(custom) = std::env::var("W3COS_RUNTIME_FEATURES") {
+            custom
+                .split(',')
+                .map(str::trim)
+                .filter(|feature| {
+                    !feature.is_empty()
+                        && feature
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if runtime_features.is_empty() {
+            runtime_features.push("gpu".to_string());
         }
-        if flags.needs_web_media_advanced {
-            runtime_features.push("web-media-advanced");
+        if flags.needs_web_graphics_advanced
+            && !runtime_features.iter().any(|feature| feature == "web-graphics-advanced")
+        {
+            runtime_features.push("web-graphics-advanced".to_string());
         }
-        if options.devtools {
-            runtime_features.push("devtools");
+        if flags.needs_web_media_advanced
+            && !runtime_features.iter().any(|feature| feature == "web-media-advanced")
+        {
+            runtime_features.push("web-media-advanced".to_string());
+        }
+        if options.devtools && !runtime_features.iter().any(|feature| feature == "devtools") {
+            runtime_features.push("devtools".to_string());
         }
         let features = format!(
             "[{}]",
@@ -797,9 +818,24 @@ edition = "2024"
     if flags.needs_std {
         toml.push_str(&dependency("w3cos-std"));
     }
-    toml.push_str(codegen::GENERATED_RELEASE_PROFILE);
+    if std::env::var("W3COS_RELEASE_PROFILE").ok().as_deref() == Some("speed") {
+        toml.push_str(SPEED_RELEASE_PROFILE);
+    } else {
+        toml.push_str(codegen::GENERATED_RELEASE_PROFILE);
+    }
     toml
 }
+
+const SPEED_RELEASE_PROFILE: &str = r#"
+# Selected only by W3COS_RELEASE_PROFILE=speed. The default generated profile
+# remains size-optimized (opt-level z, fat LTO). This opt-in is the speed
+# configuration used for browser comparisons.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "unwind"
+"#;
 
 fn uses_advanced_web_graphics(generated_rust: &str) -> bool {
     const EXACT_GLOBALS: &[&str] = &[
@@ -1930,6 +1966,11 @@ export function main() {
         assert!(
             main_rs.contains("W3COS_DOM_OK nodes="),
             "missing DOM-mode main: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("prepare_headless_entry")
+                && main_rs.contains("finish_headless_entry"),
+            "headless entry must pump through the runtime: {main_rs}"
         );
         assert!(
             main_rs.contains("w3cos_runtime::run_app_dom"),
