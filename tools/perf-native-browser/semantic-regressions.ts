@@ -80,6 +80,10 @@ row("boundary-Proxy-undefined-authoritative",proxyUndefinedGetter);
 row("boundary-Proxy-redefines-receiver",proxyRedefinesReceiver);
 row("boundary-style-RHS-order",styleRhsOrder);
 row("boundary-document-getter-this",documentGetterReceiver);
+function defineRefusal(){const p=new Proxy({}, {defineProperty:function(){return false;}});Object.defineProperty(p,"x",{value:1});return "returned";}
+function defineNestedRefusal(){const inner=new Proxy({}, {defineProperty:function(){return false;}}),outer=new Proxy(inner,{});Object.defineProperty(outer,"x",{value:1});return "returned";}
+row("boundary-defineProperty-false",defineRefusal);
+row("boundary-defineProperty-nested-false",defineNestedRefusal);
 const trace=[];
 async function fulfilled(){trace.push("before");await Promise.resolve(1);trace.push("after");}
 const done=fulfilled();trace.push("caller");

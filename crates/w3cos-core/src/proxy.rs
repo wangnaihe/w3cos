@@ -306,6 +306,55 @@ mod dynamic_tests {
     use crate::class;
 
     #[test]
+    fn dynamic_proxy_definition_refusal_throws_before_writing() {
+        let target = Value::object(HashMap::new());
+        let handler = Value::object(HashMap::from([(
+            "defineProperty".into(),
+            Value::function(|_, _| Value::Bool(false)),
+        )]));
+        let proxy = class::construct(&proxy_class(), vec![target.clone(), handler]);
+        let error = crate::catch_js(|| {
+            class::define_property(
+                &proxy,
+                "side",
+                &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+            )
+        })
+        .expect_err("Object.defineProperty must reject a false trap result");
+        assert_eq!(error.get_property("name"), Value::string("TypeError"));
+        assert!(target.get_property("side").is_undefined());
+        assert!(proxy.get_property("side").is_undefined());
+    }
+
+    #[test]
+    fn dynamic_proxy_nested_refusal_does_not_update_the_outer_mirror() {
+        let refusing = class::construct(
+            &proxy_class(),
+            vec![
+                Value::object(HashMap::new()),
+                Value::object(HashMap::from([(
+                    "defineProperty".into(),
+                    Value::function(|_, _| Value::Bool(false)),
+                )])),
+            ],
+        );
+        let outer = class::construct(
+            &proxy_class(),
+            vec![refusing, Value::object(HashMap::new())],
+        );
+        let error = crate::catch_js(|| {
+            class::define_property(
+                &outer,
+                "side",
+                &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+            )
+        })
+        .expect_err("inner refusal must propagate");
+        assert_eq!(error.get_property("name"), Value::string("TypeError"));
+        assert!(outer.get_property("side").is_undefined());
+    }
+
+    #[test]
     fn dynamic_proxy_default_definition_keeps_get_and_reflection_consistent() {
         let target = Value::object(HashMap::new());
         let proxy = class::construct(

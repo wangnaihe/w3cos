@@ -54,6 +54,12 @@ env = dict(os.environ, W3COS_JS_CONSOLE="1")
 for key in ["W3COS_AOT_WINDOW", "W3COS_PERF_WORKLOAD"]:
     env.pop(key, None)
 for label, binary in [("baseline", a.baseline), ("control", a.control), ("candidate", a.candidate)]:
+    if label == "control" and binary.resolve() == a.baseline.resolve():
+        # A two-version repair check has one frozen baseline, not two samples.
+        records[label] = records["baseline"]
+        processes[label] = {"reused_from": "baseline",
+                            "binary_sha256": processes["baseline"]["binary_sha256"]}
+        continue
     folder = out / label
     folder.mkdir()
     rows, cases = [], []

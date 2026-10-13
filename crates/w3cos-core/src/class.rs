@@ -512,7 +512,11 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
         };
         if let Some((trap, target)) = proxy_define {
             // A descriptor trap can read or redefine the proxy again.
-            trap(&target, key, descriptor);
+            if !trap(&target, key, descriptor) {
+                crate::throw_value(crate::value::type_error(
+                    "Proxy defineProperty trap rejected the definition",
+                ));
+            }
         } else {
             object.borrow_mut().define_property(key, descriptor);
         }
