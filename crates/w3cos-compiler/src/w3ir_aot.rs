@@ -3458,10 +3458,456 @@ fn emit_native_sync_loop(
     }
     let (prologue, loop_body, epilogue) = promote_unboxed_locals(&loop_body)
         .unwrap_or_else(|| (String::new(), loop_body.clone(), String::new()));
+    let outlined = outline_numeric_loop(&prologue, &loop_body, &epilogue);
     Ok(Some(format!(
-        "{prologue}loop {{\n{loop_body}}}\n{epilogue}self.block = {}; continue 'drive;\n",
+        "{outlined}self.block = {}; continue 'drive;\n",
         native.exit.0
     )))
+}
+
+/// Pull a pure numeric loop into its own `#[inline(never)]` function so LLVM
+/// register-allocates it without the state machine, drop bounds checks, keep
+/// a provable integer trip count in `i32`, and write `f64` slots back only
+/// after the loop (no `Value` boxing on the exit edge).
+fn outline_numeric_loop(prologue: &str, body: &str, epilogue: &str) -> String {
+    if body.contains("self.") || body.contains("w3cos_core::Value::") {
+        return format!("{prologue}loop {{\n{body}}}\n{epilogue}");
+    }
+    let mut locals = Vec::new();
+    for line in prologue.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("let mut ") else {
+            continue;
+        };
+        let Some((name, after_name)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some((ty, init)) = after_name.split_once('=') else {
+            continue;
+        };
+        let init = init.trim().trim_end_matches(';').trim();
+        locals.push((
+            name.trim().to_string(),
+            ty.trim().to_string(),
+            init.to_string(),
+        ));
+    }
+    if locals.is_empty() {
+        return format!("{prologue}loop {{\n{body}}}\n{epilogue}");
+    }
+    let rewritten = normalize_numeric_body(&fold_numeric_copies(body));
+    let trip = integer_trip(&rewritten, &locals);
+    let carried: Vec<_> = locals
+        .iter()
+        .filter(|(name, _, _)| rewritten.contains(name))
+        .cloned()
+        .collect();
+    if carried.is_empty() {
+        return format!("{prologue}loop {{\n{body}}}\n{epilogue}");
+    }
+    let mut params = String::new();
+    let mut args = String::new();
+    let mut returns = String::new();
+    let mut ret_tys = String::new();
+    let mut prelude = String::new();
+    let mut internal = String::new();
+    for (name, ty, _) in &locals {
+        if carried.iter().any(|(carried_name, _, _)| carried_name == name) {
+            continue;
+        }
+        if rewritten.contains(name) {
+            let zero = if ty == "bool" { "false" } else { "0.0_f64" };
+            internal.push_str(&format!("let mut {name}: {ty} = {zero};\n"));
+        }
+    }
+    for (name, ty, init) in &carried {
+        if !params.is_empty() {
+            params.push_str(", ");
+            args.push_str(", ");
+            returns.push_str(", ");
+            ret_tys.push_str(", ");
+        }
+        params.push_str(&format!("mut {name}: {ty}"));
+        returns.push_str(name);
+        ret_tys.push_str(ty);
+        args.push_str(init);
+    }
+    let (ret_ty, ret_expr, call) = if carried.len() == 1 {
+        let name = &carried[0].0;
+        (
+            ret_tys.clone(),
+            returns.clone(),
+            format!("let __w3cos_out_0 = __w3cos_numeric_loop({args});\n{name} = __w3cos_out_0;\n"),
+        )
+    } else {
+        let pat = (0..carried.len())
+            .map(|index| format!("__w3cos_out_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut assign = format!("let ({pat}) = __w3cos_numeric_loop({args});\n");
+        for (index, (name, _, _)) in carried.iter().enumerate() {
+            assign.push_str(&format!("{name} = __w3cos_out_{index};\n"));
+        }
+        (
+            format!("({ret_tys})"),
+            format!("({returns})"),
+            assign,
+        )
+    };
+    let loop_code = if let Some((counter, limit, fast)) = &trip {
+        format!(
+            "let __w3cos_i0 = {counter};\nlet __w3cos_n = {limit};\nif __w3cos_i0.fract() == 0.0_f64 && __w3cos_n.fract() == 0.0_f64 && __w3cos_i0 >= -2147483648.0_f64 && __w3cos_n >= -2147483648.0_f64 && __w3cos_i0 <= 2147483646.0_f64 && __w3cos_n <= 2147483646.0_f64 {{\nlet mut __w3cos_i: i32 = __w3cos_i0 as i32;\nlet __w3cos_limit: i32 = __w3cos_n as i32;\nwhile __w3cos_i <= __w3cos_limit {{\n{fast}__w3cos_i += 1;\n}}\n{counter} = __w3cos_i as f64;\n}} else {{\nloop {{\n{rewritten}}}\n}}\n"
+        )
+    } else {
+        format!("loop {{\n{rewritten}}}\n")
+    };
+    format!(
+        "{prologue}{{\n#[inline(never)]\nfn __w3cos_numeric_loop({params}) -> {ret_ty} {{\n{prelude}{internal}{loop_code}{ret_expr}\n}}\n{call}}}\n{epilogue}"
+    )
+}
+
+/// Inline single-assignment temps so a numeric loop mentions only bindings.
+/// A temp whose value reads a binding is materialized before that binding is
+/// overwritten when a later instruction still uses the temp.
+fn fold_numeric_copies(body: &str) -> String {
+    let lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let parsed: Vec<Option<(String, String)>> = lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("if ") {
+                return None;
+            }
+            let assign = line.strip_suffix(';')?;
+            let (dst, rhs) = assign.split_once('=')?;
+            let dst = dst.trim();
+            if dst.contains(' ') {
+                return None;
+            }
+            Some((dst.to_string(), rhs.trim().to_string()))
+        })
+        .collect();
+    let mut remaining: HashMap<String, i32> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let source = parsed[index]
+            .as_ref()
+            .map(|(_, rhs)| rhs.as_str())
+            .unwrap_or(line);
+        for ident in numeric_idents(source) {
+            if ident.starts_with("nr_") || ident.starts_with("br_") {
+                *remaining.entry(ident).or_default() += 1;
+            }
+        }
+    }
+    let mut known: Vec<(String, String)> = Vec::new();
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if parsed[index].is_none() {
+            note_consumed(line, &known, &mut remaining);
+            if let Some(rest) = line.strip_prefix("if ") {
+                out.push_str("if ");
+                out.push_str(&subst_numeric_idents(rest, &known));
+            } else {
+                out.push_str(&subst_numeric_idents(line, &known));
+            }
+            out.push('\n');
+            continue;
+        }
+        let (dst, original_rhs) = parsed[index].clone().unwrap();
+        note_consumed(&original_rhs, &known, &mut remaining);
+        let rhs = simplify_f64_expr(&subst_numeric_idents(&original_rhs, &known));
+        if dst.starts_with("nb_") {
+            let mut keep = Vec::new();
+            for (name, expr) in known.drain(..) {
+                if ident_in(&expr, &dst) && remaining.get(&name).copied().unwrap_or(0) > 0 {
+                    out.push_str(&name);
+                    out.push_str(" = ");
+                    out.push_str(&expr);
+                    out.push_str(";\n");
+                } else if !ident_in(&expr, &dst) {
+                    keep.push((name, expr));
+                }
+            }
+            known = keep;
+            out.push_str(&dst);
+            out.push_str(" = ");
+            out.push_str(&rhs);
+            out.push_str(";\n");
+        } else {
+            known.retain(|(name, _)| name != &dst);
+            known.push((dst, rhs));
+        }
+    }
+    out
+}
+
+fn note_consumed(source: &str, known: &[(String, String)], remaining: &mut HashMap<String, i32>) {
+    for ident in numeric_idents(source) {
+        if known.iter().any(|(name, _)| name == &ident)
+            && let Some(count) = remaining.get_mut(&ident)
+        {
+            *count -= 1;
+        }
+    }
+}
+
+fn numeric_idents(expr: &str) -> Vec<String> {
+    let mut idents = Vec::new();
+    let bytes = expr.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            idents.push(expr[start..index].to_string());
+        } else {
+            index += 1;
+        }
+    }
+    idents
+}
+
+fn ident_in(expr: &str, name: &str) -> bool {
+    numeric_idents(expr).iter().any(|ident| ident == name)
+}
+
+fn subst_numeric_idents(expr: &str, known: &[(String, String)]) -> String {
+    let mut keys: Vec<&str> = known.iter().map(|(name, _)| name.as_str()).collect();
+    keys.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    let bytes = expr.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &expr[index..];
+        let matched = keys.iter().find(|name| {
+            rest.starts_with(*name)
+                && rest
+                    .as_bytes()
+                    .get(name.len())
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                && (index == 0
+                    || !bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_')
+        });
+        if let Some(name) = matched {
+            let value = known
+                .iter()
+                .find(|(known_name, _)| known_name == *name)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or(name);
+            out.push('(');
+            out.push_str(value);
+            out.push(')');
+            index += name.len();
+        } else {
+            out.push(bytes[index] as char);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn simplify_f64_expr(expr: &str) -> String {
+    expr.replace(" * 1.0_f64", "")
+        .replace("1.0_f64 * ", "")
+        .replace("(1.0_f64)", "1.0_f64")
+}
+
+fn normalize_numeric_body(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("if ") {
+            out.push_str("if ");
+            out.push_str(&normalize_numeric_expr(rest));
+            out.push('\n');
+            continue;
+        }
+        if let Some((dst, rhs)) = trimmed.strip_suffix(';').and_then(|assign| assign.split_once('='))
+        {
+            let dst = dst.trim();
+            if !dst.contains(' ') {
+                out.push_str(dst);
+                out.push_str(" = ");
+                out.push_str(&normalize_numeric_expr(rhs.trim()));
+                out.push_str(";\n");
+                continue;
+            }
+        }
+        out.push_str(&normalize_numeric_expr(trimmed));
+        out.push('\n');
+    }
+    out
+}
+
+fn normalize_numeric_expr(expr: &str) -> String {
+    let mut current = expr.to_string();
+    loop {
+        let stripped = strip_atom_parens(&current);
+        let wrapped = strip_wrapping_parens(stripped.trim()).to_string();
+        if wrapped == current {
+            break;
+        }
+        current = wrapped;
+    }
+    current
+}
+
+fn strip_atom_parens(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'('
+            && let Some(end) = atom_paren_end(expr, index)
+        {
+            out.push_str(&expr[index + 1..end]);
+            index = end + 1;
+            continue;
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
+}
+
+fn atom_paren_end(expr: &str, open: usize) -> Option<usize> {
+    let inner = expr.get(open + 1..)?;
+    let token_len = inner
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '.')
+        .count();
+    if token_len == 0 {
+        return None;
+    }
+    if inner.as_bytes().get(token_len) == Some(&b')') {
+        Some(open + 1 + token_len)
+    } else {
+        None
+    }
+}
+
+fn strip_wrapping_parens(expr: &str) -> &str {
+    let mut current = expr.trim();
+    while current.starts_with('(') && current.ends_with(')') && current.len() >= 2 {
+        let inner = current[1..current.len() - 1].trim();
+        if !parens_balanced(inner) {
+            break;
+        }
+        current = inner;
+    }
+    current
+}
+
+fn parens_balanced(expr: &str) -> bool {
+    let mut depth = 0i32;
+    for byte in expr.bytes() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// `(counter, limit, body without the compare and the +1)`.
+/// The counter is a pure integer induction variable and the limit is an
+/// unchanged f64 local. Callers still guard that both values are integers
+/// inside the i32 range before using the fast body.
+fn integer_trip(body: &str, locals: &[(String, String, String)]) -> Option<(String, String, String)> {
+    let f64_names: Vec<&str> = locals
+        .iter()
+        .filter(|(_, ty, _)| *ty == "f64")
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    for name in &f64_names {
+        let increment = format!("{name} = {name} + 1.0_f64;");
+        let increment_rev = format!("{name} = 1.0_f64 + {name};");
+        let increments = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| *line == increment || *line == increment_rev)
+            .count();
+        if increments != 1 {
+            continue;
+        }
+        let mut limit = None;
+        let mut conditions = 0;
+        let mut other_uses = false;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed == increment || trimmed == increment_rev || !trimmed.contains(name) {
+                continue;
+            }
+            if let Some(found) = le_limit(trimmed, name)
+                && f64_names.contains(&found.as_str())
+                && !body.contains(&format!("{found} ="))
+            {
+                limit = Some(found);
+                conditions += 1;
+                continue;
+            }
+            other_uses = true;
+        }
+        if other_uses || conditions != 1 {
+            continue;
+        }
+        let Some(limit) = limit else {
+            continue;
+        };
+        let mut fast = String::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed == increment
+                || trimmed == increment_rev
+                || (trimmed.contains("break") && trimmed.contains(&format!("{name} <= {limit}")))
+            {
+                continue;
+            }
+            fast.push_str(trimmed);
+            fast.push('\n');
+        }
+        if ident_in(&fast, name) {
+            continue;
+        }
+        return Some(((*name).to_string(), limit, fast));
+    }
+    None
+}
+
+fn le_limit(line: &str, name: &str) -> Option<String> {
+    let needle = format!("{name} <= ");
+    let start = line.find(&needle)?;
+    if start > 0 {
+        let prev = line.as_bytes()[start - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
+    }
+    let rest = &line[start + needle.len()..];
+    let ident: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool {
@@ -5875,6 +6321,22 @@ fn main() {{
         assert!(
             generated.contains("loop {"),
             "simple numeric for-loop should be a native Rust loop: {generated}"
+        );
+        let hot = generated
+            .split_once("fn __w3cos_numeric_loop")
+            .and_then(|(_, rest)| {
+                rest.split_once("let (")
+                    .or_else(|| rest.split_once("let __w3cos_out"))
+                    .map(|(hot, _)| hot)
+            })
+            .unwrap_or("");
+        assert!(
+            hot.contains("as i32") && hot.contains("while __w3cos_i <= __w3cos_limit"),
+            "provable integer trip count should be an i32 counted loop: {hot}"
+        );
+        assert!(
+            !hot.contains("Value::Number"),
+            "the numeric loop must not box Value on the way out: {hot}"
         );
         assert!(
             generated.contains("num_bindings"),

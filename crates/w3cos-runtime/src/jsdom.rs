@@ -215,6 +215,7 @@ thread_local! {
     /// (node, key) → JS expando properties assigned through the set trap
     /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
     static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
+    static KNOWN_EXPANDS: RefCell<HashMap<(u32, u8), Value>> = RefCell::new(HashMap::new());
     // Navigation-owned origin decision, never a writable JS document URL.
     static OBJECT_DOCUMENT_READABLE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     /// Processing-instruction attributes are projected from `data`, but values
@@ -685,11 +686,39 @@ fn warn_host_api(name: &'static str, fallback: &'static str) {
     });
 }
 
+fn known_expando(key: &str) -> Option<u8> {
+    Some(match key {
+        "ownerDocument" => 1,
+        "style" => 2,
+        "dataset" => 3,
+        "__w3cos_force_async" => 4,
+        _ => return None,
+    })
+}
+
+fn is_default_document(value: &Value) -> bool {
+    document_value().as_object().is_some_and(|document| {
+        value
+            .as_object()
+            .is_some_and(|candidate| document.ptr_eq(&candidate))
+    })
+}
+
 fn get_expando(node: u32, key: &str) -> Option<Value> {
+    if let Some(id) = known_expando(key) {
+        return KNOWN_EXPANDS.with(|props| props.borrow().get(&(node, id)).cloned());
+    }
     ELEMENT_PROPS.with(|p| p.borrow().get(&(node, key.to_string())).cloned())
 }
 
 fn set_expando(node: u32, key: &str, value: Value) {
+    if key == "ownerDocument" && is_default_document(&value) {
+        return;
+    }
+    if let Some(id) = known_expando(key) {
+        KNOWN_EXPANDS.with(|props| props.borrow_mut().insert((node, id), value));
+        return;
+    }
     ELEMENT_PROPS.with(|p| p.borrow_mut().insert((node, key.to_string()), value));
 }
 
@@ -952,14 +981,18 @@ fn fast_create_element(object: &Value, tag: &str) -> Value {
     if !is_document_value(object) {
         return object.call_method("createElement", vec![Value::string(tag)]);
     }
-    let mut tag = tag.to_string();
-    if !valid_element_name(&tag) {
+    if !valid_element_name(tag) {
         dom_exception("The element name is not valid", "InvalidCharacterError");
     }
-    if html_create_element_folds_case() {
-        tag.make_ascii_lowercase();
-    }
-    let id = dom::create_element(&tag);
+    let lowered;
+    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        lowered = tag.to_ascii_lowercase();
+        lowered.as_str()
+    } else {
+        tag
+    };
+    let id = dom::create_element(tag);
     if tag == "template" {
         ensure_template_content(id);
     } else if tag == "script" {
@@ -1361,7 +1394,7 @@ fn child_node_at(node: u32, index: usize) -> Option<u32> {
                 return Some(id.as_u32());
             }
             remaining -= 1;
-            child = document.get_node(id).next_sibling;
+            child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
         }
         None
     })
@@ -1373,7 +1406,7 @@ fn child_node_count(node: u32) -> usize {
         let mut count = 0;
         while let Some(id) = child {
             count += 1;
-            child = document.get_node(id).next_sibling;
+            child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
         }
         count
     })
@@ -2017,6 +2050,11 @@ fn ensure_tree_child_type_and_adopt(parent: u32, child: u32) {
     } else {
         get_expando(parent, "ownerDocument").unwrap_or_else(document_value)
     };
+    // The default document is what `get_expando` already falls back to.
+    // Writing it onto every inserted node allocates a property entry.
+    if is_default_document(&owner_document) {
+        return;
+    }
     walk_subtree(child, &mut |descendant| {
         set_expando(descendant, "ownerDocument", owner_document.clone());
         update_cached_attribute_owner_document(descendant, &owner_document);
@@ -2304,16 +2342,32 @@ fn intern_element_value(node: u32, value: Value) {
     });
 }
 
-fn walk_subtree(root: u32, visit: &mut impl FnMut(u32)) {
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        visit(id);
-        let mut child = dom::first_child(id);
-        while let Some(cid) = child {
-            stack.push(cid);
-            child = dom::next_sibling(cid);
-        }
+fn with_walk_stack<R>(body: impl FnOnce(&mut Vec<u32>) -> R) -> R {
+    thread_local! {
+        static WALK_STACK: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     }
+    WALK_STACK.with(|slot| {
+        if let Ok(mut stack) = slot.try_borrow_mut() {
+            stack.clear();
+            return body(&mut stack);
+        }
+        let mut stack = Vec::new();
+        body(&mut stack)
+    })
+}
+
+fn walk_subtree(root: u32, visit: &mut impl FnMut(u32)) {
+    with_walk_stack(|stack| {
+        stack.push(root);
+        while let Some(id) = stack.pop() {
+            visit(id);
+            let mut child = dom::first_child(id);
+            while let Some(cid) = child {
+                stack.push(cid);
+                child = dom::next_sibling(cid);
+            }
+        }
+    });
 }
 
 fn copy_cloned_node_identity(source: u32, clone: u32) {
@@ -2339,6 +2393,10 @@ fn pin_element_subtree(root: u32) {
 }
 
 fn pin_element_wrapper(node: u32) {
+    let has_memo = ELEMENT_VALUES.with(|c| c.borrow().contains_key(&node));
+    if !has_memo {
+        return;
+    }
     if !js_wrapper_should_pin(node) {
         return;
     }
@@ -2380,6 +2438,7 @@ fn release_element_wrapper(node: u32) {
 
 fn purge_detached_node_js(node: u32) {
     ELEMENT_PROPS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
+    KNOWN_EXPANDS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
     STYLE_CACHE.with(|cache| cache.borrow_mut().retain(|(id, _), _| *id != node));
     LISTENERS.with(|listeners| {
         listeners
@@ -2455,7 +2514,7 @@ fn declared_namespace_uri(node: u32, prefix: Option<&str>) -> Option<Option<Stri
                         attribute_prefix.as_deref() == Some("xmlns") && local_name == prefix
                     }
                 };
-                matches.then(|| (!value.is_empty()).then(|| value.clone()))
+                matches.then(|| (!value.is_empty()).then(|| value.as_str().to_string()))
             })
     })
 }
@@ -2638,7 +2697,7 @@ fn native_node_attributes(node: u32) -> Vec<(Option<String>, String, String)> {
                     metadata
                         .map(|attribute| attribute.local_name.as_str())
                         .unwrap_or_else(|| qualified_name.as_str()),
-                    value.clone(),
+                    value.as_str().to_string(),
                 )
             })
             .collect::<Vec<_>>()
@@ -3320,7 +3379,62 @@ pub(crate) fn run_media_source_insertion_steps(parent: u32, child: u32) {
     }
 }
 
+fn fresh_simple_element(parent: u32, child: u32) -> bool {
+    if parent == child {
+        return false;
+    }
+    dom::with_document(|doc| {
+        use w3cos_dom::node::NodeType;
+        let child_node = doc.get_node(w3cos_dom::NodeId::from_u32(child));
+        if child_node.node_type != NodeType::Element || child_node.parent.is_some() {
+            return false;
+        }
+        if child_node.tag == option_atom() {
+            return false;
+        }
+        let mut cursor = child_node.first_child;
+        while let Some(id) = cursor {
+            let node = doc.get_node(id);
+            if node.node_type == NodeType::Element {
+                return false;
+            }
+            cursor = w3cos_dom::node::sib(node.next_sibling);
+        }
+        !matches!(
+            doc.get_node(w3cos_dom::NodeId::from_u32(parent)).node_type,
+            NodeType::Text
+                | NodeType::CdataSection
+                | NodeType::ProcessingInstruction
+                | NodeType::Comment
+                | NodeType::DocumentType
+        )
+    })
+}
+
+fn subtree_has_element_memo(root: u32) -> bool {
+    let mut found = false;
+    walk_subtree(root, &mut |node| {
+        if !found {
+            found = ELEMENT_VALUES.with(|c| c.borrow().contains_key(&node));
+        }
+    });
+    found
+}
+
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
+    let foreign_owner = parent != 0
+        && get_expando(parent, "ownerDocument")
+            .is_some_and(|owner| !is_default_document(&owner));
+    if reference.is_none() && !foreign_owner && fresh_simple_element(parent, child) {
+        dom::append_child(parent, child);
+        if subtree_has_element_memo(child) {
+            pin_element_subtree(child);
+        }
+        if dom::is_connected(child) && crate::custom_elements_web::has_definitions() {
+            crate::custom_elements_web::connected_subtree(&element_value(child));
+        }
+        return;
+    }
     ensure_tree_insertion(parent, child);
     if dom::node_type(child) != 11 {
         preserve_moved_option_selectedness(child);
@@ -7608,7 +7722,31 @@ fn set_option_selectedness(option: u32, selected: bool) {
     }
 }
 
+fn subtree_contains_option(root: u32) -> bool {
+    let option = option_atom();
+    dom::with_document(|doc| {
+        with_walk_stack(|stack| {
+            stack.push(root);
+            while let Some(id) = stack.pop() {
+                let node = doc.get_node(w3cos_dom::NodeId::from_u32(id));
+                if node.node_type == w3cos_dom::node::NodeType::Element && node.tag == option {
+                    return true;
+                }
+                let mut child = node.first_child;
+                while let Some(cid) = child {
+                    stack.push(cid.as_u32());
+                    child = w3cos_dom::node::sib(doc.get_node(cid).next_sibling);
+                }
+            }
+            false
+        })
+    })
+}
+
 fn preserve_moved_option_selectedness(root: u32) {
+    if !subtree_contains_option(root) {
+        return;
+    }
     for option in inclusive_descendant_elements(root)
         .into_iter()
         .filter(|candidate| dom::tag_name(*candidate).eq_ignore_ascii_case("option"))
@@ -7923,12 +8061,14 @@ fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Optio
             style.position,
             w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
         ) {
-            let mut sibling = document.get_node(NodeId::from_u32(node)).prev_sibling;
+            let mut sibling = w3cos_dom::node::sib(
+                document.get_node(NodeId::from_u32(node)).prev_sibling,
+            );
             while let Some(id) = sibling {
                 if document.precise_dirty_contains(id) {
                     return true;
                 }
-                sibling = document.get_node(id).prev_sibling;
+                sibling = w3cos_dom::node::sib(document.get_node(id).prev_sibling);
             }
         }
         false
@@ -9796,20 +9936,131 @@ fn element_computed_get(node: u32, key: &str) -> Value {
     }
 }
 
+fn with_value_text(value: &Value, body: impl FnOnce(&str)) {
+    if let Some(text) = value.as_js_string() {
+        body(text.as_str());
+    } else {
+        let owned = value.to_js_string();
+        body(&owned);
+    }
+}
+
+fn style_atom() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static STYLE: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    STYLE.with(|slot| {
+        let id = slot.get();
+        if id != u32::MAX {
+            return w3cos_dom::atom::Atom::from_u32(id);
+        }
+        let atom = w3cos_dom::atom::Atom::intern("style");
+        slot.set(atom.as_u32());
+        atom
+    })
+}
+
+fn option_atom() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static OPTION: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    OPTION.with(|slot| {
+        let id = slot.get();
+        if id != u32::MAX {
+            return w3cos_dom::atom::Atom::from_u32(id);
+        }
+        let atom = w3cos_dom::atom::Atom::intern("option");
+        slot.set(atom.as_u32());
+        atom
+    })
+}
+
+pub(crate) fn sync_style_element(node: u32) {
+    let style = style_atom();
+    let is_style = dom::with_document(|doc| doc.get_node(w3cos_dom::NodeId::from_u32(node)).tag == style);
+    if !is_style {
+        return;
+    }
+    let owner = node as u64;
+    w3cos_dom::stylesheet::clear_owner(owner);
+    if !dom::is_connected(node) {
+        return;
+    }
+    register_author_sheet(owner, &dom::get_descendant_text_content(node));
+}
+
+fn register_author_sheet(owner: u64, css: &str) {
+    for block in css.split('}') {
+        let Some((selector, body)) = block.split_once('{') else {
+            continue;
+        };
+        let selector = selector.trim();
+        if selector.is_empty() {
+            continue;
+        }
+        let mut declarations = Vec::new();
+        for decl in body.split(';') {
+            let Some((property, value)) = decl.split_once(':') else {
+                continue;
+            };
+            let property = property.trim();
+            let value = value.trim();
+            if property.is_empty() || value.is_empty() {
+                continue;
+            }
+            declarations.push((property.to_string(), value.to_string()));
+        }
+        if declarations.is_empty() {
+            continue;
+        }
+        let pairs = declarations
+            .iter()
+            .map(|(property, value)| (property.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        w3cos_dom::stylesheet::register_rule_for_owner(owner, selector, &pairs);
+    }
+}
+
 fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
     match key {
         "contentDocument" | "contentWindow" if dom::tag_name(node) == "object" => return true,
         "textContent" if matches!(dom::node_type(node), 1 | 11) => {
-            replace_all_children(node, || {
-                if !value.is_null() && !value.is_undefined() {
-                    let text = value.to_js_string();
-                    if !text.is_empty() {
-                        let child = dom::create_text_node(&text);
-                        ensure_tree_insertion(node, child);
-                        dom::append_child(node, child);
+            if value.is_null() || value.is_undefined() {
+                replace_all_children(node, || {});
+            } else {
+                with_value_text(&value, |text| {
+                    if text.is_empty() {
+                        replace_all_children(node, || {});
+                    } else if crate::observers_web::mutation_observers_empty() {
+                        let mut applied = false;
+                        let mut is_style = false;
+                        let style = style_atom();
+                        dom::with_document_mut(|doc| {
+                            let id = w3cos_dom::NodeId::from_u32(node);
+                            is_style = doc.get_node(id).tag == style;
+                            applied = doc.set_inline_text_child(id, text).is_some();
+                        });
+                        if applied {
+                            dom::mark_dom_dirty();
+                            if is_style {
+                                sync_style_element(node);
+                            }
+                        } else {
+                            replace_all_children(node, || {
+                                let child = dom::create_text_node(text);
+                                ensure_tree_insertion(node, child);
+                                dom::append_child(node, child);
+                            });
+                        }
+                    } else {
+                        replace_all_children(node, || {
+                            let child = dom::create_text_node(text);
+                            ensure_tree_insertion(node, child);
+                            dom::append_child(node, child);
+                        });
                     }
-                }
-            });
+                });
+            }
         }
         "textContent" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => {
             let text = if value.is_null() {
@@ -9969,14 +10220,14 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
                 dom::remove_attribute(node, "readonly");
             }
         }
-        "id" => dom::set_attribute(node, "id", &value.to_js_string()),
+        "id" => with_value_text(&value, |text| dom::set_attribute(node, "id", text)),
         "name" if exposes_window_name(node) => {
             dom::set_attribute(node, "name", &value.to_js_string())
         }
         "name" if dom::tag_name(node) == "slot" => {
             dom::set_attribute(node, "name", &value.to_js_string())
         }
-        "className" => dom::set_attribute(node, "class", &value.to_js_string()),
+        "className" => with_value_text(&value, |text| dom::set_attribute(node, "class", text)),
         "style" => apply_html_attribute(node, "style", &value.to_js_string()),
         // Web IDL exposes Element.classList as a readonly [SameObject]
         // attribute. Assignment is ignored rather than replacing the live
@@ -10099,7 +10350,7 @@ fn attributes_value(node: u32) -> Value {
                     let metadata = node.attribute_namespace_at(index);
                     (
                         qualified_name.clone(),
-                        value.clone(),
+                        value.as_str().to_string(),
                         metadata
                             .and_then(|attribute| attribute.namespace.as_ref())
                             .map(|namespace| namespace.as_str()),
@@ -20037,6 +20288,7 @@ pub fn reset_bridge() {
     w3cos_core::promise::advance_realm_generation();
     ELEMENT_VALUES.with(|c| c.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
+    KNOWN_EXPANDS.with(|c| c.borrow_mut().clear());
     OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().clear());
     PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| cache.borrow_mut().clear());
     ATTRIBUTE_VALUES.with(|cache| cache.borrow_mut().clear());

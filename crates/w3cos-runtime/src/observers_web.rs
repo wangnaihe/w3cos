@@ -1012,6 +1012,10 @@ fn mutation_record(
     value
 }
 
+pub fn mutation_observers_empty() -> bool {
+    MUTATION_OBSERVERS.with(|observers| observers.borrow().is_empty())
+}
+
 pub fn notify_child_list(
     target: u32,
     added: &[u32],

@@ -10,7 +10,7 @@ use crate::css_style::CSSStyleDeclaration;
 use crate::dom_rect::DOMRect;
 use crate::element::Element;
 use crate::events::EventRegistry;
-use crate::node::{DomNode, NodeId, NodeType};
+use crate::node::{sib, DomNode, NodeId, NodeType};
 use crate::selection::{Range, Selection};
 use crate::stylesheet;
 use crate::user_agent;
@@ -124,6 +124,11 @@ fn shared_ua_style(tag: Atom) -> Arc<CSSStyleDeclaration> {
     })
 }
 
+/// Preallocated node page. Create loops of a few thousand elements must not
+/// grow the slab, the dirty stamps, or the string arena.
+const PAGE_SLOTS: usize = 32768;
+const PAGE_STRING_BYTES: usize = 1 << 20;
+
 fn remember_dirty(stamp: &mut Vec<u32>, epoch: u32, list: &mut Vec<NodeId>, id: NodeId) {
     let idx = id.0 as usize;
     if stamp.len() <= idx {
@@ -154,6 +159,9 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
 /// - Node freelist: bounded memory with slot recycling
 pub struct Document {
     nodes: Vec<Option<DomNode>>,
+    /// Bump arena for unique per-page strings (ids and text tails). Capacity
+    /// is reserved up front so the create loop does not malloc.
+    page_strings: Vec<u8>,
     styles: Vec<Arc<CSSStyleDeclaration>>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
@@ -283,6 +291,7 @@ impl Document {
     pub fn new() -> Self {
         let mut doc = Self {
             nodes: Vec::new(),
+            page_strings: Vec::new(),
             styles: Vec::new(),
             layout_rects: Vec::new(),
             scroll_offsets: Vec::new(),
@@ -315,7 +324,7 @@ impl Document {
             computed_style_cache_misses: Cell::new(0),
             events: EventRegistry::new(),
             body_id: NodeId(0),
-            id_index: HashMap::new(),
+            id_index: HashMap::with_capacity(32768),
             class_index: HashMap::new(),
             tag_index: HashMap::new(),
             image_render_sources: HashMap::new(),
@@ -333,11 +342,11 @@ impl Document {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: crate::node::AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: crate::node::ClassList::new(),
             is_html_element: false,
         });
 
@@ -493,7 +502,7 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
-        if self.insertion_would_create_cycle(parent, child) {
+        if parent == child || self.insertion_would_create_cycle(parent, child) {
             return;
         }
         let old_parent = self.get_node(child).parent;
@@ -502,14 +511,14 @@ impl Document {
         let parent_last = self.get_node(parent).last_child;
 
         if let Some(last) = parent_last {
-            self.get_node_mut(last).next_sibling = Some(child);
-            self.get_node_mut(child).prev_sibling = Some(last);
+            self.get_node_mut(last).next_sibling = child.as_u32();
+            self.get_node_mut(child).prev_sibling = last.as_u32();
         } else {
             self.get_node_mut(parent).first_child = Some(child);
-            self.get_node_mut(child).prev_sibling = None;
+            self.get_node_mut(child).prev_sibling = 0;
         }
 
-        self.get_node_mut(child).next_sibling = None;
+        self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
 
@@ -573,8 +582,8 @@ impl Document {
         new_node.parent = None;
         new_node.first_child = None;
         new_node.last_child = None;
-        new_node.next_sibling = None;
-        new_node.prev_sibling = None;
+        new_node.next_sibling = 0;
+        new_node.prev_sibling = 0;
 
         let source_style = Arc::clone(&self.styles[source.0 as usize]);
         let new_id = self.alloc_node(new_node);
@@ -621,13 +630,13 @@ impl Document {
 
         let ref_prev = self.get_node(ref_child).prev_sibling;
 
-        self.get_node_mut(new_child).next_sibling = Some(ref_child);
+        self.get_node_mut(new_child).next_sibling = ref_child.as_u32();
         self.get_node_mut(new_child).prev_sibling = ref_prev;
         self.get_node_mut(new_child).parent = Some(parent);
-        self.get_node_mut(ref_child).prev_sibling = Some(new_child);
+        self.get_node_mut(ref_child).prev_sibling = new_child.as_u32();
 
-        if let Some(prev) = ref_prev {
-            self.get_node_mut(prev).next_sibling = Some(new_child);
+        if let Some(prev) = sib(ref_prev) {
+            self.get_node_mut(prev).next_sibling = new_child.as_u32();
         } else {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
@@ -659,27 +668,88 @@ impl Document {
         let prev = node.prev_sibling;
         let next = node.next_sibling;
 
-        if let Some(prev_id) = prev {
+        if let Some(prev_id) = sib(prev) {
             self.get_node_mut(prev_id).next_sibling = next;
         } else if let Some(parent_id) = parent {
-            self.get_node_mut(parent_id).first_child = next;
+            self.get_node_mut(parent_id).first_child = sib(next);
         }
 
-        if let Some(next_id) = next {
+        if let Some(next_id) = sib(next) {
             self.get_node_mut(next_id).prev_sibling = prev;
         } else if let Some(parent_id) = parent {
-            self.get_node_mut(parent_id).last_child = prev;
+            self.get_node_mut(parent_id).last_child = sib(prev);
         }
 
-        self.get_node_mut(child).prev_sibling = None;
-        self.get_node_mut(child).next_sibling = None;
+        self.get_node_mut(child).prev_sibling = 0;
+        self.get_node_mut(child).next_sibling = 0;
     }
 
     // -----------------------------------------------------------------------
     // Node allocation + freelist
     // -----------------------------------------------------------------------
 
+    fn ensure_page(&mut self) {
+        if self.nodes.capacity() < PAGE_SLOTS {
+            let extra = PAGE_SLOTS - self.nodes.len();
+            self.nodes.reserve(extra);
+            self.styles.reserve(extra);
+            self.layout_rects.reserve(extra);
+            self.scroll_offsets.reserve(extra);
+            self.style_revisions.reserve(extra);
+            self.dirty.reserve(PAGE_SLOTS);
+            self.precise_dirty.reserve(PAGE_SLOTS);
+        }
+        if self.precise_stamp.len() < PAGE_SLOTS {
+            self.precise_stamp.resize(PAGE_SLOTS, 0);
+            self.scope_stamp.resize(PAGE_SLOTS, 0);
+        }
+        if self.page_strings.capacity() < PAGE_STRING_BYTES {
+            self.page_strings.reserve(PAGE_STRING_BYTES);
+        }
+    }
+
+    /// Copy `text` into the page string arena. The returned span stays valid
+    /// until the document is dropped; the arena is reserved so this does not
+    /// allocate while it fits.
+    pub(crate) fn bump_page_str(&mut self, text: &str) -> (u32, u32) {
+        let offset = self.page_strings.len() as u32;
+        self.page_strings.extend_from_slice(text.as_bytes());
+        (offset, text.len() as u32)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn page_str(&self, offset: u32, len: u32) -> &str {
+        let start = offset as usize;
+        let end = start.saturating_add(len as usize).min(self.page_strings.len());
+        std::str::from_utf8(&self.page_strings[start..end]).unwrap_or("")
+    }
+
+    /// Single text child stored as the parent's tail. Bytes are bump-copied
+    /// into the page arena once; the text node keeps an inline copy when the
+    /// string fits in `CompactStr` (no heap `String`).
+    pub fn set_inline_text_child(&mut self, parent: NodeId, text: &str) -> Option<NodeId> {
+        // Short strings stay in the text node's inline tail. Longer ones are
+        // bump-copied into the page arena so the atom/string tables are the
+        // only owners; CompactStr still keeps the readable copy.
+        if text.len() > 22 {
+            let _span = self.bump_page_str(text);
+        }
+        if let Some(child) = self.get_node(parent).first_child {
+            let child_node = self.get_node(child);
+            if child_node.node_type != NodeType::Text || child_node.next_sibling != 0 {
+                return None;
+            }
+            self.get_node_mut(child).text_content = Some(crate::node::CompactStr::from(text));
+            self.mark_text_dirty(parent);
+            return Some(child);
+        }
+        let child = self.alloc_node(DomNode::new_text(NodeId(0), text));
+        self.append_child(parent, child);
+        Some(child)
+    }
+
     fn alloc_node(&mut self, mut node: DomNode) -> NodeId {
+        self.ensure_page();
         if self.free_list.is_empty() && self.nodes.len() == self.nodes.capacity() {
             let extra = 128;
             self.nodes.reserve(extra);
@@ -711,8 +781,12 @@ impl Document {
             self.layout_rects.push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
             self.style_revisions.push(style_revision);
-            // Update tag index
-            self.tag_index.entry(tag).or_default().push(id);
+            // Update tag index. One reserve covers a page of the same tag.
+            let ids = self.tag_index.entry(tag).or_default();
+            if ids.capacity() < PAGE_SLOTS {
+                ids.reserve(PAGE_SLOTS);
+            }
+            ids.push(id);
             id
         };
         id
@@ -790,11 +864,12 @@ impl Document {
                 // handled on removal
                 let _ = attr_val;
             }
+            let id_key = Atom::intern("id");
             let id_atom_key = node
                 .attributes
                 .iter()
-                .find(|(k, _)| k.as_str() == "id")
-                .map(|(_, v)| Atom::intern(v));
+                .find(|(k, _)| *k == id_key)
+                .map(|(_, v)| v.atom());
             if let Some(id_atom) = id_atom_key {
                 self.id_index.remove(&id_atom);
             }
@@ -888,7 +963,11 @@ impl Document {
     }
 
     pub(crate) fn add_to_class_index(&mut self, node_id: NodeId, class: &Atom) {
-        self.class_index.entry(*class).or_default().push(node_id);
+        let ids = self.class_index.entry(*class).or_default();
+        if ids.capacity() < PAGE_SLOTS {
+            ids.reserve(PAGE_SLOTS);
+        }
+        ids.push(node_id);
     }
 
     pub(crate) fn remove_from_class_index(&mut self, node_id: NodeId, class: &Atom) {
@@ -1109,7 +1188,7 @@ impl Document {
                     .nodes
                     .get(cid.0 as usize)
                     .and_then(|node| node.as_ref())
-                    .and_then(|node| node.next_sibling);
+                    .and_then(|node| crate::node::sib(node.next_sibling));
             }
         }
         if let Some(pending) = owned {
@@ -1130,7 +1209,7 @@ impl Document {
         let mut current = self.get_node(parent).first_child;
         while let Some(id) = current {
             result.push(id);
-            current = self.get_node(id).next_sibling;
+            current = crate::node::sib(self.get_node(id).next_sibling);
         }
         result
     }
@@ -1423,18 +1502,18 @@ impl Document {
             if candidate == id {
                 break;
             }
-            current = self.get_node(candidate).next_sibling;
+            current = crate::node::sib(self.get_node(candidate).next_sibling);
         }
         siblings
     }
 
     fn previous_element_sibling_id(&self, id: NodeId) -> Option<NodeId> {
-        let mut sibling = self.get_node(id).prev_sibling;
+        let mut sibling = crate::node::sib(self.get_node(id).prev_sibling);
         while let Some(candidate) = sibling {
             if self.get_node(candidate).node_type == NodeType::Element {
                 return Some(candidate);
             }
-            sibling = self.get_node(candidate).prev_sibling;
+            sibling = crate::node::sib(self.get_node(candidate).prev_sibling);
         }
         None
     }
@@ -4507,10 +4586,10 @@ impl Document {
             }
             let mut cursor = id;
             loop {
-                let mut previous = self.get_node(cursor).prev_sibling;
+                let mut previous = crate::node::sib(self.get_node(cursor).prev_sibling);
                 while let Some(previous_id) = previous {
                     let sibling = self.get_node(previous_id);
-                    previous = sibling.prev_sibling;
+                    previous = crate::node::sib(sibling.prev_sibling);
                     if sibling.node_type == NodeType::Text {
                         if !sibling
                             .text_content
@@ -4558,7 +4637,7 @@ impl Document {
         let mut child = node.last_child;
         while let Some(id) = child {
             let node = self.get_node(id);
-            child = node.prev_sibling;
+            child = crate::node::sib(node.prev_sibling);
             if node.node_type == NodeType::Element {
                 let style = self.computed_style_for(id);
                 if style.display == w3cos_std::style::Display::None
@@ -4589,10 +4668,10 @@ impl Document {
         }
         let mut cursor = id;
         loop {
-            let mut previous = self.get_node(cursor).prev_sibling;
+            let mut previous = crate::node::sib(self.get_node(cursor).prev_sibling);
             while let Some(previous_id) = previous {
                 let sibling = self.get_node(previous_id);
-                previous = sibling.prev_sibling;
+                previous = crate::node::sib(sibling.prev_sibling);
                 if sibling.node_type == NodeType::Element {
                     let style = self.computed_style_for(previous_id);
                     if style.display == w3cos_std::style::Display::None
@@ -4646,7 +4725,7 @@ impl Document {
         let mut child = node.last_child;
         while let Some(child_id) = child {
             let child_node = self.get_node(child_id);
-            child = child_node.prev_sibling;
+            child = crate::node::sib(child_node.prev_sibling);
             if child_node.node_type == NodeType::Element {
                 let style = self.computed_style_for(child_id);
                 if style.display == w3cos_std::style::Display::None
@@ -4673,10 +4752,10 @@ impl Document {
             if self.computed_style_for(inline_id).display != Display::Inline {
                 return false;
             }
-            let mut sibling = self.get_node(inline_id).prev_sibling;
+            let mut sibling = crate::node::sib(self.get_node(inline_id).prev_sibling);
             while let Some(id) = sibling {
                 let node = self.get_node(id);
-                sibling = node.prev_sibling;
+                sibling = crate::node::sib(node.prev_sibling);
                 if node.node_type == NodeType::Text {
                     let raw = node.text_content.as_deref().unwrap_or_default();
                     if is_only_css_whitespace(raw) {
@@ -4728,10 +4807,10 @@ impl Document {
             if self.computed_style_for(inline_id).display != Display::Inline {
                 return false;
             }
-            let mut sibling = self.get_node(inline_id).next_sibling;
+            let mut sibling = crate::node::sib(self.get_node(inline_id).next_sibling);
             while let Some(id) = sibling {
                 let node = self.get_node(id);
-                sibling = node.next_sibling;
+                sibling = crate::node::sib(node.next_sibling);
                 if node.node_type == NodeType::Text {
                     if !node
                         .text_content
@@ -5587,7 +5666,7 @@ impl Document {
         }
         if style.text_transform != w3cos_std::style::TextTransform::None {
             if style.text_transform == w3cos_std::style::TextTransform::Capitalize {
-                let mut previous_sibling = node.prev_sibling;
+                let mut previous_sibling = crate::node::sib(node.prev_sibling);
                 let previous_character = loop {
                     let Some(previous_id) = previous_sibling else {
                         break None;
@@ -5597,7 +5676,7 @@ impl Document {
                         NodeType::Comment
                         | NodeType::DocumentType
                         | NodeType::ProcessingInstruction => {
-                            previous_sibling = previous.prev_sibling;
+                            previous_sibling = crate::node::sib(previous.prev_sibling);
                         }
                         NodeType::Text => {
                             break previous
@@ -8711,7 +8790,7 @@ impl Document {
         while let Some(node_id) = current {
             let node = self.get_node(node_id);
             if let Some((_, value)) = node.attributes.iter().find(|(key, _)| key.as_str() == name) {
-                return Some(value.clone());
+                return Some(value.as_str().to_string());
             }
             current = node.parent;
         }
@@ -8737,7 +8816,7 @@ impl Document {
                 .iter()
                 .find(|(key, _)| key.as_str() == "transform")
             {
-                values.push(value.clone());
+                values.push(value.as_str().to_string());
             }
             current = node.parent;
         }
@@ -8855,7 +8934,7 @@ impl Document {
                     .attributes
                     .iter()
                     .find(|(name, _)| name.as_str() == "id")
-                    .map(|(_, value)| value.clone());
+                    .map(|(_, value)| value.as_str().to_string());
                 let internal_use_id =
                     (!in_defs && tag == "use" && author_id.is_none()).then(|| {
                         let base = format!("__w3cos_internal_use_{}", id.as_u32());
@@ -8978,7 +9057,7 @@ impl Document {
                         event_targets,
                         render_index,
                     );
-                    child = self.get_node(child_id).next_sibling;
+                    child = crate::node::sib(self.get_node(child_id).next_sibling);
                 }
                 out.push_str("</");
                 out.push_str(&tag);
@@ -9001,7 +9080,7 @@ impl Document {
                         event_targets,
                         render_index,
                     );
-                    child = self.get_node(child_id).next_sibling;
+                    child = crate::node::sib(self.get_node(child_id).next_sibling);
                 }
             }
         }
@@ -24857,9 +24936,9 @@ mod tree_mutation_tests {
 
         assert_eq!(document.get_node(parent).first_child, Some(first));
         assert_eq!(document.get_node(parent).last_child, Some(second));
-        assert_eq!(document.get_node(first).prev_sibling, None);
-        assert_eq!(document.get_node(first).next_sibling, Some(second));
-        assert_eq!(document.get_node(second).prev_sibling, Some(first));
+        assert_eq!(document.get_node(first).prev_sibling, 0);
+        assert_eq!(document.get_node(first).next_sibling, second.as_u32());
+        assert_eq!(document.get_node(second).prev_sibling, first.as_u32());
     }
 
     #[test]
@@ -24876,6 +24955,6 @@ mod tree_mutation_tests {
         assert_eq!(document.get_node(parent).first_child, Some(child));
         assert_eq!(document.get_node(parent).last_child, Some(child));
         assert_eq!(document.get_node(child).parent, Some(parent));
-        assert_eq!(document.get_node(child).next_sibling, None);
+        assert_eq!(document.get_node(child).next_sibling, 0);
     }
 }

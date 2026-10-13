@@ -71,6 +71,24 @@ impl Deref for CompactStr {
     }
 }
 
+impl std::fmt::Display for CompactStr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for CompactStr {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for CompactStr {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 impl From<&str> for CompactStr {
     fn from(text: &str) -> Self {
         let mut value = Self::new();
@@ -115,6 +133,22 @@ impl NodeId {
     }
 }
 
+/// Sibling link. `0` is none — the document root is never a sibling, so the
+/// link is a raw `u32` instead of `Option<NodeId>`.
+#[inline]
+pub fn sib(link: u32) -> Option<NodeId> {
+    if link == 0 {
+        None
+    } else {
+        Some(NodeId(link))
+    }
+}
+
+#[inline]
+pub fn sib_of(id: Option<NodeId>) -> u32 {
+    id.map(|id| id.0).unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeType {
     Element,
@@ -154,6 +188,353 @@ pub struct AttributeNamespace {
     pub local_name: Atom,
 }
 
+/// Attribute value owned by the atom arena. Copying the value does not allocate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AttrValue(Atom);
+
+impl AttrValue {
+    pub const EMPTY: Self = Self(Atom::EMPTY);
+
+    pub fn new(value: &str) -> Self {
+        Self(Atom::intern(value))
+    }
+
+    pub fn atom(self) -> Atom {
+        self.0
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.0.as_static()
+    }
+}
+
+impl Default for AttrValue {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl std::ops::Deref for AttrValue {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for AttrValue {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for AttrValue {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl std::fmt::Debug for AttrValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for AttrValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+const INLINE_ATTRS: usize = 2;
+const INLINE_CLASSES: usize = 2;
+
+/// At most two attributes live in the node. A third spills to the heap.
+#[derive(Clone, Debug)]
+pub struct AttrList {
+    inline: [(Atom, AttrValue); INLINE_ATTRS],
+    len: u8,
+    spill: Vec<(Atom, AttrValue)>,
+}
+
+impl Default for AttrList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AttrList {
+    pub fn new() -> Self {
+        Self {
+            inline: [(Atom::EMPTY, AttrValue::EMPTY); INLINE_ATTRS],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize + self.spill.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn push(&mut self, item: (Atom, AttrValue)) {
+        if self.spill.is_empty() && (self.len as usize) < INLINE_ATTRS {
+            self.inline[self.len as usize] = item;
+            self.len += 1;
+            return;
+        }
+        self.spill.push(item);
+    }
+
+    pub fn get(&self, index: usize) -> Option<&(Atom, AttrValue)> {
+        if index < self.len() {
+            Some(&self[index])
+        } else {
+            None
+        }
+    }
+
+    pub fn iter(&self) -> AttrIter<'_> {
+        AttrIter {
+            list: self,
+            index: 0,
+        }
+    }
+
+    pub fn remove(&mut self, index: usize) -> (Atom, AttrValue) {
+        assert!(index < self.len(), "attribute index");
+        if self.spill.is_empty() {
+            let removed = self.inline[index];
+            let last = self.len as usize;
+            for slot in index + 1..last {
+                self.inline[slot - 1] = self.inline[slot];
+            }
+            self.len -= 1;
+            return removed;
+        }
+        if index < self.len as usize {
+            let removed = self.inline[index];
+            let last = self.len as usize - 1;
+            for slot in index..last {
+                self.inline[slot] = self.inline[slot + 1];
+            }
+            self.inline[last] = self.spill.remove(0);
+            return removed;
+        }
+        self.spill.remove(index - self.len as usize)
+    }
+}
+
+pub struct AttrIter<'a> {
+    list: &'a AttrList,
+    index: usize,
+}
+
+impl<'a> Iterator for AttrIter<'a> {
+    type Item = &'a (Atom, AttrValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.list.len as usize {
+            let item = &self.list.inline[self.index];
+            self.index += 1;
+            return Some(item);
+        }
+        let spill = self.index - self.list.len as usize;
+        if spill < self.list.spill.len() {
+            self.index += 1;
+            return Some(&self.list.spill[spill]);
+        }
+        None
+    }
+}
+
+impl<'a> IntoIterator for &'a AttrList {
+    type Item = &'a (Atom, AttrValue);
+    type IntoIter = AttrIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl std::ops::Index<usize> for AttrList {
+    type Output = (Atom, AttrValue);
+
+    fn index(&self, index: usize) -> &Self::Output {
+        if index < self.len as usize {
+            &self.inline[index]
+        } else {
+            &self.spill[index - self.len as usize]
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for AttrList {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        if index < self.len as usize {
+            &mut self.inline[index]
+        } else {
+            &mut self.spill[index - self.len as usize]
+        }
+    }
+}
+
+/// One or two classes live in the node. More spill to the heap.
+#[derive(Clone, Debug)]
+pub struct ClassList {
+    inline: [Atom; INLINE_CLASSES],
+    len: u8,
+    spill: Vec<Atom>,
+}
+
+impl Default for ClassList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClassList {
+    pub fn new() -> Self {
+        Self {
+            inline: [Atom::EMPTY; INLINE_CLASSES],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize + self.spill.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Atom> {
+        if index < self.len as usize {
+            Some(&self.inline[index])
+        } else {
+            self.spill.get(index - self.len as usize)
+        }
+    }
+
+    pub fn contains(&self, atom: &Atom) -> bool {
+        self.iter().any(|class| class == atom)
+    }
+
+    pub fn push(&mut self, atom: Atom) {
+        if self.spill.is_empty() && (self.len as usize) < INLINE_CLASSES {
+            self.inline[self.len as usize] = atom;
+            self.len += 1;
+            return;
+        }
+        self.spill.push(atom);
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&Atom) -> bool) {
+        if self.spill.is_empty() {
+            let mut write = 0usize;
+            for read in 0..self.len as usize {
+                if keep(&self.inline[read]) {
+                    self.inline[write] = self.inline[read];
+                    write += 1;
+                }
+            }
+            self.len = write as u8;
+            return;
+        }
+        let mut kept = Vec::new();
+        for class in self.iter() {
+            if keep(class) {
+                kept.push(*class);
+            }
+        }
+        *self = Self::new();
+        for class in kept {
+            self.push(class);
+        }
+    }
+
+    pub fn iter(&self) -> ClassIter<'_> {
+        ClassIter {
+            list: self,
+            index: 0,
+        }
+    }
+}
+
+pub struct ClassIter<'a> {
+    list: &'a ClassList,
+    index: usize,
+}
+
+impl<'a> Iterator for ClassIter<'a> {
+    type Item = &'a Atom;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.list.get(self.index)?;
+        self.index += 1;
+        Some(item)
+    }
+}
+
+impl<'a> IntoIterator for &'a ClassList {
+    type Item = &'a Atom;
+    type IntoIter = ClassIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for ClassList {
+    type Item = Atom;
+    type IntoIter = ClassIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ClassIntoIter {
+            inline: self.inline,
+            len: self.len,
+            index: 0,
+            spill: self.spill.into_iter(),
+        }
+    }
+}
+
+pub struct ClassIntoIter {
+    inline: [Atom; INLINE_CLASSES],
+    len: u8,
+    index: u8,
+    spill: std::vec::IntoIter<Atom>,
+}
+
+impl Iterator for ClassIntoIter {
+    type Item = Atom;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.len {
+            let atom = self.inline[self.index as usize];
+            self.index += 1;
+            return Some(atom);
+        }
+        self.spill.next()
+    }
+}
+
+impl serde::Serialize for ClassList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        for atom in self.iter() {
+            seq.serialize_element(atom)?;
+        }
+        seq.end()
+    }
+}
+
 /// Internal node storage for the DOM tree.
 ///
 /// Uses Left-Child Right-Sibling (LCRS) tree structure (like Chrome/Blink):
@@ -173,12 +554,15 @@ pub struct DomNode {
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
-    pub next_sibling: Option<NodeId>,
-    pub prev_sibling: Option<NodeId>,
-    // Attributes: key is Atom (interned), value is String
-    pub attributes: Vec<(Atom, String)>,
+    /// `0` means no sibling. See [`sib`].
+    pub next_sibling: u32,
+    /// `0` means no sibling. See [`sib`].
+    pub prev_sibling: u32,
+    /// Up to two attributes are inline. Values are atom ids, not separate Strings.
+    pub attributes: AttrList,
     pub attribute_namespaces: Vec<AttributeNamespace>,
-    pub class_list: Vec<Atom>,
+    /// Up to two classes are inline.
+    pub class_list: ClassList,
     /// Whether CSS selector name matching follows the HTML element rules.
     /// Foreign SVG/MathML and XML elements keep authored name casing.
     pub is_html_element: bool,
@@ -194,11 +578,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: true,
         }
     }
@@ -212,11 +596,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: false,
         }
     }
@@ -230,11 +614,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: false,
         }
     }
@@ -248,11 +632,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: false,
         }
     }
@@ -266,11 +650,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: false,
         }
     }
@@ -288,11 +672,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: false,
         }
     }
@@ -306,11 +690,11 @@ impl DomNode {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: AttrList::new(),
             attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            class_list: ClassList::new(),
             is_html_element: false,
         }
     }
@@ -359,10 +743,10 @@ impl DomNode {
         let ce = Atom::intern("contenteditable");
         if let Some(index) = self.attributes.iter().position(|(name, _)| *name == ce) {
             self.clear_attribute_namespace(index);
-            self.attributes[index].1 = value.to_string();
+            self.attributes[index].1 = AttrValue::new(value);
             return;
         }
-        self.attributes.push((ce, value.to_string()));
+        self.attributes.push((ce, AttrValue::new(value)));
     }
 
     /// Get an attribute value by name.
@@ -380,10 +764,10 @@ impl DomNode {
         if let Some(index) = self.attributes.iter().position(|(name, _)| *name == key) {
             // DOM setAttribute updates the first attribute with the matching
             // qualified name without changing that Attr node's namespace.
-            self.attributes[index].1 = value.to_string();
+            self.attributes[index].1 = AttrValue::new(value);
             return;
         }
-        self.attributes.push((key, value.to_string()));
+        self.attributes.push((key, AttrValue::new(value)));
     }
 
     /// Set an attribute while retaining the namespace identity required by
@@ -425,11 +809,11 @@ impl DomNode {
             // DOM's "set an attribute value" algorithm updates the existing
             // Attr's value when namespace/local-name identify it.  The Attr's
             // qualified name (and therefore its original prefix) is stable.
-            self.attributes[existing_index].1 = value.to_string();
+            self.attributes[existing_index].1 = AttrValue::new(value);
             return;
         } else {
             self.attributes
-                .push((new_qualified_name, value.to_string()));
+                .push((new_qualified_name, AttrValue::new(value)));
             self.attributes.len() - 1
         };
         self.set_attribute_namespace_metadata(

@@ -3365,11 +3365,130 @@ macro_rules! js_object {
 
 // ── Arithmetic / comparison operators ──────────────────────────────────
 
+enum JsPiece {
+    Stack([u8; 48], usize),
+    Heap(String),
+}
+
+impl JsPiece {
+    fn as_str(&self) -> &str {
+        match self {
+            JsPiece::Stack(bytes, len) => std::str::from_utf8(&bytes[..*len]).unwrap_or(""),
+            JsPiece::Heap(text) => text.as_str(),
+        }
+    }
+}
+
+fn write_i64(value: i64, buf: &mut [u8; 48]) -> usize {
+    if value == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let negative = value < 0;
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    while magnitude > 0 {
+        digits[count] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        count += 1;
+    }
+    let mut out = 0;
+    if negative {
+        buf[out] = b'-';
+        out += 1;
+    }
+    while count > 0 {
+        count -= 1;
+        buf[out] = digits[count];
+        out += 1;
+    }
+    out
+}
+
+fn js_primitive_text(value: &Value) -> JsPiece {
+    if value.is_null() {
+        let mut bytes = [0u8; 48];
+        bytes[..4].copy_from_slice(b"null");
+        return JsPiece::Stack(bytes, 4);
+    }
+    if value.is_undefined() {
+        let mut bytes = [0u8; 48];
+        bytes[..9].copy_from_slice(b"undefined");
+        return JsPiece::Stack(bytes, 9);
+    }
+    if let Some(flag) = value.as_bool() {
+        let mut bytes = [0u8; 48];
+        if flag {
+            bytes[..4].copy_from_slice(b"true");
+            return JsPiece::Stack(bytes, 4);
+        }
+        bytes[..5].copy_from_slice(b"false");
+        return JsPiece::Stack(bytes, 5);
+    }
+    if let Some(number) = value.as_number() {
+        if number.is_nan() {
+            let mut bytes = [0u8; 48];
+            bytes[..3].copy_from_slice(b"NaN");
+            return JsPiece::Stack(bytes, 3);
+        }
+        if number.is_infinite() {
+            let mut bytes = [0u8; 48];
+            if number > 0.0 {
+                bytes[..8].copy_from_slice(b"Infinity");
+                return JsPiece::Stack(bytes, 8);
+            }
+            bytes[..9].copy_from_slice(b"-Infinity");
+            return JsPiece::Stack(bytes, 9);
+        }
+        if number == 0.0 {
+            let mut bytes = [0u8; 48];
+            bytes[0] = b'0';
+            return JsPiece::Stack(bytes, 1);
+        }
+        if number.fract() == 0.0 && number.abs() < i64::MAX as f64 {
+            let mut bytes = [0u8; 48];
+            let len = write_i64(number as i64, &mut bytes);
+            return JsPiece::Stack(bytes, len);
+        }
+        return JsPiece::Heap(format!("{number}"));
+    }
+    JsPiece::Heap(value.to_js_string())
+}
+
+fn concat_js_values(left: &Value, right: &Value) -> Value {
+    let left_owned = left.as_js_string();
+    let right_owned = right.as_js_string();
+    let left_fallback = left_owned.is_none().then(|| js_primitive_text(left));
+    let right_fallback = right_owned.is_none().then(|| js_primitive_text(right));
+    let left_text = left_owned
+        .as_ref()
+        .map(|text| text.as_str())
+        .unwrap_or_else(|| left_fallback.as_ref().unwrap().as_str());
+    let right_text = right_owned
+        .as_ref()
+        .map(|text| text.as_str())
+        .unwrap_or_else(|| right_fallback.as_ref().unwrap().as_str());
+    let total = left_text.len().saturating_add(right_text.len());
+    if total <= 128 {
+        let mut bytes = [0u8; 128];
+        bytes[..left_text.len()].copy_from_slice(left_text.as_bytes());
+        bytes[left_text.len()..total].copy_from_slice(right_text.as_bytes());
+        let joined = std::str::from_utf8(&bytes[..total]).unwrap_or("");
+        return Value::from_js_string(JsString::intern(joined));
+    }
+    let mut owned = String::with_capacity(total);
+    owned.push_str(left_text);
+    owned.push_str(right_text);
+    Value::from_js_string(JsString::intern(&owned))
+}
+
+
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
     pub fn js_add(&self, other: &Value) -> Value {
         if self.is_string() || other.is_string() {
-            Value::from(format!("{}{}", self.to_js_string(), other.to_js_string()))
+            concat_js_values(self, other)
         } else if let Some(value) = crate::bigint::add(self, other) {
             value
         } else {

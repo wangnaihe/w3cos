@@ -61,17 +61,18 @@ impl Element {
             .iter()
             .position(|(key, _)| *key == atom_name);
         if let Some(existing_index) = existing_index {
-            let old_value = doc.get_node(self.id).attributes[existing_index].1.clone();
+            let old_value = doc.get_node(self.id).attributes[existing_index].1;
             let node = doc.get_node_mut(self.id);
             if name == "id" {
-                node.attributes[existing_index].1 = value.to_string();
-                doc.update_id_index(self.id, Some(&old_value), value);
+                node.attributes[existing_index].1 = crate::node::AttrValue::new(value);
+                doc.update_id_index(self.id, Some(old_value.as_str()), value);
             } else {
-                node.attributes[existing_index].1 = value.to_string();
+                node.attributes[existing_index].1 = crate::node::AttrValue::new(value);
             }
         } else {
             let node = doc.get_node_mut(self.id);
-            node.attributes.push((atom_name, value.to_string()));
+            node.attributes
+                .push((atom_name, crate::node::AttrValue::new(value)));
             if name == "id" {
                 doc.update_id_index(self.id, None, value);
             }
@@ -137,7 +138,7 @@ impl Element {
 
     pub fn remove_attribute(&self, doc: &mut Document, name: &str) {
         if name.eq_ignore_ascii_case("class") {
-            let old_classes: Vec<Atom> = std::mem::take(&mut doc.get_node_mut(self.id).class_list);
+            let old_classes = std::mem::take(&mut doc.get_node_mut(self.id).class_list);
             for class in old_classes {
                 doc.remove_from_class_index(self.id, &class);
             }
@@ -237,11 +238,11 @@ impl Element {
     // ── W3C Node tree traversal ────────────────────────────────────────
 
     pub fn next_sibling(&self, doc: &Document) -> Option<Element> {
-        doc.get_node(self.id).next_sibling.map(Element::new)
+        crate::node::sib(doc.get_node(self.id).next_sibling).map(Element::new)
     }
 
     pub fn previous_sibling(&self, doc: &Document) -> Option<Element> {
-        doc.get_node(self.id).prev_sibling.map(Element::new)
+        crate::node::sib(doc.get_node(self.id).prev_sibling).map(Element::new)
     }
 
     pub fn first_child(&self, doc: &Document) -> Option<Element> {
@@ -323,7 +324,7 @@ impl Element {
         {
             node.clear_attribute_namespace(index);
         }
-        let old_classes: Vec<Atom> = std::mem::take(&mut node.class_list);
+        let old_classes = std::mem::take(&mut node.class_list);
         for class in old_classes {
             doc.remove_from_class_index(self.id, &class);
         }
@@ -334,14 +335,15 @@ impl Element {
             self.class_list_add(doc, class);
         }
         let node = doc.get_node_mut(self.id);
-        if let Some((_, value)) = node
+        let index = node
             .attributes
-            .iter_mut()
-            .find(|(key, _)| *key == class_attr)
-        {
-            *value = name.to_string();
+            .iter()
+            .position(|(key, _)| *key == class_attr);
+        if let Some(index) = index {
+            node.attributes[index].1 = crate::node::AttrValue::new(name);
         } else {
-            node.attributes.push((class_attr, name.to_string()));
+            node.attributes
+                .push((class_attr, crate::node::AttrValue::new(name)));
         }
         doc.mark_selector_dirty(self.id);
     }
@@ -369,7 +371,7 @@ impl Element {
                             }
                         })
                         .collect::<String>();
-                    (camel, v.clone())
+                    (camel, v.as_str().to_string())
                 })
             })
             .collect()
@@ -396,7 +398,7 @@ impl Element {
         let mut child = node.first_child;
         while let Some(child_id) = child {
             Self::collect_text(doc, child_id, out);
-            child = doc.get_node(child_id).next_sibling;
+            child = crate::node::sib(doc.get_node(child_id).next_sibling);
         }
     }
 
@@ -544,7 +546,7 @@ impl Element {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
                     Self::serialize_node(doc, child_id, out);
-                    child = doc.get_node(child_id).next_sibling;
+                    child = crate::node::sib(doc.get_node(child_id).next_sibling);
                 }
                 out.push_str("</");
                 out.push_str(&tag);
@@ -554,7 +556,7 @@ impl Element {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
                     Self::serialize_node(doc, child_id, out);
-                    child = doc.get_node(child_id).next_sibling;
+                    child = crate::node::sib(doc.get_node(child_id).next_sibling);
                 }
             }
         }

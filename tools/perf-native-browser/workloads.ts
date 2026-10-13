@@ -126,6 +126,39 @@ function layoutOnce() {
     document.body.removeChild(grid);
     return {elapsed_ms: elapsed, checksum: checksum};
 }
+function layoutCssOnce() {
+    resetPage();
+    var style = document.createElement("style");
+    style.textContent = ".wrap{width:100%}.card{display:block;width:50%}.copy{display:block;margin:0;font-size:16px;line-height:20px}";
+    document.head.appendChild(style);
+    var wrap = document.createElement("div");
+    wrap.className = "wrap";
+    document.body.appendChild(wrap);
+    var cards = 40;
+    for (var i = 0; i < cards; i++) {
+        var card = document.createElement("div");
+        card.className = "card";
+        var copy = document.createElement("div");
+        copy.className = "copy";
+        var words = (i % 5) + 2;
+        var text = "";
+        for (var w = 0; w < words; w++) text = text + "measure ";
+        copy.textContent = text + i;
+        card.appendChild(copy);
+        wrap.appendChild(card);
+    }
+    var t0 = performance.now();
+    var checksum = 0;
+    for (var r = 0; r < 6; r++) {
+        wrap.style.width = r % 2 === 0 ? "800px" : "420px";
+        checksum = checksum + wrap.offsetHeight;
+    }
+    var elapsed = performance.now() - t0;
+    check(checksum > 0, "css layout produced no height");
+    document.head.removeChild(style);
+    document.body.removeChild(wrap);
+    return {elapsed_ms: elapsed, checksum: checksum};
+}
 function computeOnce() {
     var n = COMPUTE_N;
     var t0 = performance.now();
@@ -259,6 +292,7 @@ try {
     if (workload === "startup") runStartup();
     else if (workload === "dom-list") emit({workload: "dom-list", samples: measure(domOnce)});
     else if (workload === "layout") emit({workload: "layout", samples: measure(layoutOnce)});
+    else if (workload === "layout-css") emit({workload: "layout-css", samples: measure(layoutCssOnce)});
     else if (workload === "frames") runFrames();
     else if (workload === "compute") emit({workload: "compute", samples: measure(computeOnce)});
     else if (workload === "memory") runMemory();

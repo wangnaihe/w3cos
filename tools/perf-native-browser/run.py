@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 VIEWPORT = {"width": 1024, "height": 768, "dpr": 1}
-WORKLOADS = ("startup", "dom-list", "layout", "frames", "compute", "memory")
+WORKLOADS = ("startup", "dom-list", "layout", "layout-css", "frames", "compute", "memory")
 CHROME = os.environ.get("W3COS_CHROME", "/usr/bin/google-chrome")
 CHROME_ARGS = [
     "--disable-gpu",
@@ -477,7 +477,7 @@ def comparable(workload, native, browser):
             native_result.get("frames") == browser_result.get("frames")
             and numbers_close(native_result.get("checksum"), browser_result.get("checksum"), rel=0.02, abs_tol=4)
         )
-    if workload in ("layout", "memory"):
+    if workload in ("layout", "layout-css", "memory"):
         count_ok = True
         if workload == "memory":
             count_ok = native_result.get("count") == browser_result.get("count")
@@ -639,7 +639,7 @@ def main():
     from playwright.sync_api import sync_playwright
     server = WorkloadServer(source)
     server.start()
-    timeouts = {"startup": 60000, "dom-list": 180000, "layout": 180000, "frames": 240000, "compute": 120000, "memory": 180000}
+    timeouts = {"startup": 60000, "dom-list": 180000, "layout": 180000, "layout-css": 180000, "frames": 240000, "compute": 120000, "memory": 180000}
     summaries = []
     try:
         with sync_playwright() as playwright:

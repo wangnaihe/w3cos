@@ -166,7 +166,7 @@ fn layout_block(
             }
             _ => out.push((cid, DOMRect::zero())),
         }
-        child = document.get_node(cid).next_sibling;
+        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
     }
     if saw_text && specified_height.is_none() {
         return None;
@@ -254,7 +254,7 @@ fn layout_flex(
             }
             _ => out.push((cid, DOMRect::zero())),
         }
-        child = document.get_node(cid).next_sibling;
+        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
     }
     let mut cursor = y;
     for line in lines {
@@ -349,7 +349,7 @@ fn layout_grid(
             }
             _ => out.push((cid, DOMRect::zero())),
         }
-        child = document.get_node(cid).next_sibling;
+        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
     }
     let rows = items.len().div_ceil(columns);
     let mut row_heights: Vec<f32> = vec![0.0; rows];
@@ -390,6 +390,6 @@ fn zero_subtree(document: &w3cos_dom::Document, id: NodeId, out: &mut Vec<(NodeI
     let mut child = document.get_node(id).first_child;
     while let Some(cid) = child {
         zero_subtree(document, cid, out);
-        child = document.get_node(cid).next_sibling;
+        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
     }
 }

@@ -8,10 +8,10 @@ impl Document {
     /// discarded before anonymous table coalescing. Authored inline tables
     /// remain atomic inline boxes and retain ordinary surrounding glue.
     pub(super) fn inline_space_follows_misparented_cell(&self, id: NodeId) -> bool {
-        let mut previous = self.get_node(id).prev_sibling;
+        let mut previous = crate::node::sib(self.get_node(id).prev_sibling);
         while let Some(id) = previous {
             let node = self.get_node(id);
-            previous = node.prev_sibling;
+            previous = crate::node::sib(node.prev_sibling);
             match node.node_type {
                 NodeType::Text
                     if node
@@ -35,10 +35,10 @@ impl Document {
     /// by preceding raw text. An element box (even a plain inline) is a real
     /// boundary; hidden scripts and comments do not own an intervening box.
     pub(super) fn row_space_follows_raw_text(&self, id: NodeId) -> bool {
-        let mut previous = self.get_node(id).prev_sibling;
+        let mut previous = crate::node::sib(self.get_node(id).prev_sibling);
         while let Some(id) = previous {
             let node = self.get_node(id);
-            previous = node.prev_sibling;
+            previous = crate::node::sib(node.prev_sibling);
             match node.node_type {
                 NodeType::Text => {
                     if node

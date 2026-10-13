@@ -1447,7 +1447,7 @@ fn node_language(document: &Document, mut node: NodeId) -> Option<String> {
                 "lang" | "xml:lang"
             )
         }) {
-            return Some(language.clone());
+            return Some(language.as_str().to_string());
         }
         let Some(parent) = current.parent else {
             return document_language(document);
@@ -1535,12 +1535,12 @@ fn parse_an_plus_b(expression: &str) -> Option<(i64, i64)> {
 }
 
 fn previous_element_sibling(document: &Document, node: NodeId) -> Option<NodeId> {
-    let mut sibling = document.get_node(node).prev_sibling;
+    let mut sibling = crate::node::sib(document.get_node(node).prev_sibling);
     while let Some(candidate) = sibling {
         if document.get_node(candidate).node_type == NodeType::Element {
             return Some(candidate);
         }
-        sibling = document.get_node(candidate).prev_sibling;
+        sibling = crate::node::sib(document.get_node(candidate).prev_sibling);
     }
     None
 }

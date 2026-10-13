@@ -109,7 +109,62 @@ pub(crate) fn set_quirks_mode(quirks_mode: bool) {
     with_document_mut(|document| document.set_quirks_mode(quirks_mode));
 }
 
+fn cached_atom(slot: &Cell<u32>, text: &str) -> w3cos_dom::atom::Atom {
+    let id = slot.get();
+    if id != u32::MAX {
+        return w3cos_dom::atom::Atom::from_u32(id);
+    }
+    let atom = w3cos_dom::atom::Atom::intern(text);
+    slot.set(atom.as_u32());
+    atom
+}
+
+fn media_audio() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static AUDIO: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    AUDIO.with(|slot| cached_atom(slot, "audio"))
+}
+
+fn media_video() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static VIDEO: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    VIDEO.with(|slot| cached_atom(slot, "video"))
+}
+
+fn style_tag() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static STYLE: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    STYLE.with(|slot| cached_atom(slot, "style"))
+}
+
 pub fn append_child(parent: u32, child: u32) {
+    if crate::observers_web::mutation_observers_empty() {
+        let mut media = false;
+        let mut inserted_style = false;
+        with_document_mut(|doc| {
+            let parent_tag = doc.get_node(NodeId::from_u32(parent)).tag;
+            media = parent_tag == media_audio() || parent_tag == media_video();
+            if media {
+                return;
+            }
+            doc.append_child(NodeId::from_u32(parent), NodeId::from_u32(child));
+            inserted_style = doc.get_node(NodeId::from_u32(child)).tag == style_tag();
+        });
+        if !media {
+            mark_dom_dirty();
+            #[cfg(feature = "dynamic-js")]
+            crate::dynamic_script::notify_node_inserted(child);
+            #[cfg(feature = "dynamic-js")]
+            crate::dynamic_script::notify_script_mutated(parent);
+            if inserted_style {
+                crate::jsdom::sync_style_element(child);
+            }
+            return;
+        }
+    }
     let old_parent = parent_node(child);
     let old_previous = previous_sibling(child);
     let old_next = next_sibling(child);
@@ -132,6 +187,7 @@ pub fn append_child(parent: u32, child: u32) {
     crate::dynamic_script::notify_node_inserted(child);
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::notify_script_mutated(parent);
+    crate::jsdom::sync_style_element(child);
 }
 
 pub fn remove_child(parent: u32, child: u32) {
@@ -148,6 +204,7 @@ pub fn remove_child(parent: u32, child: u32) {
         crate::dynamic_script::notify_node_removed(child);
         #[cfg(feature = "dynamic-js")]
         crate::dynamic_script::notify_script_mutated(parent);
+        crate::jsdom::sync_style_element(child);
     }
 }
 
@@ -187,6 +244,14 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
 }
 
 pub fn set_attribute(node: u32, name: &str, value: &str) {
+    if crate::observers_web::mutation_observers_empty() {
+        with_document_mut(|doc| {
+            let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+            el.set_attribute(doc, name, value);
+        });
+        mark_dom_dirty();
+        return;
+    }
     let old_value = get_attribute(node, name);
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
@@ -615,17 +680,15 @@ pub fn get_elements_by_class_name(class: &str) -> Vec<u32> {
 
 pub fn next_sibling(node: u32) -> Option<u32> {
     with_document(|doc| {
-        doc.get_node(NodeId::from_u32(node))
-            .next_sibling
-            .map(|id| id.as_u32())
+        let link = doc.get_node(NodeId::from_u32(node)).next_sibling;
+        (link != 0).then_some(link)
     })
 }
 
 pub fn previous_sibling(node: u32) -> Option<u32> {
     with_document(|doc| {
-        doc.get_node(NodeId::from_u32(node))
-            .prev_sibling
-            .map(|id| id.as_u32())
+        let link = doc.get_node(NodeId::from_u32(node)).prev_sibling;
+        (link != 0).then_some(link)
     })
 }
 

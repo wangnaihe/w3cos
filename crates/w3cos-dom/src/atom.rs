@@ -1,7 +1,8 @@
-use std::collections::HashMap;
-
 /// An interned string handle. Comparison is O(1) integer equality.
 /// Inspired by Chrome/Blink's WTF::AtomString.
+///
+/// Bytes live once in a chunked bump arena. Lookup is open-addressed, so
+/// interning a new string does not allocate a hash-map node.
 #[derive(Clone, Copy, Eq, Hash)]
 pub struct Atom(u32);
 
@@ -24,38 +25,29 @@ impl Atom {
     pub const EMPTY: Self = Self(0);
 
     pub fn intern(s: &str) -> Self {
-        INTERN_TABLE.with(|t| {
-            let mut table = t.borrow_mut();
-            if let Some(&id) = table.str_to_id.get(s) {
-                return Self(id);
-            }
-            let id = table.strings.len() as u32;
-            let owned = s.to_string();
-            table.str_to_id.insert(owned.clone(), id);
-            table.strings.push(owned);
-            Self(id)
-        })
+        INTERN_TABLE.with(|t| Self(t.borrow_mut().intern(s)))
     }
 
     pub fn as_str(&self) -> String {
-        self.with_str(|text| text.to_string())
+        self.as_static().to_string()
+    }
+
+    /// Interned bytes. The arena never relocates or frees a stored string.
+    pub fn as_static(self) -> &'static str {
+        INTERN_TABLE.with(|t| t.borrow().as_static(self.0))
     }
 
     /// Borrow the interned bytes for the duration of `f`.
     pub fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
-        INTERN_TABLE.with(|t| {
-            let table = t.borrow();
-            let text = table
-                .strings
-                .get(self.0 as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            f(text)
-        })
+        f(self.as_static())
     }
 
     pub fn as_u32(self) -> u32 {
         self.0
+    }
+
+    pub fn from_u32(id: u32) -> Self {
+        Self(id)
     }
 }
 
@@ -77,16 +69,48 @@ impl std::fmt::Display for Atom {
     }
 }
 
+const CHUNK: usize = 8192;
+const SLOT_CAP: usize = 32768;
+/// Spare chunk boxes so interning unique ids does not malloc on the create path.
+const SPARE_CHUNKS: usize = 48;
+
 struct InternTable {
-    strings: Vec<String>,
-    str_to_id: HashMap<String, u32>,
+    chunks: Vec<Box<[u8; CHUNK]>>,
+    /// Bytes used in the last chunk.
+    fill: usize,
+    /// Strings longer than a chunk. Each box stays put for the process lifetime.
+    wide: Vec<Box<[u8]>>,
+    /// `(chunk, offset, len)` per atom id. Chunk indexes with the high bit set
+    /// refer to `wide` instead of `chunks`.
+    ranges: Vec<(u32, u32, u32)>,
+    /// Prebuilt chunk boxes. `push_bytes` pops one instead of allocating.
+    spares: Vec<Box<[u8; CHUNK]>>,
+    /// Open-addressed ids. `0` is empty; a stored id is `atom + 1`.
+    slots: Vec<u32>,
+    mask: usize,
+    len: usize,
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in s.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 impl InternTable {
     fn new() -> Self {
         let mut t = Self {
-            strings: Vec::new(),
-            str_to_id: HashMap::new(),
+            chunks: Vec::new(),
+            fill: CHUNK,
+            wide: Vec::new(),
+            ranges: Vec::with_capacity(SLOT_CAP),
+            spares: (0..SPARE_CHUNKS).map(|_| Box::new([0; CHUNK])).collect(),
+            slots: vec![0; SLOT_CAP],
+            mask: SLOT_CAP - 1,
+            len: 0,
         };
         // Pre-intern common strings (index 0 = empty)
         let preinterned = [
@@ -137,11 +161,117 @@ impl InternTable {
             "value",       // 44
         ];
         for s in &preinterned {
-            let id = t.strings.len() as u32;
-            t.str_to_id.insert(s.to_string(), id);
-            t.strings.push(s.to_string());
+            t.intern(s);
         }
         t
+    }
+
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(id) = self.lookup(s) {
+            return id;
+        }
+        if (self.len + 1) * 10 >= self.slots.len() * 7 {
+            self.grow();
+        }
+        let id = self.ranges.len() as u32;
+        self.push_bytes(s.as_bytes());
+        self.insert_slot(hash_str(s), id);
+        self.len += 1;
+        id
+    }
+
+    fn lookup(&self, s: &str) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut index = hash_str(s) as usize & self.mask;
+        for _ in 0..self.slots.len() {
+            let slot = self.slots[index];
+            if slot == 0 {
+                return None;
+            }
+            let id = slot - 1;
+            if self.eq(id, s) {
+                return Some(id);
+            }
+            index = (index + 1) & self.mask;
+        }
+        None
+    }
+
+    fn eq(&self, id: u32, s: &str) -> bool {
+        self.as_static(id) == s
+    }
+
+    fn as_static(&self, id: u32) -> &'static str {
+        let Some(&(chunk, offset, len)) = self.ranges.get(id as usize) else {
+            return "";
+        };
+        if len == 0 {
+            return "";
+        }
+        let ptr = if chunk & 0x8000_0000 != 0 {
+            self.wide[(chunk & 0x7fff_ffff) as usize].as_ptr()
+        } else {
+            self.chunks[chunk as usize].as_ptr()
+        };
+        // Safety: chunk boxes are never relocated or mutated after the bytes
+        // are published. `as_static` is only called once the range exists.
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                ptr.add(offset as usize),
+                len as usize,
+            ))
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        if bytes.len() > CHUNK {
+            let mut wide = vec![0u8; bytes.len()].into_boxed_slice();
+            wide.copy_from_slice(bytes);
+            let len = wide.len() as u32;
+            self.wide.push(wide);
+            let chunk = (self.wide.len() - 1) as u32;
+            self.ranges.push((0x8000_0000 | chunk, 0, len));
+            return;
+        }
+        if self.chunks.is_empty() || self.fill + bytes.len() > CHUNK {
+            let chunk = self
+                .spares
+                .pop()
+                .unwrap_or_else(|| Box::new([0; CHUNK]));
+            self.chunks.push(chunk);
+            self.fill = 0;
+        }
+        let chunk_index = self.chunks.len() - 1;
+        let start = self.fill;
+        self.chunks[chunk_index][start..start + bytes.len()].copy_from_slice(bytes);
+        self.ranges
+            .push((chunk_index as u32, start as u32, bytes.len() as u32));
+        self.fill += bytes.len();
+    }
+
+    fn insert_slot(&mut self, hash: u64, id: u32) {
+        let mut index = hash as usize & self.mask;
+        loop {
+            if self.slots[index] == 0 {
+                self.slots[index] = id + 1;
+                return;
+            }
+            index = (index + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let next = (self.slots.len() * 2).max(SLOT_CAP);
+        self.slots = vec![0; next];
+        self.mask = next - 1;
+        let ids = self.ranges.len();
+        for id in 0..ids {
+            let text = self.as_static(id as u32);
+            let hash = hash_str(text);
+            self.insert_slot(hash, id as u32);
+        }
     }
 }
 
