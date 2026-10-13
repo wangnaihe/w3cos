@@ -4043,12 +4043,16 @@ impl LayoutEngine {
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
-            let mut layout_root = root.clone();
-            resolve_collapsed_table_layout_borders(&mut layout_root);
-            crate::table_grid::annotate(&mut layout_root);
+            let prepared = component_needs_table_prep(root).then(|| {
+                let mut layout_root = root.clone();
+                resolve_collapsed_table_layout_borders(&mut layout_root);
+                crate::table_grid::annotate(&mut layout_root);
+                layout_root
+            });
+            let layout_root = prepared.as_ref().unwrap_or(root);
             self.root_node = Some(build_taffy_tree(
                 &mut self.tree,
-                &layout_root,
+                layout_root,
                 &mut idx,
                 None,
                 None,
@@ -4085,7 +4089,10 @@ impl LayoutEngine {
         };
         self.tree.compute_layout(root_node, space)?;
         self.last_compute_layout_passes = 1;
-        if update_text_leaf_heights(&mut self.tree, root_node, flat, None)? {
+        // Definite flex/grid/block trees already have border boxes. Measuring
+        // text leaves and solving again dominates repeated offsetHeight.
+        if !self.skip_projections && update_text_leaf_heights(&mut self.tree, root_node, flat, None)?
+        {
             self.tree.compute_layout(root_node, space)?;
             self.last_compute_layout_passes = 2;
         }
@@ -21331,6 +21338,24 @@ fn patch_taffy_display(
         patch_taffy_display(tree, child, flat)?;
     }
     Ok(())
+}
+
+fn component_needs_table_prep(component: &Component) -> bool {
+    crate::table_grid::row_span(&component.style) != 1
+        || matches!(
+            component.style.display,
+            WDisplay::Table
+                | WDisplay::InlineTable
+                | WDisplay::TableRow
+                | WDisplay::TableRowGroup
+                | WDisplay::TableHeaderGroup
+                | WDisplay::TableFooterGroup
+                | WDisplay::TableColumn
+                | WDisplay::TableColumnGroup
+                | WDisplay::TableCell
+                | WDisplay::TableCaption
+        )
+        || component.children.iter().any(component_needs_table_prep)
 }
 
 /// After first layout pass, set Text leaf heights from wrapped line count at assigned width.

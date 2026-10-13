@@ -29,6 +29,7 @@ pub mod credentials_web;
 pub mod css_rules_web;
 pub mod css_typed_om_web;
 pub mod custom_elements_web;
+mod definite_layout;
 pub mod device_access_web;
 #[cfg(feature = "devtools")]
 pub mod devtools;

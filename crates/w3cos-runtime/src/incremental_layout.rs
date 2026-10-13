@@ -30,6 +30,12 @@ pub fn invalidate() {
 
 /// Flush pending layout into stored DOM rects. Returns false when Taffy fails.
 pub fn flush() -> bool {
+    if crate::definite_layout::try_apply() {
+        let _ = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+        crate::dom::clear_document_dirty();
+        invalidate();
+        return true;
+    }
     let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
     let viewport_w = viewport_w as f32;
     let viewport_h = viewport_h as f32;
