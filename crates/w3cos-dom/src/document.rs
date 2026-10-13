@@ -36,6 +36,12 @@ struct CachedComputedStyle {
     style: w3cos_std::style::Style,
 }
 
+struct SelectorContextCache {
+    style_clock: u64,
+    stylesheet_generation: u64,
+    entries: HashMap<NodeId, stylesheet::SelectorContext>,
+}
+
 fn push_generated_text(items: &mut Vec<GeneratedContentItem>, text: &str) {
     if let Some(GeneratedContentItem::Text(current)) = items.last_mut() {
         current.push_str(text);
@@ -123,6 +129,10 @@ pub struct Document {
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    /// Sibling selector contexts are rebuilt for every node during a tree walk.
+    /// Caching one pass, and skipping the sibling chain when no rule needs it,
+    /// keeps that walk linear.
+    selector_context_cache: RefCell<SelectorContextCache>,
     normal_line_height_provider: Option<(fn(&w3cos_std::style::Style) -> Option<f32>, u64)>,
     css_image_dimensions_provider: Option<fn(&str) -> Option<(u32, u32)>>,
     minimum_font_size: f32,
@@ -233,6 +243,11 @@ impl Document {
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
+            selector_context_cache: RefCell::new(SelectorContextCache {
+                style_clock: 0,
+                stylesheet_generation: 0,
+                entries: HashMap::new(),
+            }),
             normal_line_height_provider: None,
             css_image_dimensions_provider: None,
             minimum_font_size: 0.0,
@@ -1169,25 +1184,95 @@ impl Document {
 
     /// Selector context for stylesheet matching: tag, id, classes, attributes.
     fn selector_context(&self, id: NodeId) -> stylesheet::SelectorContext {
-        let mut context = self.selector_context_base(id);
-        let Some(parent) = self.get_node(id).parent else {
+        if let Some(cached) = self.cached_selector_context(id) {
+            return cached;
+        }
+        // Adjacent and general sibling combinators are the only consumers of
+        // the previous-sibling chain. Building that chain for every node by
+        // rescanning the parent is cubic in the sibling count.
+        if !stylesheet::has_sibling_dependencies() {
+            let context = self.selector_context_base(id);
+            self.store_selector_context(id, &context);
             return context;
-        };
+        }
+        let siblings = self.element_siblings_through(id);
         let mut previous_siblings = Vec::new();
-        for sibling in self.children_ids(parent) {
-            if sibling == id {
-                break;
-            }
-            if self.get_node(sibling).node_type != NodeType::Element {
+        let mut result = self.selector_context_base(id);
+        for sibling in siblings {
+            if let Some(cached) = self.cached_selector_context(sibling) {
+                if sibling == id {
+                    return cached;
+                }
+                previous_siblings.push(Rc::new(cached));
                 continue;
             }
-            let sibling_context = self
+            let context = self
                 .selector_context_base(sibling)
                 .with_shared_previous_siblings(previous_siblings.clone());
-            previous_siblings.push(Rc::new(sibling_context));
+            self.store_selector_context(sibling, &context);
+            if sibling == id {
+                result = context;
+                break;
+            }
+            previous_siblings.push(Rc::new(context));
         }
-        context.previous_siblings = previous_siblings;
-        context
+        result
+    }
+
+    fn cached_selector_context(&self, id: NodeId) -> Option<stylesheet::SelectorContext> {
+        let mut cache = self.selector_context_cache.borrow_mut();
+        let generation = stylesheet::generation();
+        if cache.style_clock != self.style_revision_clock
+            || cache.stylesheet_generation != generation
+        {
+            cache.entries.clear();
+            cache.style_clock = self.style_revision_clock;
+            cache.stylesheet_generation = generation;
+        }
+        cache.entries.get(&id).cloned()
+    }
+
+    fn store_selector_context(&self, id: NodeId, context: &stylesheet::SelectorContext) {
+        let mut cache = self.selector_context_cache.borrow_mut();
+        let generation = stylesheet::generation();
+        if cache.style_clock != self.style_revision_clock
+            || cache.stylesheet_generation != generation
+        {
+            cache.entries.clear();
+            cache.style_clock = self.style_revision_clock;
+            cache.stylesheet_generation = generation;
+        }
+        cache.entries.insert(id, context.clone());
+    }
+
+    /// Element siblings from the first child through `id`, in tree order.
+    fn element_siblings_through(&self, id: NodeId) -> Vec<NodeId> {
+        let Some(parent) = self.get_node(id).parent else {
+            return vec![id];
+        };
+        let mut siblings = Vec::new();
+        let mut current = self.get_node(parent).first_child;
+        while let Some(candidate) = current {
+            if self.get_node(candidate).node_type == NodeType::Element {
+                siblings.push(candidate);
+            }
+            if candidate == id {
+                break;
+            }
+            current = self.get_node(candidate).next_sibling;
+        }
+        siblings
+    }
+
+    fn previous_element_sibling_id(&self, id: NodeId) -> Option<NodeId> {
+        let mut sibling = self.get_node(id).prev_sibling;
+        while let Some(candidate) = sibling {
+            if self.get_node(candidate).node_type == NodeType::Element {
+                return Some(candidate);
+            }
+            sibling = self.get_node(candidate).prev_sibling;
+        }
+        None
     }
 
     fn selector_context_base(&self, id: NodeId) -> stylesheet::SelectorContext {
@@ -1208,12 +1293,9 @@ impl Document {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let is_first_child = node.parent.is_some_and(|parent| {
-            self.children_ids(parent)
-                .into_iter()
-                .find(|sibling| self.get_node(*sibling).node_type == NodeType::Element)
-                == Some(id)
-        });
+        let is_first_child = node.node_type == NodeType::Element
+            && node.parent.is_some()
+            && self.previous_element_sibling_id(id).is_none();
         let is_root = node
             .parent
             .is_none_or(|parent| self.get_node(parent).node_type == NodeType::Document);
