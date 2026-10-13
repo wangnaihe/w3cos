@@ -231,6 +231,7 @@ thread_local! {
     /// CSSStyleDeclaration object identity → element node. The AOT style
     /// setter reads this instead of entering the declaration proxy.
     static STYLE_OBJECT_NODES: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+    static HTML_CREATE_ELEMENT_FOLD: Cell<Option<bool>> = const { Cell::new(None) };
     /// Active CSS animations/transitions sampled by CSSOM and geometry reads.
     /// The corresponding JS facades live in `animations_web::ANIMATIONS`.
     static CSS_MOTIONS: RefCell<Vec<CssMotion>> = const { RefCell::new(Vec::new()) };
@@ -895,6 +896,15 @@ fn is_document_value(object: &Value) -> bool {
     })
 }
 
+fn html_create_element_folds_case() -> bool {
+    if let Some(value) = HTML_CREATE_ELEMENT_FOLD.with(std::cell::Cell::get) {
+        return value;
+    }
+    let value = document_value().get_property("contentType").to_js_string() == "text/html";
+    HTML_CREATE_ELEMENT_FOLD.with(|fold| fold.set(Some(value)));
+    value
+}
+
 fn fast_create_element(object: &Value, tag: &str) -> Value {
     if !is_document_value(object) {
         return object.call_method("createElement", vec![Value::string(tag)]);
@@ -903,7 +913,7 @@ fn fast_create_element(object: &Value, tag: &str) -> Value {
     if !valid_element_name(&tag) {
         dom_exception("The element name is not valid", "InvalidCharacterError");
     }
-    if document_value().get_property("contentType").to_js_string() == "text/html" {
+    if html_create_element_folds_case() {
         tag.make_ascii_lowercase();
     }
     let id = dom::create_element(&tag);
@@ -19962,6 +19972,7 @@ pub fn reset_bridge() {
     SELECTOR_ID_CACHE_GENERATION.with(|generation| generation.set(0));
     STYLE_CACHE.with(|c| c.borrow_mut().clear());
     STYLE_OBJECT_NODES.with(|nodes| nodes.borrow_mut().clear());
+    HTML_CREATE_ELEMENT_FOLD.with(|fold| fold.set(None));
     CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
     DISCRETE_CSS_TRANSITIONS.with(|motions| motions.borrow_mut().clear());
     LISTENERS.with(|l| l.borrow_mut().clear());
