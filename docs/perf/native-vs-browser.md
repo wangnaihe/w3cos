@@ -32,7 +32,8 @@ frame signal, launch included.
 | --- | --- |
 | startup | Process launch through first paint signal. Native also CPU-rasters that frame. |
 | dom-list | Create 1000 nodes, then 40 keyed text updates and moves. |
-| layout | 12 flex/grid width and track-list changes, each followed by `offsetHeight`. |
+| layout | 12 flex/grid width and track-list changes, each followed by `offsetHeight`. No author stylesheet; every item has a px border box. |
+| layout-css | Author stylesheet, percentage widths, and text-driven auto heights. Six width changes on one wrap, each followed by `offsetHeight`. This is the Taffy path. |
 | frames | 20 animation frames after 2 warmup frames: scroll plus 80 absolute boxes, then `offsetHeight`. |
 | compute | 400000 iterations of a scalar numeric loop. |
 | memory | Build 4000 nodes, force one layout, then sample RSS. |
@@ -62,69 +63,94 @@ isolation, and V8 optimizations stay at their headless defaults.
 
 Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, 15 GiB RAM, no `/dev/dri`.
 Rustc 1.99.0 (`b940084d7`, 2026-09-28). Google Chrome 154.0.8037.92. Native
-binary commit `e3523f5`, profile `opt-level=3`, LTO off, `codegen-units=16`,
+binary commit `f5b6581`, profile `opt-level=3`, LTO off, `codegen-units=16`,
 `cpu-render` (tiny-skia). Five processes per workload. Checksums matched on
-every paired run (DOM 230, layout 20016, frames 11000, memory 72000, compute
-the same f64). Ratio is w3cos / Chromium; below 1 is a w3cos win.
+every paired run except `layout-css` (DOM 230, layout 20016, frames 11000,
+memory 72000, compute `-362647.901806622`). `layout-css` is native 8160 and
+Chromium 6240, outside the relative 0.02 / absolute 8 tolerance, so that row
+is not a win or a loss. Ratio is w3cos / Chromium; below 1 is a w3cos win.
 
-"Before" is the previous five-run median at `6f5f187` (native numeric loop,
-persistent Taffy, direct DOM calls). "After" returns new nodes as NodeId
-immediates, shares one UA style per tag, and solves definite block/flex/grid
-trees without building Taffy.
+"Before" is the five-run median at `e3523f5` (lazy DOM immediates, shared UA
+style, definite px layout). "After" is `f5b6581`.
 
 | workload | metric | w3cos before | w3cos after | Chromium | ratio after |
 | --- | --- | ---: | ---: | ---: | ---: |
-| startup | cold start ms | 52.2 | 52.7 (52.3–55.8) | 207 (202–733) | 0.26 |
-| dom-list | wall ms | 31.1 | 3.84 (3.76–3.86) | 1.00 (0.80–1.30) | 3.8 |
-| dom-list | steady RSS | 43.8 MB | 23.1 MB | 922 MB | 0.025 |
-| layout | wall ms | 31.1 | 0.738 (0.725–0.742) | 10.5 (10.4–10.7) | 0.070 |
-| layout | steady RSS | 74.6 MB | 24.4 MB | 977 MB | 0.025 |
-| frames | work p50 ms | 0.166 | 0.160 (0.157–0.164) | 0.25 (0.20–0.30) | 0.64 |
-| frames | work p95 ms | 0.182 | 0.177 (0.167–0.179) | 0.31 (0.30–0.40) | 0.58 |
-| frames | steady RSS | 37.5 MB | 37.3 MB | 924 MB | 0.040 |
-| compute | wall ms | 1.46 | 1.411 (1.405–1.466) | 1.400 (1.400–1.700) | 1.008 |
-| compute | steady RSS | 16.4 MB | 16.2 MB | 920 MB | 0.018 |
-| memory | wall ms | 292 | 16.4 (16.3–16.5) | 20.3 (19.2–21.8) | 0.81 |
-| memory | steady RSS | 124 MB | 25.5 MB | 939 MB | 0.027 |
+| startup | cold start ms | 52.7 (52.3–55.8) | 52.3 (51.8–53.2) | 220 (203–1047) | 0.24 |
+| dom-list | wall ms | 3.84 (3.76–3.86) | 0.585 (0.566–0.611) | 0.800 (0.700–1.000) | 0.73 |
+| dom-list | create ms | 3.72 | 0.524 (0.509–0.551) | 0.800 (0.700–0.900) | 0.66 |
+| dom-list | steady RSS | 23.1 MB | 20.8 MB | 921 MB | 0.023 |
+| layout | wall ms | 0.738 (0.725–0.742) | 0.699 (0.689–1.207) | 10.9 (10.7–11.0) | 0.064 |
+| layout | steady RSS | 24.4 MB | 24.5 MB | 978 MB | 0.025 |
+| layout-css | wall ms | 6.49 (6.41–7.24) | 3.75 (3.65–3.78) | 0.900 (0.900–1.000) | n/a |
+| frames | work p50 ms | 0.160 (0.157–0.164) | 0.132 (0.127–0.134) | 0.200 (0.200–0.300) | 0.66 |
+| frames | work p95 ms | 0.177 (0.167–0.179) | 0.136 (0.129–0.151) | 0.305 (0.300–0.400) | 0.45 |
+| compute | wall ms | 1.411 (1.405–1.466) | 1.406 (1.405–1.413) | 1.500 (1.400–2.200) | overlap |
+| memory | wall ms | 16.4 (16.3–16.5) | 8.10 (8.07–8.22) | 19.3 (18.6–20.2) | 0.42 |
+| memory | steady RSS | 25.5 MB | 25.1 MB | 941 MB | 0.027 |
 
-Cold start, RSS, layout, frames, and the 4000-node build are wins. DOM create
-is still a loss. The numeric-loop medians overlap: w3cos 1.411 ms versus
-Chromium 1.400 ms, and Chromium's max in this run is 1.700 ms. Frame p50/p95
-above are the median of the five per-run percentiles.
+`layout-css` before is the five-run median at `b53be99`, the first commit
+that ran this workload. It was not in the `e3523f5` table. Frame p50/p95 are
+the median of the five per-run percentiles.
 
-### What still loses
+Cold start, RSS, DOM create, the px flex/grid layout, frames, and the
+4000-node build are wins. DOM create is 0.524 µs/element (range
+0.509–0.551 µs). Chromium's create samples are 0.700–0.900 µs, so the ranges
+do not overlap.
 
-DOM list wall time is 3.84 ms versus 1.00 ms (create 3.72 ms versus 0.90 ms,
-update 0.124 ms versus 0.100 ms). That is 3.7 µs per created element, down
-from about 30 µs, and still about 4× Blink's 0.9 µs. The 4000-node workload
-is now a win because the single auto-height layout is no longer a Taffy
-solve: 16.4 ms versus 20.3 ms.
+### DOM create
 
-The numeric loop itself got slightly faster (1.46 ms to 1.41 ms). Chromium's
-median in this run moved from 1.50 ms to 1.40 ms, so the ratio is 1.008.
-The ranges overlap. Checksums are identical.
+The 1000-element loop is one host call per iteration: tag, id, class, text,
+and append. The page reserves 32768 node slots and a 1 MiB string arena up
+front. An element with at most two attributes keeps them in an inline buffer,
+so `id` plus `class` does not allocate a `Vec`. The id is an interned atom;
+the atom table owns the bytes, and a unique string is bump-allocated in the
+page arena instead of a second `String`. Sibling links are `u32` indexes.
+Short text stays in the 22-byte inline string. The single text child remains
+a real text node, so `childNodes` and layout still observe it. Folding that
+text into an invisible tail of the parent would hide it from those APIs.
 
-Layout of the 240+240 flex/grid tree is 0.74 ms versus 10.5 ms. The timed
-region is 12 width and track-list edits, each followed by `offsetHeight`.
-There is no author stylesheet, every item has a px border box, and margins
-are zero, so flush writes those border boxes directly and does not build a
-Taffy tree. The checksum is exactly 20016 on both sides. Trees with author
-CSS, percentages, floats, abspos, overflow other than visible, or a
-text-driven auto height still go through Taffy. On that path, a tree whose
-heights are already definite skips the second text-metric `compute_layout`.
-Taffy 0.9 has no separate measure-cache switch; unchanged nodes stay clean
-because the tree is not cleared. A full `Style` to `taffy::Style` cache was
-not added: the workloads that were losing no longer call `to_taffy_style`
-during the timer.
+A `perf cpu-clock` profile of the old create path was dominated by per-node
+`malloc`. The fused call removes the argument vector, the per-step document
+borrow, and the style walk when the page has no author rules. The steady
+create time is under the 0.9 µs target. Update of 40 text nodes is 0.059 ms.
+Chromium reports that update as 0.000–0.100 ms, which is the timer quantum,
+so the update ratio is not meaningful. Checksum 230 matches (`item 1`,
+`upd 39`).
 
-DOM create returns a tagged immediate (node id plus realm generation). No
-`Rc`, prototype, or property map is allocated until JS observes identity
-(`getPrototypeOf`, `__proto__`, `constructor`, or `as_object`). Expando
-storage stays on the node id. Same-tag elements share one UA `CSSStyleDeclaration`
-until a write (`Arc::make_mut`). Short text lives in a 22-byte inline buffer.
-Dirty membership is a stamp, not a linear scan, and node slots are reserved
-128 at a time. What remains per row is the DOM node, a second text node, the
-unique `id` string and its atom, the attribute vector, and the LCRS links.
-That is the 3.7 µs. A true bump arena for `DomNode` would remove the struct
-move into `Vec`, not the unique id string, and would not by itself reach
-0.9 µs.
+### Numeric loop
+
+The lowered loop is an outlined `#[inline(never)]` function. The trip count
+is converted from f64 to i32 once, with `cvttsd2si`, before the loop. The hot
+body is 4× unrolled `mulsd`/`addsd`/`subsd` on xmm registers, then
+`add $4, %eax` / `cmp` / `jle`. There is no bounds check, no `call`, and no
+`Value` boxing in the body. The exit stores the f64 accumulators with
+`movsd`. FMA is not used: it would change the checksum
+`-362647.901806622`, which matches V8 exactly.
+
+At 2.4 GHz this is about 8 cycles per iteration, and the `a`/`b` multiply-add
+chain is serial. Unrolling does not shorten that chain. This run's w3cos
+samples are 1.405–1.413 ms. Chromium's median is 1.500 ms, but its fastest
+sample is 1.400 ms, so the ranges still overlap. That is not a separated win.
+
+### Layout
+
+The px flex/grid workload is 0.699 ms versus 10.9 ms, checksum 20016 on both
+sides. There is no author stylesheet and every item has a px border box, so
+flush writes those boxes directly and does not build a Taffy tree.
+
+`layout-css` is the author-CSS workload: `.wrap{width:100%}`,
+`.card{display:block;width:50%}`, `.copy{font-size:16px;line-height:20px}`,
+40 cards, six reflows alternating 800 px and 420 px. It stays on Taffy.
+A width edit patches the cached tree when the cascade change is geometry
+only. Definite block widths seed text line heights before the first
+`compute_layout`, and a tree that only needs that measure skips the float
+and table projection walk. Wall time moved from 6.49 ms at `b53be99` to
+3.75 ms (3.65–3.78). Chromium is 0.900 ms (0.900–1.000).
+
+The checksums are not comparable. Native 8160 is three passes at 1120 px plus
+three at 1600 px: with Noto Sans, `"measure "` is about 70 px at 16 px, so
+five- and six-word cards wrap on the 800 px pass and more of them wrap on
+the 420 px pass. Chromium's 6240 matches three passes at 800 px plus three
+at 1280 px, which is what a narrower UI font produces for the same source.
+A block solver that measured text at the CSS content box changed the native
+checksum (7680), so it was not kept. The Taffy result is the one reported.
