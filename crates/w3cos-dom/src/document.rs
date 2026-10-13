@@ -462,12 +462,17 @@ impl Document {
             self.mark_dirty(old_parent);
         }
         self.mark_dirty(parent);
+        // Used values such as flex item blockification depend on the new
+        // ancestor chain. Restyle the moved subtree without walking the
+        // parent's existing siblings.
+        self.invalidate_style_subtree(child);
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
         self.unlink_from_parent(child);
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
+        self.invalidate_style_subtree(child);
     }
 
     pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
@@ -574,6 +579,7 @@ impl Document {
             self.mark_dirty(old_parent);
         }
         self.mark_dirty(parent);
+        self.invalidate_style_subtree(new_child);
     }
 
     fn insertion_would_create_cycle(&self, parent: NodeId, child: NodeId) -> bool {
