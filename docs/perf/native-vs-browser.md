@@ -62,66 +62,69 @@ isolation, and V8 optimizations stay at their headless defaults.
 
 Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, 15 GiB RAM, no `/dev/dri`.
 Rustc 1.99.0 (`b940084d7`, 2026-09-28). Google Chrome 154.0.8037.92. Native
-binary commit `6f5f187`, profile `opt-level=3`, LTO off, `codegen-units=16`,
+binary commit `e3523f5`, profile `opt-level=3`, LTO off, `codegen-units=16`,
 `cpu-render` (tiny-skia). Five processes per workload. Checksums matched on
-every paired run. Ratio is w3cos / Chromium; below 1 is a w3cos win.
+every paired run (DOM 230, layout 20016, frames 11000, memory 72000, compute
+the same f64). Ratio is w3cos / Chromium; below 1 is a w3cos win.
 
-"Before" is the previous five-run median at `ce74c90` (sibling restyle skip,
-inline declaration replacement, rect cache). "After" unboxes numeric locals
-into native loops, flushes layout through a persistent Taffy tree, and calls
-create/append/style directly from AOT.
+"Before" is the previous five-run median at `6f5f187` (native numeric loop,
+persistent Taffy, direct DOM calls). "After" returns new nodes as NodeId
+immediates, shares one UA style per tag, and solves definite block/flex/grid
+trees without building Taffy.
 
 | workload | metric | w3cos before | w3cos after | Chromium | ratio after |
 | --- | --- | ---: | ---: | ---: | ---: |
-| startup | cold start ms | 52.0 | 52.2 (50.9–54.7) | 228 (212–249) | 0.23 |
-| dom-list | wall ms | 25.3 | 31.1 (30.8–31.9) | 0.80 (0.70–1.20) | 39 |
-| dom-list | steady RSS | 49.8 MB | 43.8 MB | 921 MB | 0.048 |
-| layout | wall ms | 306 | 31.1 (30.5–31.8) | 11.2 (11.1–12.2) | 2.8 |
-| layout | steady RSS | 79.3 MB | 74.6 MB | 976 MB | 0.076 |
-| frames | work p50 ms | 5.63 | 0.166 (0.163–0.177) | 0.20 (0.20–0.30) | 0.83 |
-| frames | work p95 ms | 6.06 | 0.182 (0.180–0.218) | 0.31 (0.30–0.40) | 0.59 |
-| frames | steady RSS | 37.6 MB | 37.5 MB | 927 MB | 0.041 |
-| compute | wall ms | 191 | 1.46 (1.41–1.55) | 1.50 (1.40–1.50) | 0.98 |
-| compute | steady RSS | 16.6 MB | 16.4 MB | 919 MB | 0.018 |
-| memory | wall ms | 358 | 292 (286–306) | 22.9 (21.2–34.8) | 13 |
-| memory | steady RSS | 133 MB | 124 MB | 941 MB | 0.13 |
+| startup | cold start ms | 52.2 | 52.7 (52.3–55.8) | 207 (202–733) | 0.26 |
+| dom-list | wall ms | 31.1 | 3.84 (3.76–3.86) | 1.00 (0.80–1.30) | 3.8 |
+| dom-list | steady RSS | 43.8 MB | 23.1 MB | 922 MB | 0.025 |
+| layout | wall ms | 31.1 | 0.738 (0.725–0.742) | 10.5 (10.4–10.7) | 0.070 |
+| layout | steady RSS | 74.6 MB | 24.4 MB | 977 MB | 0.025 |
+| frames | work p50 ms | 0.166 | 0.160 (0.157–0.164) | 0.25 (0.20–0.30) | 0.64 |
+| frames | work p95 ms | 0.182 | 0.177 (0.167–0.179) | 0.31 (0.30–0.40) | 0.58 |
+| frames | steady RSS | 37.5 MB | 37.3 MB | 924 MB | 0.040 |
+| compute | wall ms | 1.46 | 1.411 (1.405–1.466) | 1.400 (1.400–1.700) | 1.008 |
+| compute | steady RSS | 16.4 MB | 16.2 MB | 920 MB | 0.018 |
+| memory | wall ms | 292 | 16.4 (16.3–16.5) | 20.3 (19.2–21.8) | 0.81 |
+| memory | steady RSS | 124 MB | 25.5 MB | 939 MB | 0.027 |
 
-Cold start, RSS, the numeric loop, and frame work are wins. DOM update time
-is 0.61 ms versus a Chromium median of 0.0 ms (max 0.1 ms). Frame p50/p95
-above are the median of the five per-run percentiles. The earlier pass
-(46.7 ms DOM, 955 ms layout, 194 ms compute) is the "before" column of the
-previous revision of this table.
+Cold start, RSS, layout, frames, and the 4000-node build are wins. DOM create
+is still a loss. The numeric-loop medians overlap: w3cos 1.411 ms versus
+Chromium 1.400 ms, and Chromium's max in this run is 1.700 ms. Frame p50/p95
+above are the median of the five per-run percentiles.
 
 ### What still loses
 
-DOM creation (31 ms vs 0.8 ms) and the 4000-node build (292 ms vs 23 ms) are
-still losses. Layout is 31 ms vs 11 ms, about 2.8×, down from 26×. Checksums
-match.
+DOM list wall time is 3.84 ms versus 1.00 ms (create 3.72 ms versus 0.90 ms,
+update 0.124 ms versus 0.100 ms). That is 3.7 µs per created element, down
+from about 30 µs, and still about 4× Blink's 0.9 µs. The 4000-node workload
+is now a win because the single auto-height layout is no longer a Taffy
+solve: 16.4 ms versus 20.3 ms.
 
-The 400000-iteration loop now lives in `f64` slots inside a Rust `loop`.
-Median 1.46 ms versus V8 1.50 ms (about 3.7 ns per dependent iteration).
+The numeric loop itself got slightly faster (1.46 ms to 1.41 ms). Chromium's
+median in this run moved from 1.50 ms to 1.40 ms, so the ratio is 1.008.
+The ranges overlap. Checksums are identical.
 
-Frame work reads `offsetHeight` on boxes with a definite px height. Those
-reads return the specified border box when no dirty ancestor can move them, so
-the 80 `style.top` writes no longer rebuild the tree. p50 is 0.166 ms versus
-Chromium 0.20 ms.
+Layout of the 240+240 flex/grid tree is 0.74 ms versus 10.5 ms. The timed
+region is 12 width and track-list edits, each followed by `offsetHeight`.
+There is no author stylesheet, every item has a px border box, and margins
+are zero, so flush writes those border boxes directly and does not build a
+Taffy tree. The checksum is exactly 20016 on both sides. Trees with author
+CSS, percentages, floats, abspos, overflow other than visible, or a
+text-driven auto height still go through Taffy. On that path, a tree whose
+heights are already definite skips the second text-metric `compute_layout`.
+Taffy 0.9 has no separate measure-cache switch; unchanged nodes stay clean
+because the tree is not cleared. A full `Style` to `taffy::Style` cache was
+not added: the workloads that were losing no longer call `to_taffy_style`
+during the timer.
 
-Layout keeps one component tree and one Taffy tree. A width or
-`grid-template-columns` edit patches those nodes and calls `compute_layout`
-again. The first timed `offsetHeight` still builds the ~500-node tree (the
-dominant share of the 31 ms). The next eleven reflows are incremental. Taffy
-on this tree is still slower than Blink's flex/grid: 12 reflows cost 31 ms
-here and 11 ms in Chrome. Skipping the post-Taffy projection passes is limited
-to trees whose heights do not depend on text measurement, floats, or tables,
-and the checksum stayed within the harness tolerance.
-
-DOM create is a direct `dom_create_element` / `dom_set_data` / `dom_append_child`
-call, and the update loop is 0.61 ms. Creating 1000 elements plus their text
-nodes is still ~30 µs each: a DOM arena node, a UA style declaration, a
-collectable JS wrapper (host `Rc`, because arena handles are not refcounted
-and the weak wrapper cache must observe the drop), prototype install, and
-insertion invalidation. Blink does the same work at ~0.4 µs/node. At 4000
-nodes that construction, plus one real layout of the auto-height root, is the
-292 ms memory result. Closing it means a bump allocator for repeated `div`
-nodes and a wrapper that does not allocate a property map per element, without
-giving up the weak-cache drop.
+DOM create returns a tagged immediate (node id plus realm generation). No
+`Rc`, prototype, or property map is allocated until JS observes identity
+(`getPrototypeOf`, `__proto__`, `constructor`, or `as_object`). Expando
+storage stays on the node id. Same-tag elements share one UA `CSSStyleDeclaration`
+until a write (`Arc::make_mut`). Short text lives in a 22-byte inline buffer.
+Dirty membership is a stamp, not a linear scan, and node slots are reserved
+128 at a time. What remains per row is the DOM node, a second text node, the
+unique `id` string and its atom, the attribute vector, and the LCRS links.
+That is the 3.7 µs. A true bump arena for `DomNode` would remove the struct
+move into `Vec`, not the unique id string, and would not by itself reach
+0.9 µs.
