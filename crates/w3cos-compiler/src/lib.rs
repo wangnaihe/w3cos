@@ -828,11 +828,12 @@ edition = "2024"
 
 const SPEED_RELEASE_PROFILE: &str = r#"
 # Selected only by W3COS_RELEASE_PROFILE=speed. The default generated profile
-# remains size-optimized (opt-level z, fat LTO). This opt-in is the speed
-# configuration used for browser comparisons.
+# remains size-optimized (opt-level z, fat LTO). Browser comparisons use
+# opt-level 3 without LTO so the measured binary is speed-optimized without
+# requiring a separate bitcode rebuild of every dependency.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "off"
 codegen-units = 16
 panic = "unwind"
 "#;

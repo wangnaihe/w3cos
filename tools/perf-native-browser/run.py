@@ -164,7 +164,7 @@ def host_info(repo):
         "git": revision,
         "viewport": VIEWPORT,
         "chrome_args": CHROME_ARGS,
-        "native_profile": "opt-level=3 lto=thin codegen-units=16 cpu-render",
+        "native_profile": "opt-level=3 lto=off codegen-units=16 cpu-render",
     }
 
 
@@ -228,6 +228,10 @@ def build_native(repo, cli, jobs, build_root):
     env = os.environ.copy()
     env["CARGO_BUILD_JOBS"] = str(jobs)
     env["TMPDIR"] = str(build_root)
+    env["CARGO_TARGET_DIR"] = str(repo / "target")
+    env["CARGO_PROFILE_RELEASE_LTO"] = "off"
+    env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "16"
+    env["CARGO_PROFILE_RELEASE_OPT_LEVEL"] = "3"
     env["W3COS_RUNTIME_FEATURES"] = "cpu-render"
     env["W3COS_RELEASE_PROFILE"] = "speed"
     env["W3COS_NO_STRIP"] = "1"

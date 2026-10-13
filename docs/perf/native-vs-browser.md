@@ -10,7 +10,7 @@ python3 tools/perf-native-browser/run.py --runs 5
 
 The runner builds `target/release/w3cos`, then compiles the workload with
 `W3COS_RUNTIME_FEATURES=cpu-render` and `W3COS_RELEASE_PROFILE=speed`
-(`opt-level = 3`, thin LTO, `codegen-units = 16`). Production app builds stay
+(`opt-level = 3`, LTO off, `codegen-units = 16`). Production app builds stay
 on the size-optimized profile (`opt-level = "z"`, fat LTO). Chromium is the
 host Google Chrome in headless mode, sandbox left on, viewport 1024×768, DPR 1.
 
