@@ -391,6 +391,31 @@ struct Rule {
 thread_local! {
     static RULES: RefCell<RuleSet> = RefCell::new(RuleSet::default());
     static STYLE_GENERATION: Cell<u64> = const { Cell::new(1) };
+    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural.
+    /// Hot DOM mutations read this cell instead of borrowing `RULES`.
+    static RULE_FLAGS: Cell<u8> = const { Cell::new(0) };
+}
+
+fn pack_rule_flags(rules: &RuleSet) -> u8 {
+    let mut flags = 0u8;
+    if !rules.rules.is_empty() {
+        flags |= 1;
+    }
+    if rules.has_sibling_dependencies() {
+        flags |= 2;
+    }
+    if rules.has_relational_dependencies() {
+        flags |= 4;
+    }
+    if rules.has_structural_dependencies() {
+        flags |= 8;
+    }
+    flags
+}
+
+fn refresh_rule_flags() {
+    let flags = RULES.with(|rules| pack_rule_flags(&rules.borrow()));
+    RULE_FLAGS.with(|cell| cell.set(flags));
 }
 
 fn bump_generation() {
@@ -402,15 +427,15 @@ pub(crate) fn generation() -> u64 {
 }
 
 pub(crate) fn has_sibling_dependencies() -> bool {
-    RULES.with(|rules| rules.borrow().has_sibling_dependencies())
+    RULE_FLAGS.with(|cell| cell.get() & 2 != 0)
 }
 
 pub(crate) fn has_relational_dependencies() -> bool {
-    RULES.with(|rules| rules.borrow().has_relational_dependencies())
+    RULE_FLAGS.with(|cell| cell.get() & 4 != 0)
 }
 
 pub(crate) fn has_structural_dependencies() -> bool {
-    RULES.with(|rules| rules.borrow().has_structural_dependencies())
+    RULE_FLAGS.with(|cell| cell.get() & 8 != 0)
 }
 
 const CONTAINER_QUERY_MARKER: &str = "__w3cos_container_query";
@@ -595,6 +620,7 @@ fn register_parsed_rules(
         rules.rules.len() != initial_len
     });
     if added {
+        refresh_rule_flags();
         bump_generation();
     }
 }
@@ -654,6 +680,7 @@ pub fn clear_owner(owner: u64) {
         rules.rules.len() != initial_len || rules.document_roots.len() != initial_roots
     });
     if matches!(removed, Ok(true)) {
+        refresh_rule_flags();
         bump_generation();
     }
 }
@@ -667,6 +694,7 @@ pub fn clear_rules() {
         removed
     });
     if removed {
+        refresh_rule_flags();
         bump_generation();
     }
 }
@@ -678,7 +706,7 @@ pub fn rule_count() -> usize {
 
 /// Whether any rules are registered — fast path for the DOM walk.
 pub fn has_rules() -> bool {
-    RULES.with(|rules| !rules.borrow().rules.is_empty())
+    RULE_FLAGS.with(|cell| cell.get() & 1 != 0)
 }
 
 /// Declarations of every rule matching the given element, ordered for

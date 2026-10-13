@@ -2,6 +2,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -107,12 +108,64 @@ fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String
     current
 }
 
+/// Atom keys are already unique integers. Hashing them with SipHash showed up
+/// in the element-create profile (`id` / `class` / tag indexes).
+#[derive(Clone, Default)]
+struct AtomHasher(u64);
+
+impl Hasher for AtomHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut acc = self.0;
+        for &byte in bytes {
+            acc = acc.wrapping_mul(0x100000001b3) ^ u64::from(byte);
+        }
+        self.0 = acc;
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+#[derive(Clone, Default)]
+struct AtomBuildHasher;
+
+impl BuildHasher for AtomBuildHasher {
+    type Hasher = AtomHasher;
+
+    fn build_hasher(&self) -> AtomHasher {
+        AtomHasher(0)
+    }
+}
+
+type AtomMap<V> = HashMap<Atom, V, AtomBuildHasher>;
+
 fn shared_ua_style(tag: Atom) -> Arc<CSSStyleDeclaration> {
     thread_local! {
         static UA_STYLES: RefCell<HashMap<Atom, Arc<CSSStyleDeclaration>>> =
             RefCell::new(HashMap::new());
+        /// Last two tags (`div` then `#text` on the create path) skip the map.
+        static HOT: RefCell<[(u32, Option<Arc<CSSStyleDeclaration>>); 2]> =
+            RefCell::new([(u32::MAX, None), (u32::MAX, None)]);
     }
-    UA_STYLES.with(|cache| {
+    let id = tag.as_u32();
+    if let Some(style) = HOT.with(|hot| {
+        hot.borrow()
+            .iter()
+            .find(|(cached, _)| *cached == id)
+            .and_then(|(_, style)| style.clone())
+    }) {
+        return style;
+    }
+    let style = UA_STYLES.with(|cache| {
         if let Some(hit) = cache.borrow().get(&tag) {
             return Arc::clone(hit);
         }
@@ -121,7 +174,13 @@ fn shared_ua_style(tag: Atom) -> Arc<CSSStyleDeclaration> {
         });
         cache.borrow_mut().insert(tag, Arc::clone(&style));
         style
-    })
+    });
+    HOT.with(|hot| {
+        let mut hot = hot.borrow_mut();
+        hot[1] = hot[0].clone();
+        hot[0] = (id, Some(Arc::clone(&style)));
+    });
+    style
 }
 
 /// Preallocated node page. Create loops of a few thousand elements must not
@@ -202,9 +261,9 @@ pub struct Document {
     pub(crate) events: EventRegistry,
     body_id: NodeId,
     // Fast lookup indexes
-    id_index: HashMap<Atom, NodeId>,
-    class_index: HashMap<Atom, Vec<NodeId>>,
-    tag_index: HashMap<Atom, Vec<NodeId>>,
+    id_index: AtomMap<NodeId>,
+    class_index: AtomMap<Vec<NodeId>>,
+    tag_index: AtomMap<Vec<NodeId>>,
     // The selected responsive-image source used by component lowering. This
     // is rendering state rather than a reflected HTML attribute: `img.src`
     // must continue to expose the author-provided fallback while `currentSrc`
@@ -324,9 +383,9 @@ impl Document {
             computed_style_cache_misses: Cell::new(0),
             events: EventRegistry::new(),
             body_id: NodeId(0),
-            id_index: HashMap::with_capacity(32768),
-            class_index: HashMap::new(),
-            tag_index: HashMap::new(),
+            id_index: HashMap::with_capacity_and_hasher(32768, AtomBuildHasher),
+            class_index: HashMap::with_hasher(AtomBuildHasher),
+            tag_index: HashMap::with_hasher(AtomBuildHasher),
             image_render_sources: HashMap::new(),
             embedded_document_hosts: HashSet::new(),
             selection: Selection::new(),
@@ -724,6 +783,57 @@ impl Document {
         std::str::from_utf8(&self.page_strings[start..end]).unwrap_or("")
     }
 
+    /// Create `tag`, set `id` / `class`, attach one text child, and append it
+    /// to `parent` without a per-step style walk when no author rule can
+    /// observe the new node. Author stylesheets keep the normal invalidation.
+    pub fn append_labeled_element(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        id_value: &str,
+        class_name: &str,
+        text: &str,
+    ) -> NodeId {
+        let element = self.create_element(tag);
+        if !id_value.is_empty() {
+            element.set_attribute(self, "id", id_value);
+        }
+        if !class_name.is_empty() {
+            element.set_class_name(self, class_name);
+        }
+        if stylesheet::has_rules() {
+            if !text.is_empty() {
+                let _ = self.set_inline_text_child(element.id, text);
+            }
+            self.append_child(parent, element.id);
+            return element.id;
+        }
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element.id, text_id);
+        }
+        self.link_fresh_child(parent, element.id);
+        self.mark_dirty(parent);
+        self.note_structure_change();
+        element.id
+    }
+
+    /// Link a node that has no parent and no descendants that already point
+    /// back. The caller has just allocated it, so a cycle check cannot fail.
+    fn link_fresh_child(&mut self, parent: NodeId, child: NodeId) {
+        let parent_last = self.get_node(parent).last_child;
+        if let Some(last) = parent_last {
+            self.get_node_mut(last).next_sibling = child.as_u32();
+            self.get_node_mut(child).prev_sibling = last.as_u32();
+        } else {
+            self.get_node_mut(parent).first_child = Some(child);
+            self.get_node_mut(child).prev_sibling = 0;
+        }
+        self.get_node_mut(child).next_sibling = 0;
+        self.get_node_mut(child).parent = Some(parent);
+        self.get_node_mut(parent).last_child = Some(child);
+    }
+
     /// Single text child stored as the parent's tail. Bytes are bump-copied
     /// into the page arena once; the text node keeps an inline copy when the
     /// string fits in `CompactStr` (no heap `String`).
@@ -956,10 +1066,19 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub(crate) fn update_id_index(&mut self, node_id: NodeId, old_id: Option<&str>, new_id: &str) {
+        self.update_id_index_atom(node_id, old_id.map(Atom::intern), Atom::intern(new_id));
+    }
+
+    pub(crate) fn update_id_index_atom(
+        &mut self,
+        node_id: NodeId,
+        old_id: Option<Atom>,
+        new_id: Atom,
+    ) {
         if let Some(old) = old_id {
-            self.id_index.remove(&Atom::intern(old));
+            self.id_index.remove(&old);
         }
-        self.id_index.insert(Atom::intern(new_id), node_id);
+        self.id_index.insert(new_id, node_id);
     }
 
     pub(crate) fn add_to_class_index(&mut self, node_id: NodeId, class: &Atom) {
@@ -1035,12 +1154,16 @@ impl Document {
     /// Text mutations can change the parent's `:empty` state. Relational
     /// selectors such as `:has()` conservatively fall back to document scope.
     pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
-        let invalidation_root = if stylesheet::has_relational_dependencies() {
-            NodeId::ROOT
+        if stylesheet::has_relational_dependencies() {
+            self.invalidate_style_subtree(NodeId::ROOT);
+        } else if stylesheet::has_structural_dependencies() {
+            let invalidation_root = self.get_node(id).parent.unwrap_or(id);
+            self.invalidate_style_subtree(invalidation_root);
         } else {
-            self.get_node(id).parent.unwrap_or(id)
-        };
-        self.invalidate_style_subtree(invalidation_root);
+            // Text does not change tag/id/class matching. Touching the node
+            // keeps the cascade cache honest without walking the subtree.
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
         self.note_structure_change();
     }
@@ -17165,8 +17288,51 @@ mod image_component_tests {
 
         // 30px of a 30px font is a ratio of 1.
         assert_eq!(document.computed_style_for(inner.id).line_height, 1.0);
+        assert!(!document.computed_style_for(inner.id).line_height_is_normal);
+        assert_eq!(
+            document.computed_style_for(inner.id).line_height_computed_px,
+            Some(30.0)
+        );
         // The same declaration at the initial 16px stays 1.875.
         assert_eq!(document.computed_style_for(plain.id).line_height, 1.875);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn class_rules_set_percent_width_and_absolute_line_height() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".card", &[("display", "block"), ("width", "50%")]);
+        crate::stylesheet::register_rule(
+            ".copy",
+            &[
+                ("display", "block"),
+                ("margin", "0"),
+                ("font-size", "16px"),
+                ("line-height", "20px"),
+            ],
+        );
+        let mut document = Document::new();
+        let card = document.create_element("div");
+        card.set_class_name(&mut document, "card");
+        let copy = document.create_element("div");
+        copy.set_class_name(&mut document, "copy");
+        let text = document.create_text_node("measure measure 0");
+        copy.append_child(&mut document, text);
+        card.append_child(&mut document, copy);
+        document.body().append_child(&mut document, card);
+
+        let card_style = document.computed_style_for(card.id);
+        assert_eq!(card_style.width, w3cos_std::style::Dimension::Percent(50.0));
+        let copy_style = document.computed_style_for(copy.id);
+        assert_eq!(copy_style.font_size, 16.0);
+        assert!(!copy_style.line_height_is_normal);
+        assert_eq!(copy_style.line_height_computed_px, Some(20.0));
+        let text_style = document.computed_style_for(text.id);
+        assert!(
+            !text_style.line_height_is_normal,
+            "text should inherit the authored line box: {text_style:?}"
+        );
+        assert_eq!(text_style.line_height_computed_px, Some(20.0));
         crate::stylesheet::clear_rules();
     }
 

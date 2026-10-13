@@ -447,6 +447,16 @@ impl Value {
         self.object_ref_raw()
     }
 
+    /// Host-object address or interned handle, without cloning an `Rc`.
+    #[inline]
+    pub fn object_identity_bits(&self) -> Option<u64> {
+        match self {
+            Value::Object(object) => Some(Rc::as_ptr(object) as u64),
+            Value::Imm(imm) => imm.object_handle().map(|handle| (handle as u64) | (1 << 63)),
+            _ => None,
+        }
+    }
+
     /// Object storage that does not materialize a DOM immediate.
     #[inline]
     pub fn object_ref_raw(&self) -> Option<JsObjectRef> {
@@ -591,6 +601,15 @@ impl ArrayStorage {
     pub(crate) fn push(&mut self, value: Value) {
         self.values.push(value);
         self.refresh_heap_accounting();
+    }
+
+    /// Grow once toward `min_capacity` instead of doubling through every
+    /// power of two. Create loops push thousands of handles.
+    pub(crate) fn push_reserved(&mut self, value: Value, min_capacity: usize) {
+        if self.values.len() >= 16 && self.values.capacity() < min_capacity {
+            self.values.reserve(min_capacity - self.values.capacity());
+        }
+        self.push(value);
     }
 
     pub(crate) fn pop(&mut self) -> Option<Value> {
@@ -3379,7 +3398,7 @@ impl JsPiece {
     }
 }
 
-fn write_i64(value: i64, buf: &mut [u8; 48]) -> usize {
+pub(crate) fn write_i64(value: i64, buf: &mut [u8]) -> usize {
     if value == 0 {
         buf[0] = b'0';
         return 1;

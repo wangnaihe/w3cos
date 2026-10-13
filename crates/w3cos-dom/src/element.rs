@@ -1,9 +1,31 @@
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
 use crate::document::Document;
+use crate::stylesheet;
 use crate::dom_rect::DOMRect;
 use crate::events::{Event, EventHandler, EventType};
 use crate::node::{NodeId, NodeType};
+
+fn cached_attr_name(name: &str) -> Atom {
+    thread_local! {
+        static ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+        static CLASS: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    }
+    fn load(slot: &std::cell::Cell<u32>, name: &str) -> Atom {
+        let id = slot.get();
+        if id != u32::MAX {
+            return Atom::from_u32(id);
+        }
+        let atom = Atom::intern(name);
+        slot.set(atom.as_u32());
+        atom
+    }
+    match name {
+        "id" => ID.with(|slot| load(slot, name)),
+        "class" => CLASS.with(|slot| load(slot, name)),
+        _ => Atom::intern(name),
+    }
+}
 
 /// W3C Element API — the primary interface for DOM manipulation.
 ///
@@ -54,7 +76,8 @@ impl Element {
             self.set_class_name(doc, value);
             return;
         }
-        let atom_name = Atom::intern(name);
+        let atom_name = cached_attr_name(name);
+        let value_atom = Atom::intern(value);
         let existing_index = doc
             .get_node(self.id)
             .attributes
@@ -63,21 +86,21 @@ impl Element {
         if let Some(existing_index) = existing_index {
             let old_value = doc.get_node(self.id).attributes[existing_index].1;
             let node = doc.get_node_mut(self.id);
+            node.attributes[existing_index].1 = crate::node::AttrValue::from_atom(value_atom);
             if name == "id" {
-                node.attributes[existing_index].1 = crate::node::AttrValue::new(value);
-                doc.update_id_index(self.id, Some(old_value.as_str()), value);
-            } else {
-                node.attributes[existing_index].1 = crate::node::AttrValue::new(value);
+                doc.update_id_index_atom(self.id, Some(old_value.atom()), value_atom);
             }
         } else {
             let node = doc.get_node_mut(self.id);
             node.attributes
-                .push((atom_name, crate::node::AttrValue::new(value)));
+                .push((atom_name, crate::node::AttrValue::from_atom(value_atom)));
             if name == "id" {
-                doc.update_id_index(self.id, None, value);
+                doc.update_id_index_atom(self.id, None, value_atom);
             }
         }
-        doc.mark_selector_dirty(self.id);
+        if name != "id" || stylesheet::has_rules() {
+            doc.mark_selector_dirty(self.id);
+        }
     }
 
     pub fn set_attribute_ns(
@@ -164,12 +187,17 @@ impl Element {
     }
 
     pub fn class_list_add(&self, doc: &mut Document, class: &str) {
-        let atom = Atom::intern(class);
+        self.class_list_add_atom(doc, Atom::intern(class));
+    }
+
+    fn class_list_add_atom(&self, doc: &mut Document, atom: Atom) {
         let node = doc.get_node_mut(self.id);
         if !node.class_list.contains(&atom) {
             node.class_list.push(atom);
             doc.add_to_class_index(self.id, &atom);
-            doc.mark_selector_dirty(self.id);
+            if stylesheet::has_rules() {
+                doc.mark_selector_dirty(self.id);
+            }
         }
     }
 
@@ -316,7 +344,7 @@ impl Element {
 
     pub fn set_class_name(&self, doc: &mut Document, name: &str) {
         let node = doc.get_node_mut(self.id);
-        let class_attr = Atom::intern("class");
+        let class_attr = cached_attr_name("class");
         if let Some(index) = node
             .attributes
             .iter()
@@ -328,24 +356,35 @@ impl Element {
         for class in old_classes {
             doc.remove_from_class_index(self.id, &class);
         }
+        // One intern of the attribute text. A single token reuses that atom
+        // for the class list so "row" is not hashed twice per element.
+        let whole = Atom::intern(name);
+        let mut reused_whole = false;
         for class in name
             .split([' ', '\t', '\n', '\r', '\x0c'])
             .filter(|class| !class.is_empty())
         {
-            self.class_list_add(doc, class);
+            if !reused_whole && class.len() == name.len() {
+                self.class_list_add_atom(doc, whole);
+                reused_whole = true;
+            } else {
+                self.class_list_add(doc, class);
+            }
         }
         let node = doc.get_node_mut(self.id);
+        let value = crate::node::AttrValue::from_atom(whole);
         let index = node
             .attributes
             .iter()
             .position(|(key, _)| *key == class_attr);
         if let Some(index) = index {
-            node.attributes[index].1 = crate::node::AttrValue::new(name);
+            node.attributes[index].1 = value;
         } else {
-            node.attributes
-                .push((class_attr, crate::node::AttrValue::new(name)));
+            node.attributes.push((class_attr, value));
         }
-        doc.mark_selector_dirty(self.id);
+        if stylesheet::has_rules() {
+            doc.mark_selector_dirty(self.id);
+        }
     }
 
     /// `element.dataset` — returns all `data-*` attributes as key/value pairs.

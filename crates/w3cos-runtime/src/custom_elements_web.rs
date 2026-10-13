@@ -1,6 +1,6 @@
 //! JavaScript-facing Custom Elements registry and lifecycle bridge.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -13,6 +13,7 @@ use crate::jsdom::{
 
 thread_local! {
     static DEFINITIONS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static HAS_DEFINITIONS: Cell<bool> = const { Cell::new(false) };
     static WAITERS: RefCell<HashMap<String, Vec<Value>>> = RefCell::new(HashMap::new());
     static REGISTRY_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static REGISTRY_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -538,11 +539,11 @@ fn run_constructor(element: &Value, constructor: &Value) {
 /// Upgrade an element created through the document bridge when its tag has a
 /// registered autonomous custom-element definition.
 pub fn has_definitions() -> bool {
-    DEFINITIONS.with(|definitions| !definitions.borrow().is_empty())
+    HAS_DEFINITIONS.with(Cell::get)
 }
 
 pub fn upgrade_created_element(tag: &str, element: Value) -> Value {
-    if DEFINITIONS.with(|definitions| definitions.borrow().is_empty()) {
+    if !HAS_DEFINITIONS.with(Cell::get) {
         return element;
     }
     if element
@@ -742,6 +743,7 @@ pub fn custom_elements_value() -> Value {
                             .borrow_mut()
                             .insert(name.clone(), constructor.clone());
                     });
+                    HAS_DEFINITIONS.with(|slot| slot.set(true));
                     let document_element =
                         crate::jsdom::document_value().get_property("documentElement");
                     upgrade_subtree(&document_element);
@@ -874,6 +876,7 @@ pub fn custom_elements_value() -> Value {
 
 pub fn reset() {
     DEFINITIONS.with(|definitions| definitions.borrow_mut().clear());
+    HAS_DEFINITIONS.with(|slot| slot.set(false));
     WAITERS.with(|waiters| waiters.borrow_mut().clear());
     REGISTRY_VALUE.with(|slot| {
         if let Some(registry) = slot.borrow_mut().take() {

@@ -3431,6 +3431,9 @@ fn cascade_measure_width(text: &str, style: &w3cos_std::style::Style) -> f32 {
 }
 
 fn cascade_line_height(text: &str, style: &w3cos_std::style::Style) -> f32 {
+    if style.line_height_computed_px.is_some() {
+        return crate::layout::inline_style_line_height(style);
+    }
     let registry = crate::font_face::FontRegistry::global();
     registry
         .resolve_style_runs(style, text)
@@ -3489,7 +3492,7 @@ fn cascade_text_intrinsic_size(
         .map(|line| cascade_measure_width(line, style))
         .fold(0.0_f32, f32::max);
     let used_line_count = text_layout::used_text_line_count(content, style, &lines);
-    let height = if used_line_count == 1 {
+    let height = if used_line_count == 1 && style.line_height_computed_px.is_none() {
         cascade_line_height(&lines[0], style)
     } else {
         used_line_count as f32 * crate::layout::inline_style_line_height(&style)
@@ -21375,7 +21378,22 @@ fn update_text_leaf_heights(
             if let ComponentKind::Text { content } = flat[idx].kind {
                 let style = flat[idx].style;
                 if matches!(style.height, WDim::Auto) {
-                    let mut h = wrapped_text_height(content, node_width, style);
+                    let wrap_width = text_containing_block_width(tree, node, flat, node_width);
+                    let mut h = wrapped_text_height(content, wrap_width, style);
+                    if std::env::var_os("W3COS_TEXT_TRACE").is_some() {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static TRACED: AtomicU32 = AtomicU32::new(0);
+                        if TRACED.fetch_add(1, Ordering::Relaxed) < 6 {
+                            eprintln!(
+                                "W3COS_TEXT w={node_width} wrap={wrap_width} h={h} fs={} lh={} normal={} px={:?} len={}",
+                                style.font_size,
+                                style.line_height,
+                                style.line_height_is_normal,
+                                style.line_height_computed_px,
+                                content.len()
+                            );
+                        }
+                    }
                     if let Some(browser_height) =
                         browser_normal_cjk_height(content, style, parent_display)
                     {
@@ -21416,6 +21434,48 @@ fn update_text_leaf_heights(
         dirty |= update_text_leaf_heights(tree, child, flat, current_display)?;
     }
     Ok(dirty)
+}
+
+/// Inline text wraps at the nearest block container's content box. Taffy
+/// sizes the text leaf to its max-content width, which would otherwise report
+/// a single line even when the author box is narrower.
+fn text_containing_block_width(
+    tree: &TaffyTree<usize>,
+    node: NodeId,
+    flat: &[FlatNodeInfo<'_>],
+    node_width: f32,
+) -> f32 {
+    let mut current = node;
+    while let Some(parent) = tree.parent(current) {
+        let Some(index) = tree.get_node_context(parent).copied() else {
+            break;
+        };
+        let Some(info) = flat.get(index) else {
+            break;
+        };
+        if matches!(info.style.display, WDisplay::Inline) {
+            current = parent;
+            continue;
+        }
+        let Ok(layout) = tree.layout(parent) else {
+            break;
+        };
+        let padding = info.style.padding_lengths();
+        let border = info.style.border_left_width.unwrap_or(info.style.border_width)
+            + info.style.border_right_width.unwrap_or(info.style.border_width);
+        let content = layout.size.width - padding.left - padding.right - border;
+        // A leaf only a border or subpixel wider than its container is already
+        // the wrapped line. Rewrapping those changes padding/border boxes.
+        // A max-content leaf that overflows a narrower block wraps at the block.
+        if content.is_finite() && content > 0.0 && node_width > content + 8.0 {
+            if std::env::var_os("W3COS_TEXT_TRACE").is_some() {
+                eprintln!("WRAP node={node_width} content={content} parent_w={}", layout.size.width);
+            }
+            return content.max(1.0);
+        }
+        break;
+    }
+    node_width.max(1.0)
 }
 
 fn to_taffy_display(d: WDisplay) -> taffy::Display {

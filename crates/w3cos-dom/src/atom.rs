@@ -167,7 +167,8 @@ impl InternTable {
     }
 
     fn intern(&mut self, s: &str) -> u32 {
-        if let Some(id) = self.lookup(s) {
+        let hash = hash_str(s);
+        if let Some(id) = self.lookup_hash(hash, s) {
             return id;
         }
         if (self.len + 1) * 10 >= self.slots.len() * 7 {
@@ -175,16 +176,16 @@ impl InternTable {
         }
         let id = self.ranges.len() as u32;
         self.push_bytes(s.as_bytes());
-        self.insert_slot(hash_str(s), id);
+        self.insert_slot(hash, id);
         self.len += 1;
         id
     }
 
-    fn lookup(&self, s: &str) -> Option<u32> {
+    fn lookup_hash(&self, hash: u64, s: &str) -> Option<u32> {
         if self.slots.is_empty() {
             return None;
         }
-        let mut index = hash_str(s) as usize & self.mask;
+        let mut index = hash as usize & self.mask;
         for _ in 0..self.slots.len() {
             let slot = self.slots[index];
             if slot == 0 {

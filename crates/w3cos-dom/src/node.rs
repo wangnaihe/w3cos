@@ -199,6 +199,10 @@ impl AttrValue {
         Self(Atom::intern(value))
     }
 
+    pub(crate) fn from_atom(atom: Atom) -> Self {
+        Self(atom)
+    }
+
     pub fn atom(self) -> Atom {
         self.0
     }
@@ -568,12 +572,33 @@ pub struct DomNode {
     pub is_html_element: bool,
 }
 
+fn cached_tag(tag: &str) -> Atom {
+    thread_local! {
+        static DIV: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+        static TEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    }
+    fn load(slot: &std::cell::Cell<u32>, tag: &str) -> Atom {
+        let id = slot.get();
+        if id != u32::MAX {
+            return Atom::from_u32(id);
+        }
+        let atom = Atom::intern(tag);
+        slot.set(atom.as_u32());
+        atom
+    }
+    match tag {
+        "div" => DIV.with(|slot| load(slot, tag)),
+        "#text" => TEXT.with(|slot| load(slot, tag)),
+        _ => Atom::intern(tag),
+    }
+}
+
 impl DomNode {
     pub fn new_element(id: NodeId, tag: impl AsRef<str>) -> Self {
         Self {
             id,
             node_type: NodeType::Element,
-            tag: Atom::intern(tag.as_ref()),
+            tag: cached_tag(tag.as_ref()),
             text_content: None,
             parent: None,
             first_child: None,
@@ -591,7 +616,7 @@ impl DomNode {
         Self {
             id,
             node_type: NodeType::Text,
-            tag: Atom::intern("#text"),
+            tag: cached_tag("#text"),
             text_content: Some(content.into()),
             parent: None,
             first_child: None,

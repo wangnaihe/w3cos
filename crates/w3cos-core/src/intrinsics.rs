@@ -563,6 +563,12 @@ pub struct DomFast {
     pub create_text: fn(&Value, &str) -> Value,
     pub append_child: fn(&Value, &Value) -> Value,
     pub set_data: fn(&Value, &str, &Value) -> bool,
+    /// `name` + raw text. The bytes are not a `Value`, so a `"prefix" + i`
+    /// store can format into a stack buffer and skip the page-string intern.
+    pub set_data_str: fn(&Value, &str, &str) -> bool,
+    /// One create + id + class + text + append. The create loop uses this
+    /// instead of five document borrows and three string interns.
+    pub build_appended: fn(&Value, &Value, &str, &str, f64, &str, &str, f64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -607,6 +613,88 @@ pub fn dom_append_child(parent: &Value, child: &Value) -> Value {
 
 pub fn dom_set_data(object: &Value, name: &str, value: &Value) -> bool {
     DOM_FAST.get().is_some_and(|fast| (fast.set_data)(object, name, value))
+}
+
+/// `object[name] = left + right` when `right` is an integer. Formats into a
+/// stack buffer so the create loop does not intern a throwaway `JsString`.
+pub fn dom_set_data_concat(object: &Value, name: &str, left: &Value, right: &Value) -> bool {
+    let Some(fast) = DOM_FAST.get() else {
+        return false;
+    };
+    let Some(prefix) = left.as_js_string() else {
+        return false;
+    };
+    let Some(number) = right.as_number() else {
+        return false;
+    };
+    if !number.is_finite() || number.fract() != 0.0 || number.abs() >= 1e15 {
+        return false;
+    }
+    let prefix = prefix.as_str();
+    let mut buf = [0u8; 96];
+    if prefix.len() + 20 > buf.len() {
+        return false;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let digits = crate::value::write_i64(number as i64, &mut buf[prefix.len()..]);
+    let text = std::str::from_utf8(&buf[..prefix.len() + digits]).unwrap_or("");
+    (fast.set_data_str)(object, name, text)
+}
+
+pub fn format_prefix_index<'a>(prefix: &str, index: f64, buf: &'a mut [u8]) -> Option<&'a str> {
+    if !index.is_finite() || index.fract() != 0.0 || index.abs() >= 1e15 {
+        return None;
+    }
+    if prefix.len() + 20 > buf.len() {
+        return None;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let digits = crate::value::write_i64(index as i64, &mut buf[prefix.len()..]);
+    std::str::from_utf8(&buf[..prefix.len() + digits]).ok()
+}
+
+/// `document.createElement(tag)` + id/class/text + `parent.appendChild` in one
+/// call. `id` and `text` are `prefix + index` with an integer index.
+pub fn dom_build_appended(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    id_prefix: &str,
+    id_index: f64,
+    class_name: &str,
+    text_prefix: &str,
+    text_index: f64,
+) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        return (fast.build_appended)(
+            document, parent, tag, id_prefix, id_index, class_name, text_prefix, text_index,
+        );
+    }
+    let element = dom_create_element(document, tag);
+    let _ = dom_set_data_concat(
+        &element,
+        "id",
+        &Value::string(id_prefix),
+        &Value::Number(id_index),
+    );
+    element.set_property("className", Value::string(class_name));
+    let _ = dom_set_data_concat(
+        &element,
+        "textContent",
+        &Value::string(text_prefix),
+        &Value::Number(text_index),
+    );
+    dom_append_child(parent, &element)
+}
+
+/// `array.push(value)` without allocating an arguments `Vec`.
+pub fn array_push(array: &Value, value: &Value) -> Value {
+    if let Some(storage) = array.as_array() {
+        let mut values = storage.borrow_mut();
+        values.push_reserved(value.clone(), 1024);
+        return Value::Number(values.len() as f64);
+    }
+    array.call_method("push", vec![value.clone()])
 }
 
 pub fn dom_set_style(object: &Value, name: &str, value: &Value) -> bool {

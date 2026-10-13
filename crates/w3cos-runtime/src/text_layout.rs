@@ -959,7 +959,7 @@ pub fn text_intrinsic_size_font(
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = crate::layout::inline_style_line_height(&style);
     let used_line_count = used_text_line_count(content, style, &lines);
-    let h = if used_line_count == 1 {
+    let h = if used_line_count == 1 && style.line_height_computed_px.is_none() {
         single_line_content_height(&lines[0], style.font_size, style.line_height, font)
     } else {
         used_line_count as f32 * line_h
@@ -988,9 +988,12 @@ pub fn wrapped_block_height_font(
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = crate::layout::inline_style_line_height(&style);
     let used_line_count = used_text_line_count(content, style, &lines);
-    let block_h = if used_line_count == 1 {
+    let block_h = if used_line_count == 1 && style.line_height_computed_px.is_none() {
         single_line_content_height(&lines[0], style.font_size, style.line_height, font)
     } else {
+        // An authored length (`line-height: 20px`) is the line box. Ink may
+        // overflow it; it does not grow offsetHeight the way a unitless or
+        // `normal` line-height does.
         used_line_count as f32 * line_h
     };
     block_h + style.padding_lengths().top + style.padding_lengths().bottom

@@ -297,6 +297,8 @@ thread_local! {
     /// document Realm so authored expandos, event properties and child host
     /// objects cannot leak into the next navigation.
     static DOCUMENT_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    /// Address of the memoized document object. `0` means "look it up".
+    static DOCUMENT_IDENTITY: Cell<u64> = const { Cell::new(0) };
     static WINDOW_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static LOCATION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static SELECTION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
@@ -950,6 +952,8 @@ fn ensure_dom_fast() {
         create_text: fast_create_text,
         append_child: fast_append_child,
         set_data: fast_set_data,
+        set_data_str: fast_set_data_str,
+        build_appended: fast_build_appended,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -963,9 +967,18 @@ fn ensure_dom_fast() {
 }
 
 fn is_document_value(object: &Value) -> bool {
-    document_value().as_object().is_some_and(|document| {
-        object.as_object().is_some_and(|candidate| document.ptr_eq(&candidate))
-    })
+    let Some(bits) = object.object_identity_bits() else {
+        return false;
+    };
+    let cached = DOCUMENT_IDENTITY.with(|cell| cell.get());
+    if cached != 0 && cached == bits {
+        return true;
+    }
+    let Some(document_bits) = document_value().object_identity_bits() else {
+        return false;
+    };
+    DOCUMENT_IDENTITY.with(|cell| cell.set(document_bits));
+    document_bits == bits
 }
 
 fn html_create_element_folds_case() -> bool {
@@ -1024,6 +1037,78 @@ fn fast_set_data(object: &Value, name: &str, value: &Value) -> bool {
         return false;
     };
     element_computed_set(node, name, value.clone());
+    true
+}
+
+fn fast_build_appended(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    id_prefix: &str,
+    id_index: f64,
+    class_name: &str,
+    text_prefix: &str,
+    text_index: f64,
+) -> Value {
+    let mut id_buf = [0u8; 96];
+    let mut text_buf = [0u8; 96];
+    let Some(id_text) = w3cos_core::intrinsics::format_prefix_index(id_prefix, id_index, &mut id_buf) else {
+        return Value::Undefined;
+    };
+    let Some(text) = w3cos_core::intrinsics::format_prefix_index(text_prefix, text_index, &mut text_buf) else {
+        return Value::Undefined;
+    };
+    if !is_document_value(document)
+        || !crate::observers_web::mutation_observers_empty()
+        || node_id_of(parent).is_none()
+    {
+        let element = fast_create_element(document, tag);
+        let _ = fast_set_data_str(&element, "id", id_text);
+        let _ = fast_set_data_str(&element, "className", class_name);
+        let _ = fast_set_data_str(&element, "textContent", text);
+        return fast_append_child(parent, &element);
+    }
+    let parent_id = node_id_of(parent).expect("parent checked");
+    if !valid_element_name(tag) {
+        dom_exception("The element name is not valid", "InvalidCharacterError");
+    }
+    let lowered;
+    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        lowered = tag.to_ascii_lowercase();
+        lowered.as_str()
+    } else {
+        tag
+    };
+    let child = dom::with_document_mut(|doc| {
+        doc.append_labeled_element(
+            w3cos_dom::NodeId::from_u32(parent_id),
+            tag,
+            id_text,
+            class_name,
+            text,
+        )
+        .as_u32()
+    });
+    dom::mark_dom_dirty();
+    if tag == "template" {
+        ensure_template_content(child);
+    } else if tag == "script" {
+        set_expando(child, "__w3cos_force_async", Value::Bool(true));
+    }
+    crate::custom_elements_web::upgrade_created_element(tag, dom_handle(child))
+}
+
+fn fast_set_data_str(object: &Value, name: &str, text: &str) -> bool {
+    let Some(node) = node_id_of(object) else {
+        return false;
+    };
+    match name {
+        "id" => dom::set_attribute(node, "id", text),
+        "className" => dom::set_attribute(node, "class", text),
+        "textContent" => apply_text_content(node, text),
+        _ => return false,
+    }
     true
 }
 
@@ -9986,7 +10071,15 @@ pub(crate) fn sync_style_element(node: u32) {
     if !dom::is_connected(node) {
         return;
     }
-    register_author_sheet(owner, &dom::get_descendant_text_content(node));
+    let css = dom::get_descendant_text_content(node);
+    if std::env::var_os("W3COS_TEXT_TRACE").is_some() {
+        eprintln!(
+            "W3COS_STYLE owner={owner} bytes={} rules_before={}",
+            css.len(),
+            w3cos_dom::stylesheet::has_rules()
+        );
+    }
+    register_author_sheet(owner, &css);
 }
 
 fn register_author_sheet(owner: u64, css: &str) {
@@ -10021,6 +10114,41 @@ fn register_author_sheet(owner: u64, css: &str) {
     }
 }
 
+fn apply_text_content(node: u32, text: &str) {
+    if text.is_empty() {
+        replace_all_children(node, || {});
+        return;
+    }
+    if !crate::observers_web::mutation_observers_empty() {
+        replace_all_children(node, || {
+            let child = dom::create_text_node(text);
+            ensure_tree_insertion(node, child);
+            dom::append_child(node, child);
+        });
+        return;
+    }
+    let mut applied = false;
+    let mut is_style = false;
+    let style = style_atom();
+    dom::with_document_mut(|doc| {
+        let id = w3cos_dom::NodeId::from_u32(node);
+        is_style = doc.get_node(id).tag == style;
+        applied = doc.set_inline_text_child(id, text).is_some();
+    });
+    if applied {
+        dom::mark_dom_dirty();
+        if is_style {
+            sync_style_element(node);
+        }
+        return;
+    }
+    replace_all_children(node, || {
+        let child = dom::create_text_node(text);
+        ensure_tree_insertion(node, child);
+        dom::append_child(node, child);
+    });
+}
+
 fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
     match key {
         "contentDocument" | "contentWindow" if dom::tag_name(node) == "object" => return true,
@@ -10028,38 +10156,7 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
             if value.is_null() || value.is_undefined() {
                 replace_all_children(node, || {});
             } else {
-                with_value_text(&value, |text| {
-                    if text.is_empty() {
-                        replace_all_children(node, || {});
-                    } else if crate::observers_web::mutation_observers_empty() {
-                        let mut applied = false;
-                        let mut is_style = false;
-                        let style = style_atom();
-                        dom::with_document_mut(|doc| {
-                            let id = w3cos_dom::NodeId::from_u32(node);
-                            is_style = doc.get_node(id).tag == style;
-                            applied = doc.set_inline_text_child(id, text).is_some();
-                        });
-                        if applied {
-                            dom::mark_dom_dirty();
-                            if is_style {
-                                sync_style_element(node);
-                            }
-                        } else {
-                            replace_all_children(node, || {
-                                let child = dom::create_text_node(text);
-                                ensure_tree_insertion(node, child);
-                                dom::append_child(node, child);
-                            });
-                        }
-                    } else {
-                        replace_all_children(node, || {
-                            let child = dom::create_text_node(text);
-                            ensure_tree_insertion(node, child);
-                            dom::append_child(node, child);
-                        });
-                    }
-                });
+                with_value_text(&value, |text| apply_text_content(node, text));
             }
         }
         "textContent" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => {
@@ -20426,6 +20523,7 @@ pub fn reset_bridge() {
     DOCUMENT_VALUE.with(|value| {
         value.borrow_mut().take();
     });
+    DOCUMENT_IDENTITY.with(|cell| cell.set(0));
     LOCATION_VALUE.with(|value| {
         value.borrow_mut().take();
     });
