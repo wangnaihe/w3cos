@@ -1983,6 +1983,21 @@ impl Value {
         Value::Imm(Immediate::from_object_handle(handle))
     }
 
+    /// Host `Rc` object with a shared proxy. Unlike [`Self::proxied_object`],
+    /// dropping the last handle collects the wrapper. DOM nodes that are not
+    /// pinned by a live tree use this so a weak cache can observe the drop.
+    pub fn proxied_host_object(
+        entries: &[(&str, Value)],
+        handler: crate::proxy::ProxyHandler,
+    ) -> Self {
+        let mut object = crate::JsObject::new();
+        object.proxy_handler = Some(handler);
+        for (key, value) in entries {
+            object.set_direct(key, value.clone());
+        }
+        Value::Object(Rc::new(RefCell::new(object)))
+    }
+
     pub(crate) fn collectable_object(props: HashMap<String, Value>) -> Self {
         Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
     }

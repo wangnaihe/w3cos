@@ -3062,7 +3062,7 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
 
 fn build_element_value(node: u32) -> Value {
     let generation = realm_generation();
-    let value = Value::proxied_object(
+    let value = Value::proxied_host_object(
         &[
             ("__node_id", Value::Number(node as f64)),
             (
