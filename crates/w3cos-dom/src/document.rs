@@ -830,13 +830,29 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
-        let invalidation_root = if stylesheet::has_relational_dependencies() {
-            NodeId::ROOT
+        if stylesheet::has_relational_dependencies() {
+            self.invalidate_style_subtree(NodeId::ROOT);
+        } else if stylesheet::has_sibling_dependencies()
+            || stylesheet::has_structural_dependencies()
+        {
+            // :nth-child, :empty, and sibling combinators can change the
+            // matched style of existing siblings when the child list changes.
+            self.invalidate_style_subtree(id);
         } else {
-            id
-        };
-        self.invalidate_style_subtree(invalidation_root);
+            // No registered selector observes the sibling list. Restyling the
+            // whole parent on every append is quadratic and does not change
+            // any computed declaration.
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
+    }
+
+    fn touch_style_revision(&mut self, id: NodeId) {
+        self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        let revision = self.style_revision_clock;
+        if let Some(slot) = self.style_revisions.get_mut(id.0 as usize) {
+            *slot = revision;
+        }
     }
 
     /// Invalidate selectors whose subject, ancestor chain, or preceding

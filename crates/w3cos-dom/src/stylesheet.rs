@@ -409,6 +409,10 @@ pub(crate) fn has_relational_dependencies() -> bool {
     RULES.with(|rules| rules.borrow().has_relational_dependencies())
 }
 
+pub(crate) fn has_structural_dependencies() -> bool {
+    RULES.with(|rules| rules.borrow().has_structural_dependencies())
+}
+
 const CONTAINER_QUERY_MARKER: &str = "__w3cos_container_query";
 
 fn rule_has_container_query(rule: &Rule) -> bool {
@@ -2420,6 +2424,10 @@ mod tests {
         assert!(has_sibling_dependencies());
         assert!(!has_relational_dependencies());
         clear_owner(7);
+        assert!(!has_sibling_dependencies());
+        assert!(!has_structural_dependencies());
+        register_rule("li:first-child", &[("color", "blue")]);
+        assert!(has_structural_dependencies());
         assert!(!has_sibling_dependencies());
     }
 
