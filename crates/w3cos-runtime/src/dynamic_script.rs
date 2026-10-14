@@ -699,6 +699,44 @@ impl StreamingDocumentParser {
     }
 }
 
+/// Parse one local HTML document and run its classic scripts on this process's
+/// W3VM. Network fetches stay off: a page opened from the shell must not gain
+/// ambient network or filesystem authority from the loader itself.
+pub fn load_html_on_shared_vm(html: &str, document_url: &str) -> Result<()> {
+    crate::dom::reset_document();
+    crate::jsdom::reset_bridge();
+    let mut parser = StreamingDocumentParser::new(
+        ScriptLoader::new(ScriptPolicy {
+            allow_network: false,
+            ..ScriptPolicy::default()
+        }),
+        document_url,
+    )?;
+    let progress = parser.write(html)?;
+    pump_parser(&mut parser, progress)?;
+    let progress = parser.finish()?;
+    let progress = pump_parser(&mut parser, progress)?;
+    if progress != DocumentParseProgress::Complete {
+        return Err(anyhow!("shared VM page parser ended in {progress:?}"));
+    }
+    Ok(())
+}
+
+fn pump_parser(
+    parser: &mut StreamingDocumentParser,
+    mut progress: DocumentParseProgress,
+) -> Result<DocumentParseProgress> {
+    let mut steps = 0;
+    while progress == DocumentParseProgress::BlockedOnScript {
+        steps += 1;
+        if steps > 64 {
+            return Err(anyhow!("shared VM page stayed blocked on a script"));
+        }
+        progress = parser.resume()?;
+    }
+    Ok(progress)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DocumentLoaderOptions {
     pub max_body_bytes: usize,
@@ -10268,6 +10306,26 @@ mod tests {
                 .expect("write module fixture");
         });
         (format!("http://{address}/dependency.js"), handle)
+    }
+
+    #[test]
+    fn load_html_on_shared_vm_runs_inline_script() {
+        let html = r#"<!doctype html><html><body>
+            <h1 id="msg">page loading</h1>
+            <script>
+              document.getElementById("msg").textContent = "Hello from W3VM";
+            </script>
+        </body></html>"#;
+        load_html_on_shared_vm(html, "https://shared.w3cos.local/page.html").unwrap();
+        let text = crate::dom::get_descendant_text_content(crate::dom::body_id());
+        assert!(
+            text.contains("Hello from W3VM"),
+            "inline script did not run on the shared VM: {text}"
+        );
+        assert!(
+            !text.contains("page loading"),
+            "parser kept the pre-script text: {text}"
+        );
     }
 
     #[test]

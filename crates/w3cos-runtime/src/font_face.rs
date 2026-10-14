@@ -429,6 +429,12 @@ pub(crate) struct HostUiFont {
 
 static HOST_UI_FONT: OnceLock<HostUiFont> = OnceLock::new();
 
+/// Parsed face for a character the caller's font does not cover.
+pub(crate) fn parsed_fallback(character: char) -> Option<Arc<fontdue::Font>> {
+    let character = crate::text_layout::font_glyph_character(character);
+    system_fonts::fallback_for_character(character)?.parsed()
+}
+
 pub(crate) fn host_ui_font() -> &'static HostUiFont {
     HOST_UI_FONT.get_or_init(|| {
         let database = system_fonts::database();
@@ -941,7 +947,19 @@ impl FontRegistry {
             let selected = self
                 .resolve_style_for_character(style, character)
                 .and_then(|font| font.parsed());
-            let font = selected.as_deref().unwrap_or(fallback);
+            let system = if selected
+                .as_ref()
+                .is_some_and(|font| font.chars().contains_key(&character))
+                || fallback.chars().contains_key(&character)
+            {
+                None
+            } else {
+                parsed_fallback(character)
+            };
+            let font = selected
+                .as_deref()
+                .or(system.as_deref())
+                .unwrap_or(fallback);
             if !font.chars().contains_key(&character) {
                 let advance = crate::text_layout::estimated_char_width(character, font_size);
                 saw_ink = true;

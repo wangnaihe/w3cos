@@ -2,7 +2,14 @@
 
 ## One-line Definition
 
-**A Linux-based AI-native operating system that compiles TypeScript + CSS (W3C standard DOM) to native binaries. No browser. No interpreter. No V8.**
+**A Linux-based AI-native operating system that compiles TypeScript + CSS (W3C standard DOM) to native binaries. No browser. No V8.**
+
+> Status, resolved from the code in October 2026: AOT apps are rustc/LLVM
+> machine code that link a runtime. Dynamic documents run on W3VM
+> (`crates/w3cos-vm`, feature `dynamic-js`). The primary 2D renderer is Skia;
+> Vello and tiny-skia are compatibility backends. The diagram and "no runtime,
+> no VM" paragraphs below are the original static-AOT sketch and are stale.
+> The shared-runtime plan is `docs/SHARED_RUNTIME.md`.
 
 ---
 

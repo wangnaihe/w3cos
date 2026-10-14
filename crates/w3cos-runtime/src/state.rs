@@ -221,6 +221,12 @@ pub fn set_invoke_hook(hook: fn(u8, &str)) {
     INVOKE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
+/// Drop a hook installed by [`set_invoke_hook`]. Tests use this so a plugin
+/// callback does not stay registered for later cases on the same thread.
+pub fn clear_invoke_hook() {
+    INVOKE_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// Execute an event action against the signal store.
 pub fn execute_action(action: &w3cos_std::EventAction) {
     execute_action_with_draft(action, "");

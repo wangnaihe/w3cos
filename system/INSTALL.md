@@ -12,7 +12,9 @@ docker run w3cos build /apps/hello/app.ts -o /tmp/hello --release
 ### 2. Development: DevContainer / Codespaces
 
 Open this repo in GitHub Codespaces or any DevContainer-compatible IDE.
-Everything (Rust, QEMU, fonts) is installed automatically.
+`post-create.sh` installs Rust dependencies, QEMU, DejaVu, and
+`fonts-droid-fallback` (the 3.9 MB CJK face). `fonts-noto-cjk` is optional
+and about 100 MB; the runtime falls back per missing glyph either way.
 
 ```bash
 # In Codespaces / VS Code DevContainer:
@@ -65,6 +67,7 @@ w3cos.iso (~50-100MB)
 ├── W3C OS Shell (w3cos-shell)         — THE system interface (replaces desktop)
 ├── SSH server (dropbear, off by default) — set W3COS_ENABLE_SSH=1 to start it
 ├── Default apps (showcase, hello)     — pre-installed W3C OS applications
+├── Droid Sans Fallback (3.9 MB)       — CJK glyphs; Latin stays on DejaVu
 └── Boot: BIOS/UEFI → kernel → init → w3cos-shell (fullscreen)
 ```
 

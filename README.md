@@ -87,7 +87,7 @@ The shell is a native window, not a browser page. Rust 1.85+ is required
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y xvfb xdotool libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev
+sudo apt-get install -y xvfb xdotool libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev fonts-droid-fallback
 cargo build -p w3cos-shell --no-default-features --features cpu-render,ai-bridge
 Xvfb :99 -screen 0 1280x800x24 -ac &
 export DISPLAY=:99 WINIT_UNIX_BACKEND=x11

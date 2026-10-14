@@ -19,6 +19,9 @@ members = [
     "crates/w3cos-rn-compat",
     "crates/w3cos-ffi",
     "crates/w3cos-mobile",
+    "crates/w3cos-abi",
+    "crates/w3cos-runtime-host",
+    "crates/w3cos-shell-stub",
 ]
 
 [workspace.package]
@@ -39,6 +42,7 @@ w3cos-a11y = { path = "crates/w3cos-a11y" }
 w3cos-ai-bridge = { path = "crates/w3cos-ai-bridge" }
 w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 w3cos-mobile = { path = "crates/w3cos-mobile" }
+w3cos-abi = { path = "crates/w3cos-abi" }
 png = "0.17"
 # Chromium-facing raster formats. Avoid linking scientific/authoring codecs
 # (DDS/EXR/HDR/PNM/QOI/TGA/TIFF) into every standalone application.

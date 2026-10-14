@@ -19,6 +19,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11vnc novnc websockify libfontconfig1 fonts-dejavu-core \
     fonts-noto-cjk dbus-x11 xdotool openbox && rm -rf /var/lib/apt/lists/*
+# fonts-noto-cjk is the full CJK family (~100 MB). The ISO ships the 3.9 MB
+# Droid Sans Fallback instead. Either face is enough: missing glyphs fall
+# back per character instead of drawing tofu from the Latin face.
 
 RUN useradd -m -s /bin/bash demo
 

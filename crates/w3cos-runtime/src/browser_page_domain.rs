@@ -23,6 +23,9 @@ pub enum PageCommand {
         url: String,
         suggested_name: Option<String>,
     },
+    /// Parse a local document on this worker. There is no grant command:
+    /// the worker's [`crate::capability_gate`] starts empty and stays empty.
+    LoadDocument { html: String, url: String },
     Shutdown,
 }
 
@@ -38,6 +41,8 @@ pub enum PageEvent {
     Download(Result<Download, String>),
     Error(String),
     Stopped,
+    /// Reported after the worker clears its own permission store.
+    Gate { permission: &'static str, granted: bool },
 }
 
 pub struct BrowserPageDomain {
@@ -90,10 +95,17 @@ fn page_worker(
     commands: Receiver<PageCommand>,
     events: Sender<PageEvent>,
 ) {
+    // Permissions are thread-local. Resetting here drops anything the
+    // embedding thread granted, including AI-bridge capability decisions.
+    crate::capability_gate::reset();
     let mut controller = BrowserController::new(mode, options);
     let mut active = false;
     let mut last_progress = DocumentLoadProgress::Idle;
     let _ = events.send(PageEvent::Chrome(controller.chrome_state()));
+    let _ = events.send(PageEvent::Gate {
+        permission: "file-system",
+        granted: crate::capability_gate::is_granted("file-system"),
+    });
     loop {
         let command = if active {
             commands.recv_timeout(Duration::from_millis(8)).ok()
@@ -140,6 +152,20 @@ fn page_worker(
                 } => controller
                     .start_download(&url, suggested_name.as_deref())
                     .map(|_| None),
+                PageCommand::LoadDocument { html, url } => {
+                    crate::capability_gate::reset();
+                    match crate::dynamic_script::load_html_on_shared_vm(&html, &url) {
+                        Ok(()) => {
+                            let snapshot = crate::dom::to_component_tree();
+                            crate::dom::clear_document_dirty();
+                            let _ = events.send(PageEvent::Snapshot(snapshot));
+                            let _ = events.send(PageEvent::Progress(DocumentLoadProgress::Complete));
+                            active = false;
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 PageCommand::Shutdown => break,
             };
             match result {
@@ -182,6 +208,73 @@ fn page_worker(
     }
 }
 
+pub fn component_text(component: &w3cos_std::Component) -> String {
+    let mut out = String::new();
+    walk_text(component, &mut out);
+    out
+}
+
+fn walk_text(component: &w3cos_std::Component, out: &mut String) {
+    match &component.kind {
+        w3cos_std::ComponentKind::Text { content } => {
+            out.push_str(content);
+            out.push('\n');
+        }
+        w3cos_std::ComponentKind::Button { label } => {
+            out.push_str(label);
+            out.push('\n');
+        }
+        _ => {}
+    }
+    for child in &component.children {
+        walk_text(child, out);
+    }
+}
+
+/// Run `html` on a `BrowserPageDomain` worker and return the snapshot the
+/// worker produced. The caller never touches the page's DOM or VM.
+pub fn load_html_snapshot(html: &str, url: &str) -> anyhow::Result<w3cos_std::Component> {
+    let domain = BrowserPageDomain::spawn(BrowserMode::Interactive, DocumentLoaderOptions::default())
+        .map_err(|error| anyhow::anyhow!("could not start the page worker: {error}"))?;
+    domain
+        .send(PageCommand::LoadDocument {
+            html: html.to_string(),
+            url: url.to_string(),
+        })
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut snapshot = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match domain.recv_timeout(Duration::from_millis(200)) {
+            Some(PageEvent::Snapshot(component)) => snapshot = Some(component),
+            Some(PageEvent::Progress(DocumentLoadProgress::Complete)) => break,
+            Some(PageEvent::Progress(DocumentLoadProgress::Failed(message))) => {
+                anyhow::bail!("page worker failed: {message}");
+            }
+            Some(PageEvent::Error(message)) => anyhow::bail!("page worker failed: {message}"),
+            None => break,
+            Some(_) => {}
+        }
+    }
+    let mut snapshot = snapshot.ok_or_else(|| anyhow::anyhow!("page worker produced no snapshot"))?;
+    // The worker keeps the live document. The snapshot the UI paints must not
+    // carry host ids, or the UI thread would look those ids up in its own DOM.
+    detach_host_ids(&mut snapshot);
+    Ok(snapshot)
+}
+
+fn detach_host_ids(component: &mut w3cos_std::Component) {
+    if matches!(
+        component.on_click,
+        w3cos_std::EventAction::NativeHost { .. }
+    ) {
+        component.on_click = w3cos_std::EventAction::None;
+    }
+    for child in &mut component.children {
+        detach_host_ids(child);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +292,43 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn page_worker_does_not_inherit_parent_capability_grants() {
+        crate::capability_gate::reset();
+        crate::capability_gate::grant("file-system");
+        let domain =
+            BrowserPageDomain::spawn(BrowserMode::Reader, DocumentLoaderOptions::default())
+                .unwrap();
+        let mut isolated = false;
+        for _ in 0..6 {
+            match domain.recv_timeout(Duration::from_secs(2)) {
+                Some(PageEvent::Gate {
+                    permission,
+                    granted,
+                }) => {
+                    assert_eq!(permission, "file-system");
+                    assert!(!granted);
+                    isolated = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(isolated);
+        assert!(crate::capability_gate::is_granted("file-system"));
+        crate::capability_gate::reset();
+    }
+
+    #[test]
+    fn page_worker_runs_inline_script_into_a_snapshot() {
+        let html = r#"<!doctype html><h1 id="msg">page loading</h1>
+            <script>document.getElementById("msg").textContent = "Hello from W3VM";</script>"#;
+        let snapshot = load_html_snapshot(html, "https://shared.w3cos.local/page.html").unwrap();
+        let text = component_text(&snapshot);
+        assert!(text.contains("Hello from W3VM"), "{text}");
+        assert!(!text.contains("page loading"), "{text}");
     }
 }
