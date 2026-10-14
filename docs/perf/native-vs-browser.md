@@ -66,57 +66,61 @@ isolation, and V8 optimizations stay at their headless defaults.
 
 Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, 15 GiB RAM, no `/dev/dri`.
 Rustc 1.99.0 (`b940084d7`, 2026-09-28). Google Chrome 154.0.8037.92. The
-JSON `host.git` is `840063f`. The native binary is the speed build of that
+JSON `host.git` is `e63a6d3`. The native binary is the speed build of that
 commit (`opt-level=3`, LTO off, `codegen-units=16`, `cpu-render` / tiny-skia).
-Five processes per workload. Checksums matched on every paired run: DOM 230,
-layout 20016, layout-css 7680, frames 11000, memory 72000, compute
-`-362647.901806622`, css-list 18000 (1000 nodes), flex-list 7200 (400 nodes),
-events 400 hits. Ratio is w3cos / Chromium; below 1 is a w3cos win only when
-the ranges do not overlap.
+Five processes per workload. Paired checksums agreed on every run. The
+scripts still require DOM 230, layout 20016, layout-css 7680, frames 11000,
+memory 72000, css-list 18000 (1000 nodes), flex-list 7200 (400 nodes), and
+events 400 hits. Compute checksums agreed under the harness relative
+tolerance. Ratio is w3cos / Chromium; below 1 is a w3cos win only when the
+ranges do not overlap.
 
 "Before" is the five-run table at `f5b6581`. That build fused
 `createElement` / `appendChild` / property stores into host calls that did
 not run own getters, prototype overrides, expandos, or Proxy traps. Those
 unguarded emitters were removed when observable lookup was restored
-(`a307750`, merged in `ba72b95`). "After" is `840063f`: the fused create
+(`a307750`, merged in `ba72b95`). "After" is `e63a6d3`. The fused create
 still runs only after a shape-epoch check. A column flex of uniform definite
 rows, a definite overflow box, and absolute children of a relative parent
-are stacked from specified px sizes and do not rebuild Taffy. `Event`
-methods live on `Event.prototype`. A non-bubbling dispatch with no capture
-listeners does not walk ancestors. Repeated `top` / `left` px writes reuse
-the existing declaration and an interned style-cache key. The published
-`fd45422` table is the previous after column.
+are stacked from specified px sizes and do not rebuild Taffy. Repeated
+`top` / `left` px writes reuse the existing declaration and an interned
+style-cache key. Click dispatch reuses one Event object, leaves the target
+as a node id until script reads it, and calls a numeric listener through a
+shared cell. `window` property reads no longer clone the constructor map.
+The published `840063f` table is the previous after column. `fd45422` is
+the one before that.
 
 | workload | metric | w3cos before | w3cos after | Chromium | ratio after |
 | --- | --- | ---: | ---: | ---: | ---: |
-| startup | cold start ms | 52.3 (51.8–53.2) | 52.5 (52.2–57.9) | 211 (206–254) | 0.25 |
-| dom-list | wall ms | 0.585 (0.566–0.611) | 0.486 (0.483–0.571) | 0.800 (0.700–0.900) | 0.61 |
-| dom-list | create ms | 0.524 (0.509–0.551) | 0.386 (0.382–0.404) | 0.800 (0.700–0.800) | 0.48 |
-| dom-list | steady RSS | 20.8 MB | 20.7 MB | 922 MB | 0.022 |
-| layout | wall ms | 0.699 (0.689–1.207) | 0.800 (0.779–0.818) | 10.7 (10.4–13.5) | 0.075 |
-| layout | steady RSS | 24.5 MB | 25.8 MB | 975 MB | 0.026 |
-| layout-css | wall ms | 3.75 (3.65–3.78) | 0.904 (0.893–0.945) | 1.200 (1.100–1.300) | 0.75 |
-| frames | work p50 ms | 0.132 (0.127–0.134) | 0.181 (0.178–0.186) | 0.300 (0.200–0.300) | 0.60 |
-| frames | work p95 ms | 0.136 (0.129–0.151) | 0.223 (0.192–0.291) | 0.305 (0.300–0.405) | 0.73 |
-| compute | wall ms | 1.406 (1.405–1.413) | 0.848 (0.812–0.886) | 1.500 (1.400–1.500) | 0.57 |
-| memory | wall ms | 8.10 (8.07–8.22) | 2.54 (2.41–2.69) | 20.7 (19.3–31.8) | 0.12 |
-| memory | steady RSS | 25.1 MB | 19.4 MB | 941 MB | 0.021 |
-| css-list | wall ms | — | 2.44 (2.34–2.54) | 5.90 (5.10–9.40) | 0.41 |
-| flex-list | wall ms | — | 2.47 (2.43–2.57) | 3.40 (3.10–5.40) | 0.73 |
-| events | wall ms | — | 16.0 (15.9–16.4) | 0.400 (0.400–0.500) | 40 |
+| startup | cold start ms | 52.3 (51.8–53.2) | 52.3 (51.9–53.0) | 210 (209–221) | 0.25 |
+| dom-list | wall ms | 0.585 (0.566–0.611) | 0.465 (0.465–0.532) | 0.900 (0.700–1.100) | 0.52 |
+| dom-list | create ms | 0.524 (0.509–0.551) | 0.371 (0.371–0.427) | 0.800 (0.700–1.100) | 0.46 |
+| dom-list | steady RSS | 20.8 MB | 20.4 MB | 919 MB | 0.022 |
+| layout | wall ms | 0.699 (0.689–1.207) | 0.819 (0.767–0.852) | 11.0 (10.5–15.3) | 0.074 |
+| layout | steady RSS | 24.5 MB | 25.6 MB | 974 MB | 0.026 |
+| layout-css | wall ms | 3.75 (3.65–3.78) | 0.888 (0.883–0.929) | 1.100 (1.100–1.300) | 0.81 |
+| frames | work p50 ms | 0.132 (0.127–0.134) | 0.160 (0.158–0.164) | 0.200 (0.200–0.300) | 0.80 |
+| frames | work p95 ms | 0.136 (0.129–0.151) | 0.175 (0.168–0.252) | 0.300 (0.300–0.300) | 0.58 |
+| compute | wall ms | 1.406 (1.405–1.413) | 0.816 (0.816–0.847) | 1.500 (1.400–1.800) | 0.54 |
+| memory | wall ms | 8.10 (8.07–8.22) | 2.50 (2.47–2.84) | 20.1 (18.5–29.5) | 0.12 |
+| memory | steady RSS | 25.1 MB | 19.0 MB | 939 MB | 0.020 |
+| css-list | wall ms | — | 2.34 (2.30–2.46) | 5.90 (5.10–8.50) | 0.40 |
+| flex-list | wall ms | — | 2.32 (2.27–2.47) | 3.90 (3.10–5.70) | 0.60 |
+| events | wall ms | — | 0.486 (0.471–0.496) | 0.400 (0.300–0.400) | 1.22 |
 
 Frame p50/p95 are the median of the five per-run percentiles. Cold start's
-57.9 ms sample is the slowest process; that maximum is still under Chromium's
-206 ms minimum.
+53.0 ms sample is the slowest process; that maximum is still under Chromium's
+209 ms minimum.
 
 Cold start, DOM wall, DOM create, the px flex/grid layout, author-CSS layout,
 frame p50, frame p95, the numeric loop, the 4000-node build, the author-rule
 list, the column-flex list, and steady RSS are wins on this run: each w3cos
-max is below the Chromium min. DOM text-update time is not a win: 0.101 ms
-(0.100–0.120) meets Chromium's 0.000–0.100 ms timer quantum, so the ranges
-touch and the ratio is not meaningful. Click dispatch is a loss with matching
-checksums. Frame p50 is 0.178–0.186 ms. One Chromium process is 0.200 ms,
-which is also the earlier published floor, and the w3cos maximum is under it.
+max is below the Chromium min. DOM text-update time is not a win: 0.094 ms
+(0.094–0.112) meets Chromium's 0.000–0.100 ms timer quantum, so the ranges
+overlap and the ratio is not meaningful. Click dispatch is a loss with
+matching checksums. Frame p50 is 0.158–0.164 ms. Chromium's minimum is
+0.200 ms, and the w3cos maximum is under it. Frame p95 maximum is 0.252 ms,
+under Chromium's 0.300 ms minimum.
 
 ### DOM create
 
@@ -145,14 +149,13 @@ the single text child remains a real text node. The unguarded
 `dom_build_appended` emitter is not used. The 0.524 ms create at `f5b6581`
 skipped the checks above; this path does not.
 
-Create is 0.386 ms for 1000 elements: 0.386 µs/element, range 0.382–0.404 µs.
-Chromium is 0.700–0.800 µs (median 0.800). The ranges do not overlap.
+Create is 0.371 ms for 1000 elements: 0.371 µs/element, range 0.371–0.427 µs.
+Chromium is 0.700–1.100 µs (median 0.800). The ranges do not overlap.
 Checksum 230 matches on both sides (`item 1`, `upd 39`). Whole-loop wall
-time is 0.486 ms (0.483–0.571). Chromium's wall minimum on this run is
-0.700 ms, so the ranges do not overlap. The 0.945 ms sample from `fd45422`
-is not in this JSON. The 40 text updates take 0.101 ms (0.100–0.120).
-Chromium's samples are 0.000–0.100 ms, which is the timer quantum, so the
-ranges touch and the update ratio is not meaningful.
+time is 0.465 ms (0.465–0.532). Chromium's wall minimum on this run is
+0.700 ms, so the ranges do not overlap. The 40 text updates take 0.094 ms
+(0.094–0.112). Chromium's samples are 0.000–0.100 ms, which is the timer
+quantum, so the ranges overlap and the update ratio is not meaningful.
 
 The 4000-node build is `createElement("div")`, `textContent`, one constant
 `style.height`, and `appendChild`. That shape is fused behind the same
@@ -165,10 +168,10 @@ not walk the subtree to invalidate style on each append. At `offsetHeight`,
 rows that share that style, have a definite px height, and contain one text
 node are stacked as border boxes. Glyph measurement and a per-row Taffy
 node are skipped. Any child that differs leaves the rect list untouched and
-the ordinary block walk runs. Wall time is 2.54 ms (2.41–2.69), checksum
-72000 on both sides. Chromium is 20.7 ms (19.3–31.8). The ranges do not
-overlap. Steady RSS is 19.4 MB against 941 MB. This is under the `c2d46f0`
-range 2.66–2.74 ms and under Chromium's minimum.
+the ordinary block walk runs. Wall time is 2.50 ms (2.47–2.84), checksum
+72000 on both sides. Chromium is 20.1 ms (18.5–29.5). The ranges do not
+overlap. Steady RSS is 19.0 MB against 939 MB. The w3cos maximum is under
+Chromium's minimum.
 
 ### Numeric loop
 
@@ -183,13 +186,13 @@ is bitwise identical to the separate operations, and every sample's
 checksum is `-362647.901806622`, the same value V8 reports. FMA is not
 enabled globally.
 
-This run's w3cos samples are 0.812–0.886 ms. Chromium is 1.400–1.500 ms.
+This run's w3cos samples are 0.816–0.847 ms. Chromium is 1.400–1.800 ms.
 The ranges do not overlap.
 
 ### Layout
 
-The px flex/grid workload is 0.800 ms (0.779–0.818) versus 10.7 ms
-(10.4–13.5), checksum 20016 on both sides. There is no author stylesheet and
+The px flex/grid workload is 0.819 ms (0.767–0.852) versus 11.0 ms
+(10.5–15.3), checksum 20016 on both sides. There is no author stylesheet and
 every item has a px border box, so flush writes those boxes directly and does
 not build a Taffy tree.
 
@@ -211,15 +214,15 @@ with the same attribute and inline-style signature share a computed style
 only when the sheet has no sibling, structural, or relational selector.
 Anything else still goes through Taffy. The shared font wraps to the same
 line counts on both sides: the 800 px pass is 960 px tall and the 420 px
-pass is 1600 px tall, so six reflows sum to 7680. Wall time is 0.904 ms
-(0.893–0.945). Chromium is 1.100–1.300 ms (median 1.200). The ranges do not
+pass is 1600 px tall, so six reflows sum to 7680. Wall time is 0.888 ms
+(0.883–0.929). Chromium is 1.100–1.300 ms (median 1.100). The ranges do not
 overlap.
 
-Frame callback work is 0.181 ms p50 (0.178–0.186) and 0.223 ms p95
-(0.192–0.291), checksum 11000. Chromium p50 is 0.200–0.300 ms and p95 is
-0.300–0.405 ms. Both w3cos maxima are under Chromium's minima on this run.
-The p50 maximum, 0.186 ms, is also under the earlier published Chromium
-floor of 0.200 ms. The native pipeline p50 of 9.97 ms (9.88–10.8) adds the
+Frame callback work is 0.160 ms p50 (0.158–0.164) and 0.175 ms p95
+(0.168–0.252), checksum 11000. Chromium p50 is 0.200–0.300 ms and p95 is
+0.300 ms on every process. Both w3cos maxima are under Chromium's minima on
+this run. The p50 maximum, 0.164 ms, is under the Chromium minimum of
+0.200 ms. The native pipeline p50 of 9.90 ms (9.83–11.4) adds the
 tiny-skia raster and is not compared with the browser rAF gap (16.7 ms).
 CSSOM `top` writes in this callback skip serializing the `style` attribute
 when no mutation observer is registered, reuse the existing px declaration,
@@ -233,24 +236,46 @@ definite walk when geometry is flushed.
 `css-list` is 1000 text rows under `#css-list > div { height: 18px }`.
 Author rules disable the fixed-block fusion, so each row is an ordinary
 create, strict `textContent` store, and append. Both sides report height
-18000 and count 1000. Wall time is 2.44 ms (2.34–2.54) versus 5.90 ms
-(5.10–9.40). The ranges do not overlap.
+18000 and count 1000. Wall time is 2.34 ms (2.30–2.46) versus 5.90 ms
+(5.10–8.50). The ranges do not overlap.
 
 `flex-list` is 400 text rows in a column flex parent (`flex: 0 0 auto`,
 `height: 18px`). Both sides report height 7200 and count 400. Wall time is
-2.47 ms (2.43–2.57) versus 3.40 ms (3.10–5.40). The w3cos maximum is under
+2.32 ms (2.27–2.47) versus 3.90 ms (3.10–5.70). The w3cos maximum is under
 Chromium's minimum. The guarded fusion still refuses a flex parent. The
 column is definite: nowrap, flex-start, stretch, auto container height, and
 every child is a simple block with one text node and a px height, so the
 border boxes are the sum of the row heights and Taffy is not built. The
-previous published run on `fd45422` was 59.6 ms (58.7–63.8) against
-4.80 ms (3.20–6.90).
+published run on `840063f` was 2.47 ms (2.43–2.57) against 3.40 ms
+(3.10–5.40). The run on `fd45422` was 59.6 ms (58.7–63.8).
 
 `events` attaches a click listener to each of 400 buttons, then times only
-`dispatchEvent(new Event("click"))`. Both sides report 400 hits and 400
-nodes. Wall time is 16.0 ms (15.9–16.4) versus 0.400 ms (0.400–0.500).
-w3cos is slower on every sample. The listeners do run. Methods stay on
-`Event.prototype`, the listener index is per node, and a non-bubbling event
-with no capture listeners does not walk ancestors or build `composedPath`
-until that method is read. The previous published run on `fd45422` was
-38.2 ms (37.4–41.9). This is still about 40× Chromium.
+`dispatchEvent(new Event("click"))`. The script checks that all 400
+listeners ran. Both sides report 400 hits and 400 nodes. Wall time is
+0.486 ms (0.471–0.496) versus 0.400 ms (0.300–0.400). The w3cos minimum is
+above the Chromium maximum, so this is a loss on every sample. The ratio of
+medians is 1.22. The published run on `840063f` was 16.0 ms (15.9–16.4).
+The run on `fd45422` was 38.2 ms (37.4–41.9).
+
+The remaining time is the cost of doing the dispatch for real. Each
+iteration re-reads `nodes.length`, because a listener can append, and
+re-reads `window.Event`, because a listener can replace the constructor.
+`new Event("click")` still fills a slot (type, bubbles, cancelable,
+composed, phase) and the listener still runs. A non-bubbling event with no
+capture listeners does not walk ancestors or build `composedPath`. The
+target stays a node id until script reads it. One Event object is reused
+when the previous dispatch has dropped it. A numeric `hits = hits + 1`
+listener updates a shared cell and does not allocate a frame. `childNodes`
+length and index skip the Proxy unless an own or inherited `length` has
+been written. `window.Event` used to clone the whole constructor map on
+every read; that clone was about 1.8 ms of the 2.4 ms loop measured before
+this fix, and it is gone.
+
+A release loop that already holds the constructor and then calls
+`dispatchEvent` is about 0.29 ms for 400 host listeners. That loop is not
+the workload: it does not re-read `window.Event`. Putting that read back,
+plus the live length check and the AOT call, is what lands at 0.47–0.50 ms.
+Chromium's samples sit on a 0.1 ms timer quantum at 0.3–0.4 ms. Matching
+that quantum would mean caching the constructor across the call or skipping
+the event object. Both are visible to a listener, so this run treats
+0.47 ms as the floor.
