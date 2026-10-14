@@ -13,9 +13,9 @@ pub(crate) mod browser_http_cache;
 #[cfg(feature = "dynamic-js")]
 pub mod browser_page_domain;
 pub mod cache_web;
-pub mod capability_gate;
 pub mod canvas2d;
 pub mod canvas_web;
+pub mod capability_gate;
 #[cfg(all(
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
