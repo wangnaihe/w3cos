@@ -37,6 +37,20 @@ WORKLOADS = (
     "flex-list",
     "events",
 )
+# Per-side limits in milliseconds. Every WORKLOADS entry must appear here;
+# a missing key aborts the run before results are written.
+TIMEOUTS_MS = {
+    "startup": 60000,
+    "dom-list": 180000,
+    "layout": 180000,
+    "layout-css": 180000,
+    "frames": 240000,
+    "compute": 120000,
+    "memory": 180000,
+    "css-list": 180000,
+    "flex-list": 240000,
+    "events": 180000,
+}
 CHROME = os.environ.get("W3COS_CHROME", "/usr/bin/google-chrome")
 CHROME_ARGS = [
     "--disable-gpu",
@@ -623,6 +637,7 @@ def self_check():
     assert abs(percentile([1, 2, 3, 4], 0.5) - 2.5) < 1e-9
     assert numbers_close(1.0, 1.01, rel=0.02, abs_tol=0)
     assert not numbers_close(1.0, 2.0, rel=0.02, abs_tol=0)
+    assert set(TIMEOUTS_MS) == set(WORKLOADS)
     print("self-check ok")
 
 
@@ -660,7 +675,7 @@ def main():
     from playwright.sync_api import sync_playwright
     server = WorkloadServer(source)
     server.start()
-    timeouts = {"startup": 60000, "dom-list": 180000, "layout": 180000, "layout-css": 180000, "frames": 240000, "compute": 120000, "memory": 180000}
+    timeouts = TIMEOUTS_MS
     summaries = []
     try:
         with sync_playwright() as playwright:
