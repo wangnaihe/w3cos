@@ -914,7 +914,10 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
 }
 
 fn dom_handle(node: u32) -> Value {
-    Value::dom_node(node, realm_generation())
+    // A node ID alone cannot retain authored descriptors or a changed prototype.
+    // Keep the collectable/memoized wrapper until a fully guarded immediate
+    // representation can preserve the complete object state.
+    element_value(node)
 }
 
 fn dom_imm_get(node: u32, key: &str) -> Value {
@@ -3197,6 +3200,42 @@ fn bar_prop_value() -> Value {
     value
 }
 
+thread_local! {
+    /// Builtin tree methods keyed by node, filled only after own properties,
+    /// expandos, and the prototype chain have already missed. A later
+    /// prototype override is observed on the next get and wins over this cache.
+    static TREE_METHOD_CACHE: RefCell<HashMap<(u32, u8), Value>> = RefCell::new(HashMap::new());
+}
+
+fn tree_method_slot(key: &str) -> Option<u8> {
+    match key {
+        "appendChild" => Some(0),
+        "removeChild" => Some(1),
+        "insertBefore" => Some(2),
+        "replaceChild" => Some(3),
+        _ => None,
+    }
+}
+
+fn cached_tree_method(node: u32, key: &str) -> Option<Value> {
+    let slot = tree_method_slot(key)?;
+    TREE_METHOD_CACHE.with(|cache| cache.borrow().get(&(node, slot)).cloned())
+}
+
+fn remember_tree_method(node: u32, key: &str, value: &Value) {
+    let Some(slot) = tree_method_slot(key) else {
+        return;
+    };
+    if !value.is_callable() {
+        return;
+    }
+    TREE_METHOD_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert((node, slot), value.clone());
+    });
+}
+
 fn shared_element_proxy() -> w3cos_core::ProxyHandler {
     thread_local! {
         static PROXY: std::cell::RefCell<Option<w3cos_core::ProxyHandler>> =
@@ -3212,11 +3251,27 @@ fn shared_element_proxy() -> w3cos_core::ProxyHandler {
 
 fn build_element_proxy() -> w3cos_core::ProxyHandler {
     ProxyBuilder::new()
-        .get(|target, key, _receiver| {
-            let generation = target
-                .get_property("__w3cos_realm_generation")
-                .to_number() as u32;
-            let node = target.get_property("__node_id").to_number() as u32;
+        .live_target()
+        .get(|target, key, receiver| {
+            let Some(object) = target.as_object() else {
+                return Value::Undefined;
+            };
+            // Read own state without cloning the wrapper. The borrow ends
+            // before any getter or computed callback runs.
+            let (generation, node, own_getter, stored) = {
+                let object = object.borrow();
+                let generation = object
+                    .get_direct("__w3cos_realm_generation")
+                    .to_number() as u32;
+                let node = object.get_direct("__node_id").to_number() as u32;
+                let own_getter = object.own_getter(key);
+                let stored = if own_getter.is_some() {
+                    Value::Undefined
+                } else {
+                    object.get_direct(key)
+                };
+                (generation, node, own_getter, stored)
+            };
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
             }
@@ -3232,19 +3287,37 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             if let Some(v) = get_expando(node, key) {
                 return v;
             }
-            // 2. Stored props on the target snapshot (e.g. __node_id).
-            let stored = target.get_property(key);
+            // Own accessors shadow prototype data and computed DOM properties.
+            // Invoke only after the object borrow has ended, with the real
+            // wrapper as receiver; an undefined result is still authoritative.
+            if let Some(getter) = own_getter {
+                return getter.call(receiver.clone(), vec![]);
+            }
+            // 2. Stored props and prototype data (e.g. __node_id, overrides).
             if !stored.is_undefined() {
                 return stored;
             }
-            // 3. Computed DOM surface.
-            element_computed_get(node, key)
+            // 3. Computed DOM surface. The prototype miss above is the check
+            // that a user override is absent, so a cached builtin is safe.
+            if let Some(cached) = cached_tree_method(node, key) {
+                return cached;
+            }
+            let computed = element_computed_get(node, key);
+            remember_tree_method(node, key, &computed);
+            computed
         })
         .set(|target, key, value, _receiver| {
-            let generation = target
-                .get_property("__w3cos_realm_generation")
-                .to_number() as u32;
-            let node = target.get_property("__node_id").to_number() as u32;
+            let Some(object) = target.as_object() else {
+                return true;
+            };
+            let (generation, node) = {
+                let object = object.borrow();
+                let generation = object
+                    .get_direct("__w3cos_realm_generation")
+                    .to_number() as u32;
+                let node = object.get_direct("__node_id").to_number() as u32;
+                (generation, node)
+            };
             if bridge_realm_is_current(generation) {
                 element_computed_set(node, key, value)
             } else {
@@ -12207,11 +12280,15 @@ fn style_value(node: u32) -> Value {
     }
     let generation = realm_generation();
     let handler = ProxyBuilder::new()
+        .live_target()
         .get(move |target, key, _receiver| {
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
             }
-            let stored = target.get_property(key);
+            let stored = target
+                .as_object()
+                .map(|object| object.borrow().get_direct(key))
+                .unwrap_or(Value::Undefined);
             if !stored.is_undefined() {
                 return stored;
             }
@@ -19884,9 +19961,10 @@ fn build_window_value() -> Value {
 
     let handler = ProxyBuilder::new()
         .get(|target, key, _| {
-            let has_stored_property = target
-                .as_object()
-                .is_some_and(|object| object.borrow().has_direct(key));
+            let has_stored_property = target.as_object().is_some_and(|object| {
+                let object = object.borrow();
+                object.has_direct(key) || object.own_getter(key).is_some()
+            });
             if has_stored_property {
                 target.get_property(key)
             } else {
@@ -19894,10 +19972,10 @@ fn build_window_value() -> Value {
             }
         })
         .has(|target, key| {
-            target
-                .as_object()
-                .is_some_and(|object| object.borrow().has_direct(key))
-                || window_named_property(key).is_some()
+            target.as_object().is_some_and(|object| {
+                let object = object.borrow();
+                object.has_direct(key) || object.own_getter(key).is_some()
+            }) || window_named_property(key).is_some()
         })
         .build();
     let window = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
@@ -20377,6 +20455,7 @@ pub fn reset_bridge() {
     advance_bridge_realm_generation();
     w3cos_core::promise::advance_realm_generation();
     ELEMENT_VALUES.with(|c| c.borrow_mut().clear());
+    TREE_METHOD_CACHE.with(|cache| cache.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
     KNOWN_EXPANDS.with(|c| c.borrow_mut().clear());
     OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().clear());
@@ -20584,6 +20663,76 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    #[test]
+    fn own_element_getter_uses_real_receiver_and_can_return_undefined_once() {
+        setup();
+        let element = create_in_body("div");
+        let identity = element.clone();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let getter_calls = Rc::clone(&calls);
+        w3cos_core::class::define_property(
+            &element,
+            "reviewOwn",
+            &Value::object(HashMap::from([(
+                "get".into(),
+                func(move |receiver, _| {
+                    assert!(receiver.strict_eq(&identity));
+                    getter_calls.set(getter_calls.get() + 1);
+                    w3cos_core::class::define_property(
+                        &receiver,
+                        "side",
+                        &Value::object(HashMap::from([("value".into(), Value::Number(5.0))])),
+                    );
+                    Value::Undefined
+                }),
+            )])),
+        );
+        assert!(element.get_property("reviewOwn").is_undefined());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(element.get_property("side"), Value::Number(5.0));
+    }
+
+    #[test]
+    fn new_dom_handle_retains_own_properties_and_authored_prototype() {
+        setup();
+        let element = dom_handle(dom::create_element("div"));
+        w3cos_core::class::define_property(
+            &element,
+            "own",
+            &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+        );
+        let prototype = Value::object(HashMap::from([("inherited".into(), Value::Number(9.0))]));
+        w3cos_core::class::set_prototype_of(&element, &prototype);
+        assert_eq!(element.get_property("own"), Value::Number(7.0));
+        assert_eq!(element.get_property("inherited"), Value::Number(9.0));
+        assert!(w3cos_core::class::get_prototype_of(&element).strict_eq(&prototype));
+        assert!(element_value(node_id_of(&element).unwrap()).strict_eq(&element));
+    }
+
+    #[test]
+    fn document_method_accessor_shadows_the_forwarding_prototype() {
+        setup();
+        let document = document_value();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let getter_calls = Rc::clone(&calls);
+        w3cos_core::class::define_property(
+            &document,
+            "createElement",
+            &Value::object(HashMap::from([(
+                "get".into(),
+                func(move |_, _| {
+                    getter_calls.set(getter_calls.get() + 1);
+                    func(|_, _| Value::string("override"))
+                }),
+            )])),
+        );
+        assert_eq!(
+            document.call_method("createElement", vec![Value::string("div")]),
+            Value::string("override")
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

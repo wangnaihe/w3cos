@@ -501,7 +501,25 @@ pub fn get_own_property_descriptor(obj: &Value, key: &str) -> Value {
 /// `{value}`/`{get}`/`{set}` descriptor (best-effort), returning `obj`.
 pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
     if let Some(object) = obj.as_object() {
-        object.borrow_mut().define_property(key, descriptor);
+        let proxy_define = {
+            let object = object.borrow();
+            object.proxy_handler.as_ref().and_then(|handler| {
+                handler
+                    .define_property
+                    .as_ref()
+                    .map(|trap| (std::rc::Rc::clone(trap), object.target_value()))
+            })
+        };
+        if let Some((trap, target)) = proxy_define {
+            // A descriptor trap can read or redefine the proxy again.
+            if !trap(&target, key, descriptor) {
+                crate::throw_value(crate::value::type_error(
+                    "Proxy defineProperty trap rejected the definition",
+                ));
+            }
+        } else {
+            object.borrow_mut().define_property(key, descriptor);
+        }
     }
     obj.clone()
 }

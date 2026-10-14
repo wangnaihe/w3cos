@@ -190,10 +190,26 @@ impl JsObject {
         self.get_direct(key)
     }
 
+    /// Read an own getter without invoking it or traversing the prototype.
+    pub fn own_getter(&self, key: &str) -> Option<Value> {
+        if !self.has_getter_properties {
+            return None;
+        }
+        self.properties
+            .get(format!("__w3cos_getter_{key}").as_str())
+            .cloned()
+    }
+
     /// Direct property lookup (no proxy), with prototype chain fallback.
     pub fn get_direct(&self, key: &str) -> Value {
         if let Some(val) = self.properties.get(key) {
             return val.clone();
+        }
+        // An own getter shadows prototype data even before it is invoked by
+        // Value::get_property. In particular, a Document method accessor must
+        // not resolve its prototype's forwarding method and recurse forever.
+        if self.own_getter(key).is_some() {
+            return Value::Undefined;
         }
         if let Some(ref proto) = self.prototype {
             if proto.is_live() {
@@ -359,6 +375,10 @@ impl JsObject {
                 return trap(&target, key, descriptor);
             }
         }
+        self.define_property_direct(key, descriptor)
+    }
+
+    pub(crate) fn define_property_direct(&mut self, key: &str, descriptor: &Value) -> bool {
         if let Some(desc) = descriptor.as_object() {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {

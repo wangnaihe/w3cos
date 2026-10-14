@@ -3212,11 +3212,6 @@ fn emit_block_instructions(
         .enumerate()
         .map(|(index, instruction)| {
             let proven = proven_string_keys(instructions, index);
-            if let Some(fused) =
-                fused_style_emission(instructions, index, &proven, &last_uses, plan)
-            {
-                return Ok(fused);
-            }
             emit_instruction(
                 instruction,
                 exception_target,
@@ -3256,148 +3251,6 @@ fn emit_block_instructions(
         output.push('\n');
     }
     Ok(output)
-}
-
-fn is_dom_style_property(name: &str) -> bool {
-    matches!(
-        name,
-        "width"
-            | "height"
-            | "top"
-            | "left"
-            | "right"
-            | "bottom"
-            | "display"
-            | "position"
-            | "flexWrap"
-            | "gridTemplateColumns"
-            | "background"
-            | "overflow"
-            | "margin"
-    )
-}
-
-/// `element.style.width = value` is a get of `"style"` immediately consumed by
-/// one set. Emit a direct element style write and drop the declaration object.
-fn fused_style_emission(
-    instructions: &[Instruction],
-    index: usize,
-    proven: &HashMap<u32, String>,
-    last_uses: &[HashSet<u32>],
-    plan: &EscapePlan,
-) -> Option<String> {
-    match &instructions[index] {
-        Instruction::GetProperty { dst, key, .. } => {
-            if proven.get(&key.0).map(String::as_str) != Some("style") {
-                return None;
-            }
-            style_element_for_set(instructions, style_set_index(instructions, index + 1, dst.0)?, dst.0, last_uses)?;
-            Some(String::new())
-        }
-        Instruction::SetProperty { object, key, value, .. } => {
-            let prop = proven.get(&key.0)?;
-            if !is_dom_style_property(prop) {
-                return None;
-            }
-            let element = style_element_for_set(instructions, index, object.0, last_uses)?;
-            Some(format!(
-                "w3cos_core::intrinsics::dom_set_element_style(&{}, {prop:?}, &{});",
-                emit_boxed_value(plan, element),
-                emit_boxed_value(plan, value.0)
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn style_set_index(instructions: &[Instruction], from: usize, style_reg: u32) -> Option<usize> {
-    let mut index = from;
-    while index < instructions.len() {
-        if read_registers(&instructions[index]).contains(&style_reg) {
-            return matches!(instructions[index], Instruction::SetProperty { object, .. } if object.0 == style_reg)
-                .then_some(index);
-        }
-        if written_register(&instructions[index]).is_some_and(|reg| reg.0 == style_reg) {
-            return None;
-        }
-        index += 1;
-    }
-    None
-}
-
-fn style_element_for_set(
-    instructions: &[Instruction],
-    index: usize,
-    style_reg: u32,
-    last_uses: &[HashSet<u32>],
-) -> Option<u32> {
-    if !last_uses.get(index)?.contains(&style_reg) {
-        return None;
-    }
-    let mut defined: Option<(usize, Option<(u32, u32)>)> = None;
-    for (slot, instruction) in instructions.iter().enumerate().take(index) {
-        if let Instruction::GetProperty { dst, object, key } = instruction {
-            if dst.0 == style_reg {
-                defined = Some((slot, Some((object.0, key.0))));
-            }
-        } else if written_register(instruction).is_some_and(|reg| reg.0 == style_reg) {
-            defined = Some((slot, None));
-        }
-    }
-    let (defined_at, Some((element, style_key))) = defined? else {
-        return None;
-    };
-    if proven_string_keys(instructions, index).get(&style_key).map(String::as_str) != Some("style")
-    {
-        return None;
-    }
-    for instruction in &instructions[defined_at + 1..index] {
-        if read_registers(instruction).contains(&style_reg) {
-            return None;
-        }
-    }
-    Some(element)
-}
-
-fn emit_dom_fast_call(
-    plan: &EscapePlan,
-    dst: u32,
-    object: u32,
-    method: &str,
-    arguments: &[w3cos_ir::Register],
-    proven_strings: &HashMap<u32, String>,
-) -> Option<String> {
-    let dst = val_index(plan, dst);
-    let object_expr = emit_boxed_value(plan, object);
-    match (method, arguments) {
-        ("createElement", [tag]) => {
-            let expr = if let Some(tag) = proven_strings.get(&tag.0) {
-                format!("w3cos_core::intrinsics::dom_create_element(&{object_expr}, {tag:?})")
-            } else {
-                format!(
-                    "w3cos_core::intrinsics::dom_create_element_value(&{object_expr}, &{})",
-                    emit_boxed_value(plan, tag.0)
-                )
-            };
-            Some(format!("self.registers[{dst}] = {expr};"))
-        }
-        ("createTextNode", [text]) => {
-            let expr = if let Some(text) = proven_strings.get(&text.0) {
-                format!("w3cos_core::intrinsics::dom_create_text(&{object_expr}, {text:?})")
-            } else {
-                format!(
-                    "w3cos_core::intrinsics::dom_create_text_value(&{object_expr}, &{})",
-                    emit_boxed_value(plan, text.0)
-                )
-            };
-            Some(format!("self.registers[{dst}] = {expr};"))
-        }
-        ("appendChild", [child]) => Some(format!(
-            "self.registers[{dst}] = w3cos_core::intrinsics::dom_append_child(&{object_expr}, &{});",
-            emit_boxed_value(plan, child.0)
-        )),
-        _ => None,
-    }
 }
 
 fn emit_native_sync_loop(
@@ -3467,366 +3320,23 @@ fn emit_native_sync_loop(
     )))
 }
 
-/// Hoist invariant loads out of a native loop and fold integer concatenations
-/// that exist only to be stored on a DOM node.
+/// Hoist invariant binding loads out of a native loop.
+///
+/// DOM property writes and method calls stay on the ordinary lookup path so
+/// own accessors, prototype overrides, and exceptions still run.
 fn tighten_native_loop(body: &str) -> (String, String) {
-    let mut lines: Vec<String> = body
+    let lines: Vec<String> = body
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect();
-    fold_dom_concat_stores(&mut lines);
-    let lines = drop_unread_string_loads(&lines);
     let (hoisted, lines) = hoist_binding_lookups(&lines);
-    let lines = fuse_appended_elements(&lines);
     let mut out = String::new();
     for line in lines {
         out.push_str(&line);
         out.push('\n');
     }
     (hoisted, out)
-}
-
-fn fold_dom_concat_stores(lines: &mut Vec<String>) {
-    let mut index = 0;
-    while index + 1 < lines.len() {
-        let Some((dst, left, right)) = parse_add_line(&lines[index]) else {
-            index += 1;
-            continue;
-        };
-        let Some((object, name, fallback)) = parse_dom_set_line(&lines[index + 1], &dst) else {
-            index += 1;
-            continue;
-        };
-        if register_uses(lines, &dst) != 2 {
-            index += 1;
-            continue;
-        }
-        lines[index] = format!(
-            "{{ if !w3cos_core::intrinsics::dom_set_data_concat(&{object}, {name}, &self.registers[{left}].clone(), &w3cos_core::Value::Number({right})) {{ let __w3cos_assigned = w3cos_core::intrinsics::add(&self.registers[{left}].clone(), &w3cos_core::Value::Number({right})); {fallback} }} }}"
-        );
-        lines.remove(index + 1);
-        index += 1;
-    }
-}
-
-fn parse_add_line(line: &str) -> Option<(String, String, String)> {
-    let rest = line.strip_prefix("self.registers[")?;
-    let (dst, rest) = rest.split_once("] = w3cos_core::intrinsics::add(&self.registers[")?;
-    let (left, rest) = rest.split_once("].clone(), &w3cos_core::Value::Number(")?;
-    let right = rest.strip_suffix("));")?;
-    if !dst.chars().all(|ch| ch.is_ascii_digit()) || !left.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    Some((dst.to_string(), left.to_string(), right.to_string()))
-}
-
-fn parse_dom_set_line(line: &str, dst: &str) -> Option<(String, String, String)> {
-    let prefix = format!(
-        "{{ let __w3cos_assigned = self.registers[{dst}].clone(); if !w3cos_core::intrinsics::dom_set_data("
-    );
-    let rest = line.strip_prefix(&prefix)?;
-    let (object_and_name, rest) = rest.split_once(", &__w3cos_assigned) { ")?;
-    let fallback = rest.strip_suffix(" } }")?;
-    let (object, name) = object_and_name.split_once(", ")?;
-    let object = object.strip_prefix('&')?;
-    if !name.starts_with('"') || !name.ends_with('"') {
-        return None;
-    }
-    Some((object.to_string(), name.to_string(), fallback.to_string()))
-}
-
-fn register_uses(lines: &[String], index: &str) -> usize {
-    let needle = format!("self.registers[{index}]");
-    let mut count = 0;
-    for line in lines {
-        let mut start = 0;
-        while let Some(pos) = line[start..].find(&needle) {
-            let end = start + pos + needle.len();
-            if line.as_bytes().get(end).is_none_or(|byte| !byte.is_ascii_digit()) {
-                count += 1;
-            }
-            start = end;
-        }
-    }
-    count
-}
-
-fn drop_unread_string_loads(lines: &[String]) -> Vec<String> {
-    lines
-        .iter()
-        .filter(|line| {
-            let Some(index) = string_store_index(line) else {
-                return true;
-            };
-            register_uses(lines, index) != 1
-        })
-        .cloned()
-        .collect()
-}
-
-fn string_store_index(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("self.registers[")?;
-    let (index, after) = rest.split_once(']')?;
-    if !index.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    after
-        .trim_start()
-        .starts_with("= w3cos_core::Value::string(")
-        .then_some(index)
-}
-
-/// Replace create + id + class + text + append + push with one call when the
-/// straight-line body is exactly that create loop. Later reads of `el` go
-/// through the binding store, which stays.
-fn fuse_appended_elements(lines: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(lines.len());
-    let mut index = 0;
-    while index < lines.len() {
-        if let Some((consumed, replacement)) = match_appended_span(&lines[index..]) {
-            out.extend(replacement);
-            index += consumed;
-        } else {
-            out.push(lines[index].clone());
-            index += 1;
-        }
-    }
-    out
-}
-
-fn match_appended_span(lines: &[String]) -> Option<(usize, Vec<String>)> {
-    let (element, document, tag) = parse_create_element(lines.first()?)?;
-    let window = lines.len().min(28);
-    let slice = &lines[..window];
-    let id = find_concat(slice, "id")?;
-    let text = find_concat(slice, "textContent")?;
-    let class_name = find_class_name(slice)?;
-    let (append_at, append_dst, parent, _appended) = find_append(slice)?;
-    let (push_at, push_dst, nodes, _pushed) = find_push(slice)?;
-    if append_at > push_at {
-        return None;
-    }
-    let store = slice.iter().find(|line| {
-        line.contains(&format!("self.registers[{element}].clone()")) && line.contains("binding.0 =")
-    })?;
-    let parent_load = slice.iter().find(|line| assigns_register(line, &parent))?;
-    let nodes_load = slice.iter().find(|line| assigns_register(line, &nodes))?;
-    let end = push_at + 1;
-    // Temps written inside the span must not be read after it. The element
-    // value and the push length are rewritten below.
-    if register_read_after(lines, end, &id.register) || register_read_after(lines, end, &text.register)
-    {
-        return None;
-    }
-    let call = format!(
-        "self.registers[{element}] = w3cos_core::intrinsics::dom_build_appended(&self.registers[{document}].clone(), &self.registers[{parent}].clone(), {tag}, {}, {}, {class_name}, {}, {});",
-        id.literal, id.index, text.literal, text.index
-    );
-    let mut replacement = Vec::new();
-    replacement.push(parent_load.clone());
-    // The fused call reads the integer temps (`i` in `prefix + i`). Those
-    // stores sit inside the span this replacement consumes, so they have to
-    // be copied back in front of the call.
-    let mut keep = vec![false; end];
-    loop {
-        let mut changed = false;
-        for (slot, line) in slice.iter().take(end).enumerate() {
-            if keep[slot] {
-                continue;
-            }
-            let Some(reg) = num_reg_assignment(line) else {
-                continue;
-            };
-            let referenced = mentions_num_reg(&call, reg)
-                || keep.iter().enumerate().any(|(other, kept)| {
-                    *kept && other != slot && mentions_num_reg(&slice[other], reg)
-                });
-            if referenced {
-                keep[slot] = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    for (slot, line) in slice.iter().take(end).enumerate() {
-        if keep[slot] {
-            replacement.push(line.clone());
-        }
-    }
-    replacement.push(call);
-    replacement.push((*store).clone());
-    if append_dst != element && register_read_after(lines, end, &append_dst) {
-        replacement.push(format!(
-            "self.registers[{append_dst}] = self.registers[{element}].clone();"
-        ));
-    }
-    replacement.push(nodes_load.clone());
-    replacement.push(format!(
-        "self.registers[{push_dst}] = w3cos_core::intrinsics::array_push(&self.registers[{nodes}].clone(), &self.registers[{element}].clone());"
-    ));
-    Some((end, replacement))
-}
-
-struct ConcatStore {
-    register: String,
-    literal: String,
-    index: String,
-}
-
-fn parse_create_element(line: &str) -> Option<(String, String, String)> {
-    let rest = line.strip_prefix("self.registers[")?;
-    let (element, rest) = rest.split_once("] = w3cos_core::intrinsics::dom_create_element(&self.registers[")?;
-    let (document, rest) = rest.split_once("].clone(), ")?;
-    let tag = rest.strip_suffix(");")?;
-    if !element.chars().all(|ch| ch.is_ascii_digit()) || !document.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    if !tag.starts_with('"') || !tag.ends_with('"') {
-        return None;
-    }
-    Some((element.to_string(), document.to_string(), tag.to_string()))
-}
-
-fn find_concat(lines: &[String], name: &str) -> Option<ConcatStore> {
-    for line in lines {
-        let Some(after_name) = line.split(&format!("dom_set_data_concat(")).nth(1).and_then(|_| {
-            line.split(&format!(", \"{name}\", ")).nth(1)
-        }) else {
-            continue;
-        };
-        if !line.contains(&format!(", \"{name}\", ")) {
-            continue;
-        }
-        let (prefix_expr, index_expr) = after_name.split_once(", &w3cos_core::Value::Number(")?;
-        let prefix_reg = prefix_expr
-            .strip_prefix("&self.registers[")?
-            .strip_suffix("].clone()")?;
-        let index = index_expr.split(')').next()?;
-        let literal = lines.iter().find_map(|candidate| {
-            let rest = candidate.strip_prefix(&format!(
-                "self.registers[{prefix_reg}] = w3cos_core::Value::string("
-            ))?;
-            rest.strip_suffix(");").map(str::to_string)
-        })?;
-        return Some(ConcatStore {
-            register: prefix_reg.to_string(),
-            literal,
-            index: index.to_string(),
-        });
-    }
-    None
-}
-
-fn find_class_name(lines: &[String]) -> Option<String> {
-    for line in lines {
-        if !line.contains("dom_set_data(") || !line.contains("\"className\"") {
-            continue;
-        }
-        let assigned = line.split("let __w3cos_assigned = self.registers[").nth(1)?;
-        let register = assigned.split(']').next()?;
-        let store = lines.iter().find_map(|candidate| {
-            let rest = candidate.strip_prefix(&format!("self.registers[{register}] = w3cos_core::Value::string("))?;
-            rest.strip_suffix(");").map(str::to_string)
-        })?;
-        return Some(store);
-    }
-    None
-}
-
-fn find_append(lines: &[String]) -> Option<(usize, String, String, String)> {
-    for (index, line) in lines.iter().enumerate() {
-        let Some(head) = line.split("dom_append_child(&self.registers[").next() else {
-            continue;
-        };
-        let dest = head
-            .rsplit("self.registers[")
-            .next()?
-            .trim_end_matches("] = w3cos_core::intrinsics::");
-        let Some(rest) = line.split("dom_append_child(&self.registers[").nth(1) else {
-            continue;
-        };
-        let (parent, rest) = rest.split_once("].clone(), &self.registers[")?;
-        let child = rest.split(']').next()?;
-        if dest.chars().all(|ch| ch.is_ascii_digit())
-            && parent.chars().all(|ch| ch.is_ascii_digit())
-            && child.chars().all(|ch| ch.is_ascii_digit())
-        {
-            return Some((index, dest.to_string(), parent.to_string(), child.to_string()));
-        }
-    }
-    None
-}
-
-fn find_push(lines: &[String]) -> Option<(usize, String, String, String)> {
-    for (index, line) in lines.iter().enumerate() {
-        let Some(head) = line.split("array_push(&self.registers[").next() else {
-            continue;
-        };
-        let dest = head
-            .rsplit("self.registers[")
-            .next()?
-            .trim_end_matches("] = w3cos_core::intrinsics::");
-        let Some(rest) = line.split("array_push(&self.registers[").nth(1) else {
-            continue;
-        };
-        let (nodes, rest) = rest.split_once("].clone(), &self.registers[")?;
-        let child = rest.split(']').next()?;
-        if dest.chars().all(|ch| ch.is_ascii_digit())
-            && nodes.chars().all(|ch| ch.is_ascii_digit())
-            && child.chars().all(|ch| ch.is_ascii_digit())
-        {
-            return Some((index, dest.to_string(), nodes.to_string(), child.to_string()));
-        }
-    }
-    None
-}
-
-fn mentions_num_reg(line: &str, reg: &str) -> bool {
-    let needle = format!("self.num_regs[{reg}]");
-    let mut from = 0;
-    while let Some(pos) = line[from..].find(&needle) {
-        let end = from + pos + needle.len();
-        if line.as_bytes().get(end).is_none_or(|byte| !byte.is_ascii_digit()) {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-fn num_reg_assignment(line: &str) -> Option<&str> {
-    let rest = line.trim_start().strip_prefix("self.num_regs[")?;
-    let (reg, _after) = rest.split_once("] =")?;
-    reg.chars().all(|ch| ch.is_ascii_digit()).then_some(reg)
-}
-
-fn assigns_register(line: &str, index: &str) -> bool {
-    let needle = format!("self.registers[{index}] =");
-    line.contains(&needle)
-        && !line.contains("dom_create_element")
-        && !line.contains("dom_build_appended")
-        && !line.contains("dom_append_child")
-        && !line.contains("array_push")
-        && !line.contains("Value::string")
-        && !line.contains("dom_set_data")
-}
-
-fn register_read_after(lines: &[String], start: usize, index: &str) -> bool {
-    let needle = format!("self.registers[{index}]");
-    lines[start..].iter().any(|line| {
-        let mut from = 0;
-        while let Some(pos) = line[from..].find(&needle) {
-            let end = from + pos + needle.len();
-            if line.as_bytes().get(end).is_none_or(|byte| !byte.is_ascii_digit()) {
-                return true;
-            }
-            from = end;
-        }
-        false
-    })
 }
 
 fn hoist_binding_lookups(lines: &[String]) -> (String, Vec<String>) {
@@ -4590,22 +4100,7 @@ fn emit_instruction(
             if let Some(literal) = proven_strings.get(&key.0) {
                 let object_expr = emit_boxed_value(plan, object.0);
                 let value_expr = emit_boxed_value(plan, value.0);
-                let fallback = if *strict {
-                    format!(
-                        "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), __w3cos_assigned);"
-                    )
-                } else {
-                    format!("{object_expr}.set_property({literal:?}, __w3cos_assigned);")
-                };
-                if matches!(literal.as_str(), "id" | "className" | "textContent") {
-                    format!(
-                        "{{ let __w3cos_assigned = {value_expr}; if !w3cos_core::intrinsics::dom_set_data(&{object_expr}, {literal:?}, &__w3cos_assigned) {{ {fallback} }} }}"
-                    )
-                } else if is_dom_style_property(literal) {
-                    format!(
-                        "{{ let __w3cos_assigned = {value_expr}; if !w3cos_core::intrinsics::dom_set_style(&{object_expr}, {literal:?}, &__w3cos_assigned) {{ {fallback} }} }}"
-                    )
-                } else if *strict {
+                if *strict {
                     format!(
                         "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), {value_expr});"
                     )
@@ -4871,31 +4366,6 @@ fn emit_instruction(
             arguments,
         } => {
             if let Some(literal) = proven_strings.get(&key.0) {
-                if literal == "push"
-                    && arguments.len() == 1
-                    && exception_target.is_none()
-                    && matches!(mode, EmissionMode::Sync)
-                {
-                    return Ok(format!(
-                        "self.registers[{}] = w3cos_core::intrinsics::array_push(&{}, &{});",
-                        register(*dst),
-                        emit_boxed_value(plan, object.0),
-                        emit_boxed_value(plan, arguments[0].0)
-                    ));
-                }
-                if exception_target.is_none()
-                    && matches!(mode, EmissionMode::Sync)
-                    && let Some(fast) = emit_dom_fast_call(
-                        plan,
-                        dst.0,
-                        object.0,
-                        literal,
-                        arguments,
-                        proven_strings,
-                    )
-                {
-                    fast
-                } else {
                 let mut reads = vec![object.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
@@ -4911,7 +4381,6 @@ fn emit_instruction(
                     mode,
                     plan,
                 )
-                }
             } else {
                 let mut reads = vec![object.0, key.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
@@ -6779,7 +6248,7 @@ fn main() {{
     }
 
     #[test]
-    fn native_dom_loop_hoists_bindings_and_skips_argument_vec() {
+    fn native_dom_loop_keeps_observable_lookup() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
                 function fill(document, root, nodes) {
@@ -6809,38 +6278,41 @@ fn main() {{
             "element create loop should be native: {generated}"
         );
         assert!(
-            generated.contains("array_push"),
-            "push should not allocate an arguments Vec: {generated}"
+            generated.contains(".call_method(\"createElement\""),
+            "createElement must stay an ordinary method call: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"appendChild\""),
+            "appendChild must stay an ordinary method call: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"push\""),
+            "push must stay an ordinary method call: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"id\""),
+            "id must stay an ordinary property write: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"className\""),
+            "className must stay an ordinary property write: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"textContent\""),
+            "textContent must stay an ordinary property write: {generated}"
         );
         assert!(
             generated.contains("__w3cos_cb_"),
             "binding cells should be loaded once per loop: {generated}"
         );
         assert!(
-            generated.contains("dom_build_appended"),
-            "create/id/class/text/append should be one call: {generated}"
+            !generated.contains("dom_build_appended")
+                && !generated.contains("dom_create_element")
+                && !generated.contains("dom_set_data")
+                && !generated.contains("dom_append_child")
+                && !generated.contains("dom_set_style"),
+            "observable DOM operations must not use unguarded intrinsics: {generated}"
         );
-        let call = generated
-            .lines()
-            .find(|line| line.contains("dom_build_appended"))
-            .unwrap();
-        let call_at = generated.find("dom_build_appended").unwrap();
-        let loop_at = generated[..call_at].rfind("loop {").unwrap();
-        let before_call = &generated[loop_at..call_at];
-        let mut search = call;
-        while let Some(start) = search.find("self.num_regs[") {
-            let rest = &search[start + "self.num_regs[".len()..];
-            let reg: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            assert!(
-                !reg.is_empty(),
-                "numeric temp in fused call: {call}"
-            );
-            assert!(
-                before_call.contains(&format!("self.num_regs[{reg}] =")),
-                "fused call reads num_regs[{reg}] without a store in the loop: {generated}"
-            );
-            search = &rest[reg.len()..];
-        }
     }
 
     #[test]

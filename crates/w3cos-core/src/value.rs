@@ -1880,7 +1880,33 @@ impl Value {
             }
         }
         if let Some(o) = self.as_object() {
-            let value = o.borrow().get(key, self).clone();
+            // A get trap is user code and may mutate or redefine the receiver.
+            // Preserve the existing target snapshot but release the RefCell
+            // before invoking the trap. Its result (including undefined) is
+            // authoritative; a Proxy must not run an additional target getter.
+            let proxy_get = {
+                let object = o.borrow();
+                object.proxy_handler.as_ref().and_then(|handler| {
+                    handler.get.as_ref().map(|trap| {
+                        (
+                            Rc::clone(trap),
+                            handler.live_target,
+                            if handler.live_target {
+                                Value::Undefined
+                            } else {
+                                object.target_value()
+                            },
+                        )
+                    })
+                })
+            };
+            if let Some((trap, live, target)) = proxy_get {
+                if live {
+                    return trap(self, key, self);
+                }
+                return trap(&target, key, self);
+            }
+            let value = o.borrow().get_direct(key);
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
@@ -1997,10 +2023,21 @@ impl Value {
             }
             let has_own = o.borrow().properties.contains_key(key);
             if !has_own {
-                let setter = o
-                    .borrow()
-                    .get(&format!("__w3cos_setter_{key}"), self)
-                    .clone();
+                let setter_key = format!("__w3cos_setter_{key}");
+                let setter = {
+                    let object = o.borrow();
+                    if object
+                        .proxy_handler
+                        .as_ref()
+                        .is_some_and(|handler| handler.live_target)
+                    {
+                        // The setter slot is an own data property. Reading it
+                        // through the trap would clone the target and re-enter.
+                        object.get_direct(&setter_key)
+                    } else {
+                        object.get(&setter_key, self)
+                    }
+                };
                 if !setter.is_undefined() {
                     setter.call(self.clone(), vec![value]);
                     return true;
@@ -2008,17 +2045,28 @@ impl Value {
             }
             let proxy_set = {
                 let object = o.borrow();
-                object
-                    .proxy_handler
-                    .as_ref()
-                    .and_then(|handler| handler.set.as_ref())
-                    .map(|trap| (Rc::clone(trap), object.target_value()))
+                object.proxy_handler.as_ref().and_then(|handler| {
+                    handler.set.as_ref().map(|trap| {
+                        (
+                            Rc::clone(trap),
+                            handler.live_target,
+                            if handler.live_target {
+                                Value::Undefined
+                            } else {
+                                object.target_value()
+                            },
+                        )
+                    })
+                })
             };
-            if let Some((trap, target)) = proxy_set {
+            if let Some((trap, live, target)) = proxy_set {
                 // A Proxy trap is user code and can re-enter the receiver. Do
                 // not retain the RefCell borrow while it runs: DOM setters, in
                 // particular, may synchronously dispatch events or refresh a
                 // stylesheet and read another property from the same element.
+                if live {
+                    return trap(self, key, value, self);
+                }
                 return trap(&target, key, value, self);
             }
             o.borrow_mut().set_direct(key, value);
@@ -4151,6 +4199,68 @@ mod tests {
         ))));
 
         assert!(proxy.try_set_property("textContent", Value::string("updated")));
+    }
+
+    #[test]
+    fn proxy_get_can_redefine_the_receiver_without_a_borrow() {
+        let handler = crate::ProxyBuilder::new()
+            .get(|target, key, receiver| {
+                if key == "probe" {
+                    crate::class::define_property(
+                        receiver,
+                        "side",
+                        &crate::js_object! { "value" => Value::Number(7.0) },
+                    );
+                    return Value::Number(3.0);
+                }
+                target.get_property(key)
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        assert_eq!(proxy.get_property("probe"), Value::Number(3.0));
+        assert_eq!(proxy.get_property("side"), Value::Number(7.0));
+    }
+
+    #[test]
+    fn proxy_get_undefined_does_not_fall_through_to_target_getter() {
+        let called = Rc::new(std::cell::Cell::new(0));
+        let getter_called = Rc::clone(&called);
+        let getter = Value::function(move |_, _| {
+            getter_called.set(getter_called.get() + 1);
+            Value::Number(9.0)
+        });
+        let handler = crate::ProxyBuilder::new()
+            .get(|_, _, _| Value::Undefined)
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::from([("__w3cos_getter_probe".into(), getter)]),
+            handler,
+        ))));
+        assert!(proxy.get_property("probe").is_undefined());
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn own_accessor_shadows_an_inherited_callable() {
+        let object = Value::object(HashMap::new());
+        let prototype = crate::js_object! {
+            "probe" => Value::function(|_, _| Value::string("inherited")),
+        };
+        crate::class::set_prototype_of(&object, &prototype);
+        crate::class::define_property(
+            &object,
+            "probe",
+            &crate::js_object! {
+                "get" => Value::function(|receiver, _| {
+                    receiver.set_property("side", Value::Bool(true));
+                    Value::function(|this, _| this.get_property("side"))
+                }),
+            },
+        );
+        assert_eq!(object.call_method("probe", vec![]), Value::Bool(true));
     }
 
     #[test]
