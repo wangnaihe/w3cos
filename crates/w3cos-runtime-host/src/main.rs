@@ -1,8 +1,9 @@
-//! Load one system runtime, then either a component bundle or a web page.
+//! Load one system runtime, then a bundle, a C plugin, or a web page.
 //!
 //! ```text
 //! w3cos-runtime-host abi
 //! w3cos-runtime-host app <app.w3app>
+//! w3cos-runtime-host plugin <libapp.so>
 //! w3cos-runtime-host page [--headless] <file.html>
 //! ```
 
@@ -12,7 +13,9 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
-use w3cos_runtime_host::{find_runtime_library, library_dir_of, prepend_ld_library_path};
+use w3cos_runtime_host::{
+    ensure_app_compatible, find_runtime_library, library_dir_of, prepend_ld_library_path,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -30,6 +33,16 @@ fn run() -> Result<()> {
             reexec_with_library_path(&runtime)?;
             let lib = open_library(&runtime)?;
             println!("{:#x}", runtime_abi(&lib)?);
+        }
+        "plugin" => {
+            let plugin = args
+                .next()
+                .context("usage: w3cos-runtime-host plugin <libapp.so>")?;
+            let runtime = find_runtime_library()?;
+            reexec_with_library_path(&runtime)?;
+            let runtime_lib = open_library(&runtime)?;
+            let code = run_plugin(&runtime_lib, &plugin)?;
+            std::process::exit(code);
         }
         "app" => {
             let app = args
@@ -67,7 +80,7 @@ fn run() -> Result<()> {
         }
         other => {
             return Err(anyhow!(
-                "unknown command {other}. expected abi, app, or page"
+                "unknown command {other}. expected abi, app, plugin, or page"
             ));
         }
     }
@@ -97,6 +110,26 @@ fn runtime_abi(lib: &libloading::Library) -> Result<u32> {
         unsafe { lib.get(b"w3cos_runtime_abi_version\0") }
             .context("runtime is missing w3cos_runtime_abi_version")?;
     Ok(unsafe { symbol() })
+}
+
+fn run_plugin(runtime: &libloading::Library, path: &str) -> Result<i32> {
+    let host_abi = runtime_abi(runtime)?;
+    let plugin = open_library(Path::new(path))?;
+    let required: libloading::Symbol<unsafe extern "C" fn() -> u32> =
+        unsafe { plugin.get(b"w3cos_plugin_abi_required\0") }
+            .context("plugin is missing w3cos_plugin_abi_required")?;
+    let app_abi = unsafe { required() };
+    ensure_app_compatible(host_abi, app_abi)?;
+    let start: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+        unsafe { plugin.get(b"w3cos_plugin_main\0") }.context("plugin is missing w3cos_plugin_main")?;
+    let code = unsafe { start() };
+    if code != 0 {
+        return Err(anyhow!(
+            "plugin exited with {code}: {}",
+            last_error(runtime)
+        ));
+    }
+    Ok(code)
 }
 
 fn run_bundle(lib: &libloading::Library, path: &str) -> Result<i32> {

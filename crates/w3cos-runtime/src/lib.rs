@@ -145,6 +145,11 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+#[cfg(feature = "desktop")]
+#[path = "../../w3cos-shell/src/main.rs"]
+mod desktop_shell;
+
+pub mod plugin_abi;
 pub mod shared_abi;
 #[cfg(feature = "skia")]
 mod skia_text_run;

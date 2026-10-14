@@ -1,22 +1,17 @@
 #!/bin/sh
-# Show the compile toolchain shipped with the shell image.
-# rustc/cargo are copied by system/scripts/post-build.sh when W3COS_INSTALL_RUSTC=1.
+# Show the compilers shipped with the shell image.
+# rustc is not in the ISO. It is packed by system/scripts/package-sdk.sh.
 set -eu
 
 echo "w3cos toolchain"
-echo "  runtime: ${W3COS_RUNTIME_LIB:-/usr/lib/w3cos/libw3cos_runtime.so}"
-echo "  host:    ${W3COS_RUNTIME_HOST:-/usr/bin/w3cos-runtime-host}"
+echo "  runtime:  ${W3COS_RUNTIME_LIB:-/usr/lib/w3cos/libw3cos_runtime.so}"
+echo "  host:     ${W3COS_RUNTIME_HOST:-/usr/bin/w3cos-runtime-host}"
+echo "  shell:    /usr/bin/w3cos-shell (dlopens the runtime)"
 
 if [ -x /usr/bin/w3cos ]; then
-    echo "  cli:     /usr/bin/w3cos"
+    echo "  compiler: /usr/bin/w3cos (TypeScript frontend)"
 else
-    echo "  cli:     missing (/usr/bin/w3cos)"
-fi
-
-if command -v rustc >/dev/null 2>&1; then
-    echo "  rustc:   $(rustc --version)"
-else
-    echo "  rustc:   not installed in this image (set W3COS_INSTALL_RUSTC=1 at image build)"
+    echo "  compiler: missing (/usr/bin/w3cos)"
 fi
 
 if [ -f /usr/lib/w3cos/libw3cos_runtime.so ]; then
@@ -24,3 +19,5 @@ if [ -f /usr/lib/w3cos/libw3cos_runtime.so ]; then
 else
     echo "  abi-file: libw3cos_runtime.so is not installed"
 fi
+
+echo "  rustc:    not in this image; use the W3C OS SDK"

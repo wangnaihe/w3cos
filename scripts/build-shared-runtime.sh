@@ -15,8 +15,8 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNIT
 export CARGO_PROFILE_RELEASE_PANIC="${CARGO_PROFILE_RELEASE_PANIC:-unwind}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
-echo "=== shared runtime cdylib (cpu-render + dynamic-js, LTO off) ==="
-cargo rustc -p w3cos-runtime --release --lib --no-default-features --features cpu-render,dynamic-js --crate-type cdylib
+echo "=== shared runtime cdylib (cpu-render + dynamic-js + desktop, LTO off) ==="
+cargo rustc -p w3cos-runtime --release --lib --no-default-features --features cpu-render,dynamic-js,desktop --crate-type cdylib
 
 DEST="$ROOT/target/shared"
 mkdir -p "$DEST"

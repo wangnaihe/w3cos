@@ -1,0 +1,15 @@
+[package]
+name = "w3cos-shell-stub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop process that loads the one system libw3cos_runtime.so"
+
+[[bin]]
+name = "w3cos-shell-linked"
+path = "src/main.rs"
+
+[dependencies]
+w3cos-runtime-host = { path = "../w3cos-runtime-host" }
+anyhow = { workspace = true }
+libloading = { workspace = true }

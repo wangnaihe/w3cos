@@ -13,6 +13,9 @@ use w3cos_ai_bridge::intent::{
     INTENT_INPUT_PLACEHOLDER,
 };
 use w3cos_ai_bridge::permissions::AgentPermissions;
+#[cfg(feature = "desktop")]
+use crate::state;
+#[cfg(not(feature = "desktop"))]
 use w3cos_runtime::state;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
@@ -53,8 +56,13 @@ const OP_CHIP_SETTINGS: u8 = 16;
 const OP_ENROLL: u8 = 17;
 const OP_SHARED_APP: u8 = 18;
 const OP_SHARED_PAGE: u8 = 19;
+const OP_SHARED_PLUGIN: u8 = 20;
 
 fn main() {
+    shell_main();
+}
+
+pub(crate) fn shell_main() {
     if shared_launch::launch_from_args() {
         return;
     }
@@ -75,16 +83,23 @@ fn main() {
         // when the window starts the loopback listener.
         unsafe { std::env::set_var("W3COS_AI_TOKEN", token) };
     }
-    if let Some(port_str) = ai_port
+        if let Some(port_str) = ai_port
         && let Ok(port) = port_str.parse::<u16>()
     {
+        #[cfg(feature = "desktop")]
+        crate::enable_ai_bridge(port);
+        #[cfg(not(feature = "desktop"))]
         w3cos_runtime::enable_ai_bridge(port);
         eprintln!("[AI Bridge] Will start on port {port}");
     }
 
     state::set_invoke_hook(on_shell_intent);
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
-    w3cos_runtime::run_app(build_shell).expect("W3C OS Shell crashed");
+    #[cfg(feature = "desktop")]
+    let launched = crate::run_app(build_shell);
+    #[cfg(not(feature = "desktop"))]
+    let launched = w3cos_runtime::run_app(build_shell);
+    launched.expect("W3C OS Shell crashed");
 }
 
 fn bridge_propose(utterance: &str) -> String {
@@ -246,7 +261,20 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
             state::set_text_signal(
                 NOTICE_SIGNAL,
-                "已把网页载入共享 VM。Loaded the page on the shared VM.",
+                "已把网页载入页面 worker。Loaded the page in the page worker.",
+            );
+        }
+        OP_SHARED_PLUGIN => {
+            shared_launch::spawn_detached(
+                "plugin",
+                &shared_launch::configured_path(
+                    "W3COS_SHARED_PLUGIN",
+                    "/usr/share/w3cos/apps/shared-counter/libshared_counter.so",
+                ),
+            );
+            state::set_text_signal(
+                NOTICE_SIGNAL,
+                "已启动 C 插件应用。Launched the C plugin app.",
             );
         }
         _ => {}
@@ -490,6 +518,18 @@ fn build_shared_launcher() -> Component {
                     ..Style::default()
                 },
                 invoke(OP_SHARED_PAGE),
+            ),
+            Component::button_with_click(
+                "Counter",
+                Style {
+                    background: Color::from_hex("#9b2226"),
+                    color: Color::from_hex("#fff1f0"),
+                    border_radius: 8.0,
+                    font_size: 14.0,
+                    padding: Edges::xy(16.0, 10.0),
+                    ..Style::default()
+                },
+                invoke(OP_SHARED_PLUGIN),
             ),
         ],
     )

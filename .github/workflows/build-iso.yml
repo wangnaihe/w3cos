@@ -32,13 +32,16 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build w3cos-shell for Linux x86_64
+      - name: Build shared runtime, dynamic shell, and the TS compiler
         run: |
-          cargo build --release -p w3cos-shell --target x86_64-unknown-linux-gnu
-          cargo build --release -p w3cos-cli --target x86_64-unknown-linux-gnu
-          ls -lh target/x86_64-unknown-linux-gnu/release/w3cos-shell
+          # One runtime cdylib. The shell stub dlopens it. rustc is not staged
+          # into the ISO; system/scripts/package-sdk.sh builds that package.
+          scripts/build-shared-runtime.sh
+          cargo build --release -p w3cos-shell-stub -p w3cos-cli --target x86_64-unknown-linux-gnu
+          ls -lh target/x86_64-unknown-linux-gnu/release/w3cos-shell-linked
           ls -lh target/x86_64-unknown-linux-gnu/release/w3cos
-          strip target/x86_64-unknown-linux-gnu/release/w3cos-shell
+          ls -lh target/shared/libw3cos_runtime.so
+          strip target/x86_64-unknown-linux-gnu/release/w3cos-shell-linked
           strip target/x86_64-unknown-linux-gnu/release/w3cos
 
       - name: Install Buildroot dependencies
@@ -63,7 +66,7 @@ jobs:
       - name: Configure and build ISO
         run: |
           cd "buildroot-${BUILDROOT_VERSION}"
-          export W3COS_SHELL_BIN="${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-gnu/release/w3cos-shell"
+          export W3COS_SHELL_BIN="${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-gnu/release/w3cos-shell-linked"
           export W3COS_CLI_BIN="${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-gnu/release/w3cos"
           make BR2_EXTERNAL="${GITHUB_WORKSPACE}/system/buildroot" w3cos_x86_64_defconfig
           make -j$(nproc)

@@ -1914,7 +1914,7 @@ mod tests {
         assert!(!bundled.contains("w3cos_runtime::run_app"));
         let manifest = shared_app_manifest();
         assert!(manifest.contains("\"linkage\": \"component-bundle\""));
-        assert!(manifest.contains("\"abi\": \"1.0\""));
+        assert!(manifest.contains("\"abi\": \"1.1\""));
     }
 
     #[test]

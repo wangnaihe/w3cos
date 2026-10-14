@@ -18,6 +18,8 @@ web-media-advanced = []
 image-avif-encode = ["image/avif"]
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
+# Compile the desktop into this cdylib so /usr/bin/w3cos-shell can dlopen one runtime.
+desktop = ["ai-bridge", "w3cos-ai-bridge/l1"]
 dynamic-js = [
     "dep:w3cos-compiler",
     "dep:w3cos-ir",

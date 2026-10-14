@@ -13,9 +13,8 @@ use std::sync::Mutex;
 
 static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 static PAGE_TEXT: Mutex<Option<CString>> = Mutex::new(None);
-static PAGE_HTML: Mutex<Option<String>> = Mutex::new(None);
 
-fn set_error(message: impl Into<String>) {
+pub(crate) fn set_error(message: impl Into<String>) {
     let text = message.into().replace('\0', "");
     if let Ok(mut slot) = LAST_ERROR.lock() {
         *slot = CString::new(text).ok();
@@ -67,14 +66,11 @@ pub extern "C" fn w3cos_runtime_page_text(html: *const c_char) -> *const c_char 
             return std::ptr::null();
         }
         let html = unsafe { CStr::from_ptr(html) }.to_string_lossy();
-        match crate::dynamic_script::load_html_on_shared_vm(
+        match crate::browser_page_domain::load_html_snapshot(
             &html,
             "https://shared.w3cos.local/page.html",
         ) {
-            Ok(()) => {
-                let text = crate::dom::get_descendant_text_content(crate::dom::body_id());
-                store_text(text)
-            }
+            Ok(snapshot) => store_text(crate::browser_page_domain::component_text(&snapshot)),
             Err(error) => {
                 set_error(error.to_string());
                 std::ptr::null()
@@ -144,18 +140,24 @@ pub extern "C" fn w3cos_runtime_run_page(path: *const c_char) -> i32 {
             return 3;
         }
         let path = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
-        match std::fs::read_to_string(&path) {
-            Ok(html) => {
-                if let Ok(mut slot) = PAGE_HTML.lock() {
-                    *slot = Some(html);
-                }
-            }
+        let html = match std::fs::read_to_string(&path) {
+            Ok(html) => html,
             Err(error) => {
                 set_error(format!("could not read {path}: {error}"));
                 return 3;
             }
-        }
-        match crate::run_app_dom(setup_shared_page) {
+        };
+        let snapshot = match crate::browser_page_domain::load_html_snapshot(
+            &html,
+            "https://shared.w3cos.local/page.html",
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                set_error(error.to_string());
+                return 3;
+            }
+        };
+        match crate::run_app_static(snapshot) {
             Ok(()) => 0,
             Err(error) => {
                 set_error(error.to_string());
@@ -165,18 +167,16 @@ pub extern "C" fn w3cos_runtime_run_page(path: *const c_char) -> i32 {
     }
 }
 
-#[cfg(feature = "dynamic-js")]
-fn setup_shared_page() {
-    let html = PAGE_HTML
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .unwrap_or_default();
-    if let Err(error) = crate::dynamic_script::load_html_on_shared_vm(
-        &html,
-        "https://shared.w3cos.local/page.html",
-    ) {
-        set_error(error.to_string());
-        eprintln!("W3COS_PAGE_ERROR {error:#}");
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_shell_main() -> i32 {
+    #[cfg(feature = "desktop")]
+    {
+        crate::desktop_shell::shell_main();
+        0
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        set_error("this libw3cos_runtime.so was built without the desktop shell");
+        4
     }
 }

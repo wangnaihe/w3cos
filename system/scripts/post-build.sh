@@ -10,14 +10,24 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 echo "=== W3C OS post-build ==="
 
-# Install w3cos-shell (desktop environment)
-SHELL_BIN="${W3COS_SHELL_BIN:-${PROJECT_ROOT}/target/x86_64-unknown-linux-gnu/release/w3cos-shell}"
+# Install the desktop process. The product binary dlopens libw3cos_runtime.so.
+# The statically linked w3cos-shell is only a fallback when that stub is absent.
+SHELL_BIN="${W3COS_SHELL_BIN:-}"
+if [ -z "$SHELL_BIN" ]; then
+    if [ -f "${PROJECT_ROOT}/target/release/w3cos-shell-linked" ]; then
+        SHELL_BIN="${PROJECT_ROOT}/target/release/w3cos-shell-linked"
+    elif [ -f "${PROJECT_ROOT}/target/x86_64-unknown-linux-gnu/release/w3cos-shell-linked" ]; then
+        SHELL_BIN="${PROJECT_ROOT}/target/x86_64-unknown-linux-gnu/release/w3cos-shell-linked"
+    else
+        SHELL_BIN="${PROJECT_ROOT}/target/x86_64-unknown-linux-gnu/release/w3cos-shell"
+    fi
+fi
 if [ -f "$SHELL_BIN" ]; then
-    echo "  Installing w3cos-shell → ${TARGET_DIR}/usr/bin/"
+    echo "  Installing w3cos-shell → ${TARGET_DIR}/usr/bin/ (${SHELL_BIN})"
     install -m 755 "$SHELL_BIN" "${TARGET_DIR}/usr/bin/w3cos-shell"
 else
     echo "  WARNING: w3cos-shell binary not found at $SHELL_BIN"
-    echo "  Build: cargo build --release -p w3cos-shell --target x86_64-unknown-linux-gnu"
+    echo "  Build: scripts/build-shared-runtime.sh && cargo build --release -p w3cos-shell-stub"
 fi
 
 # Install w3cos CLI (build tool)
@@ -50,15 +60,12 @@ if [ -f "$HOST_BIN" ]; then
     echo "  Installing w3cos-runtime-host → ${TARGET_DIR}/usr/bin/"
     install -m 755 "$HOST_BIN" "${TARGET_DIR}/usr/bin/w3cos-runtime-host"
 fi
-if [ "${W3COS_INSTALL_RUSTC:-0}" = "1" ] && command -v rustc >/dev/null 2>&1; then
-    SYSROOT="$(rustc --print sysroot)"
-    echo "  Installing rustc sysroot → ${TARGET_DIR}/usr/share/w3cos/toolchain/rust"
-    mkdir -p "${TARGET_DIR}/usr/share/w3cos/toolchain/rust"
-    cp -a "$SYSROOT/bin" "$SYSROOT/lib" "${TARGET_DIR}/usr/share/w3cos/toolchain/rust/" || true
-    ln -sfn /usr/share/w3cos/toolchain/rust/bin/rustc "${TARGET_DIR}/usr/bin/rustc"
-    if [ -x "$SYSROOT/bin/cargo" ]; then
-        ln -sfn /usr/share/w3cos/toolchain/rust/bin/cargo "${TARGET_DIR}/usr/bin/cargo"
-    fi
+COUNTER_SO="${PROJECT_ROOT}/target/shared/libshared_counter.so"
+if [ -f "$COUNTER_SO" ]; then
+    echo "  Installing counter plugin → ${TARGET_DIR}/usr/share/w3cos/apps/shared-counter/"
+    install -d "${TARGET_DIR}/usr/share/w3cos/apps/shared-counter"
+    install -m 755 "$COUNTER_SO" "${TARGET_DIR}/usr/share/w3cos/apps/shared-counter/libshared_counter.so"
 fi
+# rustc stays in the SDK (system/scripts/package-sdk.sh), not in this rootfs.
 
 echo "=== W3C OS post-build complete ==="

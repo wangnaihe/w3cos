@@ -1,18 +1,20 @@
-//! Hand component bundles and local web pages to the system runtime host.
+//! Hand component bundles, C plugins, and local web pages to the system runtime host.
 //!
-//! The shell keeps its own static runtime for the desktop chrome. Shared apps
-//! and pages run in a child process so the page's W3VM cannot see the shell's
-//! AI-bridge token or filesystem authority.
+//! The product shell dlopens the one `libw3cos_runtime.so`. Shared apps, C
+//! plugins, and pages still run in a `w3cos-runtime-host` child. That child's
+//! page worker does not see the shell's AI-bridge token, and its
+//! `capability_gate` starts empty.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// `--shared-app` / `--shared-page` replace the desktop and wait for the host.
-/// Returns false when those flags are absent.
+/// `--shared-app` / `--shared-page` / `--shared-plugin` replace the desktop and
+/// wait for the host. Returns false when those flags are absent.
 pub fn launch_from_args() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut app = None;
     let mut page = None;
+    let mut plugin = None;
     let mut headless = false;
     let mut index = 0;
     while index < args.len() {
@@ -25,6 +27,10 @@ pub fn launch_from_args() -> bool {
                 page = args.get(index + 1).cloned();
                 index += 2;
             }
+            "--shared-plugin" => {
+                plugin = args.get(index + 1).cloned();
+                index += 2;
+            }
             "--shared-headless" => {
                 headless = true;
                 index += 1;
@@ -34,6 +40,10 @@ pub fn launch_from_args() -> bool {
     }
     if let Some(path) = app {
         let code = run_host(&["app", &path], true);
+        std::process::exit(code);
+    }
+    if let Some(path) = plugin {
+        let code = run_host(&["plugin", &path], true);
         std::process::exit(code);
     }
     if let Some(path) = page {
@@ -55,6 +65,7 @@ pub fn spawn_detached(kind: &str, path: &str) {
     let code = match kind {
         "app" => run_host(&["app", path], false),
         "page" => run_host(&["page", path], false),
+        "plugin" => run_host(&["plugin", path], false),
         _ => 1,
     };
     if code != 0 {
