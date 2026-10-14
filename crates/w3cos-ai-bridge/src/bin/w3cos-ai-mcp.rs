@@ -27,10 +27,7 @@ fn main() {
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut stdout = io::stdout().lock();
-    loop {
-        let Some(message) = read_message(&mut input) else {
-            break;
-        };
+    while let Some(message) = read_message(&mut input) {
         let Ok(message) = serde_json::from_str::<Value>(&message) else {
             continue;
         };

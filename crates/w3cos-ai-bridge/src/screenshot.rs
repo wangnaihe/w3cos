@@ -232,7 +232,7 @@ fn draw_outlines(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
             let mut pb = PathBuilder::new();
             pb.push_rect(rect);
             if let Some(path) = pb.finish() {
-                let _ = pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
     }
@@ -282,6 +282,19 @@ fn encode_pixmap(pixmap: &Pixmap) -> Vec<u8> {
     pixmap.encode_png().unwrap_or_default()
 }
 
+fn encode_raw_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        if let Ok(mut writer) = encoder.write_header() {
+            let _ = writer.write_image_data(pixels);
+        }
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,17 +340,4 @@ mod tests {
         assert!(json.contains("png_base64"));
         assert!(!json.contains("\"annotations\":[]"));
     }
-}
-
-fn encode_raw_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut buf, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        if let Ok(mut writer) = encoder.write_header() {
-            let _ = writer.write_image_data(pixels);
-        }
-    }
-    buf
 }

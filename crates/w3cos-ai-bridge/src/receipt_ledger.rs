@@ -100,10 +100,10 @@ impl ReceiptLedger {
 }
 
 fn receipt_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("W3COS_RECEIPT_DIR") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir));
-        }
+    if let Some(dir) = std::env::var_os("W3COS_RECEIPT_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME")?;
     if home.is_empty() {

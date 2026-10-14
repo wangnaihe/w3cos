@@ -7,7 +7,12 @@
 //! The unlock string is not stored. The stub keeps a PBKDF2-HMAC-SHA256
 //! verifier (salt + hash). The subject is a `did:key:` string that can be
 //! replaced later. Receipts already written keep the actor they recorded.
-//! WebAuthn enrollment here is a note, not a ceremony.
+//!
+//! Passkey enrollment can mint a challenge and store public-key bytes.
+//! It does not speak to an authenticator and does not check an assertion.
+//! TODO(webauthn): verify `clientDataJSON` against the stored challenge and
+//! the assertion signature against the stored key before setting
+//! [`IdentityMethod::Passkey`] or installing a `did:key` from that key.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +33,10 @@ pub enum IdentityMethod {
 pub enum EnrollmentState {
     #[default]
     Stub,
+    /// A challenge exists. No credential and no checked assertion.
     AwaitingPasskey,
+    /// Public-key bytes were stored for a challenge. The signature was not checked.
+    KeyMaterialStored,
 }
 
 /// What the shell needs from a local identity service.
@@ -49,6 +57,10 @@ pub struct LocalIdentityStub {
     unlocked: bool,
     /// `pbkdf2-sha256$iterations$salt$hash`. Not the unlock string.
     verifier: Option<String>,
+    /// base64url of 32 random bytes. Not a WebAuthn clientDataJSON.
+    passkey_challenge: Option<String>,
+    /// base64url of caller-supplied public-key bytes. Not attested.
+    passkey_public_key: Option<String>,
 }
 
 impl LocalIdentityStub {
@@ -61,6 +73,8 @@ impl LocalIdentityStub {
             enrollment: EnrollmentState::Stub,
             unlocked: false,
             verifier: None,
+            passkey_challenge: None,
+            passkey_public_key: None,
         }
     }
 
@@ -69,20 +83,75 @@ impl LocalIdentityStub {
     }
 
     /// Copy for the Settings identity section. This does not start WebAuthn.
-    pub fn enrollment_copy(&self) -> &'static str {
+    pub fn enrollment_copy(&self) -> String {
         match self.enrollment {
             EnrollmentState::Stub => {
                 "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
+                    .to_string()
             }
-            EnrollmentState::AwaitingPasskey => {
-                "已记下注册意向。仍然没有 WebAuthn 凭证。Enrollment noted. No credential was created."
+            EnrollmentState::AwaitingPasskey => match self.passkey_challenge.as_deref() {
+                Some(challenge) => format!(
+                    "挑战 {challenge}。还没有验证 WebAuthn 断言。Challenge stored. No assertion was checked."
+                ),
+                None => "已记下注册意向。仍然没有 WebAuthn 凭证。Enrollment noted. No credential was created."
+                    .to_string(),
+            },
+            EnrollmentState::KeyMaterialStored => {
+                "公钥已保存，签名还没验证。Public key stored. The assertion was not checked."
+                    .to_string()
             }
         }
     }
 
-    /// Remember that the user asked to enroll. Does not create a credential.
+    /// Remember that the user asked to enroll. Does not create a challenge or a credential.
     pub fn note_passkey_enrollment(&mut self) {
         self.enrollment = EnrollmentState::AwaitingPasskey;
+    }
+
+    /// Mint a fresh 32-byte challenge. Clears any stored public key.
+    /// Does not unlock, does not change the subject, and does not set
+    /// [`IdentityMethod::Passkey`].
+    ///
+    /// TODO(webauthn): hand this challenge to a platform authenticator, then
+    /// require `clientDataJSON.challenge` to match before trusting a key.
+    pub fn begin_passkey_enrollment(&mut self) -> Option<String> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).ok()?;
+        let challenge = base64url_encode(&bytes);
+        self.passkey_challenge = Some(challenge.clone());
+        self.passkey_public_key = None;
+        self.enrollment = EnrollmentState::AwaitingPasskey;
+        Some(challenge)
+    }
+
+    pub fn passkey_challenge(&self) -> Option<&str> {
+        self.passkey_challenge.as_deref()
+    }
+
+    pub fn passkey_public_key(&self) -> Option<&str> {
+        self.passkey_public_key.as_deref()
+    }
+
+    /// Store public-key bytes against the current challenge.
+    ///
+    /// TODO(webauthn): this does not verify an attestation or an assertion,
+    /// and it must not install a `did:key` from `public_key` until it does.
+    pub fn store_passkey_public_key(&mut self, public_key: &[u8]) -> bool {
+        if self.passkey_challenge.is_none() || public_key.is_empty() || public_key.len() > 128 {
+            return false;
+        }
+        self.passkey_public_key = Some(base64url_encode(public_key));
+        self.enrollment = EnrollmentState::KeyMaterialStored;
+        true
+    }
+
+    pub fn restore_passkey_material(
+        &mut self,
+        challenge: Option<String>,
+        public_key: Option<String>,
+    ) {
+        self.passkey_challenge = challenge.filter(|value| is_stored_challenge(value));
+        self.passkey_public_key = public_key.filter(|value| is_stored_public_key(value));
     }
 
     pub fn restore_enrollment(&mut self, state: EnrollmentState) {
@@ -166,6 +235,45 @@ const VERIFIER_PREFIX: &str = "pbkdf2-sha256$";
 
 fn is_verifier(stored: &str) -> bool {
     stored.starts_with(VERIFIER_PREFIX)
+}
+
+fn is_base64url(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn is_stored_challenge(value: &str) -> bool {
+    value.len() == 43 && is_base64url(value)
+}
+
+fn is_stored_public_key(value: &str) -> bool {
+    (2..=172).contains(&value.len()) && is_base64url(value)
+}
+
+fn base64url_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let chunk = u32::from_be_bytes([0, data[index], data[index + 1], data[index + 2]]);
+        for shift in [18, 12, 6, 0] {
+            out.push(TABLE[((chunk >> shift) & 0x3f) as usize] as char);
+        }
+        index += 3;
+    }
+    let rest = data.len() - index;
+    if rest == 1 {
+        let chunk = u32::from(data[index]) << 16;
+        out.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+    } else if rest == 2 {
+        let chunk = (u32::from(data[index]) << 16) | (u32::from(data[index + 1]) << 8);
+        out.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+    }
+    out
 }
 
 fn is_did_key(subject: &str) -> bool {
@@ -364,5 +472,36 @@ mod tests {
         assert!(id.remembered_pin().is_none());
         assert!(id.enrollment_copy().contains("Enrollment noted"));
         assert!(id.enrollment_copy().contains("没有 WebAuthn"));
+    }
+
+    #[test]
+    fn passkey_challenge_is_stored_without_a_ceremony() {
+        let mut id = LocalIdentityStub::new();
+        assert!(!id.store_passkey_public_key(&[1, 2, 3, 4]));
+        let first = id.begin_passkey_enrollment().expect("challenge");
+        let second = id.begin_passkey_enrollment().expect("another challenge");
+        assert_eq!(first.len(), 43, "{first}");
+        assert_ne!(first, second);
+        assert!(!first.contains('='));
+        assert_eq!(id.passkey_challenge(), Some(second.as_str()));
+        assert!(id.passkey_public_key().is_none());
+        assert_eq!(id.enrollment(), EnrollmentState::AwaitingPasskey);
+        assert_eq!(id.method(), IdentityMethod::Stub);
+        assert_eq!(id.subject(), LocalIdentityStub::SUBJECT);
+        assert!(!id.unlocked());
+        assert!(id.enrollment_copy().contains(&second));
+        assert!(id.enrollment_copy().contains("No assertion was checked"));
+        assert!(!id.store_passkey_public_key(&[]));
+        assert!(!id.store_passkey_public_key(&[0u8; 129]));
+        let key = [7u8; 32];
+        assert!(id.store_passkey_public_key(&key));
+        assert_eq!(id.enrollment(), EnrollmentState::KeyMaterialStored);
+        let stored = id.passkey_public_key().expect("public key");
+        assert!(stored.len() >= 2 && !stored.contains('='));
+        assert_eq!(id.method(), IdentityMethod::Stub);
+        assert_eq!(id.subject(), LocalIdentityStub::SUBJECT);
+        assert!(!id.unlocked());
+        assert!(id.remembered_pin().is_none());
+        assert!(id.enrollment_copy().contains("was not checked"));
     }
 }

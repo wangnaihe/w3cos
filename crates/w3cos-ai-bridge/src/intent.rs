@@ -221,6 +221,13 @@ struct LedgerSnapshot {
     subject: Option<String>,
     #[serde(default)]
     enrollment: crate::identity::EnrollmentState,
+    /// WebAuthn challenge, base64url. Missing on older files.
+    /// Storing it does not mean an assertion was verified.
+    #[serde(default)]
+    passkey_challenge: Option<String>,
+    /// Unverified public-key bytes, base64url. Missing on older files.
+    #[serde(default)]
+    passkey_public_key: Option<String>,
 }
 
 pub struct IntentSession {
@@ -259,7 +266,7 @@ impl IntentSession {
             let mut session = self;
             let disabled = std::env::var("W3COS_L1").ok().as_deref() == Some("0");
             session.l1_enabled = !disabled;
-            return session;
+            session
         }
         #[cfg(not(feature = "l1"))]
         {
@@ -295,6 +302,10 @@ impl IntentSession {
                         self.identity.restore_subject(subject);
                     }
                     self.identity.restore_enrollment(snapshot.enrollment);
+                    self.identity.restore_passkey_material(
+                        snapshot.passkey_challenge,
+                        snapshot.passkey_public_key,
+                    );
                     if let Some(next) = snapshot
                         .receipts
                         .iter()
@@ -350,7 +361,30 @@ impl IntentSession {
         self.persist();
     }
 
-    pub fn enrollment_copy(&self) -> &'static str {
+    /// Mint a 32-byte challenge and remember it. This does not create a
+    /// credential and does not check an assertion.
+    pub fn begin_passkey_enrollment(&mut self) -> Option<String> {
+        let challenge = self.identity.begin_passkey_enrollment()?;
+        self.persist();
+        Some(challenge)
+    }
+
+    /// Remember public-key bytes for a challenge that was already minted.
+    /// Returns false when there is no challenge, or the key is empty or
+    /// longer than 128 bytes. Does not change the subject or unlock.
+    pub fn store_passkey_public_key(&mut self, public_key: &[u8]) -> bool {
+        if !self.identity.store_passkey_public_key(public_key) {
+            return false;
+        }
+        self.persist();
+        true
+    }
+
+    pub fn passkey_challenge(&self) -> Option<&str> {
+        self.identity.passkey_challenge()
+    }
+
+    pub fn enrollment_copy(&self) -> String {
         self.identity.enrollment_copy()
     }
 
@@ -562,6 +596,8 @@ impl IntentSession {
             receipts: self.receipts.clone(),
             subject: Some(self.identity.subject().to_string()),
             enrollment: self.identity.enrollment(),
+            passkey_challenge: self.identity.passkey_challenge().map(str::to_string),
+            passkey_public_key: self.identity.passkey_public_key().map(str::to_string),
         };
         let Ok(bytes) = serde_json::to_vec(&snapshot) else {
             eprintln!("[intent] receipt ledger skipped a write: snapshot did not encode");
@@ -1154,5 +1190,32 @@ mod tests {
         assert_eq!(legacy.actor(), LocalIdentityStub::SUBJECT);
         assert!(legacy.enrollment_copy().contains("not implemented"));
         let _ = std::fs::remove_dir_all(&legacy_dir);
+    }
+
+    #[test]
+    fn a_passkey_challenge_survives_restart_without_becoming_a_credential() {
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "passkey-challenge"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("ledger"));
+        let challenge = session.begin_passkey_enrollment().expect("challenge");
+        assert!(session.store_passkey_public_key(&[9u8; 32]));
+        assert!(!session.identity_unlocked());
+        assert_eq!(session.actor(), LocalIdentityStub::SUBJECT);
+        drop(session);
+
+        let reloaded =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("reopen"));
+        assert_eq!(reloaded.passkey_challenge(), Some(challenge.as_str()));
+        assert!(reloaded.enrollment_copy().contains("was not checked"));
+        assert_eq!(reloaded.actor(), LocalIdentityStub::SUBJECT);
+        assert!(!reloaded.identity_unlocked());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

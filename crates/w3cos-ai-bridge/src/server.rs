@@ -126,13 +126,16 @@ pub fn take_bridge_prep() -> (bool, bool) {
     )
 }
 
-fn propose_slot() -> &'static Mutex<Option<fn(&str) -> String>> {
-    static SLOT: OnceLock<Mutex<Option<fn(&str) -> String>>> = OnceLock::new();
+type ProposeHook = fn(&str) -> String;
+type ConfirmHook = fn() -> String;
+
+fn propose_slot() -> &'static Mutex<Option<ProposeHook>> {
+    static SLOT: OnceLock<Mutex<Option<ProposeHook>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-fn confirm_slot() -> &'static Mutex<Option<fn() -> String>> {
-    static SLOT: OnceLock<Mutex<Option<fn() -> String>>> = OnceLock::new();
+fn confirm_slot() -> &'static Mutex<Option<ConfirmHook>> {
+    static SLOT: OnceLock<Mutex<Option<ConfirmHook>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 

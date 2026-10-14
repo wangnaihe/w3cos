@@ -388,8 +388,8 @@ fn index_of(summary: &str, needle: &str) -> u32 {
         .unwrap_or_else(|| panic!("no index for {needle} in {summary}"))
 }
 
-fn token<'a>(
-    bridge: &'a RunningBridge,
+fn token(
+    bridge: &RunningBridge,
     doc: &mut Document,
     method: &str,
     path: &str,

@@ -103,9 +103,7 @@ pub fn dispatch(
     exec: &mut dyn FnMut(&BridgeCall) -> (u16, String),
 ) -> Option<Value> {
     let id = message.get("id").cloned();
-    if id.is_none() {
-        return None;
-    }
+    id.as_ref()?;
     let method = message
         .get("method")
         .and_then(|value| value.as_str())

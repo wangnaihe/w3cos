@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, IntentSession, ProposeResult, ShellApp, ShellContext, INTENT_INPUT_PLACEHOLDER,
+    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
+    INTENT_INPUT_PLACEHOLDER,
 };
 use w3cos_ai_bridge::permissions::AgentPermissions;
 use w3cos_runtime::state;
@@ -31,6 +32,7 @@ const RECEIPT_SIGNAL: usize = 9;
 const STORAGE_SIGNAL: usize = 11;
 const SUBJECT_SIGNAL: usize = 12;
 const ENROLL_SIGNAL: usize = 13;
+const TIER_SIGNAL: usize = 14;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -115,6 +117,7 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("No receipts yet.");
         let _ = state::create_signal(1);
         let _ = state::create_text_signal("memory");
+        let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
     });
@@ -206,12 +209,12 @@ fn on_shell_intent(code: u8, draft: &str) {
             }
         }
         OP_ENROLL => {
-            session.note_passkey_enrollment();
-            sync_session(
-                session,
-                state::get_signal(PHASE_SIGNAL),
-                "已记下注册意向。Enrollment noted.",
-            );
+            let notice = if session.begin_passkey_enrollment().is_some() {
+                "已生成注册挑战。还没有验证断言。Challenge ready."
+            } else {
+                "挑战没有生成。Challenge was not created."
+            };
+            sync_session(session, state::get_signal(PHASE_SIGNAL), notice);
         }
         _ => {}
     });
@@ -223,11 +226,13 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
         ProposeResult::Confirm(proposal) => {
             state::set_text_signal(SUMMARY_SIGNAL, proposal.summary);
             state::set_text_signal(IMPACT_SIGNAL, proposal.impact);
+            state::set_text_signal(TIER_SIGNAL, tier_name(proposal.tier));
             sync_session(session, 1, "");
         }
         ProposeResult::Unrecognized { receipt } => {
             state::set_text_signal(SUMMARY_SIGNAL, "");
             state::set_text_signal(IMPACT_SIGNAL, "");
+            state::set_text_signal(TIER_SIGNAL, "");
             sync_session(session, 2, &receipt.outcome);
         }
     }
@@ -240,6 +245,14 @@ fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
     };
     apply_effect(&effect);
     sync_session(session, 2, &effect.receipt.outcome);
+}
+
+fn tier_name(tier: IntentTier) -> &'static str {
+    match tier {
+        IntentTier::L1 => "L1",
+        IntentTier::L0 => "L0",
+        IntentTier::Unspecified => "",
+    }
 }
 
 fn apply_effect(effect: &ExecuteResult) {
@@ -826,7 +839,7 @@ fn build_settings_app() -> Component {
                                     ..Style::default()
                                 },
                             ),
-                            chrome_button("记下注册意向 Enroll", OP_ENROLL, "#3d5570"),
+                            chrome_button("生成注册挑战 Challenge", OP_ENROLL, "#3d5570"),
                             settings_row("身份 Identity", "PBKDF2 · not a passkey"),
                             settings_row("夜间模式 Night", night),
                             settings_row("AI 权限 Bridge", bridge),
@@ -1036,6 +1049,63 @@ fn build_intent_bar() -> Component {
 }
 
 fn confirm_card() -> Component {
+    let mut rows = Vec::new();
+    if state::get_signal_text(TIER_SIGNAL) == "L1" {
+        rows.push(Component::row(
+            Style {
+                padding: Edges::xy(8.0, 4.0),
+                background: Color::from_hex("#9a3412"),
+                border_radius: 6.0,
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "L1 本地 Local",
+                Style {
+                    font_size: 12.0,
+                    font_weight: 700,
+                    color: Color::WHITE,
+                    ..Style::default()
+                },
+            )],
+        ));
+    }
+    rows.push(Component::text(
+        "确认后才会执行 · Confirm to run",
+        Style {
+            font_size: 12.0,
+            font_weight: 700,
+            color: Color::from_hex("#ffe08a"),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        state::get_signal_text(SUMMARY_SIGNAL),
+        Style {
+            font_size: 16.0,
+            font_weight: 700,
+            color: ink(),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        state::get_signal_text(IMPACT_SIGNAL),
+        Style {
+            font_size: 13.0,
+            color: muted_ink(),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            ..Style::default()
+        },
+        vec![
+            chrome_button("确认 Confirm", OP_CONFIRM, "#1c8f62"),
+            chrome_button("取消 Cancel", OP_CANCEL, "#3d5570"),
+        ],
+    ));
     Component::column(
         Style {
             gap: 6.0,
@@ -1044,44 +1114,7 @@ fn confirm_card() -> Component {
             border_radius: 8.0,
             ..Style::default()
         },
-        vec![
-            Component::text(
-                "确认后才会执行 · Confirm to run",
-                Style {
-                    font_size: 12.0,
-                    font_weight: 700,
-                    color: Color::from_hex("#ffe08a"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                state::get_signal_text(SUMMARY_SIGNAL),
-                Style {
-                    font_size: 16.0,
-                    font_weight: 700,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                state::get_signal_text(IMPACT_SIGNAL),
-                Style {
-                    font_size: 13.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::row(
-                Style {
-                    gap: 8.0,
-                    ..Style::default()
-                },
-                vec![
-                    chrome_button("确认 Confirm", OP_CONFIRM, "#1c8f62"),
-                    chrome_button("取消 Cancel", OP_CANCEL, "#3d5570"),
-                ],
-            ),
-        ],
+        rows,
     )
 }
 
@@ -1173,25 +1206,36 @@ fn build_task_center() -> Component {
                 ..Style::default()
             },
         ),
-        chrome_button(
-            if unlocked {
-                "锁定 Lock"
-            } else {
-                "解锁 Unlock"
-            },
-            if unlocked { OP_LOCK } else { OP_UNLOCK },
-            "#3d5570",
-        ),
-        Component::text(
-            "收据 Receipts",
+    ];
+    if !unlocked {
+        body.push(Component::text(
+            "已锁定。确认前请先解锁。Locked — unlock before confirm.",
             Style {
-                font_size: 14.0,
+                font_size: 13.0,
                 font_weight: 700,
-                color: ink(),
+                color: Color::from_hex("#ffe08a"),
                 ..Style::default()
             },
-        ),
-    ];
+        ));
+    }
+    body.push(chrome_button(
+        if unlocked {
+            "锁定 Lock"
+        } else {
+            "解锁才能执行 Unlock to run"
+        },
+        if unlocked { OP_LOCK } else { OP_UNLOCK },
+        if unlocked { "#3d5570" } else { "#9a3412" },
+    ));
+    body.push(Component::text(
+        "收据 Receipts",
+        Style {
+            font_size: 14.0,
+            font_weight: 700,
+            color: ink(),
+            ..Style::default()
+        },
+    ));
     let log = state::get_signal_text(RECEIPT_SIGNAL);
     if log.is_empty() || log == "No receipts yet." {
         body.push(Component::text(
