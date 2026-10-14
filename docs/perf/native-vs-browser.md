@@ -37,6 +37,9 @@ frame signal, launch included.
 | frames | 20 animation frames after 2 warmup frames: scroll plus 80 absolute boxes, then `offsetHeight`. |
 | compute | 400000 iterations of a scalar numeric loop. |
 | memory | Build 4000 nodes, force one layout, then sample RSS. |
+| css-list | Author rule `#css-list > div { height: 18px }` on 1000 text rows, then one `offsetHeight`. |
+| flex-list | 400 text rows in a column flex parent, each `height: 18px` and `flex: 0 0 auto`, then one `offsetHeight`. |
+| events | 400 buttons with click listeners already attached. Time is only `dispatchEvent(new Event("click"))`. Checksum is the handler hit count. |
 
 Frame work time is the time inside the `requestAnimationFrame` callback (script
 plus forced layout). Native pipeline time adds the tiny-skia raster of that

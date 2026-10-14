@@ -13,6 +13,9 @@ var FRAME_WARMUP = 2;
 var FRAME_SAMPLES = 20;
 var COMPUTE_N = 400000;
 var MEMORY_NODES = 4000;
+var CSS_LIST_NODES = 1000;
+var FLEX_LIST_NODES = 400;
+var EVENT_NODES = 400;
 var WARMUP = 2;
 var SAMPLES = 5;
 
@@ -266,6 +269,79 @@ function runFrames() {
     }
     requestAnimationFrame(frame);
 }
+function runCssList() {
+    resetPage();
+    var style = document.createElement("style");
+    style.textContent = "#css-list > div { height: 18px; font-size: 14px; line-height: 18px; }";
+    document.head.appendChild(style);
+    var root = document.createElement("div");
+    root.id = "css-list";
+    document.body.appendChild(root);
+    var t0 = performance.now();
+    for (var i = 0; i < CSS_LIST_NODES; i++) {
+        var el = document.createElement("div");
+        el.textContent = "row " + (i % 40);
+        root.appendChild(el);
+    }
+    var height = root.offsetHeight;
+    var elapsed = performance.now() - t0;
+    check(root.childNodes.length === CSS_LIST_NODES, "css list count");
+    emit({
+        workload: "css-list",
+        elapsed_ms: elapsed,
+        checksum: height,
+        count: root.childNodes.length
+    });
+}
+function runFlexList() {
+    resetPage();
+    var root = document.createElement("div");
+    root.style.display = "flex";
+    root.style.flexDirection = "column";
+    document.body.appendChild(root);
+    var t0 = performance.now();
+    for (var i = 0; i < FLEX_LIST_NODES; i++) {
+        var el = document.createElement("div");
+        el.textContent = "f " + (i % 20);
+        el.style.height = "18px";
+        el.style.flex = "0 0 auto";
+        root.appendChild(el);
+    }
+    var height = root.offsetHeight;
+    var elapsed = performance.now() - t0;
+    check(root.childNodes.length === FLEX_LIST_NODES, "flex list count");
+    emit({
+        workload: "flex-list",
+        elapsed_ms: elapsed,
+        checksum: height,
+        count: root.childNodes.length
+    });
+}
+function runEvents() {
+    resetPage();
+    var root = document.createElement("div");
+    document.body.appendChild(root);
+    var hits = 0;
+    for (var i = 0; i < EVENT_NODES; i++) {
+        var el = document.createElement("button");
+        el.textContent = "e " + i;
+        el.addEventListener("click", function () { hits = hits + 1; });
+        root.appendChild(el);
+    }
+    var nodes = root.childNodes;
+    var t0 = performance.now();
+    for (var n = 0; n < nodes.length; n++) {
+        nodes[n].dispatchEvent(new Event("click"));
+    }
+    var elapsed = performance.now() - t0;
+    check(hits === EVENT_NODES, "event hits");
+    emit({
+        workload: "events",
+        elapsed_ms: elapsed,
+        checksum: hits,
+        count: nodes.length
+    });
+}
 function runMemory() {
     resetPage();
     var root = document.createElement("div");
@@ -296,6 +372,9 @@ try {
     else if (workload === "frames") runFrames();
     else if (workload === "compute") emit({workload: "compute", samples: measure(computeOnce)});
     else if (workload === "memory") runMemory();
+    else if (workload === "css-list") runCssList();
+    else if (workload === "flex-list") runFlexList();
+    else if (workload === "events") runEvents();
     else emit({workload: String(workload), status: "error", error: "unknown workload"});
 } catch (error) {
     console.log("W3COS_PERF_RESULT " + JSON.stringify({

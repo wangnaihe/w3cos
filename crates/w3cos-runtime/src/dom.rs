@@ -377,7 +377,15 @@ pub fn get_descendant_text_content(node: u32) -> String {
 }
 
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
-    let old_value = get_attribute(node, "style");
+    // CSSOM writes notify attribute observers with the previous style
+    // attribute. With no observers, serializing that attribute on every
+    // `top`/`height` write is not observable.
+    let notify = !crate::observers_web::mutation_observers_empty();
+    let old_value = if notify {
+        get_attribute(node, "style")
+    } else {
+        None
+    };
     with_document_mut(|doc| {
         let id = NodeId::from_u32(node);
         doc.get_style_mut(id).set_property(prop, value);
@@ -388,7 +396,9 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
         }
     });
     mark_dom_dirty();
-    crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
+    if notify {
+        crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
+    }
 }
 
 /// Known non-inherited properties. Everything else, including custom

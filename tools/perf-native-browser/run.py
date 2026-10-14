@@ -25,7 +25,18 @@ import time
 from pathlib import Path
 
 VIEWPORT = {"width": 1024, "height": 768, "dpr": 1}
-WORKLOADS = ("startup", "dom-list", "layout", "layout-css", "frames", "compute", "memory")
+WORKLOADS = (
+    "startup",
+    "dom-list",
+    "layout",
+    "layout-css",
+    "frames",
+    "compute",
+    "memory",
+    "css-list",
+    "flex-list",
+    "events",
+)
 CHROME = os.environ.get("W3COS_CHROME", "/usr/bin/google-chrome")
 CHROME_ARGS = [
     "--disable-gpu",
@@ -482,11 +493,16 @@ def comparable(workload, native, browser):
             native_result.get("frames") == browser_result.get("frames")
             and numbers_close(native_result.get("checksum"), browser_result.get("checksum"), rel=0.02, abs_tol=4)
         )
-    if workload in ("layout", "layout-css", "memory"):
+    if workload in ("layout", "layout-css", "memory", "css-list", "flex-list"):
         count_ok = True
-        if workload == "memory":
+        if workload in ("memory", "css-list", "flex-list"):
             count_ok = native_result.get("count") == browser_result.get("count")
         return count_ok and numbers_close(checksum_of(native_result), checksum_of(browser_result), rel=0.02, abs_tol=8)
+    if workload == "events":
+        return (
+            native_result.get("count") == browser_result.get("count")
+            and checksum_of(native_result) == checksum_of(browser_result)
+        )
     return False
 
 
