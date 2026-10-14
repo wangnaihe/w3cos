@@ -10,6 +10,7 @@ default = ["scss"]
 scss = ["grass"]
 
 [dependencies]
+w3cos-abi = { workspace = true }
 w3cos-ir = { workspace = true }
 w3cos-std = { workspace = true }
 w3cos-dom = { workspace = true }

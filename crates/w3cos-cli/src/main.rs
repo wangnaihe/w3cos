@@ -47,6 +47,11 @@ enum Commands {
         /// Enable Chrome DevTools Protocol (native desktop or mobile debug builds).
         #[arg(long)]
         devtools: bool,
+        /// Emit a component bundle loaded by libw3cos_runtime.so.
+        /// The bundle does not embed the runtime. Build the cdylib first
+        /// with scripts/build-shared-runtime.sh (or install /usr/lib/w3cos).
+        #[arg(long)]
+        shared: bool,
     },
     /// Compile and immediately run the application.
     Run {
@@ -185,6 +190,7 @@ fn main() -> Result<()> {
             lto,
             target,
             devtools,
+            shared,
         } => {
             // Benchmark speed builds keep symbols unless the caller still asks
             // to strip. Runtime speed is unchanged; profiles can see frames.
@@ -195,18 +201,16 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            build(
-                &input,
-                &output,
-                release,
-                strip,
-                lto,
-                &target,
-                CompileOptions {
-                    devtools,
-                    ..CompileOptions::default()
-                },
-            )?;
+            let options = CompileOptions {
+                devtools,
+                shared_runtime: shared,
+                ..CompileOptions::default()
+            };
+            if shared {
+                build_shared(&input, &output, release, &target, options)?;
+            } else {
+                build(&input, &output, release, strip, lto, &target, options)?;
+            }
         }
         Commands::Run {
             input,
@@ -442,6 +446,74 @@ fn build(
     };
 
     println!("✅ Output: {} ({})", output.display(), size_str);
+    Ok(())
+}
+
+fn build_shared(
+    input: &PathBuf,
+    output: &PathBuf,
+    release: bool,
+    target: &str,
+    options: CompileOptions,
+) -> Result<()> {
+    if target != "native" {
+        anyhow::bail!("--shared only supports --target native");
+    }
+    let input_abs = std::fs::canonicalize(input)
+        .with_context(|| format!("Could not find {}", input.display()))?;
+    let build_dir = std::env::temp_dir().join("w3cos-shared-app");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir)?;
+    }
+    std::fs::create_dir_all(&build_dir)?;
+
+    println!(
+        "⚡ Transpiling {} → shared-runtime bundle (no runtime linked)...",
+        input.display()
+    );
+    w3cos_compiler::compile_from_file_with_options(&input_abs, &build_dir, &options)?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("🔨 Emitting component bundle...");
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run")
+        .arg("--quiet")
+        .current_dir(&build_dir)
+        .env("CARGO_PROFILE_RELEASE_LTO", "off")
+        .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    if release {
+        cmd.arg("--release");
+    }
+    let printed = cmd
+        .output()
+        .context("cargo run of the bundle printer failed")?;
+    if !printed.status.success() {
+        anyhow::bail!("shared bundle printer failed");
+    }
+    std::fs::write(output, &printed.stdout)
+        .with_context(|| format!("could not write {}", output.display()))?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::copy(
+            build_dir.join("w3cos.app.json"),
+            parent.join("w3cos.app.json"),
+        )?;
+    }
+    let size = std::fs::metadata(output)?.len();
+    println!(
+        "✅ Shared bundle: {} ({:.1} KB). It does not contain the runtime.",
+        output.display(),
+        size as f64 / 1_000.0
+    );
     Ok(())
 }
 

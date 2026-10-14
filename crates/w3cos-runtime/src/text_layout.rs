@@ -784,6 +784,12 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
         return 0.0;
     }
     let ch = font_glyph_character(ch);
+    let fallback = if font.chars().contains_key(&ch) {
+        None
+    } else {
+        crate::font_face::parsed_fallback(ch)
+    };
+    let font = fallback.as_deref().unwrap_or(font);
     if !font.chars().contains_key(&ch) {
         return estimated_char_width(ch, font_size);
     }

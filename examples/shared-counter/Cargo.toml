@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "shared-counter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Behavioral app plugin. Links libw3cos_runtime.so, does not embed it."
+
+[lib]
+name = "shared_counter"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+w3cos-abi = { path = "../../crates/w3cos-abi" }

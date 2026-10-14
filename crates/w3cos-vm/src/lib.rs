@@ -1931,13 +1931,11 @@ impl Vm {
                 getter,
                 setter,
             } => {
-                let getter = getter.as_ref().map(|register| read(*register));
-                let setter = setter.as_ref().map(|register| read(*register));
                 w3cos_core::intrinsics::define_private_accessor(
                     &read(*brand),
                     &read(*name),
-                    getter,
-                    setter,
+                    getter.map(read),
+                    setter.map(read),
                 );
             }
             Instruction::CreateObject { dst, properties } => {
@@ -2008,11 +2006,8 @@ impl Vm {
                 initializer,
             } => {
                 let constructor = read(*constructor);
-                let super_class = super_class.as_ref().map(|register| read(*register));
-                let initializer = initializer
-                    .as_ref()
-                    .map(|register| read(*register))
-                    .unwrap_or(Value::Undefined);
+                let super_class = super_class.map(read);
+                let initializer = initializer.map(read).unwrap_or(Value::Undefined);
                 registers[dst.0 as usize] = w3cos_core::intrinsics::create_class_with_initializer(
                     &constructor,
                     super_class.as_ref(),

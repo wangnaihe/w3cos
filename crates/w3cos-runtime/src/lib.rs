@@ -31,6 +31,9 @@ pub mod css_rules_web;
 pub mod css_typed_om_web;
 pub mod custom_elements_web;
 mod definite_layout;
+#[cfg(feature = "desktop")]
+#[path = "../../w3cos-shell/src/main.rs"]
+mod desktop_shell;
 pub mod device_access_web;
 #[cfg(feature = "devtools")]
 pub mod devtools;
@@ -151,6 +154,9 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+
+pub mod plugin_abi;
+pub mod shared_abi;
 #[cfg(feature = "skia")]
 mod skia_text_run;
 pub mod speech;

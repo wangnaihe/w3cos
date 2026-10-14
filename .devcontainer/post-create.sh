@@ -8,6 +8,7 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
     libfontconfig1-dev \
     fonts-dejavu-core \
+    fonts-droid-fallback \
     qemu-system-x86
 
 # Build the project

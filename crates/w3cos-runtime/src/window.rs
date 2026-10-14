@@ -3944,6 +3944,37 @@ impl App {
     // -----------------------------------------------------------------------
     // CPU paint — same zero-copy pattern
     // -----------------------------------------------------------------------
+
+    /// Write the first CPU frame to `W3COS_FRAME_DUMP`. Returns true when the
+    /// process should exit after present (`W3COS_FRAME_DUMP_EXIT`).
+    #[cfg(feature = "cpu-render")]
+    fn maybe_dump_cpu_frame(pixmap: &tiny_skia::Pixmap) -> bool {
+        let Ok(path) = std::env::var("W3COS_FRAME_DUMP") else {
+            return false;
+        };
+        if path.is_empty() {
+            return false;
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if let Ok(delay) = std::env::var("W3COS_FRAME_DUMP_AFTER_MS")
+            && let Ok(ms) = delay.parse::<u64>()
+        {
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            if START.get_or_init(Instant::now).elapsed() < Duration::from_millis(ms) {
+                return false;
+            }
+        }
+        static DUMPED: AtomicBool = AtomicBool::new(false);
+        if DUMPED.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        match pixmap.save_png(&path) {
+            Ok(()) => eprintln!("[W3C OS] frame dumped to {path}"),
+            Err(error) => eprintln!("[W3C OS] frame dump failed: {error}"),
+        }
+        std::env::var_os("W3COS_FRAME_DUMP_EXIT").is_some()
+    }
+
     #[cfg(feature = "cpu-render")]
     fn paint_cpu(&mut self) {
         let layout_started = Instant::now();
@@ -4491,6 +4522,7 @@ impl App {
             }
         }
 
+        let dump_exit = Self::maybe_dump_cpu_frame(&pixmap);
         if let Some(cpu) = self.cpu.as_mut() {
             if !painted_with_skia_metal && !painted_with_skia_vulkan {
                 cpu.present(&pixmap, w, h, softbuffer_damage);
@@ -4500,6 +4532,10 @@ impl App {
                 self.first_frame_presented = true;
                 eprintln!("[W3C OS] first frame presented");
             }
+        }
+        if dump_exit {
+            std::thread::sleep(Duration::from_millis(200));
+            std::process::exit(0);
         }
         self.complete_compositor_tiles(&tile_requests);
         if needs_anim_repaint {

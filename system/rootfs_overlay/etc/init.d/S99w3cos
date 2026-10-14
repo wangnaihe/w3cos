@@ -32,6 +32,10 @@ case "$1" in
         export HOME=/root
         export WINIT_UNIX_BACKEND=x11
         export W3COS_SHELL=1
+        if [ -d /usr/lib/w3cos ]; then
+            export LD_LIBRARY_PATH="/usr/lib/w3cos${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export W3COS_SHARED_LAUNCHER=1
+        fi
 
         # Start networking in background
         dhcpcd -b 2>/dev/null &
@@ -56,7 +60,7 @@ case "$1" in
         ;;
     stop)
         echo "Stopping W3C OS Shell..."
-        killall w3cos-shell 2>/dev/null
+        killall w3cos-shell w3cos-runtime-host 2>/dev/null
         ;;
     restart)
         $0 stop

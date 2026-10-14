@@ -1,0 +1,10 @@
+Droid Sans Fallback
+Copyright 2006–2010 Google Inc.
+Licensed under the Apache License, Version 2.0.
+
+This is the CJK face shipped in the W3C OS ISO. It is about 3.9 MB and
+covers the unified ideographs the shell and ordinary pages need.
+
+fonts-noto-cjk (Noto Sans CJK SC, all weights) is roughly 100 MB installed.
+That package stays out of the ISO. Dev images that want the full family can
+install it; the runtime still falls back per missing glyph either way.

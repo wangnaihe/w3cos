@@ -1,0 +1,18 @@
+[package]
+name = "w3cos-runtime-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin loader that runs AOT app plugins and web pages on the system runtime"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "w3cos-runtime-host"
+path = "src/main.rs"
+
+[dependencies]
+w3cos-abi = { workspace = true }
+anyhow = { workspace = true }
+libloading = { workspace = true }

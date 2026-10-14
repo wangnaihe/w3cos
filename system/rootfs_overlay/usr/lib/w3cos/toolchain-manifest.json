@@ -1,0 +1,11 @@
+{
+  "format": "w3cos.toolchain",
+  "formatVersion": 1,
+  "runtime": "/usr/lib/w3cos/libw3cos_runtime.so",
+  "host": "/usr/bin/w3cos-runtime-host",
+  "shell": "/usr/bin/w3cos-shell",
+  "compiler": "/usr/bin/w3cos",
+  "abi": "1.1",
+  "features": ["cpu-render", "dynamic-js", "desktop"],
+  "rustc": "SDK only; system/scripts/package-sdk.sh. Not installed in the ISO."
+}
