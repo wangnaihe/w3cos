@@ -11,7 +11,7 @@ use crate::permissions::{ActionRateLimiter, AgentPermissions, BridgeOp, authoriz
 
 /// Placeholder of the shell's intent field. The runtime uses it only to read
 /// that field when the Propose action fires.
-pub const INTENT_INPUT_PLACEHOLDER: &str = "Type a command";
+pub const INTENT_INPUT_PLACEHOLDER: &str = "输入命令  Type a command";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellApp {
@@ -58,6 +58,31 @@ impl ShellApp {
             Self::Agent => "AI Agent",
             Self::Browser => "Browser",
             Self::Editor => "Editor",
+        }
+    }
+
+    pub fn zh(self) -> &'static str {
+        match self {
+            Self::Desktop => "桌面",
+            Self::Files => "文件",
+            Self::Terminal => "终端",
+            Self::Settings => "设置",
+            Self::Agent => "助手",
+            Self::Browser => "浏览器",
+            Self::Editor => "编辑器",
+        }
+    }
+
+    /// Context-header label. English `label()` stays stable for receipts.
+    pub fn bilingual(self) -> &'static str {
+        match self {
+            Self::Desktop => "桌面 Desktop",
+            Self::Files => "文件 Files",
+            Self::Terminal => "终端 Terminal",
+            Self::Settings => "设置 Settings",
+            Self::Agent => "助手 Agent",
+            Self::Browser => "浏览器 Browser",
+            Self::Editor => "编辑器 Editor",
         }
     }
 
@@ -294,6 +319,13 @@ impl IntentSession {
         ))
     }
 
+    /// Where receipts live. `memory` means this process only: not encrypted,
+    /// not written to disk. A later ledger can replace the vec without
+    /// changing the confirm path.
+    pub fn receipt_storage(&self) -> &'static str {
+        "memory"
+    }
+
     pub fn receipt_log_tail(&self, limit: usize) -> String {
         if self.receipts.is_empty() {
             return "No receipts yet.".to_string();
@@ -408,40 +440,39 @@ fn execute(command: &ShellCommand, ctx: &ShellContext) -> (String, Option<ShellA
 
 fn summary_for(command: &ShellCommand, ctx: &ShellContext, shared: bool) -> String {
     match command {
-        ShellCommand::OpenApp(app) => format!("Open {}", app.label()),
+        ShellCommand::OpenApp(app) => format!("打开 {} · Open {}", app.zh(), app.label()),
         ShellCommand::ToggleNight => {
             if ctx.night {
-                "Turn night mode off".to_string()
+                "关闭夜间模式 · Turn night mode off".to_string()
             } else {
-                "Turn night mode on".to_string()
+                "打开夜间模式 · Turn night mode on".to_string()
             }
         }
-        ShellCommand::ListApps => "List shell apps".to_string(),
-        ShellCommand::ShowContext if shared => "Read the shared shell context".to_string(),
-        ShellCommand::ShowContext => "Read context (currently revoked)".to_string(),
-        ShellCommand::Help => "Show command help".to_string(),
+        ShellCommand::ListApps => "应用列表 · List shell apps".to_string(),
+        ShellCommand::ShowContext if shared => {
+            "查看上下文 · Read the shared shell context".to_string()
+        }
+        ShellCommand::ShowContext => "查看上下文 · Read context (currently revoked)".to_string(),
+        ShellCommand::Help => "命令帮助 · Show command help".to_string(),
     }
 }
 
 fn impact_for(command: &ShellCommand, shared: bool) -> String {
     match command {
         ShellCommand::OpenApp(_) => {
-            "Switches the visible shell app. Undo by opening another app.".to_string()
+            "会切换当前窗口，再打开别的应用即可回来。Switches the visible app.".to_string()
         }
         ShellCommand::ToggleNight => {
-            "Changes the shell background for this session. Ask again to undo.".to_string()
+            "只改这一次会话的背景。再发一次即可撤销。Changes the session background.".to_string()
         }
-        ShellCommand::ListApps => {
-            "Reads the built-in app list. Does not change the desktop.".to_string()
-        }
+        ShellCommand::ListApps => "只读内置应用列表，不改桌面。Reads the app list.".to_string(),
         ShellCommand::ShowContext if shared => {
-            "Reads the active app name and night-mode flag.".to_string()
+            "读取当前应用和夜间模式。Reads the active app and night mode.".to_string()
         }
         ShellCommand::ShowContext => {
-            "Context is revoked, so confirm records a denial and does not name the active app."
-                .to_string()
+            "上下文已隐藏，确认只会记下拒绝，不会说出应用名。Context is revoked.".to_string()
         }
-        ShellCommand::Help => "Lists commands this bar can match. No model is called.".to_string(),
+        ShellCommand::Help => "列出这条栏能匹配的命令，不调用模型。No model is called.".to_string(),
     }
 }
 
@@ -690,6 +721,7 @@ mod tests {
         session.propose("帮助", &ctx());
         let effect = session.confirm(&ctx(), 1_000).unwrap();
         assert!(effect.receipt.outcome.contains("No model"));
+        assert_eq!(session.receipt_storage(), "memory");
     }
 
     #[test]

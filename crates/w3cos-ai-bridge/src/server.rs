@@ -257,15 +257,20 @@ pub fn start_with_options(options: BridgeOptions) -> RunningBridge {
 }
 
 fn permissions_from_env() -> AgentPermissions {
-    match std::env::var("W3COS_AI_PERMISSIONS")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "observer" => AgentPermissions::observer(),
-        "system" => AgentPermissions::system(),
-        _ => AgentPermissions::interactive(),
+    let raw = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
+    if !crate::permissions::permissions_label_is_known(&raw) {
+        eprintln!("[AI Bridge] unknown W3COS_AI_PERMISSIONS={raw:?}; using observer (fail closed)");
     }
+    let permissions = crate::permissions::permissions_from_label(&raw);
+    let mode = if permissions.can_spawn_processes {
+        "system"
+    } else if permissions.can_interact {
+        "interactive"
+    } else {
+        "observer"
+    };
+    eprintln!("[AI Bridge] permissions={mode}");
+    permissions
 }
 
 fn resolve_token(explicit: Option<String>) -> String {

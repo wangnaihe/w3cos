@@ -167,6 +167,27 @@ impl AuthError {
     }
 }
 
+/// Resolve `W3COS_AI_PERMISSIONS`.
+///
+/// Empty and `interactive` stay interactive, matching issue #48. `observer`
+/// and `system` select those presets. Any other spelling fails closed to
+/// `observer` so a typo does not grant clicks.
+pub fn permissions_from_label(label: &str) -> AgentPermissions {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "" | "interactive" => AgentPermissions::interactive(),
+        "system" => AgentPermissions::system(),
+        "observer" => AgentPermissions::observer(),
+        _ => AgentPermissions::observer(),
+    }
+}
+
+pub fn permissions_label_is_known(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "" | "interactive" | "observer" | "system"
+    )
+}
+
 /// Permission check used by both `AiAgent` and the HTTP server.
 ///
 /// Selector matching is still the existing substring check. It does not prove
@@ -252,6 +273,19 @@ impl ActionRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_permission_label_fails_closed_to_observer() {
+        assert!(permissions_label_is_known(""));
+        assert!(permissions_label_is_known("Interactive"));
+        assert!(!permissions_label_is_known("observr"));
+        assert!(permissions_from_label("").can_interact);
+        assert!(permissions_from_label("interactive").can_interact);
+        assert!(!permissions_from_label("interactive").can_spawn_processes);
+        assert!(!permissions_from_label("observer").can_interact);
+        assert!(!permissions_from_label("observr").can_interact);
+        assert!(permissions_from_label("system").can_spawn_processes);
+    }
 
     #[test]
     fn observer_cannot_authorize_click_or_typing() {

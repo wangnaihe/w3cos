@@ -26,6 +26,9 @@ pub trait LocalIdentity {
 pub struct LocalIdentityStub {
     subject: String,
     unlocked: bool,
+    /// First non-empty assertion. Later unlocks must repeat it. This is not a
+    /// passkey; it only stops a different string from unlocking the same stub.
+    pin: Option<String>,
 }
 
 impl LocalIdentityStub {
@@ -35,6 +38,7 @@ impl LocalIdentityStub {
         Self {
             subject: Self::SUBJECT.to_string(),
             unlocked: true,
+            pin: None,
         }
     }
 
@@ -42,11 +46,19 @@ impl LocalIdentityStub {
         self.unlocked = false;
     }
 
-    /// Returns false when `assertion` is empty. A non-empty value only marks
-    /// the stub unlocked; it is not a credential check.
+    /// Returns false when `assertion` is empty. The first non-empty value is
+    /// remembered; a later unlock with a different string fails. Nothing here
+    /// is checked against an authenticator.
     pub fn unlock_with_passkey_stub(&mut self, assertion: &str) -> bool {
         if assertion.is_empty() {
             return false;
+        }
+        if let Some(pin) = &self.pin {
+            if pin != assertion {
+                return false;
+            }
+        } else {
+            self.pin = Some(assertion.to_string());
         }
         self.unlocked = true;
         true
@@ -94,6 +106,11 @@ mod tests {
         id.lock();
         assert!(!id.unlocked());
         assert!(!id.unlock_with_passkey_stub(""));
+        assert!(!id.unlocked());
+        assert!(id.unlock_with_passkey_stub("not-a-real-passkey"));
+        assert!(id.unlocked());
+        id.lock();
+        assert!(!id.unlock_with_passkey_stub("other-string"));
         assert!(!id.unlocked());
         assert!(id.unlock_with_passkey_stub("not-a-real-passkey"));
         assert!(id.unlocked());
