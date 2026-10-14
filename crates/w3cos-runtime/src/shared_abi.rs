@@ -93,7 +93,9 @@ pub extern "C" fn w3cos_runtime_run_bundle(path: *const c_char) -> i32 {
         set_error("bundle path is null");
         return 2;
     }
-    let path = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
+    let path = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .into_owned();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) => {
@@ -111,7 +113,8 @@ pub extern "C" fn w3cos_runtime_run_bundle(path: *const c_char) -> i32 {
     if !w3cos_abi::abi_compatible(w3cos_abi::W3COS_RUNTIME_ABI, bundle.abi) {
         set_error(format!(
             "ABI mismatch: runtime {:#x} cannot load bundle {:#x}",
-            w3cos_abi::W3COS_RUNTIME_ABI, bundle.abi
+            w3cos_abi::W3COS_RUNTIME_ABI,
+            bundle.abi
         ));
         return 2;
     }
@@ -139,7 +142,9 @@ pub extern "C" fn w3cos_runtime_run_page(path: *const c_char) -> i32 {
             set_error("page path is null");
             return 3;
         }
-        let path = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
+        let path = unsafe { CStr::from_ptr(path) }
+            .to_string_lossy()
+            .into_owned();
         let html = match std::fs::read_to_string(&path) {
             Ok(html) => html,
             Err(error) => {

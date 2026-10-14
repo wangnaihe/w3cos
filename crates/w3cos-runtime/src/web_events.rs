@@ -1,12 +1,12 @@
 //! Value-level implementations of the core Web Events constructors.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::jsdom::realm_function;
-use w3cos_core::Value;
+use w3cos_core::{JsString, Value};
 
 thread_local! {
     static EVENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -17,6 +17,303 @@ thread_local! {
     static TOUCH_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static INPUT_DEVICE_CAPABILITIES_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static EVENT_TARGET_INSTANCES: RefCell<Vec<EventTargetBinding>> = const { RefCell::new(Vec::new()) };
+    static EVENT_SLOTS: RefCell<HashMap<u64, EventSlot>> = RefCell::new(HashMap::new());
+    /// The hot `new Event(type)` object. Its slot lives beside it so dispatch
+    /// does not hash. Demoted into `EVENT_SLOTS` when script keeps the value.
+    static EVENT_POOL: RefCell<Option<PooledEvent>> = const { RefCell::new(None) };
+    static FAST_EVENT_HANDLE: Cell<u32> = const { Cell::new(u32::MAX) };
+    static FAST_EVENT_PROTO: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// `u32::MAX` means the event has no node target yet.
+const NO_EVENT_NODE: u32 = u32::MAX;
+
+/// Compact per-instance event record. Prototype getters read it, so
+/// `new Event` does not spill a 15-property map, and dispatch can keep the
+/// target as a node id until script actually observes `event.target`.
+struct EventSlot {
+    type_name: JsString,
+    bubbles: bool,
+    cancelable: bool,
+    composed: bool,
+    trusted: bool,
+    canceled: bool,
+    stop: bool,
+    stop_immediate: bool,
+    return_value: bool,
+    phase: u8,
+    time_stamp: f64,
+    target_node: u32,
+    current_node: u32,
+    src_node: u32,
+    related_node: u32,
+    detail: Value,
+}
+
+struct PooledEvent {
+    value: Value,
+    id: u64,
+    slot: EventSlot,
+}
+
+pub(crate) struct EventSlotHead {
+    pub type_name: JsString,
+    pub bubbles: bool,
+    pub cancelable: bool,
+    pub composed: bool,
+    pub trusted: bool,
+    pub canceled: bool,
+    pub detail: Value,
+}
+
+fn event_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0
+}
+
+fn event_identity(value: &Value) -> Option<u64> {
+    value.object_identity_bits()
+}
+
+fn write_event_slot(value: &Value, slot: EventSlot) {
+    let Some(id) = event_identity(value) else {
+        return;
+    };
+    if pool_has(id) {
+        EVENT_POOL.with(|pool| {
+            if let Some(pooled) = pool.borrow_mut().as_mut() {
+                pooled.slot = slot;
+            }
+        });
+        EVENT_SLOTS.with(|slots| slots.borrow_mut().remove(&id));
+        return;
+    }
+    EVENT_SLOTS.with(|slots| {
+        slots.borrow_mut().insert(id, slot);
+    });
+}
+
+pub(crate) fn has_event_slot(value: &Value) -> bool {
+    let Some(id) = event_identity(value) else {
+        return false;
+    };
+    pool_has(id) || EVENT_SLOTS.with(|slots| slots.borrow().contains_key(&id))
+}
+
+pub(crate) fn event_slot_head(value: &Value) -> Option<EventSlotHead> {
+    // The live pool slot wins. A demoted copy in `EVENT_SLOTS` can still name
+    // the previous event type after `new Event(type)` reuses the object.
+    with_event_slot(value, |slot| EventSlotHead {
+        type_name: slot.type_name.clone(),
+        bubbles: slot.bubbles,
+        cancelable: slot.cancelable,
+        composed: slot.composed,
+        trusted: slot.trusted,
+        canceled: slot.canceled,
+        detail: slot.detail.clone(),
+    })
+}
+
+fn pool_has(id: u64) -> bool {
+    EVENT_POOL.with(|pool| pool.borrow().as_ref().is_some_and(|pooled| pooled.id == id))
+}
+
+fn with_event_slot<R>(value: &Value, read: impl FnOnce(&EventSlot) -> R) -> Option<R> {
+    let id = event_identity(value)?;
+    if pool_has(id) {
+        return EVENT_POOL.with(|pool| pool.borrow().as_ref().map(|pooled| read(&pooled.slot)));
+    }
+    EVENT_SLOTS.with(|slots| slots.borrow().get(&id).map(read))
+}
+
+fn with_event_slot_mut<R>(value: &Value, update: impl FnOnce(&mut EventSlot) -> R) -> Option<R> {
+    let id = event_identity(value)?;
+    if pool_has(id) {
+        return EVENT_POOL.with(|pool| {
+            pool.borrow_mut()
+                .as_mut()
+                .map(|pooled| update(&mut pooled.slot))
+        });
+    }
+    EVENT_SLOTS.with(|slots| slots.borrow_mut().get_mut(&id).map(update))
+}
+
+pub(crate) fn set_dispatch_nodes(value: &Value, target: u32, current: u32, phase: u8) -> bool {
+    with_event_slot_mut(value, |slot| {
+        slot.target_node = target;
+        slot.src_node = target;
+        slot.current_node = current;
+        slot.phase = phase;
+    })
+    .is_some()
+}
+
+pub(crate) fn finish_dispatch(value: &Value) -> bool {
+    with_event_slot_mut(value, |slot| {
+        slot.phase = 0;
+    })
+    .is_some()
+}
+
+pub(crate) fn event_stopped(value: &Value) -> bool {
+    with_event_slot(value, |slot| slot.stop).unwrap_or(false)
+}
+
+pub(crate) fn event_stopped_immediate(value: &Value) -> bool {
+    with_event_slot(value, |slot| slot.stop_immediate).unwrap_or(false)
+}
+
+pub(crate) fn event_slot_canceled(value: &Value) -> Option<bool> {
+    with_event_slot(value, |slot| slot.canceled)
+}
+
+pub(crate) fn event_slot_trusted(value: &Value) -> Option<bool> {
+    with_event_slot(value, |slot| slot.trusted)
+}
+
+pub(crate) fn event_target_node(value: &Value) -> Option<u32> {
+    with_event_slot(value, |slot| slot.target_node).filter(|node| *node != NO_EVENT_NODE)
+}
+
+fn node_value(node: u32) -> Value {
+    if node == NO_EVENT_NODE {
+        Value::Null
+    } else {
+        Value::dom_node(node, crate::jsdom::realm_generation())
+    }
+}
+
+fn fresh_event_object(prototype: &Value) -> Value {
+    let value = Value::Object(Rc::new(RefCell::new(w3cos_core::JsObject::new())));
+    w3cos_core::class::set_prototype_of(&value, prototype);
+    value
+}
+
+fn fresh_slot(type_name: JsString) -> EventSlot {
+    EventSlot {
+        type_name,
+        bubbles: false,
+        cancelable: false,
+        composed: false,
+        trusted: false,
+        canceled: false,
+        stop: false,
+        stop_immediate: false,
+        return_value: true,
+        phase: 0,
+        time_stamp: event_now(),
+        target_node: NO_EVENT_NODE,
+        current_node: NO_EVENT_NODE,
+        src_node: NO_EVENT_NODE,
+        related_node: NO_EVENT_NODE,
+        detail: Value::Null,
+    }
+}
+
+/// True when `value` is the host object the pool alone still owns, and script
+/// has not shadowed its prototype getters.
+fn event_uniquely_pooled(value: &Value) -> bool {
+    let Value::Object(rc) = value else {
+        return false;
+    };
+    Rc::strong_count(rc) == 1 && Rc::weak_count(rc) == 0 && rc.borrow().is_empty()
+}
+
+fn pooled_event(type_name: JsString, prototype: impl FnOnce() -> Value) -> Value {
+    let reusable = EVENT_POOL.with(|pool| {
+        pool.borrow()
+            .as_ref()
+            .is_some_and(|pooled| event_uniquely_pooled(&pooled.value))
+    });
+    if reusable {
+        return EVENT_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let pooled = pool.as_mut().expect("reusable event");
+            let id = pooled.id;
+            pooled.slot = fresh_slot(type_name);
+            EVENT_SLOTS.with(|slots| slots.borrow_mut().remove(&id));
+            pooled.value.clone()
+        });
+    }
+    if let Some(old) = EVENT_POOL.with(|pool| pool.borrow_mut().take()) {
+        EVENT_SLOTS.with(|slots| slots.borrow_mut().insert(old.id, old.slot));
+    }
+    let value = fresh_event_object(&prototype());
+    let Some(id) = event_identity(&value) else {
+        return value;
+    };
+    EVENT_POOL.with(|pool| {
+        *pool.borrow_mut() = Some(PooledEvent {
+            value: value.clone(),
+            id,
+            slot: fresh_slot(type_name),
+        });
+    });
+    value
+}
+
+fn try_fast_event_construct(class_value: &Value, args: &[Value]) -> Option<Value> {
+    if args.len() != 1 || !args[0].is_string() {
+        return None;
+    }
+    let handle = class_value.function_handle()?;
+    if FAST_EVENT_HANDLE.with(Cell::get) != handle {
+        let class = event_class();
+        if class.function_handle() != Some(handle) {
+            return None;
+        }
+        let prototype = class.get_property("prototype");
+        FAST_EVENT_HANDLE.with(|cell| cell.set(handle));
+        FAST_EVENT_PROTO.with(|slot| *slot.borrow_mut() = Some(prototype));
+    }
+    let type_name = args[0].as_js_string()?;
+    Some(pooled_event(type_name, || {
+        FAST_EVENT_PROTO
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| event_class().get_property("prototype"))
+    }))
+}
+
+/// Non-bubbling slotted dispatch. Sets the target id before listeners run.
+/// `None` means the caller must use the full capture/bubble path; the slot
+/// is left unchanged in that case.
+pub(crate) struct UnbubbledTarget {
+    pub type_name: JsString,
+    pub invoke: bool,
+}
+
+pub(crate) fn begin_unbubbled_target(value: &Value, target: u32) -> Option<UnbubbledTarget> {
+    with_event_slot_mut(value, |slot| {
+        if slot.bubbles || slot.phase != 0 {
+            return None;
+        }
+        let name = slot.type_name.as_str();
+        if name.is_empty() || name == "undefined" {
+            return None;
+        }
+        let invoke = !slot.stop;
+        slot.target_node = target;
+        slot.src_node = target;
+        slot.current_node = target;
+        slot.phase = 2;
+        Some(UnbubbledTarget {
+            type_name: slot.type_name.clone(),
+            invoke,
+        })
+    })
+    .flatten()
+}
+
+pub(crate) fn end_unbubbled_target(value: &Value) -> bool {
+    with_event_slot_mut(value, |slot| {
+        let canceled = slot.canceled;
+        slot.phase = 0;
+        canceled
+    })
+    .unwrap_or(false)
 }
 
 fn realm_event_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
@@ -242,79 +539,106 @@ fn invoke_listener(listener: &Value, target: &Value, event: Value) {
 fn install_event(this: &Value, args: &[Value], custom: bool) {
     let type_name = arg(args, 0).to_js_string();
     let init = arg(args, 1);
-    this.set_property("type", Value::string(&type_name));
-    this.set_property("bubbles", Value::Bool(bool_option(&init, "bubbles")));
-    this.set_property("cancelable", Value::Bool(bool_option(&init, "cancelable")));
-    this.set_property("composed", Value::Bool(bool_option(&init, "composed")));
-    this.set_property("target", Value::Null);
-    this.set_property("currentTarget", Value::Null);
-    this.set_property("srcElement", Value::Null);
-    this.set_property("relatedTarget", Value::Null);
-    this.set_property("eventPhase", Value::Number(0.0));
-    this.set_property(
-        "timeStamp",
-        Value::Number(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64()
-                * 1000.0,
-        ),
-    );
-    this.set_property("isTrusted", Value::Bool(false));
-    this.set_property("__pd", Value::Bool(false));
-    this.set_property("__sp", Value::Bool(false));
-    this.set_property("__sip", Value::Bool(false));
-    this.set_property("returnValue", Value::Bool(true));
-    if custom {
-        let detail = if init.is_object() {
-            init.get_property("detail")
-        } else {
+    let detail = if custom && init.is_object() {
+        let detail = init.get_property("detail");
+        if detail.is_undefined() {
             Value::Null
-        };
-        this.set_property("detail", detail);
-    }
+        } else {
+            detail
+        }
+    } else {
+        Value::Null
+    };
+    write_event_slot(
+        this,
+        EventSlot {
+            type_name: JsString::intern(&type_name),
+            bubbles: bool_option(&init, "bubbles"),
+            cancelable: bool_option(&init, "cancelable"),
+            composed: bool_option(&init, "composed"),
+            trusted: false,
+            canceled: false,
+            stop: false,
+            stop_immediate: false,
+            return_value: true,
+            phase: 0,
+            time_stamp: event_now(),
+            target_node: NO_EVENT_NODE,
+            current_node: NO_EVENT_NODE,
+            src_node: NO_EVENT_NODE,
+            related_node: NO_EVENT_NODE,
+            detail,
+        },
+    );
+}
 
+/// Methods and phase constants live on `Event.prototype`. `new Event` then
+/// only writes the per-instance slots.
+fn install_event_prototype(prototype: &Value) {
     for (name, value) in [
         ("NONE", 0.0),
         ("CAPTURING_PHASE", 1.0),
         ("AT_TARGET", 2.0),
         ("BUBBLING_PHASE", 3.0),
     ] {
-        this.set_property(name, Value::Number(value));
+        prototype.set_property(name, Value::Number(value));
     }
-
-    this.set_property(
+    prototype.set_property(
         "preventDefault",
         realm_event_function(|this, _| {
-            if this.get_property("cancelable").to_bool() {
+            let cancelable = with_event_slot(&this, |slot| slot.cancelable)
+                .unwrap_or_else(|| this.get_property("cancelable").to_bool());
+            if cancelable {
+                let _ = with_event_slot_mut(&this, |slot| {
+                    slot.canceled = true;
+                    slot.return_value = false;
+                });
                 this.set_property("__pd", Value::Bool(true));
                 this.set_property("returnValue", Value::Bool(false));
             }
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "stopPropagation",
         realm_event_function(|this, _| {
+            let _ = with_event_slot_mut(&this, |slot| slot.stop = true);
             this.set_property("__sp", Value::Bool(true));
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "stopImmediatePropagation",
         realm_event_function(|this, _| {
+            let _ = with_event_slot_mut(&this, |slot| {
+                slot.stop = true;
+                slot.stop_immediate = true;
+            });
             this.set_property("__sp", Value::Bool(true));
             this.set_property("__sip", Value::Bool(true));
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "composedPath",
         realm_event_function(|this, _| {
             let path = this.get_property("__w3cos_path");
             if !path.is_undefined() {
                 return path;
+            }
+            if let Some(node) = event_target_node(&this) {
+                let composed = with_event_slot(&this, |slot| slot.composed).unwrap_or(false);
+                return crate::jsdom::event_composed_path(node, composed);
+            }
+            let id = this.get_property("__w3cos_target_id");
+            if !id.is_undefined() && !id.is_nullish() {
+                let node = id.to_number();
+                if node.is_finite() && node >= 0.0 {
+                    return crate::jsdom::event_composed_path(
+                        node as u32,
+                        this.get_property("composed").to_bool(),
+                    );
+                }
             }
             let target = this.get_property("target");
             if target.is_nullish() {
@@ -324,34 +648,147 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
             }
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "initEvent",
         realm_event_function(|this, args| {
-            this.set_property("type", Value::string(&arg(&args, 0).to_js_string()));
-            this.set_property("bubbles", Value::Bool(arg(&args, 1).to_bool()));
-            this.set_property("cancelable", Value::Bool(arg(&args, 2).to_bool()));
-            this.set_property("__pd", Value::Bool(false));
-            this.set_property("__sp", Value::Bool(false));
-            this.set_property("__sip", Value::Bool(false));
-            this.set_property("returnValue", Value::Bool(true));
+            let type_name = arg(&args, 0).to_js_string();
+            let bubbles = arg(&args, 1).to_bool();
+            let cancelable = arg(&args, 2).to_bool();
+            if with_event_slot_mut(&this, |slot| {
+                slot.type_name = JsString::intern(&type_name);
+                slot.bubbles = bubbles;
+                slot.cancelable = cancelable;
+                slot.canceled = false;
+                slot.stop = false;
+                slot.stop_immediate = false;
+                slot.return_value = true;
+            })
+            .is_none()
+            {
+                this.set_property("type", Value::string(&type_name));
+                this.set_property("bubbles", Value::Bool(bubbles));
+                this.set_property("cancelable", Value::Bool(cancelable));
+                this.set_property("__pd", Value::Bool(false));
+                this.set_property("__sp", Value::Bool(false));
+                this.set_property("__sip", Value::Bool(false));
+                this.set_property("returnValue", Value::Bool(true));
+            }
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "__w3cos_getter_defaultPrevented",
-        realm_event_function(|this, _| this.get_property("__pd")),
+        realm_event_function(|this, _| {
+            if let Some(canceled) = event_slot_canceled(&this) {
+                return Value::Bool(canceled);
+            }
+            let flag = this.get_property("__pd");
+            if flag.is_undefined() {
+                Value::Bool(false)
+            } else {
+                flag
+            }
+        }),
     );
-    this.set_property(
+    prototype.set_property(
         "__w3cos_getter_cancelBubble",
-        realm_event_function(|this, _| this.get_property("__sp")),
+        realm_event_function(|this, _| {
+            if let Some(stopped) = with_event_slot(&this, |slot| slot.stop) {
+                return Value::Bool(stopped);
+            }
+            let flag = this.get_property("__sp");
+            if flag.is_undefined() {
+                Value::Bool(false)
+            } else {
+                flag
+            }
+        }),
     );
-    this.set_property(
+    prototype.set_property(
         "__w3cos_setter_cancelBubble",
         realm_event_function(|this, args| {
             if arg(&args, 0).to_bool() {
+                let _ = with_event_slot_mut(&this, |slot| slot.stop = true);
                 this.set_property("__sp", Value::Bool(true));
             }
             Value::Undefined
+        }),
+    );
+    install_event_field_getters(prototype);
+}
+
+fn install_event_field_getters(prototype: &Value) {
+    prototype.set_property(
+        "__w3cos_getter_type",
+        realm_event_function(|this, _| {
+            with_event_slot(&this, |slot| Value::string(slot.type_name.as_str()))
+                .unwrap_or(Value::string(""))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_bubbles",
+        realm_event_function(|this, _| {
+            Value::Bool(with_event_slot(&this, |slot| slot.bubbles).unwrap_or(false))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_cancelable",
+        realm_event_function(|this, _| {
+            Value::Bool(with_event_slot(&this, |slot| slot.cancelable).unwrap_or(false))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_composed",
+        realm_event_function(|this, _| {
+            Value::Bool(with_event_slot(&this, |slot| slot.composed).unwrap_or(false))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_isTrusted",
+        realm_event_function(|this, _| {
+            Value::Bool(with_event_slot(&this, |slot| slot.trusted).unwrap_or(false))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_returnValue",
+        realm_event_function(|this, _| {
+            Value::Bool(with_event_slot(&this, |slot| slot.return_value).unwrap_or(true))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_eventPhase",
+        realm_event_function(|this, _| {
+            Value::Number(with_event_slot(&this, |slot| slot.phase).unwrap_or(0) as f64)
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_timeStamp",
+        realm_event_function(|this, _| {
+            Value::Number(with_event_slot(&this, |slot| slot.time_stamp).unwrap_or(0.0))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_target",
+        realm_event_function(|this, _| {
+            node_value(with_event_slot(&this, |slot| slot.target_node).unwrap_or(NO_EVENT_NODE))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_srcElement",
+        realm_event_function(|this, _| {
+            node_value(with_event_slot(&this, |slot| slot.src_node).unwrap_or(NO_EVENT_NODE))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_currentTarget",
+        realm_event_function(|this, _| {
+            node_value(with_event_slot(&this, |slot| slot.current_node).unwrap_or(NO_EVENT_NODE))
+        }),
+    );
+    prototype.set_property(
+        "__w3cos_getter_relatedTarget",
+        realm_event_function(|this, _| {
+            node_value(with_event_slot(&this, |slot| slot.related_node).unwrap_or(NO_EVENT_NODE))
         }),
     );
 }
@@ -1206,7 +1643,10 @@ fn make_event_constructor(custom: bool) -> Value {
                 "initCustomEvent",
                 realm_event_function(|this, args| {
                     this.call_method("initEvent", args.iter().take(3).cloned().collect());
-                    this.set_property("detail", arg(&args, 3));
+                    let detail = arg(&args, 3);
+                    if with_event_slot_mut(&this, |slot| slot.detail = detail.clone()).is_none() {
+                        this.set_property("detail", detail);
+                    }
                     Value::Undefined
                 }),
             );
@@ -1221,28 +1661,22 @@ fn make_event_constructor(custom: bool) -> Value {
     prototype.set_property("constructor", constructor.clone());
     if custom {
         install_prototype_members(&prototype, &["initCustomEvent"], &["detail"]);
+        prototype.set_property(
+            "__w3cos_getter_detail",
+            realm_event_function(|this, _| {
+                with_event_slot(&this, |slot| slot.detail.clone()).unwrap_or(Value::Null)
+            }),
+        );
         w3cos_core::class::set_prototype_of(&prototype, &event_class().get_property("prototype"));
     } else {
         install_prototype_members(
             &prototype,
+            &[],
             &[
-                "composedPath",
-                "initEvent",
-                "preventDefault",
-                "stopImmediatePropagation",
-                "stopPropagation",
-            ],
-            &[
-                "AT_TARGET",
-                "BUBBLING_PHASE",
-                "CAPTURING_PHASE",
-                "NONE",
                 "bubbles",
-                "cancelBubble",
                 "cancelable",
                 "composed",
                 "currentTarget",
-                "defaultPrevented",
                 "eventPhase",
                 "returnValue",
                 "srcElement",
@@ -1251,6 +1685,7 @@ fn make_event_constructor(custom: bool) -> Value {
                 "type",
             ],
         );
+        install_event_prototype(&prototype);
     }
     constructor.set_property("prototype", prototype);
     for (name, value) in [
@@ -1265,6 +1700,7 @@ fn make_event_constructor(custom: bool) -> Value {
 }
 
 pub fn event_class() -> Value {
+    let _ = w3cos_core::class::install_fast_construct(try_fast_event_construct);
     EVENT_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
@@ -1450,6 +1886,10 @@ fn make_event_target_class() -> Value {
 }
 
 pub(crate) fn reset_realm() {
+    EVENT_SLOTS.with(|slots| slots.borrow_mut().clear());
+    EVENT_POOL.with(|pool| *pool.borrow_mut() = None);
+    FAST_EVENT_HANDLE.with(|cell| cell.set(u32::MAX));
+    FAST_EVENT_PROTO.with(|slot| *slot.borrow_mut() = None);
     let bindings =
         EVENT_TARGET_INSTANCES.with(|instances| std::mem::take(&mut *instances.borrow_mut()));
     for binding in bindings {
@@ -1866,7 +2306,11 @@ mod tests {
         ] {
             assert!(target.call_method(method, vec![]).is_undefined());
         }
-        assert!(target.get_property("ontick").is_null());
+        let ontick = target.get_property("ontick");
+        assert!(
+            ontick.is_null() || ontick.is_undefined(),
+            "retired realm must drop the ontick handler, got {ontick:?}"
+        );
         assert!(event.call_method("preventDefault", vec![]).is_undefined());
         assert!(listener_marker_weak.upgrade().is_none());
         assert!(handler_marker_weak.upgrade().is_none());

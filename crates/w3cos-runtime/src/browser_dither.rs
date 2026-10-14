@@ -34,15 +34,37 @@ fn graphite_dither_shader_compiles() {
 
 /// Composite against a known solid background before RGBA8 storage; CPU
 /// SrcOver otherwise quantizes the tiny dither contribution before blending.
-pub(super) fn shader(canvas: &Canvas, input: Shader, background: skia_safe::Color4f) -> Option<Shader> {
+pub(super) fn shader(
+    canvas: &Canvas,
+    input: Shader,
+    background: skia_safe::Color4f,
+) -> Option<Shader> {
     let matrix = canvas.local_to_device_as_3x3();
-    if matrix.has_perspective() { return None; }
+    if matrix.has_perspective() {
+        return None;
+    }
     let o = matrix.map_point((0.0, 0.0));
     let x = matrix.map_point((1.0, 0.0));
     let y = matrix.map_point((0.0, 1.0));
-    let uniforms = [background.r * background.a, background.g * background.a,
-        background.b * background.a, background.a,
-        o.x, o.y, x.x - o.x, x.y - o.y, y.x - o.x, y.y - o.y];
-    let bytes = uniforms.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
-    EFFECT.with(|effect| effect.as_ref()?.make_shader(Data::new_copy(&bytes), &[input.into()], None))
+    let uniforms = [
+        background.r * background.a,
+        background.g * background.a,
+        background.b * background.a,
+        background.a,
+        o.x,
+        o.y,
+        x.x - o.x,
+        x.y - o.y,
+        y.x - o.x,
+        y.y - o.y,
+    ];
+    let bytes = uniforms
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect::<Vec<_>>();
+    EFFECT.with(|effect| {
+        effect
+            .as_ref()?
+            .make_shader(Data::new_copy(&bytes), &[input.into()], None)
+    })
 }

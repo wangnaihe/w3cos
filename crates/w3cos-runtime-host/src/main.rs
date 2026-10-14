@@ -65,8 +65,8 @@ fn run() -> Result<()> {
                 }
             }
             let path = path.context("usage: w3cos-runtime-host page [--headless] <file.html>")?;
-            let html = std::fs::read_to_string(&path)
-                .with_context(|| format!("could not read {path}"))?;
+            let html =
+                std::fs::read_to_string(&path).with_context(|| format!("could not read {path}"))?;
             let runtime = find_runtime_library()?;
             reexec_with_library_path(&runtime)?;
             let lib = open_library(&runtime)?;
@@ -101,8 +101,7 @@ fn reexec_with_library_path(runtime: &Path) -> Result<()> {
 }
 
 fn open_library(path: &Path) -> Result<libloading::Library> {
-    unsafe { libloading::Library::new(path) }
-        .with_context(|| format!("dlopen {}", path.display()))
+    unsafe { libloading::Library::new(path) }.with_context(|| format!("dlopen {}", path.display()))
 }
 
 fn runtime_abi(lib: &libloading::Library) -> Result<u32> {
@@ -121,7 +120,8 @@ fn run_plugin(runtime: &libloading::Library, path: &str) -> Result<i32> {
     let app_abi = unsafe { required() };
     ensure_app_compatible(host_abi, app_abi)?;
     let start: libloading::Symbol<unsafe extern "C" fn() -> i32> =
-        unsafe { plugin.get(b"w3cos_plugin_main\0") }.context("plugin is missing w3cos_plugin_main")?;
+        unsafe { plugin.get(b"w3cos_plugin_main\0") }
+            .context("plugin is missing w3cos_plugin_main")?;
     let code = unsafe { start() };
     if code != 0 {
         return Err(anyhow!(
@@ -153,7 +153,9 @@ fn page_text(lib: &libloading::Library, html: &str) -> Result<String> {
     if ptr.is_null() {
         return Err(anyhow!(last_error(lib)));
     }
-    Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    Ok(unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn run_page(lib: &libloading::Library, path: &str) -> Result<i32> {
@@ -163,7 +165,10 @@ fn run_page(lib: &libloading::Library, path: &str) -> Result<i32> {
     let path = std::ffi::CString::new(path).context("page path contains an interior NUL")?;
     let code = unsafe { symbol(path.as_ptr()) };
     if code != 0 {
-        return Err(anyhow!("page window exited with {code}: {}", last_error(lib)));
+        return Err(anyhow!(
+            "page window exited with {code}: {}",
+            last_error(lib)
+        ));
     }
     Ok(code)
 }
@@ -178,5 +183,7 @@ fn last_error(lib: &libloading::Library) -> String {
     if ptr.is_null() {
         return "unknown runtime error".to_string();
     }
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }

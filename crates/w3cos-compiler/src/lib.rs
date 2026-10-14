@@ -781,12 +781,16 @@ edition = "2024"
             runtime_features.push("gpu".to_string());
         }
         if flags.needs_web_graphics_advanced
-            && !runtime_features.iter().any(|feature| feature == "web-graphics-advanced")
+            && !runtime_features
+                .iter()
+                .any(|feature| feature == "web-graphics-advanced")
         {
             runtime_features.push("web-graphics-advanced".to_string());
         }
         if flags.needs_web_media_advanced
-            && !runtime_features.iter().any(|feature| feature == "web-media-advanced")
+            && !runtime_features
+                .iter()
+                .any(|feature| feature == "web-media-advanced")
         {
             runtime_features.push("web-media-advanced".to_string());
         }
@@ -1790,7 +1794,8 @@ export function keymap() {}"#,
         );
         assert!(
             bundle_rs.contains("synchronous function boot compiled from W3IR")
-                && bundle_rs.contains("w3cos_core::intrinsics::construct("),
+                && (bundle_rs.contains("w3cos_core::intrinsics::construct(")
+                    || bundle_rs.contains("w3cos_core::class::construct_slice(")),
             "new EditorView() should lower through the W3IR construct intrinsic: {bundle_rs}"
         );
         assert!(
@@ -1808,8 +1813,7 @@ export function keymap() {}"#,
         // Function bodies should be lowered, not todo!()
         assert!(
             bundle_rs.contains("class member EditorView.mount compiled from W3IR")
-                && bundle_rs.contains("w3cos_core::intrinsics::call_method(")
-                && bundle_rs.contains("w3cos_core::Value::string(\"createElement\")"),
+                && bundle_rs.contains("call_method_slice(\"createElement\""),
             "method body should be lowered: {bundle_rs}"
         );
         assert!(
@@ -1982,8 +1986,7 @@ export function main() {
             "missing DOM-mode main: {main_rs}"
         );
         assert!(
-            main_rs.contains("prepare_headless_entry")
-                && main_rs.contains("finish_headless_entry"),
+            main_rs.contains("prepare_headless_entry") && main_rs.contains("finish_headless_entry"),
             "headless entry must pump through the runtime: {main_rs}"
         );
         assert!(
@@ -2115,7 +2118,8 @@ createRoot(document.getElementById("root")!).render(App());"#,
         assert!(
             bundle_rs.contains("__init_w3ir_0(")
                 && bundle_rs.contains("createRoot_value()")
-                && bundle_rs.contains("w3cos_core::intrinsics::call(")
+                && (bundle_rs.contains("w3cos_core::intrinsics::call(")
+                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion("))
                 && bundle_rs.contains("m0__init();"),
             "top-level Web bootstrap must execute through native W3IR module init: {bundle_rs}"
         );

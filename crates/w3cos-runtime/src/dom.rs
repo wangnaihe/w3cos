@@ -16,11 +16,17 @@ thread_local! {
 fn new_host_document() -> Document {
     // Embedders may select browser-equivalent readability preferences without
     // changing CSS keyword tables or baking a locale into the generic DOM.
-    let preference = |name| std::env::var(name).ok()
-        .and_then(|value| value.parse::<f32>().ok()).unwrap_or(0.0);
+    let preference = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.0)
+    };
     let mut document = Document::new();
-    document.set_font_size_minimums(preference("W3COS_MINIMUM_FONT_SIZE"),
-        preference("W3COS_MINIMUM_LOGICAL_FONT_SIZE"));
+    document.set_font_size_minimums(
+        preference("W3COS_MINIMUM_FONT_SIZE"),
+        preference("W3COS_MINIMUM_LOGICAL_FONT_SIZE"),
+    );
     document.set_css_image_dimensions_provider(crate::image_loader::dimensions);
     document
 }
@@ -62,6 +68,7 @@ pub fn clear_document_dirty() {
 pub fn reset_document() {
     DOCUMENT.with(|d| *d.borrow_mut() = new_host_document());
     DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
+    w3cos_dom::document::bump_structure_tick();
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
     crate::incremental_layout::invalidate();
@@ -404,6 +411,24 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
 /// Known non-inherited properties. Everything else, including custom
 /// properties and `font`/`color`, still restyles the descendant subtree.
 fn inline_style_change_is_local(prop: &str) -> bool {
+    // The frame loop writes these names already in kebab case.
+    if matches!(
+        prop,
+        "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "width"
+            | "height"
+            | "flex"
+            | "display"
+            | "position"
+            | "overflow"
+            | "margin"
+            | "padding"
+    ) {
+        return true;
+    }
     let prop = prop.trim().to_ascii_lowercase();
     if prop.starts_with("--") || prop == "all" {
         return false;

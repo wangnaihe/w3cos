@@ -1323,13 +1323,18 @@ fn css_url_token_end(bytes: &[u8], mut pos: usize) -> usize {
     // Only a leading quote turns url( into a function containing a string.
     // An unquoted URL (including a bad-URL token) consumes through the first
     // unescaped ')'; quotes/braces/open parentheses inside it are not blocks.
-    if !bytes.get(pos).is_some_and(|byte| matches!(byte, b'\'' | b'"')) {
+    if !bytes
+        .get(pos)
+        .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+    {
         while pos < bytes.len() {
             if bytes[pos] == b')' {
                 return pos + 1;
             }
             if bytes[pos] == b'\\'
-                && bytes.get(pos + 1).is_some_and(|byte| !matches!(byte, b'\n' | b'\r' | b'\x0c'))
+                && bytes
+                    .get(pos + 1)
+                    .is_some_and(|byte| !matches!(byte, b'\n' | b'\r' | b'\x0c'))
             {
                 pos = css_escape_end(bytes, pos);
             } else {
@@ -1725,7 +1730,10 @@ mod tests {
         // the malformed nested import still cannot become a sheet import.
         assert_eq!(
             sheet.rules[0].declarations,
-            vec![("color".into(), "green".into()), ("color".into(), "red".into())]
+            vec![
+                ("color".into(), "green".into()),
+                ("color".into(), "red".into())
+            ]
         );
         assert_eq!(
             sheet.rules[1].declarations.last(),
@@ -1747,12 +1755,19 @@ mod tests {
             "browser-nested-media-recovery.css",
         );
         assert_eq!(sheet.rules.len(), 3);
-        assert_eq!(sheet.rules[0].declarations.last(),
+        assert_eq!(
+            sheet.rules[0].declarations.last(),
             Some(&("color".into(), "red".into())),
-            "a closed nested conditional block must not swallow the following declaration");
-        assert_eq!(sheet.rules[1].declarations.last(),
-            Some(&("color".into(), "green".into())));
-        assert_eq!(sheet.rules[2].declarations, vec![("color".into(), "green".into())]);
+            "a closed nested conditional block must not swallow the following declaration"
+        );
+        assert_eq!(
+            sheet.rules[1].declarations.last(),
+            Some(&("color".into(), "green".into()))
+        );
+        assert_eq!(
+            sheet.rules[2].declarations,
+            vec![("color".into(), "green".into())]
+        );
         assert!(sheet.imports.is_empty());
     }
 
@@ -1894,11 +1909,23 @@ mod tests {
 
     #[test]
     fn unquoted_bad_url_stops_at_first_unescaped_right_parenthesis() {
-        for source in ["foo\"bar) } next", "() } next", "}{\"\"{)}); next", "[()); next"] {
-            assert_eq!(css_url_token_end(source.as_bytes(), 0), source.find(')').unwrap() + 1, "{source}");
+        for source in [
+            "foo\"bar) } next",
+            "() } next",
+            "}{\"\"{)}); next",
+            "[()); next",
+        ] {
+            assert_eq!(
+                css_url_token_end(source.as_bytes(), 0),
+                source.find(')').unwrap() + 1,
+                "{source}"
+            );
         }
         let escaped = r"bad\)url) next";
-        assert_eq!(css_url_token_end(escaped.as_bytes(), 0), escaped.rfind(')').unwrap() + 1);
+        assert_eq!(
+            css_url_token_end(escaped.as_bytes(), 0),
+            escaped.rfind(')').unwrap() + 1
+        );
     }
 
     #[test]
@@ -1956,8 +1983,7 @@ mod tests {
                 .map(|(_, value)| value.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(
-                values,
-                expected,
+                values, expected,
                 "source={source}\nrules={:#?}",
                 sheet.rules
             );

@@ -285,9 +285,11 @@ impl LoadedFont {
 
     /// Whether this face is eligible for and contains a glyph for `character`.
     pub(crate) fn supports_character(&self, character: char) -> bool {
-        self.permits_character(character) && self.parsed
-            .as_ref()
-            .is_some_and(|font| font.chars().contains_key(&character))
+        self.permits_character(character)
+            && self
+                .parsed
+                .as_ref()
+                .is_some_and(|font| font.chars().contains_key(&character))
     }
 
     // Primary strut lookup checks CSS subset eligibility, not cmap coverage.
@@ -302,8 +304,12 @@ impl LoadedFont {
     #[cfg(feature = "skia")]
     pub(crate) fn skia_typeface(&self) -> Option<skia_safe::Typeface> {
         self.skia_typeface
-            .get_or_init(|| skia_safe::FontMgr::default().new_from_data(
-                self.data.as_slice(), self.collection_index.map(|index| index as usize)))
+            .get_or_init(|| {
+                skia_safe::FontMgr::default().new_from_data(
+                    self.data.as_slice(),
+                    self.collection_index.map(|index| index as usize),
+                )
+            })
             .clone()
     }
 }
@@ -453,7 +459,8 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
             })
             .or_else(|| database.faces().next().map(|face| face.id))
             .expect("host must provide at least one system font");
-        let family = database.face(id)
+        let family = database
+            .face(id)
             .and_then(|face| face.families.first())
             .map(|(family, _)| family.clone())
             .expect("selected system font must have a family");
@@ -468,7 +475,12 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
             },
         )
         .expect("selected system font must be valid");
-        HostUiFont { family, data, index, font }
+        HostUiFont {
+            family,
+            data,
+            index,
+            font,
+        }
     })
 }
 
@@ -549,8 +561,8 @@ impl FontRegistry {
         let data = match &face.src {
             FontSource::Bytes(b) => normalize_font_bytes(b).map(Arc::new)?,
             FontSource::Path(p) => {
-                let bytes = read_font_path(p)
-                    .ok_or_else(|| format!("font load error {}", p.display()))?;
+                let bytes =
+                    read_font_path(p).ok_or_else(|| format!("font load error {}", p.display()))?;
                 normalize_font_bytes(&bytes).map(Arc::new)?
             }
             FontSource::Local(name) => {
@@ -765,9 +777,9 @@ impl FontRegistry {
     ) -> Option<LoadedFont> {
         let key = face_hit_key(stack, weight, style);
         if let Some(cached) = FACE_HIT.with(|slot| {
-            slot.borrow().as_ref().and_then(|(cached_key, font)| {
-                (*cached_key == key).then(|| font.clone())
-            })
+            slot.borrow()
+                .as_ref()
+                .and_then(|(cached_key, font)| (*cached_key == key).then(|| font.clone()))
         }) {
             if cached.covers_all_codepoints()
                 && text.chars().all(|character| {
@@ -793,52 +805,100 @@ impl FontRegistry {
     }
 
     /// Blink's primary line strut queries U+0020 without requiring its glyph.
-    pub(crate) fn resolve_style_for_strut(&self, style: &w3cos_std::style::Style) -> Option<LoadedFont> {
+    pub(crate) fn resolve_style_for_strut(
+        &self,
+        style: &w3cos_std::style::Style,
+    ) -> Option<LoadedFont> {
         let family = style.font_family.as_deref()?;
         let face_style = match style.font_style {
             w3cos_std::style::FontStyle::Normal => FontFaceStyle::Normal,
             w3cos_std::style::FontStyle::Italic => FontFaceStyle::Italic,
             w3cos_std::style::FontStyle::Oblique => FontFaceStyle::Oblique,
         };
-        self.resolve_render_stack_with_eligibility(family, FontWeight(style.font_weight),
-            face_style, Some(' '), false)
+        self.resolve_render_stack_with_eligibility(
+            family,
+            FontWeight(style.font_weight),
+            face_style,
+            Some(' '),
+            false,
+        )
     }
 
     /// Resolve render faces without promoting installed fonts into document
     /// registrations. A generic family is a cascade boundary handled by the
     /// renderer's platform defaults, not an alias for a later named family.
     fn resolve_render_stack(
-        &self, stack: &str, weight: FontWeight, style: FontFaceStyle, character: Option<char>,
+        &self,
+        stack: &str,
+        weight: FontWeight,
+        style: FontFaceStyle,
+        character: Option<char>,
     ) -> Option<LoadedFont> {
         self.resolve_render_stack_with_eligibility(stack, weight, style, character, true)
     }
 
     fn resolve_render_stack_with_eligibility(
-        &self, stack: &str, weight: FontWeight, style: FontFaceStyle,
-        character: Option<char>, require_glyph: bool,
+        &self,
+        stack: &str,
+        weight: FontWeight,
+        style: FontFaceStyle,
+        character: Option<char>,
+        require_glyph: bool,
     ) -> Option<LoadedFont> {
         for raw in stack.split(',') {
             let raw = raw.trim();
-            if matches!(raw.to_ascii_lowercase().as_str(), "serif" | "sans-serif" | "monospace"
-                | "cursive" | "fantasy" | "system-ui" | "ui-serif" | "ui-sans-serif"
-                | "ui-monospace" | "ui-rounded" | "-apple-system" | "blinkmacsystemfont") {
+            if matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "serif"
+                    | "sans-serif"
+                    | "monospace"
+                    | "cursive"
+                    | "fantasy"
+                    | "system-ui"
+                    | "ui-serif"
+                    | "ui-sans-serif"
+                    | "ui-monospace"
+                    | "ui-rounded"
+                    | "-apple-system"
+                    | "blinkmacsystemfont"
+            ) {
                 return None;
             }
             let family = raw.trim_matches(['"', '\'']);
             let (registered, shadows_system) = {
                 let fonts = self.fonts.lock().unwrap();
-                (resolve_family_with_eligibility(&fonts, family, weight, style, character, require_glyph),
-                    fonts.keys().any(|key| key.family.eq_ignore_ascii_case(family)))
+                (
+                    resolve_family_with_eligibility(
+                        &fonts,
+                        family,
+                        weight,
+                        style,
+                        character,
+                        require_glyph,
+                    ),
+                    fonts
+                        .keys()
+                        .any(|key| key.family.eq_ignore_ascii_case(family)),
+                )
             };
-            if let Some(font) = registered { return Some(font); }
+            if let Some(font) = registered {
+                return Some(font);
+            }
             // @font-face defines this family even outside its unicode-range;
             // missing coverage falls through to the next CSS family, not a
             // system face with the same name.
-            if !shadows_system && let Some(font) = system_fonts::resolve(family, weight, style)
-                && character.is_none_or(|character| if require_glyph {
-                    font.supports_character(character)
-                } else { font.permits_character(character) })
-            { return Some(font); }
+            if !shadows_system
+                && let Some(font) = system_fonts::resolve(family, weight, style)
+                && character.is_none_or(|character| {
+                    if require_glyph {
+                        font.supports_character(character)
+                    } else {
+                        font.permits_character(character)
+                    }
+                })
+            {
+                return Some(font);
+            }
         }
         None
     }
@@ -1064,13 +1124,21 @@ fn resolve_family(
 
 fn resolve_family_with_eligibility(
     fonts: &HashMap<FontKey, Vec<(u64, LoadedFont)>>,
-    family: &str, weight: FontWeight, style: FontFaceStyle,
-    character: Option<char>, require_glyph: bool,
+    family: &str,
+    weight: FontWeight,
+    style: FontFaceStyle,
+    character: Option<char>,
+    require_glyph: bool,
 ) -> Option<LoadedFont> {
-    let eligible =
-        |font: &LoadedFont| character.is_none_or(|character| if require_glyph {
-            font.supports_character(character)
-        } else { font.permits_character(character) });
+    let eligible = |font: &LoadedFont| {
+        character.is_none_or(|character| {
+            if require_glyph {
+                font.supports_character(character)
+            } else {
+                font.permits_character(character)
+            }
+        })
+    };
     let exact = FontKey {
         family: family.to_string(),
         weight,
@@ -1087,7 +1155,9 @@ fn resolve_family_with_eligibility(
     let closest = |match_style: bool| {
         fonts
             .iter()
-            .filter(|(key, _)| key.family.eq_ignore_ascii_case(family) && (!match_style || key.style == style))
+            .filter(|(key, _)| {
+                key.family.eq_ignore_ascii_case(family) && (!match_style || key.style == style)
+            })
             .filter_map(|(key, entries)| {
                 entries
                     .iter()
@@ -1190,11 +1260,17 @@ fn resolve_system_font(name: &str) -> Option<Vec<u8>> {
 /// `font-weight`, `font-style`, `font-display`, `unicode-range`.
 fn parse_one_src(val: &str) -> Option<FontSource> {
     let val = val.trim().trim_end_matches(';');
-    if let Some(inner) = val.strip_prefix("url(").and_then(|rest| rest.strip_suffix(')')) {
+    if let Some(inner) = val
+        .strip_prefix("url(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
         let url = inner.trim().trim_matches('"').trim_matches('\'');
         return Some(FontSource::Path(url.into()));
     }
-    if let Some(inner) = val.strip_prefix("local(").and_then(|rest| rest.strip_suffix(')')) {
+    if let Some(inner) = val
+        .strip_prefix("local(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
         let name = inner.trim().trim_matches('"').trim_matches('\'');
         return Some(FontSource::Local(name.to_string()));
     }
@@ -1301,32 +1377,53 @@ mod tests {
     #[test]
     fn render_runs_use_the_same_installed_face_as_metrics() {
         let registry = FontRegistry::new();
-        let style = w3cos_std::Style { font_family: Some("Verdana, sans-serif".into()),
-            font_weight: 900, font_size: 28.0, ..Default::default() };
+        let style = w3cos_std::Style {
+            font_family: Some("Verdana, sans-serif".into()),
+            font_weight: 900,
+            font_size: 28.0,
+            ..Default::default()
+        };
         let measured = registry.resolve_style(&style).unwrap();
-        let runs = registry.resolve_style_runs(&style, "This box, which should have a bright green border.");
+        let runs = registry
+            .resolve_style_runs(&style, "This box, which should have a bright green border.");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].font.as_ref().map(LoadedFont::cache_key), Some(measured.cache_key()),
-            "paint runs must not use the registered-only cascade while metrics use installed fonts");
+        assert_eq!(
+            runs[0].font.as_ref().map(LoadedFont::cache_key),
+            Some(measured.cache_key()),
+            "paint runs must not use the registered-only cascade while metrics use installed fonts"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn render_stack_resolves_named_system_fonts_without_registering_them() {
         let registry = FontRegistry::new();
-        let mut style = w3cos_std::Style { font_family: Some("Verdana, sans-serif".into()),
-            font_weight: 900, font_size: 28.0, ..Default::default() };
+        let mut style = w3cos_std::Style {
+            font_family: Some("Verdana, sans-serif".into()),
+            font_weight: 900,
+            font_size: 28.0,
+            ..Default::default()
+        };
         let before = registry.revision();
         let installed = registry.resolve_style(&style).expect("installed Verdana");
         assert_eq!(installed.family, "Verdana");
-        assert!(installed.weight.0 >= 600, "resolve actual bold face, not normal bytes labelled900");
+        assert!(
+            installed.weight.0 >= 600,
+            "resolve actual bold face, not normal bytes labelled900"
+        );
         assert!(installed.supports_character('W'));
         assert!(installed.parsed().is_some());
-        assert!(registry.families().is_empty(), "installed lookup is not registration");
+        assert!(
+            registry.families().is_empty(),
+            "installed lookup is not registration"
+        );
         assert_eq!(registry.revision(), before);
         style.font_weight = 700;
         let bold = registry.resolve_style(&style).unwrap();
-        assert!(Arc::ptr_eq(&installed.data, &bold.data), "weights selecting one face share font data");
+        assert!(
+            Arc::ptr_eq(&installed.data, &bold.data),
+            "weights selecting one face share font data"
+        );
         #[cfg(feature = "skia")]
         {
             let face = installed.skia_typeface().unwrap();
@@ -1335,24 +1432,49 @@ mod tests {
         }
         for stack in ["Arial, Verdana", "'Arial', 'Verdana'"] {
             style.font_family = Some(stack.into());
-            assert_eq!(registry.resolve_style(&style).unwrap().family, "Arial", "CSS order: {stack}");
+            assert_eq!(
+                registry.resolve_style(&style).unwrap().family,
+                "Arial",
+                "CSS order: {stack}"
+            );
         }
         for stack in ["serif, Verdana", "monospace, Verdana"] {
             style.font_family = Some(stack.into());
-            assert!(registry.resolve_style(&style).is_none(), "generic boundary: {stack}");
+            assert!(
+                registry.resolve_style(&style).is_none(),
+                "generic boundary: {stack}"
+            );
         }
-        registry.register_for_owner(247, FontFace {
-            family: "Verdana".into(),
-            src: FontSource::Bytes(include_bytes!("../assets/Inter-Regular.ttf").to_vec()),
-            unicode_range: Some("U+0057".into()), ..Default::default()
-        }).unwrap();
+        registry
+            .register_for_owner(
+                247,
+                FontFace {
+                    family: "Verdana".into(),
+                    src: FontSource::Bytes(include_bytes!("../assets/Inter-Regular.ttf").to_vec()),
+                    unicode_range: Some("U+0057".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         style.font_family = Some("verdana, Arial".into());
         let owned = registry.resolve_style_for_character(&style, 'W').unwrap();
-        assert!(!Arc::ptr_eq(&owned.data, &installed.data), "registered face overrides installed face case-insensitively");
-        assert_eq!(registry.resolve_style_for_character(&style, 'X').unwrap().family, "Arial",
-            "out-of-range glyph advances to the next family, not shadowed system Verdana");
+        assert!(
+            !Arc::ptr_eq(&owned.data, &installed.data),
+            "registered face overrides installed face case-insensitively"
+        );
+        assert_eq!(
+            registry
+                .resolve_style_for_character(&style, 'X')
+                .unwrap()
+                .family,
+            "Arial",
+            "out-of-range glyph advances to the next family, not shadowed system Verdana"
+        );
         registry.clear_owner(247);
-        assert!(Arc::ptr_eq(&registry.resolve_style(&style).unwrap().data, &installed.data));
+        assert!(Arc::ptr_eq(
+            &registry.resolve_style(&style).unwrap().data,
+            &installed.data
+        ));
         assert!(registry.families().is_empty());
     }
 
@@ -1608,7 +1730,8 @@ mod tests {
         };
         assert_eq!(
             registry.normal_line_height_for_text(&style, "\u{0162}\u{0119}\u{015f}\u{0163}"),
-            registry.normal_line_height_for_text(&fallback_style, "\u{0162}\u{0119}\u{015f}\u{0163}"),
+            registry
+                .normal_line_height_for_text(&fallback_style, "\u{0162}\u{0119}\u{015f}\u{0163}"),
             "uncovered Ahem characters use the next family's metrics, not a hard-coded fallback",
         );
     }

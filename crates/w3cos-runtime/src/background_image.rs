@@ -18,24 +18,48 @@ pub(crate) fn annotate_fixed_background_viewport(style: &mut Style, viewport: Op
     }) else {
         return;
     };
-    if !style.background_attachment.as_deref().is_some_and(|attachments| {
-        attachments.split(',').any(|attachment| attachment.trim().eq_ignore_ascii_case("fixed"))
-    }) {
+    if !style
+        .background_attachment
+        .as_deref()
+        .is_some_and(|attachments| {
+            attachments
+                .split(',')
+                .any(|attachment| attachment.trim().eq_ignore_ascii_case("fixed"))
+        })
+    {
         return;
     }
-    let position = style.background_position.clone().unwrap_or_else(|| "0% 0%".into());
+    let position = style
+        .background_position
+        .clone()
+        .unwrap_or_else(|| "0% 0%".into());
     let properties = style.custom_properties.get_or_insert_with(Default::default);
-    properties.insert(FIXED_BACKGROUND_VIEWPORT.into(), format!("{width} {height}"));
+    properties.insert(
+        FIXED_BACKGROUND_VIEWPORT.into(),
+        format!("{width} {height}"),
+    );
     properties.insert(FIXED_BACKGROUND_POSITION.into(), position);
 }
 
 fn fixed_background_viewport(style: &Style) -> Option<LayoutRect> {
-    let value = style.custom_properties.as_ref()?.get(FIXED_BACKGROUND_VIEWPORT)?;
+    let value = style
+        .custom_properties
+        .as_ref()?
+        .get(FIXED_BACKGROUND_VIEWPORT)?;
     let mut parts = value.split_ascii_whitespace();
     let width = parts.next()?.parse::<f32>().ok()?;
     let height = parts.next()?.parse::<f32>().ok()?;
-    (parts.next().is_none() && width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-        .then_some(LayoutRect { x: 0.0, y: 0.0, width, height })
+    (parts.next().is_none()
+        && width.is_finite()
+        && height.is_finite()
+        && width > 0.0
+        && height > 0.0)
+        .then_some(LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -203,7 +227,9 @@ fn raster_background_layers_with_overrides(
                 clip_override,
             )?;
             let (repeat_x, repeat_y) = parse_repeat(layer_value(
-                style.background_repeat.as_deref(), index, "repeat",
+                style.background_repeat.as_deref(),
+                index,
+                "repeat",
             ));
             Some(RasterBackgroundLayer {
                 layer_index: index,
@@ -474,9 +500,17 @@ fn layer_geometry(
         }
     }
     let original_position = fixed_viewport.and_then(|_| {
-        style.custom_properties.as_ref()?.get(FIXED_BACKGROUND_POSITION).map(String::as_str)
+        style
+            .custom_properties
+            .as_ref()?
+            .get(FIXED_BACKGROUND_POSITION)
+            .map(String::as_str)
     });
-    let position = layer_value(original_position.or(style.background_position.as_deref()), index, "0% 0%");
+    let position = layer_value(
+        original_position.or(style.background_position.as_deref()),
+        index,
+        "0% 0%",
+    );
     let (position_x, position_y) = resolve_position_with_ex(
         position,
         positioning_area,
@@ -1752,7 +1786,12 @@ mod tests {
         use crate::paint_artifact::{PaintArtifact, PaintNode};
         use w3cos_std::component::ComponentKind;
 
-        let body = LayoutRect { x: 51.0, y: 51.0, width: 698.0, height: 212.0 };
+        let body = LayoutRect {
+            x: 51.0,
+            y: 51.0,
+            width: 698.0,
+            height: 212.0,
+        };
         let nodes = [
             PaintNode {
                 kind: ComponentKind::Box,
@@ -1780,7 +1819,18 @@ mod tests {
         ];
         let artifact = PaintArtifact::build_with_body_background_and_viewport(
             nodes,
-            &[(LayoutRect { x: 16.0, y: 16.0, width: 768.0, height: 282.0 }, 0), (body, 1)],
+            &[
+                (
+                    LayoutRect {
+                        x: 16.0,
+                        y: 16.0,
+                        width: 768.0,
+                        height: 282.0,
+                    },
+                    0,
+                ),
+                (body, 1),
+            ],
             1,
             Some(1),
             Some((800.0, 600.0)),

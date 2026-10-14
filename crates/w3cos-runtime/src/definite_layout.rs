@@ -2,8 +2,10 @@
 //!
 //! Px and stretch trees with no author rules never build a Taffy tree.
 //! Simple author blocks (percent widths, one text run per box) are solved
-//! the same way and remembered by inline style. Flex, grid, floats, abspos,
-//! and overflow stay on Taffy.
+//! the same way and remembered by inline style. Column flex of definite
+//! rows, definite overflow boxes, and absolute children of a relative
+//! parent are stacked here. Other flex, grid, float, and indefinite
+//! overflow trees stay on Taffy.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -83,8 +85,97 @@ fn layout_element(
 }
 
 fn box_is_simple(style: &Style) -> bool {
-    style.position == Position::Static
+    position_is_in_flow(style)
         && style.float == Float::None
+        && style.direction == TextDirection::Ltr
+        && style.column_count.is_none()
+        && style.gap == 0.0
+        && style.row_gap.unwrap_or(0.0) == 0.0
+        && style.column_gap.unwrap_or(0.0) == 0.0
+        && overflow_is_definite(style)
+        && spacing_is_zero(style.margin.top)
+        && spacing_is_zero(style.margin.right)
+        && spacing_is_zero(style.margin.bottom)
+        && spacing_is_zero(style.margin.left)
+        && spacing_is_zero(style.padding.top)
+        && spacing_is_zero(style.padding.right)
+        && spacing_is_zero(style.padding.bottom)
+        && spacing_is_zero(style.padding.left)
+        && style.border_width == 0.0
+        && style.border_top_width.unwrap_or(0.0) == 0.0
+        && style.border_right_width.unwrap_or(0.0) == 0.0
+        && style.border_bottom_width.unwrap_or(0.0) == 0.0
+        && style.border_left_width.unwrap_or(0.0) == 0.0
+        && matches!(style.min_width, Dimension::Auto)
+        && matches!(style.min_height, Dimension::Auto)
+        && matches!(style.max_width, Dimension::Auto)
+        && matches!(style.max_height, Dimension::Auto)
+}
+
+fn overflow_is_visible(overflow: Overflow) -> bool {
+    matches!(overflow, Overflow::Visible)
+}
+
+/// Static boxes, and relative boxes that are not offset, keep their in-flow
+/// border box. Relative is the containing block for definite absolute children.
+fn position_is_in_flow(style: &Style) -> bool {
+    match style.position {
+        Position::Static => true,
+        Position::Relative => {
+            matches!(style.top, Dimension::Auto)
+                && matches!(style.right, Dimension::Auto)
+                && matches!(style.bottom, Dimension::Auto)
+                && matches!(style.left, Dimension::Auto)
+        }
+        _ => false,
+    }
+}
+
+/// Overflow does not change a definite px border box. Auto height still
+/// depends on the visible overflow model, so that stays on Taffy.
+fn overflow_is_definite(style: &Style) -> bool {
+    let visible = overflow_is_visible(style.overflow)
+        && style.overflow_x.is_none_or(overflow_is_visible)
+        && style.overflow_y.is_none_or(overflow_is_visible);
+    visible || (px_size(style.width).is_some() && px_size(style.height).is_some())
+}
+
+enum AbsoluteBox {
+    Flow,
+    Definite {
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+    },
+    Unsupported,
+}
+
+fn classify_absolute(style: &Style) -> AbsoluteBox {
+    if !matches!(style.position, Position::Absolute | Position::Fixed) {
+        return AbsoluteBox::Flow;
+    }
+    if style.position == Position::Fixed || !box_is_simple_ignoring_position(style) {
+        return AbsoluteBox::Unsupported;
+    }
+    match (
+        px_size(style.left),
+        px_size(style.top),
+        px_size(style.width),
+        px_size(style.height),
+    ) {
+        (Some(left), Some(top), Some(width), Some(height)) => AbsoluteBox::Definite {
+            left,
+            top,
+            width,
+            height,
+        },
+        _ => AbsoluteBox::Unsupported,
+    }
+}
+
+fn box_is_simple_ignoring_position(style: &Style) -> bool {
+    style.float == Float::None
         && style.direction == TextDirection::Ltr
         && style.column_count.is_none()
         && style.gap == 0.0
@@ -110,10 +201,6 @@ fn box_is_simple(style: &Style) -> bool {
         && matches!(style.min_height, Dimension::Auto)
         && matches!(style.max_width, Dimension::Auto)
         && matches!(style.max_height, Dimension::Auto)
-}
-
-fn overflow_is_visible(overflow: Overflow) -> bool {
-    matches!(overflow, Overflow::Visible)
 }
 
 fn spacing_is_zero(spacing: Spacing) -> bool {
@@ -149,15 +236,9 @@ fn layout_block(
         Dimension::Auto => None,
         other => Some(px_size(other)?),
     };
-    if let Some(flow) = layout_repeated_text_rows(
-        document,
-        id,
-        x,
-        y,
-        width,
-        specified_height,
-        out,
-    ) {
+    let positioned = style.position == Position::Relative;
+    if let Some(flow) = layout_repeated_text_rows(document, id, x, y, width, specified_height, out)
+    {
         return Some(flow);
     }
     let mut cursor = y;
@@ -166,10 +247,37 @@ fn layout_block(
     while let Some(cid) = child {
         let node = document.get_node(cid);
         match node.node_type {
-            NodeType::Element => match layout_element(document, cid, x, cursor, width, out)? {
-                Flow::Skip => {}
-                Flow::Box { height, .. } => cursor += height,
-            },
+            NodeType::Element => {
+                match classify_absolute(&document.get_style(cid).inner) {
+                    AbsoluteBox::Flow => {}
+                    AbsoluteBox::Unsupported => return None,
+                    AbsoluteBox::Definite {
+                        left,
+                        top,
+                        width: box_width,
+                        height: box_height,
+                    } => {
+                        // Only a relative parent is the containing block here.
+                        // A static overflow box keeps absolute descendants on Taffy.
+                        if !positioned {
+                            return None;
+                        }
+                        out.push((cid, DOMRect::new(x + left, y + top, box_width, box_height)));
+                        let mut nested = document.get_node(cid).first_child;
+                        while let Some(nested_id) = nested {
+                            zero_subtree(document, nested_id, out);
+                            nested =
+                                w3cos_dom::node::sib(document.get_node(nested_id).next_sibling);
+                        }
+                        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
+                        continue;
+                    }
+                }
+                match layout_element(document, cid, x, cursor, width, out)? {
+                    Flow::Skip => {}
+                    Flow::Box { height, .. } => cursor += height,
+                }
+            }
             NodeType::Text => {
                 if node
                     .text_content
@@ -267,6 +375,9 @@ fn layout_flex(
     out: &mut Vec<(NodeId, DOMRect)>,
 ) -> Option<Flow> {
     let style = &document.get_style(id).inner;
+    if style.flex_direction == FlexDirection::Column {
+        return layout_flex_column(document, id, x, y, cb_width, out);
+    }
     if style.flex_direction != FlexDirection::Row
         || !matches!(style.flex_wrap, FlexWrap::NoWrap | FlexWrap::Wrap)
         || style.justify_content != JustifyContent::FlexStart
@@ -347,6 +458,154 @@ fn layout_flex(
             item_x += item_width;
         }
         cursor += line_height;
+    }
+    let height = specified_height.unwrap_or(cursor - y);
+    out.push((id, DOMRect::new(x, y, width, height)));
+    Some(Flow::Box { width, height })
+}
+
+/// Column flex of definite-height rows. Items with `flex-grow`/`flex-shrink`
+/// keep their base size when the container height is auto, because there is
+/// no free space to distribute. A definite container that would grow or
+/// shrink items stays on Taffy.
+fn layout_flex_column(
+    document: &w3cos_dom::Document,
+    id: NodeId,
+    x: f32,
+    y: f32,
+    cb_width: f32,
+    out: &mut Vec<(NodeId, DOMRect)>,
+) -> Option<Flow> {
+    let (width, specified_height, stretch) = {
+        let style = &document.get_style(id).inner;
+        if style.flex_wrap != FlexWrap::NoWrap
+            || style.justify_content != JustifyContent::FlexStart
+            || !matches!(
+                style.align_items,
+                AlignItems::Stretch | AlignItems::FlexStart
+            )
+        {
+            return None;
+        }
+        let width = content_width(style, cb_width)?;
+        let specified_height = match style.height {
+            Dimension::Auto => None,
+            other => Some(px_size(other)?),
+        };
+        if specified_height.is_some()
+            && style.align_content != w3cos_std::style::AlignContent::FlexStart
+        {
+            return None;
+        }
+        (
+            width,
+            specified_height,
+            style.align_items == AlignItems::Stretch,
+        )
+    };
+    struct Row {
+        id: NodeId,
+        height: f32,
+        width: f32,
+        text: Option<NodeId>,
+    }
+    let mut rows = Vec::new();
+    let mut child = document.get_node(id).first_child;
+    while let Some(cid) = child {
+        let node = document.get_node(cid);
+        match node.node_type {
+            NodeType::Element => {
+                let child_style = &document.get_style(cid).inner;
+                if child_style.display == Display::None {
+                    rows.push(None);
+                } else {
+                    if child_style.order != 0
+                        || child_style.align_self != AlignSelf::Auto
+                        || !matches!(child_style.flex_basis, Dimension::Auto | Dimension::Px(_))
+                    {
+                        return None;
+                    }
+                    if specified_height.is_some()
+                        && (child_style.flex_grow != 0.0 || child_style.flex_shrink != 0.0)
+                    {
+                        return None;
+                    }
+                    if !box_is_simple(child_style)
+                        || !matches!(child_style.display, Display::Block | Display::FlowRoot)
+                    {
+                        return None;
+                    }
+                    let item_height = px_size(child_style.height)?;
+                    if let Dimension::Px(basis) = child_style.flex_basis {
+                        if (basis - item_height).abs() > 0.05 {
+                            return None;
+                        }
+                    }
+                    let item_width = match child_style.width {
+                        Dimension::Px(item_width)
+                            if item_width.is_finite() && item_width >= 0.0 =>
+                        {
+                            item_width
+                        }
+                        Dimension::Auto if stretch => width,
+                        _ => return None,
+                    };
+                    let text = match node.first_child {
+                        None => None,
+                        Some(text) => {
+                            let text_node = document.get_node(text);
+                            if text_node.node_type != NodeType::Text || text_node.next_sibling != 0
+                            {
+                                return None;
+                            }
+                            Some(text)
+                        }
+                    };
+                    rows.push(Some(Row {
+                        id: cid,
+                        height: item_height,
+                        width: item_width,
+                        text,
+                    }));
+                }
+            }
+            NodeType::Text => {
+                if node
+                    .text_content
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    return None;
+                }
+                rows.push(None);
+            }
+            _ => rows.push(None),
+        }
+        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
+    }
+    let mut cursor = y;
+    child = document.get_node(id).first_child;
+    let mut index = 0;
+    while let Some(cid) = child {
+        match rows.get(index) {
+            Some(None) => {
+                if document.get_node(cid).node_type == NodeType::Element {
+                    zero_subtree(document, cid, out);
+                } else {
+                    out.push((cid, DOMRect::zero()));
+                }
+            }
+            Some(Some(row)) => {
+                out.push((row.id, DOMRect::new(x, cursor, row.width, row.height)));
+                if let Some(text) = row.text {
+                    out.push((text, DOMRect::zero()));
+                }
+                cursor += row.height;
+            }
+            None => return None,
+        }
+        index += 1;
+        child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
     }
     let height = specified_height.unwrap_or(cursor - y);
     out.push((id, DOMRect::new(x, y, width, height)));
@@ -510,8 +769,10 @@ fn try_apply_authored(viewport_w: f32) -> bool {
             reuse: !w3cos_dom::stylesheet::has_position_dependent_rules(),
             styles: HashMap::new(),
         };
-        if layout_authored(document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects)
-            .is_none()
+        if layout_authored(
+            document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects,
+        )
+        .is_none()
         {
             return false;
         }
@@ -648,9 +909,10 @@ fn layout_authored(
     let margin_right = spacing_px(style.margin.right)?;
     let margin_bottom = spacing_px(style.margin.bottom)?;
     let margin_left = spacing_px(style.margin.left)?;
-    let root_margin = document.get_node(id).tag.with_str(|name| {
-        name.eq_ignore_ascii_case("html") || name.eq_ignore_ascii_case("body")
-    });
+    let root_margin = document
+        .get_node(id)
+        .tag
+        .with_str(|name| name.eq_ignore_ascii_case("html") || name.eq_ignore_ascii_case("body"));
     if (margin_top != 0.0 || margin_right != 0.0 || margin_bottom != 0.0 || margin_left != 0.0)
         && !root_margin
     {

@@ -46,14 +46,21 @@ mod tests {
                 assert_eq!(owner.color, w3cos_std::Color::rgb(0, 0, 238));
                 assert_eq!(owner.font_size, 16.0);
             }
-            let owns = owns || component.style.custom_properties.as_ref()
-                .is_some_and(|p| p.contains_key("--w3cos-internal-decoration-owner-count"));
+            let owns = owns
+                || component
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .is_some_and(|p| p.contains_key("--w3cos-internal-decoration-owner-count"));
             if matches!(&component.kind, ComponentKind::Text { content } if content == "Owned") {
                 assert_eq!(component.style.text_decoration, TextDecoration::None);
                 assert_eq!(component.style.color, w3cos_std::Color::rgb(0, 128, 0));
                 return owns;
             }
-            component.children.iter().any(|child| owner_reaches_text(child, owns))
+            component
+                .children
+                .iter()
+                .any(|child| owner_reaches_text(child, owns))
         }
         let mut doc = Document::new();
         let anchor = doc.create_element("a");
@@ -64,9 +71,14 @@ mod tests {
         block.append_child(&mut doc, text);
         anchor.append_child(&mut doc, block);
         doc.body().append_child(&mut doc, anchor);
-        assert!(owner_reaches_text(&doc.to_component_tree(), false),
-            "boxless split lost its originating anchor decoration");
-        assert_eq!(doc.computed_style_for(block.id).text_decoration, TextDecoration::None);
+        assert!(
+            owner_reaches_text(&doc.to_component_tree(), false),
+            "boxless split lost its originating anchor decoration"
+        );
+        assert_eq!(
+            doc.computed_style_for(block.id).text_decoration,
+            TextDecoration::None
+        );
     }
 
     #[test]
@@ -101,21 +113,31 @@ mod tests {
             owner.append_child(&mut doc, child);
             doc.body().append_child(&mut doc, owner);
             let tree = doc.to_component_tree();
-            assert!(contains_owner(&tree), "decoration owner lost across {display}");
+            assert!(
+                contains_owner(&tree),
+                "decoration owner lost across {display}"
+            );
             let style = text_style(&tree).unwrap();
             assert_eq!(style.color, Color::rgb(0, 0, 255));
             assert_eq!(style.font_size, 24.0);
             assert_eq!(style.text_decoration, TextDecoration::None);
-            assert_eq!(doc.computed_style_for(child.id).text_decoration, TextDecoration::None);
+            assert_eq!(
+                doc.computed_style_for(child.id).text_decoration,
+                TextDecoration::None
+            );
         }
     }
 
     #[test]
     fn direct_text_decoration_survives_inline_lowering() {
-        use w3cos_std::{Component, ComponentKind, style::{Display, TextDecoration}};
+        use w3cos_std::{
+            Component, ComponentKind,
+            style::{Display, TextDecoration},
+        };
 
         fn text_style(component: &Component) -> Option<&w3cos_std::Style> {
-            if matches!(&component.kind, ComponentKind::Text { content } if content == "Filler Text") {
+            if matches!(&component.kind, ComponentKind::Text { content } if content == "Filler Text")
+            {
                 return Some(&component.style);
             }
             component.children.iter().find_map(text_style)
@@ -137,13 +159,21 @@ mod tests {
             element.append_child(&mut doc, text);
             doc.body().append_child(&mut doc, element);
             let tree = doc.to_component_tree();
-            assert_eq!(text_style(&tree).unwrap().text_decoration, TextDecoration::Underline,
-                "direct text lost decoration for {tag}, display={display:?}");
+            assert_eq!(
+                text_style(&tree).unwrap().text_decoration,
+                TextDecoration::Underline,
+                "direct text lost decoration for {tag}, display={display:?}"
+            );
             if tag == "u" {
                 assert_eq!(doc.computed_style_for(element.id).display, Display::Inline);
-                element.style_mut(&mut doc).set_property("text-decoration", "none");
+                element
+                    .style_mut(&mut doc)
+                    .set_property("text-decoration", "none");
                 let tree = doc.to_component_tree();
-                assert_eq!(text_style(&tree).unwrap().text_decoration, TextDecoration::None);
+                assert_eq!(
+                    text_style(&tree).unwrap().text_decoration,
+                    TextDecoration::None
+                );
             }
         }
     }
@@ -153,12 +183,20 @@ mod tests {
         use w3cos_std::style::TextDecoration;
         let mut doc = Document::new();
         let parent = doc.create_element("div");
-        parent.style_mut(&mut doc).set_property("text-decoration", "underline");
+        parent
+            .style_mut(&mut doc)
+            .set_property("text-decoration", "underline");
         let child = doc.create_element("span");
         parent.append_child(&mut doc, child);
         doc.body().append_child(&mut doc, parent);
-        assert_eq!(doc.computed_style_for(parent.id).text_decoration, TextDecoration::Underline);
-        assert_eq!(doc.computed_style_for(child.id).text_decoration, TextDecoration::None);
+        assert_eq!(
+            doc.computed_style_for(parent.id).text_decoration,
+            TextDecoration::Underline
+        );
+        assert_eq!(
+            doc.computed_style_for(child.id).text_decoration,
+            TextDecoration::None
+        );
     }
 
     #[test]
@@ -189,7 +227,11 @@ mod tests {
             assert_eq!(style.color, expected, "href={href}, color={color:?}");
             assert_eq!(
                 style.text_decoration,
-                if href { TextDecoration::Underline } else { TextDecoration::None }
+                if href {
+                    TextDecoration::Underline
+                } else {
+                    TextDecoration::None
+                }
             );
             anchor
                 .style_mut(&mut doc)
@@ -202,9 +244,15 @@ mod tests {
         let anchor = doc.create_element("a");
         body.append_child(&mut doc, anchor);
         anchor.set_attribute(&mut doc, "href", "#target");
-        assert_eq!(doc.computed_style_for(anchor.id).color, Color::rgb(0, 0, 238));
+        assert_eq!(
+            doc.computed_style_for(anchor.id).color,
+            Color::rgb(0, 0, 238)
+        );
         anchor.remove_attribute(&mut doc, "href");
-        assert_eq!(doc.computed_style_for(anchor.id).color, Color::rgb(0, 128, 0));
+        assert_eq!(
+            doc.computed_style_for(anchor.id).color,
+            Color::rgb(0, 128, 0)
+        );
     }
 
     #[test]
@@ -300,9 +348,15 @@ mod tests {
             doc.get_node_mut(svg.id).is_html_element = false;
             svg.set_attribute(&mut doc, "height", "50");
             doc.body().append_child(&mut doc, svg);
-            assert_eq!(doc.computed_style_for(svg.id).display, Display::InlineBlock,
-                "qualified name {name} must use the SVG local-name default");
-            assert_eq!(svg_display(&doc.to_component_tree()), Some(Display::InlineBlock));
+            assert_eq!(
+                doc.computed_style_for(svg.id).display,
+                Display::InlineBlock,
+                "qualified name {name} must use the SVG local-name default"
+            );
+            assert_eq!(
+                svg_display(&doc.to_component_tree()),
+                Some(Display::InlineBlock)
+            );
             svg.style_mut(&mut doc).set_property("display", "block");
             assert_eq!(doc.computed_style_for(svg.id).display, Display::Block);
             assert_eq!(svg_display(&doc.to_component_tree()), Some(Display::Block));
@@ -920,13 +974,16 @@ mod tests {
                 text(child, output);
             }
         }
-        for (before, after, expected) in [("x ", " y", "x y"), ("x", " y", "x y"), ("x ", "y", "x y")] {
+        for (before, after, expected) in
+            [("x ", " y", "x y"), ("x", " y", "x y"), ("x ", "y", "x y")]
+        {
             let mut doc = Document::new();
             let before = doc.create_text_node(before);
             doc.append_child(doc.body().id, before.id);
             for _ in 0..2 {
                 let empty = doc.create_element("em");
-                doc.get_style_mut(empty.id).set_property("border", "3px solid black");
+                doc.get_style_mut(empty.id)
+                    .set_property("border", "3px solid black");
                 doc.append_child(doc.body().id, empty.id);
             }
             let after = doc.create_text_node(after);
@@ -1319,16 +1376,23 @@ mod tests {
             if let w3cos_std::ComponentKind::Text { content } = &component.kind {
                 out.push((content.clone(), component.style.color));
             }
-            for child in &component.children { runs(child, out); }
+            for child in &component.children {
+                runs(child, out);
+            }
         }
         let mut actual = Vec::new();
         runs(&tree.children[0], &mut actual);
         let green = w3cos_std::Color::rgb(0, 128, 0);
         let black = w3cos_std::Color::rgb(0, 0, 0);
-        assert_eq!(actual, [
-            ("before ".into(), green), ("value".into(), green),
-            ("body".into(), black), (" after".into(), black),
-        ]);
+        assert_eq!(
+            actual,
+            [
+                ("before ".into(), green),
+                ("value".into(), green),
+                ("body".into(), black),
+                (" after".into(), black),
+            ]
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -1403,9 +1467,10 @@ mod tests {
         );
         let flex = doc.create_element("div");
         flex.style_mut(&mut doc).set_property("display", "flex");
-        assert!(doc
-            .append_fixed_text_block(flex.id, "div", 4, "m", "height", "18px")
-            .is_none());
+        assert!(
+            doc.append_fixed_text_block(flex.id, "div", 4, "m", "height", "18px")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2161,9 +2226,13 @@ mod tests {
         // taller line content must still grow the anonymous row.
         assert_eq!(row.style.height, w3cos_std::style::Dimension::Auto);
         assert_eq!(row.style.min_height, w3cos_std::style::Dimension::Px(100.0));
-        assert_eq!(doc.children_ids(host.id).into_iter()
-            .map(|id|doc.computed_style_for(id).height).collect::<Vec<_>>(),
-            [100.0,80.0,60.0].map(w3cos_std::style::Dimension::Px));
+        assert_eq!(
+            doc.children_ids(host.id)
+                .into_iter()
+                .map(|id| doc.computed_style_for(id).height)
+                .collect::<Vec<_>>(),
+            [100.0, 80.0, 60.0].map(w3cos_std::style::Dimension::Px)
+        );
         assert_eq!(row.children.len(), 3);
         assert!(row.children.iter().all(|cell| {
             cell.style.display == w3cos_std::style::Display::TableCell
@@ -2310,9 +2379,14 @@ mod tests {
             w3cos_std::style::WhiteSpace::Pre
         );
         assert_eq!(anonymous_line.style.font_size, row.style.font_size);
-        assert!(anonymous_line.style.custom_properties.as_ref().is_some_and(
-            |properties| properties.contains_key("--w3cos-internal-inline-formatting-context")
-        ));
+        assert!(
+            anonymous_line
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties
+                    .contains_key("--w3cos-internal-inline-formatting-context"))
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -3207,8 +3281,10 @@ mod tests {
         // Chrome155 computed UA geometry, independently recorded in
         // dom-oracle-browser-v3560: author decoration retains 2px inset.
         assert_eq!(tree.children[0].style.border_width, 2.0);
-        assert_eq!(tree.children[0].style.border_styles,
-            [Some(w3cos_std::style::BorderLineStyle::Inset); 4]);
+        assert_eq!(
+            tree.children[0].style.border_styles,
+            [Some(w3cos_std::style::BorderLineStyle::Inset); 4]
+        );
 
         crate::stylesheet::register_rule(
             "input",
@@ -3221,14 +3297,23 @@ mod tests {
         );
         assert_eq!(tree.children[0].style.border_radius, 8.0);
         assert_eq!(tree.children[0].style.border_width, 2.0);
-        assert_eq!(tree.children[0].style.border_styles,
-            [Some(w3cos_std::style::BorderLineStyle::Inset); 4]);
-        input.style_mut(&mut doc).set_property("border", "3px solid red");
+        assert_eq!(
+            tree.children[0].style.border_styles,
+            [Some(w3cos_std::style::BorderLineStyle::Inset); 4]
+        );
+        input
+            .style_mut(&mut doc)
+            .set_property("border", "3px solid red");
         let tree = doc.to_component_tree();
         assert_eq!(tree.children[0].style.border_width, 3.0);
-        assert_eq!(tree.children[0].style.border_styles,
-            [Some(w3cos_std::style::BorderLineStyle::Solid); 4]);
-        assert_eq!(tree.children[0].style.border_color, w3cos_std::Color::rgb(255, 0, 0));
+        assert_eq!(
+            tree.children[0].style.border_styles,
+            [Some(w3cos_std::style::BorderLineStyle::Solid); 4]
+        );
+        assert_eq!(
+            tree.children[0].style.border_color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
         crate::stylesheet::clear_rules();
     }
 

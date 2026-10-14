@@ -87,7 +87,8 @@ pub fn ensure_app_compatible(host_abi: u32, app_abi: u32) -> Result<()> {
     }
     Err(anyhow!(
         "ABI mismatch: runtime {:#x} cannot load app {:#x} (major must match and runtime minor must be >= app minor)",
-        host_abi, app_abi
+        host_abi,
+        app_abi
     ))
 }
 

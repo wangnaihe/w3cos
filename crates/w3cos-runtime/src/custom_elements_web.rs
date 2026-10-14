@@ -589,12 +589,19 @@ pub fn disconnected_subtree(root: &Value) {
     lifecycle_subtree(root, false);
 }
 
-pub fn moved_subtree(root: &Value) {
-    let root_id = root.get_property("__node_id");
-    if root_id.is_undefined() {
-        return;
+fn value_node_id(value: &Value) -> Option<u32> {
+    if let Some(id) = value.live_dom_node() {
+        return Some(id);
     }
-    let mut pending = vec![root_id.to_u32()];
+    let id = value.get_property("__node_id");
+    id.is_number().then(|| id.to_u32())
+}
+
+pub fn moved_subtree(root: &Value) {
+    let Some(root_id) = value_node_id(root) else {
+        return;
+    };
+    let mut pending = vec![root_id];
     while let Some(node) = pending.pop() {
         let element = crate::jsdom::element_value(node);
         if element
@@ -618,11 +625,10 @@ pub fn moved_subtree(root: &Value) {
 }
 
 fn lifecycle_subtree(root: &Value, is_connected: bool) {
-    let root_id = root.get_property("__node_id");
-    if root_id.is_undefined() {
+    let Some(root_id) = value_node_id(root) else {
         return;
-    }
-    let mut pending = vec![root_id.to_u32()];
+    };
+    let mut pending = vec![root_id];
     while let Some(node) = pending.pop() {
         let element = crate::jsdom::element_value(node);
         if is_connected {
@@ -635,12 +641,7 @@ fn lifecycle_subtree(root: &Value, is_connected: bool) {
 }
 
 pub(crate) fn upgrade_subtree(root: &Value) {
-    let Some(root_id) = root
-        .get_property("__node_id")
-        .to_number()
-        .is_finite()
-        .then(|| root.get_property("__node_id").to_u32())
-    else {
+    let Some(root_id) = value_node_id(root) else {
         return;
     };
     let mut pending = vec![root_id];

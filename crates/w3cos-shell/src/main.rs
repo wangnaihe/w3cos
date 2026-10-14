@@ -7,14 +7,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use w3cos_ai_bridge::identity::LocalIdentityStub;
-use w3cos_ai_bridge::intent::{
-    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
-    INTENT_INPUT_PLACEHOLDER,
-};
-use w3cos_ai_bridge::permissions::AgentPermissions;
 #[cfg(feature = "desktop")]
 use crate::state;
+use w3cos_ai_bridge::identity::LocalIdentityStub;
+use w3cos_ai_bridge::intent::{
+    ExecuteResult, INTENT_INPUT_PLACEHOLDER, IntentSession, IntentTier, ProposeResult, ShellApp,
+    ShellContext,
+};
+use w3cos_ai_bridge::permissions::AgentPermissions;
 #[cfg(not(feature = "desktop"))]
 use w3cos_runtime::state;
 use w3cos_std::color::Color;
@@ -83,7 +83,7 @@ pub(crate) fn shell_main() {
         // when the window starts the loopback listener.
         unsafe { std::env::set_var("W3COS_AI_TOKEN", token) };
     }
-        if let Some(port_str) = ai_port
+    if let Some(port_str) = ai_port
         && let Ok(port) = port_str.parse::<u16>()
     {
         #[cfg(feature = "desktop")]
@@ -1321,11 +1321,7 @@ fn build_task_center() -> Component {
                 };
                 format!(
                     "{subject_label} · {} · 口令经 KDF 保存，还不是 passkey",
-                    if unlocked {
-                        "stub unlocked"
-                    } else {
-                        "locked"
-                    }
+                    if unlocked { "stub unlocked" } else { "locked" }
                 )
             },
             Style {
@@ -1477,7 +1473,6 @@ fn build_ai_agent_app() -> Component {
         ],
     )
 }
-
 
 // ==========================================================================
 // Browser App

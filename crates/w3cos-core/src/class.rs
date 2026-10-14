@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Value;
@@ -104,6 +105,14 @@ pub fn create_class_with_initializer(
     class
 }
 
+static FAST_CONSTRUCT: OnceLock<fn(&Value, &[Value]) -> Option<Value>> = OnceLock::new();
+
+/// Runtime hook for constructors that can reuse an instance (`new Event`).
+/// The first registration wins. Returning `None` keeps the ordinary path.
+pub fn install_fast_construct(hook: fn(&Value, &[Value]) -> Option<Value>) {
+    let _ = FAST_CONSTRUCT.set(hook);
+}
+
 /// `new X(...)` — invoke the class object's call slot.
 ///
 /// Plain `Value::Function` callees are treated as classic constructor
@@ -111,6 +120,26 @@ pub fn create_class_with_initializer(
 /// function itself returns an object. Anything else yields `Undefined`
 /// (JS would throw a TypeError; the runtime stays total).
 pub fn construct(class_value: &Value, args: Vec<Value>) -> Value {
+    if let Some(hook) = FAST_CONSTRUCT.get()
+        && let Some(value) = hook(class_value, &args)
+    {
+        return value;
+    }
+    construct_slow(class_value, args)
+}
+
+/// `new X(...)` with borrowed arguments. The fast hook sees the slice; the
+/// ordinary path copies only when it has to call a host constructor.
+pub fn construct_slice(class_value: &Value, args: &[Value]) -> Value {
+    if let Some(hook) = FAST_CONSTRUCT.get()
+        && let Some(value) = hook(class_value, args)
+    {
+        return value;
+    }
+    construct_slow(class_value, args.to_vec())
+}
+
+fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
     if class_value.as_object().is_some() {
         return class_value.call(Value::Undefined, args);
     }

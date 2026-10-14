@@ -36,7 +36,10 @@ fn parse_test_font(value: &str) -> std::result::Result<TestFont, String> {
     if family.trim().is_empty() || path.is_empty() {
         return Err("test font requires nonempty family and path".into());
     }
-    Ok(TestFont { family: family.trim().into(), path: path.into() })
+    Ok(TestFont {
+        family: family.trim().into(),
+        path: path.into(),
+    })
 }
 
 const TEST_FONT_OWNER: u64 = u64::MAX - 20261004;
@@ -51,15 +54,23 @@ impl Drop for TestFontScope {
 fn install_test_fonts(fonts: &[TestFont]) -> Result<TestFontScope> {
     let scope = TestFontScope;
     for font in fonts {
-        w3cos_runtime::font_face::FontRegistry::global().register_for_owner(
-            TEST_FONT_OWNER,
-            w3cos_runtime::font_face::FontFace {
-                family: font.family.clone(),
-                src: w3cos_runtime::font_face::FontSource::Path(font.path.clone()),
-                ..Default::default()
-            },
-        ).map_err(anyhow::Error::msg)
-            .with_context(|| format!("test font prerequisite {}={}", font.family, font.path.display()))?;
+        w3cos_runtime::font_face::FontRegistry::global()
+            .register_for_owner(
+                TEST_FONT_OWNER,
+                w3cos_runtime::font_face::FontFace {
+                    family: font.family.clone(),
+                    src: w3cos_runtime::font_face::FontSource::Path(font.path.clone()),
+                    ..Default::default()
+                },
+            )
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "test font prerequisite {}={}",
+                    font.family,
+                    font.path.display()
+                )
+            })?;
     }
     Ok(scope)
 }
@@ -71,7 +82,10 @@ mod font_fixture_tests {
     #[test]
     fn explicit_test_font_is_accepted_by_isolated_worker_cli() {
         let cli = Cli::try_parse_from([
-            "w3cos-wpt", "--wpt-root", "../wpt", "--test-font",
+            "w3cos-wpt",
+            "--wpt-root",
+            "../wpt",
+            "--test-font",
             "White Space=../wpt/css/CSS2/fonts/support/AHEM_whitespace.ttf",
         ]);
         assert!(cli.is_ok(), "explicit font prerequisite rejected: {cli:?}");
@@ -83,16 +97,26 @@ mod font_fixture_tests {
         let family = "W3COS WPT lifecycle fixture";
         let fonts = [TestFont {
             family: family.into(),
-            path: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"),
-                "/../../../wpt/fonts/Ahem.ttf")),
+            path: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../crates/w3cos-runtime/assets/Inter-Regular.ttf"
+            )),
         }];
-        let lookup = || FontRegistry::global().resolve_stack(family, FontWeight::NORMAL, FontFaceStyle::Normal);
+        let lookup = || {
+            FontRegistry::global().resolve_stack(family, FontWeight::NORMAL, FontFaceStyle::Normal)
+        };
         let scope = install_test_fonts(&fonts).expect("pinned font fixture loads");
         assert!(lookup().is_some());
         drop(scope);
         assert!(lookup().is_none(), "fixture must not leak beyond its scope");
         let missing = tempfile::tempdir().unwrap();
-        assert!(install_test_fonts(&[TestFont { family: family.into(), path: missing.path().join("absent.ttf") }]).is_err());
+        assert!(
+            install_test_fonts(&[TestFont {
+                family: family.into(),
+                path: missing.path().join("absent.ttf")
+            }])
+            .is_err()
+        );
         assert!(lookup().is_none());
         for invalid in ["White Space", "=font.ttf", "White Space="] {
             assert!(parse_test_font(invalid).is_err());
@@ -390,7 +414,10 @@ fn run_isolated_suite(cli: &Cli, manifest: &SuiteManifest) -> Result<SuiteReport
         }));
     }
     if !font_evidence.is_empty() {
-        std::fs::write(cli.artifacts.join("test-fonts.json"), serde_json::to_vec_pretty(&font_evidence)?)?;
+        std::fs::write(
+            cli.artifacts.join("test-fonts.json"),
+            serde_json::to_vec_pretty(&font_evidence)?,
+        )?;
     }
     let start = cli.case_start.min(manifest.tests.len());
     let end = cli
@@ -555,7 +582,9 @@ fn spawn_worker(
         command.arg("--user-stylesheet").arg(path);
     }
     for font in &cli.test_fonts {
-        command.arg("--test-font").arg(format!("{}={}", font.family, font.path.display()));
+        command
+            .arg("--test-font")
+            .arg(format!("{}={}", font.family, font.path.display()));
     }
     let mut child = command
         .stdout(Stdio::piped())

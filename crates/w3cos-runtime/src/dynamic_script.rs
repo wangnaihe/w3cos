@@ -15324,8 +15324,12 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         listener.set_nonblocking(true).unwrap();
         let mut png = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            3, 2, image::Rgba([255, 0, 255, 255])))
-            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+            3,
+            2,
+            image::Rgba([255, 0, 255, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
         let png = png.into_inner();
         let server = thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -15334,12 +15338,15 @@ window.__dynamicInlineHandler = dynamicInlineResult;
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(1)); continue;
+                        thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
                     }
                     Err(error) => panic!("accept list image: {error}"),
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
                 let request = read_http_request(&mut stream);
                 let path = request.split_whitespace().nth(1).unwrap().to_string();
                 let (content_type, body) = match path.as_str() {
@@ -15354,28 +15361,46 @@ window.__dynamicInlineHandler = dynamicInlineResult;
             }
             requests
         });
-        let mut loader = DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
-        loader.navigate(&format!("http://{address}/index.html")).unwrap();
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/index.html"))
+            .unwrap();
         let source = format!("http://{address}/images/Diamond.PNG");
         for _ in 0..5000 {
             loader.poll();
             poll_script_fetches();
-            if crate::image_loader::dimensions(&source) == Some((3, 2)) { break; }
+            if crate::image_loader::dimensions(&source) == Some((3, 2)) {
+                break;
+            }
             thread::sleep(std::time::Duration::from_millis(1));
         }
         let requests = server.join().unwrap();
         let item = crate::dom::with_document(|document| document.query_selector("li").unwrap().id);
-        assert_eq!(crate::dom::computed_style_property(item.as_u32(), "list-style-image"),
-            format!("url('{source}')"), "stylesheet-relative URL must reach the inherited computed value");
-        assert_eq!(crate::image_loader::dimensions(&source), Some((3, 2)),
-            "inherited list images must be decoded in the shared CSS subresource cache; requests={requests:?}");
-        assert_eq!(requests, ["/index.html", "/css/list.css", "/images/Diamond.PNG"]);
+        assert_eq!(
+            crate::dom::computed_style_property(item.as_u32(), "list-style-image"),
+            format!("url('{source}')"),
+            "stylesheet-relative URL must reach the inherited computed value"
+        );
+        assert_eq!(
+            crate::image_loader::dimensions(&source),
+            Some((3, 2)),
+            "inherited list images must be decoded in the shared CSS subresource cache; requests={requests:?}"
+        );
+        assert_eq!(
+            requests,
+            ["/index.html", "/css/list.css", "/images/Diamond.PNG"]
+        );
         assert_eq!(loader.progress(), &DocumentLoadProgress::Complete);
         let tree = crate::dom::with_document(w3cos_dom::Document::to_component_tree);
         let flat = crate::layout::pre_flatten(&tree);
         let images: Vec<_> = flat.iter().filter(|node|
             matches!(node.kind, w3cos_std::ComponentKind::Image { src } if src == &source)).collect();
-        assert_eq!(images.len(), 2, "each loaded inherited image needs a marker, even with type none");
+        assert_eq!(
+            images.len(),
+            2,
+            "each loaded inherited image needs a marker, even with type none"
+        );
         for marker in images {
             assert_eq!(marker.style.width, w3cos_std::style::Dimension::Px(3.0));
             assert_eq!(marker.style.height, w3cos_std::style::Dimension::Px(2.0));

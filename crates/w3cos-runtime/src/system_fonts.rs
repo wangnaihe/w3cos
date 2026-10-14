@@ -12,26 +12,45 @@ static FACES: OnceLock<Mutex<HashMap<fontdb::ID, LoadedFont>>> = OnceLock::new()
 const CACHE_CAPACITY: usize = 2048;
 
 pub(super) fn database() -> MutexGuard<'static, fontdb::Database> {
-    DATABASE.get_or_init(|| {
-        let mut database = fontdb::Database::new();
-        database.load_system_fonts();
-        #[cfg(any(target_os = "android", target_env = "ohos"))]
-        database.load_fonts_dir("/system/fonts");
-        #[cfg(target_os = "ios")]
-        for path in ["/System/Library/Fonts", "/System/Library/Fonts/Core", "/System/Library/Fonts/Cache"] {
-            database.load_fonts_dir(path);
-        }
-        Mutex::new(database)
-    }).lock().unwrap()
+    DATABASE
+        .get_or_init(|| {
+            let mut database = fontdb::Database::new();
+            database.load_system_fonts();
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
+            database.load_fonts_dir("/system/fonts");
+            #[cfg(target_os = "ios")]
+            for path in [
+                "/System/Library/Fonts",
+                "/System/Library/Fonts/Core",
+                "/System/Library/Fonts/Cache",
+            ] {
+                database.load_fonts_dir(path);
+            }
+            Mutex::new(database)
+        })
+        .lock()
+        .unwrap()
 }
 
-pub(super) fn resolve(family: &str, weight: FontWeight, style: FontFaceStyle) -> Option<LoadedFont> {
-    let key = FontKey { family: family.to_lowercase(), weight, style };
+pub(super) fn resolve(
+    family: &str,
+    weight: FontWeight,
+    style: FontFaceStyle,
+) -> Option<LoadedFont> {
+    let key = FontKey {
+        family: family.to_lowercase(),
+        weight,
+        style,
+    };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(face) = cache.lock().unwrap().get(&key).cloned() { return face; }
+    if let Some(face) = cache.lock().unwrap().get(&key).cloned() {
+        return face;
+    }
     let face = load(family, weight, style);
     let mut cache = cache.lock().unwrap();
-    if cache.len() >= CACHE_CAPACITY { cache.clear(); }
+    if cache.len() >= CACHE_CAPACITY {
+        cache.clear();
+    }
     cache.insert(key, face.clone());
     face
 }
@@ -57,7 +76,9 @@ fn load_by_id(id: fontdb::ID) -> Option<LoadedFont> {
     // Different CSS weights/aliases can select the same installed face.
     // Share its bytes and parsed cmap, not one copy per requested weight.
     let faces = FACES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(face) = faces.lock().unwrap().get(&id).cloned() { return Some(face); }
+    if let Some(face) = faces.lock().unwrap().get(&id).cloned() {
+        return Some(face);
+    }
     let info = database.face(id)?;
     let family = info.families.first()?.0.clone();
     let weight = FontWeight(info.weight.0);
@@ -67,11 +88,19 @@ fn load_by_id(id: fontdb::ID) -> Option<LoadedFont> {
         fontdb::Style::Oblique => FontFaceStyle::Oblique,
     };
     let is_monospace = info.monospaced;
-    let (data, index) = database.with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))?;
+    let (data, index) =
+        database.with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))?;
     drop(database);
-    let parsed = Arc::new(fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings {
-        collection_index: index, ..fontdue::FontSettings::default()
-    }).ok()?);
+    let parsed = Arc::new(
+        fontdue::Font::from_bytes(
+            data.as_slice(),
+            fontdue::FontSettings {
+                collection_index: index,
+                ..fontdue::FontSettings::default()
+            },
+        )
+        .ok()?,
+    );
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
     index.hash(&mut hasher);
@@ -81,24 +110,41 @@ fn load_by_id(id: fontdb::ID) -> Option<LoadedFont> {
     #[cfg(feature = "skia")]
     let skia_typeface = {
         use skia_safe::{FontMgr, FontStyle, font_style};
-        let face = FontMgr::default().match_family_style(&family, FontStyle::new(
-            (weight.0 as i32).into(), font_style::Width::NORMAL,
-            match style { FontFaceStyle::Normal => font_style::Slant::Upright,
-                FontFaceStyle::Italic => font_style::Slant::Italic,
-                FontFaceStyle::Oblique => font_style::Slant::Oblique },
-        )).or_else(|| FontMgr::default().new_from_data(data.as_slice(), Some(index as usize)));
+        let face = FontMgr::default()
+            .match_family_style(
+                &family,
+                FontStyle::new(
+                    (weight.0 as i32).into(),
+                    font_style::Width::NORMAL,
+                    match style {
+                        FontFaceStyle::Normal => font_style::Slant::Upright,
+                        FontFaceStyle::Italic => font_style::Slant::Italic,
+                        FontFaceStyle::Oblique => font_style::Slant::Oblique,
+                    },
+                ),
+            )
+            .or_else(|| FontMgr::default().new_from_data(data.as_slice(), Some(index as usize)));
         let cell = OnceLock::new();
         let _ = cell.set(face);
         Arc::new(cell)
     };
     let loaded = LoadedFont {
-        family, weight, style, data, is_monospace, parsed: Some(parsed),
-        unicode_ranges: None, cache_key: hasher.finish(), collection_index: Some(index),
+        family,
+        weight,
+        style,
+        data,
+        is_monospace,
+        parsed: Some(parsed),
+        unicode_ranges: None,
+        cache_key: hasher.finish(),
+        collection_index: Some(index),
         #[cfg(feature = "skia")]
         skia_typeface,
     };
     let mut faces = faces.lock().unwrap();
-    if faces.len() >= CACHE_CAPACITY { faces.clear(); }
+    if faces.len() >= CACHE_CAPACITY {
+        faces.clear();
+    }
     let loaded = faces.entry(id).or_insert(loaded).clone();
     Some(loaded)
 }
@@ -292,13 +338,16 @@ fn fontconfig_match(character: char) -> Option<(std::path::PathBuf, u32)> {
         charset_create: unsafe extern "C" fn() -> *mut c_void,
         charset_destroy: unsafe extern "C" fn(*mut c_void),
         charset_add: unsafe extern "C" fn(*mut c_void, u32) -> c_int,
-        pattern_add_charset: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_void) -> c_int,
+        pattern_add_charset:
+            unsafe extern "C" fn(*mut c_void, *const c_char, *const c_void) -> c_int,
         pattern_add_bool: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int,
         config_substitute: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int) -> c_int,
         default_substitute: unsafe extern "C" fn(*mut c_void),
         font_match: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_int) -> *mut c_void,
-        pattern_get_string: unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut *mut u8) -> c_int,
-        pattern_get_integer: unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut c_int) -> c_int,
+        pattern_get_string:
+            unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut *mut u8) -> c_int,
+        pattern_get_integer:
+            unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut c_int) -> c_int,
     }
 
     fn library() -> Option<&'static Fc> {
@@ -316,7 +365,11 @@ fn fontconfig_match(character: char) -> Option<(std::path::PathBuf, u32)> {
             let symbol = |symbol: &[u8]| unsafe {
                 let name = CString::new(symbol).ok()?;
                 let pointer = libc::dlsym(handle, name.as_ptr());
-                if pointer.is_null() { None } else { Some(pointer) }
+                if pointer.is_null() {
+                    None
+                } else {
+                    Some(pointer)
+                }
             };
             Some(Fc {
                 init: std::mem::transmute(symbol(b"FcInitLoadConfigAndFonts")?),

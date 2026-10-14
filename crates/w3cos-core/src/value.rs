@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, Index, IndexMut};
 use std::rc::{Rc, Weak};
 use std::slice::SliceIndex;
+use std::sync::OnceLock;
 
 use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
@@ -452,7 +453,9 @@ impl Value {
     pub fn object_identity_bits(&self) -> Option<u64> {
         match self {
             Value::Object(object) => Some(Rc::as_ptr(object) as u64),
-            Value::Imm(imm) => imm.object_handle().map(|handle| (handle as u64) | (1 << 63)),
+            Value::Imm(imm) => imm
+                .object_handle()
+                .map(|handle| (handle as u64) | (1 << 63)),
             _ => None,
         }
     }
@@ -855,8 +858,14 @@ impl JsObjectRef {
     /// Strong count of the host `Rc`, when this is not interned.
     #[cfg(test)]
     pub(crate) fn host_strong_count(&self) -> Option<usize> {
+        self.host_rc_counts().map(|(strong, _)| strong)
+    }
+
+    /// `(strong, weak)` counts for a host `Rc` object. Interned handles have
+    /// no per-value count. `weak` does not include a temporary `Weak`.
+    pub fn host_rc_counts(&self) -> Option<(usize, usize)> {
         match &self.repr {
-            JsObjectRepr::Host(rc) => Some(Rc::strong_count(rc)),
+            JsObjectRepr::Host(rc) => Some((Rc::strong_count(rc), Rc::weak_count(rc))),
             JsObjectRepr::Interned { .. } => None,
         }
     }
@@ -1145,7 +1154,7 @@ fn function_heap_bytes(props: &PropertyMap, captures: Option<&AotCaptureMap>) ->
             .saturating_add(
                 captures
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(u32, (Value, Value))>()),
+                    .saturating_mul(std::mem::size_of::<(u32, AotCapture)>()),
             );
     }
     bytes
@@ -1246,15 +1255,111 @@ impl PartialEq for Value {
     }
 }
 
+/// One captured binding visible to an AOT nested function.
+///
+/// Mutable locals share the parent's cell. Imported and const bindings keep
+/// getter/setter callables.
+#[derive(Clone)]
+pub enum AotCapture {
+    Accessors(Value, Value),
+    Cell(Rc<RefCell<(Value, bool)>>),
+    /// Shared numeric local. `None` is JavaScript `undefined`.
+    Number(Rc<Cell<Option<f64>>>),
+}
+
 /// Capture environment for an AOT-emitted nested function factory.
 ///
-/// Keys are W3IR binding ids; values are `(getter, setter)` callables (or
-/// `Undefined` setter for const captures).
-pub type AotCaptureMap = HashMap<u32, (Value, Value)>;
+/// Keys are W3IR binding ids.
+pub type AotCaptureMap = HashMap<u32, AotCapture>;
+
+static FAST_DOM_DISPATCH: OnceLock<fn(u32, &Value) -> Option<bool>> = OnceLock::new();
+
+/// `None` asks for `length`. `Some(index)` is a canonical numeric index.
+static FAST_COLLECTION_GET: OnceLock<fn(&Value, Option<usize>) -> Option<Value>> = OnceLock::new();
+
+/// Runtime hook for `node.dispatchEvent(event)` on a DOM immediate.
+///
+/// `None` keeps the ordinary property lookup, so an own override still runs.
+/// The first registration wins.
+pub fn install_fast_dom_dispatch(hook: fn(u32, &Value) -> Option<bool>) {
+    let _ = FAST_DOM_DISPATCH.set(hook);
+}
+
+/// Runtime hook for `childNodes.length` and `childNodes[n]`.
+///
+/// `None` means this value is not a fast collection, so ordinary lookup runs.
+/// The first registration wins.
+pub fn install_fast_collection_get(hook: fn(&Value, Option<usize>) -> Option<Value>) {
+    let _ = FAST_COLLECTION_GET.set(hook);
+}
+
+static LENGTH_WRITE: OnceLock<fn(&Value)> = OnceLock::new();
+
+/// Notified when an own `length` property is written or deleted.
+///
+/// Collection length fast-paths use this to notice prototype overrides.
+pub fn install_length_write_hook(hook: fn(&Value)) {
+    let _ = LENGTH_WRITE.set(hook);
+}
+
+fn note_length_write(value: &Value) {
+    if let Some(hook) = LENGTH_WRITE.get() {
+        hook(value);
+    }
+}
+
+pub fn fast_collection_get(object: &Value, index: Option<usize>) -> Option<Value> {
+    FAST_COLLECTION_GET.get()?(object, index)
+}
+
+fn canonical_index_str(key: &str) -> Option<usize> {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 10 {
+        return None;
+    }
+    if bytes[0] == b'0' {
+        return (bytes.len() == 1).then_some(0);
+    }
+    if !bytes.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let index: u64 = key.parse().ok()?;
+    if index >= u32::MAX as u64 {
+        return None;
+    }
+    Some(index as usize)
+}
+
+fn fast_known_collection_key(object: &Value, key: &str) -> Option<Value> {
+    if FAST_COLLECTION_GET.get().is_none() {
+        return None;
+    }
+    if key == "length" {
+        return fast_collection_get(object, None);
+    }
+    if key
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        return fast_collection_get(object, Some(canonical_index_str(key)?));
+    }
+    None
+}
+
+fn fast_dom_dispatch(receiver: &Value, key: &str, event: Option<&Value>) -> Option<Value> {
+    if key != "dispatchEvent" {
+        return None;
+    }
+    let node = receiver.live_dom_node()?;
+    let event = event?;
+    let hook = FAST_DOM_DISPATCH.get()?;
+    hook(node, event).map(Value::Bool)
+}
 
 /// Native AOT factory entrypoint. Captures are borrowed so a call does not
 /// clone the env map; the factory clones Values into its frame as needed.
-pub type AotFactory = fn(Value, Vec<Value>, &AotCaptureMap) -> Value;
+pub type AotFactory = fn(Value, &[Value], &AotCaptureMap) -> Value;
 
 /// Callable body stored inside [`FunctionData`].
 ///
@@ -1267,6 +1372,21 @@ enum FunctionBody {
         factory: AotFactory,
         captures: Box<AotCaptureMap>,
     },
+    /// `hits = hits + k` with no other reads. The call ignores `this` and
+    /// arguments, which that shape does not observe.
+    Bump {
+        cell: Rc<Cell<Option<f64>>>,
+        addend: f64,
+    },
+}
+
+fn bump_number(cell: &Cell<Option<f64>>, addend: f64) -> Value {
+    let next = match cell.get() {
+        Some(n) => n + addend,
+        None => f64::NAN,
+    };
+    cell.set(Some(next));
+    Value::Undefined
 }
 
 /// Payload of a JS function object.
@@ -1332,10 +1452,14 @@ impl FunctionData {
         })
     }
 
+    pub fn from_bump(cell: Rc<Cell<Option<f64>>>, addend: f64) -> Self {
+        Self::finish(FunctionBody::Bump { cell, addend })
+    }
+
     #[inline(never)]
     fn finish(body: FunctionBody) -> Self {
         let captures_ref = match &body {
-            FunctionBody::Dyn(_) => None,
+            FunctionBody::Dyn(_) | FunctionBody::Bump { .. } => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         };
         let mut props = PropertyMap::new();
@@ -1358,7 +1482,18 @@ impl FunctionData {
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match &self.body {
             FunctionBody::Dyn(inner) => inner(this, args),
+            FunctionBody::Aot { factory, captures } => factory(this, &args, captures),
+            FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
+        }
+    }
+
+    /// Invoke without allocating an argument vector. Host closures still
+    /// collect a `Vec`; AOT factories receive the slice directly.
+    pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
+        match &self.body {
+            FunctionBody::Dyn(inner) => inner(this, args.to_vec()),
             FunctionBody::Aot { factory, captures } => factory(this, args, captures),
+            FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
     }
 
@@ -1405,7 +1540,7 @@ impl FunctionData {
     #[inline]
     fn captures_for_heap(&self) -> Option<&AotCaptureMap> {
         match &self.body {
-            FunctionBody::Dyn(_) => None,
+            FunctionBody::Dyn(_) | FunctionBody::Bump { .. } => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         }
     }
@@ -1482,6 +1617,10 @@ impl JsFunction {
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         self.data().call(this, args)
+    }
+
+    pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
+        self.data().call_slice(this, args)
     }
 
     /// Read a property of the function object (Undefined when absent).
@@ -1893,6 +2032,9 @@ impl Value {
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(value) = fast_known_collection_key(self, key) {
+            return value;
+        }
         if let Some(node) = self.live_dom_node() {
             if let Some(value) = crate::intrinsics::dom_get(node, key) {
                 return value;
@@ -2125,6 +2267,9 @@ impl Value {
 
     pub fn set_property(&self, key: &str, value: Value) {
         let _ = self.try_set_property(key, value);
+        if key == "length" {
+            note_length_write(self);
+        }
     }
 
     /// Delete an own property and return the JavaScript-style success value.
@@ -2148,6 +2293,9 @@ impl Value {
             }
             _ => true,
         };
+        if key == "length" {
+            note_length_write(self);
+        }
         Value::Bool(deleted)
     }
 }
@@ -2177,10 +2325,7 @@ impl Value {
 
     /// Arena object with a shared proxy. Own properties are written directly
     /// so the trap can read them without re-entering.
-    pub fn proxied_object(
-        entries: &[(&str, Value)],
-        handler: crate::proxy::ProxyHandler,
-    ) -> Self {
+    pub fn proxied_object(entries: &[(&str, Value)], handler: crate::proxy::ProxyHandler) -> Self {
         let mut object = crate::JsObject::new();
         object.proxy_handler = Some(handler);
         for (key, value) in entries {
@@ -2235,6 +2380,12 @@ impl Value {
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
+    /// Intern a captured numeric increment. Calling it adds `addend` to `cell`.
+    pub fn number_bump(cell: Rc<Cell<Option<f64>>>, addend: f64) -> Self {
+        let handle = crate::page_arena::alloc_function(FunctionData::from_bump(cell, addend));
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
     /// A plain object that is also callable (a JS class / constructor object).
     pub fn callable(
         props: HashMap<String, Value>,
@@ -2265,8 +2416,33 @@ impl Value {
         }
     }
 
+    /// Invoke a callable with borrowed arguments.
+    ///
+    /// Host closures still collect a `Vec`. AOT factories receive the slice,
+    /// so a one-argument listener does not allocate.
+    pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
+        match self {
+            Value::Function(function) => function.call_slice(this, args),
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").call_slice(this, args)
+            }
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
+                let slot = object.borrow().call_slot().cloned();
+                match slot {
+                    Some(function) => function.call_slice(this, args),
+                    None => Value::Undefined,
+                }
+            }
+            _ => Value::Undefined,
+        }
+    }
+
     /// Invoke a property as a method while preserving the JavaScript receiver.
     pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
+        if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
+            return value;
+        }
         if key == "__w3cos_symbol_iterator" {
             if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", args) {
                 return iterator;
@@ -2761,6 +2937,17 @@ impl Value {
             _ => {}
         }
         self.get_property(key).call(self.clone(), args)
+    }
+
+    /// Like [`Value::call_method`], but the fast DOM path borrows its arguments.
+    ///
+    /// Other methods still collect a `Vec`. `dispatchEvent` on a live DOM node
+    /// does not.
+    pub fn call_method_slice(&self, key: &str, args: &[Value]) -> Value {
+        if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
+            return value;
+        }
+        self.call_method(key, args.to_vec())
     }
 
     pub fn is_iterable(&self) -> bool {
@@ -3574,7 +3761,6 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
     owned.push_str(right_text);
     Value::from_js_string(JsString::intern(&owned))
 }
-
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
@@ -5253,20 +5439,19 @@ mod tests {
     #[test]
     fn aot_function_calls_factory_with_borrowed_captures_without_dyn_box_path() {
         crate::page_arena::reset();
-        fn factory(this: Value, args: Vec<Value>, captures: &AotCaptureMap) -> Value {
+        fn factory(this: Value, args: &[Value], captures: &AotCaptureMap) -> Value {
             assert!(this.is_undefined());
-            let capture = captures
-                .get(&7)
-                .expect("capture 7")
-                .0
-                .call(Value::Undefined, Vec::new());
+            let AotCapture::Accessors(getter, _) = captures.get(&7).expect("capture 7") else {
+                panic!("accessor capture");
+            };
+            let capture = getter.call(Value::Undefined, Vec::new());
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             Value::Number(capture.to_number() + arg.to_number())
         }
         let mut captures = AotCaptureMap::new();
         captures.insert(
             7,
-            (
+            AotCapture::Accessors(
                 Value::function(|_, _| Value::Number(10.0)),
                 Value::Undefined,
             ),

@@ -85,10 +85,7 @@ fn run_host(args: &[&str], wait: bool) -> i32 {
         return match command.spawn() {
             Ok(_) => 0,
             Err(error) => {
-                eprintln!(
-                    "[W3C OS] could not start {}: {error}",
-                    host.display()
-                );
+                eprintln!("[W3C OS] could not start {}: {error}", host.display());
                 1
             }
         };
@@ -96,10 +93,7 @@ fn run_host(args: &[&str], wait: bool) -> i32 {
     match command.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
-            eprintln!(
-                "[W3C OS] could not start {}: {error}",
-                host.display()
-            );
+            eprintln!("[W3C OS] could not start {}: {error}", host.display());
             1
         }
     }

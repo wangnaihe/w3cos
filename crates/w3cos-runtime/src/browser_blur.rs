@@ -1,8 +1,10 @@
 //! Browser-compatible small Gaussian blur on byte-backed Skia filter inputs.
-use skia_safe::{AlphaType, Canvas, Color, ColorType, Data, Image, ImageInfo, Paint,
-    Point, Rect, RuntimeEffect, TileMode};
 #[cfg(test)]
 use skia_safe::Surface;
+use skia_safe::{
+    AlphaType, Canvas, Color, ColorType, Data, Image, ImageInfo, Paint, Point, Rect, RuntimeEffect,
+    TileMode,
+};
 
 const SAMPLER: &str = r#"
     uniform shader image;
@@ -31,16 +33,27 @@ thread_local! {
 
 /// This four-tap specialization covers support radii up to three pixels.
 /// Larger sigma values must retain the general Skia path, not truncate a kernel.
-pub(super) fn rasterize_small_blur(sigma: f32, bounds: Rect,
-    draw_input: impl FnOnce(&Canvas)) -> Option<(Image, Point)> {
+pub(super) fn rasterize_small_blur(
+    sigma: f32,
+    bounds: Rect,
+    draw_input: impl FnOnce(&Canvas),
+) -> Option<(Image, Point)> {
     if !sigma.is_finite() || sigma <= 0.0 || sigma > 1.0 || bounds.is_empty() {
         return None;
     }
     let radius = (3.0 * sigma).ceil() as i32;
-    let output = Rect::new(bounds.left().floor() - radius as f32, bounds.top().floor() - radius as f32,
-        bounds.right().ceil() + radius as f32, bounds.bottom().ceil() + radius as f32);
-    let info = ImageInfo::new((output.width() as i32, output.height() as i32),
-        ColorType::RGBA8888, AlphaType::Premul, None);
+    let output = Rect::new(
+        bounds.left().floor() - radius as f32,
+        bounds.top().floor() - radius as f32,
+        bounds.right().ceil() + radius as f32,
+        bounds.bottom().ceil() + radius as f32,
+    );
+    let info = ImageInfo::new(
+        (output.width() as i32, output.height() as i32),
+        ColorType::RGBA8888,
+        AlphaType::Premul,
+        None,
+    );
     let mut source = skia_safe::surfaces::raster(&info, None, None)?;
     source.canvas().clear(Color::TRANSPARENT);
     source.canvas().save();
@@ -62,11 +75,17 @@ pub(super) fn rasterize_small_blur(sigma: f32, bounds: Rect,
         }
     }
     let total = kernel.iter().copied().fold(0_f32, |sum, value| sum + value);
-    for value in &mut kernel { *value /= total; }
+    for value in &mut kernel {
+        *value /= total;
+    }
     let center_weight = kernel[3] * 0.5 + kernel[4];
     let outer_weight = kernel[5] + kernel[6];
     let center_offset = kernel[4] / center_weight;
-    let outer_offset = if outer_weight > 0.0 { 2.0 + kernel[6] / outer_weight } else { 2.0 };
+    let outer_offset = if outer_weight > 0.0 {
+        2.0 + kernel[6] / outer_weight
+    } else {
+        2.0
+    };
     EFFECT.with(|effect| {
         let effect = effect.as_ref()?;
         // Materialize the complete logical input and its halo independently of
@@ -74,11 +93,27 @@ pub(super) fn rasterize_small_blur(sigma: f32, bounds: Rect,
         // radius restrict child sampling to the requested output and are unsafe
         // for partial/tiled replay. Image shaders retain the full backing here.
         for direction in [[1.0, 0.0], [0.0, 1.0]] {
-            let child = image.to_shader((TileMode::Decal, TileMode::Decal),
-                skia_safe::FilterMode::Nearest, None)?;
-            let uniforms = [-outer_offset, -center_offset, center_offset, outer_offset,
-                outer_weight, center_weight, center_weight, outer_weight, direction[0], direction[1]];
-            let bytes = uniforms.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+            let child = image.to_shader(
+                (TileMode::Decal, TileMode::Decal),
+                skia_safe::FilterMode::Nearest,
+                None,
+            )?;
+            let uniforms = [
+                -outer_offset,
+                -center_offset,
+                center_offset,
+                outer_offset,
+                outer_weight,
+                center_weight,
+                center_weight,
+                outer_weight,
+                direction[0],
+                direction[1],
+            ];
+            let bytes = uniforms
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>();
             let shader = effect.make_shader(Data::new_copy(&bytes), &[child.into()], None)?;
             let mut surface = skia_safe::surfaces::raster(&info, None, None)?;
             surface.canvas().clear(Color::TRANSPARENT);
@@ -104,7 +139,8 @@ mod tests {
             super::super::GLYPH_CLIP_RECORDING.with(|state| {
                 assert!(state.borrow().as_ref().unwrap().clip.is_none());
             });
-        }).unwrap();
+        })
+        .unwrap();
         super::super::GLYPH_CLIP_RECORDING.with(|state| {
             assert_eq!(state.borrow().as_ref().unwrap().clip, Some(clip));
         });
@@ -117,12 +153,15 @@ mod tests {
         let render = |clip: Option<Rect>| {
             let mut surface = Surface::new_raster_n32_premul((40, 40)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            if let Some(clip) = clip { surface.canvas().clip_rect(clip, None, Some(false)); }
+            if let Some(clip) = clip {
+                surface.canvas().clip_rect(clip, None, Some(false));
+            }
             let (image, origin) = rasterize_small_blur(1.0, bounds, |canvas| {
                 let mut paint = Paint::default();
                 paint.set_color(Color::from_argb(180, 180, 40, 100));
                 canvas.draw_rect(bounds, &paint);
-            }).unwrap();
+            })
+            .unwrap();
             surface.canvas().draw_image(&image, origin, None);
             let info = ImageInfo::new((40, 40), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 40 * 40 * 4];
@@ -130,13 +169,20 @@ mod tests {
             pixels
         };
         let full = render(None);
-        for clip in [Rect::new(10.0, 10.0, 14.0, 14.0), Rect::new(6.0, 7.0, 11.0, 12.0),
-            Rect::new(26.0, 26.0, 31.0, 31.0)] {
+        for clip in [
+            Rect::new(10.0, 10.0, 14.0, 14.0),
+            Rect::new(6.0, 7.0, 11.0, 12.0),
+            Rect::new(26.0, 26.0, 31.0, 31.0),
+        ] {
             let cropped = render(Some(clip));
             for y in clip.top() as usize..clip.bottom() as usize {
                 for x in clip.left() as usize..clip.right() as usize {
                     let i = (y * 40 + x) * 4;
-                    assert_eq!(&cropped[i..i+4], &full[i..i+4], "clip={clip:?} pixel=({x},{y})");
+                    assert_eq!(
+                        &cropped[i..i + 4],
+                        &full[i..i + 4],
+                        "clip={clip:?} pixel=({x},{y})"
+                    );
                 }
             }
         }

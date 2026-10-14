@@ -790,14 +790,18 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         fields.push(format!("column_gap: Some({gap}_f32)"));
     }
     if let Some(width) = s.column_width {
-        fields.push(format!("column_width: w3cos_std::style::Dimension::{width:?}"));
+        fields.push(format!(
+            "column_width: w3cos_std::style::Dimension::{width:?}"
+        ));
     }
     if let Some(count) = s.column_count {
         let count = count.as_option();
         fields.push(format!("column_count: {count:?}"));
     }
     if let Some(fill) = s.column_fill {
-        fields.push(format!("column_fill: w3cos_std::style::ColumnFill::{fill:?}"));
+        fields.push(format!(
+            "column_fill: w3cos_std::style::ColumnFill::{fill:?}"
+        ));
     }
     if let Some(spacing) = s.border_spacing_x {
         fields.push(format!("border_spacing_x: {spacing}_f32"));
@@ -1119,9 +1123,14 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         fields.push(format!("font_style: {}", gen_font_style(fs)));
     }
     if let Some(ref variant) = s.font_variant {
-        fields.push(format!("font_variant: FontVariant::{}", if variant == "small-caps" {
-            "SmallCaps"
-        } else { "Normal" }));
+        fields.push(format!(
+            "font_variant: FontVariant::{}",
+            if variant == "small-caps" {
+                "SmallCaps"
+            } else {
+                "Normal"
+            }
+        ));
     }
     if let Some(ls) = s.letter_spacing {
         fields.push(format!("letter_spacing: {ls}_f32"));
@@ -1574,11 +1583,17 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
         out.push_str(&sp("column-gap", &format!("{gap}px")));
     }
     if let Some(width) = style.column_width {
-        out.push_str(&sp("column-width", &w3cos_dom::css_style::dimension_to_css(&width)));
+        out.push_str(&sp(
+            "column-width",
+            &w3cos_dom::css_style::dimension_to_css(&width),
+        ));
     }
     if let Some(count) = style.column_count {
         let count = count.as_option();
-        out.push_str(&sp("column-count", &count.map_or_else(|| "auto".into(), |n| n.to_string())));
+        out.push_str(&sp(
+            "column-count",
+            &count.map_or_else(|| "auto".into(), |n| n.to_string()),
+        ));
     }
     if let Some(fill) = style.column_fill {
         let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
@@ -1940,11 +1955,17 @@ mod tests {
 
     #[test]
     fn small_caps_codegen_emits_typed_style_and_dom_calls() {
-        let style = StyleDecl { font_variant: Some("small-caps".into()), ..StyleDecl::default() };
+        let style = StyleDecl {
+            font_variant: Some("small-caps".into()),
+            ..StyleDecl::default()
+        };
         assert!(gen_style(&style, 0, &[]).contains("font_variant: FontVariant::SmallCaps"));
         let mut calls = String::new();
         gen_dom_style_calls(&style, "node", &mut calls, "");
-        assert!(calls.contains("\"font-variant\", \"small-caps\""), "{calls}");
+        assert!(
+            calls.contains("\"font-variant\", \"small-caps\""),
+            "{calls}"
+        );
     }
 
     #[test]
@@ -1956,15 +1977,24 @@ mod tests {
             ..StyleDecl::default()
         };
         let rust = gen_style(&style, 0, &[]);
-        assert!(rust.contains("column_width: w3cos_std::style::Dimension::Em(2.0)"), "{rust}");
+        assert!(
+            rust.contains("column_width: w3cos_std::style::Dimension::Em(2.0)"),
+            "{rust}"
+        );
         assert!(rust.contains("column_count: Some(3)"), "{rust}");
-        assert!(rust.contains("column_fill: w3cos_std::style::ColumnFill::Auto"), "{rust}");
+        assert!(
+            rust.contains("column_fill: w3cos_std::style::ColumnFill::Auto"),
+            "{rust}"
+        );
         let mut calls = String::new();
         gen_dom_style_calls(&style, "node", &mut calls, "");
         assert!(calls.contains("\"column-width\", \"2em\""), "{calls}");
         assert!(calls.contains("\"column-count\", \"3\""), "{calls}");
         assert!(calls.contains("\"column-fill\", \"auto\""), "{calls}");
-        let reset = StyleDecl { column_count: Some(crate::parser::ColumnCount::Auto), ..StyleDecl::default() };
+        let reset = StyleDecl {
+            column_count: Some(crate::parser::ColumnCount::Auto),
+            ..StyleDecl::default()
+        };
         let mut calls = String::new();
         gen_dom_style_calls(&reset, "node", &mut calls, "");
         assert!(calls.contains("\"column-count\", \"auto\""), "{calls}");

@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_void};
 
-use w3cos_abi::{W3cosPluginStyle, W3COS_PLUGIN_NODE_NONE};
+use w3cos_abi::{W3COS_PLUGIN_NODE_NONE, W3cosPluginStyle};
 use w3cos_std::style::{AlignItems, Dimension, Edges, JustifyContent, Style};
 use w3cos_std::{Component, EventAction};
 
@@ -40,7 +40,9 @@ fn plugin_rebuild() -> Component {
     NODES.with(|nodes| nodes.borrow_mut().clear());
     CALLBACKS.with(|slots| slots.borrow_mut().clear());
     let built = BUILD.with(|build| {
-        build.borrow().map(|(function, userdata)| unsafe { function(userdata) })
+        build
+            .borrow()
+            .map(|(function, userdata)| unsafe { function(userdata) })
     });
     let Some(root) = built else {
         return Component::text("plugin build missing", Style::default());
@@ -70,7 +72,11 @@ fn read_c_str(text: *const c_char) -> Option<String> {
     if text.is_null() {
         return None;
     }
-    Some(unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn style_from_plugin(style: *const W3cosPluginStyle) -> Style {
@@ -271,7 +277,8 @@ mod tests {
             ..W3cosPluginStyle::default()
         };
         let label = c"Add".as_ptr();
-        let button = unsafe { w3cos_plugin_button(label, &style, Some(bump), id as usize as *mut c_void) };
+        let button =
+            unsafe { w3cos_plugin_button(label, &style, Some(bump), id as usize as *mut c_void) };
         assert_ne!(button, W3COS_PLUGIN_NODE_NONE);
         crate::state::set_invoke_hook(plugin_invoke);
         let action = NODES.with(|nodes| nodes.borrow()[button as usize].on_click.clone());

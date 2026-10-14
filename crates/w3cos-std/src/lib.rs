@@ -9,9 +9,7 @@ pub mod svg;
 pub mod viewport;
 
 pub use color::Color;
-pub use component::{
-    find_text_input, Component, ComponentKind, EventAction, SvgEventTarget,
-};
+pub use component::{Component, ComponentKind, EventAction, SvgEventTarget, find_text_input};
 pub use style::Style;
 pub use svg::{SvgPathCommand, SvgPathData};
 
@@ -22,21 +20,39 @@ mod tests {
 
     #[test]
     fn css_uppercase_expands_greek_ypogegrammeni_like_browser() {
-        use crate::style::{transformed_text, TextTransform};
+        use crate::style::{TextTransform, transformed_text};
         // Chromium141 original WPT captures/innerText, bicameral-fonts-v1906.
         // The strict reference uses older simple mappings; it is independent.
-        for (source, expected) in [("ᾀ", "ἈΙ"), ("ᾐ", "ἨΙ"), ("ᾠ", "ὨΙ"),
-            ("ᾳ", "ΑΙ"), ("ῃ", "ΗΙ"), ("ῳ", "ΩΙ")] {
-            assert_eq!(transformed_text(source, TextTransform::Uppercase, None, false), expected);
+        for (source, expected) in [
+            ("ᾀ", "ἈΙ"),
+            ("ᾐ", "ἨΙ"),
+            ("ᾠ", "ὨΙ"),
+            ("ᾳ", "ΑΙ"),
+            ("ῃ", "ΗΙ"),
+            ("ῳ", "ΩΙ"),
+        ] {
+            assert_eq!(
+                transformed_text(source, TextTransform::Uppercase, None, false),
+                expected
+            );
         }
     }
 
     #[test]
     fn css_capitalize_retains_greek_titlecase_ypogegrammeni() {
-        use crate::style::{transformed_text, TextTransform};
-        for (source, expected) in [("ᾀ", "ᾈ"), ("ᾐ", "ᾘ"), ("ᾠ", "ᾨ"),
-            ("ᾳ", "ᾼ"), ("ῃ", "ῌ"), ("ῳ", "ῼ")] {
-            assert_eq!(transformed_text(source, TextTransform::Capitalize, None, false), expected);
+        use crate::style::{TextTransform, transformed_text};
+        for (source, expected) in [
+            ("ᾀ", "ᾈ"),
+            ("ᾐ", "ᾘ"),
+            ("ᾠ", "ᾨ"),
+            ("ᾳ", "ᾼ"),
+            ("ῃ", "ῌ"),
+            ("ῳ", "ῼ"),
+        ] {
+            assert_eq!(
+                transformed_text(source, TextTransform::Capitalize, None, false),
+                expected
+            );
         }
     }
 

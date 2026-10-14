@@ -472,7 +472,10 @@ fn build_shared(
         input.display()
     );
     w3cos_compiler::compile_from_file_with_options(&input_abs, &build_dir, &options)?;
-    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
 
@@ -488,13 +491,18 @@ fn build_shared(
     if release {
         cmd.arg("--release");
     }
-    let printed = cmd.output().context("cargo run of the bundle printer failed")?;
+    let printed = cmd
+        .output()
+        .context("cargo run of the bundle printer failed")?;
     if !printed.status.success() {
         anyhow::bail!("shared bundle printer failed");
     }
     std::fs::write(output, &printed.stdout)
         .with_context(|| format!("could not write {}", output.display()))?;
-    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::copy(
             build_dir.join("w3cos.app.json"),
             parent.join("w3cos.app.json"),

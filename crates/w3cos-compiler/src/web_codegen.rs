@@ -324,16 +324,25 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     px!(s.row_gap, "row-gap");
     px!(s.column_gap, "column-gap");
     if let Some(width) = s.column_width {
-        parts.push(format!("column-width:{}", w3cos_dom::css_style::dimension_to_css(&width)));
+        parts.push(format!(
+            "column-width:{}",
+            w3cos_dom::css_style::dimension_to_css(&width)
+        ));
     }
     if let Some(count) = s.column_count {
         let count = count.as_option();
-        parts.push(format!("column-count:{}", count.map_or_else(|| "auto".into(), |n| n.to_string())));
+        parts.push(format!(
+            "column-count:{}",
+            count.map_or_else(|| "auto".into(), |n| n.to_string())
+        ));
     }
     if let Some(fill) = s.column_fill {
         let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
         declaration.inner.column_fill = fill;
-        parts.push(format!("column-fill:{}", declaration.get_property("column-fill")));
+        parts.push(format!(
+            "column-fill:{}",
+            declaration.get_property("column-fill")
+        ));
     }
     if let Some(x) = s.border_spacing_x {
         let y = s.border_spacing_y.unwrap_or(x);
@@ -698,7 +707,10 @@ mod tests {
             old.as_object_mut().unwrap().remove(name);
         }
         let restored: w3cos_std::Style = serde_json::from_value(old).unwrap();
-        assert_eq!(restored, initial, "older serialized styles retain initial multicol values");
+        assert_eq!(
+            restored, initial,
+            "older serialized styles retain initial multicol values"
+        );
     }
     use super::*;
     use crate::css_parser::Stylesheet;

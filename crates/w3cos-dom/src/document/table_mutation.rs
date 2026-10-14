@@ -44,7 +44,9 @@ impl Document {
                 .get(candidate.0 as usize)
                 .into_iter()
                 .flat_map(|style| style.inline_declarations.iter())
-                .any(|(name, value)| name == "display" && value.trim().eq_ignore_ascii_case("inline"))
+                .any(|(name, value)| {
+                    name == "display" && value.trim().eq_ignore_ascii_case("inline")
+                })
         };
         let node = self.get_node(id);
         crate::node::sib(node.prev_sibling).is_some_and(specifies_inline)
@@ -76,5 +78,4 @@ impl Document {
         }
         false
     }
-
 }

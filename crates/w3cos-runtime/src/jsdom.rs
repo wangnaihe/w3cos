@@ -117,12 +117,254 @@ fn initial_event_counts() -> HashMap<String, u64> {
 
 // ── Bridge state (all thread-local, matching the thread-local Document) ────
 
+/// Inline style cache keyed by an interned property name.
+struct StyleCache {
+    names: Vec<String>,
+    /// Built on first use. `None` keeps the thread-local initializer const.
+    ids: Option<HashMap<String, u32>>,
+    values: Option<HashMap<(u32, u32), String>>,
+}
+
+impl StyleCache {
+    fn ids(&mut self) -> &mut HashMap<String, u32> {
+        self.ids.get_or_insert_with(HashMap::new)
+    }
+
+    fn values(&mut self) -> &mut HashMap<(u32, u32), String> {
+        self.values.get_or_insert_with(HashMap::new)
+    }
+
+    fn prop_id(&mut self, name: &str) -> u32 {
+        if let Some(id) = self.ids.as_ref().and_then(|ids| ids.get(name).copied()) {
+            return id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(name.to_string());
+        let key = self.names[id as usize].clone();
+        self.ids().insert(key, id);
+        id
+    }
+
+    fn insert_value(&mut self, node: u32, property: &str, value: String) {
+        let id = self.prop_id(property);
+        self.values().insert((node, id), value);
+    }
+
+    fn get_value(&self, node: u32, property: &str) -> Option<String> {
+        let id = self.ids.as_ref()?.get(property).copied()?;
+        self.values.as_ref()?.get(&(node, id)).cloned()
+    }
+
+    fn contains(&self, node: u32, property: &str) -> bool {
+        let Some(id) = self.ids.as_ref().and_then(|ids| ids.get(property).copied()) else {
+            return false;
+        };
+        self.values
+            .as_ref()
+            .is_some_and(|values| values.contains_key(&(node, id)))
+    }
+
+    fn count_nonempty(&self, node: u32) -> usize {
+        self.values
+            .as_ref()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Non-empty declarations for `node`, sorted by property name.
+    fn nonempty_pairs(&self, node: u32) -> Vec<(String, String)> {
+        let Some(values) = self.values.as_ref() else {
+            return Vec::new();
+        };
+        let mut pairs = values
+            .iter()
+            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+            .map(|((_, id), value)| (self.names[*id as usize].clone(), value.clone()))
+            .collect::<Vec<_>>();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        pairs
+    }
+
+    fn retain_other_nodes(&mut self, node: u32) {
+        if let Some(values) = self.values.as_mut() {
+            values.retain(|(id, _), _| *id != node);
+        }
+    }
+
+    fn clear_entries(&mut self) {
+        self.values = None;
+    }
+}
+
 struct JsListener {
     node: u32,
     event_type: EventType,
     handler: Value,
     capture: bool,
     inline: bool,
+}
+
+/// Listeners grouped by `(node, event type)` so dispatch does not scan every
+/// handler on the page for each ancestor. The index stays in registration order.
+enum OneListener {
+    /// Exactly one non-capture listener on this node.
+    One(EventType, Value),
+    /// More than one, or more than one event type. Dispatch uses the map.
+    Many,
+}
+
+struct ListenerStore {
+    items: Vec<JsListener>,
+    /// Built on the first mutation. `None` keeps the thread-local initializer const.
+    index: Option<HashMap<(u32, EventType), Vec<u32>>>,
+    /// Node id to a single non-capture listener. Misses fall back to `index`.
+    ones: Vec<Option<OneListener>>,
+    capture_count: u32,
+}
+
+impl ListenerStore {
+    const fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            index: None,
+            ones: Vec::new(),
+            capture_count: 0,
+        }
+    }
+
+    fn push(&mut self, listener: JsListener) {
+        if listener.capture {
+            self.capture_count = self.capture_count.saturating_add(1);
+        }
+        let key = (listener.node, listener.event_type);
+        let idx = self.items.len() as u32;
+        self.index
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_default()
+            .push(idx);
+        Self::note_one(&mut self.ones, &listener);
+        self.items.push(listener);
+    }
+
+    fn note_one(ones: &mut Vec<Option<OneListener>>, listener: &JsListener) {
+        if listener.capture {
+            return;
+        }
+        let node = listener.node as usize;
+        if ones.len() <= node {
+            ones.resize_with(node + 1, || None);
+        }
+        ones[node] = Some(match ones[node].take() {
+            None => OneListener::One(listener.event_type, listener.handler.clone()),
+            Some(OneListener::One(event_type, _)) if event_type == listener.event_type => {
+                OneListener::Many
+            }
+            Some(OneListener::One(_, _)) | Some(OneListener::Many) => OneListener::Many,
+        });
+    }
+
+    /// `Ok(None)` is no listener. `Err(())` means the map has more than one.
+    fn one_handler(&self, node: u32, event_type: EventType) -> Result<Option<Value>, ()> {
+        match self.ones.get(node as usize).and_then(|slot| slot.as_ref()) {
+            Some(OneListener::One(kind, handler)) if *kind == event_type => {
+                Ok(Some(handler.clone()))
+            }
+            Some(OneListener::One(_, _)) | None => Ok(None),
+            Some(OneListener::Many) => Err(()),
+        }
+    }
+
+    fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
+        self.items.retain(|listener| pred(listener));
+        self.reindex();
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.index = None;
+        self.ones.clear();
+        self.capture_count = 0;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &JsListener> {
+        self.items.iter()
+    }
+
+    fn has_capture(&self) -> bool {
+        self.capture_count > 0
+    }
+
+    fn handlers(&self, node: u32, event_type: EventType, capture: Option<bool>) -> Vec<Value> {
+        let Some(index) = self.index.as_ref() else {
+            return Vec::new();
+        };
+        let Some(idxs) = index.get(&(node, event_type)) else {
+            return Vec::new();
+        };
+        idxs.iter()
+            .filter_map(|&idx| {
+                let listener = &self.items[idx as usize];
+                capture
+                    .is_none_or(|flag| listener.capture == flag)
+                    .then(|| listener.handler.clone())
+            })
+            .collect()
+    }
+
+    /// Copy matching handlers into `out` and return how many matched.
+    /// A single click listener stays on the stack; a longer list falls
+    /// back to [`Self::handlers`].
+    fn copy_handlers(
+        &self,
+        node: u32,
+        event_type: EventType,
+        capture: Option<bool>,
+        out: &mut [Option<Value>],
+    ) -> usize {
+        let Some(index) = self.index.as_ref() else {
+            return 0;
+        };
+        let Some(idxs) = index.get(&(node, event_type)) else {
+            return 0;
+        };
+        let mut total = 0usize;
+        for &idx in idxs {
+            let listener = &self.items[idx as usize];
+            if !capture.is_none_or(|flag| listener.capture == flag) {
+                continue;
+            }
+            if total < out.len() {
+                out[total] = Some(listener.handler.clone());
+            }
+            total += 1;
+        }
+        total
+    }
+
+    fn reindex(&mut self) {
+        let mut index: HashMap<(u32, EventType), Vec<u32>> = HashMap::new();
+        self.capture_count = 0;
+        for (idx, listener) in self.items.iter().enumerate() {
+            if listener.capture {
+                self.capture_count = self.capture_count.saturating_add(1);
+            }
+            index
+                .entry((listener.node, listener.event_type))
+                .or_default()
+                .push(idx as u32);
+        }
+        self.index = Some(index);
+        self.ones.clear();
+        for listener in &self.items {
+            Self::note_one(&mut self.ones, listener);
+        }
+    }
 }
 
 struct JsTimer {
@@ -225,10 +467,17 @@ thread_local! {
     /// Repeated access through `attributes`, `getAttributeNode`, and
     /// `getAttributeNodeNS` must return the same JS object until it is removed.
     static ATTRIBUTE_VALUES: RefCell<HashMap<(u32, Option<String>, String), Value>> = RefCell::new(HashMap::new());
-    /// (node, kebab-prop) → raw CSS value cache. `CSSStyleDeclaration` drops
-    /// properties it does not know, so reads of e.g. `lineHeight` would
-    /// otherwise come back "".
-    static STYLE_CACHE: RefCell<HashMap<(u32, String), String>> = RefCell::new(HashMap::new());
+    /// (node, property id) → raw CSS value cache. Property names are interned
+    /// so a repeated `style.top` write does not allocate a new map key.
+    /// `CSSStyleDeclaration` drops properties it does not know, so reads of
+    /// e.g. `lineHeight` would otherwise come back "".
+    static STYLE_CACHE: RefCell<StyleCache> = const {
+        RefCell::new(StyleCache {
+            names: Vec::new(),
+            ids: None,
+            values: None,
+        })
+    };
     /// CSSStyleDeclaration object identity → element node. The AOT style
     /// setter reads this instead of entering the declaration proxy.
     static STYLE_OBJECT_NODES: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
@@ -239,7 +488,7 @@ thread_local! {
     static DISCRETE_CSS_TRANSITIONS: RefCell<Vec<DiscreteCssTransition>> = const { RefCell::new(Vec::new()) };
     /// JS event listener registry. Delivery for native events consults this
     /// at drain time; `dispatchEvent` consults it synchronously.
-    static LISTENERS: RefCell<Vec<JsListener>> = RefCell::new(Vec::new());
+    static LISTENERS: RefCell<ListenerStore> = RefCell::new(ListenerStore::new());
     /// (node, event_type) pairs that already have a native snapshot closure
     /// registered inside w3cos-dom's EventRegistry.
     static NATIVELY_REGISTERED: RefCell<HashSet<(u32, EventType)>> = RefCell::new(HashSet::new());
@@ -714,6 +963,9 @@ fn get_expando(node: u32, key: &str) -> Option<Value> {
 }
 
 fn set_expando(node: u32, key: &str, value: Value) {
+    if key == "dispatchEvent" {
+        note_dispatch_override();
+    }
     if key == "ownerDocument" && is_default_document(&value) {
         return;
     }
@@ -792,6 +1044,15 @@ fn root_node_value(node: u32, composed: bool) -> Value {
     } else {
         element_value(root)
     }
+}
+
+pub(crate) fn event_composed_path(target: u32, composed: bool) -> Value {
+    js_array(
+        shadow_event_chain(target, composed)
+            .into_iter()
+            .map(element_value)
+            .collect(),
+    )
 }
 
 fn shadow_event_chain(target: u32, composed: bool) -> Vec<u32> {
@@ -904,9 +1165,7 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
     let object = object.borrow();
     let direct = object.get_direct("__node_id");
     let generation = object.get_direct("__w3cos_realm_generation");
-    if direct.is_number()
-        && generation.is_number()
-        && bridge_realm_is_current(generation.to_u32())
+    if direct.is_number() && generation.is_number() && bridge_realm_is_current(generation.to_u32())
     {
         return Some(direct.to_u32());
     }
@@ -926,6 +1185,9 @@ fn dom_handle(node: u32) -> Value {
 }
 
 fn dom_imm_get(node: u32, key: &str) -> Value {
+    if key == "dispatchEvent" {
+        return element_dispatch_method(node);
+    }
     if matches!(key, "__proto__" | "constructor") {
         return dom_imm_materialize(node).get_property(key);
     }
@@ -954,6 +1216,9 @@ fn dom_imm_get(node: u32, key: &str) -> Value {
 }
 
 fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
+    if key == "dispatchEvent" {
+        note_dispatch_override();
+    }
     if key == "__proto__" {
         return dom_imm_materialize(node).try_set_property(key, value);
     }
@@ -1020,10 +1285,15 @@ fn dom_imm_materialize(node: u32) -> Value {
 
 fn pin_dom_wrapper(node: u32) {
     let value = element_value(node);
+    // Authored prototypes live on the wrapper. A DOM immediate does not hold
+    // that `Rc`, so `removeChild` must be able to rebuild the wrapper and
+    // still see `instanceof` and lifecycle methods.
+    let proto = w3cos_core::class::get_prototype_of(&value);
+    if proto.is_object() {
+        set_expando(node, "__w3cos_custom_prototype", proto);
+    }
     ELEMENT_VALUES.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(node, ElementMemo::Strong(value));
+        cache.borrow_mut().insert(node, ElementMemo::Strong(value));
     });
 }
 
@@ -1031,7 +1301,150 @@ fn dom_node_of(value: &Value) -> Option<u32> {
     node_id_of(value)
 }
 
+fn event_object_empty(value: &Value) -> bool {
+    match value {
+        Value::Object(rc) => rc.borrow().is_empty(),
+        _ => false,
+    }
+}
+
+fn dispatch_unbubbled_slotted(node: u32, event: &Value) -> Option<bool> {
+    if !event_object_empty(event) || LISTENERS.with(|listeners| listeners.borrow().has_capture()) {
+        return None;
+    }
+    let head = crate::web_events::begin_unbubbled_target(event, node)?;
+    let event_type = event_type_for(head.type_name.as_str());
+    let mut calls = 0usize;
+    if head.invoke {
+        let hit = LISTENERS.with(|listeners| listeners.borrow().one_handler(node, event_type));
+        match hit {
+            Ok(Some(handler)) => {
+                handler.call_slice(Value::Undefined, std::slice::from_ref(event));
+                calls = 1;
+            }
+            Ok(None) => {}
+            Err(()) => {
+                calls = invoke_phase_listeners(node, event_type, None, event, true);
+            }
+        }
+    }
+    let canceled = crate::web_events::end_unbubbled_target(event);
+    if input_trace_enabled() {
+        let mut ev = Event::new(event_type, NodeId::from_u32(node));
+        ev.bubbles = false;
+        trace_dispatched_event(&ev, event, node, calls);
+    }
+    Some(!canceled)
+}
+
+fn try_fast_dom_dispatch(node: u32, event: &Value) -> Option<bool> {
+    if DISPATCH_OVERRIDE.with(Cell::get) {
+        return None;
+    }
+    if let Some(result) = dispatch_unbubbled_slotted(node, event) {
+        return Some(result);
+    }
+    Some(js_dispatch_event(node, event.clone()))
+}
+
+fn note_collection_length_write(value: &Value) {
+    let Some(bits) = value.object_identity_bits() else {
+        return;
+    };
+    let relevant = COLLECTION_ROOTS.with(|roots| {
+        let roots = roots.borrow();
+        if roots.is_empty() {
+            return false;
+        }
+        // Own length on a live list, or length on a prototype those lists share.
+        // Unrelated `length` writes (functions, arrays) miss and stay off the
+        // read path. An empty shadow set keeps `childNodes.length` O(1).
+        roots.contains_key(&bits)
+            || roots
+                .values()
+                .any(|(_, collection)| prototype_chain_contains(collection, bits))
+    });
+    if relevant {
+        LENGTH_SHADOWS.with(|shadows| shadows.borrow_mut().insert(bits));
+    }
+}
+
+fn collection_length_shadowed(value: &Value) -> bool {
+    LENGTH_SHADOWS.with(|shadows| {
+        let shadows = shadows.borrow();
+        if shadows.is_empty() {
+            return false;
+        }
+        let mut current = value.clone();
+        for _ in 0..16 {
+            let Some(bits) = current.object_identity_bits() else {
+                return false;
+            };
+            if shadows.contains(&bits) {
+                return true;
+            }
+            let Some(object) = current.as_object() else {
+                return false;
+            };
+            let prototype = object.borrow().get_prototype_of();
+            if prototype.is_nullish() {
+                return false;
+            }
+            current = prototype;
+        }
+        false
+    })
+}
+
+fn prototype_chain_contains(value: &Value, bits: u64) -> bool {
+    let mut current = value.clone();
+    for _ in 0..16 {
+        let Some(object) = current.as_object() else {
+            return false;
+        };
+        let prototype = object.borrow().get_prototype_of();
+        if prototype.object_identity_bits() == Some(bits) {
+            return true;
+        }
+        if prototype.is_nullish() {
+            return false;
+        }
+        current = prototype;
+    }
+    false
+}
+
+fn try_fast_collection(value: &Value, index: Option<usize>) -> Option<Value> {
+    let bits = value.object_identity_bits()?;
+    let root = COLLECTION_ROOTS.with(|roots| roots.borrow().get(&bits).map(|(root, _)| *root))?;
+    if !bridge_realm_is_current(realm_generation()) {
+        return Some(Value::Undefined);
+    }
+    match index {
+        None if collection_length_shadowed(value) => None,
+        None => Some(Value::Number(child_node_count(root) as f64)),
+        Some(index) => {
+            ensure_dom_fast();
+            Some(
+                child_node_at(root, index)
+                    .map(|id| Value::dom_node(id, realm_generation()))
+                    .unwrap_or(Value::Undefined),
+            )
+        }
+    }
+}
+
+fn register_child_collection(value: &Value, root: u32) {
+    let Some(bits) = value.object_identity_bits() else {
+        return;
+    };
+    COLLECTION_ROOTS.with(|roots| roots.borrow_mut().insert(bits, (root, value.clone())));
+}
+
 fn ensure_dom_fast() {
+    let _ = w3cos_core::install_fast_collection_get(try_fast_collection);
+    let _ = w3cos_core::install_length_write_hook(note_collection_length_write);
+    let _ = w3cos_core::install_fast_dom_dispatch(try_fast_dom_dispatch);
     w3cos_core::intrinsics::install_dom_fast(w3cos_core::intrinsics::DomFast {
         create_element: fast_create_element,
         create_text: fast_create_text,
@@ -1089,13 +1502,13 @@ fn fast_create_element(object: &Value, tag: &str) -> Value {
         dom_exception("The element name is not valid", "InvalidCharacterError");
     }
     let lowered;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            tag
+        };
     let id = dom::create_element(tag);
     if tag == "template" {
         ensure_template_content(id);
@@ -1143,10 +1556,14 @@ fn fast_build_appended(
 ) -> Value {
     let mut id_buf = [0u8; 96];
     let mut text_buf = [0u8; 96];
-    let Some(id_text) = w3cos_core::intrinsics::format_prefix_index(id_prefix, id_index, &mut id_buf) else {
+    let Some(id_text) =
+        w3cos_core::intrinsics::format_prefix_index(id_prefix, id_index, &mut id_buf)
+    else {
         return Value::Undefined;
     };
-    let Some(text) = w3cos_core::intrinsics::format_prefix_index(text_prefix, text_index, &mut text_buf) else {
+    let Some(text) =
+        w3cos_core::intrinsics::format_prefix_index(text_prefix, text_index, &mut text_buf)
+    else {
         return Value::Undefined;
     };
     if !is_document_value(document)
@@ -1164,13 +1581,13 @@ fn fast_build_appended(
         dom_exception("The element name is not valid", "InvalidCharacterError");
     }
     let lowered;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            tag
+        };
     let child = dom::with_document_mut(|doc| {
         doc.append_labeled_element(
             w3cos_dom::NodeId::from_u32(parent_id),
@@ -1233,14 +1650,14 @@ fn fast_build_guarded(
     let parent_id = node_id_of(parent).expect("parent checked");
     let lowered;
     let mut tag_atom = tag_atom;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        tag_atom = u32::MAX;
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
     let child = dom::with_document_mut(|doc| {
         doc.append_labeled_unhashed(
             w3cos_dom::NodeId::from_u32(parent_id),
@@ -1282,14 +1699,14 @@ fn fast_build_block_guarded(
     let parent_id = node_id_of(parent).expect("parent checked");
     let lowered;
     let mut tag_atom = tag_atom;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        tag_atom = u32::MAX;
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
     let text = text.to_js_string();
     let Some(child) = dom::with_document_mut(|doc| {
         doc.append_fixed_text_block(
@@ -1327,7 +1744,7 @@ fn fast_set_style(object: &Value, name: &str, value: &Value) -> bool {
     }) else {
         return false;
     };
-    style_apply(node, &camel_to_kebab(name), &value.to_js_string());
+    style_apply(node, &style_property_name(name), &value.to_js_string());
     true
 }
 
@@ -1335,8 +1752,17 @@ fn fast_set_element_style(element: &Value, name: &str, value: &Value) -> bool {
     let Some(node) = node_id_of(element) else {
         return false;
     };
-    style_apply(node, &camel_to_kebab(name), &value.to_js_string());
+    style_apply(node, &style_property_name(name), &value.to_js_string());
     true
+}
+
+/// `top` / `height` stay borrowed. Camel-case names still allocate once.
+fn style_property_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().all(|byte| !byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(camel_to_kebab(name))
+    }
 }
 
 pub(crate) fn performance_now() -> f64 {
@@ -1517,7 +1943,10 @@ fn collection_value(
                     items.get(index).cloned().unwrap_or(Value::Undefined)
                 } else if let Some(node) = child_nodes_root {
                     child_node_at(node, index)
-                        .map(element_value)
+                        .map(|id| {
+                            ensure_dom_fast();
+                            Value::dom_node(id, generation)
+                        })
                         .unwrap_or(Value::Undefined)
                 } else {
                     get_provider()
@@ -1645,6 +2074,9 @@ fn collection_value(
         &value,
         &dom_collection_class(class_name).get_property("prototype"),
     );
+    if let Some(root) = child_nodes_root {
+        register_child_collection(&value, root);
+    }
     value
 }
 
@@ -1676,33 +2108,61 @@ fn element_or_null(node: Option<u32>) -> Value {
     }
 }
 
-// Read the current sibling chain without allocating a full child snapshot or
-// materializing unrelated JS wrappers. Returning the ID releases the document
-// borrow before element_value builds or retrieves the selected wrapper.
-fn child_node_at(node: u32, index: usize) -> Option<u32> {
-    dom::with_document(|document| {
-        let mut child = document.get_node(NodeId::from_u32(node)).first_child;
-        let mut remaining = index;
+// Child ids for one parent, invalidated by `structure_generation`. Indexed
+// `childNodes[n]` on a stable parent is then O(1) instead of a sibling walk.
+thread_local! {
+    static CHILD_INDEX: RefCell<Option<(u32, u64, Vec<u32>)>> = const { RefCell::new(None) };
+    static COLLECTION_ROOTS: RefCell<HashMap<u64, (u32, Value)>> = RefCell::new(HashMap::new());
+    static LENGTH_SHADOWS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+fn ensure_child_index(parent: u32) {
+    // Direct document mutations bump this counter inside `note_structure_change`,
+    // so a cache hit does not borrow the document.
+    let generation = w3cos_dom::document::structure_tick();
+    let fresh = CHILD_INDEX.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|(node, cached_generation, _)| {
+                *node == parent && *cached_generation == generation
+            })
+    });
+    if fresh {
+        return;
+    }
+    let ids = dom::with_document(|document| {
+        let mut ids = Vec::new();
+        let mut child = document.get_node(NodeId::from_u32(parent)).first_child;
         while let Some(id) = child {
-            if remaining == 0 {
-                return Some(id.as_u32());
-            }
-            remaining -= 1;
+            ids.push(id.as_u32());
             child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
         }
-        None
+        ids
+    });
+    CHILD_INDEX.with(|cache| {
+        *cache.borrow_mut() = Some((parent, generation, ids));
+    });
+}
+
+fn child_node_at(node: u32, index: usize) -> Option<u32> {
+    ensure_child_index(node);
+    CHILD_INDEX.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|(_, _, ids)| ids.get(index).copied())
     })
 }
 
 fn child_node_count(node: u32) -> usize {
-    dom::with_document(|document| {
-        let mut child = document.get_node(NodeId::from_u32(node)).first_child;
-        let mut count = 0;
-        while let Some(id) = child {
-            count += 1;
-            child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
-        }
-        count
+    ensure_child_index(node);
+    CHILD_INDEX.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .map(|(_, _, ids)| ids.len())
+            .unwrap_or(0)
     })
 }
 
@@ -2174,9 +2634,9 @@ fn matches_simple(selector: &str, node: u32, scope: Option<u32>) -> bool {
             ":popover-open" => popover_is_open(node),
             ":modal" => dialog_is_modal(node),
             ":focus-within" => element_has_focus_within(node),
-            ":focus-visible" => dom::with_document(|document| {
-                document.is_focus_visible(NodeId::from_u32(node))
-            }),
+            ":focus-visible" => {
+                dom::with_document(|document| document.is_focus_visible(NodeId::from_u32(node)))
+            }
             ":focus" => element_has_focus(node),
             _ => false,
         };
@@ -2744,7 +3204,7 @@ fn release_element_wrapper(node: u32) {
 fn purge_detached_node_js(node: u32) {
     ELEMENT_PROPS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
     KNOWN_EXPANDS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
-    STYLE_CACHE.with(|cache| cache.borrow_mut().retain(|(id, _), _| *id != node));
+    STYLE_CACHE.with(|cache| cache.borrow_mut().retain_other_nodes(node));
     LISTENERS.with(|listeners| {
         listeners
             .borrow_mut()
@@ -3447,9 +3907,7 @@ fn remember_tree_method(node: u32, key: &str, value: &Value) {
         return;
     }
     TREE_METHOD_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert((node, slot), value.clone());
+        cache.borrow_mut().insert((node, slot), value.clone());
     });
 }
 
@@ -3466,6 +3924,56 @@ fn shared_element_proxy() -> w3cos_core::ProxyHandler {
     })
 }
 
+thread_local! {
+    static DISPATCH_METHOD: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static DISPATCH_OVERRIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn note_dispatch_override() {
+    DISPATCH_OVERRIDE.with(|flag| flag.set(true));
+}
+
+/// One `dispatchEvent` function for every element. The receiver carries the
+/// node, so a property get does not allocate a closure per lookup.
+fn element_dispatch_method(node: u32) -> Value {
+    if DISPATCH_OVERRIDE.with(Cell::get) {
+        if get_expando(node, "dispatchEvent").is_some() {
+            return element_value(node).get_property("dispatchEvent");
+        }
+        if let Some(wrapper) = memoized_element(node) {
+            let own_override = wrapper.as_object().is_some_and(|object| {
+                let object = object.borrow();
+                object.own_getter("dispatchEvent").is_some()
+                    || object.has_own_property("dispatchEvent")
+            });
+            if own_override {
+                return wrapper.get_property("dispatchEvent");
+            }
+        }
+        let inherited = inherited_prototype_value(node, "dispatchEvent");
+        if inherited.is_callable() {
+            return inherited;
+        }
+    }
+    shared_dispatch_event()
+}
+
+fn shared_dispatch_event() -> Value {
+    DISPATCH_METHOD.with(|slot| {
+        if let Some(method) = slot.borrow().clone() {
+            return method;
+        }
+        let method = func(|this, args| {
+            let Some(node) = node_id_of(&this) else {
+                return Value::Bool(true);
+            };
+            Value::Bool(js_dispatch_event(node, arg(&args, 0)))
+        });
+        *slot.borrow_mut() = Some(method.clone());
+        method
+    })
+}
+
 fn build_element_proxy() -> w3cos_core::ProxyHandler {
     ProxyBuilder::new()
         .live_target()
@@ -3477,9 +3985,7 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             // before any getter or computed callback runs.
             let (generation, node, own_getter, stored) = {
                 let object = object.borrow();
-                let generation = object
-                    .get_direct("__w3cos_realm_generation")
-                    .to_number() as u32;
+                let generation = object.get_direct("__w3cos_realm_generation").to_number() as u32;
                 let node = object.get_direct("__node_id").to_number() as u32;
                 let own_getter = object.own_getter(key);
                 let stored = if own_getter.is_some() {
@@ -3491,6 +3997,13 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             };
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
+            }
+            if key == "dispatchEvent"
+                && own_getter.is_none()
+                && stored.is_undefined()
+                && !DISPATCH_OVERRIDE.with(Cell::get)
+            {
+                return element_dispatch_method(node);
             }
             if dom::tag_name(node) == "object" {
                 if key == "contentDocument" {
@@ -3529,13 +4042,14 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             };
             let (generation, node) = {
                 let object = object.borrow();
-                let generation = object
-                    .get_direct("__w3cos_realm_generation")
-                    .to_number() as u32;
+                let generation = object.get_direct("__w3cos_realm_generation").to_number() as u32;
                 let node = object.get_direct("__node_id").to_number() as u32;
                 (generation, node)
             };
             if bridge_realm_is_current(generation) {
+                if key == "dispatchEvent" {
+                    note_dispatch_override();
+                }
                 element_computed_set(node, key, value)
             } else {
                 // The old Realm is already gone. Accept the write as an inert
@@ -3579,10 +4093,7 @@ fn build_element_value(node: u32) -> Value {
     let value = Value::proxied_host_object(
         &[
             ("__node_id", Value::Number(node as f64)),
-            (
-                "__w3cos_realm_generation",
-                Value::Number(generation as f64),
-            ),
+            ("__w3cos_realm_generation", Value::Number(generation as f64)),
         ],
         shared_element_proxy(),
     );
@@ -3621,6 +4132,9 @@ fn build_element_value(node: u32) -> Value {
                 namespace.as_deref() == Some("http://www.w3.org/2000/svg"),
             ),
         );
+    }
+    if let Some(proto) = get_expando(node, "__w3cos_custom_prototype") {
+        w3cos_core::class::set_prototype_of(&value, &proto);
     }
     value
 }
@@ -3798,8 +4312,7 @@ fn subtree_has_element_memo(root: u32) -> bool {
 
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
     let foreign_owner = parent != 0
-        && get_expando(parent, "ownerDocument")
-            .is_some_and(|owner| !is_default_document(&owner));
+        && get_expando(parent, "ownerDocument").is_some_and(|owner| !is_default_document(&owner));
     if reference.is_none() && !foreign_owner && fresh_simple_element(parent, child) {
         dom::append_child(parent, child);
         if subtree_has_element_memo(child) {
@@ -6577,7 +7090,10 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     if value.trim().is_empty() {
         return false;
     }
-    if matches!(property.as_str(), "columns" | "column-width" | "column-count" | "column-fill") {
+    if matches!(
+        property.as_str(),
+        "columns" | "column-width" | "column-count" | "column-fill"
+    ) {
         return w3cos_dom::css_style::valid_multicol_declaration(&property, value);
     }
     matches!(
@@ -8404,7 +8920,10 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
 
 /// Border box of a definite px width and height whose position is unchanged
 /// by the current dirty set. Returns `None` when layout must run.
-fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Option<w3cos_dom::DOMRect> {
+fn definite_independent_border_box(
+    node: u32,
+    live: w3cos_dom::DOMRect,
+) -> Option<w3cos_dom::DOMRect> {
     if live.width == 0.0 && live.height == 0.0 && live.x == 0.0 && live.y == 0.0 {
         return None;
     }
@@ -8436,9 +8955,8 @@ fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Optio
             style.position,
             w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
         ) {
-            let mut sibling = w3cos_dom::node::sib(
-                document.get_node(NodeId::from_u32(node)).prev_sibling,
-            );
+            let mut sibling =
+                w3cos_dom::node::sib(document.get_node(NodeId::from_u32(node)).prev_sibling);
             while let Some(id) = sibling {
                 if document.precise_dirty_contains(id) {
                     return true;
@@ -8463,7 +8981,9 @@ fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Optio
             (height + padding.top + padding.bottom + border_top + border_bottom).max(0.0),
         ),
     };
-    Some(w3cos_dom::DOMRect::new(live.x, live.y, box_width, box_height))
+    Some(w3cos_dom::DOMRect::new(
+        live.x, live.y, box_width, box_height,
+    ))
 }
 
 fn offset_parent_node(node: u32) -> Option<u32> {
@@ -10352,7 +10872,8 @@ fn option_atom() -> w3cos_dom::atom::Atom {
 
 pub(crate) fn sync_style_element(node: u32) {
     let style = style_atom();
-    let is_style = dom::with_document(|doc| doc.get_node(w3cos_dom::NodeId::from_u32(node)).tag == style);
+    let is_style =
+        dom::with_document(|doc| doc.get_node(w3cos_dom::NodeId::from_u32(node)).tag == style);
     if !is_style {
         return;
     }
@@ -12004,13 +12525,13 @@ pub(crate) fn commit_css_motion_style(node: u32, pseudo: Option<&str>, property:
     STYLE_CACHE.with(|cache| {
         cache
             .borrow_mut()
-            .insert((node, property.to_string()), value.clone());
+            .insert_value(node, property, value.clone());
     });
     dom::set_style_property(node, property, &value);
 }
 
 fn style_read(node: u32, kebab: &str) -> String {
-    if let Some(v) = STYLE_CACHE.with(|c| c.borrow().get(&(node, kebab.to_string())).cloned()) {
+    if let Some(v) = STYLE_CACHE.with(|c| c.borrow().get_value(node, kebab)) {
         return v;
     }
     dom::with_document(|doc| {
@@ -12041,13 +12562,19 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
         tracks_discrete_motion.then(|| inline_computed_style_fallback(node, kebab));
     let tracks_motion = matches!(kebab, "left" | "transform");
     let before = tracks_motion.then(|| capture_transition_snapshots(node));
-    STYLE_CACHE.with(|c| {
-        c.borrow_mut()
-            .insert((node, kebab.to_string()), value.clone());
-    });
+    // Observers can read cssText while the attribute notification runs, so the
+    // cache is published first in that case. The common path moves the string
+    // in after the typed write and does not clone it.
+    let observers = !crate::observers_web::mutation_observers_empty();
+    if observers {
+        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value.clone()));
+    }
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, &value);
+    if !observers {
+        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value));
+    }
     if let Some(before) = discrete_before {
         start_discrete_css_transition(
             node,
@@ -12099,13 +12626,7 @@ fn css_easing(value: &str) -> w3cos_std::style::Easing {
 }
 
 fn cached_style_value(node: u32, property: &str) -> String {
-    STYLE_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .get(&(node, property.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    })
+    STYLE_CACHE.with(|cache| cache.borrow().get_value(node, property).unwrap_or_default())
 }
 
 fn start_discrete_css_transition(node: u32, property: &str, from: String, to: String) {
@@ -12243,18 +12764,11 @@ fn normalize_inline_style_property(property: &str, value: &str) -> Option<String
 
 fn style_css_text(node: u32) -> String {
     STYLE_CACHE.with(|c| {
-        let cache = c.borrow();
-        let mut pairs: Vec<(&String, &String)> = cache
-            .iter()
-            .filter(|((n, _), value)| *n == node && !value.is_empty())
-            .map(|((_, k), v)| (k, v))
-            .collect();
-        pairs.sort();
         let mut out = String::new();
-        for (k, v) in pairs {
-            out.push_str(k);
+        for (k, v) in c.borrow().nonempty_pairs(node) {
+            out.push_str(&k);
             out.push_str(": ");
-            out.push_str(v);
+            out.push_str(&v);
             out.push_str("; ");
         }
         out
@@ -12263,14 +12777,12 @@ fn style_css_text(node: u32) -> String {
 
 fn style_property_names(node: u32) -> Vec<String> {
     STYLE_CACHE.with(|cache| {
-        let mut names = cache
+        cache
             .borrow()
-            .iter()
-            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
-            .map(|((_, name), _)| name.clone())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
+            .nonempty_pairs(node)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     })
 }
 
@@ -12288,13 +12800,7 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
         if readonly {
             dom::computed_style_property(node, name)
         } else {
-            STYLE_CACHE.with(|cache| {
-                cache
-                    .borrow()
-                    .get(&(node, name.to_string()))
-                    .cloned()
-                    .unwrap_or_default()
-            })
+            STYLE_CACHE.with(|cache| cache.borrow().get_value(node, name).unwrap_or_default())
         }
     };
     let read_get = read;
@@ -12347,11 +12853,7 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                             dom::computed_style_property(node, &name)
                         } else {
                             STYLE_CACHE.with(|cache| {
-                                cache
-                                    .borrow()
-                                    .get(&(node, name.clone()))
-                                    .cloned()
-                                    .unwrap_or_default()
+                                cache.borrow().get_value(node, &name).unwrap_or_default()
                             })
                         });
                         match method {
@@ -12383,13 +12885,8 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                 let text = if readonly {
                     dom::computed_style_property(node, &name)
                 } else {
-                    STYLE_CACHE.with(|cache| {
-                        cache
-                            .borrow()
-                            .get(&(node, name.clone()))
-                            .cloned()
-                            .unwrap_or_default()
-                    })
+                    STYLE_CACHE
+                        .with(|cache| cache.borrow().get_value(node, &name).unwrap_or_default())
                 };
                 callback.call(
                     this_arg.clone(),
@@ -12434,13 +12931,8 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                     .map(crate::css_typed_om_web::serialize_value)
                     .collect::<Vec<_>>()
                     .join(" ");
-                let current = STYLE_CACHE.with(|cache| {
-                    cache
-                        .borrow()
-                        .get(&(node, name.clone()))
-                        .cloned()
-                        .unwrap_or_default()
-                });
+                let current = STYLE_CACHE
+                    .with(|cache| cache.borrow().get_value(node, &name).unwrap_or_default());
                 style_apply(
                     node,
                     &name,
@@ -12531,12 +13023,9 @@ fn style_value(node: u32) -> Value {
                     Value::string(&old)
                 }),
                 "cssText" => Value::string(&style_css_text(node)),
-                "length" => Value::Number(STYLE_CACHE.with(|c| {
-                    c.borrow()
-                        .iter()
-                        .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
-                        .count()
-                }) as f64),
+                "length" => {
+                    Value::Number(STYLE_CACHE.with(|c| c.borrow().count_nonempty(node)) as f64)
+                }
                 // Magic w3cos-core convention keys must stay Undefined:
                 // returning "" (a non-undefined value) for `__w3cos_setter_*`
                 // makes `Value::set_property` "call" the empty string and
@@ -12554,8 +13043,7 @@ fn style_value(node: u32) -> Value {
             }
             let property = camel_to_kebab(key);
             css_property_supported(&property, "initial")
-                || STYLE_CACHE
-                    .with(|cache| cache.borrow().contains_key(&(node, property.to_string())))
+                || STYLE_CACHE.with(|cache| cache.borrow().contains(node, &property))
         })
         .set(move |_target, key, value, _receiver| {
             if bridge_realm_is_current(generation) {
@@ -12742,8 +13230,7 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
         }
         if cleared
             || flow_distance
-                >= sibling_rect.height
-                    + resolve(sibling_style.margin.bottom, &sibling_style)
+                >= sibling_rect.height + resolve(sibling_style.margin.bottom, &sibling_style)
         {
             continue;
         }
@@ -13168,30 +13655,182 @@ fn dispatch_event_to_js(ev: Event) -> bool {
     dispatch_event_value_to_js(&ev, js_ev)
 }
 
-fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
-    if js_ev.get_property("isTrusted").to_bool() {
-        record_event_count(&js_ev.get_property("type").to_js_string());
+fn input_trace_enabled() -> bool {
+    thread_local! {
+        static TRACE: Cell<Option<bool>> = const { Cell::new(None) };
     }
-    let _activation = (js_ev.get_property("isTrusted").to_bool()
+    TRACE.with(|cell| {
+        if let Some(value) = cell.get() {
+            return value;
+        }
+        let value = std::env::var_os("W3COS_INPUT_TRACE").is_some();
+        cell.set(Some(value));
+        value
+    })
+}
+
+fn trace_dispatched_event(ev: &Event, js_ev: &Value, target: u32, listener_calls: usize) {
+    if !input_trace_enabled() {
+        return;
+    }
+    if !matches!(
+        ev.event_type,
+        EventType::Focus
+            | EventType::Blur
+            | EventType::PointerDown
+            | EventType::PointerUp
+            | EventType::MouseDown
+            | EventType::MouseUp
+            | EventType::Click
+            | EventType::KeyDown
+            | EventType::KeyUp
+            | EventType::BeforeInput
+            | EventType::Input
+    ) {
+        return;
+    }
+    eprintln!(
+        "[W3C OS][DOM INPUT] target={target} type={} listeners={listener_calls} prevented={}",
+        event_type_name(ev.event_type),
+        js_ev.get_property("__pd").to_bool()
+    );
+}
+
+fn invoke_phase_listeners(
+    node: u32,
+    event_type: EventType,
+    capture: Option<bool>,
+    js_ev: &Value,
+    slotted: bool,
+) -> usize {
+    let mut inline = [None, None, None, None];
+    let total = LISTENERS.with(|listeners| {
+        listeners
+            .borrow()
+            .copy_handlers(node, event_type, capture, &mut inline)
+    });
+    let mut calls = 0usize;
+    let stopped_immediate = |handler: &Value| {
+        handler.call_slice(Value::Undefined, std::slice::from_ref(js_ev));
+        if slotted {
+            crate::web_events::event_stopped_immediate(js_ev)
+        } else {
+            js_ev.get_property("__sip").to_bool()
+        }
+    };
+    if total <= inline.len() {
+        for handler in inline.iter().take(total).flatten() {
+            calls += 1;
+            if stopped_immediate(handler) {
+                break;
+            }
+        }
+        return calls;
+    }
+    for handler in
+        LISTENERS.with(|listeners| listeners.borrow().handlers(node, event_type, capture))
+    {
+        calls += 1;
+        if stopped_immediate(&handler) {
+            break;
+        }
+    }
+    calls
+}
+
+fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
+    let slotted = crate::web_events::has_event_slot(&js_ev);
+    let trusted = if slotted {
+        crate::web_events::event_slot_trusted(&js_ev).unwrap_or(false)
+    } else {
+        js_ev.get_property("isTrusted").to_bool()
+    };
+    if trusted {
+        let type_name = if slotted {
+            crate::web_events::event_slot_head(&js_ev)
+                .map(|head| head.type_name.as_str().to_string())
+                .unwrap_or_default()
+        } else {
+            js_ev.get_property("type").to_js_string()
+        };
+        record_event_count(&type_name);
+    }
+    let _activation = (trusted
         && matches!(
             ev.event_type,
             EventType::KeyDown | EventType::MouseDown | EventType::PointerUp | EventType::TouchEnd
         ))
     .then(crate::user_activation_web::begin_transient_activation);
     let target = ev.target.as_u32();
-    let trace = std::env::var_os("W3COS_INPUT_TRACE").is_some();
     let mut listener_calls = 0usize;
+    let stopped = |event: &Value| {
+        if slotted {
+            crate::web_events::event_stopped(event)
+        } else {
+            event.get_property("__sp").to_bool()
+        }
+    };
+    let canceled = |event: &Value| {
+        if slotted {
+            if event
+                .as_object()
+                .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"))
+            {
+                return event.get_property("defaultPrevented").to_bool();
+            }
+            crate::web_events::event_slot_canceled(event).unwrap_or(false)
+        } else {
+            event.get_property("__pd").to_bool()
+        }
+    };
+    let has_capture = LISTENERS.with(|l| l.borrow().has_capture());
+    // A non-bubbling event with no capture listeners stays on the target.
+    // Slotted events keep the target as a node id until script reads it.
+    if !has_capture && !ev.bubbles {
+        if slotted {
+            let _ = crate::web_events::set_dispatch_nodes(&js_ev, target, target, 2);
+        } else {
+            js_ev.set_property("__w3cos_target_id", Value::Number(target as f64));
+            let target_value = element_value(target);
+            js_ev.set_property("target", target_value.clone());
+            js_ev.set_property("srcElement", target_value.clone());
+            js_ev.set_property("currentTarget", target_value);
+            js_ev.set_property("eventPhase", Value::Number(2.0));
+        }
+        if !stopped(&js_ev) {
+            listener_calls += invoke_phase_listeners(target, ev.event_type, None, &js_ev, slotted);
+        }
+        if slotted {
+            let _ = crate::web_events::finish_dispatch(&js_ev);
+        } else {
+            let target_value = element_value(target);
+            js_ev.set_property("eventPhase", Value::Number(0.0));
+            js_ev.set_property("target", target_value.clone());
+            js_ev.set_property("srcElement", target_value);
+        }
+        trace_dispatched_event(ev, &js_ev, target, listener_calls);
+        return !canceled(&js_ev);
+    }
+
+    if slotted {
+        // Bubbling and capture still need the original target id so
+        // composedPath can walk the chain. Own `target` properties retarget.
+        let _ = crate::web_events::set_dispatch_nodes(&js_ev, target, target, 2);
+    } else {
+        js_ev.set_property("__w3cos_target_id", Value::Number(target as f64));
+    }
+    let target_value = element_value(target);
+    if !slotted {
+        js_ev.set_property("target", target_value.clone());
+        js_ev.set_property("srcElement", target_value.clone());
+    }
+    let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
+        LISTENERS.with(|l| l.borrow().handlers(node_id, ev.event_type, capture_phase))
+    };
+
     // [target, parent, ..., root], crossing shadow boundaries only for
     // composed events.
     let chain = shadow_event_chain(target, ev.composed);
-    js_ev.set_property(
-        "__w3cos_path",
-        js_array(chain.iter().copied().map(element_value).collect()),
-    );
-
-    let target_value = element_value(target);
-    js_ev.set_property("target", target_value.clone());
-    js_ev.set_property("srcElement", target_value);
     let stopped = |v: &Value| v.get_property("__sp").to_bool();
     let immediate = |v: &Value| v.get_property("__sip").to_bool();
     let set_current_target = |event: &Value, id: u32, phase: f64| {
@@ -13201,31 +13840,24 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
         event.set_property("eventPhase", Value::Number(phase));
     };
 
-    let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
-        LISTENERS.with(|l| {
-            l.borrow()
-                .iter()
-                .filter(|jl| {
-                    jl.node == node_id
-                        && jl.event_type == ev.event_type
-                        && capture_phase.is_none_or(|cp| jl.capture == cp)
-                })
-                .map(|jl| jl.handler.clone())
-                .collect()
-        })
-    };
-
-    // Phase 1: capture, root → parent (skip target).
-    for &id in chain.iter().rev().skip(1) {
-        if stopped(&js_ev) {
-            break;
-        }
-        set_current_target(&js_ev, id, 1.0);
-        for h in snapshot_listeners(id, Some(true)) {
-            listener_calls += 1;
-            h.call(Value::Undefined, vec![js_ev.clone()]);
-            if immediate(&js_ev) {
+    // Phase 1: capture, root → parent (skip target). Ancestors with no
+    // capture listeners are not wrapped.
+    if has_capture {
+        for &id in chain.iter().rev().skip(1) {
+            if stopped(&js_ev) {
                 break;
+            }
+            let handlers = snapshot_listeners(id, Some(true));
+            if handlers.is_empty() {
+                continue;
+            }
+            set_current_target(&js_ev, id, 1.0);
+            for h in handlers {
+                listener_calls += 1;
+                h.call_slice(Value::Undefined, std::slice::from_ref(&js_ev));
+                if immediate(&js_ev) {
+                    break;
+                }
             }
         }
     }
@@ -13233,13 +13865,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     // Phase 2: at target (both capture and bubble listeners).
     if !stopped(&js_ev) {
         set_current_target(&js_ev, target, 2.0);
-        for h in snapshot_listeners(target, None) {
-            listener_calls += 1;
-            h.call(Value::Undefined, vec![js_ev.clone()]);
-            if immediate(&js_ev) {
-                break;
-            }
-        }
+        listener_calls += invoke_phase_listeners(target, ev.event_type, None, &js_ev, slotted);
     }
 
     // Phase 3: bubble, parent → root.
@@ -13248,10 +13874,14 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
             if stopped(&js_ev) {
                 break;
             }
+            let handlers = snapshot_listeners(id, Some(false));
+            if handlers.is_empty() {
+                continue;
+            }
             set_current_target(&js_ev, id, 3.0);
-            for h in snapshot_listeners(id, Some(false)) {
+            for h in handlers {
                 listener_calls += 1;
-                h.call(Value::Undefined, vec![js_ev.clone()]);
+                h.call_slice(Value::Undefined, std::slice::from_ref(&js_ev));
                 if immediate(&js_ev) {
                     break;
                 }
@@ -13259,32 +13889,15 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
         }
     }
 
-    js_ev.set_property("eventPhase", Value::Number(0.0));
-    js_ev.set_property("target", element_value(target));
-    js_ev.set_property("srcElement", element_value(target));
-    if trace
-        && matches!(
-            ev.event_type,
-            EventType::Focus
-                | EventType::Blur
-                | EventType::PointerDown
-                | EventType::PointerUp
-                | EventType::MouseDown
-                | EventType::MouseUp
-                | EventType::Click
-                | EventType::KeyDown
-                | EventType::KeyUp
-                | EventType::BeforeInput
-                | EventType::Input
-        )
-    {
-        eprintln!(
-            "[W3C OS][DOM INPUT] target={target} type={} listeners={listener_calls} prevented={}",
-            event_type_name(ev.event_type),
-            js_ev.get_property("__pd").to_bool()
-        );
+    if slotted {
+        let _ = crate::web_events::finish_dispatch(&js_ev);
+    } else {
+        js_ev.set_property("eventPhase", Value::Number(0.0));
+        js_ev.set_property("target", target_value.clone());
+        js_ev.set_property("srcElement", target_value);
     }
-    !js_ev.get_property("__pd").to_bool()
+    trace_dispatched_event(ev, &js_ev, target, listener_calls);
+    !canceled(&js_ev)
 }
 
 fn record_event_count(event_type: &str) {
@@ -13329,7 +13942,10 @@ fn focus_element(node: u32) {
         blur_element(previous);
     }
     ACTIVE_ELEMENT.with(|active| *active.borrow_mut() = Some(node));
-    update_focus_style(node, previous_visible || KEYBOARD_FOCUS_MODALITY.with(Cell::get));
+    update_focus_style(
+        node,
+        previous_visible || KEYBOARD_FOCUS_MODALITY.with(Cell::get),
+    );
     dispatch_sync(node, EventType::Focus, EventData::Focus);
     dispatch_sync(node, EventType::FocusIn, EventData::Focus);
 }
@@ -13338,9 +13954,19 @@ fn update_focus_style(node: u32, indicate: bool) {
     let tag = dom::tag_name(node);
     let text_input = if tag.eq_ignore_ascii_case("input") {
         let kind = dom::get_attribute(node, "type").unwrap_or_else(|| "text".into());
-        !matches!(kind.to_ascii_lowercase().as_str(),
-            "button" | "checkbox" | "color" | "file" | "hidden" | "image" |
-            "radio" | "range" | "reset" | "submit")
+        !matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "button"
+                | "checkbox"
+                | "color"
+                | "file"
+                | "hidden"
+                | "image"
+                | "radio"
+                | "range"
+                | "reset"
+                | "submit"
+        )
     } else {
         tag.eq_ignore_ascii_case("textarea")
     };
@@ -14181,6 +14807,19 @@ pub(crate) fn dispatch_native_input(
 /// `element.dispatchEvent(eventValue)` — reads `.type` (and `.detail`,
 /// `.bubbles`) from the given object and dispatches synchronously.
 fn install_compat_event_controls(event: &Value) {
+    if crate::web_events::has_event_slot(event) {
+        return;
+    }
+    // `new Event` already wrote the flags, and the methods live on
+    // `Event.prototype`. Skip the per-dispatch prototype walks in that case.
+    if !event.get_property("__pd").is_undefined()
+        && event.get_property("preventDefault").is_function()
+        && !event
+            .get_property("__w3cos_getter_defaultPrevented")
+            .is_undefined()
+    {
+        return;
+    }
     for (name, default) in [
         ("__pd", Value::Bool(false)),
         ("__sp", Value::Bool(false)),
@@ -14247,7 +14886,68 @@ fn install_compat_event_controls(event: &Value) {
     }
 }
 
+fn event_was_canceled(event_val: &Value) -> bool {
+    if crate::web_events::has_event_slot(event_val) {
+        let own_default_prevented = event_val
+            .as_object()
+            .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"));
+        if own_default_prevented {
+            return event_val.get_property("defaultPrevented").to_bool();
+        }
+        return crate::web_events::event_slot_canceled(event_val).unwrap_or(false);
+    }
+    let own_default_prevented = event_val
+        .as_object()
+        .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"));
+    if own_default_prevented {
+        return event_val.get_property("defaultPrevented").to_bool();
+    }
+    if !event_val
+        .get_property("__w3cos_getter_defaultPrevented")
+        .is_undefined()
+    {
+        return event_val.get_property("__pd").to_bool();
+    }
+    event_val.get_property("defaultPrevented").to_bool()
+}
+
+fn event_slot_overridden(event_val: &Value) -> bool {
+    event_val.as_object().is_some_and(|object| {
+        let object = object.borrow();
+        if object.is_empty() {
+            return false;
+        }
+        object.has_own_property("type")
+            || object.has_own_property("bubbles")
+            || object.has_own_property("cancelable")
+            || object.has_own_property("composed")
+            || object.has_own_property("detail")
+    })
+}
+
 fn js_dispatch_event(node: u32, event_val: Value) -> bool {
+    if let Some(head) = crate::web_events::event_slot_head(&event_val)
+        && !event_slot_overridden(&event_val)
+    {
+        let type_name = head.type_name.as_str();
+        if type_name.is_empty() || type_name == "undefined" {
+            return true;
+        }
+        let et = event_type_for(type_name);
+        let data = if head.detail.is_nullish() {
+            EventData::None
+        } else {
+            EventData::Custom {
+                detail: Some(head.detail.to_js_string()),
+            }
+        };
+        let mut ev = Event::new(et, NodeId::from_u32(node));
+        ev.data = data;
+        ev.bubbles = head.bubbles;
+        ev.cancelable = head.cancelable;
+        ev.composed = head.composed;
+        return dispatch_event_value_to_js(&ev, event_val);
+    }
     let type_name = event_val.get_property("type").to_js_string();
     if type_name.is_empty() || type_name == "undefined" {
         return true;
@@ -14276,7 +14976,7 @@ fn js_dispatch_event(node: u32, event_val: Value) -> bool {
     if !composed.is_undefined() {
         ev.composed = composed.to_bool();
     }
-    let was_canceled = event_val.get_property("defaultPrevented").to_bool();
+    let was_canceled = event_was_canceled(&event_val);
     let dispatched = dispatch_event_value_to_js(&ev, event_val.clone());
     if !dispatched {
         event_val.set_property("__pd", Value::Bool(true));
@@ -14300,20 +15000,15 @@ fn deliver_pending_events() -> usize {
         });
         let Some(ev) = ev else { break };
         let listeners: Vec<Value> = LISTENERS.with(|l| {
+            let capture = match ev.event_phase {
+                w3cos_dom::events::EventPhase::Capturing => Some(true),
+                w3cos_dom::events::EventPhase::Bubbling | w3cos_dom::events::EventPhase::None => {
+                    Some(false)
+                }
+                w3cos_dom::events::EventPhase::AtTarget => None,
+            };
             l.borrow()
-                .iter()
-                .filter(|jl| {
-                    jl.node == ev.current_target.as_u32()
-                        && jl.event_type == ev.event_type
-                        && match ev.event_phase {
-                            w3cos_dom::events::EventPhase::Capturing => jl.capture,
-                            w3cos_dom::events::EventPhase::Bubbling
-                            | w3cos_dom::events::EventPhase::None => !jl.capture,
-                            w3cos_dom::events::EventPhase::AtTarget => true,
-                        }
-                })
-                .map(|jl| jl.handler.clone())
-                .collect()
+                .handlers(ev.current_target.as_u32(), ev.event_type, capture)
         });
         if listeners.is_empty() {
             continue;
@@ -20228,16 +20923,25 @@ fn build_window_value() -> Value {
     );
 
     let handler = ProxyBuilder::new()
-        .get(|target, key, _| {
-            let has_stored_property = target.as_object().is_some_and(|object| {
-                let object = object.borrow();
-                object.has_direct(key) || object.own_getter(key).is_some()
-            });
-            if has_stored_property {
-                target.get_property(key)
-            } else {
-                window_named_property(key).unwrap_or(Value::Undefined)
+        .live_target()
+        .get(|target, key, receiver| {
+            // Own data and the prototype chain, without cloning the window's
+            // property map. `get_direct` does not re-enter this trap.
+            let Some(object) = target.as_object() else {
+                return window_named_property(key).unwrap_or(Value::Undefined);
+            };
+            let value = object.borrow().get_direct(key);
+            if !value.is_undefined() {
+                return value;
             }
+            let getter = object.borrow().get_direct(&format!("__w3cos_getter_{key}"));
+            if !getter.is_undefined() {
+                return getter.call(receiver.clone(), vec![]);
+            }
+            if object.borrow().has_direct(key) {
+                return value;
+            }
+            window_named_property(key).unwrap_or(Value::Undefined)
         })
         .has(|target, key| {
             target.as_object().is_some_and(|object| {
@@ -20375,8 +21079,14 @@ fn process_cpu_ms() -> f64 {
     };
     let mut fields = stat[end + 1..].split_whitespace();
     // Fields after `comm`: state is field 3, utime field 14, stime field 15.
-    let utime: u64 = fields.nth(11).and_then(|value| value.parse().ok()).unwrap_or(0);
-    let stime: u64 = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+    let utime: u64 = fields
+        .nth(11)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let stime: u64 = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     if ticks <= 0 {
         return 0.0;
     }
@@ -20391,9 +21101,17 @@ fn process_rss_kb() -> (u64, u64) {
     let mut hwm = 0u64;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
-            rss = value.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            rss = value
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
         } else if let Some(value) = line.strip_prefix("VmHWM:") {
-            hwm = value.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            hwm = value
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
         }
     }
     (rss, hwm)
@@ -20434,7 +21152,8 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     {
         let started = Instant::now();
-        let frame = crate::headless::render_document_rgba(width, height).map_err(|error| error.to_string())?;
+        let frame = crate::headless::render_document_rgba(width, height)
+            .map_err(|error| error.to_string())?;
         let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut checksum = frame.rgba.len() as u64;
         for (index, byte) in frame.rgba.iter().enumerate() {
@@ -20724,6 +21443,11 @@ pub fn reset_bridge() {
     w3cos_core::promise::advance_realm_generation();
     ELEMENT_VALUES.with(|c| c.borrow_mut().clear());
     TREE_METHOD_CACHE.with(|cache| cache.borrow_mut().clear());
+    DISPATCH_METHOD.with(|slot| slot.borrow_mut().take());
+    DISPATCH_OVERRIDE.with(|flag| flag.set(false));
+    CHILD_INDEX.with(|cache| cache.borrow_mut().take());
+    COLLECTION_ROOTS.with(|roots| roots.borrow_mut().clear());
+    LENGTH_SHADOWS.with(|shadows| shadows.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
     KNOWN_EXPANDS.with(|c| c.borrow_mut().clear());
     OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().clear());
@@ -20731,7 +21455,7 @@ pub fn reset_bridge() {
     ATTRIBUTE_VALUES.with(|cache| cache.borrow_mut().clear());
     SELECTOR_ID_CACHE.with(|cache| cache.borrow_mut().clear());
     SELECTOR_ID_CACHE_GENERATION.with(|generation| generation.set(0));
-    STYLE_CACHE.with(|c| c.borrow_mut().clear());
+    STYLE_CACHE.with(|c| c.borrow_mut().clear_entries());
     STYLE_OBJECT_NODES.with(|nodes| nodes.borrow_mut().clear());
     HTML_CREATE_ELEMENT_FOLD.with(|fold| fold.set(None));
     CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
@@ -20917,7 +21641,7 @@ mod tests {
             assert_eq!(host.get_property("contentDocument").is_null(), !readable);
         }
     }
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     fn setup() {
@@ -20936,6 +21660,57 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    #[test]
+    fn document_visibilitychange_reaches_listener() {
+        setup();
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_cb = Rc::clone(&hits);
+        document_value().call_method(
+            "addEventListener",
+            vec![
+                Value::string("visibilitychange"),
+                Value::function(move |_, _| {
+                    hits_cb.set(hits_cb.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(set_document_visibility("hidden"));
+        assert_eq!(hits.get(), 1, "visibilitychange listener should run");
+    }
+
+    #[test]
+    fn authored_prototype_survives_remove_on_dom_immediate() {
+        setup();
+        let doc = document_value();
+        let el = doc.call_method("createElement", vec![Value::string("div")]);
+        assert!(el.live_dom_node().is_some());
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let proto = Value::object(std::collections::HashMap::new());
+        proto.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        w3cos_core::class::set_prototype_of(&el, &proto);
+        el.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        el.set_property("ready", Value::string("yes"));
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![el.clone()]);
+        body.call_method("removeChild", vec![el.clone()]);
+        let class = Value::object(std::collections::HashMap::new());
+        class.set_property("prototype", proto);
+        assert!(
+            w3cos_core::class::instance_of(&el, &class),
+            "custom prototype must survive removeChild"
+        );
+        assert_eq!(el.get_property("ready").to_js_string(), "yes");
+        assert_eq!(calls.get(), 1, "disconnectedCallback should run");
     }
 
     #[test]
@@ -21017,9 +21792,11 @@ mod tests {
             assert!(console.strict_eq(&window_value().get_property("console")));
             for name in ["log", "info", "warn", "error", "debug"] {
                 assert!(console.get_property(name).is_callable());
-                assert!(console
-                    .call_method(name, vec![Value::string("console-bridge-probe")])
-                    .is_undefined());
+                assert!(
+                    console
+                        .call_method(name, vec![Value::string("console-bridge-probe")])
+                        .is_undefined()
+                );
             }
             return;
         }
@@ -21028,7 +21805,11 @@ mod tests {
         for enabled in [false, true] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
-                .args(["--exact", "jsdom::tests::window_console_routes_esm_diagnostics_to_core_sink", "--nocapture"])
+                .args([
+                    "--exact",
+                    "jsdom::tests::window_console_routes_esm_diagnostics_to_core_sink",
+                    "--nocapture",
+                ])
                 .env(PROBE, "1")
                 .env_remove("W3COS_JS_CONSOLE");
             if enabled {
@@ -22016,7 +22797,10 @@ mod tests {
     }
 
     fn assert_child_nodes_contents(list: &Value, expected: &[Value]) {
-        assert_eq!(list.get_property("length").to_u32() as usize, expected.len());
+        assert_eq!(
+            list.get_property("length").to_u32() as usize,
+            expected.len()
+        );
         let object = list.as_object().expect("childNodes must be an object");
         let keys = object
             .borrow()
@@ -22102,7 +22886,12 @@ mod tests {
         parent.call_method("replaceChild", vec![replacement.clone(), first.clone()]);
         assert_child_nodes_contents(
             &list,
-            &[second.clone(), replacement.clone(), comment.clone(), text.clone()],
+            &[
+                second.clone(),
+                replacement.clone(),
+                comment.clone(),
+                text.clone(),
+            ],
         );
         destination.call_method("appendChild", vec![comment.clone()]);
         assert_child_nodes_contents(&list, &[second.clone(), replacement.clone(), text.clone()]);
@@ -22372,7 +23161,10 @@ mod tests {
             assert!(first.strict_eq(&document.get_property("location")));
             assert!(first.strict_eq(&window.get_property("location")));
             assert!(first.strict_eq(&location_value()));
-            assert!(w3cos_core::class::instance_of(&first, &window.get_property("Location")));
+            assert!(w3cos_core::class::instance_of(
+                &first,
+                &window.get_property("Location")
+            ));
         }
     }
 
@@ -22382,7 +23174,10 @@ mod tests {
         let document = document_value();
         let location = document.get_property("location");
         let window = window_value();
-        location.call_method("assign", vec![Value::string("https://example.test:8000/base?x=1#old")]);
+        location.call_method(
+            "assign",
+            vec![Value::string("https://example.test:8000/base?x=1#old")],
+        );
         assert_eq!(location.get_property("hash"), Value::string("#old"));
         for (name, input, expected) in [
             ("protocol", "http", "http:"),
@@ -22393,18 +23188,29 @@ mod tests {
             ("search", "q=2", "?q=2"),
             ("hash", "new", "#new"),
         ] {
-            document.get_property("location").set_property(name, Value::string(input));
+            document
+                .get_property("location")
+                .set_property(name, Value::string(input));
             assert_eq!(location.get_property(name), Value::string(expected));
-            assert_eq!(window.get_property("location").get_property(name), Value::string(expected));
+            assert_eq!(
+                window.get_property("location").get_property(name),
+                Value::string(expected)
+            );
         }
-        assert_eq!(location.get_property("origin"), Value::string("http://final.test:8080"));
+        assert_eq!(
+            location.get_property("origin"),
+            Value::string("http://final.test:8080")
+        );
         let before_replace = crate::history::get_length();
         location.call_method("replace", vec![Value::string("/replaced#replacement")]);
         assert_eq!(crate::history::get_length(), before_replace);
         assert_eq!(location.get_property("hash"), Value::string("#replacement"));
         location.set_property("href", Value::string("https://new.test/end#last"));
         assert_eq!(location.get_property("hostname"), Value::string("new.test"));
-        assert_eq!(location.call_method("toString", vec![]), location.get_property("href"));
+        assert_eq!(
+            location.call_method("toString", vec![]),
+            location.get_property("href")
+        );
         assert!(crate::history::back());
         assert_eq!(location.get_property("hash"), Value::string("#replacement"));
         assert!(crate::history::forward());
@@ -22425,15 +23231,23 @@ mod tests {
         let assign = old.get_property("assign");
         let replace = old.get_property("replace");
         old.set_property("__page_marker", Value::Bool(true));
-        crate::dom_constructors::prototype("Location").set_property("__page_marker", Value::Bool(true));
+        crate::dom_constructors::prototype("Location")
+            .set_property("__page_marker", Value::Bool(true));
         reset_bridge();
         assert!(LOCATION_VALUE.with(|slot| slot.borrow().is_none()));
-        assert!(old_weak.upgrade().is_none(), "old arena object must be invalidated");
+        assert!(
+            old_weak.upgrade().is_none(),
+            "old arena object must be invalidated"
+        );
         crate::history::reset();
         let next = location_value();
         assert!(next.get_property("__page_marker").is_undefined());
         for method in [getter, href_getter, setter, assign, replace] {
-            assert!(method.call(old.clone(), vec![Value::string("https://stale.test/#bad")]).is_undefined());
+            assert!(
+                method
+                    .call(old.clone(), vec![Value::string("https://stale.test/#bad")])
+                    .is_undefined()
+            );
         }
         old.set_property("hash", Value::string("bad"));
         assert_eq!(next.get_property("href"), Value::string("w3cos://app/"));
@@ -22448,7 +23262,10 @@ mod tests {
             drop(location);
             reset_bridge();
             assert!(LOCATION_VALUE.with(|slot| slot.borrow().is_none()));
-            assert!(weak.upgrade().is_none(), "reset must release the cached facade");
+            assert!(
+                weak.upgrade().is_none(),
+                "reset must release the cached facade"
+            );
             let after = w3cos_core::heap::heap_snapshot();
             assert_eq!(after.live_objects, baseline.live_objects);
             assert_eq!(after.live_functions, baseline.live_functions);
@@ -22494,20 +23311,48 @@ mod tests {
             "text/html",
             "https://example.test/frame#child-target",
         );
-        install_frame_document(node_id_of(&iframe).unwrap(), frame.clone(), "https://example.test/frame#child-target");
+        install_frame_document(
+            node_id_of(&iframe).unwrap(),
+            frame.clone(),
+            "https://example.test/frame#child-target",
+        );
         let child_location = frame.get_property("location");
         assert!(!child_location.strict_eq(&parent_location));
-        assert!(child_location.strict_eq(&iframe.get_property("contentWindow").get_property("location")));
+        assert!(
+            child_location.strict_eq(
+                &iframe
+                    .get_property("contentWindow")
+                    .get_property("location")
+            )
+        );
         let child = frame.call_method("getElementById", vec![Value::string("child-target")]);
         assert!(child.get_property("ownerDocument").strict_eq(&frame));
-        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
-        assert_eq!(parent_target.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        assert_eq!(
+            child.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            parent_target.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(true)
+        );
         parent_location.set_property("hash", Value::string("other-parent"));
-        assert_eq!(child_location.get_property("hash"), Value::string("#child-target"));
-        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        assert_eq!(
+            child_location.get_property("hash"),
+            Value::string("#child-target")
+        );
+        assert_eq!(
+            child.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(true)
+        );
         child_location.set_property("hash", Value::string("#different-child"));
-        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(false));
-        assert_eq!(parent_location.get_property("hash"), Value::string("#other-parent"));
+        assert_eq!(
+            child.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parent_location.get_property("hash"),
+            Value::string("#other-parent")
+        );
         let detached = parse_document("<html><body></body></html>", "text/html");
         assert!(detached.get_property("location").is_null());
     }
@@ -22519,17 +23364,31 @@ mod tests {
         let window = window_value();
         let location = document.get_property("location");
         location.set_property("marker", Value::Number(42.0));
-        assert_eq!(window.get_property("location").get_property("marker"), Value::Number(42.0));
-        let replacement = Value::object(HashMap::from([("hash".into(), Value::string("#override"))]));
+        assert_eq!(
+            window.get_property("location").get_property("marker"),
+            Value::Number(42.0)
+        );
+        let replacement =
+            Value::object(HashMap::from([("hash".into(), Value::string("#override"))]));
         document.set_property("location", replacement.clone());
         assert!(document.get_property("location").strict_eq(&replacement));
         assert!(window.get_property("location").strict_eq(&location));
         document.delete_property("location");
         assert!(document.get_property("location").strict_eq(&location));
         location.set_property("assign", func(|_, _| Value::Number(17.0)));
-        assert_eq!(document.get_property("location").call_method("assign", vec![]), Value::Number(17.0));
+        assert_eq!(
+            document
+                .get_property("location")
+                .call_method("assign", vec![]),
+            Value::Number(17.0)
+        );
         window.get_property("location").delete_property("assign");
-        assert!(document.get_property("location").get_property("assign").is_undefined());
+        assert!(
+            document
+                .get_property("location")
+                .get_property("assign")
+                .is_undefined()
+        );
         window.delete_property("location");
         assert!(window_value().get_property("location").is_undefined());
         assert!(document.get_property("location").strict_eq(&location));
@@ -22544,33 +23403,59 @@ mod tests {
         let reads = Rc::new(Cell::new(0));
         let observed = Rc::clone(&reads);
         let original = document.get_property("__w3cos_getter_location");
-        document.set_property("__w3cos_getter_location", func(move |_, _| {
-            observed.set(observed.get() + 1);
-            w3cos_core::throw_value(Value::string("authored location getter"))
-        }));
+        document.set_property(
+            "__w3cos_getter_location",
+            func(move |_, _| {
+                observed.set(observed.get() + 1);
+                w3cos_core::throw_value(Value::string("authored location getter"))
+            }),
+        );
         let missing = w3cos_core::catch_js(|| element.call_method("matches", vec![])).unwrap_err();
         assert_eq!(missing.get_property("name"), Value::string("TypeError"));
-        assert_eq!(missing.get_property("message"), Value::string("matches requires one argument"));
+        assert_eq!(
+            missing.get_property("message"),
+            Value::string("matches requires one argument")
+        );
         assert_eq!(reads.get(), 0);
-        let error = w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")])).unwrap_err();
+        let error =
+            w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")]))
+                .unwrap_err();
         assert_eq!(error, Value::string("authored location getter"));
         assert_eq!(reads.get(), 1);
         document.set_property("__w3cos_getter_location", original);
-        let invalid = w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")])).unwrap_err();
+        let invalid =
+            w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")]))
+                .unwrap_err();
         assert_eq!(invalid.get_property("name"), Value::string("SyntaxError"));
-        assert_eq!(invalid.get_property("message"), Value::string("Invalid selector"));
+        assert_eq!(
+            invalid.get_property("message"),
+            Value::string("Invalid selector")
+        );
         let hash_reads = Rc::new(Cell::new(0));
         let observed = Rc::clone(&hash_reads);
-        document.set_property("location", Value::object(HashMap::from([(
-            "__w3cos_getter_hash".into(),
-            func(move |_, _| {
-                observed.set(observed.get() + 1);
-                Value::string("")
-            }),
-        )])));
-        assert_eq!(element.call_method("matches", vec![Value::string(".active")]), Value::Bool(true));
-        assert_eq!(element.call_method("matches", vec![Value::string(".inactive")]), Value::Bool(false));
-        assert_eq!(hash_reads.get(), 2, "even simple selectors must retain observable property reads");
+        document.set_property(
+            "location",
+            Value::object(HashMap::from([(
+                "__w3cos_getter_hash".into(),
+                func(move |_, _| {
+                    observed.set(observed.get() + 1);
+                    Value::string("")
+                }),
+            )])),
+        );
+        assert_eq!(
+            element.call_method("matches", vec![Value::string(".active")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            element.call_method("matches", vec![Value::string(".inactive")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            hash_reads.get(),
+            2,
+            "even simple selectors must retain observable property reads"
+        );
     }
 
     #[test]
@@ -24397,9 +25282,15 @@ mod tests {
         for (node, css) in [
             (&target, "width:100px;display:flex"),
             (&moved, "display:contents"),
-            (&item, "display:inline;background:green;height:100px;flex-grow:1"),
+            (
+                &item,
+                "display:inline;background:green;height:100px;flex-grow:1",
+            ),
         ] {
-            node.call_method("setAttribute", vec![Value::string("style"), Value::string(css)]);
+            node.call_method(
+                "setAttribute",
+                vec![Value::string("style"), Value::string(css)],
+            );
         }
         moved.call_method("appendChild", vec![item.clone()]);
         source.call_method("appendChild", vec![moved.clone()]);
@@ -24409,8 +25300,10 @@ mod tests {
         assert!(item.get_property("parentNode") == moved);
         let tree = dom::to_component_tree();
         let flat = crate::layout::pre_flatten(&tree);
-        let index = flat.iter().position(|node|
-            node.style.background == w3cos_std::Color::rgb(0, 128, 0)).unwrap();
+        let index = flat
+            .iter()
+            .position(|node| node.style.background == w3cos_std::Color::rgb(0, 128, 0))
+            .unwrap();
         assert_eq!(flat[index].style.display, w3cos_std::style::Display::Block);
         let layouts = crate::layout::compute(&tree, 800.0, 600.0).unwrap();
         let rect = layouts.iter().find(|(_, node)| *node == index).unwrap().0;
@@ -25298,6 +26191,89 @@ try {
     }
 
     #[test]
+    fn column_flex_fixed_rows_sum_offset_height() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("display", Value::string("flex"));
+        root_style.set_property("flexDirection", Value::string("column"));
+        for i in 0..8 {
+            let row = document.call_method("createElement", vec![Value::string("div")]);
+            row.set_property("textContent", Value::string(&format!("f {i}")));
+            let style = row.get_property("style");
+            style.set_property("height", Value::string("18px"));
+            style.set_property("flex", Value::string("0 0 auto"));
+            root.call_method("appendChild", vec![row]);
+        }
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            8.0
+        );
+        assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+    }
+
+    #[test]
+    fn overflow_and_absolute_layer_keep_definite_border_boxes() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let scroller = create_in_body("div");
+        let scroller_style = scroller.get_property("style");
+        scroller_style.set_property("width", Value::string("400px"));
+        scroller_style.set_property("height", Value::string("300px"));
+        scroller_style.set_property("overflow", Value::string("auto"));
+        for i in 0..12 {
+            let row = document.call_method("createElement", vec![Value::string("div")]);
+            row.set_property("textContent", Value::string(&format!("row {i}")));
+            row.get_property("style")
+                .set_property("height", Value::string("28px"));
+            scroller.call_method("appendChild", vec![row]);
+        }
+        let layer = create_in_body("div");
+        let layer_style = layer.get_property("style");
+        layer_style.set_property("position", Value::string("relative"));
+        layer_style.set_property("width", Value::string("400px"));
+        layer_style.set_property("height", Value::string("200px"));
+        let box_el = document.call_method("createElement", vec![Value::string("div")]);
+        let box_style = box_el.get_property("style");
+        box_style.set_property("position", Value::string("absolute"));
+        box_style.set_property("width", Value::string("16px"));
+        box_style.set_property("height", Value::string("16px"));
+        box_style.set_property("left", Value::string("20px"));
+        box_style.set_property("top", Value::string("0px"));
+        layer.call_method("appendChild", vec![box_el.clone()]);
+        assert_eq!(scroller.get_property("offsetHeight").to_number(), 300.0);
+        assert_eq!(layer.get_property("offsetHeight").to_number(), 200.0);
+        assert_eq!(scroller.get_property("scrollHeight").to_number(), 336.0);
+        box_style.set_property("top", Value::string("40px"));
+        assert_eq!(layer.get_property("offsetHeight").to_number(), 200.0);
+        assert_eq!(scroller.get_property("offsetHeight").to_number(), 300.0);
+        let layer_top = layer
+            .call_method("getBoundingClientRect", vec![])
+            .get_property("top")
+            .to_number();
+        let box_top = box_el
+            .call_method("getBoundingClientRect", vec![])
+            .get_property("top")
+            .to_number();
+        assert_eq!(box_top - layer_top, 40.0);
+    }
+
+    #[test]
     fn sole_inline_image_bottom_aligns_inside_the_block_line_strut() {
         setup();
         set_viewport(800.0, 600.0);
@@ -25482,8 +26458,11 @@ try {
             .call_method("getBoundingClientRect", Vec::new())
             .get_property("top")
             .to_number();
-        assert_eq!(with_text_top - wrapper_top, 100.0,
-            "inserting real preceding text must restore the used line height");
+        assert_eq!(
+            with_text_top - wrapper_top,
+            100.0,
+            "inserting real preceding text must restore the used line height"
+        );
     }
 
     #[test]
@@ -28027,10 +29006,7 @@ try {
     fn focused_text_input_outline_survives_state_preserving_move() {
         setup();
         w3cos_dom::stylesheet::clear_rules();
-        w3cos_dom::stylesheet::register_rule(
-            ":focus-visible",
-            &[("outline", "2px solid green")],
-        );
+        w3cos_dom::stylesheet::register_rule(":focus-visible", &[("outline", "2px solid green")]);
         let document = document_value();
         let origin = create_in_body("div");
         let destination = create_in_body("div");
@@ -28039,18 +29015,29 @@ try {
         movable.call_method("appendChild", vec![input.clone()]);
         origin.call_method("appendChild", vec![movable.clone()]);
         let input_id = NodeId::from_u32(node_id_of(&input).unwrap());
-        let outline_width = || {
-            dom::with_document(|tree| tree.computed_style_for(input_id).outline_width)
-        };
+        let outline_width =
+            || dom::with_document(|tree| tree.computed_style_for(input_id).outline_width);
         assert_eq!(outline_width(), 0.0);
         input.call_method("focus", vec![]);
         assert!(document.get_property("activeElement") == input);
-        assert_eq!(outline_width(), 2.0, "focused text input must match :focus-visible");
+        assert_eq!(
+            outline_width(),
+            2.0,
+            "focused text input must match :focus-visible"
+        );
         destination.call_method("moveBefore", vec![movable, Value::Null]);
         assert!(document.get_property("activeElement") == input);
-        assert_eq!(outline_width(), 2.0, "moveBefore must preserve focus styling");
+        assert_eq!(
+            outline_width(),
+            2.0,
+            "moveBefore must preserve focus styling"
+        );
         input.call_method("blur", vec![]);
-        assert_eq!(outline_width(), 0.0, "blur must invalidate cached focus styling");
+        assert_eq!(
+            outline_width(),
+            0.0,
+            "blur must invalidate cached focus styling"
+        );
         w3cos_dom::stylesheet::clear_rules();
     }
 
@@ -28063,7 +29050,9 @@ try {
         let input = document.call_method("createElement", vec![Value::string("input")]);
         origin.call_method("appendChild", vec![input.clone()]);
         let matches = |element: &Value, selector: &str| {
-            element.call_method("matches", vec![Value::string(selector)]).to_bool()
+            element
+                .call_method("matches", vec![Value::string(selector)])
+                .to_bool()
         };
         assert!(!matches(&input, ":focus"));
         input.call_method("focus", vec![]);
@@ -28086,30 +29075,61 @@ try {
         let input = create_in_body("input");
         let button_id = node_id_of(&button).unwrap();
         let visible = |element: &Value| {
-            element.call_method("matches", vec![Value::string(":focus-visible")]).to_bool()
+            element
+                .call_method("matches", vec![Value::string(":focus-visible")])
+                .to_bool()
         };
         button.call_method("focus", vec![]);
-        assert!(visible(&button), "initial programmatic focus indicates focus");
-        dispatch_native_pointer(button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1,
-            0.5, true, false, false, false, false);
+        assert!(
+            visible(&button),
+            "initial programmatic focus indicates focus"
+        );
+        dispatch_native_pointer(
+            button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1, 0.5, true, false, false, false, false,
+        );
         dispatch_native_focus(button_id, true);
-        assert!(!visible(&button), "pointer-focused button does not indicate focus");
-        dispatch_sync(button_id, EventType::KeyDown, EventData::Keyboard(
-            w3cos_dom::events::KeyboardEventData {
-                key: "a".into(), code: "KeyA".into(), ctrl_key: false,
-                shift_key: false, alt_key: false, meta_key: false,
-                repeat: false, location: 0,
-            },
-        ));
-        assert!(!visible(&button), "synthetic keyboard dispatch must not change modality");
-        dispatch_native_key(button_id, "a", "KeyA", false, false, false, false, false, true);
-        assert!(visible(&button), "trusted keyboard input indicates existing focus");
-        dispatch_native_pointer(button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1,
-            0.5, true, false, false, false, false);
+        assert!(
+            !visible(&button),
+            "pointer-focused button does not indicate focus"
+        );
+        dispatch_sync(
+            button_id,
+            EventType::KeyDown,
+            EventData::Keyboard(w3cos_dom::events::KeyboardEventData {
+                key: "a".into(),
+                code: "KeyA".into(),
+                ctrl_key: false,
+                shift_key: false,
+                alt_key: false,
+                meta_key: false,
+                repeat: false,
+                location: 0,
+            }),
+        );
+        assert!(
+            !visible(&button),
+            "synthetic keyboard dispatch must not change modality"
+        );
+        dispatch_native_key(
+            button_id, "a", "KeyA", false, false, false, false, false, true,
+        );
+        assert!(
+            visible(&button),
+            "trusted keyboard input indicates existing focus"
+        );
+        dispatch_native_pointer(
+            button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1, 0.5, true, false, false, false, false,
+        );
         input.call_method("focus", vec![]);
-        assert!(visible(&input), "text inputs indicate focus even in pointer modality");
+        assert!(
+            visible(&input),
+            "text inputs indicate focus even in pointer modality"
+        );
         button.call_method("focus", vec![]);
-        assert!(visible(&button), "script focus transfer preserves prior indication");
+        assert!(
+            visible(&button),
+            "script focus transfer preserves prior indication"
+        );
     }
 
     #[test]
@@ -28482,18 +29502,34 @@ try {
     #[test]
     fn multicol_cssom_and_supports_use_same_property_grammar() {
         setup();
-        for (property, value) in [("columns", "3 100px"), ("column-width", "2em"),
-            ("column-count", "auto"), ("column-fill", "balance-all")] {
-            assert!(css_property_supported(property, value), "{property}:{value}");
+        for (property, value) in [
+            ("columns", "3 100px"),
+            ("column-width", "2em"),
+            ("column-count", "auto"),
+            ("column-fill", "balance-all"),
+        ] {
+            assert!(
+                css_property_supported(property, value),
+                "{property}:{value}"
+            );
         }
-        for (property, value) in [("columns", "3 4"), ("column-width", "20%"),
-            ("column-count", "0"), ("column-fill", "stretch")] {
-            assert!(!css_property_supported(property, value), "{property}:{value}");
+        for (property, value) in [
+            ("columns", "3 4"),
+            ("column-width", "20%"),
+            ("column-count", "0"),
+            ("column-fill", "stretch"),
+        ] {
+            assert!(
+                !css_property_supported(property, value),
+                "{property}:{value}"
+            );
         }
         let parent = create_in_body("div");
         let child = document_value().call_method("createElement", vec![Value::string("div")]);
         parent.call_method("appendChild", vec![child.clone()]);
-        parent.get_property("style").set_property("columns", Value::string("3 100px"));
+        parent
+            .get_property("style")
+            .set_property("columns", Value::string("3 100px"));
         let style = child.get_property("style");
         style.set_property("columns", Value::string("inherit"));
         style.set_property("columnWidth", Value::string("120px"));
@@ -28501,7 +29537,10 @@ try {
         let computed = window_value().call_method("getComputedStyle", vec![child]);
         assert_eq!(computed.get_property("columnWidth"), Value::string("120px"));
         assert_eq!(computed.get_property("columnCount"), Value::string("3"));
-        assert_eq!(computed.get_property("columnFill"), Value::string("balance"));
+        assert_eq!(
+            computed.get_property("columnFill"),
+            Value::string("balance")
+        );
     }
 
     #[test]
@@ -28703,5 +29742,119 @@ try {
         );
         assert_eq!(container.get_property("scrollTop").to_number(), 170.0);
         assert_eq!(scroll_events.get(), 1);
+    }
+
+    #[test]
+    #[ignore = "manual split of the 400-click dispatch path"]
+    fn profile_click_dispatch_split() {
+        setup();
+        let document = document_value();
+        let root = document.call_method("createElement", vec![Value::string("div")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![root.clone()]);
+        let hits = Rc::new(Cell::new(0u32));
+        for i in 0..400 {
+            let el = document.call_method("createElement", vec![Value::string("button")]);
+            let hits = Rc::clone(&hits);
+            el.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("click"),
+                    func(move |_, _| {
+                        hits.set(hits.get() + 1);
+                        Value::Undefined
+                    }),
+                ],
+            );
+            let _ = i;
+            root.call_method("appendChild", vec![el]);
+        }
+        let nodes = root.get_property("childNodes");
+        let length = nodes.get_property("length").to_number() as usize;
+        let window = window_value();
+        let class = window.get_property("Event");
+        // Warm the intern table and the event pool, then time each slice the
+        // AOT loop pays. The official loop re-reads `window.Event` and
+        // `nodes.length` on every iteration.
+        for n in 0..length {
+            let _ = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
+            let _ = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+        }
+        let time = |body: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            body();
+            started.elapsed()
+        };
+        let index = time(&mut || {
+            for n in 0..length {
+                let _ = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
+            }
+        });
+        let length_get = time(&mut || {
+            for _ in 0..length {
+                let loaded = nodes.clone();
+                let len = loaded.get_property("length");
+                let _ = w3cos_core::intrinsics::less_than(&Value::Number(0.0), &len).to_bool();
+            }
+        });
+        let event_get = time(&mut || {
+            for _ in 0..length {
+                let _ =
+                    w3cos_core::intrinsics::get_property(&window_value(), &Value::string("Event"));
+            }
+        });
+        let click_str = time(&mut || {
+            for _ in 0..length {
+                std::hint::black_box(Value::string("click"));
+            }
+        });
+        let construct = time(&mut || {
+            for _ in 0..length {
+                let _ = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+            }
+        });
+        let mut dispatch_only = Vec::new();
+        let mut aot_like = Vec::new();
+        for _ in 0..3 {
+            hits.set(0);
+            let events: Vec<Value> = (0..length)
+                .map(|_| w3cos_core::class::construct_slice(&class, &[Value::string("click")]))
+                .collect();
+            let nodes_for_dispatch = (0..length)
+                .map(|n| w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64)))
+                .collect::<Vec<_>>();
+            dispatch_only.push(time(&mut || {
+                for (node, event) in nodes_for_dispatch.iter().zip(events.iter()) {
+                    let _ = node.call_method_slice("dispatchEvent", std::slice::from_ref(event));
+                }
+            }));
+            hits.set(0);
+            aot_like.push(time(&mut || {
+                let mut n = 0.0_f64;
+                loop {
+                    let loaded = nodes.clone();
+                    let len = loaded.get_property("length");
+                    if !w3cos_core::intrinsics::less_than(&Value::Number(n), &len).to_bool() {
+                        break;
+                    }
+                    let loaded = nodes.clone();
+                    let node = w3cos_core::intrinsics::get_property(&loaded, &Value::Number(n));
+                    let class = w3cos_core::intrinsics::get_property(
+                        &window_value(),
+                        &Value::string("Event"),
+                    );
+                    let event =
+                        w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+                    let _ = node.call_method_slice("dispatchEvent", &[event]);
+                    n = n * 1.0 + 1.0;
+                }
+            }));
+        }
+        eprintln!(
+            "PROFILE index={index:?} length={length_get:?} event_get={event_get:?} click={click_str:?} construct={construct:?} dispatch_only={dispatch_only:?} aot_like={aot_like:?} hits={}",
+            hits.get()
+        );
+        assert_eq!(hits.get(), 400);
     }
 }

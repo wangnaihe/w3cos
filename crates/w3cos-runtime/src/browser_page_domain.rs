@@ -25,7 +25,10 @@ pub enum PageCommand {
     },
     /// Parse a local document on this worker. There is no grant command:
     /// the worker's [`crate::capability_gate`] starts empty and stays empty.
-    LoadDocument { html: String, url: String },
+    LoadDocument {
+        html: String,
+        url: String,
+    },
     Shutdown,
 }
 
@@ -42,7 +45,10 @@ pub enum PageEvent {
     Error(String),
     Stopped,
     /// Reported after the worker clears its own permission store.
-    Gate { permission: &'static str, granted: bool },
+    Gate {
+        permission: &'static str,
+        granted: bool,
+    },
 }
 
 pub struct BrowserPageDomain {
@@ -159,7 +165,8 @@ fn page_worker(
                             let snapshot = crate::dom::to_component_tree();
                             crate::dom::clear_document_dirty();
                             let _ = events.send(PageEvent::Snapshot(snapshot));
-                            let _ = events.send(PageEvent::Progress(DocumentLoadProgress::Complete));
+                            let _ =
+                                events.send(PageEvent::Progress(DocumentLoadProgress::Complete));
                             active = false;
                             Ok(None)
                         }
@@ -234,8 +241,9 @@ fn walk_text(component: &w3cos_std::Component, out: &mut String) {
 /// Run `html` on a `BrowserPageDomain` worker and return the snapshot the
 /// worker produced. The caller never touches the page's DOM or VM.
 pub fn load_html_snapshot(html: &str, url: &str) -> anyhow::Result<w3cos_std::Component> {
-    let domain = BrowserPageDomain::spawn(BrowserMode::Interactive, DocumentLoaderOptions::default())
-        .map_err(|error| anyhow::anyhow!("could not start the page worker: {error}"))?;
+    let domain =
+        BrowserPageDomain::spawn(BrowserMode::Interactive, DocumentLoaderOptions::default())
+            .map_err(|error| anyhow::anyhow!("could not start the page worker: {error}"))?;
     domain
         .send(PageCommand::LoadDocument {
             html: html.to_string(),
@@ -256,7 +264,8 @@ pub fn load_html_snapshot(html: &str, url: &str) -> anyhow::Result<w3cos_std::Co
             Some(_) => {}
         }
     }
-    let mut snapshot = snapshot.ok_or_else(|| anyhow::anyhow!("page worker produced no snapshot"))?;
+    let mut snapshot =
+        snapshot.ok_or_else(|| anyhow::anyhow!("page worker produced no snapshot"))?;
     // The worker keeps the live document. The snapshot the UI paints must not
     // carry host ids, or the UI thread would look those ids up in its own DOM.
     detach_host_ids(&mut snapshot);

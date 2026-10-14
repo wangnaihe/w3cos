@@ -6,27 +6,68 @@ fn edge_aligned_cell_image_reserves_the_containing_line_strut() {
     for alignment in [WAlignSelf::Center, WAlignSelf::FlexEnd] {
         for image_alignment in [WAlignSelf::FlexStart, WAlignSelf::FlexEnd] {
             for extra in [0.0, 20.0] {
-                let mut style = Style { display: WDisplay::TableCell,
-                    align_self: alignment, font_family: Some("Ahem".into()),
-                    font_size: 20.0, line_height: 1.1, line_height_is_normal: false,
-                    ..Style::default() };
+                let mut style = Style {
+                    display: WDisplay::TableCell,
+                    align_self: alignment,
+                    font_family: Some("Ahem".into()),
+                    font_size: 20.0,
+                    line_height: 1.1,
+                    line_height_is_normal: false,
+                    ..Style::default()
+                };
                 style.padding.bottom = WSpacing::Px(20.0);
-                let cell = Component::row(style.clone(), vec![Component::image(
-                    "cell-image-strut.png", Style { display: WDisplay::InlineBlock,
-                        align_self: image_alignment, width: WDim::Px(20.0),
-                        height: WDim::Px(20.0), ..style.clone() })]);
-                let image_top = if image_alignment == WAlignSelf::FlexStart { 64.0 } else { 66.0 };
+                let cell = Component::row(
+                    style.clone(),
+                    vec![Component::image(
+                        "cell-image-strut.png",
+                        Style {
+                            display: WDisplay::InlineBlock,
+                            align_self: image_alignment,
+                            width: WDim::Px(20.0),
+                            height: WDim::Px(20.0),
+                            ..style.clone()
+                        },
+                    )],
+                );
+                let image_top = if image_alignment == WAlignSelf::FlexStart {
+                    64.0
+                } else {
+                    66.0
+                };
                 let mut layouts = vec![
-                    (LayoutRect { x: 8.0, y: 64.0, width: 40.0, height: 42.0 + extra }, 0),
-                    (LayoutRect { x: 8.0, y: image_top, width: 20.0, height: 20.0 }, 1),
+                    (
+                        LayoutRect {
+                            x: 8.0,
+                            y: 64.0,
+                            width: 40.0,
+                            height: 42.0 + extra,
+                        },
+                        0,
+                    ),
+                    (
+                        LayoutRect {
+                            x: 8.0,
+                            y: image_top,
+                            width: 20.0,
+                            height: 20.0,
+                        },
+                        1,
+                    ),
                 ];
                 // Cell padding is not inherited by the image.
                 let mut cell = cell;
                 cell.children[0].style.padding = Default::default();
-                let offset = if alignment == WAlignSelf::Center { extra * 0.5 } else { extra };
+                let offset = if alignment == WAlignSelf::Center {
+                    extra * 0.5
+                } else {
+                    extra
+                };
                 align_table_cell_baselines(&mut layouts, &pre_flatten(&cell), 800.0, 600.0);
-                assert_eq!(layouts[1].0.y, image_top + offset,
-                    "align the line box, not image ink: cell={alignment:?}, image={image_alignment:?}, extra={extra}");
+                assert_eq!(
+                    layouts[1].0.y,
+                    image_top + offset,
+                    "align the line box, not image ink: cell={alignment:?}, image={image_alignment:?}, extra={extra}"
+                );
                 assert_eq!(layouts[0].0.height, 42.0 + extra);
             }
         }
@@ -35,30 +76,94 @@ fn edge_aligned_cell_image_reserves_the_containing_line_strut() {
 
 #[test]
 fn wrapped_atomic_line_projects_preceding_text_only_line() {
-    let text_style = Style { display: WDisplay::Inline,
-        font_family: Some("Ahem".into()), font_size: 20.0,
-        line_height: 1.0, line_height_is_normal: false, ..Style::default() };
-    let mut host = Style { display: WDisplay::Flex, width: WDim::Px(100.0),
-        ..text_style.clone() };
-    host.custom_properties.get_or_insert_with(Default::default).insert(
-        "--w3cos-internal-inline-formatting-context".into(), "1".into());
-    let root = Component::row(host, vec![
-        Component::text("XX", text_style.clone()),
-        Component::text("XX", text_style.clone()),
-        Component::text("X", text_style.clone()),
-        Component::boxed(Style { display: WDisplay::InlineBlock,
-            width: WDim::Px(20.0), height: WDim::Px(30.0), ..text_style }, vec![]),
-    ]);
+    let text_style = Style {
+        display: WDisplay::Inline,
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..Style::default()
+    };
+    let mut host = Style {
+        display: WDisplay::Flex,
+        width: WDim::Px(100.0),
+        ..text_style.clone()
+    };
+    host.custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-inline-formatting-context".into(),
+            "1".into(),
+        );
+    let root = Component::row(
+        host,
+        vec![
+            Component::text("XX", text_style.clone()),
+            Component::text("XX", text_style.clone()),
+            Component::text("X", text_style.clone()),
+            Component::boxed(
+                Style {
+                    display: WDisplay::InlineBlock,
+                    width: WDim::Px(20.0),
+                    height: WDim::Px(30.0),
+                    ..text_style
+                },
+                vec![],
+            ),
+        ],
+    );
     let mut layouts = vec![
-        (LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 54.0 }, 0),
-        (LayoutRect { x: 0.0, y: 5.0, width: 40.0, height: 20.0 }, 1),
-        (LayoutRect { x: 40.0, y: 5.0, width: 40.0, height: 20.0 }, 2),
-        (LayoutRect { x: 0.0, y: 35.0, width: 20.0, height: 20.0 }, 3),
-        (LayoutRect { x: 20.0, y: 25.0, width: 20.0, height: 30.0 }, 4),
+        (
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 54.0,
+            },
+            0,
+        ),
+        (
+            LayoutRect {
+                x: 0.0,
+                y: 5.0,
+                width: 40.0,
+                height: 20.0,
+            },
+            1,
+        ),
+        (
+            LayoutRect {
+                x: 40.0,
+                y: 5.0,
+                width: 40.0,
+                height: 20.0,
+            },
+            2,
+        ),
+        (
+            LayoutRect {
+                x: 0.0,
+                y: 35.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            3,
+        ),
+        (
+            LayoutRect {
+                x: 20.0,
+                y: 25.0,
+                width: 20.0,
+                height: 30.0,
+            },
+            4,
+        ),
     ];
     align_inline_block_last_line_baselines(&mut layouts, &root);
-    assert_eq!(layouts[1].0.y, 0.0,
-        "text-only first line owns its strut even when the next line contains an atomic");
+    assert_eq!(
+        layouts[1].0.y, 0.0,
+        "text-only first line owns its strut even when the next line contains an atomic"
+    );
 }
 
 #[test]

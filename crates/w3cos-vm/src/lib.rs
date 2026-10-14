@@ -2708,6 +2708,9 @@ mod tests {
         assert!(snapshot.live_bytes > 0);
         assert_eq!(snapshot.live_objects, 1);
         drop(retained);
+        // Page-interned objects are not refcounted. The handle drop leaves the
+        // payload in the page slab until reset, which is what navigation does.
+        w3cos_core::page_arena::reset();
         assert_eq!(observed.heap_snapshot().live_objects, 0);
     }
 

@@ -51,8 +51,12 @@ pub fn flush() -> bool {
     let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
     let viewport_w = viewport_w as f32;
     let viewport_h = viewport_h as f32;
-    let (structure, cascade) =
-        crate::dom::with_document(|document| (document.structure_generation(), document.cascade_generation()));
+    let (structure, cascade) = crate::dom::with_document(|document| {
+        (
+            document.structure_generation(),
+            document.cascade_generation(),
+        )
+    });
     let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
     let mut ok = false;
     CACHE.with(|slot| {
@@ -174,11 +178,17 @@ fn patch_and_compute(
         let Some(index) = cache.node_ids.iter().position(|node| node == id) else {
             return false;
         };
-        if !cache.engine.patch_style(index, style, viewport_w, viewport_h) {
+        if !cache
+            .engine
+            .patch_style(index, style, viewport_w, viewport_h)
+        {
             return false;
         }
     }
-    let Ok(results) = cache.engine.compute(&cache.component, &flat, viewport_w, viewport_h) else {
+    let Ok(results) = cache
+        .engine
+        .compute(&cache.component, &flat, viewport_w, viewport_h)
+    else {
         return false;
     };
     let snaps = write_rects(&flat, &results.layout_cache);
@@ -191,7 +201,10 @@ fn patch_and_compute(
 fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     let flat = pre_flatten(&cache.component);
     configure_engine(&mut cache.engine, &cache.component);
-    let Ok(results) = cache.engine.compute(&cache.component, &flat, viewport_w, viewport_h) else {
+    let Ok(results) = cache
+        .engine
+        .compute(&cache.component, &flat, viewport_w, viewport_h)
+    else {
         return false;
     };
     write_rects(&flat, &results.layout_cache);
@@ -353,7 +366,11 @@ fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::S
         && old.direction == new.direction
 }
 
-fn assign_layout_style(component: &mut Component, id: u32, style: &w3cos_std::style::Style) -> bool {
+fn assign_layout_style(
+    component: &mut Component,
+    id: u32,
+    style: &w3cos_std::style::Style,
+) -> bool {
     if host_id(component) == Some(id) {
         component.style = style.clone();
         return true;
@@ -394,7 +411,10 @@ fn configure_engine(engine: &mut LayoutEngine, root: &Component) {
 /// Px and out-of-flow boxes do not need a second text measure. An auto-height
 /// text leaf does, even when the projection walk is skipped.
 fn needs_text_metric(component: &Component) -> bool {
-    if matches!(component.style.position, Position::Absolute | Position::Fixed) {
+    if matches!(
+        component.style.position,
+        Position::Absolute | Position::Fixed
+    ) {
         return false;
     }
     if matches!(component.style.height, Dimension::Px(_)) {
