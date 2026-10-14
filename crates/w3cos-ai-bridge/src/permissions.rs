@@ -190,6 +190,31 @@ pub fn permissions_label_is_known(label: &str) -> bool {
     )
 }
 
+/// Capability bit for a DOM action, before a selector or a11y index is known.
+///
+/// Selector lists are applied after an index resolves to a real element.
+pub fn authorize_action(perms: &AgentPermissions, action: ActionType) -> Result<(), AuthError> {
+    let allowed = match action {
+        ActionType::Click | ActionType::Focus | ActionType::ScrollIntoView => perms.can_interact,
+        ActionType::SetText
+        | ActionType::SetAttribute
+        | ActionType::RemoveAttribute
+        | ActionType::AddClass
+        | ActionType::RemoveClass
+        | ActionType::SetStyle => perms.can_write_dom,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(match action {
+            ActionType::Click | ActionType::Focus | ActionType::ScrollIntoView => {
+                AuthError::Interact
+            }
+            _ => AuthError::WriteDom,
+        })
+    }
+}
+
 /// Permission check used by both `AiAgent` and the HTTP server.
 ///
 /// Selector matching is still the existing substring check. It does not prove

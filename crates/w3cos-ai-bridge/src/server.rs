@@ -7,24 +7,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::a11y_api;
 use crate::dom_access::{self, ActionType, DomAction};
-use crate::permissions::{self, ActionRateLimiter, AgentPermissions, BridgeOp};
+use crate::permissions::{self, ActionRateLimiter, AgentPermissions, AuthError, BridgeOp};
+use crate::screenshot::{self, CaptureConfig, ElementAnnotation};
 use w3cos_dom::document::Document;
+use w3cos_dom::element::Element;
+use w3cos_dom::node::NodeId;
 
 /// Largest request body the bridge will buffer. Larger `Content-Length` values
 /// are rejected before allocation.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64;
 
+/// CSS selector or a 1-based row from `GET /a11y`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomTarget {
+    Selector(String),
+    Index(u32),
+}
+
 /// Request from the HTTP server thread to the main event loop.
 pub enum AiBridgeRequest {
     GetA11yTree,
     GetA11yJson,
+    GetA11yIndex,
     Screenshot,
+    AnnotatedScreenshot,
     Click {
-        selector: String,
+        target: DomTarget,
     },
     Type {
-        selector: String,
+        target: DomTarget,
         text: String,
     },
     Query {
@@ -32,9 +44,21 @@ pub enum AiBridgeRequest {
     },
     Act {
         action: ActionType,
-        selector: String,
+        target: DomTarget,
         value: Option<String>,
     },
+}
+
+/// Pixels plus layout boxes, or an explicit reason the annotated shot cannot
+/// be drawn. An empty annotation list is not a successful capture.
+pub enum AnnotatedFrame {
+    Ready {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        annotations: Vec<ElementAnnotation>,
+    },
+    MissingLayout(&'static str),
 }
 
 /// Source of frame snapshots — supplied by the runtime so the bridge can
@@ -43,6 +67,14 @@ pub trait ScreenshotProvider: Send + Sync {
     /// Return the latest framebuffer encoded as PNG. `None` when no frame
     /// has been rendered yet (or the provider can't capture in this mode).
     fn capture_png(&self) -> Option<Vec<u8>>;
+
+    /// Annotated capture. The default refuses rather than inventing bounds.
+    /// Called only while handling a bridge request, not while painting.
+    fn capture_annotated(&self) -> AnnotatedFrame {
+        AnnotatedFrame::MissingLayout(
+            "layout bounds are not available for this frame; annotated screenshot was not drawn",
+        )
+    }
 }
 
 /// Response from the main event loop back to the HTTP server thread.
@@ -52,6 +84,8 @@ pub enum AiBridgeResponse {
     Png(Vec<u8>),
     Error(String),
     Denied(String),
+    NotFound(String),
+    Unavailable(String),
     RateLimited(String),
 }
 
@@ -83,45 +117,49 @@ impl AiBridgeHandle {
     }
 
     fn handle_request(&self, request: AiBridgeRequest, doc: &mut Document) -> AiBridgeResponse {
-        let op = match &request {
-            AiBridgeRequest::GetA11yTree | AiBridgeRequest::GetA11yJson => BridgeOp::ReadDom,
-            AiBridgeRequest::Screenshot => BridgeOp::Screenshot,
-            AiBridgeRequest::Query { selector } => BridgeOp::Query {
-                selector: selector.clone(),
-            },
-            AiBridgeRequest::Click { selector } => BridgeOp::Mutate {
-                action: ActionType::Click,
-                selector: selector.clone(),
-            },
-            AiBridgeRequest::Type { selector, .. } => BridgeOp::Mutate {
-                action: ActionType::SetText,
-                selector: selector.clone(),
-            },
-            AiBridgeRequest::Act {
-                action, selector, ..
-            } => BridgeOp::Mutate {
-                action: *action,
-                selector: selector.clone(),
-            },
-        };
-        if let Err(err) = permissions::authorize(&self.permissions, &op) {
-            return AiBridgeResponse::Denied(err.message("bridge"));
-        }
-        if op.is_mutating()
-            && !self
+        if let Some(action) = mutation_action(&request) {
+            if let Err(err) = permissions::authorize_action(&self.permissions, action) {
+                return AiBridgeResponse::Denied(err.message("bridge"));
+            }
+            if let Some(selector) = declared_selector(&request)
+                && !self.permissions.check_selector(&selector)
+            {
+                return AiBridgeResponse::Denied(AuthError::Selector.message("bridge"));
+            }
+            if !self
                 .rate
                 .borrow_mut()
                 .try_acquire(now_ms(), self.permissions.max_actions_per_second)
-        {
-            return AiBridgeResponse::RateLimited(
-                "Agent 'bridge' exceeded max_actions_per_second".to_string(),
-            );
+            {
+                return AiBridgeResponse::RateLimited(
+                    "Agent 'bridge' exceeded max_actions_per_second".to_string(),
+                );
+            }
+        } else {
+            let op = match &request {
+                AiBridgeRequest::GetA11yTree
+                | AiBridgeRequest::GetA11yJson
+                | AiBridgeRequest::GetA11yIndex => BridgeOp::ReadDom,
+                AiBridgeRequest::Screenshot | AiBridgeRequest::AnnotatedScreenshot => {
+                    BridgeOp::Screenshot
+                }
+                AiBridgeRequest::Query { selector } => BridgeOp::Query {
+                    selector: selector.clone(),
+                },
+                AiBridgeRequest::Click { .. }
+                | AiBridgeRequest::Type { .. }
+                | AiBridgeRequest::Act { .. } => unreachable!("mutations are handled above"),
+            };
+            if let Err(err) = permissions::authorize(&self.permissions, &op) {
+                return AiBridgeResponse::Denied(err.message("bridge"));
+            }
         }
         match request {
             AiBridgeRequest::GetA11yTree => {
                 AiBridgeResponse::Text(a11y_api::get_ui_summary(doc))
             }
             AiBridgeRequest::GetA11yJson => AiBridgeResponse::Json(a11y_api::get_tree_json(doc)),
+            AiBridgeRequest::GetA11yIndex => AiBridgeResponse::Json(a11y_api::index_json(doc)),
             AiBridgeRequest::Screenshot => match self.screenshot_provider.capture_png() {
                 Some(png) => AiBridgeResponse::Png(png),
                 None => AiBridgeResponse::Json(
@@ -129,11 +167,18 @@ impl AiBridgeHandle {
                         .to_string(),
                 ),
             },
-            AiBridgeRequest::Click { selector } => {
-                mutate(doc, ActionType::Click, selector, None)
+            AiBridgeRequest::AnnotatedScreenshot => self.annotated_screenshot(),
+            AiBridgeRequest::Click { target } => {
+                mutate(doc, &self.permissions, ActionType::Click, &target, None)
             }
-            AiBridgeRequest::Type { selector, text } => {
-                mutate(doc, ActionType::SetText, selector, Some(text))
+            AiBridgeRequest::Type { target, text } => {
+                mutate(
+                    doc,
+                    &self.permissions,
+                    ActionType::SetText,
+                    &target,
+                    Some(text),
+                )
             }
             AiBridgeRequest::Query { selector } => {
                 let result = dom_access::query(doc, &selector);
@@ -141,26 +186,112 @@ impl AiBridgeHandle {
             }
             AiBridgeRequest::Act {
                 action,
-                selector,
+                target,
                 value,
-            } => mutate(doc, action, selector, value),
+            } => mutate(doc, &self.permissions, action, &target, value),
         }
+    }
+
+    fn annotated_screenshot(&self) -> AiBridgeResponse {
+        match self.screenshot_provider.capture_annotated() {
+            AnnotatedFrame::MissingLayout(reason) => AiBridgeResponse::Unavailable(reason.into()),
+            AnnotatedFrame::Ready {
+                width,
+                height,
+                rgba,
+                annotations,
+            } => {
+                if width == 0
+                    || height == 0
+                    || annotations.is_empty()
+                    || annotations
+                        .iter()
+                        .any(|entry| entry.bounds[2] <= 0.0 || entry.bounds[3] <= 0.0)
+                {
+                    return AiBridgeResponse::Unavailable(
+                        "layout bounds are missing; refusing an empty annotation map".into(),
+                    );
+                }
+                let shot = screenshot::capture(
+                    &rgba,
+                    width,
+                    height,
+                    annotations,
+                    &CaptureConfig {
+                        annotate_interactive: true,
+                        show_outlines: false,
+                        include_map: true,
+                    },
+                );
+                AiBridgeResponse::Json(screenshot::annotated_json(&shot))
+            }
+        }
+    }
+}
+
+fn mutation_action(request: &AiBridgeRequest) -> Option<ActionType> {
+    match request {
+        AiBridgeRequest::Click { .. } => Some(ActionType::Click),
+        AiBridgeRequest::Type { .. } => Some(ActionType::SetText),
+        AiBridgeRequest::Act { action, .. } => Some(*action),
+        _ => None,
+    }
+}
+
+fn declared_selector(request: &AiBridgeRequest) -> Option<String> {
+    let target = match request {
+        AiBridgeRequest::Click { target }
+        | AiBridgeRequest::Type { target, .. }
+        | AiBridgeRequest::Act { target, .. } => target,
+        _ => return None,
+    };
+    match target {
+        DomTarget::Selector(selector) => Some(selector.clone()),
+        DomTarget::Index(_) => None,
     }
 }
 
 fn mutate(
     doc: &mut Document,
+    permissions: &AgentPermissions,
     action: ActionType,
-    selector: String,
+    target: &DomTarget,
     value: Option<String>,
 ) -> AiBridgeResponse {
-    let action = DomAction {
-        action,
-        selector,
-        value,
+    let result = match target {
+        DomTarget::Selector(selector) => {
+            let action = DomAction {
+                action,
+                selector: selector.clone(),
+                value,
+            };
+            dom_access::execute(doc, &action)
+        }
+        DomTarget::Index(index) => {
+            let Some(entry) = a11y_api::index_entries(doc)
+                .into_iter()
+                .find(|entry| entry.index == *index)
+            else {
+                return AiBridgeResponse::NotFound(format!(
+                    "a11y index {index} is not in the current tree"
+                ));
+            };
+            let selector = index_permission_selector(doc, &entry);
+            if !permissions.check_selector(&selector) {
+                return AiBridgeResponse::Denied(AuthError::Selector.message("bridge"));
+            }
+            dom_access::execute_node(doc, entry.node_id, action, value.as_deref())
+        }
     };
-    let result = dom_access::execute(doc, &action);
     AiBridgeResponse::Json(serde_json::to_string(&result).unwrap_or_default())
+}
+
+fn index_permission_selector(doc: &Document, entry: &w3cos_a11y::tree::FlatEntry) -> String {
+    let id = Element::new(NodeId::from_u32(entry.node_id))
+        .get_attribute(doc, "id")
+        .unwrap_or("");
+    let name = entry.name.as_deref().unwrap_or("");
+    format!("#{id} {} {name}", entry.role)
 }
 
 fn now_ms() -> u64 {
@@ -409,25 +540,23 @@ fn handle_connection(
     let request = match (method, path) {
         ("GET", "/a11y") => Some(AiBridgeRequest::GetA11yTree),
         ("GET", "/a11y/json") => Some(AiBridgeRequest::GetA11yJson),
+        ("GET", "/a11y/index") => Some(AiBridgeRequest::GetA11yIndex),
         ("GET", "/screenshot") => Some(AiBridgeRequest::Screenshot),
-        ("POST", "/click") => match json_selector(&body_str) {
-            Ok(selector) => Some(AiBridgeRequest::Click { selector }),
+        ("GET", "/screenshot/annotated") => Some(AiBridgeRequest::AnnotatedScreenshot),
+        ("POST", "/click") => match json_target(&body_str) {
+            Ok(target) => Some(AiBridgeRequest::Click { target }),
             Err(message) => {
                 send_json_error(&mut stream, 400, message)?;
                 return Ok(());
             }
         },
-        ("POST", "/type") => {
-            let body: serde_json::Value =
-                serde_json::from_str(&body_str).unwrap_or(serde_json::Value::Null);
-            let selector = body["selector"].as_str().unwrap_or("").to_string();
-            let text = body["text"].as_str().unwrap_or("").to_string();
-            if selector.is_empty() {
-                send_json_error(&mut stream, 400, "missing 'selector' field")?;
+        ("POST", "/type") => match json_target_and_text(&body_str) {
+            Ok((target, text)) => Some(AiBridgeRequest::Type { target, text }),
+            Err(message) => {
+                send_json_error(&mut stream, 400, message)?;
                 return Ok(());
             }
-            Some(AiBridgeRequest::Type { selector, text })
-        }
+        },
         ("POST", "/act") => match parse_act(&body_str) {
             Ok(request) => Some(request),
             Err(message) => {
@@ -454,9 +583,11 @@ fn handle_connection(
                 "endpoints": [
                     {"method": "GET", "path": "/a11y", "description": "Accessibility tree (text summary)"},
                     {"method": "GET", "path": "/a11y/json", "description": "Accessibility tree (full JSON)"},
+                    {"method": "GET", "path": "/a11y/index", "description": "Numbered a11y index (no screenshot)"},
                     {"method": "GET", "path": "/screenshot", "description": "PNG screenshot"},
-                    {"method": "POST", "path": "/click", "description": "Click element by selector"},
-                    {"method": "POST", "path": "/type", "description": "Type text into element"},
+                    {"method": "GET", "path": "/screenshot/annotated", "description": "Annotated PNG plus index map, or 503 when bounds are missing"},
+                    {"method": "POST", "path": "/click", "description": "Click element by selector or a11y index"},
+                    {"method": "POST", "path": "/type", "description": "Type text into element by selector or a11y index"},
                     {"method": "POST", "path": "/act", "description": "Run a DOM action"},
                     {"method": "GET", "path": "/query?selector=...", "description": "Query element info"},
                 ]
@@ -496,6 +627,12 @@ fn handle_connection(
                 }
                 AiBridgeResponse::Denied(msg) => {
                     send_json_error(&mut stream, 403, &msg)?;
+                }
+                AiBridgeResponse::NotFound(msg) => {
+                    send_json_error(&mut stream, 404, &msg)?;
+                }
+                AiBridgeResponse::Unavailable(msg) => {
+                    send_json_error(&mut stream, 503, &msg)?;
                 }
                 AiBridgeResponse::RateLimited(msg) => {
                     send_json_error(&mut stream, 429, &msg)?;
@@ -564,13 +701,42 @@ fn tokens_match(expected: &str, presented: &str) -> bool {
     diff == 0
 }
 
-fn json_selector(body: &str) -> Result<String, &'static str> {
+fn json_target(body: &str) -> Result<DomTarget, &'static str> {
     let body: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-    let selector = body["selector"].as_str().unwrap_or("").to_string();
-    if selector.is_empty() {
-        Err("missing 'selector' field")
-    } else {
-        Ok(selector)
+    target_from_json(&body)
+}
+
+fn json_target_and_text(body: &str) -> Result<(DomTarget, String), &'static str> {
+    let body: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let target = target_from_json(&body)?;
+    let text = body
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((target, text))
+}
+
+fn target_from_json(body: &serde_json::Value) -> Result<DomTarget, &'static str> {
+    let selector = body
+        .get("selector")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let index = body.get("index");
+    match (selector.is_empty(), index) {
+        (false, Some(_)) => Err("provide 'selector' or 'index', not both"),
+        (true, None) => Err("missing 'selector' or 'index'"),
+        (false, None) => Ok(DomTarget::Selector(selector)),
+        (true, Some(value)) => {
+            let index = value.as_u64().ok_or("index must be a positive integer")?;
+            let index = u32::try_from(index).map_err(|_| "index must be a positive integer")?;
+            if index == 0 {
+                Err("index must be a positive integer")
+            } else {
+                Ok(DomTarget::Index(index))
+            }
+        }
     }
 }
 
@@ -582,21 +748,14 @@ fn parse_act(body: &str) -> Result<AiBridgeRequest, &'static str> {
         .ok_or("missing 'action' field")?;
     let action: ActionType = serde_json::from_value(serde_json::Value::String(name.to_string()))
         .map_err(|_| "unknown action")?;
-    let selector = body
-        .get("selector")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string();
-    if selector.is_empty() {
-        return Err("missing 'selector' field");
-    }
+    let target = target_from_json(&body)?;
     let value = body
         .get("value")
         .and_then(|value| value.as_str())
         .map(str::to_string);
     Ok(AiBridgeRequest::Act {
         action,
-        selector,
+        target,
         value,
     })
 }
@@ -631,6 +790,7 @@ fn send_response(
         404 => "Not Found",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
     };

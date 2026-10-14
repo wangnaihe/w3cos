@@ -42,6 +42,8 @@ const OP_CHIP_NIGHT: u8 = 11;
 const OP_CHIP_APPS: u8 = 12;
 const OP_CHIP_CONTEXT: u8 = 13;
 const OP_TOGGLE_TASKS: u8 = 14;
+const OP_CHIP_TERMINAL: u8 = 15;
+const OP_CHIP_SETTINGS: u8 = 16;
 
 fn main() {
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
@@ -139,6 +141,8 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_CHIP_NIGHT => apply_propose(session, "night mode", &ctx),
         OP_CHIP_APPS => apply_propose(session, "list apps", &ctx),
         OP_CHIP_CONTEXT => apply_propose(session, "where am i", &ctx),
+        OP_CHIP_TERMINAL => apply_propose(session, "打开终端", &ctx),
+        OP_CHIP_SETTINGS => apply_propose(session, "打开设置", &ctx),
         OP_CONFIRM => apply_confirm(session, &ctx),
         OP_CANCEL => {
             session.cancel();
@@ -1049,6 +1053,8 @@ fn build_intent_bar() -> Component {
             },
             vec![
                 chrome_button("打开文件 Files", OP_CHIP_FILES, "#3d5570"),
+                chrome_button("打开终端 Terminal", OP_CHIP_TERMINAL, "#3d5570"),
+                chrome_button("打开设置 Settings", OP_CHIP_SETTINGS, "#3d5570"),
                 chrome_button("夜间模式 Night", OP_CHIP_NIGHT, "#3d5570"),
                 chrome_button("应用列表 Apps", OP_CHIP_APPS, "#3d5570"),
                 chrome_button("我在哪 Where", OP_CHIP_CONTEXT, "#3d5570"),
@@ -1191,7 +1197,7 @@ fn build_task_center() -> Component {
         ),
         Component::text(
             format!(
-                "{} · {}",
+                "{} · {} · 口令经 KDF 保存，还不是 passkey",
                 LocalIdentityStub::SUBJECT,
                 if unlocked {
                     "stub unlocked"

@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use w3cos_ai_bridge::permissions::AgentPermissions;
+use w3cos_ai_bridge::screenshot::ElementAnnotation;
 use w3cos_ai_bridge::server::{
-    BridgeOptions, RunningBridge, ScreenshotProvider, start_with_options,
+    AnnotatedFrame, BridgeOptions, RunningBridge, ScreenshotProvider, start_with_options,
 };
 use w3cos_dom::Document;
 
@@ -370,6 +371,234 @@ fn screenshot_without_permission_does_not_capture() {
         Some("test-token-secret"),
         None,
     );
+    assert_eq!(status, 403, "{body}");
+    assert!(!called.load(Ordering::SeqCst));
+}
+
+fn index_of(summary: &str, needle: &str) -> u32 {
+    summary
+        .lines()
+        .find(|line| line.contains(needle))
+        .and_then(|line| {
+            let rest = line.trim().strip_prefix('[')?;
+            rest.split(']').next()?.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("no index for {needle} in {summary}"))
+}
+
+fn token<'a>(
+    bridge: &'a RunningBridge,
+    doc: &mut Document,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, String) {
+    let (status, _, body) = exchange(bridge, doc, method, path, Some("test-token-secret"), body);
+    (status, body)
+}
+
+struct AnnotatedShot {
+    called: Arc<AtomicBool>,
+}
+
+impl ScreenshotProvider for AnnotatedShot {
+    fn capture_png(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn capture_annotated(&self) -> AnnotatedFrame {
+        self.called.store(true, Ordering::SeqCst);
+        AnnotatedFrame::Ready {
+            width: 32,
+            height: 32,
+            rgba: vec![255u8; 32 * 32 * 4],
+            annotations: vec![
+                ElementAnnotation {
+                    index: 1,
+                    node_id: 4,
+                    label: "button: Go".into(),
+                    bounds: [1.0, 1.0, 8.0, 8.0],
+                    interactive: true,
+                },
+                ElementAnnotation {
+                    index: 2,
+                    node_id: 5,
+                    label: "button: Stop".into(),
+                    bounds: [16.0, 8.0, 8.0, 8.0],
+                    interactive: true,
+                },
+            ],
+        }
+    }
+}
+
+#[test]
+fn observer_can_read_the_a11y_index_but_cannot_click_it() {
+    let bridge = serve(AgentPermissions::observer());
+    let (mut doc, hits) = button();
+    let (status, body) = token(&bridge, &mut doc, "GET", "/a11y", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("button: Go"), "{body}");
+    let index = index_of(&body, "button: Go");
+    let (status, index_body) = token(&bridge, &mut doc, "GET", "/a11y/index", None);
+    assert_eq!(status, 200, "{index_body}");
+    assert!(index_body.contains("\"index\":"), "{index_body}");
+    assert!(
+        index_body.contains(&format!("\"index\":{index}")),
+        "{index_body}"
+    );
+    assert!(index_body.contains("button"), "{index_body}");
+    assert!(index_body.contains("Go"), "{index_body}");
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/click",
+        Some(&format!("{{\"index\":{index}}}")),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(hits.get(), 0);
+}
+
+#[test]
+fn interactive_click_type_and_focus_accept_an_a11y_index() {
+    let bridge = serve(AgentPermissions::interactive());
+    let (mut doc, hits) = button();
+    let input = doc.create_element("input");
+    input.set_attribute(&mut doc, "id", "name");
+    input.set_text_content(&mut doc, "Name");
+    doc.body().append_child(&mut doc, input);
+
+    let (status, summary) = token(&bridge, &mut doc, "GET", "/a11y", None);
+    assert_eq!(status, 200, "{summary}");
+    let (again_status, again) = token(&bridge, &mut doc, "GET", "/a11y", None);
+    assert_eq!(again_status, 200);
+    assert_eq!(summary, again, "numbering changed without a tree edit");
+    let button_index = index_of(&summary, "button: Go");
+    let input_index = index_of(&summary, "textbox: Name");
+
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/click",
+        Some(&format!("{{\"index\":{button_index}}}")),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"success\":true"), "{body}");
+    assert_eq!(hits.get(), 1);
+
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/type",
+        Some(&format!("{{\"index\":{input_index},\"text\":\"typed\"}}")),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"success\":true"), "{body}");
+    let (status, body) = token(&bridge, &mut doc, "GET", "/query?selector=%23name", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("typed"), "{body}");
+    assert_eq!(hits.get(), 1);
+
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/act",
+        Some(&format!(
+            "{{\"action\":\"focus\",\"index\":{button_index}}}"
+        )),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"success\":true"), "{body}");
+    assert_eq!(hits.get(), 1);
+}
+
+#[test]
+fn stale_or_ambiguous_index_does_not_mutate() {
+    let bridge = serve(AgentPermissions::interactive());
+    let (mut doc, hits) = button();
+    let (status, body) = token(&bridge, &mut doc, "POST", "/click", Some("{\"index\":999}"));
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains("not in the current tree"), "{body}");
+    assert_eq!(hits.get(), 0);
+
+    let (status, body) = token(&bridge, &mut doc, "POST", "/click", Some("{\"index\":0}"));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("positive integer"), "{body}");
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/click",
+        Some("{\"selector\":\"#go\",\"index\":1}"),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("not both"), "{body}");
+    let (status, body) = token(&bridge, &mut doc, "POST", "/click", Some("{}"));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("missing"), "{body}");
+    assert_eq!(hits.get(), 0);
+}
+
+#[test]
+fn blocked_selector_denies_the_resolved_index() {
+    let mut perms = AgentPermissions::interactive();
+    perms.blocked_selectors.push("#go".into());
+    let bridge = serve(perms);
+    let (mut doc, hits) = button();
+    let (status, summary) = token(&bridge, &mut doc, "GET", "/a11y", None);
+    assert_eq!(status, 200, "{summary}");
+    let index = index_of(&summary, "button: Go");
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/click",
+        Some(&format!("{{\"index\":{index}}}")),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(hits.get(), 0);
+}
+
+#[test]
+fn annotated_screenshot_needs_layout_bounds_and_capture_permission() {
+    let bridge = serve(AgentPermissions::observer());
+    let (mut doc, _) = button();
+    let (status, raw) = token(&bridge, &mut doc, "GET", "/screenshot", None);
+    assert_eq!(status, 200, "{raw}");
+    assert!(raw.contains("no frame"), "{raw}");
+    let (status, body) = token(&bridge, &mut doc, "GET", "/screenshot/annotated", None);
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("layout bounds"), "{body}");
+
+    let called = Arc::new(AtomicBool::new(false));
+    let bridge = serve_with_shot(
+        AgentPermissions::observer(),
+        Arc::new(AnnotatedShot {
+            called: called.clone(),
+        }),
+    );
+    let (status, body) = token(&bridge, &mut doc, "GET", "/screenshot/annotated", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(called.load(Ordering::SeqCst));
+    assert!(body.contains("\"index\":1"), "{body}");
+    assert!(body.contains("\"index\":2"), "{body}");
+    assert!(body.contains("png_base64"), "{body}");
+    assert!(!body.contains("\"annotations\":[]"), "{body}");
+
+    let called = Arc::new(AtomicBool::new(false));
+    let mut perms = AgentPermissions::observer();
+    perms.can_screenshot = false;
+    let bridge = serve_with_shot(
+        perms,
+        Arc::new(AnnotatedShot {
+            called: called.clone(),
+        }),
+    );
+    let (status, body) = token(&bridge, &mut doc, "GET", "/screenshot/annotated", None);
     assert_eq!(status, 403, "{body}");
     assert!(!called.load(Ordering::SeqCst));
 }

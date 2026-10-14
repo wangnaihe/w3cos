@@ -226,11 +226,12 @@ impl IntentSession {
     }
 
     pub fn with_ledger(mut self, ledger: ReceiptLedger) -> Self {
+        let mut migrated = false;
         match ledger.load() {
             Ok(Some(bytes)) => match serde_json::from_slice::<LedgerSnapshot>(&bytes) {
                 Ok(snapshot) => {
                     if let Some(pin) = snapshot.pin.as_deref() {
-                        self.identity.restore_locked_pin(pin);
+                        migrated = self.identity.restore_locked_pin(pin);
                     }
                     if let Some(next) = snapshot
                         .receipts
@@ -252,6 +253,9 @@ impl IntentSession {
             }
         }
         self.ledger = Some(ledger);
+        if migrated {
+            self.persist();
+        }
         self
     }
 
@@ -592,6 +596,12 @@ fn match_command(normalized: &str) -> Option<ShellCommand> {
         ("current app", ShellCommand::ShowContext),
         ("我在哪", ShellCommand::ShowContext),
         ("当前应用", ShellCommand::ShowContext),
+        ("返回桌面", ShellCommand::OpenApp(ShellApp::Desktop)),
+        ("show desktop", ShellCommand::OpenApp(ShellApp::Desktop)),
+        ("系统设置", ShellCommand::OpenApp(ShellApp::Settings)),
+        ("文件管理", ShellCommand::OpenApp(ShellApp::Files)),
+        ("命令帮助", ShellCommand::Help),
+        ("show help", ShellCommand::Help),
     ];
     if let Some((_, command)) = CONTAINS
         .iter()
@@ -668,6 +678,24 @@ mod tests {
             match_command("files"),
             Some(ShellCommand::OpenApp(ShellApp::Files))
         );
+        assert_eq!(
+            match_command("返回桌面"),
+            Some(ShellCommand::OpenApp(ShellApp::Desktop))
+        );
+        assert_eq!(
+            match_command("show desktop"),
+            Some(ShellCommand::OpenApp(ShellApp::Desktop))
+        );
+        assert_eq!(
+            match_command("系统设置"),
+            Some(ShellCommand::OpenApp(ShellApp::Settings))
+        );
+        assert_eq!(
+            match_command("文件管理"),
+            Some(ShellCommand::OpenApp(ShellApp::Files))
+        );
+        assert_eq!(match_command("命令帮助"), Some(ShellCommand::Help));
+        assert_eq!(match_command("show help"), Some(ShellCommand::Help));
     }
 
     #[test]
@@ -856,6 +884,36 @@ mod tests {
         std::fs::write(dir.join("receipts.key"), [9u8; 32]).expect("replace key");
         let foreign = ReceiptLedger::open(&dir).expect("foreign key file");
         assert!(foreign.load().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_pin_is_rewritten_as_a_verifier() {
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "legacy-pin"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ReceiptLedger::open(&dir)
+            .expect("ledger")
+            .store(br#"{"pin":"alpha","receipts":[]}"#)
+            .expect("store plaintext pin");
+        let session = IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+            .with_ledger(ReceiptLedger::open(&dir).expect("reopen"));
+        assert!(!session.identity_unlocked());
+        let stored = ReceiptLedger::open(&dir)
+            .expect("read back")
+            .load()
+            .expect("decrypt")
+            .expect("snapshot");
+        let text = String::from_utf8(stored).expect("utf8");
+        assert!(text.contains("pbkdf2-sha256$"), "{text}");
+        assert!(!text.contains("alpha"), "{text}");
+        let mut session = session;
+        session.lock_identity();
+        assert!(!session.unlock_identity_stub("beta"));
+        assert!(session.unlock_identity_stub("alpha"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

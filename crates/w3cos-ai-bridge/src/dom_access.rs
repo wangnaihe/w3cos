@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use w3cos_dom::document::Document;
+use w3cos_dom::element::Element;
 use w3cos_dom::events::Event;
+use w3cos_dom::node::NodeId;
 
 /// Layer 1: Direct DOM access for AI agents.
 /// The most powerful interface — AI reads and writes the DOM directly.
@@ -113,20 +115,33 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
         Some(e) => e,
         None => return DomResult::err(format!("No element matching '{}'", action.selector)),
     };
+    apply(doc, &el, action.action, action.value.as_deref())
+}
 
-    match action.action {
+/// Run an action on the node an a11y index resolved to.
+pub fn execute_node(
+    doc: &mut Document,
+    node_id: u32,
+    action: ActionType,
+    value: Option<&str>,
+) -> DomResult {
+    apply(doc, &Element::new(NodeId::from_u32(node_id)), action, value)
+}
+
+fn apply(doc: &mut Document, el: &Element, action: ActionType, value: Option<&str>) -> DomResult {
+    match action {
         ActionType::Click => {
             let mut event = Event::click(el.id, 0.0, 0.0);
             el.dispatch_event(doc, &mut event);
             DomResult::ok_empty()
         }
         ActionType::SetText => {
-            let text = action.value.as_deref().unwrap_or("");
+            let text = value.unwrap_or("");
             el.set_text_content(doc, text);
             DomResult::ok_empty()
         }
         ActionType::SetAttribute => {
-            if let Some(ref val) = action.value
+            if let Some(val) = value
                 && let Some((name, value)) = val.split_once('=')
             {
                 el.set_attribute(doc, name.trim(), value.trim());
@@ -136,7 +151,7 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
             }
         }
         ActionType::RemoveAttribute => {
-            if let Some(ref name) = action.value {
+            if let Some(name) = value {
                 el.remove_attribute(doc, name);
                 DomResult::ok_empty()
             } else {
@@ -144,7 +159,7 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
             }
         }
         ActionType::AddClass => {
-            if let Some(ref class) = action.value {
+            if let Some(class) = value {
                 el.class_list_add(doc, class);
                 DomResult::ok_empty()
             } else {
@@ -152,7 +167,7 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
             }
         }
         ActionType::RemoveClass => {
-            if let Some(ref class) = action.value {
+            if let Some(class) = value {
                 el.class_list_remove(doc, class);
                 DomResult::ok_empty()
             } else {
@@ -160,7 +175,7 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
             }
         }
         ActionType::SetStyle => {
-            if let Some(ref val) = action.value
+            if let Some(val) = value
                 && let Some((prop, value)) = val.split_once(':')
             {
                 el.style_mut(doc).set_property(prop.trim(), value.trim());
