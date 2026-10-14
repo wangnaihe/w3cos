@@ -914,35 +914,117 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
 }
 
 fn dom_handle(node: u32) -> Value {
-    // A node ID alone cannot retain authored descriptors or a changed prototype.
-    // Keep the collectable/memoized wrapper until a fully guarded immediate
-    // representation can preserve the complete object state.
-    element_value(node)
+    // A node that already has authored descriptors or a changed prototype
+    // keeps that wrapper. A fresh node is a tagged immediate; the first
+    // defineProperty / setPrototypeOf materializes the wrapper, and later
+    // gets and sets delegate to it. Prototype data is still consulted while
+    // the node is immediate, so an override is not skipped.
+    if let Some(wrapper) = memoized_element(node) {
+        return wrapper;
+    }
+    Value::dom_node(node, realm_generation())
 }
 
 fn dom_imm_get(node: u32, key: &str) -> Value {
     if matches!(key, "__proto__" | "constructor") {
         return dom_imm_materialize(node).get_property(key);
     }
+    if let Some(wrapper) = memoized_element(node) {
+        return wrapper.get_property(key);
+    }
+    // Own accessors and prototype data win over the builtin surface. An
+    // undefined prototype placeholder still falls through to the computed
+    // property, matching the element wrapper.
+    let inherited = inherited_prototype_value(node, key);
+    if !inherited.is_undefined() {
+        return inherited;
+    }
     if let Some(value) = get_expando(node, key) {
         return value;
     }
+    if let Some(cached) = cached_tree_method(node, key) {
+        return cached;
+    }
     let computed = element_computed_get(node, key);
+    remember_tree_method(node, key, &computed);
     if !computed.is_undefined() {
         return computed;
     }
-    element_prototype(node).get_property(key)
+    Value::Undefined
 }
 
 fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
     if key == "__proto__" {
         return dom_imm_materialize(node).try_set_property(key, value);
     }
+    if let Some(wrapper) = memoized_element(node) {
+        wrapper.set_property(key, value);
+        return true;
+    }
+    let setter_key = format!("__w3cos_setter_{key}");
+    let setter = inherited_prototype_value(node, &setter_key);
+    if setter.is_callable() {
+        let wrapper = dom_imm_materialize(node);
+        wrapper.set_property(key, value);
+        return true;
+    }
     element_computed_set(node, key, value)
+}
+
+fn inherited_prototype_value(node: u32, key: &str) -> Value {
+    let prototype = cached_node_prototype(node);
+    prototype
+        .as_object()
+        .map(|object| object.borrow().get_direct(key))
+        .unwrap_or(Value::Undefined)
+}
+
+fn cached_node_prototype(node: u32) -> Value {
+    thread_local! {
+        static DIV_PROTO: RefCell<Option<Value>> = const { RefCell::new(None) };
+        static OTHER: RefCell<HashMap<(u16, String), Value>> = RefCell::new(HashMap::new());
+    }
+    let node_type = dom::node_type(node);
+    // HTML `div` is the create-loop tag. The cached object is the live
+    // prototype, so later writes on it stay visible. A namespaced element
+    // does not use this slot.
+    if node_type == 1 && get_expando(node, "namespaceURI").is_none() && dom::tag_is(node, "div") {
+        return DIV_PROTO.with(|slot| {
+            if let Some(prototype) = slot.borrow().clone() {
+                return prototype;
+            }
+            let prototype = element_prototype(node);
+            *slot.borrow_mut() = Some(prototype.clone());
+            prototype
+        });
+    }
+    let tag = if node_type == 1 {
+        dom::tag_name(node)
+    } else {
+        String::new()
+    };
+    let key = (node_type, tag);
+    OTHER.with(|cache| {
+        if let Some(prototype) = cache.borrow().get(&key) {
+            return prototype.clone();
+        }
+        let prototype = element_prototype(node);
+        cache.borrow_mut().insert(key, prototype.clone());
+        prototype
+    })
 }
 
 fn dom_imm_materialize(node: u32) -> Value {
     element_value(node)
+}
+
+fn pin_dom_wrapper(node: u32) {
+    let value = element_value(node);
+    ELEMENT_VALUES.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(node, ElementMemo::Strong(value));
+    });
 }
 
 fn dom_node_of(value: &Value) -> Option<u32> {
@@ -965,6 +1047,7 @@ fn ensure_dom_fast() {
         get: dom_imm_get,
         set: dom_imm_set,
         materialize: dom_imm_materialize,
+        pin: pin_dom_wrapper,
         node_of: dom_node_of,
     });
 }
@@ -2384,6 +2467,17 @@ fn js_wrapper_should_pin(node: u32) -> bool {
 /// Tree-owned nodes intern Strong. Parentless orphans intern Weak so
 /// dropping the last JS handle can collect the wrapper without
 /// `reset_bridge()`.
+fn memoized_element(node: u32) -> Option<Value> {
+    ELEMENT_VALUES.with(|cache| {
+        let map = cache.borrow();
+        match map.get(&node) {
+            Some(ElementMemo::Strong(value)) => Some(value.clone()),
+            Some(ElementMemo::Weak(weak)) => upgrade_realm_object(weak),
+            None => None,
+        }
+    })
+}
+
 pub fn element_value(node: u32) -> Value {
     let cached = ELEMENT_VALUES.with(|c| {
         let mut map = c.borrow_mut();
@@ -16344,7 +16438,7 @@ fn build_document_value() -> Value {
                 tag.make_ascii_lowercase();
             }
             let id = dom::create_element(&tag);
-            let element = element_value(id);
+            let element = dom_handle(id);
             if tag == "template" {
                 ensure_template_content(id);
             } else if tag == "script" {

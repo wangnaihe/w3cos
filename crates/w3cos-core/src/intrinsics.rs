@@ -505,6 +505,9 @@ pub struct DomImmOps {
     pub get: fn(u32, &str) -> Value,
     pub set: fn(u32, &str, Value) -> bool,
     pub materialize: fn(u32) -> Value,
+    /// Keep a materialized wrapper alive after the caller drops its temporary
+    /// object borrow. Used when authored state was stored on a tagged node.
+    pub pin: fn(u32),
     pub node_of: fn(&Value) -> Option<u32>,
 }
 
@@ -528,6 +531,12 @@ pub fn dom_set(node: u32, key: &str, value: Value) -> bool {
 
 pub fn materialize_dom(node: u32) -> Option<Value> {
     DOM_IMM.get().map(|ops| (ops.materialize)(node))
+}
+
+pub fn pin_dom(node: u32) {
+    if let Some(ops) = DOM_IMM.get() {
+        (ops.pin)(node);
+    }
 }
 
 pub fn dom_node_id(value: &Value) -> Option<u32> {

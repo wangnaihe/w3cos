@@ -478,6 +478,9 @@ pub fn define_field(this: &Value, key: &str, value: Value) {
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
+        if let Some(node) = obj.live_dom_node() {
+            crate::intrinsics::pin_dom(node);
+        }
     }
 }
 
@@ -519,6 +522,9 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
             }
         } else {
             object.borrow_mut().define_property(key, descriptor);
+        }
+        if let Some(node) = obj.live_dom_node() {
+            crate::intrinsics::pin_dom(node);
         }
     }
     obj.clone()

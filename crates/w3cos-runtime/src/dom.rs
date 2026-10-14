@@ -565,6 +565,10 @@ pub fn tag_name(node: u32) -> String {
     with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str())
 }
 
+pub fn tag_is(node: u32, expected: &str) -> bool {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str() == expected)
+}
+
 pub fn node_count() -> usize {
     with_document(|doc| doc.node_count())
 }
