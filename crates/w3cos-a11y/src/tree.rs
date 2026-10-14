@@ -112,49 +112,75 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
     }
 }
 
-pub fn flatten_for_ai(tree: &A11yNode) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut counter = 1u32;
-    flatten_recursive(tree, &mut lines, &mut counter);
-    lines
+/// One row of the numbered list `GET /a11y` prints. `index` starts at 1 and
+/// stays in this order until the tree changes.
+#[derive(Debug, Clone)]
+pub struct FlatEntry {
+    pub index: u32,
+    pub node_id: u32,
+    pub role: String,
+    pub name: Option<String>,
+    pub value: Option<String>,
+    pub interactive: bool,
+    pub disabled: bool,
+    pub bounds: Option<[f32; 4]>,
 }
 
-fn flatten_recursive(node: &A11yNode, lines: &mut Vec<String>, counter: &mut u32) {
-    if node.visible && node.role != AriaRole::None {
-        let idx = *counter;
-        *counter += 1;
+pub fn flatten_entries(tree: &A11yNode) -> Vec<FlatEntry> {
+    let mut entries = Vec::new();
+    let mut counter = 1u32;
+    flatten_recursive(tree, &mut entries, &mut counter);
+    entries
+}
 
-        let role_str = serde_json::to_string(&node.role)
+pub fn flatten_for_ai(tree: &A11yNode) -> Vec<String> {
+    flatten_entries(tree).iter().map(format_entry).collect()
+}
+
+fn flatten_recursive(node: &A11yNode, entries: &mut Vec<FlatEntry>, counter: &mut u32) {
+    if node.visible && node.role != AriaRole::None {
+        let role = serde_json::to_string(&node.role)
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
-
-        let mut desc = format!("[{idx}] {role_str}");
-
-        if let Some(ref name) = node.name {
-            let truncated = if name.len() > 80 {
+        let name = node.name.as_ref().map(|name| {
+            if name.len() > 80 {
                 format!("{}...", &name[..77])
             } else {
                 name.clone()
-            };
-            desc.push_str(&format!(": {truncated}"));
-        }
-
-        if let Some(ref value) = node.value {
-            desc.push_str(&format!(" (value: {value})"));
-        }
-
-        if node.interactive {
-            desc.push_str(" [interactive]");
-        }
-        if node.disabled {
-            desc.push_str(" [disabled]");
-        }
-
-        lines.push(desc);
+            }
+        });
+        entries.push(FlatEntry {
+            index: *counter,
+            node_id: node.id,
+            role,
+            name,
+            value: node.value.clone(),
+            interactive: node.interactive,
+            disabled: node.disabled,
+            bounds: node.bounds,
+        });
+        *counter += 1;
     }
 
     for child in &node.children {
-        flatten_recursive(child, lines, counter);
+        flatten_recursive(child, entries, counter);
     }
+}
+
+fn format_entry(entry: &FlatEntry) -> String {
+    let mut desc = format!("[{}] {}", entry.index, entry.role);
+    if let Some(name) = &entry.name {
+        desc.push_str(&format!(": {name}"));
+    }
+    if let Some(value) = &entry.value {
+        desc.push_str(&format!(" (value: {value})"));
+    }
+    if entry.interactive {
+        desc.push_str(" [interactive]");
+    }
+    if entry.disabled {
+        desc.push_str(" [disabled]");
+    }
+    desc
 }

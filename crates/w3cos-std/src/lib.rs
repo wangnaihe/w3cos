@@ -9,7 +9,9 @@ pub mod svg;
 pub mod viewport;
 
 pub use color::Color;
-pub use component::{Component, ComponentKind, EventAction, SvgEventTarget};
+pub use component::{
+    find_text_input, Component, ComponentKind, EventAction, SvgEventTarget,
+};
 pub use style::Style;
 pub use svg::{SvgPathCommand, SvgPathData};
 
@@ -425,6 +427,19 @@ mod tests {
         let root = Component::root(vec![child.clone()]);
         assert!(matches!(root.kind, ComponentKind::Root));
         assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn find_text_input_uses_preorder_and_the_first_match() {
+        let input = Component::text_input("hi", "Type a command", Style::default());
+        let other = Component::text_input("no", "other", Style::default());
+        let row = Component::row(Style::default(), vec![input, other]);
+        let root = Component::column(
+            Style::default(),
+            vec![Component::text("a", Style::default()), row],
+        );
+        assert_eq!(find_text_input(&root, "Type a command"), Some((3, "hi")));
+        assert_eq!(find_text_input(&root, "missing"), None);
     }
 
     #[test]

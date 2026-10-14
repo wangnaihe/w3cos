@@ -26,6 +26,55 @@ fn cache() -> &'static Mutex<Frame> {
 
 static SCREENSHOT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// One interactive component from the last layout pass.
+///
+/// Published only when a bridge request asks for an index or an annotated
+/// screenshot. Painting does not read or draw this list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutMark {
+    pub index: u32,
+    pub node_id: u32,
+    pub role: String,
+    pub name: String,
+    pub bounds: [f32; 4],
+}
+
+fn layout_marks_slot() -> &'static Mutex<Vec<LayoutMark>> {
+    static MARKS: OnceLock<Mutex<Vec<LayoutMark>>> = OnceLock::new();
+    MARKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn pending_clicks() -> &'static Mutex<Vec<u32>> {
+    static CLICKS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+    CLICKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn store_layout_marks(marks: Vec<LayoutMark>) {
+    if let Ok(mut slot) = layout_marks_slot().lock() {
+        *slot = marks;
+    }
+}
+
+pub fn layout_marks() -> Vec<LayoutMark> {
+    layout_marks_slot()
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+pub fn enqueue_layout_click(node_id: u32) {
+    if let Ok(mut slot) = pending_clicks().lock() {
+        slot.push(node_id);
+    }
+}
+
+pub fn take_layout_clicks() -> Vec<u32> {
+    pending_clicks()
+        .lock()
+        .map(|mut slot| std::mem::take(&mut *slot))
+        .unwrap_or_default()
+}
+
 /// Ask the next vsync present to copy the framebuffer for a screenshot.
 pub fn request_screenshot() {
     SCREENSHOT_REQUESTED.store(true, Ordering::Release);

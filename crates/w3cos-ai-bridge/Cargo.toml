@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "W3C OS AI bridge — structured DOM access, accessibility tree, and annotated screenshots for AI agents"
 
+[[bin]]
+name = "w3cos-ai-mcp"
+path = "src/bin/w3cos-ai-mcp.rs"
+
+[features]
+default = []
+l1 = []
+
 [dependencies]
 w3cos-dom = { workspace = true }
 w3cos-std = { workspace = true }
@@ -12,6 +20,8 @@ w3cos-a11y = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+getrandom = "0.3"
+ring = "0.17"
 png = { workspace = true }
 tiny-skia = { workspace = true }
 fontdue = { workspace = true }

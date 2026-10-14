@@ -232,10 +232,50 @@ fn draw_outlines(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
             let mut pb = PathBuilder::new();
             pb.push_rect(rect);
             if let Some(path) = pb.finish() {
-                let _ = pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
     }
+}
+
+/// JSON body for `GET /screenshot/annotated`. Drawing happens here, when a
+/// request is answered, not while a frame is painted.
+pub fn annotated_json(shot: &AnnotatedScreenshot) -> String {
+    serde_json::json!({
+        "png_base64": base64_encode(&shot.png_data),
+        "width": shot.width,
+        "height": shot.height,
+        "annotations": shot.annotations,
+    })
+    .to_string()
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let chunk = u32::from_be_bytes([0, data[index], data[index + 1], data[index + 2]]);
+        for shift in [18, 12, 6, 0] {
+            out.push(TABLE[((chunk >> shift) & 0x3f) as usize] as char);
+        }
+        index += 3;
+    }
+    let rest = data.len() - index;
+    if rest == 1 {
+        let chunk = u32::from(data[index]) << 16;
+        out.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rest == 2 {
+        let chunk = (u32::from(data[index]) << 16) | (u32::from(data[index + 1]) << 8);
+        out.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 fn encode_pixmap(pixmap: &Pixmap) -> Vec<u8> {
@@ -253,4 +293,51 @@ fn encode_raw_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_pixmap_draws_two_interactive_markers() {
+        let width = 48u32;
+        let height = 32u32;
+        let pixels = vec![255u8; (width * height * 4) as usize];
+        let annotations = vec![
+            ElementAnnotation {
+                index: 1,
+                node_id: 4,
+                label: "button: Go".into(),
+                bounds: [2.0, 2.0, 12.0, 12.0],
+                interactive: true,
+            },
+            ElementAnnotation {
+                index: 2,
+                node_id: 5,
+                label: "button: Stop".into(),
+                bounds: [20.0, 8.0, 12.0, 12.0],
+                interactive: true,
+            },
+        ];
+        let shot = capture(
+            &pixels,
+            width,
+            height,
+            annotations,
+            &CaptureConfig {
+                annotate_interactive: true,
+                show_outlines: false,
+                include_map: true,
+            },
+        );
+        assert!(shot.png_data.starts_with(b"\x89PNG"));
+        assert_eq!(shot.annotations.len(), 2);
+        assert_eq!(shot.annotations[0].index, 1);
+        assert_eq!(shot.annotations[1].index, 2);
+        let json = annotated_json(&shot);
+        assert!(json.contains("\"index\":1"));
+        assert!(json.contains("png_base64"));
+        assert!(!json.contains("\"annotations\":[]"));
+    }
 }

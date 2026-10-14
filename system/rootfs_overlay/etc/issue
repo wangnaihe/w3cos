@@ -5,5 +5,5 @@
   No browser. No V8. No Electron.
 
   Login: root (no password)
-  SSH:   ssh root@localhost -p 2222
+  SSH:   off unless W3COS_ENABLE_SSH=1 (host forward localhost:2222)
 
