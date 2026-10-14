@@ -5902,11 +5902,12 @@ impl App {
             None => return,
         };
 
-        if self.dom_mode {
-            crate::dom::with_document_mut(|doc| {
-                handle.poll_and_respond(doc);
-            });
-        }
+        // Component shells such as w3cos-shell are not in DOM mode. The
+        // listener still has to drain the queue: permission checks run here,
+        // and skipping the poll leaves clients blocked until the 5s timeout.
+        crate::dom::with_document_mut(|doc| {
+            handle.poll_and_respond(doc);
+        });
         if crate::frame_cache::screenshot_request_pending() {
             self.request_repaint();
         }
