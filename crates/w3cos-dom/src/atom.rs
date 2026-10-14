@@ -1,10 +1,169 @@
 /// An interned string handle. Comparison is O(1) integer equality.
-/// Inspired by Chrome/Blink's WTF::AtomString.
 ///
-/// Bytes live once in a chunked bump arena. Lookup is open-addressed, so
-/// interning a new string does not allocate a hash-map node.
+/// Tag and attribute names use the static qualified-name table below, the
+/// same idea as Blink's generated `HTMLNames` (`QualifiedName` /
+/// `AtomicString` tables in `third_party/blink/renderer/core/dom`): the hot
+/// path compares an integer id and does not hash. This table is original
+/// Rust, not a copy of Blink's generated sources, so no Blink copyright is
+/// reproduced. Bytes of interned and raw strings live in a chunked bump
+/// arena that never relocates. Lookup of dynamic strings is open-addressed.
 #[derive(Clone, Copy, Eq, Hash)]
 pub struct Atom(u32);
+
+/// Build-time qualified names. Index is the `Atom` id. Appending names does
+/// not renumber `Atom::DIV`, `Atom::ID`, or `Atom::CLASS`.
+const QUALIFIED_NAMES: &[&str] = &[
+    "",                    // 0
+    "#document",           // 1
+    "#text",               // 2
+    "body",                // 3
+    "div",                 // 4
+    "span",                // 5
+    "p",                   // 6
+    "button",              // 7
+    "input",               // 8
+    "a",                   // 9
+    "img",                 // 10
+    "h1",                  // 11
+    "h2",                  // 12
+    "h3",                  // 13
+    "h4",                  // 14
+    "h5",                  // 15
+    "h6",                  // 16
+    "section",             // 17
+    "main",                // 18
+    "article",             // 19
+    "nav",                 // 20
+    "header",              // 21
+    "footer",              // 22
+    "aside",               // 23
+    "form",                // 24
+    "label",               // 25
+    "ul",                  // 26
+    "ol",                  // 27
+    "li",                  // 28
+    "em",                  // 29
+    "strong",              // 30
+    "code",                // 31
+    "pre",                 // 32
+    "table",               // 33
+    "tr",                  // 34
+    "td",                  // 35
+    "th",                  // 36
+    "id",                  // 37
+    "class",               // 38
+    "src",                 // 39
+    "href",                // 40
+    "type",                // 41
+    "placeholder",         // 42
+    "style",               // 43
+    "value",               // 44
+    "html",                // 45
+    "head",                // 46
+    "meta",                // 47
+    "link",                // 48
+    "script",              // 49
+    "title",               // 50
+    "br",                  // 51
+    "hr",                  // 52
+    "canvas",              // 53
+    "video",               // 54
+    "source",              // 55
+    "template",            // 56
+    "name",                // 57
+    "content",             // 58
+    "rel",                 // 59
+    "alt",                 // 60
+    "width",               // 61
+    "height",              // 62
+    "disabled",            // 63
+    "checked",             // 64
+    "role",                // 65
+    "lang",                // 66
+    "contenteditable",     // 67
+    "#comment",            // 68
+    "#cdata-section",      // 69
+    "#document-fragment",  // 70
+];
+
+/// Id of a static tag or attribute name, compared as `u32` with no hash.
+pub fn static_qualified_id(name: &str) -> Option<u32> {
+    let id = match name {
+        "" => 0,
+        "#document" => 1,
+        "#text" => 2,
+        "body" => 3,
+        "div" => 4,
+        "span" => 5,
+        "p" => 6,
+        "button" => 7,
+        "input" => 8,
+        "a" => 9,
+        "img" => 10,
+        "h1" => 11,
+        "h2" => 12,
+        "h3" => 13,
+        "h4" => 14,
+        "h5" => 15,
+        "h6" => 16,
+        "section" => 17,
+        "main" => 18,
+        "article" => 19,
+        "nav" => 20,
+        "header" => 21,
+        "footer" => 22,
+        "aside" => 23,
+        "form" => 24,
+        "label" => 25,
+        "ul" => 26,
+        "ol" => 27,
+        "li" => 28,
+        "em" => 29,
+        "strong" => 30,
+        "code" => 31,
+        "pre" => 32,
+        "table" => 33,
+        "tr" => 34,
+        "td" => 35,
+        "th" => 36,
+        "id" => 37,
+        "class" => 38,
+        "src" => 39,
+        "href" => 40,
+        "type" => 41,
+        "placeholder" => 42,
+        "style" => 43,
+        "value" => 44,
+        "html" => 45,
+        "head" => 46,
+        "meta" => 47,
+        "link" => 48,
+        "script" => 49,
+        "title" => 50,
+        "br" => 51,
+        "hr" => 52,
+        "canvas" => 53,
+        "video" => 54,
+        "source" => 55,
+        "template" => 56,
+        "name" => 57,
+        "content" => 58,
+        "rel" => 59,
+        "alt" => 60,
+        "width" => 61,
+        "height" => 62,
+        "disabled" => 63,
+        "checked" => 64,
+        "role" => 65,
+        "lang" => 66,
+        "contenteditable" => 67,
+        "#comment" => 68,
+        "#cdata-section" => 69,
+        "#document-fragment" => 70,
+        _ => return None,
+    };
+    Some(id)
+}
 
 impl serde::Serialize for Atom {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -33,12 +192,18 @@ impl Atom {
     pub const CLASS: Self = Self(38);
 
     pub fn intern(s: &str) -> Self {
+        if let Some(id) = static_qualified_id(s) {
+            return Self(id);
+        }
         INTERN_TABLE.with(|t| Self(t.borrow_mut().intern(s)))
     }
 
     /// Intern `s` using a hash computed at AOT time. A miss or a mismatched
     /// hash falls back to `hash_str`, so a wrong literal cannot corrupt the table.
     pub fn intern_prehashed(s: &str, hash: u64) -> Self {
+        if let Some(id) = static_qualified_id(s) {
+            return Self(id);
+        }
         INTERN_TABLE.with(|t| Self(t.borrow_mut().intern_prehashed(s, hash)))
     }
 
@@ -132,57 +297,12 @@ impl InternTable {
             mask: SLOT_CAP - 1,
             len: 0,
         };
-        // Pre-intern common strings (index 0 = empty)
-        let preinterned = [
-            "",            // 0
-            "#document",   // 1
-            "#text",       // 2
-            "body",        // 3
-            "div",         // 4
-            "span",        // 5
-            "p",           // 6
-            "button",      // 7
-            "input",       // 8
-            "a",           // 9
-            "img",         // 10
-            "h1",          // 11
-            "h2",          // 12
-            "h3",          // 13
-            "h4",          // 14
-            "h5",          // 15
-            "h6",          // 16
-            "section",     // 17
-            "main",        // 18
-            "article",     // 19
-            "nav",         // 20
-            "header",      // 21
-            "footer",      // 22
-            "aside",       // 23
-            "form",        // 24
-            "label",       // 25
-            "ul",          // 26
-            "ol",          // 27
-            "li",          // 28
-            "em",          // 29
-            "strong",      // 30
-            "code",        // 31
-            "pre",         // 32
-            "table",       // 33
-            "tr",          // 34
-            "td",          // 35
-            "th",          // 36
-            "id",          // 37
-            "class",       // 38
-            "src",         // 39
-            "href",        // 40
-            "type",        // 41
-            "placeholder", // 42
-            "style",       // 43
-            "value",       // 44
-        ];
-        for s in &preinterned {
-            t.intern(s);
+        // Install the static table at fixed ids. These names are not inserted
+        // into the hash slots; `static_qualified_id` resolves them.
+        for name in QUALIFIED_NAMES {
+            t.push_bytes(name.as_bytes());
         }
+        debug_assert_eq!(t.ranges.len(), QUALIFIED_NAMES.len());
         t
     }
 
@@ -299,14 +419,20 @@ impl InternTable {
     }
 
     fn grow(&mut self) {
-        let next = (self.slots.len() * 2).max(SLOT_CAP);
+        let old = std::mem::take(&mut self.slots);
+        let next = (old.len() * 2).max(SLOT_CAP);
         self.slots = vec![0; next];
         self.mask = next - 1;
-        let ids = self.ranges.len();
-        for id in 0..ids {
-            let text = self.as_static(id as u32);
-            let hash = hash_str(text);
-            self.insert_slot(hash, id as u32);
+        // Reinsert only ids that already occupy a hash slot. Static names and
+        // `store_unhashed` bytes stay out of the table, so a later `intern`
+        // of the same text does not alias a raw id.
+        for slot in old {
+            if slot == 0 {
+                continue;
+            }
+            let id = slot - 1;
+            let text = self.as_static(id);
+            self.insert_slot(hash_str(text), id);
         }
     }
 }
@@ -362,6 +488,17 @@ mod tests {
         assert_eq!(Atom::DIV, Atom::intern("div"));
         assert_eq!(Atom::ID, Atom::intern("id"));
         assert_eq!(Atom::CLASS, Atom::intern("class"));
+    }
+
+    #[test]
+    fn static_table_ids_match_the_installed_bytes() {
+        for (index, name) in QUALIFIED_NAMES.iter().enumerate() {
+            assert_eq!(static_qualified_id(name), Some(index as u32));
+            assert_eq!(Atom::intern(name).as_u32(), index as u32);
+            assert_eq!(Atom::intern(name).as_str(), *name);
+        }
+        assert_eq!(static_qualified_id("row-7"), None);
+        assert_eq!(Atom::intern_prehashed("div", 1), Atom::DIV);
     }
 
     #[test]

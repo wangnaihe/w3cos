@@ -3262,6 +3262,16 @@ fn fnv1a(text: &str) -> u64 {
     hash
 }
 
+/// Static qualified-name id, or one prologue intern for a dynamic literal.
+fn qualified_atom_expr(name: &str) -> String {
+    if let Some(id) = w3cos_dom::atom::static_qualified_id(name) {
+        format!("{id}_u32")
+    } else {
+        let hash = fnv1a(name);
+        format!("w3cos_core::intrinsics::dom_intern_prehashed({name:?}, {hash}_u64)")
+    }
+}
+
 struct AppendedShape {
     document_binding: u32,
     parent_binding: u32,
@@ -3556,16 +3566,16 @@ fn emit_guarded_append(
         plan,
         back_edges,
     )?;
-    let tag_hash = fnv1a(&shape.tag);
-    let class_hash = fnv1a(&shape.class_name);
+    let tag_atom = qualified_atom_expr(&shape.tag);
+    let class_atom = qualified_atom_expr(&shape.class_name);
     let prelude = format!(
-        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\n{}{}{}",
+        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_tag_atom: u32 = {tag_atom};\nlet __w3cos_class_atom: u32 = {class_atom};\n{}{}{}",
         emit_stable_binding("doc", shape.document_binding),
         emit_stable_binding("parent", shape.parent_binding),
         emit_stable_binding("nodes", shape.nodes_binding),
     );
     let fast = format!(
-        "let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, {tag_hash}_u64, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, {class_hash}_u64, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n",
+        "let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, __w3cos_tag_atom, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, __w3cos_class_atom, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n",
         tag = shape.tag,
         id_prefix = shape.id_prefix,
         class_name = shape.class_name,
@@ -6719,8 +6729,10 @@ fn main() {{
             generated.contains("dom_build_guarded")
                 && generated.contains("dom_shape_epoch")
                 && generated.contains("is_undefined()")
-                && generated.contains("set_property_strict"),
-            "strict create loop should fuse behind the stamp and keep the lookup fallback: {generated}"
+                && generated.contains("set_property_strict")
+                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;")
+                && generated.contains("dom_intern_prehashed("),
+            "strict create loop should fuse behind the stamp, use the static div id, and intern the class once: {generated}"
         );
         assert!(
             !generated.contains("dom_build_appended"),

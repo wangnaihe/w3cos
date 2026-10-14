@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +41,15 @@ struct SelectorContextCache {
     style_clock: u64,
     stylesheet_generation: u64,
     entries: HashMap<NodeId, stylesheet::SelectorContext>,
+}
+
+fn resolve_name_atom(name: &str, atom: u32) -> Atom {
+    if atom != u32::MAX {
+        let resolved = Atom::from_u32(atom);
+        debug_assert_eq!(resolved.as_static(), name);
+        return resolved;
+    }
+    Atom::intern(name)
 }
 
 fn push_generated_text(items: &mut Vec<GeneratedContentItem>, text: &str) {
@@ -260,12 +268,12 @@ pub struct Document {
     computed_style_cache_misses: Cell<usize>,
     pub(crate) events: EventRegistry,
     body_id: NodeId,
-    // Fast lookup indexes
-    id_index: AtomMap<NodeId>,
-    /// Ids whose bytes were bump-stored without a hash slot. `get_element_by_id`
-    /// scans these and atomizes only the query string.
-    raw_ids: Vec<(NodeId, Atom)>,
-    class_index: AtomMap<Vec<NodeId>>,
+    // Fast lookup indexes. Id and class maps are built on lookup so the
+    // create loop does not hash unique values or insert into a hash table.
+    id_index: RefCell<AtomMap<NodeId>>,
+    class_index: RefCell<AtomMap<Vec<NodeId>>>,
+    id_index_ready: Cell<bool>,
+    class_index_ready: Cell<bool>,
     tag_index: AtomMap<Vec<NodeId>>,
     // The selected responsive-image source used by component lowering. This
     // is rendering state rather than a reflected HTML attribute: `img.src`
@@ -386,9 +394,10 @@ impl Document {
             computed_style_cache_misses: Cell::new(0),
             events: EventRegistry::new(),
             body_id: NodeId(0),
-            id_index: HashMap::with_capacity_and_hasher(32768, AtomBuildHasher),
-            raw_ids: Vec::with_capacity(PAGE_SLOTS),
-            class_index: HashMap::with_hasher(AtomBuildHasher),
+            id_index: RefCell::new(HashMap::with_capacity_and_hasher(32768, AtomBuildHasher)),
+            class_index: RefCell::new(HashMap::with_hasher(AtomBuildHasher)),
+            id_index_ready: Cell::new(true),
+            class_index_ready: Cell::new(true),
             tag_index: HashMap::with_hasher(AtomBuildHasher),
             image_render_sources: HashMap::new(),
             embedded_document_hosts: HashSet::new(),
@@ -408,7 +417,7 @@ impl Document {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: crate::node::AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: crate::node::AttributeNamespaceList::new(),
             class_list: crate::node::ClassList::new(),
             is_html_element: false,
         });
@@ -426,7 +435,11 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn create_element(&mut self, tag: &str) -> Element {
-        let id = self.alloc_node(DomNode::new_element(NodeId(0), tag));
+        self.create_element_atom(Atom::intern(tag))
+    }
+
+    fn create_element_atom(&mut self, tag: Atom) -> Element {
+        let id = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag));
         Element::new(id)
     }
 
@@ -501,16 +514,16 @@ impl Document {
         self.html_document
     }
 
-    /// O(1) lookup via HashMap index.
+    /// Lookup by id. The index is built on the first query from raw attribute
+    /// slices, so element creation does not hash unique id strings.
     pub fn get_element_by_id(&self, id: &str) -> Option<Element> {
+        self.ensure_id_index();
         let atom = Atom::intern(id);
-        if let Some(&nid) = self.id_index.get(&atom) {
-            return Some(Element::new(nid));
-        }
-        self.raw_ids
-            .iter()
-            .find(|(_, raw)| raw.as_static() == id)
-            .map(|(nid, _)| Element::new(*nid))
+        self.id_index
+            .borrow()
+            .get(&atom)
+            .copied()
+            .map(Element::new)
     }
 
     pub fn query_selector(&self, selector: &str) -> Option<Element> {
@@ -518,12 +531,14 @@ impl Document {
             return self.get_element_by_id(id);
         }
         if let Some(class) = selector.strip_prefix('.') {
+            self.ensure_class_index();
             let atom = Atom::intern(class);
             return self
                 .class_index
+                .borrow()
                 .get(&atom)
-                .and_then(|ids| ids.first())
-                .map(|&id| Element::new(id));
+                .and_then(|ids| ids.first().copied())
+                .map(Element::new);
         }
         let atom = Atom::intern(selector);
         self.tag_index
@@ -537,9 +552,11 @@ impl Document {
             return self.get_element_by_id(id).into_iter().collect();
         }
         if let Some(class) = selector.strip_prefix('.') {
+            self.ensure_class_index();
             let atom = Atom::intern(class);
             return self
                 .class_index
+                .borrow()
                 .get(&atom)
                 .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
                 .unwrap_or_default();
@@ -624,6 +641,7 @@ impl Document {
             NodeType::Element => {
                 let mut n = DomNode::new_element(NodeId(0), &node.tag.as_str());
                 n.attributes = node.attributes.clone();
+                n.attributes.share();
                 n.attribute_namespaces = node.attribute_namespaces.clone();
                 n.class_list = node.class_list.clone();
                 n.text_content = node.text_content.clone();
@@ -680,8 +698,10 @@ impl Document {
     }
 
     pub fn get_elements_by_class_name(&self, class: &str) -> Vec<Element> {
+        self.ensure_class_index();
         let atom = Atom::intern(class);
         self.class_index
+            .borrow()
             .get(&atom)
             .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
             .unwrap_or_default()
@@ -830,53 +850,52 @@ impl Document {
 
     /// `append_labeled_element` for the guarded create loop.
     ///
-    /// The id bytes are stored without hashing. Static names use the pre-interned
-    /// atoms, and `class_hash` is the FNV of `class_name` so the hit path skips
-    /// `hash_str`. Callers that have author rules must use the ordinary path:
-    /// this helper still invalidates when rules exist, but it does not re-check
-    /// prototype setters.
+    /// `tag_atom` and `class_atom` are static or prologue-interned ids
+    /// (`u32::MAX` resolves from the string). The id bytes are a raw arena
+    /// slice. Id and class maps stay stale until a lookup builds them.
+    /// Identical interned attribute sets share one immutable record.
+    /// Callers that have author rules must use the ordinary path: this helper
+    /// still invalidates when rules exist, but it does not re-check prototype
+    /// setters.
     pub fn append_labeled_unhashed(
         &mut self,
         parent: NodeId,
         tag: &str,
-        tag_hash: u64,
+        tag_atom: u32,
         id_value: &str,
         class_name: &str,
-        class_hash: u64,
+        class_atom: u32,
         text: &str,
     ) -> NodeId {
-        let _ = if tag == "div" {
-            Atom::DIV
-        } else {
-            Atom::intern_prehashed(tag, tag_hash)
-        };
-        let element = self.create_element(tag);
+        let tag_atom = resolve_name_atom(tag, tag_atom);
+        let element = self.create_element_atom(tag_atom);
         if !id_value.is_empty() {
-            let id_atom = Atom::store_unhashed(id_value);
             self.get_node_mut(element.id)
                 .attributes
-                .push((Atom::ID, crate::node::AttrValue::from_atom(id_atom)));
-            self.raw_ids.push((element.id, id_atom));
+                .push((Atom::ID, crate::node::AttrValue::raw(id_value)));
+            self.id_index_ready.set(false);
         }
         if !class_name.is_empty()
             && !class_name
                 .bytes()
                 .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
         {
-            let class_atom = Atom::intern_prehashed(class_name, class_hash);
+            let class_atom = resolve_name_atom(class_name, class_atom);
             {
                 let node = self.get_node_mut(element.id);
                 node.attributes
                     .push((Atom::CLASS, crate::node::AttrValue::from_atom(class_atom)));
                 node.class_list.push(class_atom);
             }
-            self.add_to_class_index(element.id, &class_atom);
+            self.class_index_ready.set(false);
             if stylesheet::has_rules() {
                 self.mark_selector_dirty(element.id);
             }
         } else if !class_name.is_empty() {
             element.set_class_name(self, class_name);
+            self.class_index_ready.set(false);
         }
+        self.get_node_mut(element.id).attributes.share();
         if stylesheet::has_rules() {
             if !text.is_empty() {
                 let _ = self.set_inline_text_child(element.id, text);
@@ -1050,20 +1069,27 @@ impl Document {
                 // handled on removal
                 let _ = attr_val;
             }
-            let id_key = Atom::intern("id");
-            let id_atom_key = node
+            let id_attr = node
                 .attributes
                 .iter()
-                .find(|(k, _)| *k == id_key)
-                .map(|(_, v)| v.atom());
-            if let Some(id_atom) = id_atom_key {
-                self.id_index.remove(&id_atom);
+                .find(|(k, _)| *k == Atom::ID)
+                .map(|(_, v)| *v);
+            let classes: Vec<Atom> = node.class_list.iter().copied().collect();
+            if self.id_index_ready.get()
+                && let Some(value) = id_attr
+            {
+                let mut index = self.id_index.borrow_mut();
+                index.remove(&value.atom());
+                if value.is_raw() {
+                    index.remove(&Atom::intern(value.as_str()));
+                }
             }
-            self.raw_ids.retain(|(nid, _)| *nid != id);
-            // Remove from class index
-            for class in &node.class_list {
-                if let Some(ids) = self.class_index.get_mut(class) {
-                    ids.retain(|&nid| nid != id);
+            if self.class_index_ready.get() {
+                let mut index = self.class_index.borrow_mut();
+                for class in &classes {
+                    if let Some(ids) = index.get_mut(class) {
+                        ids.retain(|&nid| nid != id);
+                    }
                 }
             }
         }
@@ -1152,15 +1178,26 @@ impl Document {
         old_id: Option<Atom>,
         new_id: Atom,
     ) {
-        if let Some(old) = old_id {
-            self.id_index.remove(&old);
+        if !self.id_index_ready.get() {
+            return;
         }
-        self.raw_ids.retain(|(id, _)| *id != node_id);
-        self.id_index.insert(new_id, node_id);
+        let mut index = self.id_index.borrow_mut();
+        if let Some(old) = old_id {
+            index.remove(&old);
+            let interned = Atom::intern(old.as_static());
+            if interned != old {
+                index.remove(&interned);
+            }
+        }
+        index.insert(new_id, node_id);
     }
 
     pub(crate) fn add_to_class_index(&mut self, node_id: NodeId, class: &Atom) {
-        let ids = self.class_index.entry(*class).or_default();
+        if !self.class_index_ready.get() {
+            return;
+        }
+        let mut index = self.class_index.borrow_mut();
+        let ids = index.entry(*class).or_default();
         if ids.capacity() < PAGE_SLOTS {
             ids.reserve(PAGE_SLOTS);
         }
@@ -1168,9 +1205,54 @@ impl Document {
     }
 
     pub(crate) fn remove_from_class_index(&mut self, node_id: NodeId, class: &Atom) {
-        if let Some(ids) = self.class_index.get_mut(class) {
+        if !self.class_index_ready.get() {
+            return;
+        }
+        if let Some(ids) = self.class_index.borrow_mut().get_mut(class) {
             ids.retain(|&id| id != node_id);
         }
+    }
+
+    fn ensure_id_index(&self) {
+        if self.id_index_ready.get() {
+            return;
+        }
+        let mut index = self.id_index.borrow_mut();
+        index.clear();
+        for slot in &self.nodes {
+            let Some(node) = slot.as_ref() else {
+                continue;
+            };
+            let Some((_, value)) = node.attributes.iter().find(|(name, _)| *name == Atom::ID) else {
+                continue;
+            };
+            let key = if value.is_raw() {
+                Atom::intern(value.as_str())
+            } else {
+                value.atom()
+            };
+            index.insert(key, node.id);
+        }
+        drop(index);
+        self.id_index_ready.set(true);
+    }
+
+    fn ensure_class_index(&self) {
+        if self.class_index_ready.get() {
+            return;
+        }
+        let mut index = self.class_index.borrow_mut();
+        index.clear();
+        for slot in &self.nodes {
+            let Some(node) = slot.as_ref() else {
+                continue;
+            };
+            for class in node.class_list.iter() {
+                index.entry(*class).or_default().push(node.id);
+            }
+        }
+        drop(index);
+        self.class_index_ready.set(true);
     }
 
     // -----------------------------------------------------------------------
@@ -25219,7 +25301,15 @@ mod tree_mutation_tests {
     fn unhashed_id_is_found_until_a_later_attribute_replaces_it() {
         let mut document = Document::new();
         let parent = document.body().id;
-        let child = document.append_labeled_unhashed(parent, "div", 0, "row-3", "row", 0, "item 3");
+        let child = document.append_labeled_unhashed(
+            parent,
+            "div",
+            Atom::DIV.as_u32(),
+            "row-3",
+            "row",
+            u32::MAX,
+            "item 3",
+        );
         let found = document.get_element_by_id("row-3").expect("raw id");
         assert_eq!(found.id, child);
         assert_eq!(document.get_node(child).get_attribute("id"), Some("row-3"));
@@ -25233,6 +25323,10 @@ mod tree_mutation_tests {
                 .join(" "),
             "row"
         );
+        assert!(document
+            .get_elements_by_class_name("row")
+            .iter()
+            .any(|element| element.id == child));
         let text = document.get_node(child).first_child.expect("text child");
         assert_eq!(document.get_node(text).text_content.as_deref(), Some("item 3"));
         assert!(document.get_node(child).text_content.is_none());
@@ -25241,6 +25335,44 @@ mod tree_mutation_tests {
         assert_eq!(
             document.get_element_by_id("renamed").map(|element| element.id),
             Some(child)
+        );
+    }
+
+    #[test]
+    fn identical_class_only_elements_share_attribute_storage() {
+        let mut document = Document::new();
+        let parent = document.body().id;
+        let first = document.append_labeled_unhashed(
+            parent,
+            "div",
+            Atom::DIV.as_u32(),
+            "",
+            "row",
+            u32::MAX,
+            "",
+        );
+        let second = document.append_labeled_unhashed(
+            parent,
+            "div",
+            Atom::DIV.as_u32(),
+            "",
+            "row",
+            u32::MAX,
+            "",
+        );
+        assert!(document.get_node(first).attributes.is_shared());
+        assert_eq!(
+            document.get_node(first).attributes.share_token(),
+            document.get_node(second).attributes.share_token()
+        );
+        Element::new(first).set_attribute(&mut document, "id", "only-first");
+        assert!(!document.get_node(first).attributes.is_shared());
+        assert!(document.get_node(second).attributes.is_shared());
+        assert_eq!(document.get_node(second).get_attribute("id"), None);
+        assert_eq!(document.get_node(second).get_attribute("class"), Some("row"));
+        assert_eq!(
+            document.get_element_by_id("only-first").map(|element| element.id),
+            Some(first)
         );
     }
 }

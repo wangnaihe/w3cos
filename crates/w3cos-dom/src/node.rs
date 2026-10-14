@@ -188,27 +188,42 @@ pub struct AttributeNamespace {
     pub local_name: Atom,
 }
 
-/// Attribute value owned by the atom arena. Copying the value does not allocate.
+/// Attribute value. Interned values compare as `u32`. A raw value is an
+/// unhashed arena slice (high bit set); id and class maps atomize it on
+/// lookup instead of hashing it when the element is created.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct AttrValue(Atom);
+pub struct AttrValue(u32);
 
 impl AttrValue {
-    pub const EMPTY: Self = Self(Atom::EMPTY);
+    pub const EMPTY: Self = Self(0);
+    const RAW_BIT: u32 = 0x8000_0000;
 
     pub fn new(value: &str) -> Self {
-        Self(Atom::intern(value))
+        Self::from_atom(Atom::intern(value))
     }
 
     pub(crate) fn from_atom(atom: Atom) -> Self {
-        Self(atom)
+        debug_assert!(atom.as_u32() < Self::RAW_BIT);
+        Self(atom.as_u32())
+    }
+
+    /// Bump `value` into the string arena without a hash slot.
+    pub(crate) fn raw(value: &str) -> Self {
+        let atom = Atom::store_unhashed(value);
+        debug_assert!(atom.as_u32() < Self::RAW_BIT);
+        Self(atom.as_u32() | Self::RAW_BIT)
+    }
+
+    pub fn is_raw(self) -> bool {
+        self.0 & Self::RAW_BIT != 0
     }
 
     pub fn atom(self) -> Atom {
-        self.0
+        Atom::from_u32(self.0 & !Self::RAW_BIT)
     }
 
     pub fn as_str(&self) -> &'static str {
-        self.0.as_static()
+        self.atom().as_static()
     }
 }
 
@@ -253,12 +268,73 @@ impl serde::Serialize for AttrValue {
 const INLINE_ATTRS: usize = 2;
 const INLINE_CLASSES: usize = 2;
 
-/// At most two attributes live in the node. A third spills to the heap.
-#[derive(Clone, Debug)]
+/// Attribute storage for one element.
+///
+/// Mirrors Blink's `ShareableElementData` / `UniqueElementData` split without
+/// Oilpan: identical interned attribute sets share one immutable record, and
+/// the first mutation copies that record into the element (copy-on-write).
+/// One or two unique attributes stay inline. The spill `Vec` is allocated
+/// only for a third attribute. Raw (unhashed) values are never shared,
+/// because each one is a distinct arena slice.
+#[derive(Clone)]
 pub struct AttrList {
     inline: [(Atom, AttrValue); INLINE_ATTRS],
+    /// Inline count when `shared == 0`. Full count when the list is shared.
     len: u8,
-    spill: Vec<(Atom, AttrValue)>,
+    /// `0` is unique storage. Otherwise `pool_index + 1`.
+    shared: u32,
+    spill: Option<Box<Vec<(Atom, AttrValue)>>>,
+}
+
+struct SharePool {
+    records: Vec<Box<[(Atom, AttrValue)]>>,
+    by_hash: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+thread_local! {
+    static SHARE_POOL: std::cell::RefCell<SharePool> = std::cell::RefCell::new(SharePool {
+        records: Vec::new(),
+        by_hash: std::collections::HashMap::new(),
+    });
+}
+
+fn share_fingerprint(pairs: &[(Atom, AttrValue)]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for (name, value) in pairs {
+        hash ^= name.as_u32() as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= value.0 as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Immutable shared records are append-only. The slice allocation does not
+/// move when the pool `Vec` grows, so the pointer stays valid for the thread.
+fn shared_pairs(index: usize) -> &'static [(Atom, AttrValue)] {
+    SHARE_POOL.with(|pool| {
+        let pool = pool.borrow();
+        let slice = pool.records[index].as_ref();
+        unsafe { &*(slice as *const [(Atom, AttrValue)]) }
+    })
+}
+
+fn intern_share(pairs: &[(Atom, AttrValue)]) -> u32 {
+    let hash = share_fingerprint(pairs);
+    SHARE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if let Some(hits) = pool.by_hash.get(&hash) {
+            for &index in hits {
+                if pool.records[index].as_ref() == pairs {
+                    return index as u32;
+                }
+            }
+        }
+        let index = pool.records.len();
+        pool.records.push(pairs.to_vec().into_boxed_slice());
+        pool.by_hash.entry(hash).or_default().push(index);
+        index as u32
+    })
 }
 
 impl Default for AttrList {
@@ -267,35 +343,105 @@ impl Default for AttrList {
     }
 }
 
+impl std::fmt::Debug for AttrList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 impl AttrList {
     pub fn new() -> Self {
         Self {
             inline: [(Atom::EMPTY, AttrValue::EMPTY); INLINE_ATTRS],
             len: 0,
-            spill: Vec::new(),
+            shared: 0,
+            spill: None,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.len as usize + self.spill.len()
+        if self.shared != 0 {
+            return self.len as usize;
+        }
+        self.len as usize + self.spill.as_ref().map(|spill| spill.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    pub fn is_shared(&self) -> bool {
+        self.shared != 0
+    }
+
+    /// Pool token. Equal tokens are the same immutable attribute record.
+    pub fn share_token(&self) -> u32 {
+        self.shared
+    }
+
+    /// Publish this attribute set as a `ShareableElementData` record when
+    /// every value is interned. Raw id slices stay unique.
+    pub fn share(&mut self) {
+        if self.shared != 0 || self.is_empty() || self.len() > u8::MAX as usize {
+            return;
+        }
+        let count = self.len();
+        for index in 0..count {
+            if self.pair(index).1.is_raw() {
+                return;
+            }
+        }
+        let pairs: Vec<(Atom, AttrValue)> = (0..count).map(|index| *self.pair(index)).collect();
+        let id = intern_share(&pairs);
+        self.inline = [(Atom::EMPTY, AttrValue::EMPTY); INLINE_ATTRS];
+        self.len = pairs.len() as u8;
+        self.spill = None;
+        self.shared = id + 1;
+    }
+
     pub fn push(&mut self, item: (Atom, AttrValue)) {
-        if self.spill.is_empty() && (self.len as usize) < INLINE_ATTRS {
+        self.ensure_unique();
+        self.push_unique(item);
+    }
+
+    fn push_unique(&mut self, item: (Atom, AttrValue)) {
+        if self.spill.is_none() && (self.len as usize) < INLINE_ATTRS {
             self.inline[self.len as usize] = item;
             self.len += 1;
             return;
         }
-        self.spill.push(item);
+        self.spill
+            .get_or_insert_with(|| Box::new(Vec::new()))
+            .push(item);
+    }
+
+    fn ensure_unique(&mut self) {
+        if self.shared == 0 {
+            return;
+        }
+        let pairs = shared_pairs((self.shared - 1) as usize).to_vec();
+        self.shared = 0;
+        self.len = 0;
+        self.spill = None;
+        for pair in pairs {
+            self.push_unique(pair);
+        }
+    }
+
+    fn pair(&self, index: usize) -> &(Atom, AttrValue) {
+        if self.shared != 0 {
+            return &shared_pairs((self.shared - 1) as usize)[index];
+        }
+        if index < self.len as usize {
+            &self.inline[index]
+        } else {
+            &self.spill.as_ref().expect("attribute spill")[index - self.len as usize]
+        }
     }
 
     pub fn get(&self, index: usize) -> Option<&(Atom, AttrValue)> {
         if index < self.len() {
-            Some(&self[index])
+            Some(self.pair(index))
         } else {
             None
         }
@@ -310,7 +456,8 @@ impl AttrList {
 
     pub fn remove(&mut self, index: usize) -> (Atom, AttrValue) {
         assert!(index < self.len(), "attribute index");
-        if self.spill.is_empty() {
+        self.ensure_unique();
+        if self.spill.as_ref().map(|spill| spill.is_empty()).unwrap_or(true) {
             let removed = self.inline[index];
             let last = self.len as usize;
             for slot in index + 1..last {
@@ -319,16 +466,24 @@ impl AttrList {
             self.len -= 1;
             return removed;
         }
-        if index < self.len as usize {
-            let removed = self.inline[index];
-            let last = self.len as usize - 1;
-            for slot in index..last {
-                self.inline[slot] = self.inline[slot + 1];
+        let removed = {
+            let spill = self.spill.as_mut().expect("attribute spill");
+            if index < self.len as usize {
+                let removed = self.inline[index];
+                let last = self.len as usize - 1;
+                for slot in index..last {
+                    self.inline[slot] = self.inline[slot + 1];
+                }
+                self.inline[last] = spill.remove(0);
+                removed
+            } else {
+                spill.remove(index - self.len as usize)
             }
-            self.inline[last] = self.spill.remove(0);
-            return removed;
+        };
+        if self.spill.as_ref().is_some_and(|spill| spill.is_empty()) {
+            self.spill = None;
         }
-        self.spill.remove(index - self.len as usize)
+        removed
     }
 }
 
@@ -341,17 +496,12 @@ impl<'a> Iterator for AttrIter<'a> {
     type Item = &'a (Atom, AttrValue);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.list.len as usize {
-            let item = &self.list.inline[self.index];
-            self.index += 1;
-            return Some(item);
+        if self.index >= self.list.len() {
+            return None;
         }
-        let spill = self.index - self.list.len as usize;
-        if spill < self.list.spill.len() {
-            self.index += 1;
-            return Some(&self.list.spill[spill]);
-        }
-        None
+        let item = self.list.pair(self.index);
+        self.index += 1;
+        Some(item)
     }
 }
 
@@ -368,30 +518,30 @@ impl std::ops::Index<usize> for AttrList {
     type Output = (Atom, AttrValue);
 
     fn index(&self, index: usize) -> &Self::Output {
-        if index < self.len as usize {
-            &self.inline[index]
-        } else {
-            &self.spill[index - self.len as usize]
-        }
+        assert!(index < self.len(), "attribute index");
+        self.pair(index)
     }
 }
 
 impl std::ops::IndexMut<usize> for AttrList {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        assert!(index < self.len(), "attribute index");
+        self.ensure_unique();
         if index < self.len as usize {
             &mut self.inline[index]
         } else {
-            &mut self.spill[index - self.len as usize]
+            &mut self.spill.as_mut().expect("attribute spill")[index - self.len as usize]
         }
     }
 }
 
-/// One or two classes live in the node. More spill to the heap.
+/// One or two classes live in the node. The spill vector is allocated only
+/// for a third class.
 #[derive(Clone, Debug)]
 pub struct ClassList {
     inline: [Atom; INLINE_CLASSES],
     len: u8,
-    spill: Vec<Atom>,
+    spill: Option<Box<Vec<Atom>>>,
 }
 
 impl Default for ClassList {
@@ -405,12 +555,12 @@ impl ClassList {
         Self {
             inline: [Atom::EMPTY; INLINE_CLASSES],
             len: 0,
-            spill: Vec::new(),
+            spill: None,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.len as usize + self.spill.len()
+        self.len as usize + self.spill.as_ref().map(|spill| spill.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -421,7 +571,9 @@ impl ClassList {
         if index < self.len as usize {
             Some(&self.inline[index])
         } else {
-            self.spill.get(index - self.len as usize)
+            self.spill
+                .as_ref()
+                .and_then(|spill| spill.get(index - self.len as usize))
         }
     }
 
@@ -430,16 +582,20 @@ impl ClassList {
     }
 
     pub fn push(&mut self, atom: Atom) {
-        if self.spill.is_empty() && (self.len as usize) < INLINE_CLASSES {
+        if self.spill.as_ref().map(|spill| spill.is_empty()).unwrap_or(true)
+            && (self.len as usize) < INLINE_CLASSES
+        {
             self.inline[self.len as usize] = atom;
             self.len += 1;
             return;
         }
-        self.spill.push(atom);
+        self.spill
+            .get_or_insert_with(|| Box::new(Vec::new()))
+            .push(atom);
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&Atom) -> bool) {
-        if self.spill.is_empty() {
+        if self.spill.as_ref().map(|spill| spill.is_empty()).unwrap_or(true) {
             let mut write = 0usize;
             for read in 0..self.len as usize {
                 if keep(&self.inline[read]) {
@@ -503,7 +659,10 @@ impl IntoIterator for ClassList {
             inline: self.inline,
             len: self.len,
             index: 0,
-            spill: self.spill.into_iter(),
+            spill: self
+                .spill
+                .map(|spill| (*spill).into_iter())
+                .unwrap_or_else(|| Vec::new().into_iter()),
         }
     }
 }
@@ -539,6 +698,54 @@ impl serde::Serialize for ClassList {
     }
 }
 
+/// Namespace records for attributes. The vector is allocated only when an
+/// attribute actually has a namespace.
+#[derive(Clone, Debug, Default)]
+pub struct AttributeNamespaceList {
+    values: Option<Box<Vec<AttributeNamespace>>>,
+}
+
+impl AttributeNamespaceList {
+    pub fn new() -> Self {
+        Self { values: None }
+    }
+
+    pub fn push(&mut self, attribute: AttributeNamespace) {
+        self.values
+            .get_or_insert_with(|| Box::new(Vec::new()))
+            .push(attribute);
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&AttributeNamespace) -> bool) {
+        let Some(values) = self.values.as_mut() else {
+            return;
+        };
+        values.retain(|attribute| keep(attribute));
+        if values.is_empty() {
+            self.values = None;
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, AttributeNamespace> {
+        let values: &mut [AttributeNamespace] = match self.values.as_deref_mut() {
+            Some(values) => values,
+            None => &mut [],
+        };
+        values.iter_mut()
+    }
+}
+
+impl std::ops::Deref for AttributeNamespaceList {
+    type Target = [AttributeNamespace];
+
+    fn deref(&self) -> &Self::Target {
+        match self.values.as_deref() {
+            Some(values) => values,
+            None => &[],
+        }
+    }
+}
+
 /// Internal node storage for the DOM tree.
 ///
 /// Uses Left-Child Right-Sibling (LCRS) tree structure (like Chrome/Blink):
@@ -564,7 +771,7 @@ pub struct DomNode {
     pub prev_sibling: u32,
     /// Up to two attributes are inline. Values are atom ids, not separate Strings.
     pub attributes: AttrList,
-    pub attribute_namespaces: Vec<AttributeNamespace>,
+    pub attribute_namespaces: AttributeNamespaceList,
     /// Up to two classes are inline.
     pub class_list: ClassList,
     /// Whether CSS selector name matching follows the HTML element rules.
@@ -573,19 +780,19 @@ pub struct DomNode {
 }
 
 fn cached_tag(tag: &str) -> Atom {
-    match tag {
-        "div" => Atom::DIV,
-        "#text" => Atom::TEXT,
-        _ => Atom::intern(tag),
-    }
+    Atom::intern(tag)
 }
 
 impl DomNode {
     pub fn new_element(id: NodeId, tag: impl AsRef<str>) -> Self {
+        Self::new_element_atom(id, cached_tag(tag.as_ref()))
+    }
+
+    pub fn new_element_atom(id: NodeId, tag: Atom) -> Self {
         Self {
             id,
             node_type: NodeType::Element,
-            tag: cached_tag(tag.as_ref()),
+            tag,
             text_content: None,
             parent: None,
             first_child: None,
@@ -593,7 +800,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: true,
         }
@@ -611,7 +818,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: false,
         }
@@ -629,7 +836,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: false,
         }
@@ -647,7 +854,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: false,
         }
@@ -665,7 +872,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: false,
         }
@@ -687,7 +894,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: false,
         }
@@ -705,7 +912,7 @@ impl DomNode {
             next_sibling: 0,
             prev_sibling: 0,
             attributes: AttrList::new(),
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaceList::new(),
             class_list: ClassList::new(),
             is_html_element: false,
         }
@@ -936,10 +1143,54 @@ impl DomNode {
     pub(crate) fn remove_attribute_at(&mut self, attribute_index: usize) {
         self.attributes.remove(attribute_index);
         self.clear_attribute_namespace(attribute_index);
-        for attribute in &mut self.attribute_namespaces {
+        for attribute in self.attribute_namespaces.iter_mut() {
             if attribute.attribute_index > attribute_index {
                 attribute.attribute_index -= 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod attribute_storage_tests {
+    use super::*;
+
+    #[test]
+    fn two_attributes_stay_inline_and_the_third_allocates() {
+        let mut list = AttrList::new();
+        list.push((Atom::ID, AttrValue::new("a")));
+        list.push((Atom::CLASS, AttrValue::new("b")));
+        assert!(list.spill.is_none());
+        list.push((Atom::intern("title"), AttrValue::new("c")));
+        assert!(list.spill.is_some());
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[2].1.as_str(), "c");
+    }
+
+    #[test]
+    fn identical_interned_sets_share_until_mutation() {
+        let mut first = AttrList::new();
+        first.push((Atom::CLASS, AttrValue::from_atom(Atom::intern("row"))));
+        let mut second = first.clone();
+        first.share();
+        second.share();
+        assert!(first.is_shared());
+        assert_eq!(first.share_token(), second.share_token());
+        first.push((Atom::ID, AttrValue::new("only")));
+        assert!(!first.is_shared());
+        assert!(second.is_shared());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1.as_str(), "row");
+        assert_eq!(first[1].1.as_str(), "only");
+    }
+
+    #[test]
+    fn raw_values_are_not_shared() {
+        let mut list = AttrList::new();
+        list.push((Atom::ID, AttrValue::raw("row-1")));
+        list.share();
+        assert!(!list.is_shared());
+        assert!(list[0].1.is_raw());
+        assert_eq!(list[0].1.as_str(), "row-1");
     }
 }

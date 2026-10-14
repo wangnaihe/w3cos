@@ -581,7 +581,9 @@ pub struct DomFast {
     /// Fused create used only when `epoch` still matches [`dom_shape_epoch`].
     /// Returns [`Value::Undefined`] when the stamp is stale or the fast path
     /// refuses, so the caller runs the ordinary lookup.
-    pub build_guarded: fn(&Value, &Value, &str, u64, &str, f64, &str, u64, &str, f64, u64) -> Value,
+    /// `tag_atom` / `class_atom` are static or prologue-interned ids.
+    /// `u32::MAX` means the runtime resolves the name.
+    pub build_guarded: fn(&Value, &Value, &str, u32, &str, f64, &str, u32, &str, f64, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -722,11 +724,11 @@ pub fn dom_build_guarded(
     document: &Value,
     parent: &Value,
     tag: &str,
-    tag_hash: u64,
+    tag_atom: u32,
     id_prefix: &str,
     id_index: f64,
     class_name: &str,
-    class_hash: u64,
+    class_atom: u32,
     text_prefix: &str,
     text_index: f64,
     epoch: u64,
@@ -741,15 +743,30 @@ pub fn dom_build_guarded(
         document,
         parent,
         tag,
-        tag_hash,
+        tag_atom,
         id_prefix,
         id_index,
         class_name,
-        class_hash,
+        class_atom,
         text_prefix,
         text_index,
         epoch,
     )
+}
+
+static ATOM_PREHASH: std::sync::OnceLock<fn(&str, u64) -> u32> = std::sync::OnceLock::new();
+
+pub fn install_atom_prehash(prehash: fn(&str, u64) -> u32) {
+    let _ = ATOM_PREHASH.set(prehash);
+}
+
+/// Intern a loop-invariant name once in the prologue. `u32::MAX` if the
+/// runtime has not installed the atom table yet.
+pub fn dom_intern_prehashed(text: &str, hash: u64) -> u32 {
+    ATOM_PREHASH
+        .get()
+        .map(|prehash| prehash(text, hash))
+        .unwrap_or(u32::MAX)
 }
 
 /// `array.push(value)` without allocating an arguments `Vec`.

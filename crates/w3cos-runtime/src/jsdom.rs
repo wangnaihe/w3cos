@@ -1043,6 +1043,9 @@ fn ensure_dom_fast() {
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
+    w3cos_core::intrinsics::install_atom_prehash(|text, hash| {
+        w3cos_dom::atom::Atom::intern_prehashed(text, hash).as_u32()
+    });
     w3cos_core::intrinsics::install_dom_imm(w3cos_core::intrinsics::DomImmOps {
         generation: realm_generation,
         get: dom_imm_get,
@@ -1190,11 +1193,11 @@ fn fast_build_guarded(
     document: &Value,
     parent: &Value,
     tag: &str,
-    tag_hash: u64,
+    tag_atom: u32,
     id_prefix: &str,
     id_index: f64,
     class_name: &str,
-    class_hash: u64,
+    class_atom: u32,
     text_prefix: &str,
     text_index: f64,
     epoch: u64,
@@ -1228,9 +1231,11 @@ fn fast_build_guarded(
     }
     let parent_id = node_id_of(parent).expect("parent checked");
     let lowered;
+    let mut tag_atom = tag_atom;
     let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
     {
         lowered = tag.to_ascii_lowercase();
+        tag_atom = u32::MAX;
         lowered.as_str()
     } else {
         tag
@@ -1239,10 +1244,10 @@ fn fast_build_guarded(
         doc.append_labeled_unhashed(
             w3cos_dom::NodeId::from_u32(parent_id),
             tag,
-            tag_hash,
+            tag_atom,
             id_text,
             class_name,
-            class_hash,
+            class_atom,
             text,
         )
         .as_u32()
