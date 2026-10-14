@@ -28,6 +28,10 @@ BR2_TARGET_ROOTFS_ISO9660=y
 BR2_TARGET_ROOTFS_ISO9660_BOOT_MENU="system/buildroot/isolinux.cfg"
 BR2_ROOTFS_OVERLAY="system/rootfs_overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="system/scripts/post-build.sh"
+# post-build.sh also installs /usr/lib/w3cos/libw3cos_runtime.so and
+# /usr/bin/w3cos-runtime-host when scripts/build-shared-runtime.sh has produced
+# target/shared. The cdylib statically links std. Set W3COS_INSTALL_RUSTC=1
+# to copy rustc into the image.
 
 # Init system: busybox init (minimal)
 BR2_INIT_BUSYBOX=y

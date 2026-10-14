@@ -77,6 +77,9 @@ pub struct CompileOptions {
     pub devtools: bool,
     /// HTTP(S) base URL for relative browser APIs in a packaged application.
     pub document_base_url: Option<String>,
+    /// Emit a component bundle loaded by the system runtime instead of a
+    /// standalone binary with the runtime linked statically.
+    pub shared_runtime: bool,
 }
 
 pub(crate) const GENERATED_RELEASE_PROFILE: &str = r#"
@@ -92,6 +95,119 @@ codegen-units = 1
 panic = "unwind"
 strip = "symbols"
 "#;
+
+/// Replace the standalone `fn main` with the versioned C entry the system
+/// runtime host dlopens. The numeric ABI comes from `w3cos-abi`.
+pub fn wrap_shared_runtime_entry(rust_code: &str) -> Result<String> {
+    let abi = w3cos_abi::W3COS_RUNTIME_ABI;
+    let app = format!(
+        r#"#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_app_abi_required() -> u32 {{
+    {abi}
+}}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_app_main() -> i32 {{
+    match w3cos_runtime::run_app(build_ui) {{
+        Ok(()) => 0,
+        Err(error) => {{
+            eprintln!("W3C OS app crashed: {{error:#}}");
+            1
+        }}
+    }}
+}}"#
+    );
+    let dom = format!(
+        r#"#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_app_abi_required() -> u32 {{
+    {abi}
+}}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_app_main() -> i32 {{
+    match w3cos_runtime::run_app_dom(setup) {{
+        Ok(()) => 0,
+        Err(error) => {{
+            eprintln!("W3C OS app crashed: {{error:#}}");
+            1
+        }}
+    }}
+}}"#
+    );
+    const APP_MAIN: &str =
+        "fn main() {\n    w3cos_runtime::run_app(build_ui).expect(\"W3C OS app crashed\");\n}";
+    const DOM_MAIN: &str =
+        "fn main() {\n    w3cos_runtime::run_app_dom(setup).expect(\"W3C OS app crashed\");\n}";
+    if rust_code.contains(APP_MAIN) {
+        return Ok(rust_code.replacen(APP_MAIN, &app, 1));
+    }
+    if rust_code.contains(DOM_MAIN) {
+        return Ok(rust_code.replacen(DOM_MAIN, &dom, 1));
+    }
+    anyhow::bail!(
+        "shared-runtime output needs a generated run_app or run_app_dom entry; this source did not produce one"
+    )
+}
+
+/// Replace `fn main` with a build-time printer. The printer links `w3cos-std`
+/// only and writes the component tree as a bundle the system runtime loads.
+pub fn wrap_shared_bundle_entry(rust_code: &str) -> Result<String> {
+    let abi = w3cos_abi::W3COS_RUNTIME_ABI;
+    let printer = format!(
+        r#"fn main() {{
+    let component = build_ui();
+    let bundle = serde_json::json!({{
+        "abi": {abi},
+        "component": component,
+    }});
+    println!("{{bundle}}");
+}}"#
+    );
+    const APP_MAIN: &str =
+        "fn main() {\n    w3cos_runtime::run_app(build_ui).expect(\"W3C OS app crashed\");\n}";
+    if !rust_code.contains(APP_MAIN) {
+        anyhow::bail!(
+            "shared bundles are emitted from a static run_app UI. This source did not produce one."
+        );
+    }
+    Ok(rust_code.replacen(APP_MAIN, &printer, 1))
+}
+
+pub fn generate_bundle_cargo_toml(output_dir: &std::path::Path) -> Result<String> {
+    let _ = output_dir;
+    let workspace_root = find_workspace_root()?;
+    let std_path = workspace_root.join("crates/w3cos-std");
+    Ok(format!(
+        r#"[package]
+name = "w3cos-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+w3cos-std = {{ path = "{std_}" }}
+serde_json = "1"
+"#,
+        std_ = std_path.display(),
+    ))
+}
+
+pub fn shared_app_manifest() -> String {
+    let major = w3cos_abi::W3COS_RUNTIME_ABI_MAJOR;
+    let minor = w3cos_abi::W3COS_RUNTIME_ABI_MINOR;
+    format!(
+        r#"{{
+  "format": "w3cos.app",
+  "formatVersion": 1,
+  "abi": "{major}.{minor}",
+  "abiPacked": {packed},
+  "linkage": "component-bundle",
+  "entry": "w3cos_runtime_run_bundle",
+  "runtime": "libw3cos_runtime.so.1"
+}}
+"#,
+        packed = w3cos_abi::W3COS_RUNTIME_ABI,
+    )
+}
 
 pub(crate) const GENERATED_DEV_PROFILE: &str = r#"
 # Large W3IR state-machine match arms retain enough temporary stack state at
@@ -114,9 +230,26 @@ pub fn generate_cargo_toml(
     let runtime_path = workspace_root.join("crates/w3cos-runtime");
     let std_path = workspace_root.join("crates/w3cos-std");
     let runtime_features = if options.devtools {
-        r#"["gpu", "devtools"]"#
+        r#"["gpu", "devtools"]"#.to_string()
+    } else if let Some(custom) = std::env::var("W3COS_RUNTIME_FEATURES")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let features = custom
+            .split(',')
+            .map(str::trim)
+            .filter(|feature| {
+                !feature.is_empty()
+                    && feature
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            })
+            .map(|feature| format!("{feature:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{features}]")
     } else {
-        r#"["gpu"]"#
+        r#"["gpu"]"#.to_string()
     };
 
     Ok(format!(
@@ -1764,6 +1897,24 @@ mod tests {
         assert!(toml.contains("codegen-units = 1"), "{toml}");
         assert!(toml.contains("panic = \"unwind\""), "{toml}");
         assert!(toml.contains("strip = \"symbols\""), "{toml}");
+    }
+
+    #[test]
+    fn shared_runtime_entry_exports_the_versioned_plugin_abi() {
+        let mut node = test_node(NodeKind::Text("hello".into()), StyleDecl::default());
+        node.text = Some("hello".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
+        let shared = wrap_shared_runtime_entry(&rust).unwrap();
+        assert!(!shared.contains("fn main()"));
+        assert!(shared.contains("w3cos_app_main"));
+        assert!(shared.contains("w3cos_app_abi_required"));
+        assert!(shared.contains(&w3cos_abi::W3COS_RUNTIME_ABI.to_string()));
+        let bundled = wrap_shared_bundle_entry(&rust).unwrap();
+        assert!(bundled.contains("serde_json::json!"));
+        assert!(!bundled.contains("w3cos_runtime::run_app"));
+        let manifest = shared_app_manifest();
+        assert!(manifest.contains("\"linkage\": \"component-bundle\""));
+        assert!(manifest.contains("\"abi\": \"1.0\""));
     }
 
     #[test]

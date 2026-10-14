@@ -31,6 +31,7 @@ ohos-check = ["skia", "skia-safe/gl"]
 
 [dependencies]
 w3cos-std = { workspace = true }
+w3cos-abi = { workspace = true }
 w3cos-dom = { workspace = true }
 w3cos-core = { workspace = true }
 w3cos-compiler = { workspace = true, optional = true }

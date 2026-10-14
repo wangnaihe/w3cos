@@ -1,0 +1,26 @@
+#!/bin/sh
+# Show the compile toolchain shipped with the shell image.
+# rustc/cargo are copied by system/scripts/post-build.sh when W3COS_INSTALL_RUSTC=1.
+set -eu
+
+echo "w3cos toolchain"
+echo "  runtime: ${W3COS_RUNTIME_LIB:-/usr/lib/w3cos/libw3cos_runtime.so}"
+echo "  host:    ${W3COS_RUNTIME_HOST:-/usr/bin/w3cos-runtime-host}"
+
+if [ -x /usr/bin/w3cos ]; then
+    echo "  cli:     /usr/bin/w3cos"
+else
+    echo "  cli:     missing (/usr/bin/w3cos)"
+fi
+
+if command -v rustc >/dev/null 2>&1; then
+    echo "  rustc:   $(rustc --version)"
+else
+    echo "  rustc:   not installed in this image (set W3COS_INSTALL_RUSTC=1 at image build)"
+fi
+
+if [ -f /usr/lib/w3cos/libw3cos_runtime.so ]; then
+    echo "  abi-file: present"
+else
+    echo "  abi-file: libw3cos_runtime.so is not installed"
+fi

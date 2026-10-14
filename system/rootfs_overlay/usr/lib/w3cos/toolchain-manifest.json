@@ -1,0 +1,10 @@
+{
+  "format": "w3cos.toolchain",
+  "formatVersion": 1,
+  "runtime": "/usr/lib/w3cos/libw3cos_runtime.so",
+  "host": "/usr/bin/w3cos-runtime-host",
+  "cli": "/usr/bin/w3cos",
+  "abi": "1.0",
+  "features": ["cpu-render", "dynamic-js"],
+  "rustc": "optional; installed when W3COS_INSTALL_RUSTC=1"
+}

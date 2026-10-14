@@ -145,6 +145,7 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+pub mod shared_abi;
 #[cfg(feature = "skia")]
 mod skia_text_run;
 #[cfg(feature = "skia")]

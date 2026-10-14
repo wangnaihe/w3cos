@@ -37,4 +37,28 @@ if [ -d "${PROJECT_ROOT}/examples" ]; then
     cp -r "${PROJECT_ROOT}/examples/"* "${TARGET_DIR}/usr/share/w3cos/apps/" 2>/dev/null || true
 fi
 
+# System shared runtime, VM (inside the runtime dylib) and the thin host.
+# Build first: scripts/build-shared-runtime.sh
+LIB_DIR="${W3COS_SHARED_LIB_DIR:-${PROJECT_ROOT}/target/shared}"
+install -d "${TARGET_DIR}/usr/lib/w3cos" "${TARGET_DIR}/usr/share/w3cos/toolchain"
+if [ -f "${LIB_DIR}/libw3cos_runtime.so" ]; then
+    echo "  Installing shared runtime → ${TARGET_DIR}/usr/lib/w3cos/"
+    cp -a "${LIB_DIR}/." "${TARGET_DIR}/usr/lib/w3cos/"
+fi
+HOST_BIN="${W3COS_RUNTIME_HOST_BIN:-${PROJECT_ROOT}/target/release/w3cos-runtime-host}"
+if [ -f "$HOST_BIN" ]; then
+    echo "  Installing w3cos-runtime-host → ${TARGET_DIR}/usr/bin/"
+    install -m 755 "$HOST_BIN" "${TARGET_DIR}/usr/bin/w3cos-runtime-host"
+fi
+if [ "${W3COS_INSTALL_RUSTC:-0}" = "1" ] && command -v rustc >/dev/null 2>&1; then
+    SYSROOT="$(rustc --print sysroot)"
+    echo "  Installing rustc sysroot → ${TARGET_DIR}/usr/share/w3cos/toolchain/rust"
+    mkdir -p "${TARGET_DIR}/usr/share/w3cos/toolchain/rust"
+    cp -a "$SYSROOT/bin" "$SYSROOT/lib" "${TARGET_DIR}/usr/share/w3cos/toolchain/rust/" || true
+    ln -sfn /usr/share/w3cos/toolchain/rust/bin/rustc "${TARGET_DIR}/usr/bin/rustc"
+    if [ -x "$SYSROOT/bin/cargo" ]; then
+        ln -sfn /usr/share/w3cos/toolchain/rust/bin/cargo "${TARGET_DIR}/usr/bin/cargo"
+    fi
+fi
+
 echo "=== W3C OS post-build complete ==="

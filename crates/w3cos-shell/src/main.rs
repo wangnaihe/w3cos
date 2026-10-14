@@ -18,6 +18,8 @@ use w3cos_std::color::Color;
 use w3cos_std::style::*;
 use w3cos_std::{Component, EventAction, Style};
 
+mod shared_launch;
+
 const APP_SIGNAL: usize = 0;
 const NIGHT_SIGNAL: usize = 1;
 const PHASE_SIGNAL: usize = 2;
@@ -49,8 +51,13 @@ const OP_TOGGLE_TASKS: u8 = 14;
 const OP_CHIP_TERMINAL: u8 = 15;
 const OP_CHIP_SETTINGS: u8 = 16;
 const OP_ENROLL: u8 = 17;
+const OP_SHARED_APP: u8 = 18;
+const OP_SHARED_PAGE: u8 = 19;
 
 fn main() {
+    if shared_launch::launch_from_args() {
+        return;
+    }
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
 
     let mut ai_port = None;
@@ -216,6 +223,32 @@ fn on_shell_intent(code: u8, draft: &str) {
             };
             sync_session(session, state::get_signal(PHASE_SIGNAL), notice);
         }
+        OP_SHARED_APP => {
+            shared_launch::spawn_detached(
+                "app",
+                &shared_launch::configured_path(
+                    "W3COS_SHARED_APP",
+                    "/usr/share/w3cos/apps/shared-hello/shared-hello.w3app",
+                ),
+            );
+            state::set_text_signal(
+                NOTICE_SIGNAL,
+                "已启动共享运行时应用。Launched the shared-runtime app.",
+            );
+        }
+        OP_SHARED_PAGE => {
+            shared_launch::spawn_detached(
+                "page",
+                &shared_launch::configured_path(
+                    "W3COS_SHARED_PAGE",
+                    "/usr/share/w3cos/apps/shared-hello/page.html",
+                ),
+            );
+            state::set_text_signal(
+                NOTICE_SIGNAL,
+                "已把网页载入共享 VM。Loaded the page on the shared VM.",
+            );
+        }
         _ => {}
     });
 }
@@ -343,6 +376,9 @@ fn build_shell() -> Component {
 fn build_desktop() -> Component {
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
     let mut children = vec![build_desktop_icons(), build_system_info(), build_branding()];
+    if std::env::var_os("W3COS_SHARED_LAUNCHER").is_some() {
+        children.insert(1, build_shared_launcher());
+    }
     if night {
         children.push(Component::text(
             "Night mode is on",
@@ -420,6 +456,42 @@ fn build_desktop_icons() -> Component {
             ..Style::default()
         },
         icons,
+    )
+}
+
+fn build_shared_launcher() -> Component {
+    Component::row(
+        Style {
+            gap: 16.0,
+            align_items: AlignItems::Center,
+            ..Style::default()
+        },
+        vec![
+            Component::button_with_click(
+                "Shared Hello",
+                Style {
+                    background: Color::from_hex("#2bb0ed"),
+                    color: Color::from_hex("#041422"),
+                    border_radius: 8.0,
+                    font_size: 14.0,
+                    padding: Edges::xy(16.0, 10.0),
+                    ..Style::default()
+                },
+                invoke(OP_SHARED_APP),
+            ),
+            Component::button_with_click(
+                "Web VM",
+                Style {
+                    background: Color::from_hex("#1b4332"),
+                    color: Color::from_hex("#d8f3dc"),
+                    border_radius: 8.0,
+                    font_size: 14.0,
+                    padding: Edges::xy(16.0, 10.0),
+                    ..Style::default()
+                },
+                invoke(OP_SHARED_PAGE),
+            ),
+        ],
     )
 }
 

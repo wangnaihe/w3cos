@@ -201,10 +201,23 @@ fn compile_with_source_dir(
     if is_ui {
         let tree = parser::parse(ts_source)?;
         let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
-        let rust_code = codegen::generate(&tree, &stylesheet)?;
-        let cargo_toml = codegen::generate_cargo_toml(output_dir, options)?;
-        std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
-        std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
+        let mut rust_code = codegen::generate(&tree, &stylesheet)?;
+        if options.shared_runtime {
+            rust_code = codegen::wrap_shared_bundle_entry(&rust_code)?;
+            std::fs::write(output_dir.join("src/main.rs"), &rust_code)?;
+            std::fs::write(
+                output_dir.join("Cargo.toml"),
+                codegen::generate_bundle_cargo_toml(output_dir)?,
+            )?;
+            std::fs::write(
+                output_dir.join("w3cos.app.json"),
+                codegen::shared_app_manifest(),
+            )?;
+        } else {
+            let cargo_toml = codegen::generate_cargo_toml(output_dir, options)?;
+            std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
+            std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
+        }
     } else {
         let output = ts_transpiler::transpile_with_flags(ts_source)?;
         let (esm_diagnostics, esm_bundle_code, _has_entry_main, has_dynamic_global_access) =

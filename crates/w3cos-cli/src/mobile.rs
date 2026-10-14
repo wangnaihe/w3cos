@@ -363,6 +363,7 @@ pub fn mobile_build_with_evidence(
         &CompileOptions {
             devtools,
             document_base_url,
+            ..CompileOptions::default()
         },
     )?;
     apply_native_extensions(project_dir, &build_dir, platform)?;
