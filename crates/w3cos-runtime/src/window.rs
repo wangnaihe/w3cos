@@ -286,6 +286,81 @@ use w3cos_std::{Component, ComponentKind, EventAction};
 const ANIMATION_FRAME_INTERVAL_MS: u64 = 16;
 const TOUCH_SCROLL_SLOP: f32 = 8.0;
 const KINETIC_SCROLL_MIN_VELOCITY: f32 = 80.0;
+/// Set on the shell intent field. Read only when Enter is pressed there.
+const INTENT_SUBMIT_PROPERTY: &str = "--w3cos-intent-submit";
+
+fn draft_for_action(
+    root: &Component,
+    values: &HashMap<usize, String>,
+    action: &EventAction,
+) -> String {
+    let EventAction::Invoke {
+        input_placeholder, ..
+    } = action
+    else {
+        return String::new();
+    };
+    if input_placeholder.is_empty() {
+        return String::new();
+    }
+    let Some((index, fallback)) = w3cos_std::find_text_input(root, input_placeholder) else {
+        return String::new();
+    };
+    values
+        .get(&index)
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn intent_submit_draft(
+    root: &Component,
+    values: &HashMap<usize, String>,
+    focus_idx: usize,
+) -> Option<(u8, String)> {
+    let flat = layout::pre_flatten(root);
+    let node = flat.get(focus_idx)?;
+    let ComponentKind::TextInput { value, .. } = node.kind else {
+        return None;
+    };
+    let code = node
+        .style
+        .custom_properties
+        .as_ref()?
+        .get(INTENT_SUBMIT_PROPERTY)?
+        .parse::<u8>()
+        .ok()?;
+    Some((
+        code,
+        values
+            .get(&focus_idx)
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
+    ))
+}
+
+/// After an intent hook rewrites a marked field, copy that value into the
+/// edit buffer. Paint prefers the buffer, and this does not run on keystrokes.
+fn sync_marked_text_inputs(root: &Component, values: &mut HashMap<usize, String>) {
+    fn walk(node: &Component, index: &mut usize, values: &mut HashMap<usize, String>) {
+        let current = *index;
+        *index += 1;
+        let marked = node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key(INTENT_SUBMIT_PROPERTY));
+        if marked
+            && let ComponentKind::TextInput { value, .. } = &node.kind
+        {
+            values.insert(current, value.clone());
+        }
+        for child in &node.children {
+            walk(child, index, values);
+        }
+    }
+    let mut index = 0;
+    walk(root, &mut index, values);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventLoopSchedule {
@@ -5541,6 +5616,7 @@ impl App {
             }
             if kind_is_button {
                 let action = hit.on_click.clone();
+                let draft = draft_for_action(&self.root, &self.text_input_values, &action);
                 // Focus dispatch can synchronously run React handlers and
                 // rebuild the lowered component tree. Preserve the DOM host
                 // chain captured by pointer-down so the subsequent click is
@@ -5574,15 +5650,20 @@ impl App {
                     click_chain
                 ));
                 if !action.is_none() && !matches!(action, EventAction::NativeHost { .. }) {
-                    state::execute_action(&action);
+                    state::execute_action_with_draft(&action, &draft);
                 } else if !click_prevented && submitted.is_none() {
                     eprintln!("[W3C OS] Click → Button (no action)");
                 }
+                let refreshed = state::is_dirty();
                 self.rebuild_if_dirty();
+                if refreshed && matches!(action, EventAction::Invoke { .. }) {
+                    sync_marked_text_inputs(&self.root, &mut self.text_input_values);
+                }
                 self.repaint_after_interaction();
                 return;
             }
             let action = hit.on_click.clone();
+            let draft = draft_for_action(&self.root, &self.text_input_values, &action);
             // A browser moves focus away from a text control when the user
             // activates a non-focusable surface. Do this before click
             // dispatch so a click handler can still focus another control.
@@ -5601,10 +5682,14 @@ impl App {
             let has_legacy_action =
                 !action.is_none() && !matches!(action, EventAction::NativeHost { .. });
             if has_legacy_action {
-                state::execute_action(&action);
+                state::execute_action_with_draft(&action, &draft);
             }
             if dispatched_native || has_legacy_action {
+                let refreshed = state::is_dirty();
                 self.rebuild_if_dirty();
+                if refreshed && matches!(action, EventAction::Invoke { .. }) {
+                    sync_marked_text_inputs(&self.root, &mut self.text_input_values);
+                }
                 self.repaint_after_interaction();
                 return;
             }
@@ -8191,6 +8276,32 @@ impl ApplicationHandler for App {
                                             "insertLineBreak",
                                             false,
                                         );
+                                    } else if let Some((code, draft)) = intent_submit_draft(
+                                        &self.root,
+                                        &self.text_input_values,
+                                        focus_idx,
+                                    ) {
+                                        // Key repeat must not re-run propose. The matcher
+                                        // stays off the character-input path entirely.
+                                        if !event.repeat {
+                                            state::execute_action_with_draft(
+                                                &EventAction::Invoke {
+                                                    code,
+                                                    input_placeholder: String::new(),
+                                                },
+                                                &draft,
+                                            );
+                                        }
+                                        let refreshed = state::is_dirty();
+                                        self.rebuild_if_dirty();
+                                        if refreshed {
+                                            sync_marked_text_inputs(
+                                                &self.root,
+                                                &mut self.text_input_values,
+                                            );
+                                        }
+                                        self.repaint_after_interaction();
+                                        return;
                                     } else if host_runtime::dispatch_submit_chain(&chain).is_some()
                                     {
                                         self.rebuild_if_dirty();

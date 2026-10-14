@@ -36,10 +36,13 @@ case "$1" in
         # Start networking in background
         dhcpcd -b 2>/dev/null &
 
-        # Start SSH server for AI agent remote access
-        if [ -x /usr/sbin/dropbear ]; then
+        # Dropbear is opt-in. The AI bridge is loopback + bearer token;
+        # an open SSH port is not the default remote-agent path.
+        if [ "$W3COS_ENABLE_SSH" = "1" ] && [ -x /usr/sbin/dropbear ]; then
             /usr/sbin/dropbear -R 2>/dev/null &
-            echo "  SSH: listening on port 22"
+            echo "  SSH: listening on port 22 (W3COS_ENABLE_SSH=1)"
+        else
+            echo "  SSH: disabled (set W3COS_ENABLE_SSH=1 to start dropbear)"
         fi
 
         # Launch W3C OS Desktop Shell (fullscreen, replaces desktop)

@@ -4,33 +4,205 @@
 //! Click an app icon → the app UI replaces the desktop area.
 //! Click "W3C Apps" in taskbar → return to desktop.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use w3cos_ai_bridge::identity::LocalIdentityStub;
+use w3cos_ai_bridge::intent::{
+    ExecuteResult, IntentSession, ProposeResult, ShellApp, ShellContext, INTENT_INPUT_PLACEHOLDER,
+};
+use w3cos_ai_bridge::permissions::AgentPermissions;
+use w3cos_runtime::state;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
 use w3cos_std::{Component, EventAction, Style};
 
+const APP_SIGNAL: usize = 0;
+const NIGHT_SIGNAL: usize = 1;
+const PHASE_SIGNAL: usize = 2;
+const CONTEXT_SIGNAL: usize = 3;
+const UNLOCKED_SIGNAL: usize = 4;
+const DRAFT_SIGNAL: usize = 5;
+const SUMMARY_SIGNAL: usize = 6;
+const IMPACT_SIGNAL: usize = 7;
+const NOTICE_SIGNAL: usize = 8;
+const RECEIPT_SIGNAL: usize = 9;
+
+const OP_PROPOSE: u8 = 1;
+const OP_CONFIRM: u8 = 2;
+const OP_CANCEL: u8 = 3;
+const OP_REVOKE: u8 = 4;
+const OP_RESTORE: u8 = 5;
+const OP_LOCK: u8 = 6;
+const OP_UNLOCK: u8 = 7;
+const OP_CHIP_FILES: u8 = 10;
+const OP_CHIP_NIGHT: u8 = 11;
+const OP_CHIP_APPS: u8 = 12;
+const OP_CHIP_CONTEXT: u8 = 13;
+
 fn main() {
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
 
+    let mut ai_port = None;
+    let mut ai_token = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--ai-port" {
-            if let Some(port_str) = args.next() {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    w3cos_runtime::enable_ai_bridge(port);
-                    eprintln!("[AI Bridge] Will start on port {port}");
-                }
-            }
+        match arg.as_str() {
+            "--ai-port" => ai_port = args.next(),
+            "--ai-token" => ai_token = args.next(),
+            _ => {}
         }
     }
+    if let Some(token) = ai_token.filter(|token| !token.is_empty()) {
+        // The process is still single-threaded here. The bridge reads this
+        // when the window starts the loopback listener.
+        unsafe { std::env::set_var("W3COS_AI_TOKEN", token) };
+    }
+    if let Some(port_str) = ai_port
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        w3cos_runtime::enable_ai_bridge(port);
+        eprintln!("[AI Bridge] Will start on port {port}");
+    }
 
+    state::set_invoke_hook(on_shell_intent);
     w3cos_runtime::run_app(build_shell).expect("W3C OS Shell crashed");
 }
 
-const APP_SIGNAL: usize = 0;
+thread_local! {
+    static SESSION: RefCell<Option<IntentSession>> = const { RefCell::new(None) };
+}
+
+fn ensure_shell_signals() {
+    state::ensure_signals(|| {
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(1);
+        let _ = state::create_signal(1);
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("No receipts yet.");
+    });
+}
+
+fn with_session(body: impl FnOnce(&mut IntentSession)) {
+    SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(IntentSession::new(
+                AgentPermissions::interactive(),
+                LocalIdentityStub::new(),
+            ));
+        }
+        body(slot.as_mut().expect("shell intent session"));
+    });
+}
+
+fn on_shell_intent(code: u8, draft: &str) {
+    ensure_shell_signals();
+    let ctx = ShellContext {
+        app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
+        night: state::get_signal(NIGHT_SIGNAL) != 0,
+    };
+    with_session(|session| match code {
+        OP_PROPOSE => apply_propose(session, draft, &ctx),
+        OP_CHIP_FILES => apply_propose(session, "open files", &ctx),
+        OP_CHIP_NIGHT => apply_propose(session, "night mode", &ctx),
+        OP_CHIP_APPS => apply_propose(session, "list apps", &ctx),
+        OP_CHIP_CONTEXT => apply_propose(session, "where am i", &ctx),
+        OP_CONFIRM => apply_confirm(session, &ctx),
+        OP_CANCEL => {
+            session.cancel();
+            sync_session(session, 0, "");
+        }
+        OP_REVOKE => {
+            session.revoke_context();
+            sync_session(session, state::get_signal(PHASE_SIGNAL), "Context hidden.");
+        }
+        OP_RESTORE => {
+            session.restore_context();
+            sync_session(session, state::get_signal(PHASE_SIGNAL), "Context shared.");
+        }
+        OP_LOCK => {
+            session.lock_identity();
+            sync_session(session, state::get_signal(PHASE_SIGNAL), "Identity locked.");
+        }
+        OP_UNLOCK => {
+            if session.unlock_identity_stub("stub-passkey") {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    "Identity unlocked (stub, not a passkey).",
+                );
+            }
+        }
+        _ => {}
+    });
+}
+
+fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContext) {
+    state::set_text_signal(DRAFT_SIGNAL, utterance);
+    match session.propose(utterance, ctx) {
+        ProposeResult::Confirm(proposal) => {
+            state::set_text_signal(SUMMARY_SIGNAL, proposal.summary);
+            state::set_text_signal(IMPACT_SIGNAL, proposal.impact);
+            sync_session(session, 1, "");
+        }
+        ProposeResult::Unrecognized { receipt } => {
+            state::set_text_signal(SUMMARY_SIGNAL, "");
+            state::set_text_signal(IMPACT_SIGNAL, "");
+            sync_session(session, 2, &receipt.outcome);
+        }
+    }
+}
+
+fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
+    let Some(effect) = session.confirm(ctx, now_ms()) else {
+        sync_session(session, 0, "");
+        return;
+    };
+    apply_effect(&effect);
+    sync_session(session, 2, &effect.receipt.outcome);
+}
+
+fn apply_effect(effect: &ExecuteResult) {
+    if let Some(app) = effect.navigate {
+        state::set_signal(APP_SIGNAL, app.signal_value());
+    }
+    if let Some(night) = effect.night {
+        state::set_signal(NIGHT_SIGNAL, i64::from(night));
+    }
+}
+
+fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
+    state::set_signal(PHASE_SIGNAL, phase);
+    state::set_signal(CONTEXT_SIGNAL, i64::from(session.context_shared()));
+    state::set_signal(UNLOCKED_SIGNAL, i64::from(session.identity_unlocked()));
+    state::set_text_signal(NOTICE_SIGNAL, notice);
+    state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(12));
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn invoke(code: u8) -> EventAction {
+    EventAction::Invoke {
+        code,
+        input_placeholder: String::new(),
+    }
+}
 
 fn build_shell() -> Component {
-    let _ = w3cos_runtime::state::create_signal(0);
-    let current = w3cos_runtime::state::get_signal(APP_SIGNAL);
+    ensure_shell_signals();
+    let current = state::get_signal(APP_SIGNAL);
+    let night = state::get_signal(NIGHT_SIGNAL) != 0;
 
     let content = match current {
         0 => build_desktop(),
@@ -47,11 +219,11 @@ fn build_shell() -> Component {
         Style {
             width: Dimension::Vw(100.0),
             height: Dimension::Vh(100.0),
-            background: Color::from_hex("#0a0a14"),
+            background: Color::from_hex(if night { "#07070f" } else { "#0a0a14" }),
             gap: 0.0,
             ..Style::default()
         },
-        vec![content, build_taskbar(current)],
+        vec![build_intent_bar(current, night), content, build_taskbar(current)],
     )
 }
 
@@ -60,17 +232,29 @@ fn build_shell() -> Component {
 // ==========================================================================
 
 fn build_desktop() -> Component {
+    let night = state::get_signal(NIGHT_SIGNAL) != 0;
+    let mut children = vec![build_desktop_icons(), build_system_info(), build_branding()];
+    if night {
+        children.push(Component::text(
+            "Night mode is on",
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#a29bfe"),
+                ..Style::default()
+            },
+        ));
+    }
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0f1923"),
+            background: Color::from_hex(if night { "#070711" } else { "#0f1923" }),
             padding: Edges::all(60.0),
             gap: 40.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
             ..Style::default()
         },
-        vec![build_desktop_icons(), build_system_info(), build_branding()],
+        children,
     )
 }
 
@@ -669,10 +853,235 @@ fn settings_toggle(label: &str, on: bool) -> Component {
 }
 
 // ==========================================================================
-// AI Agent App
+
+fn build_intent_bar(current: i64, night: bool) -> Component {
+    let shared = state::get_signal(CONTEXT_SIGNAL) != 0;
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let phase = state::get_signal(PHASE_SIGNAL);
+    let app_label = if shared {
+        ShellApp::from_signal(current).label()
+    } else {
+        "context hidden"
+    };
+    let mut input_style = Style {
+        flex_grow: 1.0,
+        font_size: 14.0,
+        color: Color::from_hex("#d0d0e0"),
+        background: Color::from_hex("#1c1c34"),
+        border_radius: 8.0,
+        ..Style::default()
+    };
+    input_style.custom_properties = Some(HashMap::from([(
+        "--w3cos-intent-submit".to_string(),
+        OP_PROPOSE.to_string(),
+    )]));
+    let mut rows = vec![
+        Component::row(
+            Style {
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    format!(
+                        "{app_label} · {} · {} · {}",
+                        if night { "night on" } else { "night off" },
+                        if unlocked { "unlocked" } else { "locked" },
+                        LocalIdentityStub::SUBJECT
+                    ),
+                    Style {
+                        font_size: 12.0,
+                        color: Color::from_hex("#9090b0"),
+                        ..Style::default()
+                    },
+                ),
+                bar_button(
+                    if shared { "Revoke" } else { "Restore" },
+                    if shared { OP_REVOKE } else { OP_RESTORE },
+                    "#2a2a3e",
+                ),
+            ],
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![
+                Component::text_input(
+                    state::get_signal_text(DRAFT_SIGNAL),
+                    INTENT_INPUT_PLACEHOLDER,
+                    input_style,
+                ),
+                bar_button("Propose", OP_PROPOSE_WITH_INPUT, "#6c5ce7"),
+            ],
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![
+                bar_button("Open Files", OP_CHIP_FILES, "#2a2a3e"),
+                bar_button("Night mode", OP_CHIP_NIGHT, "#2a2a3e"),
+                bar_button("List apps", OP_CHIP_APPS, "#2a2a3e"),
+                bar_button("Where am I", OP_CHIP_CONTEXT, "#2a2a3e"),
+            ],
+        ),
+    ];
+    if phase == 1 {
+        rows.push(confirm_card());
+    } else if phase == 2 {
+        let notice = state::get_signal_text(NOTICE_SIGNAL);
+        if !notice.is_empty() {
+            rows.push(Component::column(
+                Style {
+                    gap: 6.0,
+                    ..Style::default()
+                },
+                vec![
+                    Component::text(notice, Style {
+                        font_size: 13.0,
+                        color: Color::from_hex("#d0d0e0"),
+                        ..Style::default()
+                    }),
+                    bar_button("Dismiss", OP_CANCEL, "#2a2a3e"),
+                ],
+            ));
+        }
+    }
+    Component::column(
+        Style {
+            padding: Edges::xy(16.0, 10.0),
+            gap: 8.0,
+            background: Color::from_hex(if night { "#101018" } else { "#141428" }),
+            ..Style::default()
+        },
+        rows,
+    )
+}
+
+const OP_PROPOSE_WITH_INPUT: u8 = OP_PROPOSE;
+
+fn confirm_card() -> Component {
+    Component::column(
+        Style {
+            gap: 6.0,
+            padding: Edges::all(10.0),
+            background: Color::from_hex("#1c1c34"),
+            border_radius: 8.0,
+            ..Style::default()
+        },
+        vec![
+            Component::text(state::get_signal_text(SUMMARY_SIGNAL), Style {
+                font_size: 14.0,
+                color: Color::from_hex("#f0f0ff"),
+                font_weight: 700,
+                ..Style::default()
+            }),
+            Component::text(state::get_signal_text(IMPACT_SIGNAL), Style {
+                font_size: 12.0,
+                color: Color::from_hex("#a0a0c0"),
+                ..Style::default()
+            }),
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    ..Style::default()
+                },
+                vec![
+                    bar_button("Confirm", OP_CONFIRM, "#00b894"),
+                    bar_button("Cancel", OP_CANCEL, "#2a2a3e"),
+                ],
+            ),
+        ],
+    )
+}
+
+fn bar_button(label: &str, code: u8, background: &str) -> Component {
+    let action = if code == OP_PROPOSE {
+        EventAction::Invoke {
+            code,
+            input_placeholder: INTENT_INPUT_PLACEHOLDER.to_string(),
+        }
+    } else {
+        invoke(code)
+    };
+    Component::button_with_click(
+        label,
+        Style {
+            background: Color::from_hex(background),
+            border_radius: 8.0,
+            font_size: 13.0,
+            color: Color::WHITE,
+            padding: Edges::xy(12.0, 8.0),
+            ..Style::default()
+        },
+        action,
+    )
+}
+
+// ==========================================================================
+// AI Agent App — session view for the intent bar
 // ==========================================================================
 
 fn build_ai_agent_app() -> Component {
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let mut lines = vec![
+        Component::text(
+            "L0 rule matcher. No model. Confirm runs the action through the AI Bridge permission gate.",
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#9090b0"),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            format!(
+                "Subject {} ({})",
+                LocalIdentityStub::SUBJECT,
+                if unlocked { "stub unlocked" } else { "locked" }
+            ),
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#d0d0e0"),
+                ..Style::default()
+            },
+        ),
+        bar_button(
+            if unlocked {
+                "Lock identity"
+            } else {
+                "Unlock stub"
+            },
+            if unlocked { OP_LOCK } else { OP_UNLOCK },
+            "#2a2a3e",
+        ),
+        Component::text("Receipts", Style {
+            font_size: 16.0,
+            color: Color::from_hex("#f0f0ff"),
+            font_weight: 700,
+            ..Style::default()
+        }),
+    ];
+    for line in state::get_signal_text(RECEIPT_SIGNAL).lines() {
+        lines.push(Component::text(line, Style {
+            font_size: 12.0,
+            color: Color::from_hex("#c8c8e0"),
+            ..Style::default()
+        }));
+    }
+    lines.push(Component::text(
+        "Try: open files, 打开终端, night mode, list apps, where am i, help. Free text cannot name a DOM selector.",
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#606080"),
+            ..Style::default()
+        },
+    ));
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -682,197 +1091,14 @@ fn build_ai_agent_app() -> Component {
         },
         vec![
             app_titlebar("AI Agent", "#e74c3c"),
-            Component::row(
+            Component::column(
                 Style {
                     flex_grow: 1.0,
-                    gap: 0.0,
+                    padding: Edges::all(20.0),
+                    gap: 10.0,
                     ..Style::default()
                 },
-                vec![
-                    // Agent sidebar
-                    Component::column(
-                        Style {
-                            width: Dimension::Px(220.0),
-                            background: Color::from_hex("#10101c"),
-                            padding: Edges::all(12.0),
-                            gap: 8.0,
-                            ..Style::default()
-                        },
-                        vec![
-                            Component::text(
-                                "ACTIVE AGENTS",
-                                Style {
-                                    font_size: 11.0,
-                                    color: Color::from_hex("#505070"),
-                                    font_weight: 700,
-                                    ..Style::default()
-                                },
-                            ),
-                            agent_card(
-                                "Code Agent",
-                                "Running",
-                                "#00b894",
-                                "Writing filesystem module...",
-                            ),
-                            agent_card("Review Agent", "Waiting", "#fdcb6e", "Queued: PR #42"),
-                            agent_card("Test Agent", "Running", "#00b894", "47/52 tests passed"),
-                        ],
-                    ),
-                    // Chat area
-                    Component::column(
-                        Style {
-                            flex_grow: 1.0,
-                            padding: Edges::all(20.0),
-                            gap: 16.0,
-                            ..Style::default()
-                        },
-                        vec![
-                            Component::text(
-                                "Agent Conversation",
-                                Style {
-                                    font_size: 18.0,
-                                    color: Color::from_hex("#f0f0ff"),
-                                    font_weight: 700,
-                                    ..Style::default()
-                                },
-                            ),
-                            chat_msg(
-                                "System",
-                                "Agent connected. DOM access granted (Layer 1 + 2). Permission: interactive.",
-                                "#141428",
-                                "#606080",
-                            ),
-                            chat_msg(
-                                "Code Agent",
-                                "I can see 47 DOM elements, 12 interactive buttons, 3 text inputs. All elements properly labeled in the a11y tree.",
-                                "#1c1c34",
-                                "#6c5ce7",
-                            ),
-                            chat_msg(
-                                "You",
-                                "Build a file manager with tree view sidebar.",
-                                "#6c5ce7",
-                                "#ffffff",
-                            ),
-                            chat_msg(
-                                "Code Agent",
-                                "Creating component tree via DOM API... 24 operations completed in 0.3ms.",
-                                "#1c1c34",
-                                "#6c5ce7",
-                            ),
-                            Component::row(
-                                Style {
-                                    gap: 8.0,
-                                    align_items: AlignItems::Center,
-                                    ..Style::default()
-                                },
-                                vec![
-                                    Component::text_input(
-                                        "",
-                                        "Ask the AI agent...",
-                                        Style {
-                                            flex_grow: 1.0,
-                                            font_size: 14.0,
-                                            color: Color::from_hex("#d0d0e0"),
-                                            background: Color::from_hex("#1c1c34"),
-                                            border_radius: 8.0,
-                                            ..Style::default()
-                                        },
-                                    ),
-                                    Component::button(
-                                        "Send",
-                                        Style {
-                                            background: Color::from_hex("#6c5ce7"),
-                                            border_radius: 8.0,
-                                            font_size: 14.0,
-                                            color: Color::WHITE,
-                                            ..Style::default()
-                                        },
-                                    ),
-                                ],
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        ],
-    )
-}
-
-fn agent_card(name: &str, status: &str, status_color: &str, desc: &str) -> Component {
-    Component::column(
-        Style {
-            padding: Edges::all(12.0),
-            background: Color::from_hex("#1c1c34"),
-            border_radius: 8.0,
-            gap: 6.0,
-            ..Style::default()
-        },
-        vec![
-            Component::row(
-                Style {
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    ..Style::default()
-                },
-                vec![
-                    Component::text(
-                        name,
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#d0d0e0"),
-                            font_weight: 600,
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        status,
-                        Style {
-                            font_size: 11.0,
-                            color: Color::from_hex(status_color),
-                            ..Style::default()
-                        },
-                    ),
-                ],
-            ),
-            Component::text(
-                desc,
-                Style {
-                    font_size: 11.0,
-                    color: Color::from_hex("#606080"),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
-}
-
-fn chat_msg(sender: &str, text: &str, bg: &str, sender_color: &str) -> Component {
-    Component::column(
-        Style {
-            padding: Edges::all(12.0),
-            background: Color::from_hex(bg),
-            border_radius: 8.0,
-            gap: 4.0,
-            ..Style::default()
-        },
-        vec![
-            Component::text(
-                sender,
-                Style {
-                    font_size: 11.0,
-                    color: Color::from_hex(sender_color),
-                    font_weight: 600,
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                text,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    ..Style::default()
-                },
+                lines,
             ),
         ],
     )
