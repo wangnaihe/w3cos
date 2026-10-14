@@ -213,6 +213,21 @@ pub fn reset() {
 
 thread_local! {
     static INVOKE_HOOK: RefCell<Option<fn(u8, &str)>> = const { RefCell::new(None) };
+    static AGENT_POLL: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Shell hook drained on the UI thread after the L2 worker finishes.
+/// Layout and paint do not call it.
+pub fn set_agent_poll_hook(hook: fn()) {
+    AGENT_POLL.with(|slot| slot.set(Some(hook)));
+}
+
+pub fn run_agent_poll_hook() {
+    AGENT_POLL.with(|slot| {
+        if let Some(hook) = slot.get() {
+            hook();
+        }
+    });
 }
 
 /// Register the shell intent hook. The window calls it from a button click or

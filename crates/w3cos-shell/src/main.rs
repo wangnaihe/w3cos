@@ -7,14 +7,19 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+mod agent_host;
+
 #[cfg(feature = "desktop")]
 use crate::state;
+use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
     ExecuteResult, INTENT_INPUT_PLACEHOLDER, IntentSession, IntentTier, ProposeResult, ShellApp,
     ShellContext,
 };
-use w3cos_ai_bridge::permissions::AgentPermissions;
+use w3cos_ai_bridge::permissions::{AgentPermissions, BridgeOp};
+use w3cos_ai_bridge::shell_tools::{self, ShellView};
+use w3cos_runtime::capability_gate;
 #[cfg(not(feature = "desktop"))]
 use w3cos_runtime::state;
 use w3cos_std::color::Color;
@@ -38,6 +43,9 @@ const STORAGE_SIGNAL: usize = 11;
 const SUBJECT_SIGNAL: usize = 12;
 const ENROLL_SIGNAL: usize = 13;
 const TIER_SIGNAL: usize = 14;
+const STEPS_SIGNAL: usize = 15;
+const TERMINAL_SIGNAL: usize = 16;
+const TERM_OUT_SIGNAL: usize = 17;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -57,6 +65,7 @@ const OP_ENROLL: u8 = 17;
 const OP_SHARED_APP: u8 = 18;
 const OP_SHARED_PAGE: u8 = 19;
 const OP_SHARED_PLUGIN: u8 = 20;
+const OP_RUN_TERMINAL: u8 = 21;
 
 fn main() {
     shell_main();
@@ -94,6 +103,8 @@ pub(crate) fn shell_main() {
     }
 
     state::set_invoke_hook(on_shell_intent);
+    state::set_agent_poll_hook(on_agent_poll);
+    agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     #[cfg(feature = "desktop")]
     let launched = crate::run_app(build_shell);
@@ -142,6 +153,9 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -167,7 +181,15 @@ fn boot_session_once() {
     if already {
         return;
     }
-    with_session(|session| sync_session(session, 0, ""));
+    with_session(|session| {
+        if session.authorize_bridge(&BridgeOp::ReadDom).is_ok() {
+            capability_gate::grant(shell_tools::CAP_A11Y);
+        }
+        if session.authorize_bridge(&BridgeOp::Screenshot).is_ok() {
+            capability_gate::grant(shell_tools::CAP_CAPTURE);
+        }
+        sync_session(session, 0, "");
+    });
 }
 
 fn on_shell_intent(code: u8, draft: &str) {
@@ -194,8 +216,13 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_CHIP_SETTINGS => apply_propose(session, "打开设置", &ctx),
         OP_CONFIRM => apply_confirm(session, &ctx),
         OP_CANCEL => {
-            session.cancel();
-            sync_session(session, 0, "");
+            if state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending() {
+                let update = agent_host::cancel();
+                apply_host_update(session, update);
+            } else {
+                session.cancel();
+                sync_session(session, 0, "");
+            }
         }
         OP_REVOKE => {
             session.revoke_context();
@@ -264,6 +291,7 @@ fn on_shell_intent(code: u8, draft: &str) {
                 "已把网页载入页面 worker。Loaded the page in the page worker.",
             );
         }
+        OP_RUN_TERMINAL => run_terminal_from_button(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
                 "plugin",
@@ -290,6 +318,23 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
             state::set_text_signal(TIER_SIGNAL, tier_name(proposal.tier));
             sync_session(session, 1, "");
         }
+        ProposeResult::Plan { utterance } => match agent_host::begin(&utterance) {
+            Ok(update) => apply_host_update(session, update),
+            Err(err) => {
+                let receipt = session.record_external(
+                    &utterance,
+                    "l2",
+                    w3cos_ai_bridge::intent::Decision::Unrecognized,
+                    false,
+                    &err,
+                    IntentTier::L2,
+                );
+                state::set_text_signal(SUMMARY_SIGNAL, "");
+                state::set_text_signal(IMPACT_SIGNAL, "");
+                state::set_text_signal(TIER_SIGNAL, "L2");
+                sync_session(session, 2, &receipt.outcome);
+            }
+        },
         ProposeResult::Unrecognized { receipt } => {
             state::set_text_signal(SUMMARY_SIGNAL, "");
             state::set_text_signal(IMPACT_SIGNAL, "");
@@ -300,6 +345,10 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
 }
 
 fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
+    if w3cos_ai_bridge::agent_loop::has_pending() {
+        confirm_agent_step(session);
+        return;
+    }
     let Some(effect) = session.confirm(ctx, now_ms()) else {
         sync_session(session, 0, "");
         return;
@@ -310,10 +359,167 @@ fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
 
 fn tier_name(tier: IntentTier) -> &'static str {
     match tier {
+        IntentTier::L2 => "L2",
         IntentTier::L1 => "L1",
         IntentTier::L0 => "L0",
         IntentTier::Unspecified => "",
     }
+}
+
+fn on_agent_poll() {
+    ensure_shell_signals();
+    let (can_read, can_shot) = session_read_flags();
+    let mut view = current_shell_view();
+    let Some(update) = agent_host::poll(&mut view, &|name| match name {
+        shell_tools::CAP_A11Y => can_read,
+        shell_tools::CAP_CAPTURE => can_shot,
+        _ => false,
+    }) else {
+        return;
+    };
+    with_session(|session| apply_host_update(session, update));
+}
+
+fn confirm_agent_step(session: &mut IntentSession) {
+    let name = w3cos_ai_bridge::agent_loop::pending_capability();
+    let tool_name = if name == shell_tools::CAP_PROCESS {
+        "click"
+    } else {
+        "act"
+    };
+    if let Err(reason) = session.gate_mutation(now_ms()) {
+        apply_host_update(session, agent_host::reject(reason));
+        return;
+    }
+    let op = BridgeOp::Mutate {
+        action: ActionType::Click,
+        selector: format!("shell:l2:{tool_name}"),
+    };
+    if let Err(reason) = session.authorize_bridge(&op) {
+        apply_host_update(session, agent_host::reject(&reason));
+        return;
+    }
+    capability_gate::grant(shell_tools::CAP_ACT);
+    if name == shell_tools::CAP_PROCESS {
+        capability_gate::grant(shell_tools::CAP_PROCESS);
+    }
+    let mut view = current_shell_view();
+    let update = agent_host::confirm(&mut view, &|capability| {
+        capability_gate::is_granted(capability)
+    });
+    capability_gate::deny(shell_tools::CAP_ACT);
+    capability_gate::deny(shell_tools::CAP_PROCESS);
+    apply_host_update(session, update);
+}
+
+fn session_read_flags() -> (bool, bool) {
+    let mut can_read = false;
+    let mut can_shot = false;
+    with_session(|session| {
+        can_read = session.authorize_bridge(&BridgeOp::ReadDom).is_ok()
+            && capability_gate::is_granted(shell_tools::CAP_A11Y);
+        can_shot = session.authorize_bridge(&BridgeOp::Screenshot).is_ok()
+            && capability_gate::is_granted(shell_tools::CAP_CAPTURE);
+    });
+    (can_read, can_shot)
+}
+
+fn current_shell_view() -> ShellView {
+    ShellView {
+        app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
+        night: state::get_signal(NIGHT_SIGNAL) != 0,
+        terminal_line: state::get_signal_text(TERMINAL_SIGNAL),
+        terminal_output: state::get_signal_text(TERM_OUT_SIGNAL),
+    }
+}
+
+fn apply_host_update(session: &mut IntentSession, update: agent_host::HostUpdate) {
+    for effect in &update.effects {
+        match effect {
+            shell_tools::ShellEffect::Navigate(app) => {
+                state::set_signal(APP_SIGNAL, app.signal_value());
+            }
+            shell_tools::ShellEffect::SetNight(night) => {
+                state::set_signal(NIGHT_SIGNAL, i64::from(*night));
+            }
+            shell_tools::ShellEffect::SetTerminalLine(line) => {
+                state::set_text_signal(TERMINAL_SIGNAL, line);
+            }
+            shell_tools::ShellEffect::SetTerminalOutput(output) => {
+                state::set_text_signal(TERM_OUT_SIGNAL, output);
+            }
+        }
+    }
+    for receipt in &update.receipts {
+        session.record_external(
+            &update.utterance,
+            &receipt.command,
+            receipt.decision,
+            receipt.confirmed,
+            &receipt.outcome,
+            receipt.tier,
+        );
+    }
+    if update.open_tasks {
+        state::set_signal(TASKS_SIGNAL, 1);
+    }
+    state::set_text_signal(SUMMARY_SIGNAL, update.summary);
+    state::set_text_signal(IMPACT_SIGNAL, update.impact);
+    state::set_text_signal(TIER_SIGNAL, update.tier);
+    state::set_text_signal(STEPS_SIGNAL, update.steps);
+    sync_session(session, update.phase, &update.notice);
+    if let Ok(path) = std::env::var("W3COS_AGENT_TRACE") {
+        let line = format!(
+            "phase={} {}\n",
+            update.phase,
+            update.notice.replace('\n', " ")
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(line.as_bytes())
+            });
+    }
+}
+
+fn run_terminal_from_button(session: &mut IntentSession) {
+    let line = state::get_signal_text(TERMINAL_SIGNAL);
+    if let Err(reason) = session.gate_mutation(now_ms()) {
+        sync_session(session, state::get_signal(PHASE_SIGNAL), reason);
+        return;
+    }
+    let op = BridgeOp::Mutate {
+        action: ActionType::Click,
+        selector: "shell:l2:run".into(),
+    };
+    if let Err(reason) = session.authorize_bridge(&op) {
+        sync_session(session, state::get_signal(PHASE_SIGNAL), &reason);
+        return;
+    }
+    capability_gate::grant(shell_tools::CAP_PROCESS);
+    let granted = capability_gate::is_granted(shell_tools::CAP_PROCESS);
+    let outcome = if !granted {
+        "Denied: w3cos-process is not granted. Nothing was changed.".to_string()
+    } else {
+        match shell_tools::run_allowlisted(&line) {
+            Ok(output) => {
+                state::set_text_signal(TERM_OUT_SIGNAL, &output);
+                output
+            }
+            Err(err) => format!("Denied: {err}. Nothing was changed."),
+        }
+    };
+    capability_gate::deny(shell_tools::CAP_PROCESS);
+    let decision = if outcome.starts_with("Denied") {
+        w3cos_ai_bridge::intent::Decision::Denied
+    } else {
+        w3cos_ai_bridge::intent::Decision::Allowed
+    };
+    session.record_external(&line, "l2:run", decision, true, &outcome, IntentTier::L2);
+    sync_session(session, 2, &outcome);
 }
 
 fn apply_effect(effect: &ExecuteResult) {
@@ -849,7 +1055,7 @@ fn build_terminal_app() -> Component {
                                 },
                             ),
                             Component::text_input(
-                                "",
+                                state::get_signal_text(TERMINAL_SIGNAL),
                                 "help",
                                 Style {
                                     font_size: 14.0,
@@ -859,7 +1065,23 @@ fn build_terminal_app() -> Component {
                                     ..Style::default()
                                 },
                             ),
+                            chrome_button("运行 Run", OP_RUN_TERMINAL, "#1c8f62"),
                         ],
+                    ),
+                    Component::text(
+                        {
+                            let output = state::get_signal_text(TERM_OUT_SIGNAL);
+                            if output.is_empty() {
+                                "允许 echo、pwd、help。需要一次性的 w3cos-process。".to_string()
+                            } else {
+                                output
+                            }
+                        },
+                        Style {
+                            font_size: 13.0,
+                            color: Color::from_hex("#b7f0d8"),
+                            ..Style::default()
+                        },
                     ),
                 ],
             ),
@@ -1159,6 +1381,8 @@ fn build_intent_bar() -> Component {
     ];
     if phase == 1 {
         rows.push(confirm_card());
+    } else if phase == 3 {
+        rows.push(result_card("规划中 Planning · 模型在后台线程"));
     } else if phase == 2 {
         let notice = state::get_signal_text(NOTICE_SIGNAL);
         if !notice.is_empty() {
@@ -1178,17 +1402,22 @@ fn build_intent_bar() -> Component {
 
 fn confirm_card() -> Component {
     let mut rows = Vec::new();
-    if state::get_signal_text(TIER_SIGNAL) == "L1" {
+    let tier = state::get_signal_text(TIER_SIGNAL);
+    if tier == "L1" || tier == "L2" {
         rows.push(Component::row(
             Style {
                 padding: Edges::xy(8.0, 4.0),
-                background: Color::from_hex("#9a3412"),
+                background: Color::from_hex(if tier == "L2" { "#1d4e89" } else { "#9a3412" }),
                 border_radius: 6.0,
                 align_self: AlignSelf::FlexStart,
                 ..Style::default()
             },
             vec![Component::text(
-                "L1 本地 Local",
+                if tier == "L2" {
+                    "L2 规划 Planner"
+                } else {
+                    "L1 本地 Local"
+                },
                 Style {
                     font_size: 12.0,
                     font_weight: 700,
@@ -1278,6 +1507,7 @@ fn build_task_center() -> Component {
     let (status, status_color) = match phase {
         1 => ("等待确认 Awaiting confirm", "#ffe08a"),
         2 => ("已完成 Done", "#b7f0d8"),
+        3 => ("规划中 Planning", "#9eb6ff"),
         _ => ("空闲 Idle", "#d5dee8"),
     };
     let mut body = vec![
@@ -1291,11 +1521,7 @@ fn build_task_center() -> Component {
             },
         ),
         Component::text(
-            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
-                "本地 L0/L1 · 无模型 · 加密文件"
-            } else {
-                "本地 L0/L1 · 无模型 · 仅内存"
-            },
+            planner_subtitle(),
             Style {
                 font_size: 12.0,
                 color: muted_ink(),
@@ -1351,6 +1577,35 @@ fn build_task_center() -> Component {
         if unlocked { OP_LOCK } else { OP_UNLOCK },
         if unlocked { "#3d5570" } else { "#9a3412" },
     ));
+    let steps = state::get_signal_text(STEPS_SIGNAL);
+    if !steps.is_empty() {
+        body.push(Component::text(
+            "步骤 Steps",
+            Style {
+                font_size: 14.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ));
+        for line in steps
+            .lines()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            body.push(Component::text(
+                line,
+                Style {
+                    font_size: 12.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
+    }
     body.push(Component::text(
         "收据 Receipts",
         Style {
@@ -1382,12 +1637,12 @@ fn build_task_center() -> Component {
             ));
         }
     }
-    if phase == 1 {
+    if phase == 1 || phase == 3 {
         body.push(chrome_button("停止 Stop", OP_CANCEL, "#a33b45"));
     }
     Component::column(
         Style {
-            width: Dimension::Px(300.0),
+            width: Dimension::Px(340.0),
             padding: Edges::all(14.0),
             gap: 8.0,
             background: Color::from_hex("#1b2c3e"),
@@ -1395,6 +1650,23 @@ fn build_task_center() -> Component {
         },
         body,
     )
+}
+
+fn planner_subtitle() -> String {
+    match std::env::var("W3COS_L2").ok().as_deref().map(str::trim) {
+        Some("script") => "L2 脚本夹具 · 无权重 · 后台线程".to_string(),
+        Some("1") | Some("true") => {
+            let model = std::env::var("W3COS_L2_MODEL").unwrap_or_else(|_| "local".into());
+            format!("L2 {model} · 后台线程 · 确认后执行")
+        }
+        _ => {
+            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
+                "本地 L0/L1 · 无模型 · 加密文件".to_string()
+            } else {
+                "本地 L0/L1 · 无模型 · 仅内存".to_string()
+            }
+        }
+    }
 }
 
 fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Component {

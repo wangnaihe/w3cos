@@ -6179,6 +6179,11 @@ impl App {
 
     #[cfg(feature = "ai-bridge")]
     fn poll_ai_bridge(&mut self) {
+        state::run_agent_poll_hook();
+        if state::is_dirty() {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
         if self.ai_bridge_handle.is_none() {
             return;
         }
@@ -7813,6 +7818,11 @@ impl ApplicationHandler for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         self.process_uitest_commands();
+        state::run_agent_poll_hook();
+        if state::is_dirty() {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
         self.microtask_checkpoint();
     }
 

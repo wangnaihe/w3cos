@@ -80,6 +80,18 @@ fall through to a local L1 synonym matcher (no model, no network).
 badge on the confirm card. The task center starts locked; the orange
 `解锁才能执行` button unlocks the local stub.
 
+Free-form text can go to an L2 planner when `W3COS_L2=1`. That planner is off
+by default and runs on a background thread. It calls the same MCP tools the
+bridge already exposes. Mutating steps still wait for confirm, the capability
+gate, and a receipt. See [docs/AI_HARNESS.md](docs/AI_HARNESS.md). Model
+weights are not in the repo:
+
+```bash
+./scripts/fetch-l2-models.sh
+./scripts/w3cos-inferd.sh llama-1.5b
+export W3COS_L2=1 W3COS_L2_BASE_URL=http://127.0.0.1:8081/v1 W3COS_L2_MODEL=qwen2.5-1.5b-instruct
+```
+
 ### Xvfb demo (Codespaces or any Linux VM)
 
 The shell is a native window, not a browser page. Rust 1.85+ is required

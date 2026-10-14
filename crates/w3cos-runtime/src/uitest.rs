@@ -394,6 +394,11 @@ pub fn set_event_loop_proxy(proxy: EventLoopProxy<()>) {
     }
 }
 
+/// Wake the window after a background planner step. The UI thread drains it.
+pub fn poke_event_loop() {
+    wake_event_loop();
+}
+
 fn wake_event_loop() {
     if let Ok(slot) = EVENT_LOOP_PROXY.lock()
         && let Some(proxy) = slot.as_ref()

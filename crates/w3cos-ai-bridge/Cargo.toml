@@ -13,6 +13,10 @@ path = "src/bin/w3cos-ai-mcp.rs"
 default = []
 l1 = []
 
+[[bin]]
+name = "w3cos-l2-bench"
+path = "src/bin/w3cos-l2-bench.rs"
+
 [dependencies]
 w3cos-dom = { workspace = true }
 w3cos-std = { workspace = true }
@@ -25,3 +29,4 @@ ring = "0.17"
 png = { workspace = true }
 tiny-skia = { workspace = true }
 fontdue = { workspace = true }
+ureq = { workspace = true }
