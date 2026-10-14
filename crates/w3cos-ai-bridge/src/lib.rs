@@ -4,6 +4,7 @@ pub mod dom_access;
 pub mod identity;
 pub mod intent;
 pub mod permissions;
+mod receipt_ledger;
 pub mod screenshot;
 pub mod server;
 

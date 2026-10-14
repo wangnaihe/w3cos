@@ -4,7 +4,7 @@
 //! Click an app icon → the app UI replaces the desktop area.
 //! Click "W3C Apps" in taskbar → return to desktop.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use w3cos_ai_bridge::identity::LocalIdentityStub;
@@ -22,11 +22,13 @@ const NIGHT_SIGNAL: usize = 1;
 const PHASE_SIGNAL: usize = 2;
 const CONTEXT_SIGNAL: usize = 3;
 const UNLOCKED_SIGNAL: usize = 4;
+const TASKS_SIGNAL: usize = 10;
 const DRAFT_SIGNAL: usize = 5;
 const SUMMARY_SIGNAL: usize = 6;
 const IMPACT_SIGNAL: usize = 7;
 const NOTICE_SIGNAL: usize = 8;
 const RECEIPT_SIGNAL: usize = 9;
+const STORAGE_SIGNAL: usize = 11;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -39,6 +41,7 @@ const OP_CHIP_FILES: u8 = 10;
 const OP_CHIP_NIGHT: u8 = 11;
 const OP_CHIP_APPS: u8 = 12;
 const OP_CHIP_CONTEXT: u8 = 13;
+const OP_TOGGLE_TASKS: u8 = 14;
 
 fn main() {
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
@@ -71,6 +74,7 @@ fn main() {
 
 thread_local! {
     static SESSION: RefCell<Option<IntentSession>> = const { RefCell::new(None) };
+    static SESSION_BOOTED: Cell<bool> = const { Cell::new(false) };
 }
 
 fn ensure_shell_signals() {
@@ -79,12 +83,14 @@ fn ensure_shell_signals() {
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
         let _ = state::create_signal(1);
-        let _ = state::create_signal(1);
+        let _ = state::create_signal(0);
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("No receipts yet.");
+        let _ = state::create_signal(1);
+        let _ = state::create_text_signal("memory");
     });
 }
 
@@ -92,7 +98,7 @@ fn with_session(body: impl FnOnce(&mut IntentSession)) {
     SESSION.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Some(IntentSession::new(
+            *slot = Some(IntentSession::open_local(
                 AgentPermissions::interactive(),
                 LocalIdentityStub::new(),
             ));
@@ -101,8 +107,25 @@ fn with_session(body: impl FnOnce(&mut IntentSession)) {
     });
 }
 
+fn boot_session_once() {
+    let already = SESSION_BOOTED.with(|booted| {
+        let seen = booted.get();
+        booted.set(true);
+        seen
+    });
+    if already {
+        return;
+    }
+    with_session(|session| sync_session(session, 0, ""));
+}
+
 fn on_shell_intent(code: u8, draft: &str) {
     ensure_shell_signals();
+    if code == OP_TOGGLE_TASKS {
+        let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);
+        state::set_signal(TASKS_SIGNAL, next);
+        return;
+    }
     let ctx = ShellContext {
         app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
         night: state::get_signal(NIGHT_SIGNAL) != 0,
@@ -195,6 +218,7 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
     state::set_signal(UNLOCKED_SIGNAL, i64::from(session.identity_unlocked()));
     state::set_text_signal(NOTICE_SIGNAL, notice);
     state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(12));
+    state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
 }
 
 fn now_ms() -> u64 {
@@ -213,8 +237,10 @@ fn invoke(code: u8) -> EventAction {
 
 fn build_shell() -> Component {
     ensure_shell_signals();
+    boot_session_once();
     let current = state::get_signal(APP_SIGNAL);
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
+    let tasks_open = state::get_signal(TASKS_SIGNAL) != 0;
 
     let content = match current {
         0 => build_desktop(),
@@ -245,7 +271,11 @@ fn build_shell() -> Component {
                     align_items: AlignItems::Stretch,
                     ..Style::default()
                 },
-                vec![content, build_task_center()],
+                if tasks_open {
+                    vec![content, build_task_center()]
+                } else {
+                    vec![content]
+                },
             ),
             build_taskbar(current),
         ],
@@ -956,6 +986,15 @@ fn build_context_header(current: i64, night: bool) -> Component {
                     ..Style::default()
                 },
             ),
+            chrome_button(
+                if state::get_signal(TASKS_SIGNAL) != 0 {
+                    "收起任务 Hide"
+                } else {
+                    "任务 Tasks"
+                },
+                OP_TOGGLE_TASKS,
+                "#3d5570",
+            ),
             Component::text(
                 "实时 Live",
                 Style {
@@ -1127,7 +1166,11 @@ fn build_task_center() -> Component {
             },
         ),
         Component::text(
-            "L0 规则匹配，无模型。No model.",
+            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
+                "L0 无模型 · 加密文件 Encrypted file"
+            } else {
+                "L0 无模型 · 仅内存 Memory"
+            },
             Style {
                 font_size: 12.0,
                 color: muted_ink(),

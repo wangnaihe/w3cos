@@ -20,8 +20,9 @@ pub trait LocalIdentity {
     fn unlocked(&self) -> bool;
 }
 
-/// In-memory stand-in. `unlock_with_passkey_stub` accepts any non-empty
-/// string and does not check it against an authenticator.
+/// In-memory stand-in. It boots locked. The first non-empty unlock string is
+/// remembered for this process; later unlocks must repeat it. Nothing is
+/// checked against an authenticator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalIdentityStub {
     subject: String,
@@ -37,12 +38,27 @@ impl LocalIdentityStub {
     pub fn new() -> Self {
         Self {
             subject: Self::SUBJECT.to_string(),
-            unlocked: true,
+            unlocked: false,
             pin: None,
         }
     }
 
     pub fn lock(&mut self) {
+        self.unlocked = false;
+    }
+
+    pub fn remembered_pin(&self) -> Option<&str> {
+        self.pin.as_deref()
+    }
+
+    /// Install a pin while staying locked. A ledger reload uses this so the
+    /// first unlock string still matches after a restart. Does not replace a
+    /// pin that is already set.
+    pub fn restore_locked_pin(&mut self, pin: &str) {
+        if pin.is_empty() || self.pin.is_some() {
+            return;
+        }
+        self.pin = Some(pin.to_string());
         self.unlocked = false;
     }
 
@@ -95,7 +111,7 @@ mod tests {
         assert_eq!(id.subject(), LocalIdentityStub::SUBJECT);
         assert!(id.subject().starts_with("did:key:stub"));
         assert_eq!(id.method(), IdentityMethod::Stub);
-        assert!(id.unlocked());
+        assert!(!id.unlocked());
         assert_ne!(id.method(), IdentityMethod::DidKey);
         assert_ne!(id.method(), IdentityMethod::Passkey);
     }

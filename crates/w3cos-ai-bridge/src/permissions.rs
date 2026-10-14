@@ -169,14 +169,16 @@ impl AuthError {
 
 /// Resolve `W3COS_AI_PERMISSIONS`.
 ///
-/// Empty and `interactive` stay interactive, matching issue #48. `observer`
-/// and `system` select those presets. Any other spelling fails closed to
-/// `observer` so a typo does not grant clicks.
+/// Unset and empty values are `observer`. `interactive` and `system` are
+/// explicit overrides. Any other spelling fails closed to `observer`.
+///
+/// Issue #48 originally asked for a default of `interactive()`. That default
+/// is superseded: a listener with no explicit grant must not click or type.
 pub fn permissions_from_label(label: &str) -> AgentPermissions {
     match label.trim().to_ascii_lowercase().as_str() {
-        "" | "interactive" => AgentPermissions::interactive(),
+        "interactive" => AgentPermissions::interactive(),
         "system" => AgentPermissions::system(),
-        "observer" => AgentPermissions::observer(),
+        "" | "observer" => AgentPermissions::observer(),
         _ => AgentPermissions::observer(),
     }
 }
@@ -279,7 +281,8 @@ mod tests {
         assert!(permissions_label_is_known(""));
         assert!(permissions_label_is_known("Interactive"));
         assert!(!permissions_label_is_known("observr"));
-        assert!(permissions_from_label("").can_interact);
+        assert!(!permissions_from_label("").can_interact);
+        assert!(!permissions_from_label("").can_write_dom);
         assert!(permissions_from_label("interactive").can_interact);
         assert!(!permissions_from_label("interactive").can_spawn_processes);
         assert!(!permissions_from_label("observer").can_interact);

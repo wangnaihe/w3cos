@@ -257,6 +257,7 @@ pub fn start_with_options(options: BridgeOptions) -> RunningBridge {
 }
 
 fn permissions_from_env() -> AgentPermissions {
+    // Unset and empty stay observer. interactive|system must be explicit.
     let raw = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
     if !crate::permissions::permissions_label_is_known(&raw) {
         eprintln!("[AI Bridge] unknown W3COS_AI_PERMISSIONS={raw:?}; using observer (fail closed)");

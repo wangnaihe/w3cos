@@ -31,6 +31,95 @@ fn default_logical_size() -> LogicalSize<f64> {
     LogicalSize::new(1200.0, 800.0)
 }
 
+/// `_NET_ACTIVE_WINDOW` is a no-op without a window manager. Xvfb is that
+/// case, so also call `XSetInputFocus` when the handle is an X11 window.
+/// Real window managers still get `Window::focus_window`.
+#[cfg(target_os = "linux")]
+fn claim_x11_keyboard_focus(window: &Window) {
+    use std::ffi::{c_int, c_ulong, c_void, CStr};
+    use std::sync::OnceLock;
+    use winit::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+
+    let Ok(window_handle) = window.window_handle() else {
+        return;
+    };
+    let Ok(display_handle) = window.display_handle() else {
+        return;
+    };
+    let RawWindowHandle::Xlib(xwindow) = window_handle.as_raw() else {
+        return;
+    };
+    let RawDisplayHandle::Xlib(xdisplay) = display_handle.as_raw() else {
+        return;
+    };
+    let Some(display) = xdisplay.display else {
+        return;
+    };
+    let display = display.as_ptr();
+
+    type LockFn = unsafe extern "C" fn(*mut c_void);
+    type SetFn = unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_ulong) -> c_int;
+    type FlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+    struct XlibFocus {
+        lock: LockFn,
+        unlock: LockFn,
+        set_input_focus: SetFn,
+        flush: FlushFn,
+    }
+
+    fn load() -> Option<XlibFocus> {
+        unsafe fn lookup<T>(handle: *mut c_void, name: &[u8]) -> Option<T> {
+            let symbol = CStr::from_bytes_with_nul(name).ok()?;
+            let ptr = libc::dlsym(handle, symbol.as_ptr());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute_copy(&ptr))
+            }
+        }
+        unsafe {
+            let handle = libc::dlopen(
+                CStr::from_bytes_with_nul(b"libX11.so.6\0").ok()?.as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_GLOBAL,
+            );
+            if handle.is_null() {
+                return None;
+            }
+            Some(XlibFocus {
+                lock: lookup(handle, b"XLockDisplay\0")?,
+                unlock: lookup(handle, b"XUnlockDisplay\0")?,
+                set_input_focus: lookup(handle, b"XSetInputFocus\0")?,
+                flush: lookup(handle, b"XFlush\0")?,
+            })
+        }
+    }
+
+    static FNS: OnceLock<Option<XlibFocus>> = OnceLock::new();
+    let Some(fns) = FNS.get_or_init(load).as_ref() else {
+        return;
+    };
+    const REVERT_TO_PARENT: c_int = 2;
+    const CURRENT_TIME: c_ulong = 0;
+    unsafe {
+        (fns.lock)(display);
+        (fns.set_input_focus)(display, xwindow.window, REVERT_TO_PARENT, CURRENT_TIME);
+        (fns.flush)(display);
+        (fns.unlock)(display);
+    }
+    if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+        eprintln!("[W3C OS][IME] XSetInputFocus window={}", xwindow.window);
+    }
+}
+
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "ios", target_os = "android"))
+))]
+fn claim_x11_keyboard_focus(_window: &Window) {}
+
 fn default_window_attributes() -> WindowAttributes {
     let attributes = WindowAttributes::default().with_title("W3C OS");
     #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -5444,11 +5533,24 @@ impl App {
         }
     }
 
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    fn claim_desktop_text_focus(&self, window: &Window) {
+        window.focus_window();
+        window.set_ime_allowed(true);
+        claim_x11_keyboard_focus(window);
+    }
+
     fn focus_text_input(&mut self, idx: usize) {
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
             eprintln!("[W3C OS][IME] TextInput focus index={idx}");
         }
         self.set_focused_index(Some(idx));
+        // set_focused_index returns early when this field is already focused.
+        // Claim again so a second click on Xvfb still pulls keyboard focus.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        if let Some(window) = self.get_window() {
+            self.claim_desktop_text_focus(window);
+        }
         #[cfg(target_os = "ios")]
         {
             self.ios_ime_viewport_poll = Some(IosImeRetry {
@@ -5836,6 +5938,20 @@ impl App {
             }
         }
         self.sync_soft_keyboard();
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        if let Some(window) = self.get_window() {
+            let text_input = next.is_some_and(|index| {
+                matches!(
+                    self.get_kind_at(index),
+                    Some(ComponentKind::TextInput { .. })
+                )
+            });
+            if text_input {
+                self.claim_desktop_text_focus(window);
+            } else {
+                window.set_ime_allowed(false);
+            }
+        }
         if let Some(current) = next {
             let chain = self.native_host_chain(current);
             if self.dom_mode {

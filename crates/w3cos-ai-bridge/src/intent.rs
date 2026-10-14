@@ -5,9 +5,12 @@
 //! [`authorize`](crate::permissions::authorize) gate as the HTTP AI bridge.
 //! Utterances are not turned into arbitrary DOM selectors.
 
+use serde::{Deserialize, Serialize};
+
 use crate::dom_access::ActionType;
 use crate::identity::{LocalIdentity, LocalIdentityStub};
 use crate::permissions::{ActionRateLimiter, AgentPermissions, BridgeOp, authorize};
+use crate::receipt_ledger::ReceiptLedger;
 
 /// Placeholder of the shell's intent field. The runtime uses it only to read
 /// that field when the Propose action fires.
@@ -126,7 +129,7 @@ pub struct ShellContext {
     pub night: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Allowed,
     Denied,
@@ -145,7 +148,7 @@ impl Decision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionReceipt {
     pub operation_id: u64,
     pub actor: String,
@@ -177,6 +180,12 @@ pub struct ExecuteResult {
     pub night: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LedgerSnapshot {
+    pin: Option<String>,
+    receipts: Vec<ActionReceipt>,
+}
+
 pub struct IntentSession {
     permissions: AgentPermissions,
     rate: ActionRateLimiter,
@@ -185,6 +194,7 @@ pub struct IntentSession {
     proposal: Option<Proposal>,
     receipts: Vec<ActionReceipt>,
     next_id: u64,
+    ledger: Option<ReceiptLedger>,
 }
 
 impl IntentSession {
@@ -197,7 +207,52 @@ impl IntentSession {
             proposal: None,
             receipts: Vec::new(),
             next_id: 1,
+            ledger: None,
         }
+    }
+
+    /// Shell entry point. Loads the machine-local ledger when a directory is
+    /// available. Tests keep using [`new`](Self::new), which stays in memory.
+    pub fn open_local(permissions: AgentPermissions, identity: LocalIdentityStub) -> Self {
+        match ReceiptLedger::open_default() {
+            Ok(ledger) => Self::new(permissions, identity).with_ledger(ledger),
+            Err(err) => {
+                eprintln!(
+                    "[intent] receipt ledger unavailable ({err}); keeping receipts in memory"
+                );
+                Self::new(permissions, identity)
+            }
+        }
+    }
+
+    pub fn with_ledger(mut self, ledger: ReceiptLedger) -> Self {
+        match ledger.load() {
+            Ok(Some(bytes)) => match serde_json::from_slice::<LedgerSnapshot>(&bytes) {
+                Ok(snapshot) => {
+                    if let Some(pin) = snapshot.pin.as_deref() {
+                        self.identity.restore_locked_pin(pin);
+                    }
+                    if let Some(next) = snapshot
+                        .receipts
+                        .iter()
+                        .map(|receipt| receipt.operation_id)
+                        .max()
+                    {
+                        self.next_id = next.saturating_add(1);
+                    }
+                    self.receipts = snapshot.receipts;
+                }
+                Err(err) => {
+                    eprintln!("[intent] receipt ledger JSON unreadable ({err})");
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("[intent] receipt ledger unreadable ({err}); leaving the file in place");
+            }
+        }
+        self.ledger = Some(ledger);
+        self
     }
 
     pub fn actor(&self) -> &str {
@@ -225,7 +280,11 @@ impl IntentSession {
     }
 
     pub fn unlock_identity_stub(&mut self, assertion: &str) -> bool {
-        self.identity.unlock_with_passkey_stub(assertion)
+        let unlocked = self.identity.unlock_with_passkey_stub(assertion);
+        if unlocked {
+            self.persist();
+        }
+        unlocked
     }
 
     pub fn revoke_context(&mut self) {
@@ -319,11 +378,13 @@ impl IntentSession {
         ))
     }
 
-    /// Where receipts live. `memory` means this process only: not encrypted,
-    /// not written to disk. A later ledger can replace the vec without
-    /// changing the confirm path.
+    /// `memory` is this process only. `encrypted-file` is the local AEAD stub.
     pub fn receipt_storage(&self) -> &'static str {
-        "memory"
+        if self.ledger.is_some() {
+            "encrypted-file"
+        } else {
+            "memory"
+        }
     }
 
     pub fn receipt_log_tail(&self, limit: usize) -> String {
@@ -383,7 +444,25 @@ impl IntentSession {
         };
         self.next_id += 1;
         self.receipts.push(receipt.clone());
+        self.persist();
         receipt
+    }
+
+    fn persist(&self) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        let snapshot = LedgerSnapshot {
+            pin: self.identity.remembered_pin().map(str::to_string),
+            receipts: self.receipts.clone(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+            eprintln!("[intent] receipt ledger skipped a write: snapshot did not encode");
+            return;
+        };
+        if let Err(err) = ledger.store(&bytes) {
+            eprintln!("[intent] receipt ledger write failed: {err}");
+        }
     }
 }
 
@@ -554,7 +633,9 @@ mod tests {
     use super::*;
 
     fn session(perms: AgentPermissions) -> IntentSession {
-        IntentSession::new(perms, LocalIdentityStub::new())
+        let mut session = IntentSession::new(perms, LocalIdentityStub::new());
+        assert!(session.unlock_identity_stub("test-unlock"));
+        session
     }
 
     fn ctx() -> ShellContext {
@@ -704,8 +785,9 @@ mod tests {
 
     #[test]
     fn locked_identity_blocks_execution_until_the_stub_unlocks() {
-        let mut session = session(AgentPermissions::interactive());
-        session.lock_identity();
+        let mut session =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new());
+        assert!(!session.identity_unlocked());
         let denied = confirm_open(&mut session, "open settings");
         assert!(denied.navigate.is_none());
         assert!(denied.receipt.outcome.contains("locked"));
@@ -734,5 +816,46 @@ mod tests {
             ProposeResult::Confirm(_) => panic!("smuggled selector became a proposal"),
         }
         assert!(session.confirm(&ctx(), 1_000).is_none());
+    }
+
+    #[test]
+    fn encrypted_ledger_survives_restart_and_rejects_the_wrong_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "ledger"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("ledger"));
+        assert_eq!(session.receipt_storage(), "encrypted-file");
+        assert!(!session.identity_unlocked());
+        assert!(session.unlock_identity_stub("alpha"));
+        let effect = confirm_open(&mut session, "open files");
+        assert_eq!(effect.receipt.decision, Decision::Allowed);
+        drop(session);
+
+        let sealed = std::fs::read(dir.join("receipts.bin")).expect("sealed file");
+        assert!(sealed.starts_with(b"W3R1"));
+        assert!(!sealed.windows(6).any(|window| window == b"Files."));
+        assert!(!sealed.windows(5).any(|window| window == b"alpha"));
+
+        let reloaded =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("reopen"));
+        assert!(!reloaded.identity_unlocked());
+        assert_eq!(reloaded.receipts().len(), 1);
+        assert!(reloaded.receipts()[0].outcome.contains("Files"));
+        let mut reloaded = reloaded;
+        assert!(!reloaded.unlock_identity_stub("beta"));
+        assert!(!reloaded.identity_unlocked());
+        assert!(reloaded.unlock_identity_stub("alpha"));
+        assert!(reloaded.identity_unlocked());
+
+        std::fs::write(dir.join("receipts.key"), [9u8; 32]).expect("replace key");
+        let foreign = ReceiptLedger::open(&dir).expect("foreign key file");
+        assert!(foreign.load().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
