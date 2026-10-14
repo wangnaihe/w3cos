@@ -8478,6 +8478,18 @@ impl ApplicationHandler for App {
                 is_synthetic: false,
                 ..
             } => {
+                if event.state == ElementState::Pressed
+                    && crate::w3cos_extensions::shortcuts_active()
+                    && crate::w3cos_extensions::dispatch_matching_shortcut(
+                        &web_key(&event.logical_key),
+                        self.modifiers.control_key(),
+                        self.modifiers.alt_key(),
+                        self.modifiers.shift_key(),
+                        self.modifiers.super_key(),
+                    )
+                {
+                    return;
+                }
                 #[cfg(target_os = "android")]
                 if event.state == ElementState::Pressed
                     && matches!(event.logical_key, Key::Named(NamedKey::BrowserBack))

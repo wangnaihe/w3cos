@@ -19,6 +19,16 @@ pub struct HeadlessFrame {
 /// Render the current live DOM through the same component, layout and Skia
 /// stages used by native windows, without creating an operating-system window.
 pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
+    render_document_rgba_inner(width, height, false)
+}
+
+/// Rasterize with tiny-skia even when Skia is also compiled in.
+#[cfg(feature = "cpu-render")]
+pub fn render_document_rgba_cpu(width: u32, height: u32) -> Result<HeadlessFrame> {
+    render_document_rgba_inner(width, height, true)
+}
+
+fn render_document_rgba_inner(width: u32, height: u32, force_cpu: bool) -> Result<HeadlessFrame> {
     if width == 0 || height == 0 {
         bail!("headless viewport dimensions must be positive");
     }
@@ -169,13 +179,25 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         width as f32,
         height as f32,
     );
-    let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact)?;
+    let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact, force_cpu)?;
 
     Ok(HeadlessFrame {
         width,
         height,
         rgba,
     })
+}
+
+/// Write a headless frame as a PNG. Used by the native-gaps demo.
+pub fn write_frame_png(path: &std::path::Path, frame: &HeadlessFrame) -> Result<()> {
+    image::save_buffer(
+        path,
+        &frame.rgba,
+        frame.width,
+        frame.height,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", path.display()))
 }
 
 fn rasterize_prepared_frame(
@@ -189,7 +211,32 @@ fn rasterize_prepared_frame(
     )],
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
     artifact: &PaintArtifact,
+    force_cpu: bool,
 ) -> Result<Vec<u8>> {
+    if force_cpu {
+        #[cfg(feature = "cpu-render")]
+        {
+            let _ = artifact;
+            let mut pixmap = tiny_skia::Pixmap::new(width, height)
+                .ok_or_else(|| anyhow::anyhow!("viewport is too large to rasterize on the CPU"))?;
+            let mut clips = crate::render_cpu::ClipMaskCache::default();
+            crate::render_cpu::render_frame(
+                &mut pixmap,
+                nodes,
+                layout::layout_font(),
+                scroll_info,
+                &HashMap::new(),
+                None,
+                &mut clips,
+            );
+            return Ok(pixmap.take());
+        }
+        #[cfg(not(feature = "cpu-render"))]
+        {
+            let _ = (width, height, nodes, scroll_info, artifact);
+            bail!("cpu renderer is not compiled in");
+        }
+    }
     // Skia software raster is the conformance path. Headless machines without
     // that feature use the tiny-skia CPU renderer instead of opening a GPU
     // window. Prefer Skia when both renderers are compiled in so existing

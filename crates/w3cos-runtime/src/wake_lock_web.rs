@@ -1,11 +1,9 @@
 //! Screen Wake Lock API compatibility surface.
 
+use crate::jsdom::realm_function;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Once;
-
-use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -112,7 +110,7 @@ pub fn wake_lock_value() -> Value {
     w3cos_core::class::set_prototype_of(&wake_lock, &wake_lock_class().get_property("prototype"));
     wake_lock.set_property(
         "request",
-        realm_function(generation, |_, args| {
+        realm_function(generation, move |_, args| {
             let lock_type = args
                 .first()
                 .cloned()
@@ -124,14 +122,24 @@ pub fn wake_lock_value() -> Value {
                     "only the screen wake lock type is supported",
                 )]);
             }
-            static WARNING: Once = Once::new();
-            WARNING.call_once(|| {
-                eprintln!(
-                    "[w3cos] warning: navigator.wakeLock returns a compatibility sentinel; \
-                     preventing host display sleep requires a platform power adapter"
-                );
-            });
-            w3cos_core::promise::resolve(vec![sentinel_value()])
+            if let Some(rejected) =
+                crate::capability_gate::reject_unless_granted("screen-wake-lock")
+            {
+                return rejected;
+            }
+            if let Err(message) = crate::platform_host::set_screen_awake(true) {
+                return w3cos_core::promise::reject(vec![error("NotSupportedError", &message)]);
+            }
+            let sentinel = sentinel_value();
+            let release = sentinel.get_property("release");
+            sentinel.set_property(
+                "release",
+                realm_function(generation, move |this, args| {
+                    let _ = crate::platform_host::set_screen_awake(false);
+                    release.call(this, args)
+                }),
+            );
+            w3cos_core::promise::resolve(vec![sentinel])
         }),
     );
     wake_lock
@@ -155,6 +163,23 @@ mod tests {
         reset_realm();
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
+        crate::capability_gate::reset();
+        crate::platform_host::reset_overrides();
+        let denied = Rc::new(RefCell::new(String::new()));
+        let denied_for_catch = Rc::clone(&denied);
+        wake_lock_value()
+            .call_method("request", vec![Value::string("screen")])
+            .call_method(
+                "catch",
+                vec![Value::function(move |_, args| {
+                    *denied_for_catch.borrow_mut() = args[0].get_property("name").to_js_string();
+                    Value::Undefined
+                })],
+            );
+        w3cos_core::promise::drain_microtasks();
+        assert_eq!(&*denied.borrow(), "NotAllowedError");
+        crate::capability_gate::grant("screen-wake-lock");
+        crate::platform_host::set_wake_hook(Some(|awake| if awake { Ok(()) } else { Ok(()) }));
         let wake_lock = wake_lock_value();
         assert!(w3cos_core::class::instance_of(
             &wake_lock,
@@ -213,6 +238,8 @@ mod tests {
             );
         w3cos_core::promise::drain_microtasks();
         assert_eq!(&*error_name.borrow(), "NotSupportedError");
+        crate::capability_gate::reset();
+        crate::platform_host::reset_overrides();
         reset_realm();
     }
 
