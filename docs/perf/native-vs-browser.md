@@ -63,7 +63,7 @@ isolation, and V8 optimizations stay at their headless defaults.
 
 Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, 15 GiB RAM, no `/dev/dri`.
 Rustc 1.99.0 (`b940084d7`, 2026-09-28). Google Chrome 154.0.8037.92. Native
-binary commit `6989059`, profile `opt-level=3`, LTO off, `codegen-units=16`,
+binary commit `c2bb44a`, profile `opt-level=3`, LTO off, `codegen-units=16`,
 `cpu-render` (tiny-skia). Five processes per workload. Checksums matched on
 every paired run: DOM 230, layout 20016, layout-css 7680, frames 11000,
 memory 72000, compute `-362647.901806622`. Ratio is w3cos / Chromium; below
@@ -73,28 +73,29 @@ memory 72000, compute `-362647.901806622`. Ratio is w3cos / Chromium; below
 `createElement` / `appendChild` / property stores into host calls that did
 not run own getters, prototype overrides, expandos, or Proxy traps. Those
 unguarded emitters were removed when observable lookup was restored
-(`a307750`, merged in `ba72b95`). "After" is `6989059`: the fused create
+(`a307750`, merged in `ba72b95`). "After" is `c2bb44a`: the fused create
 runs only after a shape-epoch check, and a mismatch takes the ordinary
-property path.
+property path. Tag and attribute names are static `u32`s. Identical
+interned attribute sets share one immutable record and copy on write.
 
 | workload | metric | w3cos before | w3cos after | Chromium | ratio after |
 | --- | --- | ---: | ---: | ---: | ---: |
-| startup | cold start ms | 52.3 (51.8–53.2) | 53.2 (52.0–166.9) | 210 (206–1349) | 0.25 |
-| dom-list | wall ms | 0.585 (0.566–0.611) | 0.526 (0.518–0.556) | 0.800 (0.700–0.800) | 0.66 |
-| dom-list | create ms | 0.524 (0.509–0.551) | 0.423 (0.416–0.443) | 0.700 (0.700–0.800) | 0.60 |
-| dom-list | steady RSS | 20.8 MB | 20.9 MB | 920 MB | 0.023 |
-| layout | wall ms | 0.699 (0.689–1.207) | 0.750 (0.734–0.765) | 10.4 (10.4–10.7) | 0.072 |
-| layout | steady RSS | 24.5 MB | 26.0 MB | 976 MB | 0.027 |
-| layout-css | wall ms | 3.75 (3.65–3.78) | 0.881 (0.871–0.896) | 1.100 (1.100–1.100) | 0.80 |
-| frames | work p50 ms | 0.132 (0.127–0.134) | 0.183 (0.182–0.189) | 0.200 (0.200–0.300) | 0.92 |
-| frames | work p95 ms | 0.136 (0.129–0.151) | 0.193 (0.185–0.219) | 0.300 (0.300–0.305) | 0.64 |
-| compute | wall ms | 1.406 (1.405–1.413) | 0.820 (0.812–0.923) | 1.500 (1.400–2.200) | 0.55 |
-| memory | wall ms | 8.10 (8.07–8.22) | 18.7 (18.5–25.9) | 19.9 (19.5–30.4) | overlap |
-| memory | steady RSS | 25.1 MB | 27.2 MB | 942 MB | 0.029 |
+| startup | cold start ms | 52.3 (51.8–53.2) | 53.1 (52.4–99.4) | 208 (203–267) | 0.25 |
+| dom-list | wall ms | 0.585 (0.566–0.611) | 0.490 (0.483–0.511) | 0.700 (0.700–0.800) | 0.70 |
+| dom-list | create ms | 0.524 (0.509–0.551) | 0.385 (0.380–0.402) | 0.700 (0.600–0.700) | 0.55 |
+| dom-list | steady RSS | 20.8 MB | 20.3 MB | 922 MB | 0.022 |
+| layout | wall ms | 0.699 (0.689–1.207) | 0.752 (0.742–0.773) | 10.7 (10.5–10.9) | 0.070 |
+| layout | steady RSS | 24.5 MB | 25.7 MB | 977 MB | 0.026 |
+| layout-css | wall ms | 3.75 (3.65–3.78) | 0.894 (0.877–0.955) | 1.100 (1.000–1.200) | 0.81 |
+| frames | work p50 ms | 0.132 (0.127–0.134) | 0.182 (0.181–0.191) | 0.200 (0.200–0.200) | 0.91 |
+| frames | work p95 ms | 0.136 (0.129–0.151) | 0.201 (0.197–0.225) | 0.305 (0.300–0.400) | 0.66 |
+| compute | wall ms | 1.406 (1.405–1.413) | 0.820 (0.815–0.868) | 1.400 (1.400–1.500) | 0.59 |
+| memory | wall ms | 8.10 (8.07–8.22) | 19.3 (19.0–23.2) | 21.2 (20.0–22.4) | overlap |
+| memory | steady RSS | 25.1 MB | 26.8 MB | 941 MB | 0.028 |
 
 Frame p50/p95 are the median of the five per-run percentiles. Cold start's
-167 ms sample is one slow process; the other four sit next to the 53 ms
-median, and that maximum is still under Chromium's 206 ms minimum.
+99 ms sample is one slow process; the other four sit next to the 53 ms
+median, and that maximum is still under Chromium's 203 ms minimum.
 
 Cold start, DOM create, the px flex/grid layout, author-CSS layout, frame
 work, the numeric loop, and steady RSS are wins: each w3cos max is below
@@ -112,24 +113,30 @@ methods, expandos, and Proxy traps still run. A fresh node with no memoized
 wrapper is an immediate handle. `defineProperty` and `setPrototypeOf` pin a
 collectable wrapper so authored state stays visible on the next read.
 
-Unique attribute strings are copied into the page arena without a hash
-slot and are atomized on lookup. Static names (`div`, `id`, `class`) are
-hashed at AOT time and interned with that hash. The page still reserves
-32768 node slots and a 1 MiB string arena. Two attributes stay in an inline
-buffer. Sibling links are `u32`. Short text stays in the 22-byte inline
-string, and the single text child remains a real text node. The unguarded
+Tag and attribute names come from a build-time qualified-name table and
+compare as `u32`. The AOT prologue interns a dynamic class literal once and
+passes that id into the loop, so the create path does not hash it. Unique
+id bytes are an arena slice with no hash slot. The id and class maps are
+built on the first lookup, which is when those values are atomized.
+Elements whose interned attribute sets match share one immutable record;
+the first mutation copies it. One or two attributes stay in the element.
+A third allocates the spill vector. This is the ShareableElementData /
+UniqueElementData split, without Oilpan, compositor tiles, or another
+process. The page still reserves 32768 node slots and a 1 MiB string arena.
+Sibling links are `u32`. Short text stays in the 22-byte inline string, and
+the single text child remains a real text node. The unguarded
 `dom_build_appended` emitter is not used. The 0.524 ms create at `f5b6581`
 skipped the checks above; this path does not.
 
-Create is 0.423 ms for 1000 elements: 0.423 µs/element, range 0.416–0.443 µs.
-Chromium is 0.700–0.800 µs. The ranges do not overlap. Checksum 230 matches
-on both sides (`item 1`, `upd 39`). The 40 text updates take 0.102 ms
-(0.102–0.106). Chromium reports 0.000 ms on every sample, which is the timer
-quantum, so the update ratio is not meaningful.
+Create is 0.385 ms for 1000 elements: 0.385 µs/element, range 0.380–0.402 µs.
+Chromium is 0.600–0.700 µs (median 0.700). The ranges do not overlap.
+Checksum 230 matches on both sides (`item 1`, `upd 39`). The 40 text updates
+take 0.106 ms (0.104–0.113). Chromium reports 0.000 ms on every sample,
+which is the timer quantum, so the update ratio is not meaningful.
 
-The 4000-node build does not match the fused create shape. It is 18.7 ms
-(18.5–25.9). Chromium is 19.9 ms (19.5–30.4). The ranges overlap, so this
-is not a win. Steady RSS is 27.2 MB against 942 MB, and that range does not
+The 4000-node build does not match the fused create shape. It is 19.3 ms
+(19.0–23.2). Chromium is 21.2 ms (20.0–22.4). The ranges overlap, so this
+is not a win. Steady RSS is 26.8 MB against 941 MB, and that range does not
 overlap.
 
 ### Numeric loop
@@ -145,13 +152,13 @@ is bitwise identical to the separate operations, and every sample's
 checksum is `-362647.901806622`, the same value V8 reports. FMA is not
 enabled globally.
 
-This run's w3cos samples are 0.812–0.923 ms. Chromium is 1.400–2.200 ms.
+This run's w3cos samples are 0.815–0.868 ms. Chromium is 1.400–1.500 ms.
 The ranges do not overlap.
 
 ### Layout
 
-The px flex/grid workload is 0.750 ms (0.734–0.765) versus 10.4 ms
-(10.4–10.7), checksum 20016 on both sides. There is no author stylesheet and
+The px flex/grid workload is 0.752 ms (0.742–0.773) versus 10.7 ms
+(10.5–10.9), checksum 20016 on both sides. There is no author stylesheet and
 every item has a px border box, so flush writes those boxes directly and does
 not build a Taffy tree.
 
@@ -173,12 +180,12 @@ with the same attribute and inline-style signature share a computed style
 only when the sheet has no sibling, structural, or relational selector.
 Anything else still goes through Taffy. The shared font wraps to the same
 line counts on both sides: the 800 px pass is 960 px tall and the 420 px
-pass is 1600 px tall, so six reflows sum to 7680. Wall time is 0.881 ms
-(0.871–0.896). Chromium is 1.100 ms on every sample. The ranges do not
+pass is 1600 px tall, so six reflows sum to 7680. Wall time is 0.894 ms
+(0.877–0.955). Chromium is 1.000–1.200 ms (median 1.100). The ranges do not
 overlap.
 
-Frame callback work is 0.183 ms p50 (0.182–0.189) and 0.193 ms p95
-(0.185–0.219), checksum 11000. Chromium is 0.200–0.300 ms p50 and
-0.300–0.305 ms p95. Both native ranges sit under the Chromium minimum.
-The p50 edge gap is 0.011 ms. The native pipeline p50 of 9.35 ms adds the
+Frame callback work is 0.182 ms p50 (0.181–0.191) and 0.201 ms p95
+(0.197–0.225), checksum 11000. Chromium is 0.200 ms p50 on every sample and
+0.300–0.400 ms p95. Both native ranges sit under the Chromium minimum.
+The p50 edge gap is 0.009 ms. The native pipeline p50 of 9.41 ms adds the
 tiny-skia raster and is not compared with the browser rAF gap (16.7 ms).
