@@ -117,6 +117,20 @@ system/scripts/package-sdk.sh /other/dir
 
 不安装 rustc。`system/rootfs_overlay/usr/lib/w3cos/toolchain-manifest.json` 的 `compiler` 是 `/usr/bin/w3cos`，`rustc` 字段写明 SDK only。ISO workflow 先跑 `scripts/build-shared-runtime.sh`，再编 stub 和 `w3cos-cli`。
 
+## 字体
+
+宿主 UI 字体按名字选中 Noto Sans 或 DejaVu 时，拉丁字形是有的，汉字不在这张 cmap 里。CPU 路径以前对缺字直接栅格化 `.notdef`，所以中文是方框。Skia 路径本来就会 `match_family_style_character`。
+
+现在缺字按这个顺序找脸，并且只有栅格器真能画出墨水才采用：
+
+1. `libfontconfig.so.1` 的 charset 匹配（`dlopen`，镜像里没有这个库就跳过）。
+2. 具名回退：汉字/假名/谚文优先 Noto Sans CJK SC、思源黑体、文泉驿、Droid Sans Fallback；emoji 优先轮廓字体，Noto Color Emoji 放在最后；符号优先 Noto Sans Symbols 和 DejaVu。
+3. 已安装字体里再扫最多 64 个族。
+
+ISO 带的是 `system/rootfs_overlay/usr/share/fonts/truetype/w3cos/DroidSansFallback.ttf`（3.9 MB，Apache-2.0）。`fonts-noto-cjk` 安装后大约 100 MB，不进 ISO。DevContainer / Codespaces 的 `post-create.sh` 和 README 的 Xvfb 依赖装 `fonts-droid-fallback`，同一张脸。HF 演示镜像继续用 `fonts-noto-cjk`。
+
+Noto Color Emoji 是 CBDT 彩色位图。CPU 栅格器画不出它的轮廓时不会选它，避免再画出空方框。系统里如果没有可栅格的轮廓 emoji，U+1F600 仍然没有字形。符号（例如 ✓）走 DejaVu。
+
 ## 测量
 
 机器：x86_64，rustc 1.99。`CARGO_PROFILE_RELEASE_LTO=off`、`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`、`CARGO_PROFILE_RELEASE_PANIC=unwind`。workspace 的 `opt-level` 是 3。

@@ -350,8 +350,24 @@ fn invoke(code: u8) -> EventAction {
     }
 }
 
+fn apply_screen_override() {
+    // Screenshot hook. Set once so a later click can still change the screen.
+    thread_local! {
+        static APPLIED: Cell<bool> = const { Cell::new(false) };
+    }
+    if APPLIED.with(|applied| applied.replace(true)) {
+        return;
+    }
+    match std::env::var("W3COS_SCREEN").ok().as_deref() {
+        Some("settings") => state::set_signal(APP_SIGNAL, 3),
+        Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
+        _ => {}
+    }
+}
+
 fn build_shell() -> Component {
     ensure_shell_signals();
+    apply_screen_override();
     boot_session_once();
     let current = state::get_signal(APP_SIGNAL);
     let night = state::get_signal(NIGHT_SIGNAL) != 0;

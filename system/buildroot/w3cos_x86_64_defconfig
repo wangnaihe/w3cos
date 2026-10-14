@@ -50,7 +50,8 @@ BR2_PACKAGE_MESA3D_DRI_DRIVER_I965=y
 BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_NOUVEAU=y
 BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y
 
-# Fonts
+# Fonts. DejaVu covers Latin. CJK is the 3.9 MB Droid Sans Fallback in
+# system/rootfs_overlay/usr/share/fonts/truetype/w3cos, not fonts-noto-cjk.
 BR2_PACKAGE_DEJAVU=y
 
 # Network: basic networking for SSH access

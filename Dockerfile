@@ -23,6 +23,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 \
     fonts-dejavu-core \
+    fonts-droid-fallback \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the W3C OS CLI and examples

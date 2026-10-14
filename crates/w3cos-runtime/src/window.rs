@@ -3937,6 +3937,14 @@ impl App {
             return false;
         }
         use std::sync::atomic::{AtomicBool, Ordering};
+        if let Ok(delay) = std::env::var("W3COS_FRAME_DUMP_AFTER_MS")
+            && let Ok(ms) = delay.parse::<u64>()
+        {
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            if START.get_or_init(Instant::now).elapsed() < Duration::from_millis(ms) {
+                return false;
+            }
+        }
         static DUMPED: AtomicBool = AtomicBool::new(false);
         if DUMPED.swap(true, Ordering::Relaxed) {
             return false;

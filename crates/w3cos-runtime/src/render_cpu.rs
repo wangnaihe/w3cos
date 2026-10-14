@@ -94,8 +94,9 @@ impl GlyphRasterCache {
 }
 
 thread_local! {
-    /// CPU equivalent of Chromium/Skia's retained glyph atlas. The runtime
-    /// currently owns one embedded UI font per render thread.
+    /// CPU equivalent of Chromium/Skia's retained glyph atlas. Missing glyphs
+    /// are drawn from a fallback face, so one thread can cache more than the
+    /// primary UI font.
     static GLYPH_RASTER_CACHE: RefCell<GlyphRasterCache> = RefCell::new(GlyphRasterCache::default());
 }
 
@@ -1632,7 +1633,19 @@ fn draw_text_line(
             let registered = crate::font_face::FontRegistry::global()
                 .resolve_style_for_character(style, ch)
                 .and_then(|font| font.parsed());
-            let glyph_font = registered.as_deref().unwrap_or(font);
+            let system = if registered
+                .as_ref()
+                .is_some_and(|font| font.chars().contains_key(&ch))
+                || font.chars().contains_key(&ch)
+            {
+                None
+            } else {
+                crate::font_face::parsed_fallback(ch)
+            };
+            let glyph_font = registered
+                .as_deref()
+                .or(system.as_deref())
+                .unwrap_or(font);
             let glyph = cache.get_or_rasterize(glyph_font, ch, font_size);
             let metrics = &glyph.metrics;
             let advance = if metrics.advance_width > 0.0 {
