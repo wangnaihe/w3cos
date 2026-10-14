@@ -24,6 +24,15 @@ pub(super) fn lower_image_style(style: &mut Style) {
     }
 }
 
+pub(super) fn is_replaced_table_cell(component: &Component) -> bool {
+    component
+        .style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(CELL_ROLE))
+        .is_some_and(|value| value == "1")
+}
+
 pub(super) fn separator_role(component: &Component) -> Option<Display> {
     component
         .style

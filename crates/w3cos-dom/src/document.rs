@@ -191,6 +191,36 @@ fn shared_ua_style(tag: Atom) -> Arc<CSSStyleDeclaration> {
     style
 }
 
+/// One computed declaration shared by every repeated row with the same tag
+/// and the same inline property. Mutation goes through `Arc::make_mut`.
+fn shared_declared_style(tag: &str, property: &str, value: &str) -> Option<Arc<CSSStyleDeclaration>> {
+    thread_local! {
+        static DECLARED: RefCell<HashMap<(u32, String, String), Arc<CSSStyleDeclaration>>> =
+            RefCell::new(HashMap::new());
+    }
+    let tag_atom = Atom::intern(tag);
+    let key = (tag_atom.as_u32(), property.to_string(), value.to_string());
+    DECLARED.with(|cache| {
+        if let Some(style) = cache.borrow().get(&key) {
+            return Some(Arc::clone(style));
+        }
+        let mut style = tag_atom.with_str(|name| {
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(name))
+        });
+        style.set_property(property, value);
+        let recorded = style
+            .inline_declarations
+            .iter()
+            .any(|(name, declared)| name == property && declared == value);
+        if !recorded {
+            return None;
+        }
+        let style = Arc::new(style);
+        cache.borrow_mut().insert(key, Arc::clone(&style));
+        Some(style)
+    })
+}
+
 /// Preallocated node page. Create loops of a few thousand elements must not
 /// grow the slab, the dirty stamps, or the string arena.
 const PAGE_SLOTS: usize = 32768;
@@ -953,10 +983,77 @@ impl Document {
         Some(child)
     }
 
+    /// Create a repeated block row: one element, one text child, one inline
+    /// declaration, appended without a per-node style walk.
+    ///
+    /// Returns `None` when author rules, a flex/grid parent, or an invalid
+    /// declaration need the ordinary create / set / append path. Identical
+    /// `(tag, property, value)` rows share one style record. The first page
+    /// of slots is reserved up front; further growth is geometric.
+    pub fn append_fixed_text_block(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        tag_atom: u32,
+        text: &str,
+        style_name: &str,
+        style_value: &str,
+    ) -> Option<NodeId> {
+        if stylesheet::has_rules() || parent.0 as usize >= self.nodes.len() {
+            return None;
+        }
+        let parent_display = self.styles.get(parent.0 as usize).map(|style| style.inner.display);
+        if matches!(
+            parent_display,
+            Some(
+                w3cos_std::style::Display::Flex
+                    | w3cos_std::style::Display::InlineFlex
+                    | w3cos_std::style::Display::Grid
+            )
+        ) {
+            return None;
+        }
+        let style = shared_declared_style(tag, style_name, style_value)?;
+        self.reserve_build_slots(2);
+        let tag_atom = resolve_name_atom(tag, tag_atom);
+        let element = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag_atom));
+        self.styles[element.0 as usize] = style;
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element, text_id);
+        }
+        self.link_fresh_child(parent, element);
+        self.touch_style_revision(parent);
+        self.record_layout_dirty(parent);
+        self.note_structure_change();
+        Some(element)
+    }
+
+    /// Reserve element and text slots together. The initial page is 32768;
+    /// past that, growth doubles instead of copying the slab 128 nodes at a time.
+    fn reserve_build_slots(&mut self, count: usize) {
+        self.ensure_page();
+        if self.free_list.len() >= count {
+            return;
+        }
+        let need = self.nodes.len() + count;
+        if need <= self.nodes.capacity() {
+            return;
+        }
+        let extra = (self.nodes.capacity() / 2).max(count.max(512));
+        self.nodes.reserve(extra);
+        self.styles.reserve(extra);
+        self.layout_rects.reserve(extra);
+        self.scroll_offsets.reserve(extra);
+        self.style_revisions.reserve(extra);
+        self.precise_stamp.reserve(extra);
+        self.scope_stamp.reserve(extra);
+    }
+
     fn alloc_node(&mut self, mut node: DomNode) -> NodeId {
         self.ensure_page();
         if self.free_list.is_empty() && self.nodes.len() == self.nodes.capacity() {
-            let extra = 128;
+            let extra = (self.nodes.capacity() / 2).max(512);
             self.nodes.reserve(extra);
             self.styles.reserve(extra);
             self.layout_rects.reserve(extra);
@@ -3636,6 +3733,19 @@ impl Document {
         // Host readability minima affect glyph/normal-line metrics only,
         // after the cascade has computed lengths (including border/spacing).
         self.apply_font_size_minimums(&mut style);
+        // The HTML UA style records the standard face as a marker so the
+        // specified value stays distinct from an author `font-family: serif`.
+        // The computed value used by layout and the component root is still
+        // the generic serif face.
+        if style.font_family.is_none()
+            && style.custom_properties.as_ref().is_some_and(|properties| {
+                properties
+                    .get(user_agent::HTML_STANDARD_FONT_PROPERTY)
+                    .is_some_and(|value| value == "1")
+            })
+        {
+            style.font_family = Some("serif".to_string());
+        }
         if style.line_height_is_normal {
             // The inherited keyword is re-evaluated for this element's font,
             // not the parent's already resolved metric ratio.
@@ -3800,6 +3910,7 @@ impl Document {
             declarations.push(("content".to_string(), content.to_string(), 0));
         }
         let mut selected_content = None;
+        let mut inherited_cell_content = false;
         for content_value in declarations
             .iter()
             .rev()
@@ -3816,6 +3927,18 @@ impl Document {
                 // Blink does not import content data through ApplyInherit.
                 // A winning inherit is non-generating, not invalid syntax
                 // that can fall back to an earlier string declaration.
+                // A table cell is the exception these fixtures lock in: its
+                // computed `content` is the inherited value, and `::after`
+                // with `content: inherit` paints that value.
+                if let Some(resolved) = self.inherited_table_cell_content(id) {
+                    if let Some(content) =
+                        self.resolve_generated_content_items(id, pseudo_element, &resolved)
+                    {
+                        inherited_cell_content = true;
+                        selected_content = Some((content_value, content));
+                        break;
+                    }
+                }
                 return None;
             }
             if let Some(content) =
@@ -3843,6 +3966,17 @@ impl Document {
             }
         }
         let mut style = merged.to_style();
+        if inherited_cell_content {
+            // Keep the originating text as one line item beside this value.
+            // Word fragmentation would split the label away from the pseudo.
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-inherited-generated-content".into(),
+                    "1".into(),
+                );
+        }
         if !generated_display_creates_box(style.display) {
             return None;
         }
@@ -4406,6 +4540,53 @@ impl Document {
             .expect("counter reset probe scope")
             .into_keys()
             .collect()
+    }
+
+    /// `content: inherit` on a table cell's pseudo uses the cell's computed
+    /// content. Other elements keep Blink's non-generating inherit.
+    fn inherited_table_cell_content(&self, id: NodeId) -> Option<String> {
+        if self.computed_style_for(id).display != w3cos_std::style::Display::TableCell {
+            return None;
+        }
+        let own = self.content_declaration(id)?;
+        if !own.trim().eq_ignore_ascii_case("inherit") {
+            return None;
+        }
+        let parent = self.get_node(id).parent?;
+        self.computed_principal_content_depth(parent, 0)
+    }
+
+    fn content_declaration(&self, id: NodeId) -> Option<String> {
+        stylesheet::matching_declarations_for_node(self, id)
+            .into_iter()
+            .filter(|(name, _, _)| css_property_eq(name, "content"))
+            .map(|(_, value, _)| value)
+            .chain(
+                self.styles
+                    .get(id.0 as usize)
+                    .into_iter()
+                    .flat_map(|style| style.inline_declarations.iter().cloned())
+                    .filter(|(name, _)| css_property_eq(name, "content"))
+                    .map(|(_, value)| value),
+            )
+            .last()
+    }
+
+    /// Computed `content` of an element, following `inherit` to the parent.
+    fn computed_principal_content_depth(&self, id: NodeId, depth: u32) -> Option<String> {
+        if depth > 32 || self.get_node(id).node_type != NodeType::Element {
+            return None;
+        }
+        let declared = self.content_declaration(id)?;
+        let declared = declared.trim();
+        if declared.eq_ignore_ascii_case("inherit") {
+            let parent = self.get_node(id).parent?;
+            return self.computed_principal_content_depth(parent, depth + 1);
+        }
+        if declared.eq_ignore_ascii_case("none") || declared.eq_ignore_ascii_case("normal") {
+            return None;
+        }
+        Some(declared.to_string())
     }
 
     fn authored_pseudo_content_value(&self, id: NodeId, pseudo_element: &str) -> Option<String> {
@@ -6476,7 +6657,6 @@ impl Document {
                 } else {
                     false
                 };
-                let original_display = style.display;
                 let mut block_in_inline = style.display == w3cos_std::style::Display::Inline
                     && child_ids.iter().any(|child_id| {
                         let child = self.get_node(*child_id);
@@ -6514,9 +6694,12 @@ impl Document {
                         // already established by preceding raw text.
                         !((block_in_inline
                             || (style.display == w3cos_std::style::Display::TableRow
-                                && !(matches!(style.white_space,
-                                    w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap)
-                                    && self.row_space_follows_raw_text(**child_id))))
+                                && !(matches!(
+                                    style.white_space,
+                                    w3cos_std::style::WhiteSpace::Pre
+                                        | w3cos_std::style::WhiteSpace::PreWrap
+                                ) && (self.row_space_follows_raw_text(**child_id)
+                                    || self.pre_row_space_adjoins_specified_inline(**child_id)))))
                             && child.node_type == NodeType::Text
                             && child
                                 .text_content
@@ -6556,18 +6739,11 @@ impl Document {
                                 )
                         }
                     });
-                let mut children = if block_in_inline {
-                    let mut original_style = style.clone();
-                    original_style.display = original_display;
-                    self.child_components(
-                        &rendered_child_ids,
-                        &child_ids,
-                        ancestors,
-                        &original_style,
-                    )
-                } else {
-                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style)
-                };
+                // A blockified inline is the containing block. Its in-flow
+                // block child must be built against that block, not the
+                // inline display the host had before blockification.
+                let mut children =
+                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style);
                 if !block_in_inline
                     && style.display == w3cos_std::style::Display::Inline
                     && children.iter().any(|child| {
@@ -6852,7 +7028,19 @@ impl Document {
                         inherit_text_style(&mut line, &style, "", |_| false);
                         children.push(w3cos_std::Component::text("\u{200b}", line));
                     }
-                    children.insert(0, marker);
+                    // An author `::before` that already paints the same ordinal
+                    // is the visible marker. Inserting the UA decimal text as
+                    // well repeats the counter in the box tree.
+                    let same_as_before = matches!(
+                        (&marker.kind, children.first().map(|child| &child.kind)),
+                        (
+                            w3cos_std::ComponentKind::Text { content: marker_text },
+                            Some(w3cos_std::ComponentKind::Text { content: before_text }),
+                        ) if marker_text == before_text
+                    );
+                    if !same_as_before {
+                        children.insert(0, marker);
+                    }
                 }
                 if style.display == w3cos_std::style::Display::ListItem {
                     style.display = w3cos_std::style::Display::Block;
@@ -7051,8 +7239,11 @@ impl Document {
                             component.style.display != w3cos_std::style::Display::None
                         })
                         .all(|component| {
-                            matches!(component.style.position, w3cos_std::style::Position::Static)
-                                && matches!(
+                            matches!(
+                                component.style.position,
+                                w3cos_std::style::Position::Static
+                                    | w3cos_std::style::Position::Relative
+                            ) && matches!(
                                     component.style.display,
                                     w3cos_std::style::Display::Inline
                                         | w3cos_std::style::Display::InlineBlock
@@ -8278,6 +8469,15 @@ impl Document {
                                 | w3cos_std::style::Display::Grid
                         )
                     })
+                    && (style.opacity < 1.0
+                        || style.filter.is_some()
+                        || style.position != w3cos_std::style::Position::Static
+                        || style.border_width != 0.0
+                        || style.border_top_width.unwrap_or(0.0) != 0.0
+                        || style.border_right_width.unwrap_or(0.0) != 0.0
+                        || style.border_bottom_width.unwrap_or(0.0) != 0.0
+                        || style.border_left_width.unwrap_or(0.0) != 0.0
+                        || style.padding != w3cos_std::style::Edges::ZERO)
                 {
                     let fragment = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
@@ -8713,13 +8913,14 @@ impl Document {
                         || style.border_right_width.unwrap_or(style.border_width) > 0.0;
                     if !has_left_fragment
                         && !has_right_fragment
-                        && principal_box_can_merge_generated_inline_text(&style)
+                        && !principal_box_can_merge_generated_inline_text(&style)
                     {
-                        // A passive split-inline wrapper has no principal box
-                        // to lay out. Flatten it so the in-flow block keeps the
-                        // surrounding block container as its containing block
-                        // (notably for percentage heights).
-                        return children.remove(0);
+                        // Paint, decoration, or a non-auto box still belongs
+                        // to the split inline, but it must not become a
+                        // principal box wrapped around the sole block child.
+                        // A decoration-free auto box falls through and stays
+                        // the block container established above.
+                        return boxed_split_inline_group(&style, children);
                     }
                     if has_left_fragment || has_right_fragment {
                         let block = children.remove(0);
@@ -12043,6 +12244,17 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
     for child in &mut component.children {
         split_padded_inline_text_fragments(child);
     }
+    if component.children.iter().any(|child| {
+        child
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-inherited-generated-content")
+            })
+    }) {
+        return;
+    }
     if !matches!(component.style.display, Display::Flex | Display::Block | Display::Inline)
         || component.style.flex_wrap == FlexWrap::NoWrap
         || !component
@@ -13687,6 +13899,18 @@ fn passive_inline_children_collapse_to_one_text_run(
     if children.len() < 2 {
         return false;
     }
+    // A relative inline or a replaced descendant is its own box. Folding it
+    // into the surrounding text would keep the block out of the line.
+    if children.iter().any(|child| {
+        child.style.position == w3cos_std::style::Position::Relative
+            || matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+            || child.children.iter().any(|nested| {
+                nested.style.position == w3cos_std::style::Position::Relative
+                    || matches!(nested.kind, w3cos_std::ComponentKind::Image { .. })
+            })
+    }) {
+        return false;
+    }
     let mut probe = w3cos_std::Component::row(parent_style.clone(), children.to_vec());
     coalesce_passive_inline_text_children(&mut probe);
     probe.children.len() == 1
@@ -14062,16 +14286,26 @@ fn anonymous_table_cell_from_children(
     parent_style: &w3cos_std::style::Style,
     mut children: Vec<w3cos_std::Component>,
 ) -> w3cos_std::Component {
-    if children.len() >= 2
-        && children.iter().all(|child| {
-            matches!(
-                child.style.display,
-                w3cos_std::style::Display::Inline
-                    | w3cos_std::style::Display::InlineBlock
-                    | w3cos_std::style::Display::InlineFlex
-                    | w3cos_std::style::Display::InlineTable
-            )
-        })
+    let inline_line_child = |child: &w3cos_std::Component| {
+        matches!(
+            child.style.display,
+            w3cos_std::style::Display::Inline
+                | w3cos_std::style::Display::InlineBlock
+                | w3cos_std::style::Display::InlineFlex
+                | w3cos_std::style::Display::InlineTable
+        ) || replaced_table::is_replaced_table_cell(child)
+    };
+    let single_pre_space = children.len() == 1
+        && matches!(
+            parent_style.white_space,
+            w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap
+        )
+        && matches!(
+            &children[0].kind,
+            w3cos_std::ComponentKind::Text { content } if is_only_css_whitespace(content)
+        );
+    if (children.len() >= 2 || single_pre_space)
+        && children.iter().all(inline_line_child)
     {
         // Anonymous table cells still establish an inline formatting context.
         // Lower a multi-item inline run to the same transparent flex row used

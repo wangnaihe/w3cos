@@ -31,6 +31,26 @@ impl Document {
         false
     }
 
+    /// A preformatted row space next to an element that specifies `display:inline`
+    /// belongs to that improper inline's anonymous cell. A plain row child with
+    /// no display declaration does not give the space a box.
+    pub(super) fn pre_row_space_adjoins_specified_inline(&self, id: NodeId) -> bool {
+        let specifies_inline = |candidate: NodeId| {
+            let node = self.get_node(candidate);
+            if node.node_type != NodeType::Element {
+                return false;
+            }
+            self.styles
+                .get(candidate.0 as usize)
+                .into_iter()
+                .flat_map(|style| style.inline_declarations.iter())
+                .any(|(name, value)| name == "display" && value.trim().eq_ignore_ascii_case("inline"))
+        };
+        let node = self.get_node(id);
+        crate::node::sib(node.prev_sibling).is_some_and(specifies_inline)
+            || crate::node::sib(node.next_sibling).is_some_and(specifies_inline)
+    }
+
     /// A later preformatted text node can join the anonymous cell established
     /// by preceding raw text. An element box (even a plain inline) is a real
     /// boundary; hidden scripts and comments do not own an intervening box.

@@ -149,6 +149,17 @@ fn layout_block(
         Dimension::Auto => None,
         other => Some(px_size(other)?),
     };
+    if let Some(flow) = layout_repeated_text_rows(
+        document,
+        id,
+        x,
+        y,
+        width,
+        specified_height,
+        out,
+    ) {
+        return Some(flow);
+    }
     let mut cursor = y;
     let mut saw_text = false;
     let mut child = document.get_node(id).first_child;
@@ -175,6 +186,72 @@ fn layout_block(
     }
     if saw_text && specified_height.is_none() {
         return None;
+    }
+    let height = specified_height.unwrap_or(cursor - y);
+    out.push((id, DOMRect::new(x, y, width, height)));
+    Some(Flow::Box { width, height })
+}
+
+/// Identical simple blocks that each carry one text run and a definite px
+/// height. The border box is the specified height, so glyph measurement and
+/// a per-node Taffy box are unnecessary.
+fn layout_repeated_text_rows(
+    document: &w3cos_dom::Document,
+    id: NodeId,
+    x: f32,
+    y: f32,
+    width: f32,
+    specified_height: Option<f32>,
+    out: &mut Vec<(NodeId, DOMRect)>,
+) -> Option<Flow> {
+    let first = document.get_node(id).first_child?;
+    let first_node = document.get_node(first);
+    if first_node.node_type != NodeType::Element {
+        return None;
+    }
+    let row_style = document.get_style(first);
+    let row_ptr = row_style as *const _;
+    let row_height = px_size(row_style.inner.height)?;
+    let row_width = content_width(&row_style.inner, width)?;
+    if !box_is_simple(&row_style.inner)
+        || !matches!(row_style.inner.display, Display::Block | Display::FlowRoot)
+    {
+        return None;
+    }
+    // Validate every sibling before writing. A mismatch must leave `out`
+    // untouched so the ordinary block walk can still place the tree.
+    let mut count = 0u32;
+    let mut child = Some(first);
+    while let Some(cid) = child {
+        let node = document.get_node(cid);
+        if node.node_type != NodeType::Element {
+            return None;
+        }
+        if (document.get_style(cid) as *const _) != row_ptr {
+            return None;
+        }
+        let Some(text) = node.first_child else {
+            return None;
+        };
+        let text_node = document.get_node(text);
+        if text_node.node_type != NodeType::Text || text_node.next_sibling != 0 {
+            return None;
+        }
+        child = w3cos_dom::node::sib(node.next_sibling);
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut cursor = y;
+    child = Some(first);
+    while let Some(cid) = child {
+        let node = document.get_node(cid);
+        let text = node.first_child.expect("validated text child");
+        out.push((cid, DOMRect::new(x, cursor, row_width, row_height)));
+        out.push((text, DOMRect::zero()));
+        cursor += row_height;
+        child = w3cos_dom::node::sib(node.next_sibling);
     }
     let height = specified_height.unwrap_or(cursor - y);
     out.push((id, DOMRect::new(x, y, width, height)));

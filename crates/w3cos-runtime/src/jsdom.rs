@@ -1040,6 +1040,7 @@ fn ensure_dom_fast() {
         set_data_str: fast_set_data_str,
         build_appended: fast_build_appended,
         build_guarded: fast_build_guarded,
+        build_block: fast_build_block_guarded,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -1252,6 +1253,57 @@ fn fast_build_guarded(
         )
         .as_u32()
     });
+    dom::mark_dom_dirty();
+    dom_handle(child)
+}
+
+fn fast_build_block_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    style_name: &str,
+    style_value: &str,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !is_document_value(document)
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::has_rules()
+        || node_id_of(parent).is_none()
+        || !valid_element_name(tag)
+    {
+        return Value::Undefined;
+    }
+    let parent_id = node_id_of(parent).expect("parent checked");
+    let lowered;
+    let mut tag_atom = tag_atom;
+    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        lowered = tag.to_ascii_lowercase();
+        tag_atom = u32::MAX;
+        lowered.as_str()
+    } else {
+        tag
+    };
+    let text = text.to_js_string();
+    let Some(child) = dom::with_document_mut(|doc| {
+        doc.append_fixed_text_block(
+            w3cos_dom::NodeId::from_u32(parent_id),
+            tag,
+            tag_atom,
+            &text,
+            style_name,
+            style_value,
+        )
+        .map(|id| id.as_u32())
+    }) else {
+        return Value::Undefined;
+    };
     dom::mark_dom_dirty();
     dom_handle(child)
 }
@@ -25153,6 +25205,44 @@ try {
                 .get_property("x")
                 .to_number()
         );
+    }
+
+    #[test]
+    fn repeated_fixed_height_rows_report_the_summed_offset_height() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        let root_id = node_id_of(&root).expect("root");
+        dom::with_document_mut(|doc| {
+            for i in 0..8 {
+                let text = format!("m {}", i % 50);
+                assert!(
+                    doc.append_fixed_text_block(
+                        w3cos_dom::NodeId::from_u32(root_id),
+                        "div",
+                        4,
+                        &text,
+                        "height",
+                        "18px",
+                    )
+                    .is_some(),
+                    "fixed row {i} should share the repeated block path"
+                );
+            }
+        });
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            8.0
+        );
+        assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
     }
 
     #[test]

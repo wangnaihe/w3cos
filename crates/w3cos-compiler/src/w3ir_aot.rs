@@ -3584,6 +3584,264 @@ fn emit_guarded_append(
     Ok(Some((prelude, fast)))
 }
 
+struct StyledBlock {
+    document_binding: u32,
+    parent_binding: u32,
+    element_reg: u32,
+    text_reg: u32,
+    tag: String,
+    style_name: String,
+    style_value: String,
+    text_expr_at: usize,
+    text_expr_end: usize,
+    store_at: usize,
+    tail_at: usize,
+}
+
+fn pure_value_inst(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::LoadConstant { .. }
+            | Instruction::LoadBinding { .. }
+            | Instruction::Add { .. }
+            | Instruction::Binary { .. }
+            | Instruction::Unary { .. }
+            | Instruction::Move { .. }
+    )
+}
+
+/// `createElement` + `textContent` + one constant `style.*` + `appendChild`.
+fn match_styled_block(body: &[Instruction]) -> Option<StyledBlock> {
+    let mut i = 0usize;
+    let (document_reg, document_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (create_key_reg, create_key) = load_string_inst(pull(body, &mut i)?)?;
+    if create_key != "createElement" {
+        return None;
+    }
+    let (tag_reg, tag) = load_string_inst(pull(body, &mut i)?)?;
+    if tag.is_empty() {
+        return None;
+    }
+    let Instruction::CallMethod {
+        dst,
+        object,
+        key,
+        arguments,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != document_reg
+        || key.0 != create_key_reg
+        || arguments.len() != 1
+        || arguments[0].0 != tag_reg
+    {
+        return None;
+    }
+    let element_reg = dst.0;
+    let store_at = i;
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != element_reg {
+        return None;
+    }
+    let element_binding = binding.0;
+
+    let (text_object, text_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_bind != element_binding {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let text_expr_at = i;
+    let mut text_reg = None;
+    while i < body.len() {
+        if let Instruction::SetProperty {
+            object,
+            key,
+            value,
+            strict: _,
+        } = &body[i]
+        {
+            if object.0 == text_object && key.0 == text_key_reg {
+                text_reg = Some(value.0);
+                break;
+            }
+        }
+        if !pure_value_inst(&body[i]) {
+            return None;
+        }
+        i += 1;
+    }
+    let text_reg = text_reg?;
+    let text_expr_end = i;
+    i += 1;
+
+    let (style_object, style_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if style_bind != element_binding {
+        return None;
+    }
+    let (style_key_reg, style_key) = load_string_inst(pull(body, &mut i)?)?;
+    if style_key != "style" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: style_dst,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != style_object || key.0 != style_key_reg {
+        return None;
+    }
+    let style_reg = style_dst.0;
+    let (prop_reg, style_name) = load_string_inst(pull(body, &mut i)?)?;
+    let (value_reg, style_value) = load_string_inst(pull(body, &mut i)?)?;
+    if style_name.is_empty() || style_value.is_empty() {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict: _,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != style_reg || key.0 != prop_reg || value.0 != value_reg {
+        return None;
+    }
+
+    let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
+    if append_key != "appendChild" {
+        return None;
+    }
+    let (_, append_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if append_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != parent_reg || key.0 != append_key_reg || arguments.len() != 1 {
+        return None;
+    }
+    let tail_at = i;
+    let tail_is_arithmetic = !body[tail_at..].is_empty()
+        && body[tail_at..].iter().all(|inst| {
+            matches!(
+                inst,
+                Instruction::LoadConstant { .. }
+                    | Instruction::LoadBinding { .. }
+                    | Instruction::Add { .. }
+                    | Instruction::Binary { .. }
+                    | Instruction::Unary { .. }
+                    | Instruction::StoreBinding { .. }
+                    | Instruction::Move { .. }
+            )
+        });
+    if !tail_is_arithmetic {
+        return None;
+    }
+    Some(StyledBlock {
+        document_binding,
+        parent_binding,
+        element_reg,
+        text_reg,
+        tag,
+        style_name,
+        style_value,
+        text_expr_at,
+        text_expr_end,
+        store_at,
+        tail_at,
+    })
+}
+
+fn emit_guarded_block(
+    body: &[Instruction],
+    slow: &str,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
+) -> Result<Option<(String, String)>> {
+    let Some(shape) = match_styled_block(body) else {
+        return Ok(None);
+    };
+    let Some(element_slot) = val_slot(plan, shape.element_reg) else {
+        return Ok(None);
+    };
+    let Some(text_slot) = val_slot(plan, shape.text_reg) else {
+        return Ok(None);
+    };
+    let text_expr = emit_block_instructions(
+        &body[shape.text_expr_at..shape.text_expr_end],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let store = emit_block_instructions(
+        &body[shape.store_at..shape.store_at + 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tail = emit_block_instructions(
+        &body[shape.tail_at..],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tag_atom = qualified_atom_expr(&shape.tag);
+    let prelude = format!(
+        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_tag_atom: u32 = {tag_atom};\n{}{}",
+        emit_stable_binding("doc", shape.document_binding),
+        emit_stable_binding("parent", shape.parent_binding),
+    );
+    let fast = format!(
+        "{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, __w3cos_tag_atom, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n",
+        tag = shape.tag,
+        style_name = shape.style_name,
+        style_value = shape.style_value,
+    );
+    Ok(Some((prelude, fast)))
+}
+
 fn emit_native_sync_loop(
     header: &[Instruction],
     blocks: &[(w3cos_ir::BlockId, Vec<Instruction>)],
@@ -3636,7 +3894,7 @@ fn emit_native_sync_loop(
     } else {
         format!("if {condition} {{ break; }}")
     };
-    let guarded = emit_guarded_append(
+    let guarded = match emit_guarded_append(
         &body[..body.len() - 1],
         &body_code,
         function,
@@ -3646,7 +3904,20 @@ fn emit_native_sync_loop(
         storage,
         plan,
         back_edges,
-    )?;
+    )? {
+        some @ Some(_) => some,
+        None => emit_guarded_block(
+            &body[..body.len() - 1],
+            &body_code,
+            function,
+            factories,
+            module_specifier,
+            type_name,
+            storage,
+            plan,
+            back_edges,
+        )?,
+    };
     let loop_body = if let Some((_, fast)) = &guarded {
         format!("{header_code}{gate}\n{fast}")
     } else {
@@ -6813,6 +7084,100 @@ fn main() {{
                 && !generated.contains("dom_append_child")
                 && !generated.contains("dom_set_style"),
             "observable DOM operations must not use unguarded intrinsics: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_fixed_block_loop_is_guarded() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                function fill(document, root) {
+                    for (var i = 0; i < 4000; i++) {
+                        var el = document.createElement("div");
+                        el.textContent = "m " + (i % 50);
+                        el.style.height = "18px";
+                        root.appendChild(el);
+                    }
+                    return root;
+                }
+                fill;
+            "#,
+            "app:///memory-block.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("fill"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "memory_block_aot").unwrap();
+        assert!(
+            generated.contains("dom_build_block_guarded")
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;"),
+            "fixed block loop should fuse behind the stamp: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"createElement\"")
+                && generated.contains("set_property_strict(")
+                && generated.contains("\"textContent\"")
+                && generated.contains("\"height\"")
+                && generated.contains(".call_method(\"appendChild\""),
+            "ordinary lookup stays on the fallback: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the block loop: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_fixed_block_module_loop_is_guarded() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                function fill(document, root) {
+                    for (var i = 0; i < 4000; i++) {
+                        var el = document.createElement("div");
+                        el.textContent = "m " + (i % 50);
+                        el.style.height = "18px";
+                        root.appendChild(el);
+                    }
+                    return root;
+                }
+            "#,
+            "app:///memory-block.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("fill"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "memory_block_module_aot")
+                .unwrap();
+        assert!(
+            generated.contains("dom_build_block_guarded")
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;"),
+            "module block loop should fuse behind the stamp: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"createElement\"")
+                && generated.contains("set_property_strict(")
+                && generated.contains("\"textContent\"")
+                && generated.contains("\"height\"")
+                && generated.contains(".call_method(\"appendChild\""),
+            "ordinary lookup stays on the module fallback: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the module block loop: {generated}"
         );
     }
 

@@ -584,6 +584,10 @@ pub struct DomFast {
     /// `tag_atom` / `class_atom` are static or prologue-interned ids.
     /// `u32::MAX` means the runtime resolves the name.
     pub build_guarded: fn(&Value, &Value, &str, u32, &str, f64, &str, u32, &str, f64, u64) -> Value,
+    /// Fused create + text + one inline style + append. `Value::Undefined`
+    /// when `epoch` is stale or the runtime refuses, so the caller runs the
+    /// ordinary lookup. `tag_atom == u32::MAX` resolves the name.
+    pub build_block: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -750,6 +754,36 @@ pub fn dom_build_guarded(
         class_atom,
         text_prefix,
         text_index,
+        epoch,
+    )
+}
+
+/// Fused create + textContent + one inline style + appendChild, or
+/// [`Value::Undefined`] when `epoch` is stale or the runtime refuses.
+pub fn dom_build_block_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    style_name: &str,
+    style_value: &str,
+    epoch: u64,
+) -> Value {
+    if dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let Some(fast) = DOM_FAST.get() else {
+        return Value::Undefined;
+    };
+    (fast.build_block)(
+        document,
+        parent,
+        tag,
+        tag_atom,
+        text,
+        style_name,
+        style_value,
         epoch,
     )
 }
