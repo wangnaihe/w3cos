@@ -67,12 +67,19 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
     static MODULE_FUNCTIONS: std::cell::RefCell<Vec<Function>> = std::cell::RefCell::new(Vec::new());
     static SHARED_NUMBERS: std::cell::RefCell<HashSet<u32>> = std::cell::RefCell::new(HashSet::new());
+    /// Outermost `generate_function_tree` owns the thread-locals above.
+    /// An empty numeric-constant map is a valid install, so emptiness cannot
+    /// mark that owner.
+    static AOT_MODULE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 struct NumericConstantGuard(bool);
 
 impl Drop for NumericConstantGuard {
     fn drop(&mut self) {
+        AOT_MODULE_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
         if self.0 {
             NUMERIC_CONSTANTS.with(|constants| constants.borrow_mut().clear());
             MODULE_FUNCTIONS.with(|functions| functions.borrow_mut().clear());
@@ -395,6 +402,25 @@ fn analyze_function(function: &Function) -> EscapePlan {
         n_num_bindings,
         constants,
     }
+}
+
+/// `let`/`var` bindings stay writable from every nested closure, including
+/// closures that only re-capture a binding declared in an outer function.
+/// Those outer declarations are not copied into the inner function's binding
+/// list, so a local lookup would treat the cell as const and emit a getter
+/// with an undefined setter.
+fn binding_is_mutable(function: &Function, id: u32) -> bool {
+    if let Some(binding) = function.bindings.iter().find(|binding| binding.id.0 == id) {
+        return binding.mutable;
+    }
+    MODULE_FUNCTIONS.with(|functions| {
+        functions.borrow().iter().any(|other| {
+            other
+                .bindings
+                .iter()
+                .any(|binding| binding.id.0 == id && binding.mutable)
+        })
+    })
 }
 
 fn captured_binding_ids(function: &Function) -> HashSet<u32> {
@@ -2030,7 +2056,11 @@ fn generate_function_tree(
     if !visiting.insert(function.id) {
         bail!("recursive W3IR closure factory graph is not supported yet");
     }
-    let install_constants = NUMERIC_CONSTANTS.with(|constants| constants.borrow().is_empty());
+    let install_constants = AOT_MODULE_DEPTH.with(|depth| {
+        let outermost = depth.get() == 0;
+        depth.set(depth.get() + 1);
+        outermost
+    });
     if install_constants {
         NUMERIC_CONSTANTS
             .with(|slot| *slot.borrow_mut() = module_numeric_constants(&module.functions));
@@ -5429,12 +5459,18 @@ fn emit_instruction(
                 )
             }
         }
-        Instruction::DeleteProperty { dst, object, key } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::delete_property(&{}, &{});",
-            register(*dst),
-            emit_boxed_value(plan, object.0),
-            emit_boxed_value(plan, key.0)
-        ),
+        Instruction::DeleteProperty { dst, object, key } => {
+            let key_expr = if let Some(literal) = proven_strings.get(&key.0) {
+                format!("w3cos_core::Value::from({literal:?})")
+            } else {
+                emit_boxed_value(plan, key.0)
+            };
+            format!(
+                "self.registers[{}] = w3cos_core::intrinsics::delete_property(&{}, &{key_expr});",
+                register(*dst),
+                emit_boxed_value(plan, object.0),
+            )
+        }
         Instruction::SetProperty {
             object,
             key,
@@ -5614,11 +5650,7 @@ fn emit_instruction(
             let mut ordered_captures = captures.clone();
             ordered_captures.sort_by_key(|capture| capture.0);
             for capture in &ordered_captures {
-                let mutable = function
-                    .bindings
-                    .iter()
-                    .find(|binding| binding.id == *capture)
-                    .is_some_and(|binding| binding.mutable);
+                let mutable = binding_is_mutable(function, capture.0);
                 let weaken = back_edges.weak_captures.contains(&(*nested, *capture));
                 let const_getter = "let getter = { let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| { let binding = cell.borrow(); if binding.1 { binding.0.clone() } else { w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) } }) }; let __w3cos_pair = (getter, w3cos_core::Value::Undefined);";
                 let cell_store = if mutable {
@@ -5783,11 +5815,20 @@ fn emit_instruction(
             key,
             arguments,
         } => {
-            let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0, arguments.0]);
+            let literal_key = proven_strings.get(&key.0).cloned();
+            let mut uses = if literal_key.is_some() {
+                ValueUseEmitter::new(plan, last_uses, [object.0, arguments.0])
+            } else {
+                ValueUseEmitter::new(plan, last_uses, [object.0, key.0, arguments.0])
+            };
+            let key_expr = if let Some(literal) = &literal_key {
+                format!("w3cos_core::Value::from({literal:?})")
+            } else {
+                uses.emit(key.0)
+            };
             let expr = format!(
-                "w3cos_core::intrinsics::call_method_with_arguments_completion(&{}, &{}, &{})",
+                "w3cos_core::intrinsics::call_method_with_arguments_completion(&{}, &{key_expr}, &{})",
                 uses.emit(object.0),
-                uses.emit(key.0),
                 uses.emit(arguments.0)
             );
             emit_completion_match(
@@ -7555,6 +7596,67 @@ fn main() {{
                 );
             }
         }
+    }
+
+    #[test]
+    fn nested_closure_forwards_mutable_cell_for_outer_let() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function outer() {
+                    let log = "";
+                    function middle(event) {
+                        const moved = event.port;
+                        moved.onmessage = function inner(message) {
+                            log += message.data;
+                        };
+                    }
+                    return middle;
+                }
+                outer;
+            "#,
+            "app:///nested-let-capture.js",
+        )
+        .unwrap();
+        let outer = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("outer"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, outer, "outer_aot").unwrap();
+        assert!(
+            generated.contains("AotCapture::Cell(cell)"),
+            "outer let must be shared as a cell: {generated}"
+        );
+        assert!(
+            !generated.contains("let __w3cos_pair = (getter, w3cos_core::Value::Undefined)"),
+            "re-capturing a let must not freeze the cell: {generated}"
+        );
+    }
+
+    #[test]
+    fn delete_inlines_proven_string_key() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function removeUser(dataset) {
+                    delete dataset.userId;
+                    return dataset;
+                }
+                removeUser;
+            "#,
+            "app:///delete-proven-key.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("removeUser"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "remove_user_aot").unwrap();
+        assert!(
+            generated.contains("delete_property(") && generated.contains("Value::from(\"userId\")"),
+            "delete must keep the property name after the string load is folded: {generated}"
+        );
     }
 
     #[test]

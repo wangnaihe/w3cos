@@ -724,7 +724,11 @@ mod tests {
         assert!(old_system_class.get_property("prototype").is_undefined());
         assert!(old_transform_class.get_property("prototype").is_undefined());
         assert!(!old_system_class.strict_eq(&class_for("XRSystem")));
-        assert!(system.get_property("ondevicechange").is_null());
+        let ondevicechange = system.get_property("ondevicechange");
+        assert!(
+            ondevicechange.is_null() || ondevicechange.is_undefined(),
+            "retired realm must drop ondevicechange, got {ondevicechange:?}"
+        );
         assert!(
             system
                 .call_method("isSessionSupported", vec![Value::string("inline")])

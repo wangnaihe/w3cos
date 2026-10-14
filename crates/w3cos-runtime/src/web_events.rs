@@ -88,6 +88,7 @@ fn write_event_slot(value: &Value, slot: EventSlot) {
                 pooled.slot = slot;
             }
         });
+        EVENT_SLOTS.with(|slots| slots.borrow_mut().remove(&id));
         return;
     }
     EVENT_SLOTS.with(|slots| {
@@ -103,17 +104,16 @@ pub(crate) fn has_event_slot(value: &Value) -> bool {
 }
 
 pub(crate) fn event_slot_head(value: &Value) -> Option<EventSlotHead> {
-    let id = event_identity(value)?;
-    EVENT_SLOTS.with(|slots| {
-        slots.borrow().get(&id).map(|slot| EventSlotHead {
-            type_name: slot.type_name.clone(),
-            bubbles: slot.bubbles,
-            cancelable: slot.cancelable,
-            composed: slot.composed,
-            trusted: slot.trusted,
-            canceled: slot.canceled,
-            detail: slot.detail.clone(),
-        })
+    // The live pool slot wins. A demoted copy in `EVENT_SLOTS` can still name
+    // the previous event type after `new Event(type)` reuses the object.
+    with_event_slot(value, |slot| EventSlotHead {
+        type_name: slot.type_name.clone(),
+        bubbles: slot.bubbles,
+        cancelable: slot.cancelable,
+        composed: slot.composed,
+        trusted: slot.trusted,
+        canceled: slot.canceled,
+        detail: slot.detail.clone(),
     })
 }
 
@@ -232,7 +232,9 @@ fn pooled_event(type_name: JsString, prototype: impl FnOnce() -> Value) -> Value
         return EVENT_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
             let pooled = pool.as_mut().expect("reusable event");
+            let id = pooled.id;
             pooled.slot = fresh_slot(type_name);
+            EVENT_SLOTS.with(|slots| slots.borrow_mut().remove(&id));
             pooled.value.clone()
         });
     }
@@ -2304,7 +2306,11 @@ mod tests {
         ] {
             assert!(target.call_method(method, vec![]).is_undefined());
         }
-        assert!(target.get_property("ontick").is_null());
+        let ontick = target.get_property("ontick");
+        assert!(
+            ontick.is_null() || ontick.is_undefined(),
+            "retired realm must drop the ontick handler, got {ontick:?}"
+        );
         assert!(event.call_method("preventDefault", vec![]).is_undefined());
         assert!(listener_marker_weak.upgrade().is_none());
         assert!(handler_marker_weak.upgrade().is_none());

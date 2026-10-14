@@ -1285,6 +1285,13 @@ fn dom_imm_materialize(node: u32) -> Value {
 
 fn pin_dom_wrapper(node: u32) {
     let value = element_value(node);
+    // Authored prototypes live on the wrapper. A DOM immediate does not hold
+    // that `Rc`, so `removeChild` must be able to rebuild the wrapper and
+    // still see `instanceof` and lifecycle methods.
+    let proto = w3cos_core::class::get_prototype_of(&value);
+    if proto.is_object() {
+        set_expando(node, "__w3cos_custom_prototype", proto);
+    }
     ELEMENT_VALUES.with(|cache| {
         cache.borrow_mut().insert(node, ElementMemo::Strong(value));
     });
@@ -4125,6 +4132,9 @@ fn build_element_value(node: u32) -> Value {
                 namespace.as_deref() == Some("http://www.w3.org/2000/svg"),
             ),
         );
+    }
+    if let Some(proto) = get_expando(node, "__w3cos_custom_prototype") {
+        w3cos_core::class::set_prototype_of(&value, &proto);
     }
     value
 }
@@ -21650,6 +21660,57 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    #[test]
+    fn document_visibilitychange_reaches_listener() {
+        setup();
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_cb = Rc::clone(&hits);
+        document_value().call_method(
+            "addEventListener",
+            vec![
+                Value::string("visibilitychange"),
+                Value::function(move |_, _| {
+                    hits_cb.set(hits_cb.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(set_document_visibility("hidden"));
+        assert_eq!(hits.get(), 1, "visibilitychange listener should run");
+    }
+
+    #[test]
+    fn authored_prototype_survives_remove_on_dom_immediate() {
+        setup();
+        let doc = document_value();
+        let el = doc.call_method("createElement", vec![Value::string("div")]);
+        assert!(el.live_dom_node().is_some());
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let proto = Value::object(std::collections::HashMap::new());
+        proto.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        w3cos_core::class::set_prototype_of(&el, &proto);
+        el.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        el.set_property("ready", Value::string("yes"));
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![el.clone()]);
+        body.call_method("removeChild", vec![el.clone()]);
+        let class = Value::object(std::collections::HashMap::new());
+        class.set_property("prototype", proto);
+        assert!(
+            w3cos_core::class::instance_of(&el, &class),
+            "custom prototype must survive removeChild"
+        );
+        assert_eq!(el.get_property("ready").to_js_string(), "yes");
+        assert_eq!(calls.get(), 1, "disconnectedCallback should run");
     }
 
     #[test]

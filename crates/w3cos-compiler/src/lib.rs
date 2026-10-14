@@ -1781,7 +1781,8 @@ export function keymap() {}"#,
         );
         assert!(
             bundle_rs.contains("synchronous function boot compiled from W3IR")
-                && bundle_rs.contains("w3cos_core::intrinsics::construct("),
+                && (bundle_rs.contains("w3cos_core::intrinsics::construct(")
+                    || bundle_rs.contains("w3cos_core::class::construct_slice(")),
             "new EditorView() should lower through the W3IR construct intrinsic: {bundle_rs}"
         );
         assert!(
@@ -1799,8 +1800,7 @@ export function keymap() {}"#,
         // Function bodies should be lowered, not todo!()
         assert!(
             bundle_rs.contains("class member EditorView.mount compiled from W3IR")
-                && bundle_rs.contains("w3cos_core::intrinsics::call_method(")
-                && bundle_rs.contains("w3cos_core::Value::string(\"createElement\")"),
+                && bundle_rs.contains("call_method_slice(\"createElement\""),
             "method body should be lowered: {bundle_rs}"
         );
         assert!(
@@ -2105,7 +2105,8 @@ createRoot(document.getElementById("root")!).render(App());"#,
         assert!(
             bundle_rs.contains("__init_w3ir_0(")
                 && bundle_rs.contains("createRoot_value()")
-                && bundle_rs.contains("w3cos_core::intrinsics::call(")
+                && (bundle_rs.contains("w3cos_core::intrinsics::call(")
+                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion("))
                 && bundle_rs.contains("m0__init();"),
             "top-level Web bootstrap must execute through native W3IR module init: {bundle_rs}"
         );

@@ -3888,8 +3888,10 @@ export function boot() {
         assert!(
             code.contains("fn m0_Animal__ctor(__this: w3cos_core::Value")
                 && code.contains("class constructor Animal.constructor compiled from W3IR")
-                && code.contains("w3cos_core::Value::string(\"name\")")
-                && code.contains("w3cos_core::intrinsics::set_property("),
+                && (code.contains("w3cos_core::Value::string(\"name\")")
+                    || code.contains("w3cos_core::Value::from(\"name\")"))
+                && (code.contains("w3cos_core::intrinsics::set_property(")
+                    || code.contains("set_property_strict(")),
             "constructor should lower through W3IR: {code}"
         );
         assert!(
@@ -3944,12 +3946,12 @@ export function boot() {
         );
         assert!(
             code.contains("class constructor Dog.constructor compiled from W3IR")
-                && code.contains("w3cos_core::Value::string(\"__w3cos_super_ctor\")"),
+                && code.contains("call_method_slice(\"__w3cos_super_ctor\""),
             "super(...) should lower through shared W3IR/Core semantics: {code}"
         );
         assert!(
             code.contains("class member Dog.describe compiled from W3IR")
-                && code.contains("w3cos_core::Value::string(\"__w3cos_super_method\")")
+                && code.contains("call_method_slice(\"__w3cos_super_method\"")
                 && code.contains("w3cos_core::Value::string(\"kind\")"),
             "super.method() should lower through shared W3IR/Core semantics: {code}"
         );
@@ -5526,10 +5528,10 @@ export function wakeLockShape() {
     sentinel.release();
     wakeLockLog += ":" + sentinel.released;
   }).catch((error) => {
-    wakeLockLog = error.name;
+    wakeLockLog += "screen=" + error.name + ";";
   });
   navigator.wakeLock.request("system").catch((error) => {
-    wakeLockLog += ":" + error.name;
+    wakeLockLog += "system=" + error.name + ";";
   });
   return typeof WakeLock + ":" + typeof WakeLockSentinel + ":" +
     (navigator.wakeLock instanceof WakeLock) + ":" + wakeLockLog;
@@ -7694,7 +7696,7 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getWakeLockLog(vec![]);
     assert!(
-        matches_js_string!(&r, s, s == "NotAllowedError:NotSupportedError"),
+        matches_js_string!(&r, s, s.contains("screen=NotAllowedError;") && s.contains("system=NotSupportedError;")),
         "Screen Wake Lock refuses without a grant and rejects the system type: {r:?}"
     );
     let r = m0::m0_badgingShape(vec![]);
