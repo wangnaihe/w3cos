@@ -60,6 +60,25 @@ cargo build --release
 ./showcase    # Opens a native window — no browser involved
 ```
 
+## AI Bridge
+
+The shell can listen on loopback for an agent. Permissions come from
+`W3COS_AI_PERMISSIONS` (`observer` when unset). The bearer token is
+`W3COS_AI_TOKEN` or `--ai-token`.
+
+```bash
+cargo build -p w3cos-shell --no-default-features --features cpu-render,ai-bridge
+W3COS_AI_TOKEN=demo-token ./target/debug/w3cos-shell --ai-port 9222 --ai-token demo-token
+
+# stdio MCP adapter. It only forwards to that listener.
+W3COS_AI_PORT=9222 W3COS_AI_TOKEN=demo-token cargo run -p w3cos-ai-bridge --bin w3cos-ai-mcp
+```
+
+`a11y_index` and `screenshot_annotated` are readable by an observer.
+`propose_intent`, `confirm_intent`, `click`, and `type` use the bridge's
+interaction permission, so an observer token is rejected before the shell runs
+the command.
+
 ## Mobile (Android / iOS / HarmonyOS)
 
 Native **shell + AOT app** — generic platform, no product-specific examples.

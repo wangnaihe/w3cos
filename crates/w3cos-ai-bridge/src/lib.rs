@@ -3,6 +3,7 @@ pub mod agent;
 pub mod dom_access;
 pub mod identity;
 pub mod intent;
+pub mod mcp;
 pub mod permissions;
 mod receipt_ledger;
 pub mod screenshot;

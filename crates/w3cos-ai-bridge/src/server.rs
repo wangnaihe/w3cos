@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,6 +48,18 @@ pub enum AiBridgeRequest {
         target: DomTarget,
         value: Option<String>,
     },
+    Propose {
+        utterance: String,
+    },
+    ConfirmIntent,
+}
+
+/// What a component-layout index did with an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutInvoke {
+    Absent,
+    Invoked,
+    Rejected(&'static str),
 }
 
 /// Pixels plus layout boxes, or an explicit reason the annotated shot cannot
@@ -74,6 +87,62 @@ pub trait ScreenshotProvider: Send + Sync {
         AnnotatedFrame::MissingLayout(
             "layout bounds are not available for this frame; annotated screenshot was not drawn",
         )
+    }
+
+    /// Numbered component layout, when the DOM tree has no interactive nodes.
+    fn layout_index_json(&self) -> Option<String> {
+        None
+    }
+
+    /// Text form of [`layout_index_json`](Self::layout_index_json).
+    fn layout_summary(&self) -> Option<String> {
+        None
+    }
+
+    /// Activate a component hit by the layout index. Default: not a layout index.
+    fn invoke_layout_index(&self, _index: u32, _action: ActionType) -> LayoutInvoke {
+        LayoutInvoke::Absent
+    }
+}
+
+static PREP_LAYOUT: AtomicBool = AtomicBool::new(false);
+static PREP_PIXELS: AtomicBool = AtomicBool::new(false);
+
+/// The HTTP thread asks the main thread to snapshot layout, and pixels when
+/// the request is a screenshot. Painting itself does not watch this flag.
+pub fn note_bridge_prep(layout: bool, pixels: bool) {
+    if layout {
+        PREP_LAYOUT.store(true, Ordering::Release);
+    }
+    if pixels {
+        PREP_PIXELS.store(true, Ordering::Release);
+    }
+}
+
+pub fn take_bridge_prep() -> (bool, bool) {
+    (
+        PREP_LAYOUT.swap(false, Ordering::AcqRel),
+        PREP_PIXELS.swap(false, Ordering::AcqRel),
+    )
+}
+
+fn propose_slot() -> &'static Mutex<Option<fn(&str) -> String>> {
+    static SLOT: OnceLock<Mutex<Option<fn(&str) -> String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn confirm_slot() -> &'static Mutex<Option<fn() -> String>> {
+    static SLOT: OnceLock<Mutex<Option<fn() -> String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Shell hook for `POST /intent`. The HTTP permission check still runs first.
+pub fn set_intent_hooks(propose: fn(&str) -> String, confirm: fn() -> String) {
+    if let Ok(mut slot) = propose_slot().lock() {
+        *slot = Some(propose);
+    }
+    if let Ok(mut slot) = confirm_slot().lock() {
+        *slot = Some(confirm);
     }
 }
 
@@ -117,7 +186,23 @@ impl AiBridgeHandle {
     }
 
     fn handle_request(&self, request: AiBridgeRequest, doc: &mut Document) -> AiBridgeResponse {
-        if let Some(action) = mutation_action(&request) {
+        if matches!(
+            request,
+            AiBridgeRequest::Propose { .. } | AiBridgeRequest::ConfirmIntent
+        ) {
+            if !self.permissions.can_interact {
+                return AiBridgeResponse::Denied(AuthError::Interact.message("bridge"));
+            }
+            if !self
+                .rate
+                .borrow_mut()
+                .try_acquire(now_ms(), self.permissions.max_actions_per_second)
+            {
+                return AiBridgeResponse::RateLimited(
+                    "Agent 'bridge' exceeded max_actions_per_second".to_string(),
+                );
+            }
+        } else if let Some(action) = mutation_action(&request) {
             if let Err(err) = permissions::authorize_action(&self.permissions, action) {
                 return AiBridgeResponse::Denied(err.message("bridge"));
             }
@@ -148,7 +233,11 @@ impl AiBridgeHandle {
                 },
                 AiBridgeRequest::Click { .. }
                 | AiBridgeRequest::Type { .. }
-                | AiBridgeRequest::Act { .. } => unreachable!("mutations are handled above"),
+                | AiBridgeRequest::Act { .. }
+                | AiBridgeRequest::Propose { .. }
+                | AiBridgeRequest::ConfirmIntent => {
+                    unreachable!("mutations are handled above")
+                }
             };
             if let Err(err) = permissions::authorize(&self.permissions, &op) {
                 return AiBridgeResponse::Denied(err.message("bridge"));
@@ -156,10 +245,22 @@ impl AiBridgeHandle {
         }
         match request {
             AiBridgeRequest::GetA11yTree => {
+                if !dom_has_interactive(doc)
+                    && let Some(summary) = self.screenshot_provider.layout_summary()
+                {
+                    return AiBridgeResponse::Text(summary);
+                }
                 AiBridgeResponse::Text(a11y_api::get_ui_summary(doc))
             }
             AiBridgeRequest::GetA11yJson => AiBridgeResponse::Json(a11y_api::get_tree_json(doc)),
-            AiBridgeRequest::GetA11yIndex => AiBridgeResponse::Json(a11y_api::index_json(doc)),
+            AiBridgeRequest::GetA11yIndex => {
+                if !dom_has_interactive(doc)
+                    && let Some(json) = self.screenshot_provider.layout_index_json()
+                {
+                    return AiBridgeResponse::Json(json);
+                }
+                AiBridgeResponse::Json(a11y_api::index_json(doc))
+            }
             AiBridgeRequest::Screenshot => match self.screenshot_provider.capture_png() {
                 Some(png) => AiBridgeResponse::Png(png),
                 None => AiBridgeResponse::Json(
@@ -168,18 +269,22 @@ impl AiBridgeHandle {
                 ),
             },
             AiBridgeRequest::AnnotatedScreenshot => self.annotated_screenshot(),
-            AiBridgeRequest::Click { target } => {
-                mutate(doc, &self.permissions, ActionType::Click, &target, None)
-            }
-            AiBridgeRequest::Type { target, text } => {
-                mutate(
-                    doc,
-                    &self.permissions,
-                    ActionType::SetText,
-                    &target,
-                    Some(text),
-                )
-            }
+            AiBridgeRequest::Click { target } => mutate(
+                doc,
+                &self.permissions,
+                self.screenshot_provider.as_ref(),
+                ActionType::Click,
+                &target,
+                None,
+            ),
+            AiBridgeRequest::Type { target, text } => mutate(
+                doc,
+                &self.permissions,
+                self.screenshot_provider.as_ref(),
+                ActionType::SetText,
+                &target,
+                Some(text),
+            ),
             AiBridgeRequest::Query { selector } => {
                 let result = dom_access::query(doc, &selector);
                 AiBridgeResponse::Json(serde_json::to_string(&result).unwrap_or_default())
@@ -188,7 +293,16 @@ impl AiBridgeHandle {
                 action,
                 target,
                 value,
-            } => mutate(doc, &self.permissions, action, &target, value),
+            } => mutate(
+                doc,
+                &self.permissions,
+                self.screenshot_provider.as_ref(),
+                action,
+                &target,
+                value,
+            ),
+            AiBridgeRequest::Propose { utterance } => propose_intent(&utterance),
+            AiBridgeRequest::ConfirmIntent => confirm_intent(),
         }
     }
 
@@ -251,9 +365,34 @@ fn declared_selector(request: &AiBridgeRequest) -> Option<String> {
     }
 }
 
+fn dom_has_interactive(doc: &Document) -> bool {
+    a11y_api::index_entries(doc)
+        .iter()
+        .any(|entry| entry.interactive)
+}
+
+fn propose_intent(utterance: &str) -> AiBridgeResponse {
+    let hook = propose_slot().lock().ok().and_then(|slot| *slot);
+    let Some(hook) = hook else {
+        return AiBridgeResponse::Error("intent bridge is not registered".into());
+    };
+    let summary = hook(utterance);
+    AiBridgeResponse::Json(serde_json::json!({"ok": true, "summary": summary}).to_string())
+}
+
+fn confirm_intent() -> AiBridgeResponse {
+    let hook = confirm_slot().lock().ok().and_then(|slot| *slot);
+    let Some(hook) = hook else {
+        return AiBridgeResponse::Error("intent bridge is not registered".into());
+    };
+    let summary = hook();
+    AiBridgeResponse::Json(serde_json::json!({"ok": true, "summary": summary}).to_string())
+}
+
 fn mutate(
     doc: &mut Document,
     permissions: &AgentPermissions,
+    provider: &dyn ScreenshotProvider,
     action: ActionType,
     target: &DomTarget,
     value: Option<String>,
@@ -268,6 +407,19 @@ fn mutate(
             dom_access::execute(doc, &action)
         }
         DomTarget::Index(index) => {
+            if !dom_has_interactive(doc) {
+                return match provider.invoke_layout_index(*index, action) {
+                    LayoutInvoke::Invoked => {
+                        AiBridgeResponse::Json(r#"{"success":true}"#.to_string())
+                    }
+                    LayoutInvoke::Rejected(message) => AiBridgeResponse::Json(
+                        serde_json::json!({"success": false, "error": message}).to_string(),
+                    ),
+                    LayoutInvoke::Absent => AiBridgeResponse::NotFound(format!(
+                        "a11y index {index} is not in the current tree"
+                    )),
+                };
+            }
             let Some(entry) = a11y_api::index_entries(doc)
                 .into_iter()
                 .find(|entry| entry.index == *index)
@@ -557,6 +709,14 @@ fn handle_connection(
                 return Ok(());
             }
         },
+        ("POST", "/intent") => match json_utterance(&body_str) {
+            Ok(utterance) => Some(AiBridgeRequest::Propose { utterance }),
+            Err(message) => {
+                send_json_error(&mut stream, 400, message)?;
+                return Ok(());
+            }
+        },
+        ("POST", "/intent/confirm") => Some(AiBridgeRequest::ConfirmIntent),
         ("POST", "/act") => match parse_act(&body_str) {
             Ok(request) => Some(request),
             Err(message) => {
@@ -589,6 +749,8 @@ fn handle_connection(
                     {"method": "POST", "path": "/click", "description": "Click element by selector or a11y index"},
                     {"method": "POST", "path": "/type", "description": "Type text into element by selector or a11y index"},
                     {"method": "POST", "path": "/act", "description": "Run a DOM action"},
+                    {"method": "POST", "path": "/intent", "description": "Propose an L0 intent utterance"},
+                    {"method": "POST", "path": "/intent/confirm", "description": "Confirm the pending intent"},
                     {"method": "GET", "path": "/query?selector=...", "description": "Query element info"},
                 ]
             });
@@ -603,6 +765,15 @@ fn handle_connection(
     };
 
     if let Some(req) = request {
+        match &req {
+            AiBridgeRequest::GetA11yTree
+            | AiBridgeRequest::GetA11yJson
+            | AiBridgeRequest::GetA11yIndex => note_bridge_prep(true, false),
+            AiBridgeRequest::Screenshot | AiBridgeRequest::AnnotatedScreenshot => {
+                note_bridge_prep(true, true)
+            }
+            _ => {}
+        }
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send((req, reply_tx))?;
 
@@ -699,6 +870,21 @@ fn tokens_match(expected: &str, presented: &str) -> bool {
         diff |= usize::from(left ^ right);
     }
     diff == 0
+}
+
+fn json_utterance(body: &str) -> Result<String, &'static str> {
+    let body: serde_json::Value = serde_json::from_str(body).map_err(|_| "invalid json")?;
+    let utterance = body
+        .get("utterance")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if utterance.is_empty() {
+        Err("missing 'utterance'")
+    } else {
+        Ok(utterance)
+    }
 }
 
 fn json_target(body: &str) -> Result<DomTarget, &'static str> {

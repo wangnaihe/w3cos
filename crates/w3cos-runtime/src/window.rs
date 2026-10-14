@@ -1377,6 +1377,98 @@ impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
         crate::frame_cache::request_screenshot();
         crate::frame_cache::encode_png()
     }
+
+    fn capture_annotated(&self) -> w3cos_ai_bridge::server::AnnotatedFrame {
+        use w3cos_ai_bridge::screenshot::ElementAnnotation;
+        use w3cos_ai_bridge::server::AnnotatedFrame;
+        let marks = crate::frame_cache::layout_marks();
+        if marks.is_empty() {
+            return AnnotatedFrame::MissingLayout(
+                "layout bounds are not available for this frame; annotated screenshot was not drawn",
+            );
+        }
+        let Some((width, height, rgba, _)) = crate::frame_cache::snapshot() else {
+            crate::frame_cache::request_screenshot();
+            return AnnotatedFrame::MissingLayout(
+                "framebuffer has not been presented yet; annotated screenshot was not drawn",
+            );
+        };
+        let annotations = marks
+            .into_iter()
+            .map(|mark| ElementAnnotation {
+                index: mark.index,
+                node_id: mark.node_id,
+                label: format!("{}: {}", mark.role, mark.name),
+                bounds: mark.bounds,
+                interactive: true,
+            })
+            .collect();
+        AnnotatedFrame::Ready {
+            width,
+            height,
+            rgba,
+            annotations,
+        }
+    }
+
+    fn layout_index_json(&self) -> Option<String> {
+        let marks = crate::frame_cache::layout_marks();
+        if marks.is_empty() {
+            return None;
+        }
+        let entries: Vec<_> = marks
+            .iter()
+            .map(|mark| {
+                serde_json::json!({
+                    "index": mark.index,
+                    "node_id": mark.node_id,
+                    "role": mark.role,
+                    "name": mark.name,
+                    "interactive": true,
+                })
+            })
+            .collect();
+        Some(serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()))
+    }
+
+    fn layout_summary(&self) -> Option<String> {
+        let marks = crate::frame_cache::layout_marks();
+        if marks.is_empty() {
+            return None;
+        }
+        let mut summary = format!(
+            "UI: {} elements, {} interactive\n---\n",
+            marks.len(),
+            marks.len()
+        );
+        for mark in &marks {
+            summary.push_str(&format!(
+                "[{}] {}: {} [interactive]\n",
+                mark.index, mark.role, mark.name
+            ));
+        }
+        Some(summary)
+    }
+
+    fn invoke_layout_index(
+        &self,
+        index: u32,
+        action: w3cos_ai_bridge::dom_access::ActionType,
+    ) -> w3cos_ai_bridge::server::LayoutInvoke {
+        use w3cos_ai_bridge::dom_access::ActionType;
+        use w3cos_ai_bridge::server::LayoutInvoke;
+        let marks = crate::frame_cache::layout_marks();
+        let Some(mark) = marks.iter().find(|mark| mark.index == index) else {
+            return LayoutInvoke::Absent;
+        };
+        match action {
+            ActionType::Click | ActionType::Focus => {
+                crate::frame_cache::enqueue_layout_click(mark.node_id);
+                LayoutInvoke::Invoked
+            }
+            _ => LayoutInvoke::Rejected("component layout index accepts click or focus"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6018,20 +6110,89 @@ impl App {
 
     #[cfg(feature = "ai-bridge")]
     fn poll_ai_bridge(&mut self) {
-        let handle = match &self.ai_bridge_handle {
-            Some(h) => h,
-            None => return,
-        };
+        if self.ai_bridge_handle.is_none() {
+            return;
+        }
+        // Bounds and pixels are copied here, while answering a bridge request,
+        // not while rasterizing. Markers are drawn later inside the bridge.
+        let (layout, pixels) = w3cos_ai_bridge::server::take_bridge_prep();
+        if layout {
+            self.publish_layout_marks();
+        }
+        if pixels {
+            self.copy_retained_framebuffer();
+        }
 
         // Component shells such as w3cos-shell are not in DOM mode. The
         // listener still has to drain the queue: permission checks run here,
         // and skipping the poll leaves clients blocked until the 5s timeout.
-        crate::dom::with_document_mut(|doc| {
-            handle.poll_and_respond(doc);
-        });
+        if let Some(handle) = &self.ai_bridge_handle {
+            crate::dom::with_document_mut(|doc| {
+                handle.poll_and_respond(doc);
+            });
+        }
+        for node_id in crate::frame_cache::take_layout_clicks() {
+            self.handle_click(node_id as usize);
+        }
         if crate::frame_cache::screenshot_request_pending() {
             self.request_repaint();
         }
+    }
+
+    #[cfg(feature = "ai-bridge")]
+    fn publish_layout_marks(&self) {
+        let mut marks = Vec::new();
+        let mut index = 1u32;
+        for hit in &self.hit_nodes {
+            if !hit.is_interactive || hit.rect.width <= 0.0 || hit.rect.height <= 0.0 {
+                continue;
+            }
+            let (role, name) = match self.get_kind_at(hit.index) {
+                Some(ComponentKind::Button { label }) => ("button", label.clone()),
+                Some(ComponentKind::TextInput {
+                    placeholder,
+                    value,
+                    ..
+                }) => {
+                    let name = if placeholder.is_empty() {
+                        value.clone()
+                    } else {
+                        placeholder.clone()
+                    };
+                    ("textbox", name)
+                }
+                _ => ("generic", String::new()),
+            };
+            let scale = self.scale_factor as f32;
+            marks.push(crate::frame_cache::LayoutMark {
+                index,
+                node_id: hit.index as u32,
+                role: role.to_string(),
+                name,
+                bounds: [
+                    hit.rect.x * scale,
+                    hit.rect.y * scale,
+                    hit.rect.width * scale,
+                    hit.rect.height * scale,
+                ],
+            });
+            index += 1;
+        }
+        crate::frame_cache::store_layout_marks(marks);
+    }
+
+    #[cfg(feature = "ai-bridge")]
+    fn copy_retained_framebuffer(&self) {
+        #[cfg(feature = "cpu-render")]
+        if let Some(pixmap) = self
+            .cpu
+            .as_ref()
+            .and_then(|cpu| cpu.framebuffer.as_ref())
+        {
+            crate::frame_cache::store_from_slice(pixmap.width(), pixmap.height(), pixmap.data());
+            return;
+        }
+        crate::frame_cache::request_screenshot();
     }
 
     #[cfg(feature = "devtools")]

@@ -8,10 +8,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::permissions::AgentPermissions;
 use w3cos_ai_bridge::screenshot::ElementAnnotation;
 use w3cos_ai_bridge::server::{
-    AnnotatedFrame, BridgeOptions, RunningBridge, ScreenshotProvider, start_with_options,
+    AnnotatedFrame, BridgeOptions, LayoutInvoke, RunningBridge, ScreenshotProvider,
+    start_with_options,
 };
 use w3cos_dom::Document;
 
@@ -601,4 +603,125 @@ fn annotated_screenshot_needs_layout_bounds_and_capture_permission() {
     let (status, body) = token(&bridge, &mut doc, "GET", "/screenshot/annotated", None);
     assert_eq!(status, 403, "{body}");
     assert!(!called.load(Ordering::SeqCst));
+}
+
+struct LayoutIndex {
+    invoked: Arc<AtomicBool>,
+}
+
+impl ScreenshotProvider for LayoutIndex {
+    fn capture_png(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn capture_annotated(&self) -> AnnotatedFrame {
+        AnnotatedFrame::Ready {
+            width: 16,
+            height: 16,
+            rgba: vec![255u8; 16 * 16 * 4],
+            annotations: vec![ElementAnnotation {
+                index: 1,
+                node_id: 9,
+                label: "button: Terminal".into(),
+                bounds: [2.0, 2.0, 8.0, 8.0],
+                interactive: true,
+            }],
+        }
+    }
+
+    fn layout_index_json(&self) -> Option<String> {
+        Some(
+            r#"[{"index":1,"node_id":9,"role":"button","name":"Terminal","interactive":true}]"#
+                .into(),
+        )
+    }
+
+    fn layout_summary(&self) -> Option<String> {
+        Some("UI: 1 elements, 1 interactive\n---\n[1] button: Terminal [interactive]\n".into())
+    }
+
+    fn invoke_layout_index(&self, index: u32, action: ActionType) -> LayoutInvoke {
+        if index == 1 && matches!(action, ActionType::Click | ActionType::Focus) {
+            self.invoked.store(true, Ordering::SeqCst);
+            LayoutInvoke::Invoked
+        } else if index == 1 {
+            LayoutInvoke::Rejected("component layout index accepts click or focus")
+        } else {
+            LayoutInvoke::Absent
+        }
+    }
+}
+
+fn intent_propose(utterance: &str) -> String {
+    format!("proposed {utterance}")
+}
+
+fn intent_confirm() -> String {
+    "confirmed".into()
+}
+
+#[test]
+fn component_layout_index_is_readable_and_clickable() {
+    let invoked = Arc::new(AtomicBool::new(false));
+    let bridge = serve_with_shot(
+        AgentPermissions::observer(),
+        Arc::new(LayoutIndex {
+            invoked: invoked.clone(),
+        }),
+    );
+    let mut doc = Document::new();
+    let (status, summary) = token(&bridge, &mut doc, "GET", "/a11y", None);
+    assert_eq!(status, 200, "{summary}");
+    assert!(summary.contains("button: Terminal"), "{summary}");
+    let (status, body) = token(&bridge, &mut doc, "GET", "/a11y/index", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"index\":1"), "{body}");
+    let (status, body) = token(&bridge, &mut doc, "POST", "/click", Some("{\"index\":1}"));
+    assert_eq!(status, 403, "{body}");
+    assert!(!invoked.load(Ordering::SeqCst));
+
+    let bridge = serve_with_shot(
+        AgentPermissions::interactive(),
+        Arc::new(LayoutIndex {
+            invoked: invoked.clone(),
+        }),
+    );
+    let (status, body) = token(&bridge, &mut doc, "POST", "/click", Some("{\"index\":1}"));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"success\":true"), "{body}");
+    assert!(invoked.load(Ordering::SeqCst));
+    let (status, body) = token(&bridge, &mut doc, "GET", "/screenshot/annotated", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("png_base64"), "{body}");
+    assert!(body.contains("\"index\":1"), "{body}");
+}
+
+#[test]
+fn observer_cannot_propose_an_intent() {
+    w3cos_ai_bridge::server::set_intent_hooks(intent_propose, intent_confirm);
+    let bridge = serve(AgentPermissions::observer());
+    let mut doc = Document::new();
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/intent",
+        Some("{\"utterance\":\"打开终端\"}"),
+    );
+    assert_eq!(status, 403, "{body}");
+    let bridge = serve(AgentPermissions::interactive());
+    let (status, body) = token(
+        &bridge,
+        &mut doc,
+        "POST",
+        "/intent",
+        Some("{\"utterance\":\"打开终端\"}"),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("proposed 打开终端"), "{body}");
+    let (status, body) = token(&bridge, &mut doc, "POST", "/intent/confirm", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("confirmed"), "{body}");
+    let (status, body) = token(&bridge, &mut doc, "POST", "/intent", Some("{}"));
+    assert_eq!(status, 400, "{body}");
 }

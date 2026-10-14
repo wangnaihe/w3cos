@@ -71,7 +71,26 @@ fn main() {
     }
 
     state::set_invoke_hook(on_shell_intent);
+    w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     w3cos_runtime::run_app(build_shell).expect("W3C OS Shell crashed");
+}
+
+fn bridge_propose(utterance: &str) -> String {
+    on_shell_intent(OP_PROPOSE, utterance);
+    let summary = state::get_signal_text(SUMMARY_SIGNAL);
+    if !summary.is_empty() {
+        return summary;
+    }
+    state::get_signal_text(NOTICE_SIGNAL)
+}
+
+fn bridge_confirm() -> String {
+    on_shell_intent(OP_CONFIRM, "");
+    let notice = state::get_signal_text(NOTICE_SIGNAL);
+    if !notice.is_empty() {
+        return notice;
+    }
+    state::get_signal_text(SUMMARY_SIGNAL)
 }
 
 thread_local! {
@@ -545,8 +564,8 @@ fn build_files_app() -> Component {
 }
 
 fn sidebar_item(name: &str, active: bool) -> Component {
-    let bg = if active { "#6c5ce7" } else { "#10101c" };
-    let color = if active { "#ffffff" } else { "#a0a0c0" };
+    let bg = if active { "#3d5570" } else { "#243447" };
+    let color = if active { "#f4f7fb" } else { "#d5dee8" };
     Component::text(
         name,
         Style {
@@ -616,129 +635,70 @@ fn build_terminal_app() -> Component {
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0c0c14"),
+            background: Color::from_hex("#24384a"),
             gap: 0.0,
             ..Style::default()
         },
         vec![
-            app_titlebar("Terminal", "#2ecc71"),
+            app_titlebar("终端 Terminal", "#1c8f62"),
             Component::column(
                 Style {
                     flex_grow: 1.0,
                     padding: Edges::all(16.0),
-                    gap: 2.0,
-                    overflow: Overflow::Scroll,
+                    gap: 10.0,
                     ..Style::default()
                 },
                 vec![
                     Component::text(
-                        "W3C OS Terminal v0.1.0",
+                        "本机终端占位。命令还不会执行。",
                         Style {
-                            font_size: 14.0,
-                            color: Color::from_hex("#00b894"),
+                            font_size: 16.0,
+                            font_weight: 700,
+                            color: Color::from_hex("#f4f7fb"),
                             ..Style::default()
                         },
                     ),
                     Component::text(
-                        "Type 'help' for available commands.",
+                        "Local terminal placeholder. Typed commands stay on this page.",
                         Style {
                             font_size: 13.0,
-                            color: Color::from_hex("#606080"),
+                            color: Color::from_hex("#d5dee8"),
                             ..Style::default()
                         },
                     ),
                     Component::text(
-                        "",
+                        "w3cos shell ready",
                         Style {
                             font_size: 13.0,
-                            ..Style::default()
-                        },
-                    ),
-                    term_prompt("cargo build --release"),
-                    Component::text(
-                        "   Compiling w3cos-std v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "   Compiling w3cos-dom v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "   Compiling w3cos-runtime v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "   Compiling w3cos-shell v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "    Finished release [optimized] in 42.3s",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#00b894"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "",
-                        Style {
-                            font_size: 13.0,
-                            ..Style::default()
-                        },
-                    ),
-                    term_prompt("./target/release/w3cos-shell"),
-                    Component::text(
-                        "W3C OS Desktop Shell v0.1.0 -- starting...",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "",
-                        Style {
-                            font_size: 13.0,
+                            color: Color::from_hex("#b7f0d8"),
                             ..Style::default()
                         },
                     ),
                     Component::row(
                         Style {
-                            gap: 0.0,
+                            gap: 8.0,
+                            padding: Edges::xy(12.0, 10.0),
+                            background: Color::from_hex("#1b2c3e"),
+                            border_radius: 8.0,
+                            align_items: AlignItems::Center,
                             ..Style::default()
                         },
                         vec![
                             Component::text(
-                                "user@w3cos:~$ ",
+                                "user@w3cos:~$",
                                 Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#6c5ce7"),
+                                    font_size: 14.0,
+                                    color: Color::from_hex("#9eb6ff"),
                                     ..Style::default()
                                 },
                             ),
                             Component::text_input(
                                 "",
-                                "",
+                                "help",
                                 Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#d0d0e0"),
-                                    background: Color::from_hex("#0c0c14"),
+                                    font_size: 14.0,
+                                    color: Color::from_hex("#f4f7fb"),
+                                    background: Color::from_hex("#1b2c3e"),
                                     flex_grow: 1.0,
                                     ..Style::default()
                                 },
@@ -751,47 +711,38 @@ fn build_terminal_app() -> Component {
     )
 }
 
-fn term_prompt(cmd: &str) -> Component {
-    Component::row(
-        Style {
-            gap: 0.0,
-            ..Style::default()
-        },
-        vec![
-            Component::text(
-                "user@w3cos:~$ ",
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#6c5ce7"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                cmd,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
-}
-
 // ==========================================================================
 // Settings App
 // ==========================================================================
 
 fn build_settings_app() -> Component {
+    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
+        "开 On"
+    } else {
+        "关 Off"
+    };
+    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
+    let storage_label = if storage_owned.is_empty() {
+        "memory".to_string()
+    } else {
+        storage_owned
+    };
+    let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
+    let bridge = match bridge.trim() {
+        "" | "observer" => "observer",
+        "interactive" => "interactive",
+        "system" => "system",
+        _ => "observer",
+    };
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0f0f1a"),
+            background: Color::from_hex("#24384a"),
             gap: 0.0,
             ..Style::default()
         },
         vec![
-            app_titlebar("Settings", "#9b59b6"),
+            app_titlebar("设置 Settings", "#5b4fe0"),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -799,48 +750,49 @@ fn build_settings_app() -> Component {
                     ..Style::default()
                 },
                 vec![
-                    // Settings sidebar
                     Component::column(
                         Style {
                             width: Dimension::Px(200.0),
-                            background: Color::from_hex("#10101c"),
+                            background: Color::from_hex("#1b2c3e"),
                             padding: Edges::all(12.0),
                             gap: 4.0,
                             ..Style::default()
                         },
                         vec![
-                            sidebar_item("Display", true),
-                            sidebar_item("Network", false),
-                            sidebar_item("Sound", false),
-                            sidebar_item("AI Agents", false),
-                            sidebar_item("About", false),
+                            sidebar_item("本机 Local", true),
+                            sidebar_item("身份 Identity", false),
+                            sidebar_item("桥接 Bridge", false),
                         ],
                     ),
-                    // Settings content
                     Component::column(
                         Style {
                             flex_grow: 1.0,
-                            padding: Edges::all(24.0),
-                            gap: 20.0,
+                            padding: Edges::all(20.0),
+                            gap: 12.0,
                             ..Style::default()
                         },
                         vec![
                             Component::text(
-                                "Display Settings",
+                                "本机设置 · Local preferences",
                                 Style {
-                                    font_size: 20.0,
-                                    color: Color::from_hex("#f0f0ff"),
+                                    font_size: 18.0,
+                                    color: Color::from_hex("#f4f7fb"),
                                     font_weight: 700,
                                     ..Style::default()
                                 },
                             ),
-                            settings_row("Theme", "Dark"),
-                            settings_row("Font Size", "14px"),
-                            settings_row("Resolution", "1920 x 1080"),
-                            settings_row("Scale", "100%"),
-                            settings_row("Refresh Rate", "60 Hz"),
-                            settings_toggle("Enable Animations", true),
-                            settings_toggle("Reduce Motion", false),
+                            Component::text(
+                                "没有账号，也没有链。Passkey / did:key 仍是下一步。",
+                                Style {
+                                    font_size: 13.0,
+                                    color: Color::from_hex("#d5dee8"),
+                                    ..Style::default()
+                                },
+                            ),
+                            settings_row("身份 Identity", "PBKDF2 · not a passkey"),
+                            settings_row("夜间模式 Night", night),
+                            settings_row("AI 权限 Bridge", bridge),
+                            settings_row("收据 Receipts", &storage_label),
                         ],
                     ),
                 ],
@@ -853,7 +805,7 @@ fn settings_row(label: &str, value: &str) -> Component {
     Component::row(
         Style {
             padding: Edges::all(14.0),
-            background: Color::from_hex("#16162a"),
+            background: Color::from_hex("#31475e"),
             border_radius: 8.0,
             justify_content: JustifyContent::SpaceBetween,
             align_items: AlignItems::Center,
@@ -864,7 +816,7 @@ fn settings_row(label: &str, value: &str) -> Component {
                 label,
                 Style {
                     font_size: 14.0,
-                    color: Color::from_hex("#d0d0e0"),
+                    color: Color::from_hex("#f4f7fb"),
                     ..Style::default()
                 },
             ),
@@ -872,48 +824,13 @@ fn settings_row(label: &str, value: &str) -> Component {
                 value,
                 Style {
                     font_size: 14.0,
-                    color: Color::from_hex("#6c5ce7"),
+                    color: Color::from_hex("#ffe08a"),
                     ..Style::default()
                 },
             ),
         ],
     )
 }
-
-fn settings_toggle(label: &str, on: bool) -> Component {
-    let indicator = if on { "[ON]" } else { "[OFF]" };
-    let color = if on { "#00b894" } else { "#808090" };
-    Component::row(
-        Style {
-            padding: Edges::all(14.0),
-            background: Color::from_hex("#16162a"),
-            border_radius: 8.0,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            ..Style::default()
-        },
-        vec![
-            Component::text(
-                label,
-                Style {
-                    font_size: 14.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                indicator,
-                Style {
-                    font_size: 14.0,
-                    color: Color::from_hex(color),
-                    font_weight: 700,
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
-}
-
 
 // ==========================================================================
 // Chrome: context header, intent bar, and the agent task center.
