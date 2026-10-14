@@ -13,77 +13,77 @@ pub struct Atom(u32);
 /// Build-time qualified names. Index is the `Atom` id. Appending names does
 /// not renumber `Atom::DIV`, `Atom::ID`, or `Atom::CLASS`.
 const QUALIFIED_NAMES: &[&str] = &[
-    "",                    // 0
-    "#document",           // 1
-    "#text",               // 2
-    "body",                // 3
-    "div",                 // 4
-    "span",                // 5
-    "p",                   // 6
-    "button",              // 7
-    "input",               // 8
-    "a",                   // 9
-    "img",                 // 10
-    "h1",                  // 11
-    "h2",                  // 12
-    "h3",                  // 13
-    "h4",                  // 14
-    "h5",                  // 15
-    "h6",                  // 16
-    "section",             // 17
-    "main",                // 18
-    "article",             // 19
-    "nav",                 // 20
-    "header",              // 21
-    "footer",              // 22
-    "aside",               // 23
-    "form",                // 24
-    "label",               // 25
-    "ul",                  // 26
-    "ol",                  // 27
-    "li",                  // 28
-    "em",                  // 29
-    "strong",              // 30
-    "code",                // 31
-    "pre",                 // 32
-    "table",               // 33
-    "tr",                  // 34
-    "td",                  // 35
-    "th",                  // 36
-    "id",                  // 37
-    "class",               // 38
-    "src",                 // 39
-    "href",                // 40
-    "type",                // 41
-    "placeholder",         // 42
-    "style",               // 43
-    "value",               // 44
-    "html",                // 45
-    "head",                // 46
-    "meta",                // 47
-    "link",                // 48
-    "script",              // 49
-    "title",               // 50
-    "br",                  // 51
-    "hr",                  // 52
-    "canvas",              // 53
-    "video",               // 54
-    "source",              // 55
-    "template",            // 56
-    "name",                // 57
-    "content",             // 58
-    "rel",                 // 59
-    "alt",                 // 60
-    "width",               // 61
-    "height",              // 62
-    "disabled",            // 63
-    "checked",             // 64
-    "role",                // 65
-    "lang",                // 66
-    "contenteditable",     // 67
-    "#comment",            // 68
-    "#cdata-section",      // 69
-    "#document-fragment",  // 70
+    "",                   // 0
+    "#document",          // 1
+    "#text",              // 2
+    "body",               // 3
+    "div",                // 4
+    "span",               // 5
+    "p",                  // 6
+    "button",             // 7
+    "input",              // 8
+    "a",                  // 9
+    "img",                // 10
+    "h1",                 // 11
+    "h2",                 // 12
+    "h3",                 // 13
+    "h4",                 // 14
+    "h5",                 // 15
+    "h6",                 // 16
+    "section",            // 17
+    "main",               // 18
+    "article",            // 19
+    "nav",                // 20
+    "header",             // 21
+    "footer",             // 22
+    "aside",              // 23
+    "form",               // 24
+    "label",              // 25
+    "ul",                 // 26
+    "ol",                 // 27
+    "li",                 // 28
+    "em",                 // 29
+    "strong",             // 30
+    "code",               // 31
+    "pre",                // 32
+    "table",              // 33
+    "tr",                 // 34
+    "td",                 // 35
+    "th",                 // 36
+    "id",                 // 37
+    "class",              // 38
+    "src",                // 39
+    "href",               // 40
+    "type",               // 41
+    "placeholder",        // 42
+    "style",              // 43
+    "value",              // 44
+    "html",               // 45
+    "head",               // 46
+    "meta",               // 47
+    "link",               // 48
+    "script",             // 49
+    "title",              // 50
+    "br",                 // 51
+    "hr",                 // 52
+    "canvas",             // 53
+    "video",              // 54
+    "source",             // 55
+    "template",           // 56
+    "name",               // 57
+    "content",            // 58
+    "rel",                // 59
+    "alt",                // 60
+    "width",              // 61
+    "height",             // 62
+    "disabled",           // 63
+    "checked",            // 64
+    "role",               // 65
+    "lang",               // 66
+    "contenteditable",    // 67
+    "#comment",           // 68
+    "#cdata-section",     // 69
+    "#document-fragment", // 70
 ];
 
 /// Id of a static tag or attribute name, compared as `u32` with no hash.
@@ -392,10 +392,7 @@ impl InternTable {
             return;
         }
         if self.chunks.is_empty() || self.fill + bytes.len() > CHUNK {
-            let chunk = self
-                .spares
-                .pop()
-                .unwrap_or_else(|| Box::new([0; CHUNK]));
+            let chunk = self.spares.pop().unwrap_or_else(|| Box::new([0; CHUNK]));
             self.chunks.push(chunk);
             self.fill = 0;
         }

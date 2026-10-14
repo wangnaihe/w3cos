@@ -22,8 +22,11 @@ struct SourceDecoration {
 }
 
 pub(crate) fn remove_generated_border_edges(style: &mut Style) {
-    if style.custom_properties.as_ref().is_some_and(|properties|
-        properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)) {
+    if style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key(w3cos_std::inline_text::SOURCE_RUN))
+    {
         // Logical slice edges affect fitting and painting, not font shaping.
         style.border_width = 0.0;
         style.border_top_width = Some(0.0);
@@ -43,25 +46,31 @@ pub(crate) struct Fragment {
 /// Recover authored text nodes from their generated word/space pieces. Only
 /// whitespace-delimited, cluster-safe boundaries may be shaped independently.
 pub(crate) fn authored_word_groups(
-    texts: &[&str], style: &Style,
+    texts: &[&str],
+    style: &Style,
 ) -> Option<Vec<(std::ops::Range<usize>, Vec<f32>)>> {
     let text = texts.concat();
     let ends = w3cos_std::inline_text::fragment_ends(&text, style)?;
     render_skia::measure_skia_inline_fragment_advances(texts, style)?;
     let mut boundaries = vec![0];
-    for part in texts { boundaries.push(boundaries.last()? + part.len()); }
+    for part in texts {
+        boundaries.push(boundaries.last()? + part.len());
+    }
     let mut start = 0;
     let mut groups = Vec::with_capacity(ends.len());
     for end in ends {
         if end < text.len()
             && !text[..end].chars().last().is_some_and(char::is_whitespace)
             && !text[end..].chars().next().is_some_and(char::is_whitespace)
-        { return None; }
+        {
+            return None;
+        }
         let stop = boundaries.binary_search(&end).ok()?;
-        if stop <= start { return None; }
-        let mut advances = render_skia::measure_skia_inline_fragment_advances(
-            &texts[start..stop], style,
-        )?;
+        if stop <= start {
+            return None;
+        }
+        let mut advances =
+            render_skia::measure_skia_inline_fragment_advances(&texts[start..stop], style)?;
         let advance: f32 = advances.iter().sum();
         *advances.last_mut()? += crate::text_layout::inline_layout_advance(advance) - advance;
         groups.push((start..stop, advances));
@@ -78,15 +87,21 @@ pub(crate) fn authored_fragment_word_advances(texts: &[&str], style: &Style) -> 
     let ends = w3cos_std::inline_text::fragment_ends(&text, style)?;
     let mut advances = render_skia::measure_skia_inline_fragment_advances(texts, style)?;
     let mut start = 0;
-    let sources = ends.iter().map(|end| {
-        let source = &text[start..*end];
-        start = *end;
-        source
-    }).collect::<Vec<_>>();
+    let sources = ends
+        .iter()
+        .map(|end| {
+            let source = &text[start..*end];
+            start = *end;
+            source
+        })
+        .collect::<Vec<_>>();
     let source_advances = render_skia::measure_skia_inline_fragment_advances(&sources, style)?;
     let mut word_ends = Vec::with_capacity(texts.len());
     let mut offset = 0;
-    for word in texts { offset += word.len(); word_ends.push(offset); }
+    for word in texts {
+        offset += word.len();
+        word_ends.push(offset);
+    }
     for (end, advance) in ends.into_iter().zip(source_advances) {
         let word = word_ends.partition_point(|word_end| *word_end < end);
         *advances.get_mut(word)? += crate::text_layout::inline_layout_advance(advance) - advance;
@@ -95,27 +110,62 @@ pub(crate) fn authored_fragment_word_advances(texts: &[&str], style: &Style) -> 
 }
 
 impl Fragment {
-    pub(crate) fn decoration_span(&self, rect: LayoutRect,
-        kind: w3cos_std::style::TextDecoration) -> (f32, f32) {
-        self.decoration.as_ref().map_or((rect.x, rect.width), |(source, first, last)| {
-            let leader = if kind == w3cos_std::style::TextDecoration::LineThrough { *last } else { *first };
-            (rect.x - self.source_x + source.x, if leader { source.width } else { 0.0 })
-        })
+    pub(crate) fn decoration_span(
+        &self,
+        rect: LayoutRect,
+        kind: w3cos_std::style::TextDecoration,
+    ) -> (f32, f32) {
+        self.decoration
+            .as_ref()
+            .map_or((rect.x, rect.width), |(source, first, last)| {
+                let leader = if kind == w3cos_std::style::TextDecoration::LineThrough {
+                    *last
+                } else {
+                    *first
+                };
+                (
+                    rect.x - self.source_x + source.x,
+                    if leader { source.width } else { 0.0 },
+                )
+            })
     }
 
     pub(crate) fn baseline(&self, rect: LayoutRect) -> f32 {
         rect.y + self.ascent
     }
 
-    pub(crate) fn ink_intercepts(&self, rect: LayoutRect, style: &Style, upper: f32, lower: f32) -> Vec<f32> {
+    pub(crate) fn ink_intercepts(
+        &self,
+        rect: LayoutRect,
+        style: &Style,
+        upper: f32,
+        lower: f32,
+    ) -> Vec<f32> {
         let mut intervals = Vec::new();
-        let runs = self.decoration.as_ref().map_or(&self.runs, |(source, _, _)| &source.runs);
+        let runs = self
+            .decoration
+            .as_ref()
+            .map_or(&self.runs, |(source, _, _)| &source.runs);
         for run in runs {
             let origin = rect.x - self.source_x + run.origin_x;
             let font = skia_text_run::css_font_for_style(&run.face, style.font_size, style);
-            skia_text_run::visit_glyph_fonts(&font, &run.glyph_font_sizes, run.glyphs.len(), |font, range|
-                intervals.extend(font.get_intercepts(&run.glyphs[range.clone()], &run.positions[range],
-                    (upper, lower), None).into_iter().map(|position| origin + position)));
+            skia_text_run::visit_glyph_fonts(
+                &font,
+                &run.glyph_font_sizes,
+                run.glyphs.len(),
+                |font, range| {
+                    intervals.extend(
+                        font.get_intercepts(
+                            &run.glyphs[range.clone()],
+                            &run.positions[range],
+                            (upper, lower),
+                            None,
+                        )
+                        .into_iter()
+                        .map(|position| origin + position),
+                    )
+                },
+            );
         }
         intervals
     }
@@ -129,19 +179,56 @@ impl Fragment {
             let x = rect.x - self.source_x + run.origin_x;
             let baseline = rect.y + self.ascent;
             let visible = render_skia::glyph_slice_intersects_clip(
-                canvas, &font, &run.glyphs, &run.positions, &run.glyph_font_sizes, x, baseline,
+                canvas,
+                &font,
+                &run.glyphs,
+                &run.positions,
+                &run.glyph_font_sizes,
+                x,
+                baseline,
             );
             if trace {
-                eprintln!("W3COS_HEADLESS_GLYPH rect={rect:?} source_x={} origin={} baseline={baseline} face={:?} glyphs={} first={:?} visible={visible} clip={:?}",
-                    self.source_x, x, run.face.family_name(), run.glyphs.len(), run.positions.first(), canvas.local_clip_bounds());
+                eprintln!(
+                    "W3COS_HEADLESS_GLYPH rect={rect:?} source_x={} origin={} baseline={baseline} face={:?} glyphs={} first={:?} visible={visible} clip={:?}",
+                    self.source_x,
+                    x,
+                    run.face.family_name(),
+                    run.glyphs.len(),
+                    run.positions.first(),
+                    canvas.local_clip_bounds()
+                );
             }
-            if !visible { continue; }
-            skia_text_run::visit_glyph_fonts(&font, &run.glyph_font_sizes, run.glyphs.len(), |font, range| {
-                let ink = skia_text_run::geometric_ink_bounds(font,&run.glyphs[range.clone()],&run.positions[range.clone()])
-                    .map(|bounds| bounds.with_offset((x,baseline)));
-                render_skia::draw_fractional_text(canvas,style,&paint,ink,|target,paint|
-                    target.draw_glyphs_at(&run.glyphs[range.clone()],&run.positions[range.clone()],(x,baseline),font,paint));
-            });
+            if !visible {
+                continue;
+            }
+            skia_text_run::visit_glyph_fonts(
+                &font,
+                &run.glyph_font_sizes,
+                run.glyphs.len(),
+                |font, range| {
+                    let ink = skia_text_run::geometric_ink_bounds(
+                        font,
+                        &run.glyphs[range.clone()],
+                        &run.positions[range.clone()],
+                    )
+                    .map(|bounds| bounds.with_offset((x, baseline)));
+                    render_skia::draw_fractional_text(
+                        canvas,
+                        style,
+                        &paint,
+                        ink,
+                        |target, paint| {
+                            target.draw_glyphs_at(
+                                &run.glyphs[range.clone()],
+                                &run.positions[range.clone()],
+                                (x, baseline),
+                                font,
+                                paint,
+                            )
+                        },
+                    );
+                },
+            );
         }
     }
 }
@@ -156,28 +243,53 @@ pub(crate) fn build(
     // of the adjacent authored text. Recover the transparent word's inline
     // owner so its text can share glyph slices with later spaces/words.
     // Keep quote operators themselves as distinct source/style barriers.
-    let quote_words = artifact.nodes.iter().filter_map(|node| {
-        if !node.style.custom_properties.as_ref().is_some_and(|p|
-            p.contains_key("--w3cos-internal-generated-quote")) { return None; }
-        let parent = node.parent?;
-        artifact.nodes[parent].style.custom_properties.as_ref().is_some_and(|p|
-            p.contains_key("--w3cos-internal-unbroken-inline-word")).then_some(parent)
-    }).collect::<HashSet<_>>();
+    let quote_words = artifact
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            if !node
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|p| p.contains_key("--w3cos-internal-generated-quote"))
+            {
+                return None;
+            }
+            let parent = node.parent?;
+            artifact.nodes[parent]
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|p| p.contains_key("--w3cos-internal-unbroken-inline-word"))
+                .then_some(parent)
+        })
+        .collect::<HashSet<_>>();
     let inline_owner = |mut parent: usize| -> Option<usize> {
-        while quote_words.contains(&parent) { parent = artifact.nodes[parent].parent?; }
+        while quote_words.contains(&parent) {
+            parent = artifact.nodes[parent].parent?;
+        }
         Some(parent)
     };
     let same_source_style = |first: usize, current: usize| {
         let a = &artifact.nodes[first];
         let b = &artifact.nodes[current];
-        if a.style == b.style { return true; }
+        if a.style == b.style {
+            return true;
+        }
         let mut edge_free_a = a.style.clone();
         let mut edge_free_b = b.style.clone();
         remove_generated_border_edges(&mut edge_free_a);
         remove_generated_border_edges(&mut edge_free_b);
-        if edge_free_a == edge_free_b { return true; }
-        if ![a.parent, b.parent].into_iter().flatten().any(|parent|
-            quote_words.contains(&parent)) { return false; }
+        if edge_free_a == edge_free_b {
+            return true;
+        }
+        if ![a.parent, b.parent]
+            .into_iter()
+            .flatten()
+            .any(|parent| quote_words.contains(&parent))
+        {
+            return false;
+        }
         // The no-break wrapper assigns flex-shrink:0 to its children for
         // fitting only. This must not become an authored shaping boundary.
         let mut a = a.style.clone();
@@ -186,22 +298,30 @@ pub(crate) fn build(
         b.flex_shrink = 1.0;
         a == b
     };
-    let parents = clients.iter()
+    let parents = clients
+        .iter()
         .filter_map(|index| inline_owner(artifact.nodes.get(*index)?.parent?))
         .collect::<HashSet<_>>();
     let mut siblings: HashMap<usize, Vec<usize>> = HashMap::new();
     for (index, node) in artifact.nodes.iter().enumerate() {
-        if quote_words.contains(&index) { continue; }
-        if let Some(parent) = node.parent.and_then(inline_owner)
-            .filter(|parent| parents.contains(parent)) {
+        if quote_words.contains(&index) {
+            continue;
+        }
+        if let Some(parent) = node
+            .parent
+            .and_then(inline_owner)
+            .filter(|parent| parents.contains(parent))
+        {
             siblings.entry(parent).or_default().push(index);
         }
     }
     let mut result = HashMap::new();
     for (parent, children) in siblings {
         let style = &artifact.nodes[parent].style;
-        if !matches!(style.display, Display::Block | Display::Flex | Display::Inline)
-            || style.direction != TextDirection::Ltr
+        if !matches!(
+            style.display,
+            Display::Block | Display::Flex | Display::Inline
+        ) || style.direction != TextDirection::Ltr
             || !style.custom_properties.as_ref().is_some_and(|properties| {
                 properties.contains_key("--w3cos-internal-inline-formatting-context")
             })
@@ -210,26 +330,29 @@ pub(crate) fn build(
         }
         let eligible = |index: usize| {
             artifact.rect_by_index[index].is_some_and(|rect| {
-                rect.width > 0.0
-                    && {
-                        let node = &artifact.nodes[index];
-                        let mut style = node.style.clone();
-                        if style.custom_properties.as_ref().is_some_and(|properties|
-                            properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)) {
-                            // Decoration is paint-only for generated pieces of
-                            // one source. Do not relax the layout classifier.
-                            style.text_decoration = w3cos_std::style::TextDecoration::None;
-                            remove_generated_border_edges(&mut style);
-                        }
-                        // A forced break terminates layout, but contributes no
-                        // glyph to the preceding word's shaping context.
-                        let paint_kind = match &node.kind {
-                            ComponentKind::Text { content } if content.ends_with('\u{2028}') =>
-                                ComponentKind::Text { content: content.strip_suffix('\u{2028}').unwrap().into() },
-                            _ => node.kind.clone(),
-                        };
-                        crate::layout::is_plain_inline_word_fragment(&paint_kind, &style)
+                rect.width > 0.0 && {
+                    let node = &artifact.nodes[index];
+                    let mut style = node.style.clone();
+                    if style.custom_properties.as_ref().is_some_and(|properties| {
+                        properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
+                    }) {
+                        // Decoration is paint-only for generated pieces of
+                        // one source. Do not relax the layout classifier.
+                        style.text_decoration = w3cos_std::style::TextDecoration::None;
+                        remove_generated_border_edges(&mut style);
                     }
+                    // A forced break terminates layout, but contributes no
+                    // glyph to the preceding word's shaping context.
+                    let paint_kind = match &node.kind {
+                        ComponentKind::Text { content } if content.ends_with('\u{2028}') => {
+                            ComponentKind::Text {
+                                content: content.strip_suffix('\u{2028}').unwrap().into(),
+                            }
+                        }
+                        _ => node.kind.clone(),
+                    };
+                    crate::layout::is_plain_inline_word_fragment(&paint_kind, &style)
+                }
             })
         };
         let mut start = 0;
@@ -242,14 +365,13 @@ pub(crate) fn build(
             let mut end = start + 1;
             while end < children.len() {
                 if matches!(&artifact.nodes[children[end - 1]].kind,
-                    ComponentKind::Text { content } if content.ends_with('\u{2028}')) {
+                    ComponentKind::Text { content } if content.ends_with('\u{2028}'))
+                {
                     break;
                 }
                 let previous = artifact.rect_by_index[children[end - 1]].unwrap();
                 let current = children[end];
-                if !eligible(current)
-                    || !same_source_style(first, current)
-                {
+                if !eligible(current) || !same_source_style(first, current) {
                     break;
                 }
                 let rect = artifact.rect_by_index[current].unwrap();
@@ -270,22 +392,48 @@ pub(crate) fn build(
     result
 }
 
-fn share_source_decoration(fragments: &mut [(usize, Fragment)], artifact: &PaintArtifact,
-    clients: &HashSet<usize>) {
-    let Some((first_index, _)) = fragments.first() else { return; };
+fn share_source_decoration(
+    fragments: &mut [(usize, Fragment)],
+    artifact: &PaintArtifact,
+    clients: &HashSet<usize>,
+) {
+    let Some((first_index, _)) = fragments.first() else {
+        return;
+    };
     let style = &artifact.nodes[*first_index].style;
-    if !style.custom_properties.as_ref().is_some_and(|properties|
-        properties.contains_key(w3cos_std::inline_text::SOURCE_RUN))
+    if !style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key(w3cos_std::inline_text::SOURCE_RUN))
         || (style.text_decoration == w3cos_std::style::TextDecoration::None
-            && artifact.ancestor_text_decorations(*first_index).is_empty()) { return; }
-    let Some(first) = fragments.iter().position(|(index, _)| clients.contains(index)) else { return; };
-    let last = fragments.iter().rposition(|(index, _)| clients.contains(index)).unwrap();
+            && artifact.ancestor_text_decorations(*first_index).is_empty())
+    {
+        return;
+    }
+    let Some(first) = fragments
+        .iter()
+        .position(|(index, _)| clients.contains(index))
+    else {
+        return;
+    };
+    let last = fragments
+        .iter()
+        .rposition(|(index, _)| clients.contains(index))
+        .unwrap();
     let start = render_skia::text_content_box(artifact.rect_by_index[*first_index].unwrap(), style);
     let last_index = fragments.last().unwrap().0;
-    let end = render_skia::text_content_box(artifact.rect_by_index[last_index].unwrap(),
-        &artifact.nodes[last_index].style);
-    let source = Arc::new(SourceDecoration { x: start.x, width: end.x + end.width - start.x,
-        runs: fragments.iter().flat_map(|(_, fragment)| fragment.runs.iter().cloned()).collect() });
+    let end = render_skia::text_content_box(
+        artifact.rect_by_index[last_index].unwrap(),
+        &artifact.nodes[last_index].style,
+    );
+    let source = Arc::new(SourceDecoration {
+        x: start.x,
+        width: end.x + end.width - start.x,
+        runs: fragments
+            .iter()
+            .flat_map(|(_, fragment)| fragment.runs.iter().cloned())
+            .collect(),
+    });
     for (position, (_, fragment)) in fragments.iter_mut().enumerate() {
         fragment.decoration = Some((source.clone(), position == first, position == last));
     }
@@ -325,8 +473,11 @@ fn shape_group(
             Some((
                 *index,
                 Fragment {
-                    source_x: render_skia::text_content_box(artifact.rect_by_index[*index]?,
-                        &artifact.nodes[*index].style).x,
+                    source_x: render_skia::text_content_box(
+                        artifact.rect_by_index[*index]?,
+                        &artifact.nodes[*index].style,
+                    )
+                    .x,
                     ascent,
                     runs: Vec::new(),
                     decoration: None,
@@ -341,11 +492,15 @@ fn shape_group(
     for run in render_skia::css_font_runs(&text, face, style) {
         let shaped = skia_text_run::shape_visual_run_with_clusters(run.text, &run.typeface, style)?;
         let mut cursor = 0.0_f64;
-        let cluster_origins = shaped.clusters.iter().map(|(cluster, advance)| {
-            let entry = (*cluster, cursor);
-            cursor += f64::from(*advance);
-            entry
-        }).collect::<HashMap<_, _>>();
+        let cluster_origins = shaped
+            .clusters
+            .iter()
+            .map(|(cluster, advance)| {
+                let entry = (*cluster, cursor);
+                cursor += f64::from(*advance);
+                entry
+            })
+            .collect::<HashMap<_, _>>();
         let mut slices = group
             .iter()
             .map(|_| GlyphSlice {
@@ -371,19 +526,27 @@ fn shape_group(
             if let Some(size) = shaped.glyph_font_sizes.get(glyph_index) {
                 slice.glyph_font_sizes.push(*size);
             }
-            if let Some((range, _)) = authored_groups.as_ref()
-                .and_then(|groups| groups.iter().find(|(range, _)| range.contains(&fragment))) {
+            if let Some((range, _)) = authored_groups
+                .as_ref()
+                .and_then(|groups| groups.iter().find(|(range, _)| range.contains(&fragment)))
+            {
                 // Like a ShapeResultView, retain the full shaping context but
                 // start this authored slice at its used layout origin. Subtract
                 // the logical cursor, not the first glyph's offset (marks may
                 // have non-zero offsets). Generated words are not new slices.
                 let run_delta = f64::from(run_origin) - f64::from(origin);
-                let base = *source_cursor_bases.entry(range.start)
+                let base = *source_cursor_bases
+                    .entry(range.start)
                     .or_insert(run_delta + cluster_origins.get(cluster)?);
-                slice.origin_x = render_skia::text_content_box(artifact.rect_by_index[group[range.start]]?,
-                    &artifact.nodes[group[range.start]].style).x;
+                slice.origin_x = render_skia::text_content_box(
+                    artifact.rect_by_index[group[range.start]]?,
+                    &artifact.nodes[group[range.start]].style,
+                )
+                .x;
                 slice.positions.push(Point::new(
-                    (run_delta + f64::from(position.x) - base) as f32, position.y));
+                    (run_delta + f64::from(position.x) - base) as f32,
+                    position.y,
+                ));
             } else {
                 // Without validated authored boundaries, keep full-run points
                 // intact; rebasing each generated word loses subpixel context.
@@ -409,48 +572,116 @@ mod tests {
 
     #[test]
     fn trailing_forced_break_keeps_the_last_word_in_shared_shaping() {
-        let face = FontMgr::default().match_family_style("Arial", FontStyle::normal()).unwrap();
-        let style = Style { display: Display::Inline, font_family: Some("sans-serif".into()),
-            font_size: 16.0, ..Style::default() };
-        let parent = Style { display: Display::Inline, custom_properties: Some(HashMap::from([
-            ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
-        ])), ..Style::default() };
+        let face = FontMgr::default()
+            .match_family_style("Arial", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("sans-serif".into()),
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let parent = Style {
+            display: Display::Inline,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
         let words = ["Filler", " ", "Text"];
         let advances = render_skia::measure_skia_inline_fragment_advances(&words, &style).unwrap();
-        let mut nodes = vec![PaintNode { kind: ComponentKind::Row, style: parent,
-            parent: None, sticky_counter_signal: None }];
-        let mut layouts = vec![(LayoutRect { x: 8.0, y: 8.0, width: 200.0, height: 22.0 }, 0)];
+        let mut nodes = vec![PaintNode {
+            kind: ComponentKind::Row,
+            style: parent,
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        let mut layouts = vec![(
+            LayoutRect {
+                x: 8.0,
+                y: 8.0,
+                width: 200.0,
+                height: 22.0,
+            },
+            0,
+        )];
         let mut x = 8.0;
         for (position, (word, width)) in words.iter().zip(advances).enumerate() {
-            let content = if position == 2 { format!("{word}\u{2028}") } else { (*word).into() };
-            nodes.push(PaintNode { kind: ComponentKind::Text { content }, style: style.clone(),
-                parent: Some(0), sticky_counter_signal: None });
-            layouts.push((LayoutRect { x, y: 8.0, width, height: 22.0 }, position + 1));
+            let content = if position == 2 {
+                format!("{word}\u{2028}")
+            } else {
+                (*word).into()
+            };
+            nodes.push(PaintNode {
+                kind: ComponentKind::Text { content },
+                style: style.clone(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            });
+            layouts.push((
+                LayoutRect {
+                    x,
+                    y: 8.0,
+                    width,
+                    height: 22.0,
+                },
+                position + 1,
+            ));
             x += width;
         }
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
         let slices = build(&artifact, [1, 2, 3].into_iter(), &face);
-        assert_eq!(slices.len(), 3, "a final forced line break must not split glyph shaping");
+        assert_eq!(
+            slices.len(),
+            3,
+            "a final forced line break must not split glyph shaping"
+        );
         assert_eq!(slices[&3].runs[0].origin_x, 8.0);
     }
 
     #[test]
     fn generated_border_pieces_share_glyph_positions_without_losing_edges() {
-        let face = FontMgr::default().match_family_style("Arial", FontStyle::normal()).unwrap();
-        let style = Style { display: Display::Inline, font_family: Some("sans-serif".into()),
-            font_size: 16.0, border_width: 3.0,
+        let face = FontMgr::default()
+            .match_family_style("Arial", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("sans-serif".into()),
+            font_size: 16.0,
+            border_width: 3.0,
             color: w3cos_std::Color::rgb(0, 128, 0),
             border_color: w3cos_std::Color::rgb(0, 128, 0),
             border_styles: [Some(w3cos_std::style::BorderLineStyle::Solid); 4],
-            custom_properties: Some(HashMap::from([
-                (w3cos_std::inline_text::SOURCE_RUN.into(), "text:1".into()),
-            ])), ..Style::default() };
-        let parent = Style { display: Display::Flex, custom_properties: Some(HashMap::from([
-            ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
-        ])), ..Style::default() };
-        let mut nodes = vec![PaintNode { kind: ComponentKind::Row, style: parent,
-            parent: None, sticky_counter_signal: None }];
-        let mut layouts = vec![(LayoutRect { x: 8.0, y: 8.0, width: 400.0, height: 22.0 }, 0)];
+            custom_properties: Some(HashMap::from([(
+                w3cos_std::inline_text::SOURCE_RUN.into(),
+                "text:1".into(),
+            )])),
+            ..Style::default()
+        };
+        let parent = Style {
+            display: Display::Flex,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
+        let mut nodes = vec![PaintNode {
+            kind: ComponentKind::Row,
+            style: parent,
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        let mut layouts = vec![(
+            LayoutRect {
+                x: 8.0,
+                y: 8.0,
+                width: 400.0,
+                height: 22.0,
+            },
+            0,
+        )];
         let words = ["green", " ", "border"];
         let advances = render_skia::measure_skia_inline_fragment_advances(&words, &style).unwrap();
         let mut x = 8.0;
@@ -458,152 +689,436 @@ mod tests {
             let mut piece = style.clone();
             piece.border_left_width = Some(if position == 0 { 3.0 } else { 0.0 });
             piece.border_right_width = Some(if position == 2 { 3.0 } else { 0.0 });
-            let width = advance + piece.border_left_width.unwrap() + piece.border_right_width.unwrap();
+            let width =
+                advance + piece.border_left_width.unwrap() + piece.border_right_width.unwrap();
             let index = nodes.len();
-            nodes.push(PaintNode { kind: ComponentKind::Text { content: (*word).into() },
-                style: piece, parent: Some(0), sticky_counter_signal: None });
-            layouts.push((LayoutRect { x, y: 5.0, width, height: 28.0 }, index));
+            nodes.push(PaintNode {
+                kind: ComponentKind::Text {
+                    content: (*word).into(),
+                },
+                style: piece,
+                parent: Some(0),
+                sticky_counter_signal: None,
+            });
+            layouts.push((
+                LayoutRect {
+                    x,
+                    y: 5.0,
+                    width,
+                    height: 28.0,
+                },
+                index,
+            ));
             x += width;
         }
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
-        assert_eq!(build(&artifact, [1,2,3].into_iter(), &face).len(), 3,
-            "generated paint edges must not split one authored glyph run");
-        let input = layouts[1..].iter().map(|(rect,index)|
-            (*index,*rect,&artifact.nodes[*index].kind,&artifact.nodes[*index].style)).collect::<Vec<_>>();
+        assert_eq!(
+            build(&artifact, [1, 2, 3].into_iter(), &face).len(),
+            3,
+            "generated paint edges must not split one authored glyph run"
+        );
+        let input = layouts[1..]
+            .iter()
+            .map(|(rect, index)| {
+                (
+                    *index,
+                    *rect,
+                    &artifact.nodes[*index].kind,
+                    &artifact.nodes[*index].style,
+                )
+            })
+            .collect::<Vec<_>>();
         let mut renderer = render_skia::SkiaRasterizer::new_host().unwrap();
-        let pixels = renderer.render_frame(420,60,&input,crate::layout::layout_font(),
-            &[],&HashMap::new(),None,w3cos_std::Color::WHITE,
-            Some(&artifact),None,1.0).unwrap();
-        assert_ne!(&pixels[(5*420+20)*4..(5*420+20)*4+4], &[255;4], "shared glyphs must retain the top border");
-        assert_ne!(&pixels[(15*420+8)*4..(15*420+8)*4+4], &[255;4], "shared glyphs must retain the start border");
+        let pixels = renderer
+            .render_frame(
+                420,
+                60,
+                &input,
+                crate::layout::layout_font(),
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::Color::WHITE,
+                Some(&artifact),
+                None,
+                1.0,
+            )
+            .unwrap();
+        assert_ne!(
+            &pixels[(5 * 420 + 20) * 4..(5 * 420 + 20) * 4 + 4],
+            &[255; 4],
+            "shared glyphs must retain the top border"
+        );
+        assert_ne!(
+            &pixels[(15 * 420 + 8) * 4..(15 * 420 + 8) * 4 + 4],
+            &[255; 4],
+            "shared glyphs must retain the start border"
+        );
         let mut decorated_nodes = artifact.nodes.clone();
         for node in &mut decorated_nodes[1..] {
             node.style.text_decoration = w3cos_std::style::TextDecoration::Underline;
         }
         let decorated = PaintArtifact::build(decorated_nodes, &layouts, 2);
-        let slices = build(&decorated, [1,2,3].into_iter(), &face);
+        let slices = build(&decorated, [1, 2, 3].into_iter(), &face);
         let first = render_skia::text_content_box(layouts[1].0, &decorated.nodes[1].style);
         let last = render_skia::text_content_box(layouts[3].0, &decorated.nodes[3].style);
-        let (start, width) = slices[&1].decoration_span(first, w3cos_std::style::TextDecoration::Underline);
-        assert!((start-first.x).abs() < 0.001 && (width-(last.x+last.width-first.x)).abs() < 0.001,
-            "text decoration excludes the logical border edges: start={start}, width={width}");
+        let (start, width) =
+            slices[&1].decoration_span(first, w3cos_std::style::TextDecoration::Underline);
+        assert!(
+            (start - first.x).abs() < 0.001
+                && (width - (last.x + last.width - first.x)).abs() < 0.001,
+            "text decoration excludes the logical border edges: start={start}, width={width}"
+        );
     }
 
     #[test]
     fn quote_word_wrapper_keeps_the_adjacent_text_source_shaped_together() {
-        let face = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
-        let text_style = Style { display: Display::Inline, font_family: Some("serif".into()),
-            font_size: 16.0, custom_properties: Some(HashMap::from([
-                (w3cos_std::inline_text::SOURCE_RUN.into(), "pseudo:1:before:2".into()),
-            ])), ..Style::default() };
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::normal())
+            .unwrap();
+        let text_style = Style {
+            display: Display::Inline,
+            font_family: Some("serif".into()),
+            font_size: 16.0,
+            custom_properties: Some(HashMap::from([(
+                w3cos_std::inline_text::SOURCE_RUN.into(),
+                "pseudo:1:before:2".into(),
+            )])),
+            ..Style::default()
+        };
         let mut quote_style = text_style.clone();
-        quote_style.custom_properties.as_mut().unwrap().insert(
-            "--w3cos-internal-generated-quote".into(), "1".into());
-        let parent = Style { display: Display::Flex, custom_properties: Some(HashMap::from([
-            ("--w3cos-internal-inline-formatting-context".into(), "1".into()),
-        ])), ..Style::default() };
-        let word = Style { display: Display::InlineFlex, custom_properties: Some(HashMap::from([
-            ("--w3cos-internal-unbroken-inline-word".into(), "1".into()),
-        ])), ..Style::default() };
+        quote_style
+            .custom_properties
+            .as_mut()
+            .unwrap()
+            .insert("--w3cos-internal-generated-quote".into(), "1".into());
+        let parent = Style {
+            display: Display::Flex,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
+        let word = Style {
+            display: Display::InlineFlex,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-unbroken-inline-word".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
         let nodes = vec![
-            PaintNode { kind: ComponentKind::Row, style: parent, parent: None, sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Row, style: word, parent: Some(0), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "\"".into() }, style: quote_style, parent: Some(1), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "Before".into() }, style: Style { flex_shrink: 0.0, ..text_style.clone() }, parent: Some(1), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: " ".into() }, style: text_style.clone(), parent: Some(0), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "block".into() }, style: text_style.clone(), parent: Some(0), sticky_counter_signal: None },
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: parent,
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: word,
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: "\"".into(),
+                },
+                style: quote_style,
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: "Before".into(),
+                },
+                style: Style {
+                    flex_shrink: 0.0,
+                    ..text_style.clone()
+                },
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: " ".into(),
+                },
+                style: text_style.clone(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: "block".into(),
+                },
+                style: text_style.clone(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
         ];
         let advances = render_skia::measure_skia_inline_fragment_advances(
-            &["Before", " ", "block"], &text_style).unwrap();
+            &["Before", " ", "block"],
+            &text_style,
+        )
+        .unwrap();
         let mut layouts = vec![
-            (LayoutRect { x: 20.0, y: 20.0, width: 300.0, height: 22.0 }, 0),
-            (LayoutRect { x: 20.0, y: 20.0, width: 6.0 + advances[0], height: 22.0 }, 1),
-            (LayoutRect { x: 20.0, y: 20.0, width: 6.0, height: 22.0 }, 2),
+            (
+                LayoutRect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 300.0,
+                    height: 22.0,
+                },
+                0,
+            ),
+            (
+                LayoutRect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 6.0 + advances[0],
+                    height: 22.0,
+                },
+                1,
+            ),
+            (
+                LayoutRect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 6.0,
+                    height: 22.0,
+                },
+                2,
+            ),
         ];
         let mut x = 26.0;
         for (index, width) in advances.into_iter().enumerate() {
-            layouts.push((LayoutRect { x, y: 20.0, width, height: 22.0 }, index + 3));
+            layouts.push((
+                LayoutRect {
+                    x,
+                    y: 20.0,
+                    width,
+                    height: 22.0,
+                },
+                index + 3,
+            ));
             x += width;
         }
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
         let slices = build(&artifact, [2, 3, 4, 5].into_iter(), &face);
-        assert!([3, 4, 5].iter().all(|index| slices.contains_key(index)),
-            "a no-break quote wrapper must not split the adjacent text's shared glyph slices");
+        assert!(
+            [3, 4, 5].iter().all(|index| slices.contains_key(index)),
+            "a no-break quote wrapper must not split the adjacent text's shared glyph slices"
+        );
     }
 
     #[test]
     fn merged_bidi_replay_does_not_reuse_the_first_word_glyph_slice() {
-        let style = Style { display: Display::Inline, font_family: Some("serif".into()),
-            font_size: 16.0, color: w3cos_std::Color::BLACK,
-            custom_properties: Some(HashMap::from([
-                ("--w3cos-internal-bidi-logical-order".into(), "0".into())])),
-            ..Style::default() };
-        let face = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
-        let parent = Style { display: Display::Flex, custom_properties: Some(HashMap::from([
-            ("--w3cos-internal-inline-formatting-context".into(), "1".into())])),
-            ..Style::default() };
-        let mut nodes = vec![PaintNode { kind: ComponentKind::Row, style: parent,
-            parent: None, sticky_counter_signal: None }];
-        let mut layouts = vec![(LayoutRect { x: 20.0, y: 20.0, width: 360.0, height: 22.0 }, 0)];
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("serif".into()),
+            font_size: 16.0,
+            color: w3cos_std::Color::BLACK,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-bidi-logical-order".into(),
+                "0".into(),
+            )])),
+            ..Style::default()
+        };
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::normal())
+            .unwrap();
+        let parent = Style {
+            display: Display::Flex,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
+        let mut nodes = vec![PaintNode {
+            kind: ComponentKind::Row,
+            style: parent,
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        let mut layouts = vec![(
+            LayoutRect {
+                x: 20.0,
+                y: 20.0,
+                width: 360.0,
+                height: 22.0,
+            },
+            0,
+        )];
         let mut x = 20.0;
         for text in ["This", " ", "is", " ", "text"] {
             let width = skia_text_run::css_font_for_style(&face, style.font_size, &style)
-                .measure_str(text, None).0;
+                .measure_str(text, None)
+                .0;
             let index = nodes.len();
-            nodes.push(PaintNode { kind: ComponentKind::Text { content: text.into() },
-                style: style.clone(), parent: Some(0), sticky_counter_signal: None });
-            layouts.push((LayoutRect { x, y: 20.0, width, height: 22.0 }, index));
+            nodes.push(PaintNode {
+                kind: ComponentKind::Text {
+                    content: text.into(),
+                },
+                style: style.clone(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            });
+            layouts.push((
+                LayoutRect {
+                    x,
+                    y: 20.0,
+                    width,
+                    height: 22.0,
+                },
+                index,
+            ));
             x += width;
         }
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
-        let input = layouts[1..].iter().map(|(rect,index)|
-            (*index,*rect,&artifact.nodes[*index].kind,&artifact.nodes[*index].style))
+        let input = layouts[1..]
+            .iter()
+            .map(|(rect, index)| {
+                (
+                    *index,
+                    *rect,
+                    &artifact.nodes[*index].kind,
+                    &artifact.nodes[*index].style,
+                )
+            })
             .collect::<Vec<_>>();
         let replay = crate::bidi_paint::replay(&input, &artifact);
-        let merged = replay.iter().find(|node| matches!(node.kind.as_ref(),
-            ComponentKind::Text { content } if content == "This is text")).unwrap();
-        let actual_nodes = replay.iter().map(|node|
-            (node.index,node.rect,node.kind.as_ref(),node.style.as_ref())).collect::<Vec<_>>();
-        let expected_rect = LayoutRect { width: 360.0, ..merged.rect };
-        let expected_nodes = [(merged.index,expected_rect,merged.kind.as_ref(),merged.style.as_ref())];
-        let paint = |nodes: &[(usize,LayoutRect,&ComponentKind,&Style)], artifact| {
+        let merged = replay
+            .iter()
+            .find(|node| {
+                matches!(node.kind.as_ref(),
+            ComponentKind::Text { content } if content == "This is text")
+            })
+            .unwrap();
+        let actual_nodes = replay
+            .iter()
+            .map(|node| {
+                (
+                    node.index,
+                    node.rect,
+                    node.kind.as_ref(),
+                    node.style.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_rect = LayoutRect {
+            width: 360.0,
+            ..merged.rect
+        };
+        let expected_nodes = [(
+            merged.index,
+            expected_rect,
+            merged.kind.as_ref(),
+            merged.style.as_ref(),
+        )];
+        let paint = |nodes: &[(usize, LayoutRect, &ComponentKind, &Style)], artifact| {
             // Independent captures cannot inherit retained recordings from
             // the other side of the comparison under the same client IDs.
             let mut renderer = render_skia::SkiaRasterizer::new_host().unwrap();
-            renderer.render_frame(400,80,nodes,crate::layout::layout_font(),
-                &[],&HashMap::new(),None,w3cos_std::Color::WHITE,
-                artifact,None,1.0).unwrap().to_vec()
+            renderer
+                .render_frame(
+                    400,
+                    80,
+                    nodes,
+                    crate::layout::layout_font(),
+                    &[],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    artifact,
+                    None,
+                    1.0,
+                )
+                .unwrap()
+                .to_vec()
         };
         let expected = paint(&expected_nodes, None);
         let actual = paint(&actual_nodes, Some(&artifact));
-        let different = actual.chunks_exact(4).zip(expected.chunks_exact(4))
-            .filter(|(actual, expected)| actual != expected).count();
-        assert_eq!(different, 0, "a merged replay Text must paint all its glyphs, not its original ID's first-word slice");
+        let different = actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .filter(|(actual, expected)| actual != expected)
+            .count();
+        assert_eq!(
+            different, 0,
+            "a merged replay Text must paint all its glyphs, not its original ID's first-word slice"
+        );
     }
-
 
     #[test]
     fn authored_glyph_view_starts_at_its_used_inline_origin() {
-        let face = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
-        let texts = ["This", " ", "line", " ", "is", " ", "all", " ",
-            "in", " ", "one", " ", "font", " ", "size", " "];
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::normal())
+            .unwrap();
+        let texts = [
+            "This", " ", "line", " ", "is", " ", "all", " ", "in", " ", "one", " ", "font", " ",
+            "size", " ",
+        ];
         let text = texts.concat();
-        let mut style = Style { display: Display::Inline, font_family: Some("serif".into()),
-            font_size: 19.2, ..Style::default() };
+        let mut style = Style {
+            display: Display::Inline,
+            font_family: Some("serif".into()),
+            font_size: 19.2,
+            ..Style::default()
+        };
         w3cos_std::inline_text::set_fragment_ends(&mut style, &text, &[17, 28, text.len()]);
         let groups = authored_word_groups(&texts, &style).unwrap();
-        let starts = groups.iter().map(|(range, _)| range.start + 1).collect::<Vec<_>>();
-        let widths = groups.into_iter().flat_map(|(_, widths)| widths).collect::<Vec<_>>();
-        let parent = Style { display: Display::Flex, custom_properties: Some(HashMap::from([
-            ("--w3cos-internal-inline-formatting-context".into(), "1".into())])), ..Style::default() };
-        let mut nodes = vec![PaintNode { kind: ComponentKind::Row, style: parent, parent: None,
-            sticky_counter_signal: None }];
-        let mut layouts = vec![(LayoutRect { x: 11.0, y: 20.0, width: 300.0, height: 24.0 }, 0)];
+        let starts = groups
+            .iter()
+            .map(|(range, _)| range.start + 1)
+            .collect::<Vec<_>>();
+        let widths = groups
+            .into_iter()
+            .flat_map(|(_, widths)| widths)
+            .collect::<Vec<_>>();
+        let parent = Style {
+            display: Display::Flex,
+            custom_properties: Some(HashMap::from([(
+                "--w3cos-internal-inline-formatting-context".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
+        let mut nodes = vec![PaintNode {
+            kind: ComponentKind::Row,
+            style: parent,
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        let mut layouts = vec![(
+            LayoutRect {
+                x: 11.0,
+                y: 20.0,
+                width: 300.0,
+                height: 24.0,
+            },
+            0,
+        )];
         let mut x = 11.0;
         for (text, width) in texts.iter().zip(widths) {
-            nodes.push(PaintNode { kind: ComponentKind::Text { content: (*text).into() },
-                style: style.clone(), parent: Some(0), sticky_counter_signal: None });
-            layouts.push((LayoutRect { x, y: 20.0, width, height: 24.0 }, nodes.len() - 1));
+            nodes.push(PaintNode {
+                kind: ComponentKind::Text {
+                    content: (*text).into(),
+                },
+                style: style.clone(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            });
+            layouts.push((
+                LayoutRect {
+                    x,
+                    y: 20.0,
+                    width,
+                    height: 24.0,
+                },
+                nodes.len() - 1,
+            ));
             x += width;
         }
         let count = nodes.len();
@@ -612,9 +1127,11 @@ mod tests {
         assert_eq!(artifact.rect_by_index[starts[1]].unwrap().x, 125.125);
         for index in starts {
             let run = &fragments[&index].runs[0];
-            assert_eq!(run.origin_x + run.positions[0].x,
+            assert_eq!(
+                run.origin_x + run.positions[0].x,
                 artifact.rect_by_index[index].unwrap().x,
-                "an authored glyph view must start at its used inline origin");
+                "an authored glyph view must start at its used inline origin"
+            );
         }
     }
 
@@ -623,7 +1140,8 @@ mod tests {
         w3cos_dom::stylesheet::clear_rules();
         let mut document = w3cos_dom::Document::new();
         let p = document.create_element("p");
-        let before = document.create_text_node("PREREQUISITE: Operating system needs to have the '");
+        let before =
+            document.create_text_node("PREREQUISITE: Operating system needs to have the '");
         let link = document.create_element("a");
         link.set_attribute(&mut document, "href", "support/AHEM_whitespace.ttf");
         let text = document.create_text_node("White Space");
@@ -635,22 +1153,38 @@ mod tests {
         document.body().append_child(&mut document, p);
         let root = document.to_component_tree();
         let flat = crate::layout::pre_flatten(&root);
-        let nodes = flat.iter().map(|node| PaintNode {
-            kind: node.kind.clone(), style: node.style.clone(), parent: node.parent,
-            sticky_counter_signal: None,
-        }).collect::<Vec<_>>();
+        let nodes = flat
+            .iter()
+            .map(|node| PaintNode {
+                kind: node.kind.clone(),
+                style: node.style.clone(),
+                parent: node.parent,
+                sticky_counter_signal: None,
+            })
+            .collect::<Vec<_>>();
         let layouts = crate::layout::compute(&root, 800.0, 600.0).unwrap();
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
-        let face = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::normal())
+            .unwrap();
         let fragments = build(&artifact, 0..artifact.nodes.len(), &face);
         let words = artifact.nodes.iter().enumerate().filter(|(_,node)|
             matches!(&node.kind, ComponentKind::Text { content } if content == "White" || content == "Space"))
             .collect::<Vec<_>>();
-        assert_eq!(words.len(), 2, "actual DOM must lower to the original split words");
+        assert_eq!(
+            words.len(),
+            2,
+            "actual DOM must lower to the original split words"
+        );
         for (index, node) in words {
-            assert!(fragments.get(&index).is_some_and(|fragment| fragment.decoration.is_some()),
+            assert!(
+                fragments
+                    .get(&index)
+                    .is_some_and(|fragment| fragment.decoration.is_some()),
                 "lowered decorated source needs shared coverage: index={index}, style={:?}, parent={:?}",
-                node.style, node.parent.map(|parent| &artifact.nodes[parent].style));
+                node.style,
+                node.parent.map(|parent| &artifact.nodes[parent].style)
+            );
         }
         w3cos_dom::stylesheet::clear_rules();
     }
@@ -661,8 +1195,15 @@ mod tests {
         w3cos_dom::stylesheet::register_rule("div::first-line", &[("background", "orange")]);
         let mut document = w3cos_dom::Document::new();
         let block = document.create_element("div");
-        for (index, text) in ["First line in 2nd block box.", "Second line.",
-            "First line after block-in-inline is not ::first-line.", "Second line."].iter().enumerate() {
+        for (index, text) in [
+            "First line in 2nd block box.",
+            "Second line.",
+            "First line after block-in-inline is not ::first-line.",
+            "Second line.",
+        ]
+        .iter()
+        .enumerate()
+        {
             if index > 0 {
                 let br = document.create_element("br");
                 block.append_child(&mut document, br);
@@ -673,23 +1214,35 @@ mod tests {
         document.body().append_child(&mut document, block);
         let root = document.to_component_tree();
         let flat = crate::layout::pre_flatten(&root);
-        let nodes = flat.iter().map(|node| PaintNode {
-            kind: node.kind.clone(), style: node.style.clone(), parent: node.parent,
-            sticky_counter_signal: None,
-        }).collect::<Vec<_>>();
+        let nodes = flat
+            .iter()
+            .map(|node| PaintNode {
+                kind: node.kind.clone(),
+                style: node.style.clone(),
+                parent: node.parent,
+                sticky_counter_signal: None,
+            })
+            .collect::<Vec<_>>();
         let layouts = crate::layout::compute(&root, 800.0, 600.0).unwrap();
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
-        let face = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::normal())
+            .unwrap();
         let fragments = build(&artifact, 0..artifact.nodes.len(), &face);
         let (index, node) = artifact.nodes.iter().enumerate().find(|(_, node)|
             matches!(&node.kind, ComponentKind::Text { content } if content == "in")).unwrap();
-        assert!(fragments.contains_key(&index),
-            "first-line paint must not discard authored shaping: index={index}, style={:?}", node.style);
+        assert!(
+            fragments.contains_key(&index),
+            "first-line paint must not discard authored shaping: index={index}, style={:?}",
+            node.style
+        );
         assert_eq!(node.style.background_image.as_deref(), Some("none"));
         let mut image_style = node.style.clone();
         image_style.background_image = Some("url(background.png)".into());
-        assert!(!crate::layout::is_plain_inline_word_fragment(&node.kind, &image_style),
-            "an actual background image remains a fragment barrier");
+        assert!(
+            !crate::layout::is_plain_inline_word_fragment(&node.kind, &image_style),
+            "an actual background image remains a fragment barrier"
+        );
         w3cos_dom::stylesheet::clear_rules();
     }
 
@@ -730,105 +1283,109 @@ mod tests {
                     w3cos_std::Color::rgb(0, 0, 255),
                 ] {
                     for parent_display in [Display::Flex, Display::Inline] {
-                    let style = Style {
-                        display: Display::Inline,
-                        font_family: Some("serif".into()),
-                        font_size: 16.0,
-                        line_height: 1.125,
-                        font_kerning: kerning,
-                        color: w3cos_std::Color::BLACK,
-                        background,
-                        ..Style::default()
-                    };
-                    let parent = Style {
-                        display: parent_display,
-                        custom_properties: Some(HashMap::from([(
-                            "--w3cos-internal-inline-formatting-context".into(),
-                            "1".into(),
-                        )])),
-                        ..Style::default()
-                    };
-                    let lines = [["⇦", " ", "There"], ["There", " ", "should"]];
-                    let mut nodes = vec![PaintNode {
-                        kind: ComponentKind::Row,
-                        style: parent,
-                        parent: None,
-                        sticky_counter_signal: None,
-                    }];
-                    let mut layouts = vec![(
-                        LayoutRect {
-                            x: origin,
-                            y: 8.0,
-                            width: 112.0,
-                            height: 36.0,
-                        },
-                        0,
-                    )];
-                    for (row, texts) in lines.iter().enumerate() {
-                        let mut x = origin;
-                        let widths =
-                            render_skia::measure_skia_inline_fragment_advances(texts, &style)
-                                .unwrap();
-                        for (text, width) in texts.iter().zip(widths) {
-                            nodes.push(PaintNode {
-                                kind: ComponentKind::Text {
-                                    content: (*text).into(),
-                                },
-                                style: style.clone(),
-                                parent: Some(0),
-                                sticky_counter_signal: None,
-                            });
-                            layouts.push((
-                                LayoutRect {
-                                    x,
-                                    y: 8.0 + row as f32 * 18.0,
-                                    width,
-                                    height: 18.0,
-                                },
-                                nodes.len() - 1,
-                            ));
-                            x += width;
-                        }
-                    }
-                    let count = nodes.len();
-                    let artifact = PaintArtifact::build(nodes, &layouts, 1);
-                    let fragments = build(&artifact, (1..count).into_iter(), &face);
-                    assert_eq!(fragments.len(), 6);
-                    let pixels = |split: bool| {
-                        let mut surface = Surface::new_raster_n32_premul((800, 48)).unwrap();
-                        surface.canvas().clear(Color::WHITE);
-                        if split {
-                            for index in 1..count {
-                                fragments[&index].paint(
-                                    surface.canvas(),
-                                    artifact.rect_by_index[index].unwrap(),
-                                    &style,
-                                );
-                            }
-                        } else {
-                            for (row, line) in lines.iter().enumerate() {
-                                render_skia::draw_text_line(
-                                    surface.canvas(),
-                                    origin,
-                                    8.0 + row as f32 * 18.0,
-                                    &line.concat(),
-                                    16.0,
-                                    style.color,
-                                    style.opacity,
-                                    &face,
-                                    &style,
-                                );
+                        let style = Style {
+                            display: Display::Inline,
+                            font_family: Some("serif".into()),
+                            font_size: 16.0,
+                            line_height: 1.125,
+                            font_kerning: kerning,
+                            color: w3cos_std::Color::BLACK,
+                            background,
+                            ..Style::default()
+                        };
+                        let parent = Style {
+                            display: parent_display,
+                            custom_properties: Some(HashMap::from([(
+                                "--w3cos-internal-inline-formatting-context".into(),
+                                "1".into(),
+                            )])),
+                            ..Style::default()
+                        };
+                        let lines = [["⇦", " ", "There"], ["There", " ", "should"]];
+                        let mut nodes = vec![PaintNode {
+                            kind: ComponentKind::Row,
+                            style: parent,
+                            parent: None,
+                            sticky_counter_signal: None,
+                        }];
+                        let mut layouts = vec![(
+                            LayoutRect {
+                                x: origin,
+                                y: 8.0,
+                                width: 112.0,
+                                height: 36.0,
+                            },
+                            0,
+                        )];
+                        for (row, texts) in lines.iter().enumerate() {
+                            let mut x = origin;
+                            let widths =
+                                render_skia::measure_skia_inline_fragment_advances(texts, &style)
+                                    .unwrap();
+                            for (text, width) in texts.iter().zip(widths) {
+                                nodes.push(PaintNode {
+                                    kind: ComponentKind::Text {
+                                        content: (*text).into(),
+                                    },
+                                    style: style.clone(),
+                                    parent: Some(0),
+                                    sticky_counter_signal: None,
+                                });
+                                layouts.push((
+                                    LayoutRect {
+                                        x,
+                                        y: 8.0 + row as f32 * 18.0,
+                                        width,
+                                        height: 18.0,
+                                    },
+                                    nodes.len() - 1,
+                                ));
+                                x += width;
                             }
                         }
-                        let info =
-                            ImageInfo::new((800, 48), ColorType::RGBA8888, AlphaType::Premul, None);
-                        let mut pixels = vec![0; 800 * 48 * 4];
-                        assert!(surface.read_pixels(&info, &mut pixels, 800 * 4, (0, 0)));
-                        pixels
-                    };
-                    let whole = pixels(false);
-                    assert!(whole.chunks_exact(4).any(|pixel| pixel[0] < 200));
-                    assert_eq!(pixels(true), whole, "kerning={kerning}, origin={origin}");
+                        let count = nodes.len();
+                        let artifact = PaintArtifact::build(nodes, &layouts, 1);
+                        let fragments = build(&artifact, (1..count).into_iter(), &face);
+                        assert_eq!(fragments.len(), 6);
+                        let pixels = |split: bool| {
+                            let mut surface = Surface::new_raster_n32_premul((800, 48)).unwrap();
+                            surface.canvas().clear(Color::WHITE);
+                            if split {
+                                for index in 1..count {
+                                    fragments[&index].paint(
+                                        surface.canvas(),
+                                        artifact.rect_by_index[index].unwrap(),
+                                        &style,
+                                    );
+                                }
+                            } else {
+                                for (row, line) in lines.iter().enumerate() {
+                                    render_skia::draw_text_line(
+                                        surface.canvas(),
+                                        origin,
+                                        8.0 + row as f32 * 18.0,
+                                        &line.concat(),
+                                        16.0,
+                                        style.color,
+                                        style.opacity,
+                                        &face,
+                                        &style,
+                                    );
+                                }
+                            }
+                            let info = ImageInfo::new(
+                                (800, 48),
+                                ColorType::RGBA8888,
+                                AlphaType::Premul,
+                                None,
+                            );
+                            let mut pixels = vec![0; 800 * 48 * 4];
+                            assert!(surface.read_pixels(&info, &mut pixels, 800 * 4, (0, 0)));
+                            pixels
+                        };
+                        let whole = pixels(false);
+                        assert!(whole.chunks_exact(4).any(|pixel| pixel[0] < 200));
+                        assert_eq!(pixels(true), whole, "kerning={kerning}, origin={origin}");
                     }
                 }
             }

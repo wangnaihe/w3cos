@@ -1492,10 +1492,14 @@ fn node_language(document: &Document, mut node: NodeId) -> Option<String> {
 }
 
 pub(crate) fn document_language(document: &Document) -> Option<String> {
-    document.query_selector_all("meta").into_iter().find(|meta| {
-        meta.get_attribute(document, "http-equiv")
-            .is_some_and(|value| value.eq_ignore_ascii_case("content-language"))
-    }).and_then(|meta| meta.get_attribute(document, "content").map(str::to_string))
+    document
+        .query_selector_all("meta")
+        .into_iter()
+        .find(|meta| {
+            meta.get_attribute(document, "http-equiv")
+                .is_some_and(|value| value.eq_ignore_ascii_case("content-language"))
+        })
+        .and_then(|meta| meta.get_attribute(document, "content").map(str::to_string))
         .filter(|language| !language.trim().is_empty())
 }
 
@@ -1611,7 +1615,11 @@ fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext
     SelectorContext::new(&node.tag.as_str(), id_attribute, &class_refs)
         .with_attributes(&attribute_refs)
         .with_tree_state(is_first_child, is_root)
-        .with_focus_state(document.is_focused(id), document.is_focus_visible(id), document.is_focus_within(id))
+        .with_focus_state(
+            document.is_focused(id),
+            document.is_focus_visible(id),
+            document.is_focus_within(id),
+        )
         .with_html_document(document.is_html_document())
         .with_html_element(document.is_html_document() && node.is_html_element)
 }
@@ -2116,14 +2124,15 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                     }
                     (false, false, "checked") => compound.pseudo_classes.push(PseudoClass::Checked),
                     (false, false, "focus") => compound.pseudo_classes.push(PseudoClass::Focus),
-                    (false, false, "focus-visible") => compound.pseudo_classes.push(PseudoClass::FocusVisible),
-                    (false, false, "focus-within") => compound.pseudo_classes.push(PseudoClass::FocusWithin),
-                    (
-                        false,
-                        false,
-                        "active" | "hover"
-                        | "indeterminate" | "placeholder-shown",
-                    ) => compound.unsupported = true,
+                    (false, false, "focus-visible") => {
+                        compound.pseudo_classes.push(PseudoClass::FocusVisible)
+                    }
+                    (false, false, "focus-within") => {
+                        compound.pseudo_classes.push(PseudoClass::FocusWithin)
+                    }
+                    (false, false, "active" | "hover" | "indeterminate" | "placeholder-shown") => {
+                        compound.unsupported = true
+                    }
                     (
                         true,
                         false,
@@ -2827,7 +2836,11 @@ mod tests {
         second.set_class_name(&mut document, "item");
         assert_node_first_child_state(
             &document,
-            &[(parent.id, false), (first.id, false), (leading_comment.id, false)],
+            &[
+                (parent.id, false),
+                (first.id, false),
+                (leading_comment.id, false),
+            ],
         );
         for id in [
             leading_text.id,
@@ -2853,8 +2866,14 @@ mod tests {
         assert_node_first_child_state(&document, &expected);
         document.append_child(document.body().id, parent.id);
         assert_node_first_child_state(&document, &expected);
-        assert_eq!(document.matches_selector(first.id, ".item:first-child"), Ok(true));
-        assert_eq!(document.matches_selector(second.id, ".item:first-child"), Ok(false));
+        assert_eq!(
+            document.matches_selector(first.id, ".item:first-child"),
+            Ok(true)
+        );
+        assert_eq!(
+            document.matches_selector(second.id, ".item:first-child"),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -2870,7 +2889,13 @@ mod tests {
         let first = document.create_element("span");
         let middle_text = document.create_text_node("between");
         let second = document.create_element("span");
-        for id in [leading_text.id, leading_comment.id, first.id, middle_text.id, second.id] {
+        for id in [
+            leading_text.id,
+            leading_comment.id,
+            first.id,
+            middle_text.id,
+            second.id,
+        ] {
             document.append_child(parent.id, id);
         }
         let destination_comment = document.create_comment("destination");
@@ -2888,7 +2913,12 @@ mod tests {
         document.insert_before(destination.id, first.id, anchor.id);
         assert_node_first_child_state(
             &document,
-            &[(first.id, true), (anchor.id, false), (second.id, false), (middle_text.id, false)],
+            &[
+                (first.id, true),
+                (anchor.id, false),
+                (second.id, false),
+                (middle_text.id, false),
+            ],
         );
         document.remove_child(destination.id, first.id);
         assert_node_first_child_state(&document, &[(first.id, false), (anchor.id, true)]);

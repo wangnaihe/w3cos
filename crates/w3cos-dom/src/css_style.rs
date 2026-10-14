@@ -1,9 +1,9 @@
 use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
-    AlignItems, BoxSizing, Clear, ColumnFill, Contain, CssClipRect, Dimension, Display, Edges, FlexDirection,
-    FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
-    UnicodeBidi, WillChange, parse_css_integer_clamped,
+    AlignItems, BoxSizing, Clear, ColumnFill, Contain, CssClipRect, Dimension, Display, Edges,
+    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style,
+    TextDirection, UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
@@ -32,8 +32,13 @@ fn invalid_cssom_declaration(name: &str, value: &str) -> bool {
         return false;
     }
     match name {
-        "border-top-style" | "borderTopStyle" | "border-right-style" | "borderRightStyle"
-        | "border-bottom-style" | "borderBottomStyle" | "border-left-style"
+        "border-top-style"
+        | "borderTopStyle"
+        | "border-right-style"
+        | "borderRightStyle"
+        | "border-bottom-style"
+        | "borderBottomStyle"
+        | "border-left-style"
         | "borderLeftStyle" => parse_border_line_style(value).is_none(),
         "text-decoration-color" | "textDecorationColor" => {
             keyword != "currentcolor" && Color::from_css(value).is_none()
@@ -151,8 +156,19 @@ impl CSSStyleDeclaration {
         if !valid_multicol_declaration(name, value) {
             return;
         }
-        if name == "resize" && !matches!(value.trim().to_ascii_lowercase().as_str(),
-            "none" | "both" | "horizontal" | "vertical" | "block" | "inline" | "initial" | "unset") {
+        if name == "resize"
+            && !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "none"
+                    | "both"
+                    | "horizontal"
+                    | "vertical"
+                    | "block"
+                    | "inline"
+                    | "initial"
+                    | "unset"
+            )
+        {
             return;
         }
         // An invalid longhand or shorthand is dropped at parse time. Replacing
@@ -198,15 +214,24 @@ impl CSSStyleDeclaration {
                 if w3cos_std::background::split_top_level(value, ',').len() == 1
                     && w3cos_std::background::is_valid_image_list(value)
                 {
-                    self.inner.custom_properties.get_or_insert_with(Default::default)
-                        .insert(LIST_IMAGE_PROPERTY.into(), if value.eq_ignore_ascii_case("none") {
-                            "none".into()
-                        } else { value.into() });
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            LIST_IMAGE_PROPERTY.into(),
+                            if value.eq_ignore_ascii_case("none") {
+                                "none".into()
+                            } else {
+                                value.into()
+                            },
+                        );
                 }
             }
             "list-style" | "listStyle" => {
                 if let Some((_, _, image)) = list_style_properties(value) {
-                    self.inner.custom_properties.get_or_insert_with(Default::default)
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
                         .insert(LIST_IMAGE_PROPERTY.into(), image);
                 }
             }
@@ -247,13 +272,19 @@ impl CSSStyleDeclaration {
             "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
             "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
             "column-width" | "columnWidth" => {
-                if let Some(width) = parse_column_width(value) { self.inner.column_width = width; }
+                if let Some(width) = parse_column_width(value) {
+                    self.inner.column_width = width;
+                }
             }
             "column-count" | "columnCount" => {
-                if let Some(count) = parse_column_count(value) { self.inner.column_count = count; }
+                if let Some(count) = parse_column_count(value) {
+                    self.inner.column_count = count;
+                }
             }
             "column-fill" | "columnFill" => {
-                if let Some(fill) = parse_column_fill(value) { self.inner.column_fill = fill; }
+                if let Some(fill) = parse_column_fill(value) {
+                    self.inner.column_fill = fill;
+                }
             }
             "columns" => {
                 if let Some((width, count)) = parse_columns(value) {
@@ -525,10 +556,17 @@ impl CSSStyleDeclaration {
             "overflow" => self.inner.overflow = parse_overflow(value),
             "resize" => {
                 let value = value.trim().to_ascii_lowercase();
-                self.inner.custom_properties.get_or_insert_with(Default::default)
-                    .insert(RESIZE_PROPERTY.into(), if matches!(value.as_str(), "initial" | "unset") {
-                        "none".into()
-                    } else { value });
+                self.inner
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        RESIZE_PROPERTY.into(),
+                        if matches!(value.as_str(), "initial" | "unset") {
+                            "none".into()
+                        } else {
+                            value
+                        },
+                    );
             }
             "clip" => {
                 if let Some(clip) = parse_clip(value) {
@@ -587,8 +625,9 @@ impl CSSStyleDeclaration {
                 // A negative size is invalid, so it is dropped and the previous
                 // declaration in the same rule survives (`font-size-123`).
                 if !is_negative_font_size_value(value)
-                    && let Some(v) = absolute_font_size_keyword_px(value, self.inner.font_family.as_deref())
-                        .or_else(|| parse_px(value))
+                    && let Some(v) =
+                        absolute_font_size_keyword_px(value, self.inner.font_family.as_deref())
+                            .or_else(|| parse_px(value))
                 {
                     self.inner.font_size = v
                 }
@@ -937,22 +976,37 @@ impl CSSStyleDeclaration {
             }
             "text-decoration" | "textDecoration" => {
                 self.inner.text_decoration = parse_text_decoration(value);
-                if matches!(value.trim(), "none" | "underline" | "overline" | "line-through") {
-                    self.inner.custom_properties.get_or_insert_with(Default::default)
+                if matches!(
+                    value.trim(),
+                    "none" | "underline" | "overline" | "line-through"
+                ) {
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
                         .insert(TEXT_DECORATION_COLOR_PROPERTY.into(), "currentcolor".into());
                 }
             }
             "text-decoration-color" | "textDecorationColor" => {
                 let value = value.trim();
                 let lower = value.to_ascii_lowercase();
-                if matches!(lower.as_str(), "currentcolor" | "inherit" | "initial" | "unset")
-                    || Color::from_css(value).is_some()
+                if matches!(
+                    lower.as_str(),
+                    "currentcolor" | "inherit" | "initial" | "unset"
+                ) || Color::from_css(value).is_some()
                 {
-                    self.inner.custom_properties.get_or_insert_with(Default::default)
-                        .insert(TEXT_DECORATION_COLOR_PROPERTY.into(),
-                            if matches!(lower.as_str(), "initial" | "unset") { "currentcolor".into() }
-                            else if matches!(lower.as_str(), "currentcolor" | "inherit") { lower }
-                            else { value.into() });
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            TEXT_DECORATION_COLOR_PROPERTY.into(),
+                            if matches!(lower.as_str(), "initial" | "unset") {
+                                "currentcolor".into()
+                            } else if matches!(lower.as_str(), "currentcolor" | "inherit") {
+                                lower
+                            } else {
+                                value.into()
+                            },
+                        );
                 }
             }
             "text-overflow" | "textOverflow" => {
@@ -1029,11 +1083,12 @@ impl CSSStyleDeclaration {
                     self.inner.align_self = w3cos_std::style::AlignSelf::Baseline;
                     let baseline_descent = self.inner.font_size * 0.2;
                     let line_extension = (offset.abs() - baseline_descent).max(0.0);
-                    if !matches!(self.inner.display,
+                    if !matches!(
+                        self.inner.display,
                         w3cos_std::style::Display::InlineBlock
                             | w3cos_std::style::Display::InlineFlex
-                            | w3cos_std::style::Display::InlineTable)
-                    {
+                            | w3cos_std::style::Display::InlineTable
+                    ) {
                         if offset >= 0.0 {
                             self.inner.margin.bottom = Spacing::Px(line_extension);
                         } else {
@@ -1084,13 +1139,31 @@ impl CSSStyleDeclaration {
                 let (mut width, mut line_style, mut color) = (None, None, None);
                 for part in split_css_whitespace(value) {
                     if let Some(parsed) = parse_border_width(&part) {
-                        if width.replace(parsed).is_some() { return; }
-                    } else if matches!(part.as_str(), "none" | "solid" | "dashed" | "dotted"
-                        | "double" | "groove" | "ridge" | "inset" | "outset") {
-                        if line_style.replace(parse_outline_style(&part)).is_some() { return; }
+                        if width.replace(parsed).is_some() {
+                            return;
+                        }
+                    } else if matches!(
+                        part.as_str(),
+                        "none"
+                            | "solid"
+                            | "dashed"
+                            | "dotted"
+                            | "double"
+                            | "groove"
+                            | "ridge"
+                            | "inset"
+                            | "outset"
+                    ) {
+                        if line_style.replace(parse_outline_style(&part)).is_some() {
+                            return;
+                        }
                     } else if let Some(parsed) = Color::from_css(&part) {
-                        if color.replace(parsed).is_some() { return; }
-                    } else { return; }
+                        if color.replace(parsed).is_some() {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
                 }
                 self.inner.outline_width = width.unwrap_or(3.0);
                 self.inner.outline_style = line_style.unwrap_or_default();
@@ -1134,17 +1207,29 @@ impl CSSStyleDeclaration {
 
     pub fn get_property(&self, name: &str) -> String {
         match name {
-            "text-decoration-color" | "textDecorationColor" => self.inner.custom_properties.as_ref()
-                .and_then(|properties| properties.get(TEXT_DECORATION_COLOR_PROPERTY)).cloned()
+            "text-decoration-color" | "textDecorationColor" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(TEXT_DECORATION_COLOR_PROPERTY))
+                .cloned()
                 .unwrap_or_else(|| "currentcolor".into()),
             "column-width" | "columnWidth" => dimension_to_css(&self.inner.column_width),
-            "column-count" | "columnCount" => self.inner.column_count
+            "column-count" | "columnCount" => self
+                .inner
+                .column_count
                 .map_or_else(|| "auto".into(), |count| count.to_string()),
             "column-fill" | "columnFill" => match self.inner.column_fill {
-                ColumnFill::Auto => "auto", ColumnFill::Balance => "balance",
+                ColumnFill::Auto => "auto",
+                ColumnFill::Balance => "balance",
                 ColumnFill::BalanceAll => "balance-all",
-            }.into(),
-            "columns" => format!("{} {}", self.get_property("column-width"), self.get_property("column-count")),
+            }
+            .into(),
+            "columns" => format!(
+                "{} {}",
+                self.get_property("column-width"),
+                self.get_property("column-count")
+            ),
             "display" => match self.inner.display {
                 Display::Block => "block".to_string(),
                 Display::FlowRoot => "flow-root".to_string(),
@@ -1253,8 +1338,12 @@ impl CSSStyleDeclaration {
                 .background_image
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
-            "list-style-image" | "listStyleImage" => self.inner.custom_properties.as_ref()
-                .and_then(|properties| properties.get(LIST_IMAGE_PROPERTY)).cloned()
+            "list-style-image" | "listStyleImage" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(LIST_IMAGE_PROPERTY))
+                .cloned()
                 .unwrap_or_else(|| "none".into()),
             "background-size" | "backgroundSize" => self
                 .inner
@@ -1333,8 +1422,12 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
-            "resize" => self.inner.custom_properties.as_ref()
-                .and_then(|properties| properties.get(RESIZE_PROPERTY)).cloned()
+            "resize" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(RESIZE_PROPERTY))
+                .cloned()
                 .unwrap_or_else(|| "none".into()),
             "clip" => self.inner.clip.map_or_else(
                 || "auto".to_string(),
@@ -1817,10 +1910,16 @@ fn parse_px(value: &str) -> Option<f32> {
 pub(crate) fn parse_border_width(value: &str) -> Option<f32> {
     // Relative zero lengths are context-free, including signed zero. Keep
     // them distinct from unresolved non-zero font/viewport-relative lengths.
-    let normalized=value.trim().to_ascii_lowercase();
-    for unit in ["rem","em","ex","ch","rlh","lh","dvw","dvh","svw","svh",
-        "lvw","lvh","vmin","vmax","vw","vh"] {
-        if normalized.strip_suffix(unit).and_then(|v|v.parse::<f32>().ok())==Some(0.0) {
+    let normalized = value.trim().to_ascii_lowercase();
+    for unit in [
+        "rem", "em", "ex", "ch", "rlh", "lh", "dvw", "dvh", "svw", "svh", "lvw", "lvh", "vmin",
+        "vmax", "vw", "vh",
+    ] {
+        if normalized
+            .strip_suffix(unit)
+            .and_then(|v| v.parse::<f32>().ok())
+            == Some(0.0)
+        {
             return Some(0.0);
         }
     }
@@ -2015,13 +2114,19 @@ pub fn parse_column_width(value: &str) -> Option<Dimension> {
         return Some(Dimension::Auto);
     }
     // A nonzero unitless number is a count, never a column length.
-    if value.parse::<f32>().is_ok_and(|number| number != 0.0) { return None; }
+    if value.parse::<f32>().is_ok_and(|number| number != 0.0) {
+        return None;
+    }
     match parse_dimension_checked(&value)? {
         Dimension::Auto | Dimension::Percent(_) => None,
         width => {
             let number = match width {
-                Dimension::Px(n) | Dimension::Rem(n) | Dimension::Em(n)
-                | Dimension::Ch(n) | Dimension::Vw(n) | Dimension::Vh(n) => n,
+                Dimension::Px(n)
+                | Dimension::Rem(n)
+                | Dimension::Em(n)
+                | Dimension::Ch(n)
+                | Dimension::Vw(n)
+                | Dimension::Vh(n) => n,
                 _ => return None,
             };
             (number.is_finite() && number >= 0.0).then_some(width)
@@ -2031,7 +2136,9 @@ pub fn parse_column_width(value: &str) -> Option<Dimension> {
 
 pub fn parse_column_count(value: &str) -> Option<Option<u32>> {
     let value = value.trim().to_ascii_lowercase();
-    if matches!(value.as_str(), "auto" | "initial" | "unset") { return Some(None); }
+    if matches!(value.as_str(), "auto" | "initial" | "unset") {
+        return Some(None);
+    }
     let count = parse_css_integer_clamped(&value)?;
     (count > 0).then_some(Some(count as u32))
 }
@@ -2047,28 +2154,46 @@ pub fn parse_column_fill(value: &str) -> Option<ColumnFill> {
 
 pub fn parse_columns(value: &str) -> Option<(Dimension, Option<u32>)> {
     let value = value.trim().to_ascii_lowercase();
-    if matches!(value.as_str(), "initial" | "unset") { return Some((Dimension::Auto, None)); }
+    if matches!(value.as_str(), "initial" | "unset") {
+        return Some((Dimension::Auto, None));
+    }
     let parts = split_css_whitespace(&value);
-    if parts.is_empty() || parts.len() > 2 { return None; }
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
     let mut width = None;
     let mut count = None;
     for part in parts {
-        if part == "auto" { continue; }
+        if part == "auto" {
+            continue;
+        }
         if let Some(Some(number)) = parse_column_count(&part) {
-            if count.replace(number).is_some() { return None; }
+            if count.replace(number).is_some() {
+                return None;
+            }
         } else {
-            if matches!(part.as_str(), "initial" | "unset") { return None; }
+            if matches!(part.as_str(), "initial" | "unset") {
+                return None;
+            }
             let length = parse_column_width(&part)?;
-            if width.replace(length).is_some() { return None; }
+            if width.replace(length).is_some() {
+                return None;
+            }
         }
     }
     Some((width.unwrap_or(Dimension::Auto), count))
 }
 
 pub fn valid_multicol_declaration(name: &str, value: &str) -> bool {
-    let Some(name) = multicol_property_name(name) else { return true; };
-    if matches!(value.trim().to_ascii_lowercase().as_str(),
-        "inherit" | "initial" | "unset" | "revert" | "revert-layer") { return true; }
+    let Some(name) = multicol_property_name(name) else {
+        return true;
+    };
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return true;
+    }
     match name {
         "column-width" => parse_column_width(value).is_some(),
         "column-count" => parse_column_count(value).is_some(),
@@ -2082,14 +2207,23 @@ pub fn valid_multicol_declaration(name: &str, value: &str) -> bool {
 /// declarations. CSSOM camel-case aliases share the same grammar.
 pub fn multicol_property_name(name: &str) -> Option<&'static str> {
     let prefix = name.get(..6)?;
-    if !prefix.eq_ignore_ascii_case("column") { return None; }
+    if !prefix.eq_ignore_ascii_case("column") {
+        return None;
+    }
     let suffix = &name[6..];
-    if suffix.eq_ignore_ascii_case("s") { return Some("columns"); }
+    if suffix.eq_ignore_ascii_case("s") {
+        return Some("columns");
+    }
     let suffix = suffix.strip_prefix('-').unwrap_or(suffix);
-    if suffix.eq_ignore_ascii_case("width") { Some("column-width") }
-    else if suffix.eq_ignore_ascii_case("count") { Some("column-count") }
-    else if suffix.eq_ignore_ascii_case("fill") { Some("column-fill") }
-    else { None }
+    if suffix.eq_ignore_ascii_case("width") {
+        Some("column-width")
+    } else if suffix.eq_ignore_ascii_case("count") {
+        Some("column-count")
+    } else if suffix.eq_ignore_ascii_case("fill") {
+        Some("column-fill")
+    } else {
+        None
+    }
 }
 
 fn parse_dimension(value: &str) -> Dimension {
@@ -2204,7 +2338,9 @@ pub(crate) fn list_style_marker_properties(value: &str) -> Option<(String, Strin
 fn list_style_properties(value: &str) -> Option<(String, String, String)> {
     let (value, _) = crate::stylesheet::declaration_value_and_importance(value);
     let tokens = split_css_whitespace(value);
-    if tokens.is_empty() { return None; }
+    if tokens.is_empty() {
+        return None;
+    }
     let mut marker_type = None;
     let mut position = None;
     let mut image = None;
@@ -2214,14 +2350,21 @@ fn list_style_properties(value: &str) -> Option<(String, String, String)> {
         match lower.as_str() {
             "none" => none_count += 1,
             "inside" | "outside" => {
-                if position.replace(lower).is_some() { return None; }
+                if position.replace(lower).is_some() {
+                    return None;
+                }
             }
             "disc" | "circle" | "square" | "decimal" => {
-                if marker_type.replace(lower).is_some() { return None; }
+                if marker_type.replace(lower).is_some() {
+                    return None;
+                }
             }
             _ if lower.starts_with("url(") && lower.ends_with(')') => {
                 if !w3cos_std::background::is_valid_image_list(&token)
-                    || image.replace(token).is_some() { return None; }
+                    || image.replace(token).is_some()
+                {
+                    return None;
+                }
             }
             _ => return None,
         }
@@ -2230,11 +2373,17 @@ fn list_style_properties(value: &str) -> Option<(String, String, String)> {
     // slots first; a third ambiguous token invalidates the whole shorthand.
     // It must not override a prior valid declaration in the cascade.
     let available = 2 - usize::from(marker_type.is_some()) - usize::from(image.is_some());
-    if none_count > available { return None; }
-    if marker_type.is_none() && none_count > 0 { marker_type = Some("none".into()); }
-    Some((marker_type.unwrap_or_else(|| "disc".into()),
+    if none_count > available {
+        return None;
+    }
+    if marker_type.is_none() && none_count > 0 {
+        marker_type = Some("none".into());
+    }
+    Some((
+        marker_type.unwrap_or_else(|| "disc".into()),
         position.unwrap_or_else(|| "outside".into()),
-        image.unwrap_or_else(|| "none".into())))
+        image.unwrap_or_else(|| "none".into()),
+    ))
 }
 
 fn split_css_whitespace(value: &str) -> Vec<String> {
@@ -2814,18 +2963,28 @@ fn split_font_family_list(value: &str) -> Option<Vec<&str>> {
 fn normalize_font_family_value(value: &str) -> String {
     let families = split_font_family_list(value).unwrap_or_else(|| vec![value]);
     let single = families.len() == 1;
-    families.into_iter().map(|family| {
-        let family = family.trim_matches(is_css_whitespace);
-        if family.starts_with(['"', '\'']) {
-            if single { family.trim_matches('"').trim_matches('\'').to_string() }
-            else { family.to_string() }
-        } else if family.contains('\\') {
-            family.to_string()
-        } else {
-            family.split(is_css_whitespace).filter(|part| !part.is_empty())
-                .collect::<Vec<_>>().join(" ")
-        }
-    }).collect::<Vec<_>>().join(", ")
+    families
+        .into_iter()
+        .map(|family| {
+            let family = family.trim_matches(is_css_whitespace);
+            if family.starts_with(['"', '\'']) {
+                if single {
+                    family.trim_matches('"').trim_matches('\'').to_string()
+                } else {
+                    family.to_string()
+                }
+            } else if family.contains('\\') {
+                family.to_string()
+            } else {
+                family
+                    .split(is_css_whitespace)
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One `<family-name>`: either a single quoted string, or one or more
@@ -3147,7 +3306,9 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
 
     let family = if let Some(after_slash) = after_slash {
         let after_slash = after_slash.trim_start();
-        let line_height_end = after_slash.find(char::is_whitespace).unwrap_or(after_slash.len());
+        let line_height_end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
         after_slash[line_height_end..].trim().to_string()
     } else {
         before_parts[size_index + 1..].join(" ")
@@ -3155,7 +3316,9 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
     if !family.is_empty() {
         style.font_family = Some(normalize_font_family_value(&family));
     }
-    if let Some(size) = absolute_font_size_keyword_px(&before_parts[size_index], style.font_family.as_deref()) {
+    if let Some(size) =
+        absolute_font_size_keyword_px(&before_parts[size_index], style.font_family.as_deref())
+    {
         style.font_size = size;
     }
     if let Some(after_slash) = after_slash {
@@ -3229,14 +3392,22 @@ fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
 /// Keyword sizing uses the final family, not the parent's numeric size.
 pub(crate) fn absolute_font_size_keyword_px(value: &str, family: Option<&str>) -> Option<f32> {
     let index = match value.trim().to_ascii_lowercase().as_str() {
-        "xx-small" => 0, "x-small" => 1, "small" => 2, "medium" => 3,
-        "large" => 4, "x-large" => 5, "xx-large" => 6, "xxx-large" => 7,
+        "xx-small" => 0,
+        "x-small" => 1,
+        "small" => 2,
+        "medium" => 3,
+        "large" => 4,
+        "x-large" => 5,
+        "xx-large" => 6,
+        "xxx-large" => 7,
         _ => return None,
     };
-    let monospace = family
-        .is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"));
-    Some(if monospace { [9.0, 9.0, 10.0, 13.0, 16.0, 20.0, 26.0, 40.0][index] }
-        else { [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0][index] })
+    let monospace = family.is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"));
+    Some(if monospace {
+        [9.0, 9.0, 10.0, 13.0, 16.0, 20.0, 26.0, 40.0][index]
+    } else {
+        [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0][index]
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3560,11 +3731,20 @@ mod font_family_validity_tests {
     fn unquoted_font_family_collapses_identifier_whitespace() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("font-family", "  White\t \n Space  ");
-        assert_eq!(declaration.to_style().font_family.as_deref(), Some("White Space"));
+        assert_eq!(
+            declaration.to_style().font_family.as_deref(),
+            Some("White Space")
+        );
         declaration.set_property("font-family", "White   Space, serif");
-        assert_eq!(declaration.to_style().font_family.as_deref(), Some("White Space, serif"));
+        assert_eq!(
+            declaration.to_style().font_family.as_deref(),
+            Some("White Space, serif")
+        );
         declaration.set_property("font-family", "\"White   Space\", serif");
-        assert_eq!(declaration.to_style().font_family.as_deref(), Some("\"White   Space\", serif"));
+        assert_eq!(
+            declaration.to_style().font_family.as_deref(),
+            Some("\"White   Space\", serif")
+        );
     }
 }
 
@@ -4201,7 +4381,11 @@ mod tests {
             declaration.set_property("resize", value);
             assert_eq!(declaration.get_property("resize"), value);
             declaration.set_property("resize", "sideways");
-            assert_eq!(declaration.get_property("resize"), value, "invalid resize must not replace its winner");
+            assert_eq!(
+                declaration.get_property("resize"),
+                value,
+                "invalid resize must not replace its winner"
+            );
         }
     }
 
@@ -4216,7 +4400,10 @@ mod tests {
         declaration.set_property("text-decoration-color", "not-a-color");
         assert_eq!(declaration.get_property("text-decoration-color"), "black");
         declaration.set_property("text-decoration-color", "currentColor");
-        assert_eq!(declaration.get_property("text-decoration-color"), "currentcolor");
+        assert_eq!(
+            declaration.get_property("text-decoration-color"),
+            "currentcolor"
+        );
     }
 
     #[test]
@@ -4241,8 +4428,10 @@ mod tests {
             let mut declaration = CSSStyleDeclaration::new();
             let initial = declaration.inner.clone();
             declaration.set_property(name, value);
-            assert_ne!(declaration.inner, initial,
-                "{name}:{value} must affect layout style, not just CSSOM source text");
+            assert_ne!(
+                declaration.inner, initial,
+                "{name}:{value} must affect layout style, not just CSSOM source text"
+            );
         }
     }
 
@@ -4276,17 +4465,29 @@ mod tests {
         assert_eq!(declaration.inner.column_count, Some(3));
         assert_eq!(declaration.get_property("columns"), "2em 3");
         for (name, value) in [
-            ("column-width", "-1px"), ("column-width", "20%"), ("column-width", "3"),
-            ("column-width", "NaNpx"), ("column-count", "0"), ("column-count", "2.5"),
-            ("column-count", "-3"), ("column-fill", "stretch"),
-            ("columns", "3 4"), ("columns", "10px 20px"), ("columns", "auto 2 10px"),
-            ("columns", "inherit 10px"), ("columns", "unset auto"),
+            ("column-width", "-1px"),
+            ("column-width", "20%"),
+            ("column-width", "3"),
+            ("column-width", "NaNpx"),
+            ("column-count", "0"),
+            ("column-count", "2.5"),
+            ("column-count", "-3"),
+            ("column-fill", "stretch"),
+            ("columns", "3 4"),
+            ("columns", "10px 20px"),
+            ("columns", "auto 2 10px"),
+            ("columns", "inherit 10px"),
+            ("columns", "unset auto"),
         ] {
             let before = declaration.inner.clone();
             let source_len = declaration.inline_declarations.len();
             declaration.set_property(name, value);
             assert_eq!(declaration.inner, before, "{name}:{value}");
-            assert_eq!(declaration.inline_declarations.len(), source_len, "invalid CSSOM declaration");
+            assert_eq!(
+                declaration.inline_declarations.len(),
+                source_len,
+                "invalid CSSOM declaration"
+            );
         }
         declaration.set_property("columns", "auto 120px");
         assert_eq!(declaration.inner.column_width, Dimension::Px(120.0));
@@ -4296,7 +4497,11 @@ mod tests {
         declaration.set_property("columns", "2");
         assert_eq!(declaration.inner.column_width, Dimension::Auto);
         assert_eq!(declaration.inner.column_count, Some(2));
-        assert_eq!(declaration.inner.column_fill, ColumnFill::BalanceAll, "columns excludes fill");
+        assert_eq!(
+            declaration.inner.column_fill,
+            ColumnFill::BalanceAll,
+            "columns excludes fill"
+        );
         declaration.set_property("columns", "initial");
         declaration.set_property("column-fill", "unset");
         assert_eq!(declaration.inner.column_width, Dimension::Auto);
@@ -4421,14 +4626,19 @@ mod tests {
     fn percentage_foreground_color_retains_fractional_paint_channels() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("color", "rgb(0%, 50%, 0%)");
-        assert_eq!(declaration.inner.color, Color::rgb(0,128,0));
-        assert_eq!(declaration.inner.color_rgba, Some([0.0,0.5,0.0,1.0]));
+        assert_eq!(declaration.inner.color, Color::rgb(0, 128, 0));
+        assert_eq!(declaration.inner.color_rgba, Some([0.0, 0.5, 0.0, 1.0]));
         declaration.set_property("color", "not-a-color");
-        assert_eq!(declaration.inner.color_rgba, Some([0.0,0.5,0.0,1.0]),
-            "invalid declaration must not clear used paint precision");
+        assert_eq!(
+            declaration.inner.color_rgba,
+            Some([0.0, 0.5, 0.0, 1.0]),
+            "invalid declaration must not clear used paint precision"
+        );
         declaration.set_property("color", "green");
-        assert_eq!(declaration.inner.color_rgba, None,
-            "explicit named color replaces inherited fractional precision");
+        assert_eq!(
+            declaration.inner.color_rgba, None,
+            "explicit named color replaces inherited fractional precision"
+        );
     }
 
     #[test]
@@ -5046,8 +5256,11 @@ mod tests {
 
     #[test]
     fn character_relative_spacing_does_not_alias_ch_to_em() {
-        assert_ne!(parse_spacing("1ch"), Some(Spacing::Em(1.0)),
-            "ch must retain zero-glyph units until the final font is known");
+        assert_ne!(
+            parse_spacing("1ch"),
+            Some(Spacing::Em(1.0)),
+            "ch must retain zero-glyph units until the final font is known"
+        );
         assert_eq!(parse_spacing("1ch"), Some(Spacing::Ch(1.0)));
         assert_eq!(parse_spacing("-2ch"), Some(Spacing::Ch(-2.0)));
         assert_eq!(parse_padding_spacing("-2ch"), None);

@@ -932,7 +932,10 @@ fn render_node(
         ComponentKind::SvgDocument { source, .. } => {
             let rect = crate::svg_renderer::content_box(rect, style);
             if let Some(raster) = crate::svg_renderer::get_or_render_inline(
-                source, rect.width.ceil().max(1.0) as u32, rect.height.ceil().max(1.0) as u32) {
+                source,
+                rect.width.ceil().max(1.0) as u32,
+                rect.height.ceil().max(1.0) as u32,
+            ) {
                 draw_decoded_image(scene, rect, &raster);
             }
         }

@@ -647,7 +647,9 @@ pub fn dom_append_child(parent: &Value, child: &Value) -> Value {
 }
 
 pub fn dom_set_data(object: &Value, name: &str, value: &Value) -> bool {
-    DOM_FAST.get().is_some_and(|fast| (fast.set_data)(object, name, value))
+    DOM_FAST
+        .get()
+        .is_some_and(|fast| (fast.set_data)(object, name, value))
 }
 
 /// `object[name] = left + right` when `right` is an integer. Formats into a
@@ -702,7 +704,14 @@ pub fn dom_build_appended(
 ) -> Value {
     if let Some(fast) = DOM_FAST.get() {
         return (fast.build_appended)(
-            document, parent, tag, id_prefix, id_index, class_name, text_prefix, text_index,
+            document,
+            parent,
+            tag,
+            id_prefix,
+            id_index,
+            class_name,
+            text_prefix,
+            text_index,
         );
     }
     let element = dom_create_element(document, tag);
@@ -814,7 +823,9 @@ pub fn array_push(array: &Value, value: &Value) -> Value {
 }
 
 pub fn dom_set_style(object: &Value, name: &str, value: &Value) -> bool {
-    DOM_FAST.get().is_some_and(|fast| (fast.set_style)(object, name, value))
+    DOM_FAST
+        .get()
+        .is_some_and(|fast| (fast.set_style)(object, name, value))
 }
 
 pub fn dom_set_element_style(element: &Value, name: &str, value: &Value) -> bool {

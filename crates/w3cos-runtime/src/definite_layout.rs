@@ -142,7 +142,12 @@ fn overflow_is_definite(style: &Style) -> bool {
 
 enum AbsoluteBox {
     Flow,
-    Definite { left: f32, top: f32, width: f32, height: f32 },
+    Definite {
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+    },
     Unsupported,
 }
 
@@ -232,15 +237,8 @@ fn layout_block(
         other => Some(px_size(other)?),
     };
     let positioned = style.position == Position::Relative;
-    if let Some(flow) = layout_repeated_text_rows(
-        document,
-        id,
-        x,
-        y,
-        width,
-        specified_height,
-        out,
-    ) {
+    if let Some(flow) = layout_repeated_text_rows(document, id, x, y, width, specified_height, out)
+    {
         return Some(flow);
     }
     let mut cursor = y;
@@ -264,14 +262,12 @@ fn layout_block(
                         if !positioned {
                             return None;
                         }
-                        out.push((
-                            cid,
-                            DOMRect::new(x + left, y + top, box_width, box_height),
-                        ));
+                        out.push((cid, DOMRect::new(x + left, y + top, box_width, box_height)));
                         let mut nested = document.get_node(cid).first_child;
                         while let Some(nested_id) = nested {
                             zero_subtree(document, nested_id, out);
-                            nested = w3cos_dom::node::sib(document.get_node(nested_id).next_sibling);
+                            nested =
+                                w3cos_dom::node::sib(document.get_node(nested_id).next_sibling);
                         }
                         child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
                         continue;
@@ -501,7 +497,11 @@ fn layout_flex_column(
         {
             return None;
         }
-        (width, specified_height, style.align_items == AlignItems::Stretch)
+        (
+            width,
+            specified_height,
+            style.align_items == AlignItems::Stretch,
+        )
     };
     struct Row {
         id: NodeId,
@@ -521,10 +521,7 @@ fn layout_flex_column(
                 } else {
                     if child_style.order != 0
                         || child_style.align_self != AlignSelf::Auto
-                        || !matches!(
-                            child_style.flex_basis,
-                            Dimension::Auto | Dimension::Px(_)
-                        )
+                        || !matches!(child_style.flex_basis, Dimension::Auto | Dimension::Px(_))
                     {
                         return None;
                     }
@@ -534,10 +531,7 @@ fn layout_flex_column(
                         return None;
                     }
                     if !box_is_simple(child_style)
-                        || !matches!(
-                            child_style.display,
-                            Display::Block | Display::FlowRoot
-                        )
+                        || !matches!(child_style.display, Display::Block | Display::FlowRoot)
                     {
                         return None;
                     }
@@ -560,8 +554,7 @@ fn layout_flex_column(
                         None => None,
                         Some(text) => {
                             let text_node = document.get_node(text);
-                            if text_node.node_type != NodeType::Text
-                                || text_node.next_sibling != 0
+                            if text_node.node_type != NodeType::Text || text_node.next_sibling != 0
                             {
                                 return None;
                             }
@@ -776,8 +769,10 @@ fn try_apply_authored(viewport_w: f32) -> bool {
             reuse: !w3cos_dom::stylesheet::has_position_dependent_rules(),
             styles: HashMap::new(),
         };
-        if layout_authored(document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects)
-            .is_none()
+        if layout_authored(
+            document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects,
+        )
+        .is_none()
         {
             return false;
         }
@@ -914,9 +909,10 @@ fn layout_authored(
     let margin_right = spacing_px(style.margin.right)?;
     let margin_bottom = spacing_px(style.margin.bottom)?;
     let margin_left = spacing_px(style.margin.left)?;
-    let root_margin = document.get_node(id).tag.with_str(|name| {
-        name.eq_ignore_ascii_case("html") || name.eq_ignore_ascii_case("body")
-    });
+    let root_margin = document
+        .get_node(id)
+        .tag
+        .with_str(|name| name.eq_ignore_ascii_case("html") || name.eq_ignore_ascii_case("body"));
     if (margin_top != 0.0 || margin_right != 0.0 || margin_bottom != 0.0 || margin_left != 0.0)
         && !root_margin
     {

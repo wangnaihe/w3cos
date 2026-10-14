@@ -137,11 +137,7 @@ impl NodeId {
 /// link is a raw `u32` instead of `Option<NodeId>`.
 #[inline]
 pub fn sib(link: u32) -> Option<NodeId> {
-    if link == 0 {
-        None
-    } else {
-        Some(NodeId(link))
-    }
+    if link == 0 { None } else { Some(NodeId(link)) }
 }
 
 #[inline]
@@ -457,7 +453,12 @@ impl AttrList {
     pub fn remove(&mut self, index: usize) -> (Atom, AttrValue) {
         assert!(index < self.len(), "attribute index");
         self.ensure_unique();
-        if self.spill.as_ref().map(|spill| spill.is_empty()).unwrap_or(true) {
+        if self
+            .spill
+            .as_ref()
+            .map(|spill| spill.is_empty())
+            .unwrap_or(true)
+        {
             let removed = self.inline[index];
             let last = self.len as usize;
             for slot in index + 1..last {
@@ -582,7 +583,11 @@ impl ClassList {
     }
 
     pub fn push(&mut self, atom: Atom) {
-        if self.spill.as_ref().map(|spill| spill.is_empty()).unwrap_or(true)
+        if self
+            .spill
+            .as_ref()
+            .map(|spill| spill.is_empty())
+            .unwrap_or(true)
             && (self.len as usize) < INLINE_CLASSES
         {
             self.inline[self.len as usize] = atom;
@@ -595,7 +600,12 @@ impl ClassList {
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&Atom) -> bool) {
-        if self.spill.as_ref().map(|spill| spill.is_empty()).unwrap_or(true) {
+        if self
+            .spill
+            .as_ref()
+            .map(|spill| spill.is_empty())
+            .unwrap_or(true)
+        {
             let mut write = 0usize;
             for read in 0..self.len as usize {
                 if keep(&self.inline[read]) {

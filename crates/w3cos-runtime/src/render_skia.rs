@@ -26,26 +26,26 @@ use crate::retained_layers::{
     layer_opacity as compositor_layer_opacity, layer_scroll_translation,
 };
 use crate::text_layout;
-#[path = "text_decoration.rs"]
-mod text_decoration;
 #[path = "analytic_ellipse.rs"]
 mod analytic_ellipse;
 #[path = "analytic_round_rect.rs"]
 mod analytic_round_rect;
+#[path = "block_text_paint.rs"]
+mod block_text_paint;
 #[path = "browser_blur.rs"]
 mod browser_blur;
 #[path = "browser_dither.rs"]
 mod browser_dither;
-#[path = "block_text_paint.rs"]
-mod block_text_paint;
-#[path = "media_controls_paint.rs"]
-mod media_controls_paint;
 #[cfg(target_os = "macos")]
 #[path = "browser_font_defaults.rs"]
 mod browser_font_defaults;
+#[path = "media_controls_paint.rs"]
+mod media_controls_paint;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "metal_blur_tests.rs"]
 mod metal_blur_tests;
+#[path = "text_decoration.rs"]
+mod text_decoration;
 #[cfg(test)]
 use skia_safe::Font;
 
@@ -130,7 +130,10 @@ fn cached_skia_image(decoded: &crate::image_loader::DecodedImage) -> Option<Imag
     cached_skia_image_for_sampling(decoded, true)
 }
 
-fn cached_skia_image_for_sampling(decoded: &crate::image_loader::DecodedImage, scaled: bool) -> Option<Image> {
+fn cached_skia_image_for_sampling(
+    decoded: &crate::image_loader::DecodedImage,
+    scaled: bool,
+) -> Option<Image> {
     let pixels_id = decoded.pixels_id();
     let key = (pixels_id, scaled);
     SKIA_IMAGES.with(|cache| {
@@ -152,7 +155,11 @@ fn cached_skia_image_for_sampling(decoded: &crate::image_loader::DecodedImage, s
         let info = ImageInfo::new(
             (width as i32, height as i32),
             ColorType::RGBA8888,
-            if opaque && scaled { AlphaType::Unpremul } else { AlphaType::Premul },
+            if opaque && scaled {
+                AlphaType::Unpremul
+            } else {
+                AlphaType::Premul
+            },
             None,
         );
         // Scaled opaque textures need Skia's float sampling path: the optimized
@@ -196,7 +203,8 @@ fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
 fn host_typeface() -> Option<Typeface> {
     let host = crate::font_face::host_ui_font();
     let manager = FontMgr::default();
-    manager.new_from_data(host.data.as_slice(), Some(host.index as usize))
+    manager
+        .new_from_data(host.data.as_slice(), Some(host.index as usize))
         // Some platform font collections cannot be instantiated from copied
         // bytes by the OS-backed manager. Resolve the already-selected family,
         // never substitute an unrelated bundled/default font for its metrics.
@@ -245,11 +253,21 @@ fn generic_serif_typeface(style: &Style) -> Option<Typeface> {
     // css_font_for_style synthesizes only if the family has no slanted face.
     let key = (base.unique_id(), slant as u8);
     GENERIC_SLANTED_TYPEFACES.with(|cache| {
-        if let Some(face) = cache.borrow().get(&key) { return face.clone().or(Some(base)); }
-        let face = FontMgr::default().match_family_style(&base.family_name(),
-            FontStyle::new(base.font_style().weight(), skia_safe::font_style::Width::NORMAL, slant));
+        if let Some(face) = cache.borrow().get(&key) {
+            return face.clone().or(Some(base));
+        }
+        let face = FontMgr::default().match_family_style(
+            &base.family_name(),
+            FontStyle::new(
+                base.font_style().weight(),
+                skia_safe::font_style::Width::NORMAL,
+                slant,
+            ),
+        );
         let mut cache = cache.borrow_mut();
-        if cache.len() >= 256 { cache.clear(); }
+        if cache.len() >= 256 {
+            cache.clear();
+        }
         cache.insert(key, face.clone());
         face.or(Some(base))
     })
@@ -257,11 +275,19 @@ fn generic_serif_typeface(style: &Style) -> Option<Typeface> {
 
 fn generic_serif_base_typeface(style: &Style) -> Option<Typeface> {
     let Some(families) = style.font_family.as_deref() else {
-        return style.custom_properties.as_ref().is_some_and(|properties| {
-            properties.get(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY)
-                .is_some_and(|value| value == "1")
-        }).then(|| language_generic_typeface(style, "standard")
-            .or_else(|| HTML_STANDARD_TYPEFACE.with(Clone::clone))).flatten();
+        return style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties
+                    .get(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY)
+                    .is_some_and(|value| value == "1")
+            })
+            .then(|| {
+                language_generic_typeface(style, "standard")
+                    .or_else(|| HTML_STANDARD_TYPEFACE.with(Clone::clone))
+            })
+            .flatten();
     };
     // A bare generic fixed family resolves to the platform's browser face,
     // not the embedding's primary UI font. All geometry and glyph callers
@@ -312,9 +338,12 @@ fn generic_serif_base_typeface(style: &Style) -> Option<Typeface> {
                     .is_none()
             })
         };
-    if unresolved && style.custom_properties.as_ref().is_some_and(|properties|
-        properties.get(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY)
-            .is_some_and(|value| value == "1"))
+    if unresolved
+        && style.custom_properties.as_ref().is_some_and(|properties| {
+            properties
+                .get(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY)
+                .is_some_and(|value| value == "1")
+        })
     {
         return language_generic_typeface(style, "standard")
             .or_else(|| HTML_STANDARD_TYPEFACE.with(Clone::clone));
@@ -322,8 +351,10 @@ fn generic_serif_base_typeface(style: &Style) -> Option<Typeface> {
     // Native embeddings without an HTML standard context retain their
     // existing default. Never replace an explicit serif or installed family.
     (uses_serif || unresolved)
-        .then(|| language_generic_typeface(style, "serif")
-            .or_else(|| GENERIC_SERIF_TYPEFACE.with(Clone::clone)))
+        .then(|| {
+            language_generic_typeface(style, "serif")
+                .or_else(|| GENERIC_SERIF_TYPEFACE.with(Clone::clone))
+        })
         .flatten()
 }
 
@@ -338,17 +369,28 @@ fn language_generic_typeface(style: &Style, generic: &str) -> Option<Typeface> {
             "monospace" => GenericFamily::Monospace,
             _ => return None,
         };
-        let language = style.custom_properties.as_ref()?
+        let language = style
+            .custom_properties
+            .as_ref()?
             .get(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY)?;
         let family = browser_font_defaults::family(language, generic)?;
         // The finite platform-default family set bounds this cache. Geometry
         // and glyph callers reuse the same face; no per-character OS lookup.
-        LANGUAGE_GENERIC_TYPEFACES.with(|cache| cache.borrow_mut().entry(family)
-            .or_insert_with(|| FontMgr::default().match_family_style(family, FontStyle::normal()))
-            .clone())
+        LANGUAGE_GENERIC_TYPEFACES.with(|cache| {
+            cache
+                .borrow_mut()
+                .entry(family)
+                .or_insert_with(|| {
+                    FontMgr::default().match_family_style(family, FontStyle::normal())
+                })
+                .clone()
+        })
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (style, generic); None }
+    {
+        let _ = (style, generic);
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -359,13 +401,20 @@ pub(crate) struct ResolvedFontGeometry {
 }
 
 impl ResolvedFontGeometry {
-    pub fn height(self) -> f32 { self.ascent + self.descent }
-    pub fn line_spacing(self) -> f32 { self.height() + self.line_gap }
+    pub fn height(self) -> f32 {
+        self.ascent + self.descent
+    }
+    pub fn line_spacing(self) -> f32 {
+        self.height() + self.line_gap
+    }
 
     fn normal_line_box(self) -> Self {
         let upper = crate::layout::inline_upper_leading(self.line_spacing(), self.height());
-        Self { ascent: self.ascent + upper,
-            descent: self.descent + self.line_gap - upper, line_gap: 0.0 }
+        Self {
+            ascent: self.ascent + upper,
+            descent: self.descent + self.line_gap - upper,
+            line_gap: 0.0,
+        }
     }
 }
 
@@ -377,21 +426,40 @@ thread_local! {
 fn typeface_font_geometry(face: &Typeface, size: f32) -> ResolvedFontGeometry {
     let key = (face.unique_id(), size.to_bits());
     FONT_GEOMETRY_CACHE.with(|cache| {
-        if let Some(metrics) = cache.borrow().get(&key).copied() { return metrics; }
+        if let Some(metrics) = cache.borrow().get(&key).copied() {
+            return metrics;
+        }
         let (_, raw) = crate::skia_text_run::css_font(face, size).metrics();
         let tiny = -raw.ascent < 3.0 || raw.descent - raw.ascent < 2.0;
-        let mut ascent = if tiny { -raw.ascent } else { (-raw.ascent).round() };
-        let descent = if tiny { raw.descent } else { raw.descent.round() };
+        let mut ascent = if tiny {
+            -raw.ascent
+        } else {
+            (-raw.ascent).round()
+        };
+        let descent = if tiny {
+            raw.descent
+        } else {
+            raw.descent.round()
+        };
         // Match the browser's macOS web-font compatibility metrics, not
         // AppKit's extra line spacing. The adjustment belongs to ascent and
         // must be shared by normal struts, inline font boxes and baselines.
         #[cfg(target_os = "macos")]
-        if matches!(face.family_name().as_str(), "Times" | "Helvetica" | "Courier") {
+        if matches!(
+            face.family_name().as_str(),
+            "Times" | "Helvetica" | "Courier"
+        ) {
             ascent += ((ascent + descent) * 0.15 + 0.5).floor();
         }
-        let metrics = ResolvedFontGeometry { ascent, descent, line_gap: raw.leading.round() };
+        let metrics = ResolvedFontGeometry {
+            ascent,
+            descent,
+            line_gap: raw.leading.round(),
+        };
         let mut cache = cache.borrow_mut();
-        if cache.len() >= 256 { cache.clear(); }
+        if cache.len() >= 256 {
+            cache.clear();
+        }
         cache.insert(key, metrics);
         metrics
     })
@@ -400,7 +468,9 @@ fn typeface_font_geometry(face: &Typeface, size: f32) -> ResolvedFontGeometry {
 /// Resolve a face shared with CSS glyph shaping. Unspecified native styles
 /// retain the intrinsic embedding primary, not the HTML standard/serif face.
 pub(crate) fn resolved_font_geometry(style: &Style) -> Option<ResolvedFontGeometry> {
-    if !style.font_size.is_finite() || style.font_size <= 0.0 { return None; }
+    if !style.font_size.is_finite() || style.font_size <= 0.0 {
+        return None;
+    }
     let registered = registered_strut_typeface(style);
     if registered.is_none() && style_uses_ahem(style) && registered_typeface(style).is_none() {
         // The unregistered Ahem painter uses deterministic em cells rather
@@ -418,11 +488,16 @@ pub(crate) fn resolved_font_geometry(style: &Style) -> Option<ResolvedFontGeomet
     // HTML's standard-font marker still resolves through `generic` above.
     let intrinsic = (style.font_family.is_none() && generic.is_none())
         .then(|| INTRINSIC_PRIMARY_TYPEFACE.with(Clone::clone));
-    let face = registered.as_ref().map(|(_, face)| face).or(generic.as_ref())
+    let face = registered
+        .as_ref()
+        .map(|(_, face)| face)
+        .or(generic.as_ref())
         .or(intrinsic.as_ref())?;
     let face = if registered.is_none() {
         typeface_for_character(face, 'x', style.font_weight)
-    } else { face.clone() };
+    } else {
+        face.clone()
+    };
     let metrics = typeface_font_geometry(&face, style.font_size);
     (metrics.height().is_finite() && metrics.height() > 0.0).then_some(metrics)
 }
@@ -430,7 +505,10 @@ pub(crate) fn resolved_font_geometry(style: &Style) -> Option<ResolvedFontGeomet
 /// Normal lines include the concrete fallback faces used by glyph shaping,
 /// not just the CSS stack's primary strut. Keep the primary inline font box
 /// unchanged: this geometry expands line ascent/descent, not decoration.
-pub(crate) fn resolved_text_font_geometry(text: &str, style: &Style) -> Option<ResolvedFontGeometry> {
+pub(crate) fn resolved_text_font_geometry(
+    text: &str,
+    style: &Style,
+) -> Option<ResolvedFontGeometry> {
     let primary = resolved_font_geometry(style)?;
     if !style.line_height_is_normal || text.is_empty() {
         return Some(primary);
@@ -439,26 +517,41 @@ pub(crate) fn resolved_text_font_geometry(text: &str, style: &Style) -> Option<R
         // Leading belongs to each face's own line box. Combining maximum
         // ink ascent/descent with another face's leading invents extra space
         // (Times + its Hebrew fallback would incorrectly grow 18px to 19px).
-        css_font_runs(text, face, style).into_iter().fold(primary.normal_line_box(), |metrics, run| {
-            let fallback = typeface_font_geometry(&run.typeface, style.font_size).normal_line_box();
-            ResolvedFontGeometry { ascent: metrics.ascent.max(fallback.ascent),
-                descent: metrics.descent.max(fallback.descent),
-                line_gap: 0.0 }
-        })
+        css_font_runs(text, face, style).into_iter().fold(
+            primary.normal_line_box(),
+            |metrics, run| {
+                let fallback =
+                    typeface_font_geometry(&run.typeface, style.font_size).normal_line_box();
+                ResolvedFontGeometry {
+                    ascent: metrics.ascent.max(fallback.ascent),
+                    descent: metrics.descent.max(fallback.descent),
+                    line_gap: 0.0,
+                }
+            },
+        )
     }))
 }
 
 /// CSS middle alignment uses the parent's concrete x-height, not half an em.
 /// Resolve the same primary face and weight as its strut/glyph painter.
 pub(crate) fn resolved_font_x_height(style: &Style) -> Option<f32> {
-    if !style.font_size.is_finite() || style.font_size <= 0.0 { return None; }
+    if !style.font_size.is_finite() || style.font_size <= 0.0 {
+        return None;
+    }
     let registered = registered_typeface(style);
-    if registered.is_none() && style_uses_ahem(style) { return Some(style.font_size * 0.8); }
+    if registered.is_none() && style_uses_ahem(style) {
+        return Some(style.font_size * 0.8);
+    }
     let generic = generic_serif_typeface(style);
-    let face = registered.as_ref().map(|(_, face)| face).or(generic.as_ref())?;
+    let face = registered
+        .as_ref()
+        .map(|(_, face)| face)
+        .or(generic.as_ref())?;
     let face = if registered.is_none() {
         typeface_for_character(face, 'x', style.font_weight)
-    } else { face.clone() };
+    } else {
+        face.clone()
+    };
     let font = crate::skia_text_run::css_font(&face, style.font_size);
     let (_, metrics) = font.metrics();
     let mut height = metrics.x_height;
@@ -470,7 +563,10 @@ pub(crate) fn resolved_font_x_height(style: &Style) -> Option<f32> {
         let glyph = face.unichar_to_glyph('x' as i32);
         if glyph != 0 {
             if let Some(bounds) = crate::skia_text_run::geometric_ink_bounds(
-                &font, &[glyph], &[skia_safe::Point::new(0.0, 0.0)]) {
+                &font,
+                &[glyph],
+                &[skia_safe::Point::new(0.0, 0.0)],
+            ) {
                 height = -bounds.top;
             }
         }
@@ -520,13 +616,21 @@ struct GlyphClipRecordingScope {
 
 impl GlyphClipRecordingScope {
     fn new(clip: Option<Rect>) -> Self {
-        let previous = GLYPH_CLIP_RECORDING.with(|recording|
-            recording.replace(Some(GlyphClipRecording { clip, decisions: Vec::new() })));
-        Self { previous, active: true }
+        let previous = GLYPH_CLIP_RECORDING.with(|recording| {
+            recording.replace(Some(GlyphClipRecording {
+                clip,
+                decisions: Vec::new(),
+            }))
+        });
+        Self {
+            previous,
+            active: true,
+        }
     }
 
     fn finish(mut self) -> Vec<GlyphClipDecision> {
-        let recording = GLYPH_CLIP_RECORDING.with(|recording| recording.replace(self.previous.take()));
+        let recording =
+            GLYPH_CLIP_RECORDING.with(|recording| recording.replace(self.previous.take()));
         self.active = false;
         recording.map_or_else(Vec::new, |recording| recording.decisions)
     }
@@ -541,12 +645,19 @@ impl Drop for GlyphClipRecordingScope {
 }
 
 fn glyph_ink_visible(ink: Rect, clip: Option<Rect>) -> bool {
-    clip.is_none_or(|clip| !clip.is_empty() && ink.left < clip.right && ink.right > clip.left
-        && ink.top < clip.bottom && ink.bottom > clip.top)
+    clip.is_none_or(|clip| {
+        !clip.is_empty()
+            && ink.left < clip.right
+            && ink.right > clip.left
+            && ink.top < clip.bottom
+            && ink.bottom > clip.top
+    })
 }
 
 fn glyph_clip_decisions_match(decisions: &[GlyphClipDecision], clip: Option<Rect>) -> bool {
-    decisions.iter().all(|decision| glyph_ink_visible(decision.ink, clip) == decision.visible)
+    decisions
+        .iter()
+        .all(|decision| glyph_ink_visible(decision.ink, clip) == decision.visible)
 }
 
 impl RetainedSkiaCache {
@@ -674,23 +785,41 @@ fn paint_display_list(
     frame: ReplayFrame<'_>,
     bake_compositor_props: bool,
 ) {
-    paint_display_list_with_suppressed_effects(canvas, typeface, frame, bake_compositor_props, &[], true);
+    paint_display_list_with_suppressed_effects(
+        canvas,
+        typeface,
+        frame,
+        bake_compositor_props,
+        &[],
+        true,
+    );
 }
 
 fn resize_multisampled_effects(frame: &ReplayFrame<'_>) -> std::collections::HashSet<usize> {
     let visible_resize = |rect: LayoutRect, style: &Style| {
-        style.display != Display::None && rect.width > 1.0 && rect.height > 1.0
+        style.display != Display::None
+            && rect.width > 1.0
+            && rect.height > 1.0
             && has_css_resize_indicator(style)
     };
     if let Some(artifact) = frame.artifact {
         // Picture recordings can split one raster effect into several chunks
         // (e.g. at a scroll clip). Its sample context must still see sibling
         // draws from that effect, not just this recording's client indices.
-        artifact.nodes.iter().enumerate().filter_map(|(index,node)| {
-            let rect=artifact.rect_by_index.get(index).copied().flatten()?;
-            visible_resize(rect,&node.style).then(||artifact.node_properties[index].effect)
-        }).collect()
-    } else if frame.nodes.iter().any(|(_,rect,_,style)|visible_resize(*rect,style)) {
+        artifact
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let rect = artifact.rect_by_index.get(index).copied().flatten()?;
+                visible_resize(rect, &node.style).then(|| artifact.node_properties[index].effect)
+            })
+            .collect()
+    } else if frame
+        .nodes
+        .iter()
+        .any(|(_, rect, _, style)| visible_resize(*rect, style))
+    {
         [0].into_iter().collect()
     } else {
         Default::default()
@@ -698,16 +827,26 @@ fn resize_multisampled_effects(frame: &ReplayFrame<'_>) -> std::collections::Has
 }
 
 fn paint_display_list_with_suppressed_effects(
-    canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'_>,
-    bake_compositor_props: bool, suppressed: &[usize], paint_background: bool,
+    canvas: &Canvas,
+    typeface: &Typeface,
+    frame: ReplayFrame<'_>,
+    bake_compositor_props: bool,
+    suppressed: &[usize],
+    paint_background: bool,
 ) {
     let multisampled_effects = resize_multisampled_effects(&frame);
-    let shaped_fragments = frame.artifact.map(|artifact| {
-        crate::inline_shaping::build(artifact, frame.nodes.iter().map(|node| node.0), typeface)
-    }).unwrap_or_default();
-    let background_groups = frame.artifact.map(inline_background_groups).unwrap_or_default();
-    let grouped_backgrounds: std::collections::HashSet<usize> = background_groups.values()
-        .flatten().copied().collect();
+    let shaped_fragments = frame
+        .artifact
+        .map(|artifact| {
+            crate::inline_shaping::build(artifact, frame.nodes.iter().map(|node| node.0), typeface)
+        })
+        .unwrap_or_default();
+    let background_groups = frame
+        .artifact
+        .map(inline_background_groups)
+        .unwrap_or_default();
+    let grouped_backgrounds: std::collections::HashSet<usize> =
+        background_groups.values().flatten().copied().collect();
     let blur_bounds = small_blur_input_bounds(&frame, bake_compositor_props);
     // Layer recordings must not bake a background clear; composite applies
     // the canvas background, then opacity / transform / scroll.
@@ -717,44 +856,92 @@ fn paint_display_list_with_suppressed_effects(
     }
     let mut active_filters = Vec::new();
     let mut suppressed_subtree = None;
-    let block_replay=frame.artifact.map(|artifact|block_text_paint::replay(frame.nodes,artifact));
-    let block_nodes=block_replay.as_ref().map(|nodes|nodes.iter().map(|node|
-        (node.index,node.rect,node.kind.as_ref(),node.style.as_ref())).collect::<Vec<_>>());
+    let block_replay = frame
+        .artifact
+        .map(|artifact| block_text_paint::replay(frame.nodes, artifact));
+    let block_nodes = block_replay.as_ref().map(|nodes| {
+        nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.index,
+                    node.rect,
+                    node.kind.as_ref(),
+                    node.style.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
     for &(idx, rect, kind, style) in block_nodes.as_deref().unwrap_or(frame.nodes) {
         // Automatic multicol principals use the balanced physical height;
         // their descendants retain source flow coordinates for fragmentation.
-        let rect = if matches!(style.height,w3cos_std::style::Dimension::Auto)
+        let rect = if matches!(style.height, w3cos_std::style::Dimension::Auto)
             && (style.column_count.is_some()
-                || !matches!(style.column_width,w3cos_std::style::Dimension::Auto))
+                || !matches!(style.column_width, w3cos_std::style::Dimension::Auto))
         {
-            frame.artifact.and_then(|artifact| artifact.rect_by_index.get(idx).copied().flatten())
+            frame
+                .artifact
+                .and_then(|artifact| artifact.rect_by_index.get(idx).copied().flatten())
                 .unwrap_or(rect)
-        } else {rect};
+        } else {
+            rect
+        };
         let mut filter_path: Vec<_> = effect_path(frame.artifact, idx, bake_compositor_props)
-            .into_iter().filter(|id| !suppressed.contains(id)).collect();
-        if suppressed_subtree.is_some_and(|id| filter_path.contains(&id)) { continue; }
+            .into_iter()
+            .filter(|id| !suppressed.contains(id))
+            .collect();
+        if suppressed_subtree.is_some_and(|id| filter_path.contains(&id)) {
+            continue;
+        }
         suppressed_subtree = None;
-        let prepared = filter_path.iter().position(|id| blur_bounds.contains_key(id)).and_then(|position| {
-            let id = filter_path[position];
-            let artifact = frame.artifact?;
-            let effect = artifact.properties.effects.get(id)?;
-            let chain = effect.filter.as_deref().and_then(parse_css_filter)?;
-            let [FilterOp::Blur(sigma)] = chain.ops.as_slice() else { return None; };
-            let nodes: Vec<_> = frame.nodes.iter().copied().filter(|node|
-                effect_path(frame.artifact, node.0, bake_compositor_props).contains(&id)).collect();
-            let mut excluded = suppressed.to_vec();
-            excluded.extend_from_slice(&filter_path[..=position]);
-            let (image, origin) = browser_blur::rasterize_small_blur(*sigma, blur_bounds[&id], |input| {
-                paint_display_list_with_suppressed_effects(input, typeface, ReplayFrame {
-                    nodes: &nodes, metrics_font: frame.metrics_font, scroll_info: frame.scroll_info,
-                    text_input_values: frame.text_input_values, focused_index: frame.focused_index,
-                    background: frame.background, artifact: frame.artifact, retained: None,
-                    compositor_overrides: frame.compositor_overrides, scale_factor: frame.scale_factor,
-                }, bake_compositor_props, &excluded, false);
-            })?;
-            Some((position, id, image, origin, effect.opacity))
-        });
-        if let Some((position, ..)) = prepared.as_ref() { filter_path.truncate(*position); }
+        let prepared = filter_path
+            .iter()
+            .position(|id| blur_bounds.contains_key(id))
+            .and_then(|position| {
+                let id = filter_path[position];
+                let artifact = frame.artifact?;
+                let effect = artifact.properties.effects.get(id)?;
+                let chain = effect.filter.as_deref().and_then(parse_css_filter)?;
+                let [FilterOp::Blur(sigma)] = chain.ops.as_slice() else {
+                    return None;
+                };
+                let nodes: Vec<_> = frame
+                    .nodes
+                    .iter()
+                    .copied()
+                    .filter(|node| {
+                        effect_path(frame.artifact, node.0, bake_compositor_props).contains(&id)
+                    })
+                    .collect();
+                let mut excluded = suppressed.to_vec();
+                excluded.extend_from_slice(&filter_path[..=position]);
+                let (image, origin) =
+                    browser_blur::rasterize_small_blur(*sigma, blur_bounds[&id], |input| {
+                        paint_display_list_with_suppressed_effects(
+                            input,
+                            typeface,
+                            ReplayFrame {
+                                nodes: &nodes,
+                                metrics_font: frame.metrics_font,
+                                scroll_info: frame.scroll_info,
+                                text_input_values: frame.text_input_values,
+                                focused_index: frame.focused_index,
+                                background: frame.background,
+                                artifact: frame.artifact,
+                                retained: None,
+                                compositor_overrides: frame.compositor_overrides,
+                                scale_factor: frame.scale_factor,
+                            },
+                            bake_compositor_props,
+                            &excluded,
+                            false,
+                        );
+                    })?;
+                Some((position, id, image, origin, effect.opacity))
+            });
+        if let Some((position, ..)) = prepared.as_ref() {
+            filter_path.truncate(*position);
+        }
         let common = active_filters
             .iter()
             .zip(&filter_path)
@@ -771,8 +958,11 @@ fn paint_display_list_with_suppressed_effects(
             else {
                 continue;
             };
-            let mut paint = opacity_layer_paint(
-                if bake_compositor_props { effect.opacity } else { 1.0 });
+            let mut paint = opacity_layer_paint(if bake_compositor_props {
+                effect.opacity
+            } else {
+                1.0
+            });
             if let Some(filter) = effect
                 .filter
                 .as_deref()
@@ -785,8 +975,10 @@ fn paint_display_list_with_suppressed_effects(
             active_filters.push(effect_id);
         }
         if let Some((_, id, image, origin, opacity)) = prepared {
-            let paint = color_paint(w3cos_std::Color::WHITE,
-                if bake_compositor_props { opacity } else { 1.0 });
+            let paint = color_paint(
+                w3cos_std::Color::WHITE,
+                if bake_compositor_props { opacity } else { 1.0 },
+            );
             canvas.draw_image(&image, origin, Some(&paint));
             suppressed_subtree = Some(id);
             continue;
@@ -806,328 +998,406 @@ fn paint_display_list_with_suppressed_effects(
             None => (rect, None),
         };
 
-        let fragments = frame.artifact.and_then(|artifact| artifact.column_fragments.get(idx))
+        let fragments = frame
+            .artifact
+            .and_then(|artifact| artifact.column_fragments.get(idx))
             .filter(|fragments| !fragments.is_empty());
         for fragment_index in 0..fragments.map_or(1, Vec::len) {
-        let save = canvas.save();
-        if bake_compositor_props && let Some(artifact) = frame.artifact {
-            let (sx, sy) = artifact.viewport_scroll_for(idx);
-            canvas.translate((-sx * frame.scale_factor, -sy * frame.scale_factor));
-        }
-        if let Some(fragment) = fragments.and_then(|fragments| fragments.get(fragment_index)) {
-            let scale = frame.scale_factor;
-            if let Some(bounds) = canvas.local_clip_bounds() {
-                canvas.clip_rect(Rect::new(bounds.left(), fragment.clip_top * scale,
-                    bounds.right(), fragment.clip_bottom * scale), None, Some(false));
+            let save = canvas.save();
+            if bake_compositor_props && let Some(artifact) = frame.artifact {
+                let (sx, sy) = artifact.viewport_scroll_for(idx);
+                canvas.translate((-sx * frame.scale_factor, -sy * frame.scale_factor));
             }
-            canvas.translate((fragment.translate_x * scale, fragment.translate_y * scale));
-        }
-        for clip in clip_path(frame.artifact, idx, !bake_compositor_props) {
-            canvas.clip_rect(to_rect(clip), None, Some(false));
-        }
-        if let Some(clip) = clip {
-            canvas.clip_rect(to_rect(clip), None, Some(false));
-        }
-        let local_filter = frame.artifact.is_none().then(|| {
-            style
-                .filter
-                .as_deref()
-                .and_then(parse_css_filter)
-                .and_then(|chain| skia_filter_chain(&chain))
-                .map(|filter| {
-                    let mut paint = Paint::default();
-                    paint.set_image_filter(filter);
-                    paint
-                })
-        });
-        if let Some(Some(paint)) = local_filter.as_ref() {
-            canvas.save_layer(&SaveLayerRec::default().paint(paint));
-        }
-        // With a PaintArtifact, opacity belongs to the Effect tree and must be
-        // applied once to the whole subtree. Avoid multiplying it into this
-        // display item a second time.
-        if let Some(group) = background_groups.get(&idx) {
-            let artifact = frame.artifact.expect("groups require retained nodes");
-            let origin = artifact.rect_by_index[idx].expect("group has layout");
-            let first_line_font_box = style.custom_properties.as_ref()
-                .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
-                .filter(|source| source.as_str() == "first-line")
-                .and_then(|_| artifact.nodes[idx].parent)
-                .and_then(|parent| group.iter().find(|&&member| {
-                    let font = &artifact.nodes[member].style;
-                    let owner = &artifact.nodes[parent].style;
-                    font.font_size == owner.font_size && font.font_family == owner.font_family
-                        && font.font_weight == owner.font_weight && font.font_style == owner.font_style
-                }))
-                .and_then(|&member| artifact.rect_by_index[member].map(|font_box| {
-                    let font = &artifact.nodes[member].style;
-                    (font_box.y + rect.y - origin.y, resolved_font_geometry(font)
-                        .map_or(font.font_size, ResolvedFontGeometry::height))
-                }));
-            for &member in group {
-                let node = &artifact.nodes[member];
-                let ComponentKind::Text { content } = &node.kind else { continue; };
-                let Some(mut member_rect) = artifact.rect_by_index[member] else { continue; };
-                member_rect.x += rect.x - origin.x;
-                member_rect.y += rect.y - origin.y;
-                let mut background_style = node.style.clone();
-                background_style.opacity = 1.0;
-                if plain_inline_background(&background_style)
-                    && background_style.background_image.as_deref().is_none_or(|image|
-                        image.trim().eq_ignore_ascii_case("none"))
-                    && let Some((y, height)) = first_line_font_box
-                {
-                    // A first-line pseudo owns one principal font box. A
-                    // larger descendant's ink does not enlarge that source.
-                    background_style.custom_properties.get_or_insert_with(Default::default)
-                        .insert("--w3cos-internal-inline-background-font-box".into(), format!("{y} {height}"));
+            if let Some(fragment) = fragments.and_then(|fragments| fragments.get(fragment_index)) {
+                let scale = frame.scale_factor;
+                if let Some(bounds) = canvas.local_clip_bounds() {
+                    canvas.clip_rect(
+                        Rect::new(
+                            bounds.left(),
+                            fragment.clip_top * scale,
+                            bounds.right(),
+                            fragment.clip_bottom * scale,
+                        ),
+                        None,
+                        Some(false),
+                    );
                 }
-                let context = artifact.inline_line_context(member).map(|mut context| {
-                    context.line_box.x += rect.x - origin.x;
-                    context.line_box.y += rect.y - origin.y;
-                    context
+                canvas.translate((fragment.translate_x * scale, fragment.translate_y * scale));
+            }
+            for clip in clip_path(frame.artifact, idx, !bake_compositor_props) {
+                canvas.clip_rect(to_rect(clip), None, Some(false));
+            }
+            if let Some(clip) = clip {
+                canvas.clip_rect(to_rect(clip), None, Some(false));
+            }
+            let local_filter = frame.artifact.is_none().then(|| {
+                style
+                    .filter
+                    .as_deref()
+                    .and_then(parse_css_filter)
+                    .and_then(|chain| skia_filter_chain(&chain))
+                    .map(|filter| {
+                        let mut paint = Paint::default();
+                        paint.set_image_filter(filter);
+                        paint
+                    })
+            });
+            if let Some(Some(paint)) = local_filter.as_ref() {
+                canvas.save_layer(&SaveLayerRec::default().paint(paint));
+            }
+            // With a PaintArtifact, opacity belongs to the Effect tree and must be
+            // applied once to the whole subtree. Avoid multiplying it into this
+            // display item a second time.
+            if let Some(group) = background_groups.get(&idx) {
+                let artifact = frame.artifact.expect("groups require retained nodes");
+                let origin = artifact.rect_by_index[idx].expect("group has layout");
+                let first_line_font_box = style
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
+                    .filter(|source| source.as_str() == "first-line")
+                    .and_then(|_| artifact.nodes[idx].parent)
+                    .and_then(|parent| {
+                        group.iter().find(|&&member| {
+                            let font = &artifact.nodes[member].style;
+                            let owner = &artifact.nodes[parent].style;
+                            font.font_size == owner.font_size
+                                && font.font_family == owner.font_family
+                                && font.font_weight == owner.font_weight
+                                && font.font_style == owner.font_style
+                        })
+                    })
+                    .and_then(|&member| {
+                        artifact.rect_by_index[member].map(|font_box| {
+                            let font = &artifact.nodes[member].style;
+                            (
+                                font_box.y + rect.y - origin.y,
+                                resolved_font_geometry(font)
+                                    .map_or(font.font_size, ResolvedFontGeometry::height),
+                            )
+                        })
+                    });
+                for &member in group {
+                    let node = &artifact.nodes[member];
+                    let ComponentKind::Text { content } = &node.kind else {
+                        continue;
+                    };
+                    let Some(mut member_rect) = artifact.rect_by_index[member] else {
+                        continue;
+                    };
+                    member_rect.x += rect.x - origin.x;
+                    member_rect.y += rect.y - origin.y;
+                    let mut background_style = node.style.clone();
+                    background_style.opacity = 1.0;
+                    if plain_inline_background(&background_style)
+                        && background_style
+                            .background_image
+                            .as_deref()
+                            .is_none_or(|image| image.trim().eq_ignore_ascii_case("none"))
+                        && let Some((y, height)) = first_line_font_box
+                    {
+                        // A first-line pseudo owns one principal font box. A
+                        // larger descendant's ink does not enlarge that source.
+                        background_style
+                            .custom_properties
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                "--w3cos-internal-inline-background-font-box".into(),
+                                format!("{y} {height}"),
+                            );
+                    }
+                    let context = artifact.inline_line_context(member).map(|mut context| {
+                        context.line_box.x += rect.x - origin.x;
+                        context.line_box.y += rect.y - origin.y;
+                        context
+                    });
+                    draw_text_in_rect_with_line_painter(
+                        canvas,
+                        member_rect,
+                        content,
+                        &background_style,
+                        typeface,
+                        frame.metrics_font,
+                        context,
+                        true,
+                        &mut |_, _, _, _, advance, _, _| advance,
+                    );
+                }
+            }
+            let passive_split_inline = style.display == Display::Flex
+                && style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-split-inline-fragment")
                 });
-                draw_text_in_rect_with_line_painter(canvas, member_rect, content,
-                    &background_style, typeface, frame.metrics_font, context, true,
-                    &mut |_, _, _, _, advance, _, _| advance);
-            }
-        }
-        let passive_split_inline = style.display == Display::Flex
-            && style.custom_properties.as_ref().is_some_and(|properties|
-                properties.contains_key("--w3cos-internal-split-inline-fragment"));
-        let normalized_style = (frame.artifact.is_some()
-            && (style.opacity < 0.999 || grouped_backgrounds.contains(&idx)
-                || passive_split_inline)).then(|| {
-            let mut normalized = style.clone();
-            normalized.opacity = 1.0;
-            // The Flex box is an anonymous line-layout carrier. Its source
-            // inline still owns content-sized decoration, not a block fill.
-            if passive_split_inline { normalized.display = Display::Inline; }
-            if grouped_backgrounds.contains(&idx) {
-                normalized.background = w3cos_std::Color::TRANSPARENT;
-            }
-            normalized
-        });
-        let style = if passive_split_inline {
-            normalized_style.as_ref().unwrap_or(style)
-        } else { style };
-        let render_rect = inline_background_union_rect(
-            frame.artifact,
-            idx,
-            rect,
-            kind,
-            normalized_style.as_ref().unwrap_or(style),
-        );
-        let normal_plain_white_background = style.line_height_is_normal
-            && style.background.r == 255
-            && style.background.g == 255
-            && style.background.b == 255
-            && style.padding_lengths().top == 0.0
-            && style.padding_lengths().right == 0.0
-            && style.padding_lengths().bottom == 0.0
-            && style.padding_lengths().left == 0.0
-            && style.border_width == 0.0
-            && style.border_top_width.unwrap_or(0.0) == 0.0
-            && style.border_right_width.unwrap_or(0.0) == 0.0
-            && style.border_bottom_width.unwrap_or(0.0) == 0.0
-            && style.border_left_width.unwrap_or(0.0) == 0.0;
-        let extra_inline_background_rects = if style.display == Display::Inline
-            && style.background.a > 0
-            && matches!(kind, ComponentKind::Row | ComponentKind::Box)
-        {
-            frame
-                .artifact
-                .map(|artifact| {
-                    artifact
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(descendant, node)| {
-                            let mut parent = node.parent;
-                            let mut is_descendant = false;
-                            let mut under_decorated = false;
-                            while let Some(candidate) = parent {
-                                if candidate == idx {
-                                    is_descendant = true;
-                                    break;
+            let normalized_style = (frame.artifact.is_some()
+                && (style.opacity < 0.999
+                    || grouped_backgrounds.contains(&idx)
+                    || passive_split_inline))
+                .then(|| {
+                    let mut normalized = style.clone();
+                    normalized.opacity = 1.0;
+                    // The Flex box is an anonymous line-layout carrier. Its source
+                    // inline still owns content-sized decoration, not a block fill.
+                    if passive_split_inline {
+                        normalized.display = Display::Inline;
+                    }
+                    if grouped_backgrounds.contains(&idx) {
+                        normalized.background = w3cos_std::Color::TRANSPARENT;
+                    }
+                    normalized
+                });
+            let style = if passive_split_inline {
+                normalized_style.as_ref().unwrap_or(style)
+            } else {
+                style
+            };
+            let render_rect = inline_background_union_rect(
+                frame.artifact,
+                idx,
+                rect,
+                kind,
+                normalized_style.as_ref().unwrap_or(style),
+            );
+            let normal_plain_white_background = style.line_height_is_normal
+                && style.background.r == 255
+                && style.background.g == 255
+                && style.background.b == 255
+                && style.padding_lengths().top == 0.0
+                && style.padding_lengths().right == 0.0
+                && style.padding_lengths().bottom == 0.0
+                && style.padding_lengths().left == 0.0
+                && style.border_width == 0.0
+                && style.border_top_width.unwrap_or(0.0) == 0.0
+                && style.border_right_width.unwrap_or(0.0) == 0.0
+                && style.border_bottom_width.unwrap_or(0.0) == 0.0
+                && style.border_left_width.unwrap_or(0.0) == 0.0;
+            let extra_inline_background_rects = if style.display == Display::Inline
+                && style.background.a > 0
+                && matches!(kind, ComponentKind::Row | ComponentKind::Box)
+            {
+                frame
+                    .artifact
+                    .map(|artifact| {
+                        artifact
+                            .nodes
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(descendant, node)| {
+                                let mut parent = node.parent;
+                                let mut is_descendant = false;
+                                let mut under_decorated = false;
+                                while let Some(candidate) = parent {
+                                    if candidate == idx {
+                                        is_descendant = true;
+                                        break;
+                                    }
+                                    let ancestor = artifact.nodes.get(candidate)?;
+                                    if ancestor.style.background.a > 0
+                                        || ancestor.style.background_image.is_some()
+                                        || ancestor.style.padding_lengths().top > 0.0
+                                        || ancestor.style.padding_lengths().right > 0.0
+                                        || ancestor.style.padding_lengths().bottom > 0.0
+                                        || ancestor.style.padding_lengths().left > 0.0
+                                        || ancestor.style.border_width > 0.0
+                                        || ancestor
+                                            .style
+                                            .border_top_width
+                                            .is_some_and(|width| width > 0.0)
+                                        || ancestor
+                                            .style
+                                            .border_right_width
+                                            .is_some_and(|width| width > 0.0)
+                                        || ancestor
+                                            .style
+                                            .border_bottom_width
+                                            .is_some_and(|width| width > 0.0)
+                                        || ancestor
+                                            .style
+                                            .border_left_width
+                                            .is_some_and(|width| width > 0.0)
+                                    {
+                                        under_decorated = true;
+                                    }
+                                    parent = ancestor.parent;
                                 }
-                                let ancestor = artifact.nodes.get(candidate)?;
-                                if ancestor.style.background.a > 0
-                                    || ancestor.style.background_image.is_some()
-                                    || ancestor.style.padding_lengths().top > 0.0
-                                    || ancestor.style.padding_lengths().right > 0.0
-                                    || ancestor.style.padding_lengths().bottom > 0.0
-                                    || ancestor.style.padding_lengths().left > 0.0
-                                    || ancestor.style.border_width > 0.0
-                                    || ancestor
-                                        .style
-                                        .border_top_width
-                                        .is_some_and(|width| width > 0.0)
-                                    || ancestor
-                                        .style
-                                        .border_right_width
-                                        .is_some_and(|width| width > 0.0)
-                                    || ancestor
-                                        .style
-                                        .border_bottom_width
-                                        .is_some_and(|width| width > 0.0)
-                                    || ancestor
-                                        .style
-                                        .border_left_width
-                                        .is_some_and(|width| width > 0.0)
-                                {
-                                    under_decorated = true;
-                                }
-                                parent = ancestor.parent;
-                            }
-                            if !is_descendant
+                                if !is_descendant
                                 || under_decorated
                                 // A descendant's different em box is not a
                                 // continuation of this inline's decoration.
                                 // Its text remains independently paintable.
                                 || (node.style.font_size - style.font_size).abs() > 0.01
                                 || !matches!(node.kind, ComponentKind::Text { .. })
-                            {
-                                return None;
-                            }
-                            let rect = artifact.rect_by_index.get(descendant).copied().flatten()?;
-                            let ComponentKind::Text { content } = &node.kind else {
-                                return None;
-                            };
-                            // Coincident geometry does not remove a text
-                            // fragment. In a block-split inline the first
-                            // text rect can equal the principal rect, while
-                            // its painted advance is shorter than that rect.
-                            Some((rect, content.clone()))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let line_context = frame
-            .artifact
-            .and_then(|artifact| artifact.inline_line_context(idx))
-            .map(|mut context| {
-                if let Some((sx, sy, _)) = frame.scroll_info.get(idx).copied().flatten() {
-                    context.line_box.x -= sx;
-                    context.line_box.y -= sy;
-                    context.first_line_box.x -= sx;
-                    context.first_line_box.y -= sy;
-                }
-                context
-            });
-        // A decorated inline nested inside another inline shares the
-        // parent's anonymous line box, but its own background/border should
-        // remain centered in that line box. Keep this context for decoration
-        // paint only; text still uses the original layout rect.
-        let inline_decoration_line_box = frame.artifact.and_then(|artifact| {
-            let parent = artifact.nodes.get(idx)?.parent?;
-            if !matches!(
-                artifact.nodes.get(parent)?.style.display,
-                Display::Inline | Display::Contents
-            ) {
-                return None;
-            }
-            let mut ancestor = Some(parent);
-            while let Some(index) = ancestor {
-                let node = artifact.nodes.get(index)?;
-                let is_line = node
-                    .style
-                    .custom_properties
-                    .as_ref()
-                    .is_some_and(|properties| {
-                        properties.contains_key("--w3cos-internal-anonymous-block-line")
-                    });
-                if is_line {
-                    return artifact.rect_by_index.get(index).copied().flatten();
-                }
-                ancestor = node.parent;
-            }
-            None
-        });
-        let inline_text_leading = frame.artifact.and_then(|artifact| {
-            if !matches!(kind, ComponentKind::Text { .. }) {
-                return None;
-            }
-            let mut ancestor = artifact.nodes.get(idx)?.parent;
-            let mut saw_inline = false;
-            while let Some(index) = ancestor {
-                let node = artifact.nodes.get(index)?;
-                if matches!(node.style.display, Display::Inline | Display::Contents) {
-                    let padding = node.style.padding_lengths();
-                    let has_edge = node.style.border_width > 0.0
-                        || node.style.border_top_width.is_some_and(|width| width > 0.0)
-                        || node.style.border_right_width.is_some_and(|width| width > 0.0)
-                        || node.style.border_bottom_width.is_some_and(|width| width > 0.0)
-                        || node.style.border_left_width.is_some_and(|width| width > 0.0)
-                        || [padding.top, padding.right, padding.bottom, padding.left]
-                            .into_iter()
-                            .any(|edge| edge > 0.0);
-                    if has_edge || top_aligned_inline(&node.style) {
-                        return Some(false);
-                    }
-                    saw_inline = true;
-                }
-                if node
-                    .style
-                    .custom_properties
-                    .as_ref()
-                    .is_some_and(|properties| {
-                        properties.contains_key("--w3cos-internal-anonymous-block-line")
+                                {
+                                    return None;
+                                }
+                                let rect =
+                                    artifact.rect_by_index.get(descendant).copied().flatten()?;
+                                let ComponentKind::Text { content } = &node.kind else {
+                                    return None;
+                                };
+                                // Coincident geometry does not remove a text
+                                // fragment. In a block-split inline the first
+                                // text rect can equal the principal rect, while
+                                // its painted advance is shorter than that rect.
+                                Some((rect, content.clone()))
+                            })
+                            .collect::<Vec<_>>()
                     })
-                {
-                    let text_rect = artifact.rect_by_index.get(idx).copied().flatten()?;
-                    let line_rect = artifact.rect_by_index.get(index).copied().flatten()?;
-                    let strut_height = crate::layout::inline_style_line_height(&node.style);
-                    return Some(saw_inline && inline_text_is_in_first_strut(
-                        text_rect, line_rect, strut_height,
-                    ));
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let line_context = frame
+                .artifact
+                .and_then(|artifact| artifact.inline_line_context(idx))
+                .map(|mut context| {
+                    if let Some((sx, sy, _)) = frame.scroll_info.get(idx).copied().flatten() {
+                        context.line_box.x -= sx;
+                        context.line_box.y -= sy;
+                        context.first_line_box.x -= sx;
+                        context.first_line_box.y -= sy;
+                    }
+                    context
+                });
+            // A decorated inline nested inside another inline shares the
+            // parent's anonymous line box, but its own background/border should
+            // remain centered in that line box. Keep this context for decoration
+            // paint only; text still uses the original layout rect.
+            let inline_decoration_line_box = frame.artifact.and_then(|artifact| {
+                let parent = artifact.nodes.get(idx)?.parent?;
+                if !matches!(
+                    artifact.nodes.get(parent)?.style.display,
+                    Display::Inline | Display::Contents
+                ) {
+                    return None;
                 }
-                ancestor = node.parent;
+                let mut ancestor = Some(parent);
+                while let Some(index) = ancestor {
+                    let node = artifact.nodes.get(index)?;
+                    let is_line = node
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|properties| {
+                            properties.contains_key("--w3cos-internal-anonymous-block-line")
+                        });
+                    if is_line {
+                        return artifact.rect_by_index.get(index).copied().flatten();
+                    }
+                    ancestor = node.parent;
+                }
+                None
+            });
+            let inline_text_leading = frame.artifact.and_then(|artifact| {
+                if !matches!(kind, ComponentKind::Text { .. }) {
+                    return None;
+                }
+                let mut ancestor = artifact.nodes.get(idx)?.parent;
+                let mut saw_inline = false;
+                while let Some(index) = ancestor {
+                    let node = artifact.nodes.get(index)?;
+                    if matches!(node.style.display, Display::Inline | Display::Contents) {
+                        let padding = node.style.padding_lengths();
+                        let has_edge = node.style.border_width > 0.0
+                            || node.style.border_top_width.is_some_and(|width| width > 0.0)
+                            || node
+                                .style
+                                .border_right_width
+                                .is_some_and(|width| width > 0.0)
+                            || node
+                                .style
+                                .border_bottom_width
+                                .is_some_and(|width| width > 0.0)
+                            || node
+                                .style
+                                .border_left_width
+                                .is_some_and(|width| width > 0.0)
+                            || [padding.top, padding.right, padding.bottom, padding.left]
+                                .into_iter()
+                                .any(|edge| edge > 0.0);
+                        if has_edge || top_aligned_inline(&node.style) {
+                            return Some(false);
+                        }
+                        saw_inline = true;
+                    }
+                    if node
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|properties| {
+                            properties.contains_key("--w3cos-internal-anonymous-block-line")
+                        })
+                    {
+                        let text_rect = artifact.rect_by_index.get(idx).copied().flatten()?;
+                        let line_rect = artifact.rect_by_index.get(index).copied().flatten()?;
+                        let strut_height = crate::layout::inline_style_line_height(&node.style);
+                        return Some(
+                            saw_inline
+                                && inline_text_is_in_first_strut(
+                                    text_rect,
+                                    line_rect,
+                                    strut_height,
+                                ),
+                        );
+                    }
+                    ancestor = node.parent;
+                }
+                Some(false)
+            });
+            let applied_decorations = frame
+                .artifact
+                .map_or_else(Vec::new, |artifact| artifact.ancestor_text_decorations(idx));
+            render_node_with_applied_decorations(
+                canvas,
+                idx,
+                render_rect,
+                kind,
+                normalized_style.as_ref().unwrap_or(style),
+                typeface,
+                frame.metrics_font,
+                frame.text_input_values.get(&idx).map(String::as_str),
+                frame.focused_index == Some(idx),
+                bake_compositor_props,
+                line_context,
+                inline_decoration_line_box,
+                inline_text_leading.unwrap_or(false),
+                frame.artifact.is_some_and(|artifact| {
+                    style.display == Display::Inline
+                        && matches!(kind, ComponentKind::Row | ComponentKind::Box)
+                        && inline_has_content(artifact, idx)
+                }),
+                &extra_inline_background_rects,
+                // Replay can combine several source words under the first client
+                // ID. That ID's original glyph slice no longer describes the new
+                // Text; reshape it instead of silently painting only the first word.
+                shaped_fragments.get(&idx).filter(|_| {
+                    frame.artifact.is_some_and(|artifact| {
+                        artifact
+                            .nodes
+                            .get(idx)
+                            .is_some_and(|source| match (kind, &source.kind) {
+                                (
+                                    ComponentKind::Text { content },
+                                    ComponentKind::Text { content: original },
+                                ) => content == original,
+                                _ => false,
+                            })
+                    })
+                }),
+                &applied_decorations,
+                frame.artifact.and_then(|artifact| {
+                    terminal_inline_padding_fragment(artifact, idx, render_rect)
+                }),
+                multisampled_effects.contains(
+                    &frame
+                        .artifact
+                        .and_then(|artifact| artifact.node_properties.get(idx))
+                        .map_or(0, |properties| properties.effect),
+                ),
+            );
+            if matches!(local_filter, Some(Some(_))) {
+                canvas.restore();
             }
-            Some(false)
-        });
-        let applied_decorations = frame.artifact
-            .map_or_else(Vec::new, |artifact| artifact.ancestor_text_decorations(idx));
-        render_node_with_applied_decorations(
-            canvas,
-            idx,
-            render_rect,
-            kind,
-            normalized_style.as_ref().unwrap_or(style),
-            typeface,
-            frame.metrics_font,
-            frame.text_input_values.get(&idx).map(String::as_str),
-            frame.focused_index == Some(idx),
-            bake_compositor_props,
-            line_context,
-            inline_decoration_line_box,
-            inline_text_leading.unwrap_or(false),
-            frame.artifact.is_some_and(|artifact| {
-                style.display == Display::Inline
-                    && matches!(kind, ComponentKind::Row | ComponentKind::Box)
-                    && inline_has_content(artifact, idx)
-            }),
-            &extra_inline_background_rects,
-            // Replay can combine several source words under the first client
-            // ID. That ID's original glyph slice no longer describes the new
-            // Text; reshape it instead of silently painting only the first word.
-            shaped_fragments.get(&idx).filter(|_| frame.artifact.is_some_and(|artifact|
-                artifact.nodes.get(idx).is_some_and(|source| match (kind, &source.kind) {
-                    (ComponentKind::Text { content }, ComponentKind::Text { content: original }) => content == original,
-                    _ => false,
-                }))),
-            &applied_decorations,
-            frame.artifact.and_then(|artifact| terminal_inline_padding_fragment(artifact, idx, render_rect)),
-            multisampled_effects.contains(&frame.artifact
-                .and_then(|artifact|artifact.node_properties.get(idx)).map_or(0,|properties|properties.effect)),
-        );
-        if matches!(local_filter, Some(Some(_))) {
-            canvas.restore();
-        }
-        canvas.restore_to_count(save);
+            canvas.restore_to_count(save);
         }
     }
     for _ in 0..active_filters.len() {
@@ -1153,16 +1423,31 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         let default_overrides = CompositorOverrides::default();
         let overrides = overrides.unwrap_or(&default_overrides);
         let action = cache.tree.sync(artifact, &scrolls, overrides);
-        let glyph_clips = cache.tree.layers.iter().map(|layer|
-            layer_glyph_clip(layer, artifact, frame.scroll_info, overrides, scale_factor,
-                canvas.local_clip_bounds().unwrap_or_default()))
+        let glyph_clips = cache
+            .tree
+            .layers
+            .iter()
+            .map(|layer| {
+                layer_glyph_clip(
+                    layer,
+                    artifact,
+                    frame.scroll_info,
+                    overrides,
+                    scale_factor,
+                    canvas.local_clip_bounds().unwrap_or_default(),
+                )
+            })
             .collect::<Vec<_>>();
         let reusable = matches!(action, LayerPaintAction::Replay)
             && cache.tree.recordings_valid()
             && cache.pictures.len() == cache.tree.layers.len()
             && cache.glyph_clip_decisions.len() == cache.tree.layers.len();
-        let can_replay = reusable && cache.glyph_clip_decisions.iter().zip(&glyph_clips)
-            .all(|(decisions, clip)| glyph_clip_decisions_match(decisions, *clip));
+        let can_replay = reusable
+            && cache
+                .glyph_clip_decisions
+                .iter()
+                .zip(&glyph_clips)
+                .all(|(decisions, clip)| glyph_clip_decisions_match(decisions, *clip));
         if can_replay {
             cache.tree.note_replay();
             crate::perf::record_paint_path("retained-layer-replay");
@@ -1181,9 +1466,12 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         let mut pictures = Vec::with_capacity(cache.tree.layers.len());
         let mut glyph_clip_decisions = Vec::with_capacity(cache.tree.layers.len());
         for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
-            if reusable && glyph_clip_decisions_match(
-                &cache.glyph_clip_decisions[layer_index], glyph_clips[layer_index],
-            ) {
+            if reusable
+                && glyph_clip_decisions_match(
+                    &cache.glyph_clip_decisions[layer_index],
+                    glyph_clips[layer_index],
+                )
+            {
                 pictures.push(cache.pictures[layer_index].clone());
                 glyph_clip_decisions.push(cache.glyph_clip_decisions[layer_index].clone());
                 continue;
@@ -1246,31 +1534,48 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
 }
 
 fn layer_scrollport_clips(
-    layer: &crate::retained_layers::CompositorLayer, artifact: &PaintArtifact,
+    layer: &crate::retained_layers::CompositorLayer,
+    artifact: &PaintArtifact,
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
 ) -> Vec<LayoutRect> {
     let mut clips = Vec::new();
-    if let Some(clip) = layer_scroll_translation(layer, scroll_info).2 { clips.push(clip); }
-    let root_overflow_visible = artifact.nodes.first().is_some_and(|root|
+    if let Some(clip) = layer_scroll_translation(layer, scroll_info).2 {
+        clips.push(clip);
+    }
+    let root_overflow_visible = artifact.nodes.first().is_some_and(|root| {
         root.style.resolved_overflow_x() == w3cos_std::style::Overflow::Visible
-            && root.style.resolved_overflow_y() == w3cos_std::style::Overflow::Visible);
+            && root.style.resolved_overflow_y() == w3cos_std::style::Overflow::Visible
+    });
     let mut scroll = layer.properties.scroll;
     while scroll != 0 {
-        let Some(node) = artifact.properties.scrolls.get(scroll) else { break; };
-        let viewport_host = artifact.body_index.is_some() && (node.host_index == Some(0)
-            || (root_overflow_visible && node.host_index == artifact.body_index));
-        if !viewport_host && let Some(rect) = node.clip
-            .and_then(|clip| artifact.properties.clips.get(clip)).and_then(|clip| clip.rect)
-        { clips.push(rect); }
-        if node.parent == scroll { break; }
+        let Some(node) = artifact.properties.scrolls.get(scroll) else {
+            break;
+        };
+        let viewport_host = artifact.body_index.is_some()
+            && (node.host_index == Some(0)
+                || (root_overflow_visible && node.host_index == artifact.body_index));
+        if !viewport_host
+            && let Some(rect) = node
+                .clip
+                .and_then(|clip| artifact.properties.clips.get(clip))
+                .and_then(|clip| clip.rect)
+        {
+            clips.push(rect);
+        }
+        if node.parent == scroll {
+            break;
+        }
         scroll = node.parent;
     }
     clips
 }
 
 fn layer_glyph_clip(
-    layer: &crate::retained_layers::CompositorLayer, artifact: &PaintArtifact,
-    scroll_info: &[Option<(f32, f32, LayoutRect)>], overrides: &CompositorOverrides, scale: f32,
+    layer: &crate::retained_layers::CompositorLayer,
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale: f32,
     viewport: Rect,
 ) -> Option<Rect> {
     // Filters can spread ink across a clip even when the unfiltered outline
@@ -1280,21 +1585,44 @@ fn layer_glyph_clip(
         let mut current = artifact.node_properties.get(index)?.effect;
         while current != 0 {
             let effect = artifact.properties.effects.get(current)?;
-            if effect.filter.is_some() { return None; }
-            if effect.parent == current { break; }
+            if effect.filter.is_some() {
+                return None;
+            }
+            if effect.parent == current {
+                break;
+            }
             current = effect.parent;
         }
     }
-    let (sx, sy) = layer.client_indices.first().map_or((0.0, 0.0), |index|
-        artifact.viewport_scroll_for(*index));
-    let viewport = Rect::new(viewport.left + sx * scale, viewport.top + sy * scale,
-        viewport.right + sx * scale, viewport.bottom + sy * scale);
-    let clip = layer_scrollport_clips(layer, artifact, scroll_info).into_iter().map(to_rect)
-        .fold(viewport, |left, right| Rect::new(left.left.max(right.left), left.top.max(right.top),
-            left.right.min(right.right), left.bottom.min(right.bottom)));
-    if clip.is_empty() { return Some(Rect::default()); }
-    let inverse = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale).invert()?;
-    if inverse.has_perspective() { return None; }
+    let (sx, sy) = layer
+        .client_indices
+        .first()
+        .map_or((0.0, 0.0), |index| artifact.viewport_scroll_for(*index));
+    let viewport = Rect::new(
+        viewport.left + sx * scale,
+        viewport.top + sy * scale,
+        viewport.right + sx * scale,
+        viewport.bottom + sy * scale,
+    );
+    let clip = layer_scrollport_clips(layer, artifact, scroll_info)
+        .into_iter()
+        .map(to_rect)
+        .fold(viewport, |left, right| {
+            Rect::new(
+                left.left.max(right.left),
+                left.top.max(right.top),
+                left.right.min(right.right),
+                left.bottom.min(right.bottom),
+            )
+        });
+    if clip.is_empty() {
+        return Some(Rect::default());
+    }
+    let inverse =
+        compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale).invert()?;
+    if inverse.has_perspective() {
+        return None;
+    }
     let local = inverse.map_rect(clip).0;
     local.is_finite().then_some(local)
 }
@@ -1350,7 +1678,10 @@ fn composite_skia_layers(
         for clip_rect in layer_scrollport_clips(layer, artifact, scroll_info) {
             canvas.clip_rect(to_rect(clip_rect), None, Some(false));
         }
-        let isolates_surface = artifact.properties.effects.get(layer.properties.effect)
+        let isolates_surface = artifact
+            .properties
+            .effects
+            .get(layer.properties.effect)
             .is_some_and(|effect| effect.isolates_surface);
         if opacity < 0.999 || isolates_surface {
             // CSS opacity uses the same normalized SrcOver rounding as
@@ -1392,13 +1723,15 @@ fn paint_canvas_background_image(
         },
         0.0,
         style,
-        artifact.and_then(|artifact| artifact.canvas_background_positioning_rect.map(|rect| {
-            LayoutRect {
-                x: rect.x - artifact.viewport_scroll.0,
-                y: rect.y - artifact.viewport_scroll.1,
-                ..rect
-            }
-        })),
+        artifact.and_then(|artifact| {
+            artifact
+                .canvas_background_positioning_rect
+                .map(|rect| LayoutRect {
+                    x: rect.x - artifact.viewport_scroll.0,
+                    y: rect.y - artifact.viewport_scroll.1,
+                    ..rect
+                })
+        }),
         1.0,
     );
     canvas.restore_to_count(save);
@@ -1544,23 +1877,38 @@ impl SkiaMetalPresenter {
     }
 }
 
-fn inline_background_groups(artifact: &crate::paint_artifact::PaintArtifact)
-    -> HashMap<usize, Vec<usize>>
-{
+fn inline_background_groups(
+    artifact: &crate::paint_artifact::PaintArtifact,
+) -> HashMap<usize, Vec<usize>> {
     let mut sources: HashMap<(usize, &str), Vec<usize>> = HashMap::new();
     for (index, node) in artifact.nodes.iter().enumerate() {
-        let Some(parent) = node.parent else { continue; };
-        let Some(source) = node.style.custom_properties.as_ref().and_then(|properties|
-            properties.get("--w3cos-internal-inline-background-group")) else { continue; };
-        if node.style.display == Display::Inline && node.style.background.a > 0
+        let Some(parent) = node.parent else {
+            continue;
+        };
+        let Some(source) = node
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-inline-background-group"))
+        else {
+            continue;
+        };
+        if node.style.display == Display::Inline
+            && node.style.background.a > 0
             && matches!(node.kind, ComponentKind::Text { .. })
             && artifact.rect_by_index[index].is_some()
         {
-            sources.entry((parent, source.as_str())).or_default().push(index);
+            sources
+                .entry((parent, source.as_str()))
+                .or_default()
+                .push(index);
         }
     }
-    sources.into_values().filter(|group| group.len() > 1)
-        .map(|group| (group[0], group)).collect()
+    sources
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .map(|group| (group[0], group))
+        .collect()
 }
 
 fn plain_inline_background(style: &Style) -> bool {
@@ -1578,31 +1926,62 @@ fn plain_inline_background(style: &Style) -> bool {
 /// A preserved terminal break closes the text fragment, but an inline's
 /// trailing padding still occupies the following line. It must not remain
 /// attached to the preceding line's principal background rectangle.
-fn terminal_inline_padding_fragment(artifact: &PaintArtifact, index: usize, rect: LayoutRect) -> Option<LayoutRect> {
+fn terminal_inline_padding_fragment(
+    artifact: &PaintArtifact,
+    index: usize,
+    rect: LayoutRect,
+) -> Option<LayoutRect> {
     use w3cos_std::style::{TextDirection, WhiteSpace};
     let node = artifact.nodes.get(index)?;
-    if node.style.display != Display::Inline || !plain_inline_background(&node.style)
-        || node.style.direction != TextDirection::Ltr || node.style.padding_lengths().right <= 0.0
+    if node.style.display != Display::Inline
+        || !plain_inline_background(&node.style)
+        || node.style.direction != TextDirection::Ltr
+        || node.style.padding_lengths().right <= 0.0
         || !matches!(node.kind, ComponentKind::Row | ComponentKind::Box)
-    { return None; }
-    let children = artifact.nodes.iter().filter(|child| child.parent == Some(index)).collect::<Vec<_>>();
-    if children.iter().any(|child| !matches!(child.kind, ComponentKind::Text { .. })
-        || child.style.display != Display::Inline || child.style.position != w3cos_std::style::Position::Static
-        || child.style.float != w3cos_std::style::Float::None) { return None; }
+    {
+        return None;
+    }
+    let children = artifact
+        .nodes
+        .iter()
+        .filter(|child| child.parent == Some(index))
+        .collect::<Vec<_>>();
+    if children.iter().any(|child| {
+        !matches!(child.kind, ComponentKind::Text { .. })
+            || child.style.display != Display::Inline
+            || child.style.position != w3cos_std::style::Position::Static
+            || child.style.float != w3cos_std::style::Float::None
+    }) {
+        return None;
+    }
     let last = children.last()?;
-    let ComponentKind::Text { content } = &last.kind else { return None; };
+    let ComponentKind::Text { content } = &last.kind else {
+        return None;
+    };
     let prepared = text_layout::prepare_text_for_white_space(content, last.style.white_space);
-    if !matches!(last.style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine)
-        || !content.ends_with(['\n', '\r', '\u{2028}'])
-        || prepared.chars().filter(|character| matches!(character, '\n' | '\u{2028}')).count() != 1
-        || children.iter().any(|child| child.style.font_size != node.style.font_size
-            || child.style.line_height != node.style.line_height)
+    if !matches!(
+        last.style.white_space,
+        WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+    ) || !content.ends_with(['\n', '\r', '\u{2028}'])
+        || prepared
+            .chars()
+            .filter(|character| matches!(character, '\n' | '\u{2028}'))
+            .count()
+            != 1
+        || children.iter().any(|child| {
+            child.style.font_size != node.style.font_size
+                || child.style.line_height != node.style.line_height
+        })
         || children[..children.len() - 1].iter().any(|child| {
-            let ComponentKind::Text { content } = &child.kind else { return true; };
+            let ComponentKind::Text { content } = &child.kind else {
+                return true;
+            };
             text_layout::prepare_text_for_white_space(content, child.style.white_space)
                 .contains(['\n', '\u{2028}'])
         })
-    { return None; }
+    {
+        return None;
+    }
     let original = artifact.rect_by_index.get(index).copied().flatten()?;
     let mut ancestor = node.parent;
     while let Some(owner) = ancestor {
@@ -1610,9 +1989,14 @@ fn terminal_inline_padding_fragment(artifact: &PaintArtifact, index: usize, rect
         if !matches!(parent.style.display, Display::Inline | Display::Contents) {
             let line = artifact.rect_by_index.get(owner).copied().flatten()?;
             return Some(LayoutRect {
-                x: line.x + parent.style.padding_lengths().left
-                    + parent.style.border_left_width.unwrap_or(parent.style.border_width)
-                    + rect.x - original.x,
+                x: line.x
+                    + parent.style.padding_lengths().left
+                    + parent
+                        .style
+                        .border_left_width
+                        .unwrap_or(parent.style.border_width)
+                    + rect.x
+                    - original.x,
                 y: rect.y + crate::layout::inline_style_line_height(&node.style),
                 width: node.style.padding_lengths().right,
                 height: rect.height,
@@ -1630,7 +2014,8 @@ fn inline_background_union_rect(
     kind: &ComponentKind,
     style: &Style,
 ) -> LayoutRect {
-    let vertical_edges = style.padding_lengths().top + style.padding_lengths().bottom
+    let vertical_edges = style.padding_lengths().top
+        + style.padding_lengths().bottom
         + style.border_top_width.unwrap_or(style.border_width)
         + style.border_bottom_width.unwrap_or(style.border_width);
     if artifact.is_none()
@@ -1676,31 +2061,44 @@ fn inline_background_union_rect(
         || style.border_right_width.unwrap_or(style.border_width) > 0.0
         || style.border_bottom_width.unwrap_or(style.border_width) > 0.0
         || style.border_left_width.unwrap_or(style.border_width) > 0.0;
-    let decorated_descendant = artifact.nodes.iter().enumerate().find_map(|(descendant, node)| {
-        let mut parent = node.parent;
-        let mut is_descendant = false;
-        while let Some(candidate) = parent {
-            if candidate == index {
-                is_descendant = true;
-                break;
+    let decorated_descendant = artifact
+        .nodes
+        .iter()
+        .enumerate()
+        .find_map(|(descendant, node)| {
+            let mut parent = node.parent;
+            let mut is_descendant = false;
+            while let Some(candidate) = parent {
+                if candidate == index {
+                    is_descendant = true;
+                    break;
+                }
+                parent = artifact.nodes.get(candidate).and_then(|node| node.parent);
             }
-            parent = artifact.nodes.get(candidate).and_then(|node| node.parent);
-        }
-        (is_descendant
-            && (node.style.background.a > 0
-                || node.style.background_image.is_some()
-                || node.style.padding_lengths().top > 0.0
-                || node.style.padding_lengths().right > 0.0
-                || node.style.padding_lengths().bottom > 0.0
-                || node.style.padding_lengths().left > 0.0
-                || node.style.border_width > 0.0
-                || node.style.border_top_width.is_some_and(|width| width > 0.0)
-                || node.style.border_right_width.is_some_and(|width| width > 0.0)
-                || node.style.border_bottom_width.is_some_and(|width| width > 0.0)
-                || node.style.border_left_width.is_some_and(|width| width > 0.0)))
+            (is_descendant
+                && (node.style.background.a > 0
+                    || node.style.background_image.is_some()
+                    || node.style.padding_lengths().top > 0.0
+                    || node.style.padding_lengths().right > 0.0
+                    || node.style.padding_lengths().bottom > 0.0
+                    || node.style.padding_lengths().left > 0.0
+                    || node.style.border_width > 0.0
+                    || node.style.border_top_width.is_some_and(|width| width > 0.0)
+                    || node
+                        .style
+                        .border_right_width
+                        .is_some_and(|width| width > 0.0)
+                    || node
+                        .style
+                        .border_bottom_width
+                        .is_some_and(|width| width > 0.0)
+                    || node
+                        .style
+                        .border_left_width
+                        .is_some_and(|width| width > 0.0)))
             .then(|| artifact.rect_by_index.get(descendant).copied().flatten())
             .flatten()
-    });
+        });
     let direct_parent = artifact.nodes.get(index).and_then(|node| node.parent);
     let mut line_parent = (has_inline_border || decorated_descendant.is_some())
         .then_some(direct_parent)
@@ -1750,7 +2148,8 @@ fn inline_background_union_rect(
         if !is_descendant || (node.style.font_size - style.font_size).abs() > 0.01 {
             continue;
         }
-        let Some(descendant_rect) = artifact.rect_by_index.get(descendant).copied().flatten() else {
+        let Some(descendant_rect) = artifact.rect_by_index.get(descendant).copied().flatten()
+        else {
             continue;
         };
         let max_x = (union.x + union.width).max(descendant_rect.x + descendant_rect.width);
@@ -1773,18 +2172,23 @@ fn inline_has_content(artifact: &crate::paint_artifact::PaintArtifact, index: us
         .take_while(|node| node.parent.is_some_and(|parent| parent >= index))
         .any(|node| match &node.kind {
             ComponentKind::Text { content } => !content.is_empty(),
-            ComponentKind::Root | ComponentKind::Row | ComponentKind::Column | ComponentKind::Box => {
-                node.style.display == Display::InlineBlock
-            }
+            ComponentKind::Root
+            | ComponentKind::Row
+            | ComponentKind::Column
+            | ComponentKind::Box => node.style.display == Display::InlineBlock,
             _ => true,
         })
 }
 
 fn inline_background_fragment_width(
-    fragment: LayoutRect, content: &str, typeface: &Typeface, style: &Style,
+    fragment: LayoutRect,
+    content: &str,
+    typeface: &Typeface,
+    style: &Style,
 ) -> f32 {
     if style.white_space == w3cos_std::style::WhiteSpace::Pre
-        && content.contains('\t') && !content.contains(['\r', '\n', '\u{2028}'])
+        && content.contains('\t')
+        && !content.contains(['\r', '\n', '\u{2028}'])
     {
         // Preserved tabs have already been resolved against their block's
         // stops and line offset. Remeasuring from zero changes decoration.
@@ -1805,10 +2209,10 @@ fn top_aligned_inline(style: &Style) -> bool {
     // Layout already positions this principal em/edge box at the line top.
     // Its decoration must not snap to a parent block or absorb the strut.
     style.custom_properties.as_ref().is_some_and(|properties| {
-            properties
-                .get("--w3cos-internal-vertical-align-keyword")
-                .is_some_and(|value| value == "top")
-        })
+        properties
+            .get("--w3cos-internal-vertical-align-keyword")
+            .is_some_and(|value| value == "top")
+    })
 }
 
 fn render_node_with_line_context(
@@ -1829,14 +2233,39 @@ fn render_node_with_line_context(
     extra_inline_background_rects: &[(LayoutRect, String)],
     shaped_fragment: Option<&crate::inline_shaping::Fragment>,
 ) {
-    render_node_with_applied_decorations(canvas, client_index, rect, kind, style,
-        typeface, metrics_font, text_input_value, focused, bake_compositor_props,
-        line_context, inline_decoration_line_box, inline_text_leading, inline_has_content,
-        extra_inline_background_rects, shaped_fragment, &[], None, has_css_resize_indicator(style));
+    render_node_with_applied_decorations(
+        canvas,
+        client_index,
+        rect,
+        kind,
+        style,
+        typeface,
+        metrics_font,
+        text_input_value,
+        focused,
+        bake_compositor_props,
+        line_context,
+        inline_decoration_line_box,
+        inline_text_leading,
+        inline_has_content,
+        extra_inline_background_rects,
+        shaped_fragment,
+        &[],
+        None,
+        has_css_resize_indicator(style),
+    );
 }
 
-fn paint_html_auto_control(canvas: &Canvas, rect: LayoutRect, kind: &ComponentKind, style: &Style, multisample: bool) -> bool {
-    let part = style.custom_properties.as_ref()
+fn paint_html_auto_control(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    kind: &ComponentKind,
+    style: &Style,
+    multisample: bool,
+) -> bool {
+    let part = style
+        .custom_properties
+        .as_ref()
         .and_then(|p| p.get("--w3cos-internal-html-control-appearance"))
         .map(String::as_str);
     let button = match (part, kind) {
@@ -1846,9 +2275,17 @@ fn paint_html_auto_control(canvas: &Canvas, rect: LayoutRect, kind: &ComponentKi
     };
     // NativeThemeBase receives a snapped integer control rectangle, not CSS
     // border edges. Its normal/light theme paints a1px stroke inside that box.
-    let bounds = skia_safe::Rect::new(rect.x.round() + 0.5, rect.y.round() + 0.5,
-        (rect.x + rect.width).round() - 0.5, (rect.y + rect.height).round() - 0.5);
-    let fill = if button { w3cos_std::Color::rgb(239, 239, 239) } else { w3cos_std::Color::WHITE };
+    let bounds = skia_safe::Rect::new(
+        rect.x.round() + 0.5,
+        rect.y.round() + 0.5,
+        (rect.x + rect.width).round() - 0.5,
+        (rect.y + rect.height).round() - 0.5,
+    );
+    let fill = if button {
+        w3cos_std::Color::rgb(239, 239, 239)
+    } else {
+        w3cos_std::Color::WHITE
+    };
     let mut paint = color_paint(fill, style.opacity);
     paint.set_anti_alias(button);
     // Sampling belongs to the raster effect, including resize paths painted
@@ -1856,8 +2293,13 @@ fn paint_html_auto_control(canvas: &Canvas, rect: LayoutRect, kind: &ComponentKi
     if !analytic_round_rect::draw_with_samples(canvas, bounds, 2.0, &paint, multisample) {
         canvas.draw_round_rect(bounds, 2.0, 2.0, &paint);
     }
-    paint.set_color(to_skia_color(w3cos_std::Color::rgb(118, 118, 118), style.opacity))
-        .set_style(paint::Style::Stroke).set_stroke_width(1.0);
+    paint
+        .set_color(to_skia_color(
+            w3cos_std::Color::rgb(118, 118, 118),
+            style.opacity,
+        ))
+        .set_style(paint::Style::Stroke)
+        .set_stroke_width(1.0);
     if !analytic_round_rect::draw_with_samples(canvas, bounds, 2.0, &paint, multisample) {
         canvas.draw_round_rect(bounds, 2.0, 2.0, &paint);
     }
@@ -1971,12 +2413,9 @@ fn render_node_with_applied_decorations(
             .map(|context| context.line_box.height + vertical_edges)
             .filter(|height| height.is_finite() && *height > 0.0)
             .unwrap_or(rect.height.max(authored_line_height));
-        let split_inline_edge = style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| {
-                properties.contains_key("--w3cos-internal-split-inline-edge")
-            });
+        let split_inline_edge = style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-split-inline-edge")
+        });
         let empty_split_inline_edge = style
             .custom_properties
             .as_ref()
@@ -1988,7 +2427,9 @@ fn render_node_with_applied_decorations(
             line_height
         };
         let centered = inline_decoration_line_box
-            .filter(|line| !normal_side_only_border && !top_aligned_inline && line.height > rect.height + 0.01)
+            .filter(|line| {
+                !normal_side_only_border && !top_aligned_inline && line.height > rect.height + 0.01
+            })
             .map(|line| LayoutRect {
                 y: line.y + (line.height - rect.height) * 0.5,
                 ..rect
@@ -2069,28 +2510,36 @@ fn render_node_with_applied_decorations(
         && bg.a > 0
     {
         let mut background_box = inline_decoration_rect;
-        if terminal_inline_padding.is_none() && let Some((first, content)) = extra_inline_background_rects
-            .iter()
-            .min_by(|(left, _), (right, _)| left.y.total_cmp(&right.y))
+        if terminal_inline_padding.is_none()
+            && let Some((first, content)) = extra_inline_background_rects
+                .iter()
+                .min_by(|(left, _), (right, _)| left.y.total_cmp(&right.y))
         {
-            let single_plain_line = plain_background && extra_inline_background_rects
-                .iter().all(|(fragment, _)| (fragment.y - first.y).abs() < 0.01);
-            if !single_plain_line || style.custom_properties.as_ref().is_some_and(|properties|
-                properties.contains_key("--w3cos-internal-split-inline-fragment")) {
+            let single_plain_line = plain_background
+                && extra_inline_background_rects
+                    .iter()
+                    .all(|(fragment, _)| (fragment.y - first.y).abs() < 0.01);
+            if !single_plain_line
+                || style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-split-inline-fragment")
+                })
+            {
                 background_box.x = first.x;
-                background_box.width = inline_background_fragment_width(*first, content, typeface, style);
+                background_box.width =
+                    inline_background_fragment_width(*first, content, typeface, style);
             }
         }
         background_box
     } else {
         rect
     };
-    let mut background_rects =
-        if themed_control || (style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. })) {
-            Vec::new() // Inline decorations follow shaped fragments below.
-        } else {
-            crate::paint_artifact::box_background_paint_rects(style, background_box)
-        };
+    let mut background_rects = if themed_control
+        || (style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. }))
+    {
+        Vec::new() // Inline decorations follow shaped fragments below.
+    } else {
+        crate::paint_artifact::box_background_paint_rects(style, background_box)
+    };
     if let Some(terminal) = terminal_inline_padding {
         for fragment in &mut background_rects {
             fragment.width = (fragment.width - terminal.width).max(0.0);
@@ -2127,12 +2576,18 @@ fn render_node_with_applied_decorations(
             // fragment. Repainting it is invisible for opaque colors but
             // compounds alpha. Containment is safe only for square corners;
             // identical geometry has identical rounded coverage as well.
-            let square = style.border_corner_radii().iter().all(|radius| *radius == 0.0);
-            if background_rects.iter().any(|painted| *painted == fragment
-                || (square && fragment.x >= painted.x && fragment.y >= painted.y
-                    && fragment.x + fragment.width <= painted.x + painted.width
-                    && fragment.y + fragment.height <= painted.y + painted.height))
-            {
+            let square = style
+                .border_corner_radii()
+                .iter()
+                .all(|radius| *radius == 0.0);
+            if background_rects.iter().any(|painted| {
+                *painted == fragment
+                    || (square
+                        && fragment.x >= painted.x
+                        && fragment.y >= painted.y
+                        && fragment.x + fragment.width <= painted.x + painted.width
+                        && fragment.y + fragment.height <= painted.y + painted.height)
+            }) {
                 continue;
             }
             draw_rounded_rect(
@@ -2143,12 +2598,17 @@ fn render_node_with_applied_decorations(
             );
         }
     }
-    if !themed_control && !(style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. })) {
+    if !themed_control
+        && !(style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. }))
+    {
         draw_box_border(canvas, inline_decoration_rect, style);
     }
 
-    if style.custom_properties.as_ref().is_some_and(|p|
-        p.get("--w3cos-internal-media-controls-layer").map(String::as_str) == Some("no-source")) {
+    if style.custom_properties.as_ref().is_some_and(|p| {
+        p.get("--w3cos-internal-media-controls-layer")
+            .map(String::as_str)
+            == Some("no-source")
+    }) {
         media_controls_paint::draw(canvas, rect, style);
     }
 
@@ -2158,22 +2618,30 @@ fn render_node_with_applied_decorations(
             if let Some(context) = line_context {
                 origin.x = context.fragment_box(style, true, true).x;
             }
-            if let Some(band) = style.custom_properties.as_ref()
+            if let Some(band) = style
+                .custom_properties
+                .as_ref()
                 .and_then(|p| p.get("--w3cos-internal-float-line-bands"))
-                .and_then(|bands| bands.split(';').next()) {
-                let values = band.split_ascii_whitespace()
-                    .filter_map(|v| v.parse::<f32>().ok()).collect::<Vec<_>>();
+                .and_then(|bands| bands.split(';').next())
+            {
+                let values = band
+                    .split_ascii_whitespace()
+                    .filter_map(|v| v.parse::<f32>().ok())
+                    .collect::<Vec<_>>();
                 if values.len() == 3 {
-                    origin.x = text_paint_box(rect, style).x + values[0]
-                        + style.margin_lengths().left;
+                    origin.x =
+                        text_paint_box(rect, style).x + values[0] + style.margin_lengths().left;
                 }
             }
             let symbol = crate::list_marker::inside_symbol_rect(origin, style);
             let kind = crate::list_marker::inside_kind(style).unwrap();
             let mut paint = text_color_paint(style, style.opacity);
-            if kind == "square" { canvas.draw_rect(to_rect(symbol), &paint); }
-            else if kind == "circle" {
-                paint.set_style(skia_safe::paint::Style::Stroke).set_stroke_width(1.0);
+            if kind == "square" {
+                canvas.draw_rect(to_rect(symbol), &paint);
+            } else if kind == "circle" {
+                paint
+                    .set_style(skia_safe::paint::Style::Stroke)
+                    .set_stroke_width(1.0);
                 canvas.draw_oval(to_rect(symbol), &paint);
             } else {
                 draw_rounded_rect(canvas, symbol, [style.font_size; 4], &paint);
@@ -2182,16 +2650,34 @@ fn render_node_with_applied_decorations(
         ComponentKind::Text { content } => {
             let decoration_rect = if shaped_fragment.is_some() {
                 text_content_box(rect, style)
-            } else { rect };
+            } else {
+                rect
+            };
             let own_decoration = (shaped_fragment.is_some()
                 && style.text_decoration != w3cos_std::style::TextDecoration::None)
                 .then(|| crate::paint_artifact::AppliedTextDecoration {
-                    style: std::borrow::Cow::Borrowed(style), baseline_shift: 0.0 });
-            for decoration in applied_decorations.iter().chain(own_decoration.iter()).filter(|decoration|
-                decoration.style.text_decoration != w3cos_std::style::TextDecoration::LineThrough)
+                    style: std::borrow::Cow::Borrowed(style),
+                    baseline_shift: 0.0,
+                });
+            for decoration in applied_decorations
+                .iter()
+                .chain(own_decoration.iter())
+                .filter(|decoration| {
+                    decoration.style.text_decoration
+                        != w3cos_std::style::TextDecoration::LineThrough
+                })
             {
-                text_decoration::paint_applied_in_rect(canvas, decoration_rect, content, style,
-                    typeface, metrics_font, line_context, shaped_fragment, decoration);
+                text_decoration::paint_applied_in_rect(
+                    canvas,
+                    decoration_rect,
+                    content,
+                    style,
+                    typeface,
+                    metrics_font,
+                    line_context,
+                    shaped_fragment,
+                    decoration,
+                );
             }
             if let Some(fragment) = shaped_fragment {
                 // The ordinary inline text path paints decorations as it
@@ -2221,11 +2707,25 @@ fn render_node_with_applied_decorations(
                     line_context,
                 );
             }
-            for decoration in applied_decorations.iter().chain(own_decoration.iter()).filter(|decoration|
-                decoration.style.text_decoration == w3cos_std::style::TextDecoration::LineThrough)
+            for decoration in applied_decorations
+                .iter()
+                .chain(own_decoration.iter())
+                .filter(|decoration| {
+                    decoration.style.text_decoration
+                        == w3cos_std::style::TextDecoration::LineThrough
+                })
             {
-                text_decoration::paint_applied_in_rect(canvas, decoration_rect, content, style,
-                    typeface, metrics_font, line_context, shaped_fragment, decoration);
+                text_decoration::paint_applied_in_rect(
+                    canvas,
+                    decoration_rect,
+                    content,
+                    style,
+                    typeface,
+                    metrics_font,
+                    line_context,
+                    shaped_fragment,
+                    decoration,
+                );
             }
         }
         ComponentKind::Button { label } => {
@@ -2308,7 +2808,10 @@ fn render_node_with_applied_decorations(
         ComponentKind::SvgDocument { source, .. } => {
             let rect = crate::svg_renderer::content_box(rect, style);
             if let Some(raster) = crate::svg_renderer::get_or_render_inline(
-                source, rect.width.ceil().max(1.0) as u32, rect.height.ceil().max(1.0) as u32) {
+                source,
+                rect.width.ceil().max(1.0) as u32,
+                rect.height.ceil().max(1.0) as u32,
+            ) {
                 draw_decoded_image(canvas, rect, &raster, style.opacity, false, (false, false));
             }
         }
@@ -2324,52 +2827,100 @@ fn render_node_with_applied_decorations(
 
 fn has_css_resize_indicator(style: &Style) -> bool {
     use w3cos_std::style::Overflow;
-    let enabled = style.custom_properties.as_ref()
+    let enabled = style
+        .custom_properties
+        .as_ref()
         .and_then(|properties| properties.get(w3cos_dom::css_style::RESIZE_PROPERTY))
-        .is_some_and(|value| matches!(value.as_str(), "both" | "horizontal" | "vertical" | "block" | "inline"));
-    enabled && (style.resolved_overflow_x() != Overflow::Visible
-        || style.resolved_overflow_y() != Overflow::Visible)
+        .is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                "both" | "horizontal" | "vertical" | "block" | "inline"
+            )
+        });
+    enabled
+        && (style.resolved_overflow_x() != Overflow::Visible
+            || style.resolved_overflow_y() != Overflow::Visible)
 }
 
 fn draw_css_resize_indicator(canvas: &Canvas, rect: LayoutRect, style: &Style) {
     use w3cos_std::style::TextDirection;
-    if !has_css_resize_indicator(style) { return; }
+    if !has_css_resize_indicator(style) {
+        return;
+    }
     let left = (rect.x + style.border_left_width.unwrap_or(style.border_width)).round();
-    let right = (rect.x + rect.width - style.border_right_width.unwrap_or(style.border_width)).round();
-    let bottom = (rect.y + rect.height - style.border_bottom_width.unwrap_or(style.border_width)).round();
-    let width = (right - left).clamp(0.0,15.0);
-    let height = (bottom - rect.y - style.border_top_width.unwrap_or(style.border_width)).clamp(0.0,15.0);
-    if width < 1.0 || height < 1.0 { return; }
+    let right =
+        (rect.x + rect.width - style.border_right_width.unwrap_or(style.border_width)).round();
+    let bottom =
+        (rect.y + rect.height - style.border_bottom_width.unwrap_or(style.border_width)).round();
+    let width = (right - left).clamp(0.0, 15.0);
+    let height =
+        (bottom - rect.y - style.border_top_width.unwrap_or(style.border_width)).clamp(0.0, 15.0);
+    if width < 1.0 || height < 1.0 {
+        return;
+    }
     // Blink's fixed-size resizer uses two diagonal strokes, capped to the
     // available padding-box corner. The light stroke offsets the dark one
     // to preserve contrast, not a bitmap tied to a particular control size.
-    let spacing = (width / 4.0).floor().min((height / 4.0).floor()).clamp(1.0,2.0);
-    let large = (width - spacing).min(height - spacing).clamp(1.0,7.0);
+    let spacing = (width / 4.0)
+        .floor()
+        .min((height / 4.0).floor())
+        .clamp(1.0, 2.0);
+    let large = (width - spacing).min(height - spacing).clamp(1.0, 7.0);
     let small = (large / 2.0).floor().max(1.0);
     let on_left = style.direction == TextDirection::Rtl;
-    let x = if on_left { left + spacing } else { right - spacing };
+    let x = if on_left {
+        left + spacing
+    } else {
+        right - spacing
+    };
     let step = if on_left { 1.0 } else { -1.0 };
     let y = bottom - spacing;
     let save = canvas.save();
-    canvas.clip_rect(Rect::new(left,bottom-height,right,bottom),None,Some(false));
-    let mut paint = color_paint(w3cos_std::Color::rgba(0,0,0,153),style.opacity);
-    paint.set_style(paint::Style::Stroke).set_stroke_width(1.0).set_anti_alias(true);
-    for light in [false,true] {
+    canvas.clip_rect(
+        Rect::new(left, bottom - height, right, bottom),
+        None,
+        Some(false),
+    );
+    let mut paint = color_paint(w3cos_std::Color::rgba(0, 0, 0, 153), style.opacity);
+    paint
+        .set_style(paint::Style::Stroke)
+        .set_stroke_width(1.0)
+        .set_anti_alias(true);
+    for light in [false, true] {
         let offset = if light { 1.0 } else { 0.0 };
-        if light { paint.set_color(to_skia_color(w3cos_std::Color::rgba(255,255,255,153),style.opacity)); }
-        for size in [large,small] {
-            draw_multisample_resize_line(canvas, (x,y-size+offset), (x+step*(size-offset),y), &paint);
+        if light {
+            paint.set_color(to_skia_color(
+                w3cos_std::Color::rgba(255, 255, 255, 153),
+                style.opacity,
+            ));
+        }
+        for size in [large, small] {
+            draw_multisample_resize_line(
+                canvas,
+                (x, y - size + offset),
+                (x + step * (size - offset), y),
+                &paint,
+            );
         }
     }
     canvas.restore_to_count(save);
 }
 
-fn draw_multisample_resize_line(canvas: &Canvas, start: (f32,f32), end: (f32,f32), paint: &Paint) {
+fn draw_multisample_resize_line(
+    canvas: &Canvas,
+    start: (f32, f32),
+    end: (f32, f32),
+    paint: &Paint,
+) {
     // Evaluate the rotated four-sample device coverage of the butt-capped
     // stroke. CPU Skia's 1px hairline shortcut loses the fringe that remains
     // in the captured browser resizer. Keep this scoped to the resize overlay;
     // it is not a replacement for arbitrary CSS/SVG path antialiasing.
-    if start==end || ![start.0,start.1,end.0,end.1].iter().all(|value|value.is_finite()) {
+    if start == end
+        || ![start.0, start.1, end.0, end.1]
+            .iter()
+            .all(|value| value.is_finite())
+    {
         return;
     }
     thread_local! {
@@ -2391,79 +2942,140 @@ half4 main(float2 p) {
  return half4(rgba*coverage);
 }"#,None).ok();
     }
-    let matrix=canvas.local_to_device_as_3x3();
-    if !matrix.is_scale_translate() || matrix.scale_x()<=0.0
-        || matrix.scale_x()!=matrix.scale_y() {
-        canvas.draw_line(start,end,paint);
+    let matrix = canvas.local_to_device_as_3x3();
+    if !matrix.is_scale_translate()
+        || matrix.scale_x() <= 0.0
+        || matrix.scale_x() != matrix.scale_y()
+    {
+        canvas.draw_line(start, end, paint);
         return;
     }
-    let local_start=start;
-    let local_end=end;
-    let start=matrix.map_point(start);
-    let end=matrix.map_point(end);
-    let color=paint.color4f();
-    let values=[start.x,start.y,end.x,end.y,color.r*color.a,color.g*color.a,
-        color.b*color.a,color.a,paint.stroke_width()*matrix.scale_x()];
-    let drawn=EFFECT.with(|effect| {
-        let Some(effect)=effect else {return false};
-        let bytes: Vec<u8>=values.iter().flat_map(|value|value.to_ne_bytes()).collect();
-        let Some(shader)=effect.make_shader(skia_safe::Data::new_copy(&bytes),&[],None) else {return false};
-        let mut fill=paint.clone();
-        fill.set_style(paint::Style::Fill).set_color(Color::WHITE).set_shader(shader).set_anti_alias(false);
-        let extent=values[8]*0.5+1.0;
-        let save=canvas.save();
+    let local_start = start;
+    let local_end = end;
+    let start = matrix.map_point(start);
+    let end = matrix.map_point(end);
+    let color = paint.color4f();
+    let values = [
+        start.x,
+        start.y,
+        end.x,
+        end.y,
+        color.r * color.a,
+        color.g * color.a,
+        color.b * color.a,
+        color.a,
+        paint.stroke_width() * matrix.scale_x(),
+    ];
+    let drawn = EFFECT.with(|effect| {
+        let Some(effect) = effect else { return false };
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        let Some(shader) = effect.make_shader(skia_safe::Data::new_copy(&bytes), &[], None) else {
+            return false;
+        };
+        let mut fill = paint.clone();
+        fill.set_style(paint::Style::Fill)
+            .set_color(Color::WHITE)
+            .set_shader(shader)
+            .set_anti_alias(false);
+        let extent = values[8] * 0.5 + 1.0;
+        let save = canvas.save();
         canvas.reset_matrix();
-        canvas.draw_rect(Rect::new((start.x.min(end.x)-extent).floor(),(start.y.min(end.y)-extent).floor(),
-            (start.x.max(end.x)+extent).ceil(),(start.y.max(end.y)+extent).ceil()),&fill);
+        canvas.draw_rect(
+            Rect::new(
+                (start.x.min(end.x) - extent).floor(),
+                (start.y.min(end.y) - extent).floor(),
+                (start.x.max(end.x) + extent).ceil(),
+                (start.y.max(end.y) + extent).ceil(),
+            ),
+            &fill,
+        );
         canvas.restore_to_count(save);
         true
     });
-    if !drawn { canvas.draw_line(local_start,local_end,paint); }
+    if !drawn {
+        canvas.draw_line(local_start, local_end, paint);
+    }
 }
 
 fn draw_box_outline(canvas: &Canvas, rect: LayoutRect, style: &Style) {
-    use w3cos_std::style::{OutlineStyle, BorderLineStyle};
+    use w3cos_std::style::{BorderLineStyle, OutlineStyle};
     let width = style.outline_width;
-    if !width.is_finite() || width <= 0.0 || style.outline_color.a == 0
-        || matches!(style.display,Display::None | Display::Contents
-            | Display::TableColumn | Display::TableColumnGroup)
-        || style.outline_style == OutlineStyle::None { return; }
-    let band = |inner: f32, outer: f32, dashed: Option<(f32,f32)>| {
+    if !width.is_finite()
+        || width <= 0.0
+        || style.outline_color.a == 0
+        || matches!(
+            style.display,
+            Display::None | Display::Contents | Display::TableColumn | Display::TableColumnGroup
+        )
+        || style.outline_style == OutlineStyle::None
+    {
+        return;
+    }
+    let band = |inner: f32, outer: f32, dashed: Option<(f32, f32)>| {
         let center = (inner + outer) * 0.5;
-        let mut paint = color_paint(style.outline_color,style.opacity);
+        let mut paint = color_paint(style.outline_color, style.opacity);
         paint.set_style(paint::Style::Stroke);
-        paint.set_stroke_width(outer-inner);
-        if let Some((on,off)) = dashed {
-            paint.set_path_effect(skia_safe::PathEffect::dash(&[on,off],0.0));
+        paint.set_stroke_width(outer - inner);
+        if let Some((on, off)) = dashed {
+            paint.set_path_effect(skia_safe::PathEffect::dash(&[on, off], 0.0));
         }
-        draw_rounded_rect(canvas,LayoutRect { x:rect.x-center,y:rect.y-center,
-            width:rect.width+center*2.0,height:rect.height+center*2.0 },
-            style.border_corner_radii().map(|r| if r>0.0 {r+center} else {0.0}),&paint);
+        draw_rounded_rect(
+            canvas,
+            LayoutRect {
+                x: rect.x - center,
+                y: rect.y - center,
+                width: rect.width + center * 2.0,
+                height: rect.height + center * 2.0,
+            },
+            style
+                .border_corner_radii()
+                .map(|r| if r > 0.0 { r + center } else { 0.0 }),
+            &paint,
+        );
     };
     match style.outline_style {
-        OutlineStyle::None => {},
-        OutlineStyle::Solid => band(0.0,width,None),
-        OutlineStyle::Dashed => band(0.0,width,Some((width*3.0,width*3.0))),
-        OutlineStyle::Dotted => band(0.0,width,Some((width,width))),
-        OutlineStyle::Double if width>=3.0 => {
-            let stripe=(width/3.0).round();
-            band(0.0,stripe,None);band(width-stripe,width,None);
-        },
-        OutlineStyle::Double => band(0.0,width,None),
+        OutlineStyle::None => {}
+        OutlineStyle::Solid => band(0.0, width, None),
+        OutlineStyle::Dashed => band(0.0, width, Some((width * 3.0, width * 3.0))),
+        OutlineStyle::Dotted => band(0.0, width, Some((width, width))),
+        OutlineStyle::Double if width >= 3.0 => {
+            let stripe = (width / 3.0).round();
+            band(0.0, stripe, None);
+            band(width - stripe, width, None);
+        }
+        OutlineStyle::Double => band(0.0, width, None),
         line_style => {
-            let line_style=match line_style {
+            let line_style = match line_style {
                 OutlineStyle::Groove => BorderLineStyle::Groove,
                 OutlineStyle::Ridge => BorderLineStyle::Ridge,
                 OutlineStyle::Inset => BorderLineStyle::Inset,
                 OutlineStyle::Outset => BorderLineStyle::Outset,
                 _ => unreachable!(),
             };
-            let border=Style { border_width:width,border_color:style.outline_color,
-                border_styles:[Some(line_style);4],border_top_width:Some(width),
-                border_right_width:Some(width),border_bottom_width:Some(width),
-                border_left_width:Some(width),opacity:style.opacity,..Style::default() };
-            draw_box_border(canvas,LayoutRect {x:rect.x-width,y:rect.y-width,
-                width:rect.width+width*2.0,height:rect.height+width*2.0},&border);
+            let border = Style {
+                border_width: width,
+                border_color: style.outline_color,
+                border_styles: [Some(line_style); 4],
+                border_top_width: Some(width),
+                border_right_width: Some(width),
+                border_bottom_width: Some(width),
+                border_left_width: Some(width),
+                opacity: style.opacity,
+                ..Style::default()
+            };
+            draw_box_border(
+                canvas,
+                LayoutRect {
+                    x: rect.x - width,
+                    y: rect.y - width,
+                    width: rect.width + width * 2.0,
+                    height: rect.height + width * 2.0,
+                },
+                &border,
+            );
         }
     }
 }
@@ -2523,33 +3135,86 @@ thread_local! {
 /// rasterizing adjacent quads quantizes their complementary coverages and
 /// biases midpoint colors. Keep unsupported transforms/fractional corner
 /// extents on the ordinary path; this shader does not alter glyph/opacity AA.
-fn draw_opaque_border_miter(canvas:&Canvas, rect:LayoutRect, corner:usize,
-    width:f32,height:f32,horizontal:w3cos_std::Color,vertical:w3cos_std::Color) -> bool {
-    if width<=0.0 || height<=0.0 || horizontal==vertical {return false;}
-    let matrix=canvas.local_to_device_as_3x3();
-    if !matrix.is_scale_translate() || matrix.scale_x()<=0.0 || matrix.scale_y()<=0.0 {return false;}
-    let right=matches!(corner,1|2);
-    let bottom=corner>=2;
-    let bounds=Rect::from_xywh(if right {rect.x+rect.width-width} else {rect.x},
-        if bottom {rect.y+rect.height-height} else {rect.y},width,height);
-    let Some(bounds)=matrix.map_rect_scale_translate(bounds) else {return false;};
-    if !bounds.is_finite() || [bounds.left,bounds.top,bounds.right,bounds.bottom]
-        .iter().any(|edge|edge.fract()!=0.0) {return false;}
+fn draw_opaque_border_miter(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    corner: usize,
+    width: f32,
+    height: f32,
+    horizontal: w3cos_std::Color,
+    vertical: w3cos_std::Color,
+) -> bool {
+    if width <= 0.0 || height <= 0.0 || horizontal == vertical {
+        return false;
+    }
+    let matrix = canvas.local_to_device_as_3x3();
+    if !matrix.is_scale_translate() || matrix.scale_x() <= 0.0 || matrix.scale_y() <= 0.0 {
+        return false;
+    }
+    let right = matches!(corner, 1 | 2);
+    let bottom = corner >= 2;
+    let bounds = Rect::from_xywh(
+        if right {
+            rect.x + rect.width - width
+        } else {
+            rect.x
+        },
+        if bottom {
+            rect.y + rect.height - height
+        } else {
+            rect.y
+        },
+        width,
+        height,
+    );
+    let Some(bounds) = matrix.map_rect_scale_translate(bounds) else {
+        return false;
+    };
+    if !bounds.is_finite()
+        || [bounds.left, bounds.top, bounds.right, bounds.bottom]
+            .iter()
+            .any(|edge| edge.fract() != 0.0)
+    {
+        return false;
+    }
     SOLID_BORDER_MITER.with(|effect| {
-        let Some(effect)=effect else {return false;};
-        let values=[if right {bounds.right} else {bounds.left},if bottom {bounds.bottom} else {bounds.top},
-            if right {-1.0} else {1.0},if bottom {-1.0} else {1.0},
-            bounds.width(),bounds.height(),0.0,0.0,
-            horizontal.r as f32,horizontal.g as f32,horizontal.b as f32,255.0,
-            vertical.r as f32,vertical.g as f32,vertical.b as f32,255.0];
-        let bytes=values.iter().flat_map(|value|value.to_ne_bytes()).collect::<Vec<_>>();
-        let Some(shader)=effect.make_shader(skia_safe::Data::new_copy(&bytes),&[],None) else {return false;};
-        let mut paint=Paint::default();
-        paint.set_anti_alias(false).set_color(Color::WHITE).set_shader(shader)
+        let Some(effect) = effect else {
+            return false;
+        };
+        let values = [
+            if right { bounds.right } else { bounds.left },
+            if bottom { bounds.bottom } else { bounds.top },
+            if right { -1.0 } else { 1.0 },
+            if bottom { -1.0 } else { 1.0 },
+            bounds.width(),
+            bounds.height(),
+            0.0,
+            0.0,
+            horizontal.r as f32,
+            horizontal.g as f32,
+            horizontal.b as f32,
+            255.0,
+            vertical.r as f32,
+            vertical.g as f32,
+            vertical.b as f32,
+            255.0,
+        ];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        let Some(shader) = effect.make_shader(skia_safe::Data::new_copy(&bytes), &[], None) else {
+            return false;
+        };
+        let mut paint = Paint::default();
+        paint
+            .set_anti_alias(false)
+            .set_color(Color::WHITE)
+            .set_shader(shader)
             .set_blend_mode(skia_safe::BlendMode::Src);
-        let save=canvas.save();
+        let save = canvas.save();
         canvas.reset_matrix();
-        canvas.draw_rect(bounds,&paint);
+        canvas.draw_rect(bounds, &paint);
         canvas.restore_to_count(save);
         true
     })
@@ -2629,48 +3294,74 @@ fn draw_box_border(canvas: &Canvas, rect: LayoutRect, style: &Style) {
             canvas.restore();
         } else if !style.border_collapse
             && colors.iter().all(|color| color.a == 255)
-            && style.border_corner_radii().iter().all(|radius| *radius == 0.0)
-            && style.border_styles.iter().all(|line| matches!(line,
-                None | Some(w3cos_std::style::BorderLineStyle::Solid)))
+            && style
+                .border_corner_radii()
+                .iter()
+                .all(|radius| *radius == 0.0)
+            && style
+                .border_styles
+                .iter()
+                .all(|line| matches!(line, None | Some(w3cos_std::style::BorderLineStyle::Solid)))
         {
             // Opaque adjacent sides must meet at a miter. Fill the side
             // underpaint first, then overlay top/bottom quads: AA on a shared
             // diagonal blends the two border colors, not an uncovered backdrop.
             // Apply element opacity once, after resolving those opaque joins.
-            let snap = |value:f32| (value + 0.5).floor();
+            let snap = |value: f32| (value + 0.5).floor();
             let left = snap(rect.x);
             let top = snap(rect.y);
             let right = snap(rect.x + rect.width);
             let bottom = snap(rect.y + rect.height);
-            let rect = LayoutRect {x:left,y:top,width:(right-left).max(0.0),height:(bottom-top).max(0.0)};
+            let rect = LayoutRect {
+                x: left,
+                y: top,
+                width: (right - left).max(0.0),
+                height: (bottom - top).max(0.0),
+            };
             let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
             let save = canvas.save_count();
             if style.opacity != 1.0 {
-                let opacity = color_paint(w3cos_std::Color::rgb(255,255,255),style.opacity);
+                let opacity = color_paint(w3cos_std::Color::rgb(255, 255, 255), style.opacity);
                 canvas.save_layer(&SaveLayerRec::default().paint(&opacity));
             }
-            for side in [0,2,3,1] {
+            for side in [0, 2, 3, 1] {
                 if widths[side] > 0.0 {
-                    draw_round_rect(canvas,edges[side],0.0,&color_paint(colors[side],1.0));
+                    draw_round_rect(canvas, edges[side], 0.0, &color_paint(colors[side], 1.0));
                 }
             }
-            let outer=[(left,top),(right,top),(right,bottom),(left,bottom)];
-            let inner=[(left+widths[3],top+widths[0]),(right-widths[1],top+widths[0]),
-                (right-widths[1],bottom-widths[2]),(left+widths[3],bottom-widths[2])];
-            for side in [0,2] {
-                if widths[side] <= 0.0 {continue;}
-                let next=(side+1)%4;
-                let mut path=PathBuilder::new();
-                path.move_to(outer[side]).line_to(outer[next]).line_to(inner[next])
-                    .line_to(inner[side]).close();
-                canvas.draw_path(&path.detach(),&color_paint(colors[side],1.0));
+            let outer = [(left, top), (right, top), (right, bottom), (left, bottom)];
+            let inner = [
+                (left + widths[3], top + widths[0]),
+                (right - widths[1], top + widths[0]),
+                (right - widths[1], bottom - widths[2]),
+                (left + widths[3], bottom - widths[2]),
+            ];
+            for side in [0, 2] {
+                if widths[side] <= 0.0 {
+                    continue;
+                }
+                let next = (side + 1) % 4;
+                let mut path = PathBuilder::new();
+                path.move_to(outer[side])
+                    .line_to(outer[next])
+                    .line_to(inner[next])
+                    .line_to(inner[side])
+                    .close();
+                canvas.draw_path(&path.detach(), &color_paint(colors[side], 1.0));
             }
-            if widths[1]+widths[3]<=rect.width && widths[0]+widths[2]<=rect.height {
+            if widths[1] + widths[3] <= rect.width && widths[0] + widths[2] <= rect.height {
                 for corner in 0..4 {
-                    let horizontal=if corner<2 {0} else {2};
-                    let vertical=if matches!(corner,1|2) {1} else {3};
-                    draw_opaque_border_miter(canvas,rect,corner,widths[vertical],widths[horizontal],
-                        colors[horizontal],colors[vertical]);
+                    let horizontal = if corner < 2 { 0 } else { 2 };
+                    let vertical = if matches!(corner, 1 | 2) { 1 } else { 3 };
+                    draw_opaque_border_miter(
+                        canvas,
+                        rect,
+                        corner,
+                        widths[vertical],
+                        widths[horizontal],
+                        colors[horizontal],
+                        colors[vertical],
+                    );
                 }
             }
             canvas.restore_to_count(save);
@@ -2750,7 +3441,8 @@ fn effect_path(
             break;
         };
         if effect.filter.is_some()
-            || (bake_compositor_props && (effect.opacity < 0.999 || effect.isolates_surface)) {
+            || (bake_compositor_props && (effect.opacity < 0.999 || effect.isolates_surface))
+        {
             path.push(current);
         }
         if effect.parent == current {
@@ -2764,48 +3456,78 @@ fn effect_path(
 
 fn small_blur_input_bounds(frame: &ReplayFrame<'_>, bake: bool) -> HashMap<usize, Rect> {
     let mut bounds = HashMap::<usize, Rect>::new();
-    let Some(artifact) = frame.artifact else { return bounds; };
+    let Some(artifact) = frame.artifact else {
+        return bounds;
+    };
     let candidates: std::collections::HashSet<_> = artifact.properties.effects.iter().enumerate()
         .filter_map(|(index, effect)| effect.filter.as_deref().and_then(parse_css_filter)
             .filter(|chain| matches!(chain.ops.as_slice(), [FilterOp::Blur(sigma)] if *sigma > 0.0 && *sigma <= 1.0))
             .map(|_| index)).collect();
-    if candidates.is_empty() { return bounds; }
+    if candidates.is_empty() {
+        return bounds;
+    }
     let mut unsupported = std::collections::HashSet::new();
     for &(index, rect, kind, style) in frame.nodes {
         let path = effect_path(frame.artifact, index, bake);
         for (position, &effect) in path.iter().enumerate() {
-            if !candidates.contains(&effect) { continue; }
+            if !candidates.contains(&effect) {
+                continue;
+            }
             // Keep the established general filter path for geometry requiring
             // transformed/fragmented or expanded ink bounds, until those bounds
             // are derived in the same coordinate system as the filter input.
-            if frame.scale_factor != 1.0 || style.transform != Transform2D::IDENTITY
-                || style.box_shadow.is_some() || style.outline_width > 0.0
-                || path[position+1..].iter().any(|id| artifact.properties.effects[*id].filter.is_some())
-                || artifact.column_fragments.get(index).is_some_and(|fragments| !fragments.is_empty()) {
+            if frame.scale_factor != 1.0
+                || style.transform != Transform2D::IDENTITY
+                || style.box_shadow.is_some()
+                || style.outline_width > 0.0
+                || path[position + 1..]
+                    .iter()
+                    .any(|id| artifact.properties.effects[*id].filter.is_some())
+                || artifact
+                    .column_fragments
+                    .get(index)
+                    .is_some_and(|fragments| !fragments.is_empty())
+            {
                 unsupported.insert(effect);
                 continue;
             }
             let paints_content = !matches!(kind, ComponentKind::Row | ComponentKind::Column)
-                || style.background.a > 0 || style.border_width > 0.0
-                || style.background_image.as_deref().is_some_and(|image|
-                    !image.trim().eq_ignore_ascii_case("none"));
+                || style.background.a > 0
+                || style.border_width > 0.0
+                || style
+                    .background_image
+                    .as_deref()
+                    .is_some_and(|image| !image.trim().eq_ignore_ascii_case("none"));
             if !paints_content || style.opacity <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
                 continue;
             }
             let mut rect = rect;
             if let Some((x, y, _)) = frame.scroll_info.get(index).copied().flatten() {
-                rect.x -= x; rect.y -= y;
+                rect.x -= x;
+                rect.y -= y;
             }
             if bake {
                 let (x, y) = artifact.viewport_scroll_for(index);
-                rect.x -= x; rect.y -= y;
+                rect.x -= x;
+                rect.y -= y;
             }
-            let logical = Rect::new(rect.x.floor(), rect.y.floor(),
-                (rect.x + rect.width).ceil(), (rect.y + rect.height).ceil());
-            bounds.entry(effect).and_modify(|existing| {
-                *existing = Rect::new(existing.left().min(logical.left()), existing.top().min(logical.top()),
-                    existing.right().max(logical.right()), existing.bottom().max(logical.bottom()));
-            }).or_insert(logical);
+            let logical = Rect::new(
+                rect.x.floor(),
+                rect.y.floor(),
+                (rect.x + rect.width).ceil(),
+                (rect.y + rect.height).ceil(),
+            );
+            bounds
+                .entry(effect)
+                .and_modify(|existing| {
+                    *existing = Rect::new(
+                        existing.left().min(logical.left()),
+                        existing.top().min(logical.top()),
+                        existing.right().max(logical.right()),
+                        existing.bottom().max(logical.bottom()),
+                    );
+                })
+                .or_insert(logical);
         }
     }
     bounds.retain(|effect, _| !unsupported.contains(effect));
@@ -2871,9 +3593,13 @@ fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
     if src.is_empty() {
         // An img without a resource paints a one-pixel frame inside its
         // content rectangle; this does not change its CSS box dimensions.
-        let frame=Style { border_width:1.0,
-            border_color:w3cos_std::Color::rgb(192,192,192),opacity,..Style::default() };
-        draw_box_border(canvas,rect,&frame);
+        let frame = Style {
+            border_width: 1.0,
+            border_color: w3cos_std::Color::rgb(192, 192, 192),
+            opacity,
+            ..Style::default()
+        };
+        draw_box_border(canvas, rect, &frame);
         return;
     }
     // Untransformed replaced images own their pixel coverage just like a
@@ -3138,15 +3864,7 @@ fn draw_text_in_rect(
     typeface: &Typeface,
     metrics_font: &fontdue::Font,
 ) {
-    draw_text_in_rect_with_line_context(
-        canvas,
-        rect,
-        text,
-        style,
-        typeface,
-        metrics_font,
-        None,
-    );
+    draw_text_in_rect_with_line_context(canvas, rect, text, style, typeface, metrics_font, None);
 }
 
 fn draw_text_in_rect_with_line_context(
@@ -3158,20 +3876,48 @@ fn draw_text_in_rect_with_line_context(
     _metrics_font: &fontdue::Font,
     line_context: Option<crate::paint_artifact::InlineLineContext>,
 ) {
-    draw_text_in_rect_with_line_painter(canvas, rect, text, style, typeface,
-        _metrics_font, line_context, true, &mut |canvas, x, top, text, _advance, style, expansion| {
+    draw_text_in_rect_with_line_painter(
+        canvas,
+        rect,
+        text,
+        style,
+        typeface,
+        _metrics_font,
+        line_context,
+        true,
+        &mut |canvas, x, top, text, _advance, style, expansion| {
             if let Some(expansion) = expansion {
-                draw_justified_text_line(canvas, x, top, text, style.font_size, style.color,
-                    style.opacity, typeface, style, expansion)
+                draw_justified_text_line(
+                    canvas,
+                    x,
+                    top,
+                    text,
+                    style.font_size,
+                    style.color,
+                    style.opacity,
+                    typeface,
+                    style,
+                    expansion,
+                )
             } else {
-                draw_text_line(canvas, x, top, text, style.font_size, style.color,
-                    style.opacity, typeface, style)
+                draw_text_line(
+                    canvas,
+                    x,
+                    top,
+                    text,
+                    style.font_size,
+                    style.color,
+                    style.opacity,
+                    typeface,
+                    style,
+                )
             }
-        });
+        },
+    );
 }
 
-type TextLinePainter<'a> = dyn FnMut(&Canvas, f32, f32, &str, f32, &Style,
-    Option<text_layout::JustificationExpansion>) -> f32 + 'a;
+type TextLinePainter<'a> = dyn FnMut(&Canvas, f32, f32, &str, f32, &Style, Option<text_layout::JustificationExpansion>) -> f32
+    + 'a;
 
 fn draw_text_in_rect_with_line_painter(
     canvas: &Canvas,
@@ -3304,11 +4050,14 @@ fn draw_text_in_rect_with_line_painter(
     let registry = crate::font_face::FontRegistry::global();
     let tab_context = (style.white_space == w3cos_std::style::WhiteSpace::Pre
         && style.direction == w3cos_std::style::TextDirection::Ltr
-        && text.contains('\t') && !text.contains(['\r', '\n', '\u{2028}']))
-        .then(|| line_context.map_or_else(
+        && text.contains('\t')
+        && !text.contains(['\r', '\n', '\u{2028}']))
+    .then(|| {
+        line_context.map_or_else(
             || (tab_stops_for_style(style), 0.0),
             |context| (context.tab_stops, content.x - context.line_box.x),
-        ));
+        )
+    });
     if tab_context.is_some() {
         // An outer inline can contain earlier siblings of this text. Its
         // first-line box is paragraph geometry, not this run's resolved start.
@@ -3316,39 +4065,60 @@ fn draw_text_in_rect_with_line_painter(
         first_line_content.x = content.x;
         first_line_content.width = (end - content.x).max(1.0);
     }
-    let measure_line = |line: &str| tab_runs_for_context(line, typeface, style, tab_context).map_or_else(
-        || measure_skia_text_advance(line, typeface, style), |(_, advance)| advance);
-    let measure_ink = |line: &str| tab_runs_for_context(line, typeface, style, tab_context).map_or_else(
-        || measure_skia_text_ink_bounds(line, style.font_size, typeface, style.font_weight, Some(style)),
-        |(runs, _)| tab_run_ink_bounds(&runs, style.font_size, typeface, style.font_weight, style),
-    );
+    let measure_line = |line: &str| {
+        tab_runs_for_context(line, typeface, style, tab_context).map_or_else(
+            || measure_skia_text_advance(line, typeface, style),
+            |(_, advance)| advance,
+        )
+    };
+    let measure_ink = |line: &str| {
+        tab_runs_for_context(line, typeface, style, tab_context).map_or_else(
+            || {
+                measure_skia_text_ink_bounds(
+                    line,
+                    style.font_size,
+                    typeface,
+                    style.font_weight,
+                    Some(style),
+                )
+            },
+            |(runs, _)| {
+                tab_run_ink_bounds(&runs, style.font_size, typeface, style.font_weight, style)
+            },
+        )
+    };
     // A single preserved line cannot soft-wrap. Keep its tabs as shifts until
     // positioning; preparing them as spaces would destroy block-stop context.
     let layout = if tab_context.is_some() {
         std::rc::Rc::new(text_layout::TextPaintLayout {
-            lines: vec![text.to_string()], ink_bounds: vec![measure_ink(text)],
+            lines: vec![text.to_string()],
+            ink_bounds: vec![measure_ink(text)],
         })
-    } else { text_layout::retained_text_paint_layout_with_run_width_and_line_widths(
-        text,
-        continuation_content.width,
-        &line_widths,
-        style.font_size,
-        style.white_space,
-        registry.cascade_cache_key(style, text) ^ 0x534b_4941_5445_5801
-            ^ w3cos_std::inline_text::metadata_cache_key(style),
-        |line| measure_line(line),
-        |line| {
-            measure_skia_text_ink_bounds(
-                line,
-                style.font_size,
-                typeface,
-                style.font_weight,
-                Some(style),
-            )
-        },
-    ) };
+    } else {
+        text_layout::retained_text_paint_layout_with_run_width_and_line_widths(
+            text,
+            continuation_content.width,
+            &line_widths,
+            style.font_size,
+            style.white_space,
+            registry.cascade_cache_key(style, text)
+                ^ 0x534b_4941_5445_5801
+                ^ w3cos_std::inline_text::metadata_cache_key(style),
+            |line| measure_line(line),
+            |line| {
+                measure_skia_text_ink_bounds(
+                    line,
+                    style.font_size,
+                    typeface,
+                    style.font_weight,
+                    Some(style),
+                )
+            },
+        )
+    };
     let authored_styles = text_layout::authored_line_styles(text, style, &layout.lines);
-    if paint_inline_box && style.display == Display::Inline
+    if paint_inline_box
+        && style.display == Display::Inline
         && (style.background.a > 0
             || style.background_image.is_some()
             || text_layout::inline_fragment_border_widths(style, true, true)
@@ -3358,7 +4128,8 @@ fn draw_text_in_rect_with_line_painter(
         // InlineLineContext carries the paragraph's available geometry,
         // whose height can enclose several lines. Decoration must advance
         // by the same line spacing as the glyph loop below, not that height.
-        let line_height = line_context.and_then(|context| context.line_advance)
+        let line_height = line_context
+            .and_then(|context| context.line_advance)
             .unwrap_or(crate::layout::inline_style_line_height(&style));
         let top = content.y
             + text_vertical_offset(
@@ -3411,15 +4182,21 @@ fn draw_text_in_rect_with_line_painter(
             let x = aligned_text_x(line_content, line_align, 0.0, advance);
             // Inline decoration follows the font em box, not the line-height
             // strut; half-leading belongs to the ancestor's background.
-            let group_font_box = style.custom_properties.as_ref()
+            let group_font_box = style
+                .custom_properties
+                .as_ref()
                 .and_then(|p| p.get("--w3cos-internal-inline-background-font-box"))
                 .and_then(|value| {
                     let mut parts = value.split_ascii_whitespace();
-                    Some((parts.next()?.parse::<f32>().ok()?, parts.next()?.parse::<f32>().ok()?))
+                    Some((
+                        parts.next()?.parse::<f32>().ok()?,
+                        parts.next()?.parse::<f32>().ok()?,
+                    ))
                 })
                 .filter(|(y, height)| y.is_finite() && height.is_finite() && *height > 0.0);
-            let decoration_height = group_font_box.map(|(_, height)| height).unwrap_or_else(|| resolved_font_geometry(style)
-                .map_or(style.font_size, ResolvedFontGeometry::height));
+            let decoration_height = group_font_box.map(|(_, height)| height).unwrap_or_else(|| {
+                resolved_font_geometry(style).map_or(style.font_size, ResolvedFontGeometry::height)
+            });
             let fragment = text_layout::inline_fragment_background_box(
                 LayoutRect {
                     x,
@@ -3435,16 +4212,16 @@ fn draw_text_in_rect_with_line_painter(
             // A merged decorated text leaf and a wrapper around the same
             // text must rasterize their non-empty normal inline edges alike.
             let fragment = if style.line_height_is_normal
-                    && !top_aligned_inline(style)
-                    && (style.padding_lengths().top > 0.0
-                        || style.padding_lengths().bottom > 0.0
-                        || style.border_top_width.unwrap_or(style.border_width) > 0.0
-                        || style.border_bottom_width.unwrap_or(style.border_width) > 0.0)
-                {
-                    floor_inline_decoration_origin(fragment)
-                } else {
-                    fragment
-                };
+                && !top_aligned_inline(style)
+                && (style.padding_lengths().top > 0.0
+                    || style.padding_lengths().bottom > 0.0
+                    || style.border_top_width.unwrap_or(style.border_width) > 0.0
+                    || style.border_bottom_width.unwrap_or(style.border_width) > 0.0)
+            {
+                floor_inline_decoration_origin(fragment)
+            } else {
+                fragment
+            };
             if style.background.a > 0 {
                 draw_rounded_rect(
                     canvas,
@@ -3500,45 +4277,66 @@ fn draw_text_in_rect_with_line_painter(
         // Short line-height permits ink overflow; the current string's ink
         // bounds must not relocate its baseline upward.
         let top = content.y
-            + text_vertical_offset(style, content.height, crate::layout::inline_style_line_height(&style))
+            + text_vertical_offset(
+                style,
+                content.height,
+                crate::layout::inline_style_line_height(&style),
+            )
             + line_box_half_leading(style);
-        if paint_inline_box && let Some((runs, _)) = tab_runs_for_context(&layout.lines[0], typeface, style, tab_context) {
+        if paint_inline_box
+            && let Some((runs, _)) =
+                tab_runs_for_context(&layout.lines[0], typeface, style, tab_context)
+        {
             for (offset, run) in runs {
-                paint_line(canvas, x + offset, top, run,
-                    measure_skia_text_advance(run, typeface, style), style, None);
+                paint_line(
+                    canvas,
+                    x + offset,
+                    top,
+                    run,
+                    measure_skia_text_advance(run, typeface, style),
+                    style,
+                    None,
+                );
             }
-        } else { paint_line(
-            canvas,
-            x,
-            top,
-            &layout.lines[0],
-            advance,
-            style,
-            None,
-        ); }
+        } else {
+            paint_line(canvas, x, top, &layout.lines[0], advance, style, None);
+        }
         if let Some(save) = clip_save {
             canvas.restore_to_count(save);
         }
         return;
     }
-    let line_height = line_context.and_then(|context| context.line_advance)
+    let line_height = line_context
+        .and_then(|context| context.line_advance)
         .unwrap_or(crate::layout::inline_style_line_height(&style));
-    let line_heights = layout.lines.iter().enumerate().map(|(index, line)| {
-        let line_style = authored_styles.as_ref().map_or(style, |styles| &styles[index]);
-        line_height.max(resolved_text_line_height(line, line_style))
-    }).collect::<Vec<_>>();
+    let line_heights = layout
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let line_style = authored_styles
+                .as_ref()
+                .map_or(style, |styles| &styles[index]);
+            line_height.max(resolved_text_line_height(line, line_style))
+        })
+        .collect::<Vec<_>>();
     let mut next_line_top = 0.0;
-    let line_tops = line_heights.iter().map(|height| {
-        let top = next_line_top;
-        next_line_top += height;
-        top
-    }).collect::<Vec<_>>();
+    let line_tops = line_heights
+        .iter()
+        .map(|height| {
+            let top = next_line_top;
+            next_line_top += height;
+            top
+        })
+        .collect::<Vec<_>>();
     let text_height = next_line_top;
     let top = content.y + text_vertical_offset(style, content.height, text_height);
     let paragraph_ends =
         text_layout::paragraph_terminal_lines(text, style.white_space, &layout.lines);
     for (index, line) in layout.lines.iter().enumerate() {
-        let style = authored_styles.as_ref().map_or(style, |styles| &styles[index]);
+        let style = authored_styles
+            .as_ref()
+            .map_or(style, |styles| &styles[index]);
         let ink = measure_skia_text_ink_bounds(
             line,
             style.font_size,
@@ -3572,24 +4370,45 @@ fn draw_text_in_rect_with_line_painter(
             )
         {
             if !paint_inline_box {
-                let expansion = (!style_uses_ahem(style)).then(||
-                    text_layout::justification_expansion(line, line_content.width,
-                        measure_skia_text_advance(line, typeface, style))).flatten();
-                paint_line(canvas, line_content.x,
+                let expansion = (!style_uses_ahem(style))
+                    .then(|| {
+                        text_layout::justification_expansion(
+                            line,
+                            line_content.width,
+                            measure_skia_text_advance(line, typeface, style),
+                        )
+                    })
+                    .flatten();
+                paint_line(
+                    canvas,
+                    line_content.x,
                     top + line_tops[index] + line_box_half_leading(style),
-                    line, line_content.width, style, expansion);
+                    line,
+                    line_content.width,
+                    style,
+                    expansion,
+                );
                 continue;
             }
             if !style_uses_ahem(style)
                 && let Some(expansion) = text_layout::justification_expansion(
-                    line, line_content.width, measure_skia_text_advance(line, typeface, style))
+                    line,
+                    line_content.width,
+                    measure_skia_text_advance(line, typeface, style),
+                )
             {
                 // Preserve contextual shaping and the precise cursor across
                 // word boundaries. Per-word origins add an extra float
                 // conversion before Skia positions the contextual glyphs.
-                paint_line(canvas, line_content.x,
+                paint_line(
+                    canvas,
+                    line_content.x,
                     top + line_tops[index] + line_box_half_leading(style),
-                    line, line_content.width, style, Some(expansion));
+                    line,
+                    line_content.width,
+                    style,
+                    Some(expansion),
+                );
                 continue;
             }
             if let Some(words) =
@@ -3671,8 +4490,10 @@ fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) ->
 fn line_box_half_leading(style: &Style) -> f32 {
     // Shared outside-marker layout has already aligned the text content box
     // to the item's first-line baseline, including its leading allocation.
-    if style.custom_properties.as_ref().and_then(|properties|
-        properties.get("--w3cos-internal-outside-list-marker"))
+    if style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"))
         .is_some_and(|kind| matches!(kind.as_str(), "decimal" | "string"))
     {
         return 0.0;
@@ -3686,13 +4507,15 @@ fn line_box_half_leading(style: &Style) -> f32 {
     {
         0.0
     } else {
-        let font_height = resolved_font_geometry(style)
-            .map_or(style.font_size, ResolvedFontGeometry::height);
+        let font_height =
+            resolved_font_geometry(style).map_or(style.font_size, ResolvedFontGeometry::height);
         // Use the same upper-leading allocation as inline line metrics.
         // A half-pixel (including negative leading) is assigned below the
         // baseline, not rounded again by glyph painting of block text.
         ((crate::layout::inline_used_line_height(crate::layout::inline_style_line_height(&style))
-            - font_height) * 0.5).floor()
+            - font_height)
+            * 0.5)
+            .floor()
     }
 }
 
@@ -3712,20 +4535,26 @@ fn draw_centered_text(
         style.font_weight,
         Some(style),
     );
-    let html_control = style.custom_properties.as_ref()
+    let html_control = style
+        .custom_properties
+        .as_ref()
         .is_some_and(|p| p.contains_key("--w3cos-internal-html-control-appearance"));
     let (x, y) = if html_control {
         // HTML labels are inline content: align the glyph advance and shared
         // font baseline, rather than moving the line for each label's ink.
         // This also applies when author decoration disables theme painting.
         let advance = measure_skia_text_advance(text, typeface, style);
-        let font_height = resolved_font_geometry(style)
-            .map_or(style.font_size, ResolvedFontGeometry::height);
-        (content.x + (content.width - advance) * 0.5,
-            content.y + (content.height - font_height) * 0.5)
+        let font_height =
+            resolved_font_geometry(style).map_or(style.font_size, ResolvedFontGeometry::height);
+        (
+            content.x + (content.width - advance) * 0.5,
+            content.y + (content.height - font_height) * 0.5,
+        )
     } else {
-        (content.x + (content.width - ink.width) * 0.5 - ink.left,
-            content.y + (content.height - ink.height) * 0.5 - ink.top)
+        (
+            content.x + (content.width - ink.width) * 0.5 - ink.left,
+            content.y + (content.height - ink.height) * 0.5 - ink.top,
+        )
     };
     draw_text_line(
         canvas,
@@ -3793,8 +4622,9 @@ fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_wid
         // glyph positions inside it retain raw shaping precision. Subtracting
         // raw width can move a final glyph across a subpixel raster phase.
         TextAlign::Right => rect.x + rect.width - text_layout::inline_layout_advance(advance_width),
-        TextAlign::Center => rect.x
-            + (rect.width - text_layout::inline_layout_advance(advance_width)) * 0.5,
+        TextAlign::Center => {
+            rect.x + (rect.width - text_layout::inline_layout_advance(advance_width)) * 0.5
+        }
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
             rect.x - ink_left.min(0.0)
         }
@@ -3869,14 +4699,42 @@ pub(crate) fn draw_text_line(
 }
 
 fn draw_justified_text_line(
-    canvas: &Canvas, x: f32, top: f32, text: &str, font_size: f32,
-    color: w3cos_std::color::Color, opacity: f32, typeface: &Typeface, style: &Style,
+    canvas: &Canvas,
+    x: f32,
+    top: f32,
+    text: &str,
+    font_size: f32,
+    color: w3cos_std::color::Color,
+    opacity: f32,
+    typeface: &Typeface,
+    style: &Style,
     expansion: text_layout::JustificationExpansion,
 ) -> f32 {
-    let advance = draw_text_glyph_line_with_expansion(canvas, x, top, text, font_size,
-        color, opacity, typeface, style, Some(expansion));
-    text_decoration::paint_with_expansion(canvas, x, top, text, advance, font_size,
-        color, opacity, typeface, style, Some(expansion));
+    let advance = draw_text_glyph_line_with_expansion(
+        canvas,
+        x,
+        top,
+        text,
+        font_size,
+        color,
+        opacity,
+        typeface,
+        style,
+        Some(expansion),
+    );
+    text_decoration::paint_with_expansion(
+        canvas,
+        x,
+        top,
+        text,
+        advance,
+        font_size,
+        color,
+        opacity,
+        typeface,
+        style,
+        Some(expansion),
+    );
     advance
 }
 
@@ -3891,32 +4749,58 @@ fn draw_text_glyph_line(
     typeface: &Typeface,
     style: &Style,
 ) -> f32 {
-    draw_text_glyph_line_with_expansion(canvas, x, top, text, font_size, color,
-        opacity, typeface, style, None)
+    draw_text_glyph_line_with_expansion(
+        canvas, x, top, text, font_size, color, opacity, typeface, style, None,
+    )
 }
 
 fn floor_inline_decoration_origin(rect: LayoutRect) -> LayoutRect {
     // Align the top without translating the unsnapped bottom edge. Pixel
     // coverage resolves both endpoints; moving only the origin loses the
     // last border row when fractional padding crosses the bottom midpoint.
-    let y=rect.y.floor();
-    LayoutRect {y,height:rect.height+(rect.y-y),..rect}
+    let y = rect.y.floor();
+    LayoutRect {
+        y,
+        height: rect.height + (rect.y - y),
+        ..rect
+    }
 }
 
 fn draw_text_glyph_line_with_expansion(
-    canvas: &Canvas, x: f32, top: f32, text: &str, font_size: f32,
-    color: w3cos_std::color::Color, opacity: f32, typeface: &Typeface, style: &Style,
+    canvas: &Canvas,
+    x: f32,
+    top: f32,
+    text: &str,
+    font_size: f32,
+    color: w3cos_std::color::Color,
+    opacity: f32,
+    typeface: &Typeface,
+    style: &Style,
     expansion: Option<text_layout::JustificationExpansion>,
 ) -> f32 {
     if let Some((runs, advance)) = positioned_tab_runs(text, typeface, style) {
         for (offset, run) in runs {
-            draw_text_glyph_line(canvas, x + offset, top, run, font_size, color, opacity, typeface, style);
+            draw_text_glyph_line(
+                canvas,
+                x + offset,
+                top,
+                run,
+                font_size,
+                color,
+                opacity,
+                typeface,
+                style,
+            );
         }
         return advance;
     }
-    let paint = if color == style.color { text_color_paint(style, opacity) }
-        else { color_paint(color, opacity) };
-    let (font_text, bidi_boundaries) = text_layout::font_render_text_for_style_with_boundaries(text, style);
+    let paint = if color == style.color {
+        text_color_paint(style, opacity)
+    } else {
+        color_paint(color, opacity)
+    };
+    let (font_text, bidi_boundaries) =
+        text_layout::font_render_text_for_style_with_boundaries(text, style);
     if style_uses_ahem(style) {
         // Ahem paints one deterministic em cell per character it covers, but
         // `font-family` still applies per character: a stack such as
@@ -4074,12 +4958,13 @@ fn draw_ahem_cells(
         let baseline = text_baseline(top, font_size, &face, style, text);
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *TRACE.get_or_init(|| std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some()) {
-            eprintln!("W3COS_HEADLESS_AHEM x={x} top={top} baseline={baseline} text={text:?} matrix={:?} clip={:?}",
-                canvas.local_to_device_as_3x3(), canvas.local_clip_bounds());
+            eprintln!(
+                "W3COS_HEADLESS_AHEM x={x} top={top} baseline={baseline} text={text:?} matrix={:?} clip={:?}",
+                canvas.local_to_device_as_3x3(),
+                canvas.local_clip_bounds()
+            );
         }
-        return draw_font_stack_runs(canvas, x,
-            baseline, text, font_size,
-            &face, style, paint);
+        return draw_font_stack_runs(canvas, x, baseline, text, font_size, &face, style, paint);
     }
     let mut cursor_x = x;
     let snapped_top = top.round();
@@ -4107,7 +4992,13 @@ fn draw_ahem_cells(
 
 /// Distance from the line top to the alphabetic baseline, taken from the face
 /// that establishes the line's metrics.
-pub(crate) fn text_baseline(top: f32, font_size: f32, typeface: &Typeface, style: &Style, _text: &str) -> f32 {
+pub(crate) fn text_baseline(
+    top: f32,
+    font_size: f32,
+    typeface: &Typeface,
+    style: &Style,
+    _text: &str,
+) -> f32 {
     // Fallback glyphs still share the registered primary font box's baseline.
     // Coverage decides which face paints, not which embedding supplies a strut.
     let registered = registered_strut_typeface(style);
@@ -4120,7 +5011,9 @@ pub(crate) fn text_baseline(top: f32, font_size: f32, typeface: &Typeface, style
     if registered.is_some() || generic.is_some() {
         let face = if registered.is_none() {
             typeface_for_character(baseline_typeface, 'x', style.font_weight)
-        } else { baseline_typeface.clone() };
+        } else {
+            baseline_typeface.clone()
+        };
         return top + typeface_font_geometry(&face, font_size).ascent;
     }
     let (_, metrics) = crate::skia_text_run::css_font(baseline_typeface, font_size).metrics();
@@ -4136,36 +5029,77 @@ fn glyph_run_intersects_clip(
     x: f32,
     baseline: f32,
 ) -> bool {
-    glyph_slice_intersects_clip(canvas, font, &run.glyphs, &run.positions, &run.glyph_font_sizes, x, baseline)
+    glyph_slice_intersects_clip(
+        canvas,
+        font,
+        &run.glyphs,
+        &run.positions,
+        &run.glyph_font_sizes,
+        x,
+        baseline,
+    )
 }
 
 pub(crate) fn glyph_slice_intersects_clip(
-    canvas: &Canvas, font: &skia_safe::Font,
-    glyphs: &[skia_safe::GlyphId], positions: &[skia_safe::Point],
+    canvas: &Canvas,
+    font: &skia_safe::Font,
+    glyphs: &[skia_safe::GlyphId],
+    positions: &[skia_safe::Point],
     glyph_font_sizes: &[f32],
-    x: f32, baseline: f32,
+    x: f32,
+    baseline: f32,
 ) -> bool {
-    let Some(clip) = canvas.device_clip_bounds() else { return false; };
+    let Some(clip) = canvas.device_clip_bounds() else {
+        return false;
+    };
     let matrix = canvas.local_to_device_as_3x3();
-    if matrix.has_perspective() { return true; }
+    if matrix.has_perspective() {
+        return true;
+    }
     let Some(ink) = crate::skia_text_run::geometric_ink_bounds_with_sizes(
-        font, glyphs, positions, glyph_font_sizes) else { return true; };
-    if ink.is_empty() { return false; }
-    let bounds = matrix.map_rect(Rect::new(ink.left + x, ink.top + baseline,
-        ink.right + x, ink.bottom + baseline)).0;
-    if !bounds.is_finite() { return true; }
+        font,
+        glyphs,
+        positions,
+        glyph_font_sizes,
+    ) else {
+        return true;
+    };
+    if ink.is_empty() {
+        return false;
+    }
+    let bounds = matrix
+        .map_rect(Rect::new(
+            ink.left + x,
+            ink.top + baseline,
+            ink.right + x,
+            ink.bottom + baseline,
+        ))
+        .0;
+    if !bounds.is_finite() {
+        return true;
+    }
     let late_visible = GLYPH_CLIP_RECORDING.with(|recording| {
         let mut recording = recording.borrow_mut();
-        let Some(recording) = recording.as_mut().filter(|recording| recording.clip.is_some())
-            else { return true; };
+        let Some(recording) = recording
+            .as_mut()
+            .filter(|recording| recording.clip.is_some())
+        else {
+            return true;
+        };
         let visible = glyph_ink_visible(bounds, recording.clip);
-        recording.decisions.push(GlyphClipDecision { ink: bounds, visible });
+        recording.decisions.push(GlyphClipDecision {
+            ink: bounds,
+            visible,
+        });
         visible
     });
     // Do not let a raster mask's antialias fringe paint when the vector ink
     // lies wholly outside the clip. Actual negative bearings remain included.
-    late_visible && bounds.left < clip.right as f32 && bounds.right > clip.left as f32
-        && bounds.top < clip.bottom as f32 && bounds.bottom > clip.top as f32
+    late_visible
+        && bounds.left < clip.right as f32
+        && bounds.right > clip.left as f32
+        && bounds.top < clip.bottom as f32
+        && bounds.bottom > clip.top as f32
 }
 
 fn draw_font_stack_runs(
@@ -4178,25 +5112,37 @@ fn draw_font_stack_runs(
     style: &Style,
     paint: &Paint,
 ) -> f32 {
-    draw_font_stack_runs_with_expansion(canvas, x, baseline, text, font_size,
-        typeface, style, paint, None, None)
+    draw_font_stack_runs_with_expansion(
+        canvas, x, baseline, text, font_size, typeface, style, paint, None, None,
+    )
 }
 
 fn draw_font_stack_runs_with_expansion(
-    canvas: &Canvas, x: f32, baseline: f32, text: &str, font_size: f32,
-    typeface: &Typeface, style: &Style, paint: &Paint,
+    canvas: &Canvas,
+    x: f32,
+    baseline: f32,
+    text: &str,
+    font_size: f32,
+    typeface: &Typeface,
+    style: &Style,
+    paint: &Paint,
     expansion: Option<text_layout::JustificationExpansion>,
     resolved_boundaries: Option<&[usize]>,
 ) -> f32 {
     let mut cursor_x = x;
     let adjustments = authored_fragment_adjustments(text, style);
     let fallback_boundaries;
-    let bidi_boundaries = if let Some(boundaries) = resolved_boundaries { boundaries } else {
+    let bidi_boundaries = if let Some(boundaries) = resolved_boundaries {
+        boundaries
+    } else {
         fallback_boundaries = unresolved_bidi_segment_boundaries(text, style);
         &fallback_boundaries
     };
     let mut byte_offset = 0;
-    for (index, run) in css_font_runs_with_boundaries(text, typeface, style, bidi_boundaries).into_iter().enumerate() {
+    for (index, run) in css_font_runs_with_boundaries(text, typeface, style, bidi_boundaries)
+        .into_iter()
+        .enumerate()
+    {
         // Bidi segment boxes use LayoutUnit starts. A same-direction font
         // fallback is still inside that box and retains raw shaping precision.
         if index > 0 && bidi_boundaries.contains(&byte_offset) {
@@ -4204,13 +5150,20 @@ fn draw_font_stack_runs_with_expansion(
         }
         let font = crate::skia_text_run::css_font_for_style(&run.typeface, font_size, style);
         let shaped = if let Some(expansion) = expansion {
-            crate::skia_text_run::shape_visual_run_with_expansion(run.text,
-                &run.typeface, style, adjustments.is_some(), expansion, byte_offset)
+            crate::skia_text_run::shape_visual_run_with_expansion(
+                run.text,
+                &run.typeface,
+                style,
+                adjustments.is_some(),
+                expansion,
+                byte_offset,
+            )
         } else if adjustments.is_some() {
             crate::skia_text_run::shape_visual_run_with_clusters(run.text, &run.typeface, style)
-        } else { crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style) };
-        if let Some(mut shaped) = shaped
-        {
+        } else {
+            crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style)
+        };
+        if let Some(mut shaped) = shaped {
             if let Some((ends, offsets, _)) = &adjustments {
                 for (position, cluster) in shaped.positions.iter_mut().zip(&shaped.glyph_clusters) {
                     let fragment = ends.partition_point(|end| *end <= byte_offset + cluster);
@@ -4218,15 +5171,18 @@ fn draw_font_stack_runs_with_expansion(
                 }
             }
             if glyph_run_intersects_clip(canvas, &font, &shaped, cursor_x, baseline) {
-                let ink = shaped.geometric_ink_bounds(&font)
-                    .map(|bounds| bounds.with_offset((cursor_x,baseline)));
-                draw_fractional_text(canvas,style,paint,ink,|target,paint|
-                    shaped.draw(target,(cursor_x,baseline),&font,paint));
+                let ink = shaped
+                    .geometric_ink_bounds(&font)
+                    .map(|bounds| bounds.with_offset((cursor_x, baseline)));
+                draw_fractional_text(canvas, style, paint, ink, |target, paint| {
+                    shaped.draw(target, (cursor_x, baseline), &font, paint)
+                });
             }
             cursor_x += shaped.advance;
         } else {
-            draw_fractional_text(canvas,style,paint,None,|target,paint|
-                { target.draw_str(run.text,(cursor_x,baseline),&font,paint); });
+            draw_fractional_text(canvas, style, paint, None, |target, paint| {
+                target.draw_str(run.text, (cursor_x, baseline), &font, paint);
+            });
             cursor_x += font.measure_str(run.text, Some(paint)).0;
         }
         byte_offset += run.text.len();
@@ -4237,38 +5193,54 @@ fn draw_font_stack_runs_with_expansion(
 fn authored_fragment_adjustments(text: &str, style: &Style) -> Option<(Vec<usize>, Vec<f32>, f32)> {
     let ends = w3cos_std::inline_text::fragment_ends(text, style)?;
     let mut start = 0;
-    let fragments = ends.iter().map(|end| {
-        let fragment = &text[start..*end];
-        start = *end;
-        fragment
-    }).collect::<Vec<_>>();
+    let fragments = ends
+        .iter()
+        .map(|end| {
+            let fragment = &text[start..*end];
+            start = *end;
+            fragment
+        })
+        .collect::<Vec<_>>();
     // Reuse contextual shaping validation: never cut ligatures, reorder
     // clusters or independently reshape each authored fragment.
     let advances = measure_skia_inline_fragment_advances(&fragments, style)?;
     let mut remainder = 0.0;
-    let offsets = advances.iter().map(|advance| {
-        let offset = remainder;
-        remainder += text_layout::inline_layout_advance(*advance) - advance;
-        offset
-    }).collect();
+    let offsets = advances
+        .iter()
+        .map(|advance| {
+            let offset = remainder;
+            remainder += text_layout::inline_layout_advance(*advance) - advance;
+            offset
+        })
+        .collect();
     Some((ends, offsets, remainder))
 }
 
 fn tab_run_ink_bounds(
-    runs: &[(f32, &str)], font_size: f32, typeface: &Typeface, font_weight: u16, style: &Style,
+    runs: &[(f32, &str)],
+    font_size: f32,
+    typeface: &Typeface,
+    font_weight: u16,
+    style: &Style,
 ) -> text_layout::InkBounds {
     let mut bounds = None::<text_layout::InkBounds>;
     for &(offset, run) in runs {
         let ink = measure_skia_text_ink_bounds(run, font_size, typeface, font_weight, Some(style));
-        if ink.width <= 0.0 && ink.height <= 0.0 { continue; }
-        let ink = text_layout::InkBounds { left: ink.left + offset, ..ink };
+        if ink.width <= 0.0 && ink.height <= 0.0 {
+            continue;
+        }
+        let ink = text_layout::InkBounds {
+            left: ink.left + offset,
+            ..ink
+        };
         bounds = Some(match bounds {
             None => ink,
             Some(previous) => {
                 let left = previous.left.min(ink.left);
                 let top = previous.top.min(ink.top);
                 text_layout::InkBounds {
-                    left, top,
+                    left,
+                    top,
                     width: (previous.left + previous.width).max(ink.left + ink.width) - left,
                     height: (previous.top + previous.height).max(ink.top + ink.height) - top,
                 }
@@ -4290,16 +5262,23 @@ fn measure_skia_text_ink_bounds(
     {
         let mut bounds = None::<text_layout::InkBounds>;
         for (offset, run) in runs {
-            let ink = measure_skia_text_ink_bounds(run, font_size, typeface, font_weight, Some(style));
-            if ink.width <= 0.0 && ink.height <= 0.0 { continue; }
-            let ink = text_layout::InkBounds { left: ink.left + offset, ..ink };
+            let ink =
+                measure_skia_text_ink_bounds(run, font_size, typeface, font_weight, Some(style));
+            if ink.width <= 0.0 && ink.height <= 0.0 {
+                continue;
+            }
+            let ink = text_layout::InkBounds {
+                left: ink.left + offset,
+                ..ink
+            };
             bounds = Some(match bounds {
                 None => ink,
                 Some(previous) => {
                     let left = previous.left.min(ink.left);
                     let top = previous.top.min(ink.top);
                     text_layout::InkBounds {
-                        left, top,
+                        left,
+                        top,
                         width: (previous.left + previous.width).max(ink.left + ink.width) - left,
                         height: (previous.top + previous.height).max(ink.top + ink.height) - top,
                     }
@@ -4409,20 +5388,29 @@ fn font_stack_ink_bounds(
     let mut saw_ink = false;
 
     let (font_text, bidi_boundaries) = style.map_or_else(
-        || (text_layout::font_render_text(text, w3cos_std::style::TextDirection::Ltr), Vec::new()),
+        || {
+            (
+                text_layout::font_render_text(text, w3cos_std::style::TextDirection::Ltr),
+                Vec::new(),
+            )
+        },
         |style| text_layout::font_render_text_for_style_with_boundaries(text, style),
     );
     let runs = style.map_or_else(
         || fallback_font_runs(font_text.as_ref(), typeface, font_weight),
-        |style| css_font_runs_with_boundaries(font_text.as_ref(), typeface, style, &bidi_boundaries),
+        |style| {
+            css_font_runs_with_boundaries(font_text.as_ref(), typeface, style, &bidi_boundaries)
+        },
     );
     let mut byte_offset = 0;
     for (index, run) in runs.into_iter().enumerate() {
         if index > 0 && bidi_boundaries.contains(&byte_offset) {
             cursor_x = text_layout::inline_layout_advance(cursor_x);
         }
-        let font = style.map_or_else(|| crate::skia_text_run::css_font(&run.typeface, font_size),
-            |style| crate::skia_text_run::css_font_for_style(&run.typeface, font_size, style));
+        let font = style.map_or_else(
+            || crate::skia_text_run::css_font(&run.typeface, font_size),
+            |style| crate::skia_text_run::css_font_for_style(&run.typeface, font_size, style),
+        );
         let default_style = Style {
             font_size,
             ..Style::default()
@@ -4563,7 +5551,8 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
     if let Some((_, advance)) = positioned_tab_runs(text, typeface, style) {
         return advance;
     }
-    let (render_text, bidi_boundaries) = text_layout::font_render_text_for_style_with_boundaries(text, style);
+    let (render_text, bidi_boundaries) =
+        text_layout::font_render_text_for_style_with_boundaries(text, style);
     if style_uses_ahem(style) {
         return ahem_segments(render_text.as_ref(), style)
             .into_iter()
@@ -4597,17 +5586,27 @@ pub(crate) struct TabStops {
 }
 
 fn tab_runs_for_context<'a>(
-    text: &'a str, typeface: &Typeface, style: &Style, context: Option<(TabStops, f32)>,
+    text: &'a str,
+    typeface: &Typeface,
+    style: &Style,
+    context: Option<(TabStops, f32)>,
 ) -> Option<(Vec<(f32, &'a str)>, f32)> {
-    context.and_then(|(stops, offset)|
-        positioned_tab_runs_in_context(text, typeface, style, Some(stops), offset))
+    context.and_then(|(stops, offset)| {
+        positioned_tab_runs_in_context(text, typeface, style, Some(stops), offset)
+    })
 }
 
 fn with_text_typeface<T>(text: &str, style: &Style, callback: impl FnOnce(&Typeface) -> T) -> T {
     let registered = registered_typeface_covering(style, text);
     let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
-        callback(registered.as_ref().map(|(_, face)| face).or(generic.as_ref()).unwrap_or(intrinsic))
+        callback(
+            registered
+                .as_ref()
+                .map(|(_, face)| face)
+                .or(generic.as_ref())
+                .unwrap_or(intrinsic),
+        )
     })
 }
 
@@ -4621,30 +5620,75 @@ pub(crate) fn html_text_input_content_size(style: &Style, size: u32) -> (f32, f3
         let zero = font.measure_str("0", None).0;
         let average = if cfg!(target_os = "macos") {
             font.measure_str("x", None).0
-        } else { raw.avg_char_width };
+        } else {
+            raw.avg_char_width
+        };
         // The browser rejects families with incompatible average-width data,
         // including metrics reporting a CJK cell for Latin text controls.
-        let invalid = ["American Typewriter", "Arial Hebrew", "Chalkboard", "Cochin",
-            "Corsiva Hebrew", "Courier", "Euphemia UCAS", "Geneva", "Gill Sans",
-            "Hei", "Helvetica", "Hoefler Text", "InaiMathi", "Kai", "Lucida Grande",
-            "Marker Felt", "Monaco", "Mshtakan", "New Peninim MT", "Osaka", "Raanana",
-            "STHeiti", "Symbol", "Times", "Apple Braille", "Apple LiGothic", "Apple LiSung",
-            "Apple Symbols", "AppleGothic", "AppleMyungjo", "#GungSeo", "#HeadLineA",
-            "#PCMyungjo", "#PilGi"].contains(&face.family_name().as_str());
-        let valid = average.is_finite() && average > 0.0
-            && average <= zero * 1.7 && !invalid;
-        let character = if valid { average.max(average.round()) } else { zero };
-        let maximum = if !valid { character } else if cfg!(target_os = "macos") {
+        let invalid = [
+            "American Typewriter",
+            "Arial Hebrew",
+            "Chalkboard",
+            "Cochin",
+            "Corsiva Hebrew",
+            "Courier",
+            "Euphemia UCAS",
+            "Geneva",
+            "Gill Sans",
+            "Hei",
+            "Helvetica",
+            "Hoefler Text",
+            "InaiMathi",
+            "Kai",
+            "Lucida Grande",
+            "Marker Felt",
+            "Monaco",
+            "Mshtakan",
+            "New Peninim MT",
+            "Osaka",
+            "Raanana",
+            "STHeiti",
+            "Symbol",
+            "Times",
+            "Apple Braille",
+            "Apple LiGothic",
+            "Apple LiSung",
+            "Apple Symbols",
+            "AppleGothic",
+            "AppleMyungjo",
+            "#GungSeo",
+            "#HeadLineA",
+            "#PCMyungjo",
+            "#PilGi",
+        ]
+        .contains(&face.family_name().as_str());
+        let valid = average.is_finite() && average > 0.0 && average <= zero * 1.7 && !invalid;
+        let character = if valid {
+            average.max(average.round())
+        } else {
+            zero
+        };
+        let maximum = if !valid {
+            character
+        } else if cfg!(target_os = "macos") {
             geometry.ascent
-        } else { raw.max_char_width.round() };
-        ((character * size as f32 + (maximum - character).max(0.0)).ceil(),
-            geometry.line_spacing())
+        } else {
+            raw.max_char_width.round()
+        };
+        (
+            (character * size as f32 + (maximum - character).max(0.0)).ceil(),
+            geometry.line_spacing(),
+        )
     })
 }
 
 pub(crate) fn tab_stops_for_style(style: &Style) -> TabStops {
     with_text_typeface(" 0", style, |face| {
-        let unspaced = Style { word_spacing: 0.0, letter_spacing: 0.0, ..style.clone() };
+        let unspaced = Style {
+            word_spacing: 0.0,
+            letter_spacing: 0.0,
+            ..style.clone()
+        };
         TabStops {
             width: 8.0 * measure_skia_text_advance(" ", face, style).max(0.0),
             minimum_gap: 0.5 * measure_skia_text_advance("0", face, &unspaced).max(0.0),
@@ -4653,13 +5697,16 @@ pub(crate) fn tab_stops_for_style(style: &Style) -> TabStops {
 }
 
 pub(crate) fn preserved_tab_advance_in_block(
-    text: &str, style: &Style, block_style: &Style, line_offset: f32,
+    text: &str,
+    style: &Style,
+    block_style: &Style,
+    line_offset: f32,
 ) -> Option<f32> {
     let stops = tab_stops_for_style(block_style);
-    with_text_typeface(text, style, |face|
+    with_text_typeface(text, style, |face| {
         positioned_tab_runs_in_context(text, face, style, Some(stops), line_offset)
             .map(|(_, advance)| advance)
-    )
+    })
 }
 
 fn positioned_tab_runs_in_context<'a>(
@@ -4671,8 +5718,10 @@ fn positioned_tab_runs_in_context<'a>(
 ) -> Option<(Vec<(f32, &'a str)>, f32)> {
     if !text.contains('\t')
         || style.direction != w3cos_std::style::TextDirection::Ltr
-        || !matches!(style.white_space,
-            w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap)
+        || !matches!(
+            style.white_space,
+            w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap
+        )
     {
         return None;
     }
@@ -4680,7 +5729,11 @@ fn positioned_tab_runs_in_context<'a>(
         || 8.0 * measure_skia_text_advance(" ", typeface, style).max(0.0),
         |stops| stops.width,
     );
-    let unspaced = Style { word_spacing: 0.0, letter_spacing: 0.0, ..style.clone() };
+    let unspaced = Style {
+        word_spacing: 0.0,
+        letter_spacing: 0.0,
+        ..style.clone()
+    };
     let minimum_gap = block_stops.map_or_else(
         || 0.5 * measure_skia_text_advance("0", typeface, &unspaced).max(0.0),
         |stops| stops.minimum_gap,
@@ -4695,7 +5748,9 @@ fn positioned_tab_runs_in_context<'a>(
         }
         if parts.peek().is_some() && stop_width > 0.0 {
             let mut next = ((cursor / stop_width).floor() + 1.0) * stop_width;
-            if next - cursor < minimum_gap { next += stop_width; }
+            if next - cursor < minimum_gap {
+                next += stop_width;
+            }
             cursor = next;
         }
     }
@@ -4727,7 +5782,10 @@ fn font_stack_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
 }
 
 fn font_stack_advance_with_boundaries(
-    text: &str, typeface: &Typeface, style: &Style, bidi_boundaries: &[usize],
+    text: &str,
+    typeface: &Typeface,
+    style: &Style,
+    bidi_boundaries: &[usize],
 ) -> f32 {
     let mut byte_offset = 0;
     css_font_runs_with_boundaries(text, typeface, style, bidi_boundaries)
@@ -4736,39 +5794,55 @@ fn font_stack_advance_with_boundaries(
         .fold(0.0, |cursor, (index, run)| {
             let cursor = if index > 0 && bidi_boundaries.contains(&byte_offset) {
                 text_layout::inline_layout_advance(cursor)
-            } else { cursor };
+            } else {
+                cursor
+            };
             byte_offset += run.text.len();
-            cursor + crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style)
-                .map(|shaped| shaped.advance)
-                .unwrap_or_else(|| {
-                    crate::skia_text_run::css_font(&run.typeface, style.font_size)
-                        .measure_str(run.text, None)
-                        .0
-                        + run
-                            .text
-                            .chars()
-                            .filter(|character| is_word_spacing_character(*character))
-                            .count() as f32
-                            * style.word_spacing
-                })
+            cursor
+                + crate::skia_text_run::shape_visual_run(run.text, &run.typeface, style)
+                    .map(|shaped| shaped.advance)
+                    .unwrap_or_else(|| {
+                        crate::skia_text_run::css_font(&run.typeface, style.font_size)
+                            .measure_str(run.text, None)
+                            .0
+                            + run
+                                .text
+                                .chars()
+                                .filter(|character| is_word_spacing_character(*character))
+                                .count() as f32
+                                * style.word_spacing
+                    })
         })
 }
 
 fn unresolved_bidi_segment_boundaries(text: &str, style: &Style) -> Vec<usize> {
     // Prepared inline source runs already carry their segment geometry. Do
     // not quantize that shared shaping context again in the glyph painter.
-    if style.custom_properties.as_ref().is_some_and(|properties|
-        properties.get("--w3cos-internal-bidi-visual-order").is_some_and(|value| value == "1"))
-        || !text.chars().any(|character| matches!(unicode_bidi::bidi_class(character),
-            unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)) { return Vec::new(); }
+    if style.custom_properties.as_ref().is_some_and(|properties| {
+        properties
+            .get("--w3cos-internal-bidi-visual-order")
+            .is_some_and(|value| value == "1")
+    }) || !text.chars().any(|character| {
+        matches!(
+            unicode_bidi::bidi_class(character),
+            unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+        )
+    }) {
+        return Vec::new();
+    }
     // This input is already in left-to-right visual paint order, including
     // mirrored punctuation. Reapplying the authored paragraph base changes
     // neutral boundaries a second time and loses fallback-font LayoutUnit
     // starts. The paragraph direction was consumed by font_render_text_for_style.
     let base = unicode_bidi::Level::ltr();
     let bidi = unicode_bidi::BidiInfo::new(text, Some(base));
-    bidi.levels.windows(2).enumerate().filter_map(|(index, levels)|
-        (levels[0].is_rtl() != levels[1].is_rtl()).then_some(index + 1)).collect()
+    bidi.levels
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, levels)| {
+            (levels[0].is_rtl() != levels[1].is_rtl()).then_some(index + 1)
+        })
+        .collect()
 }
 
 fn is_word_spacing_character(character: char) -> bool {
@@ -4797,7 +5871,6 @@ fn style_uses_generic_monospace(style: &Style) -> bool {
     })
 }
 
-
 /// Partition one shaped font-stack run at existing fragment boundaries.
 /// Never split a glyph cluster: ligatures or reordered clusters require a
 /// shared paint run instead of independently painted word fragments.
@@ -4819,51 +5892,80 @@ pub(crate) fn measure_skia_inline_fragment_advances(
     let registered = registered_typeface_covering(style, &text);
     let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
-        let primary = registered.as_ref().map(|(_, face)| face)
-            .or(generic.as_ref()).unwrap_or(intrinsic);
+        let primary = registered
+            .as_ref()
+            .map(|(_, face)| face)
+            .or(generic.as_ref())
+            .unwrap_or(intrinsic);
         let mut advances = vec![0.0; fragments.len()];
         let mut run_offset = 0;
         for run in css_font_runs(&text, primary, style) {
-            let shaped = crate::skia_text_run::shape_visual_run_with_clusters(run.text, &run.typeface, style)?;
+            let shaped = crate::skia_text_run::shape_visual_run_with_clusters(
+                run.text,
+                &run.typeface,
+                style,
+            )?;
             if shaped.clusters.first()?.0 != 0
-                || shaped.clusters.windows(2).any(|pair| pair[0].0 >= pair[1].0)
-            { return None; }
+                || shaped
+                    .clusters
+                    .windows(2)
+                    .any(|pair| pair[0].0 >= pair[1].0)
+            {
+                return None;
+            }
             for (index, &(start, advance)) in shaped.clusters.iter().enumerate() {
-                let end = shaped.clusters.get(index + 1).map_or(run.text.len(), |next| next.0);
-                let fragment = boundaries.partition_point(|boundary| *boundary <= run_offset + start)
+                let end = shaped
+                    .clusters
+                    .get(index + 1)
+                    .map_or(run.text.len(), |next| next.0);
+                let fragment = boundaries
+                    .partition_point(|boundary| *boundary <= run_offset + start)
                     .checked_sub(1)?;
-                if fragment >= fragments.len() || run_offset + end > boundaries[fragment + 1]
+                if fragment >= fragments.len()
+                    || run_offset + end > boundaries[fragment + 1]
                     || !advance.is_finite()
-                { return None; }
+                {
+                    return None;
+                }
                 advances[fragment] += advance;
             }
             run_offset += run.text.len();
         }
-        (run_offset == text.len() && advances.iter().all(|width| *width >= 0.0))
-            .then_some(advances)
+        (run_offset == text.len() && advances.iter().all(|width| *width >= 0.0)).then_some(advances)
     })
 }
 
 fn resolved_text_line_height(text: &str, style: &Style) -> f32 {
     let authored = crate::layout::inline_style_line_height(style);
     if style.line_height_is_normal {
-        resolved_text_font_geometry(text, style).map_or(authored,
-            |metrics| authored.max(metrics.line_spacing()))
-    } else { authored }
+        resolved_text_font_geometry(text, style)
+            .map_or(authored, |metrics| authored.max(metrics.line_spacing()))
+    } else {
+        authored
+    }
 }
 
 /// Font-relative ch is the selected face's zero width, not a shaped text run
 /// whose advance has already passed through HarfBuzz fixed-point conversion.
 pub(crate) fn measure_skia_font_zero_advance(style: &Style) -> f32 {
-    if style_uses_ahem(style) { return style.font_size; }
+    if style_uses_ahem(style) {
+        return style.font_size;
+    }
     let registered = registered_typeface_covering(style, "0");
     let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
-        let primary = registered.as_ref().map(|(_, face)| face)
-            .or(generic.as_ref()).unwrap_or(intrinsic);
-        css_font_runs_with_boundaries("0", primary, style, &[]).into_iter()
-            .map(|run| crate::skia_text_run::css_font_for_style(
-                &run.typeface, style.font_size, style).measure_str(run.text, None).0)
+        let primary = registered
+            .as_ref()
+            .map(|(_, face)| face)
+            .or(generic.as_ref())
+            .unwrap_or(intrinsic);
+        css_font_runs_with_boundaries("0", primary, style, &[])
+            .into_iter()
+            .map(|run| {
+                crate::skia_text_run::css_font_for_style(&run.typeface, style.font_size, style)
+                    .measure_str(run.text, None)
+                    .0
+            })
             .sum()
     })
 }
@@ -4888,7 +5990,9 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
             .iter()
             .enumerate()
             .map(|(index, line)| {
-                let style = authored_styles.as_ref().map_or(style, |styles| &styles[index]);
+                let style = authored_styles
+                    .as_ref()
+                    .map_or(style, |styles| &styles[index]);
                 measure_skia_text_advance(line, primary, style)
                     + authored_fragment_adjustments(line, style).map_or(0.0, |(_, _, extra)| extra)
             })
@@ -4901,8 +6005,14 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
         // by `browser_normal_cjk_height` in layout.rs.
         let used = text_layout::used_text_line_count(text, style, &lines);
         let content_height = if used > 1 {
-            lines.iter().take(used).map(|line| resolved_text_line_height(line, style)).sum()
-        } else { used as f32 * crate::layout::inline_style_line_height(style) };
+            lines
+                .iter()
+                .take(used)
+                .map(|line| resolved_text_line_height(line, style))
+                .sum()
+        } else {
+            used as f32 * crate::layout::inline_style_line_height(style)
+        };
         (
             width + padding.left + padding.right,
             content_height + padding.top + padding.bottom,
@@ -4917,11 +6027,19 @@ pub(crate) fn measure_skia_wrapped_text_height(text: &str, width: f32, style: &S
 /// Offset from the first text content-box top to the final painted baseline.
 /// Use the same shaped lines as height measurement, including soft wraps and
 /// per-line fallback metrics; unused authored block height is not a text line.
-pub(crate) fn measure_skia_wrapped_text_last_baseline(text: &str, width: f32, style: &Style) -> f32 {
+pub(crate) fn measure_skia_wrapped_text_last_baseline(
+    text: &str,
+    width: f32,
+    style: &Style,
+) -> f32 {
     measure_skia_wrapped_text_geometry::<true>(text, width, style).1
 }
 
-fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(text: &str, width: f32, style: &Style) -> (f32, f32) {
+fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(
+    text: &str,
+    width: f32,
+    style: &Style,
+) -> (f32, f32) {
     let registered = registered_typeface_covering(style, text);
     let generic = generic_serif_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
@@ -4940,12 +6058,21 @@ fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(text: &str, width: f
         let continuation_width = if style.display == Display::Inline
             && style.custom_properties.as_ref().is_some_and(|properties| {
                 properties.contains_key("--w3cos-internal-text-line-width")
-            })
-        {
-            text_layout::inline_text_continuation_box(LayoutRect {
-                x: 0.0, y: 0.0, width: inner_width, height: 0.0,
-            }, style).width.max(1.0)
-        } else { inner_width };
+            }) {
+            text_layout::inline_text_continuation_box(
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: inner_width,
+                    height: 0.0,
+                },
+                style,
+            )
+            .width
+            .max(1.0)
+        } else {
+            inner_width
+        };
         let lines = text_layout::wrap_text_with_run_width_and_first_line(
             text,
             continuation_width,
@@ -4957,20 +6084,36 @@ fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(text: &str, width: f
         let content_height = if used_line_count == 1 {
             measure_skia_text_intrinsic_size(&lines[0], style).1 - padding.top - padding.bottom
         } else {
-            lines.iter().take(used_line_count).map(|line| resolved_text_line_height(line, style)).sum()
+            lines
+                .iter()
+                .take(used_line_count)
+                .map(|line| resolved_text_line_height(line, style))
+                .sum()
         };
         let height = content_height + padding.top + padding.bottom;
-        if !BASELINE { return (height, 0.0); }
-        let preceding_height: f32 = lines.iter().take(used_line_count.saturating_sub(1))
-            .map(|line| resolved_text_line_height(line, style)).sum();
-        let first_ascent = lines.first().and_then(|line| resolved_text_font_geometry(line, style))
-            .map(|metrics| metrics.ascent);
-        let ascent_delta = lines.get(used_line_count.saturating_sub(1))
+        if !BASELINE {
+            return (height, 0.0);
+        }
+        let preceding_height: f32 = lines
+            .iter()
+            .take(used_line_count.saturating_sub(1))
+            .map(|line| resolved_text_line_height(line, style))
+            .sum();
+        let first_ascent = lines
+            .first()
             .and_then(|line| resolved_text_font_geometry(line, style))
-            .zip(first_ascent).map_or(0.0, |(last, first)| last.ascent - first);
+            .map(|metrics| metrics.ascent);
+        let ascent_delta = lines
+            .get(used_line_count.saturating_sub(1))
+            .and_then(|line| resolved_text_font_geometry(line, style))
+            .zip(first_ascent)
+            .map_or(0.0, |(last, first)| last.ascent - first);
         // The rect has already been shifted from line-top to first font
         // content-top. Adding normal leading again moves single-line exports.
-        (height, preceding_height + crate::layout::inline_font_content_ascent(style) + ascent_delta)
+        (
+            height,
+            preceding_height + crate::layout::inline_font_content_ascent(style) + ascent_delta,
+        )
     })
 }
 
@@ -4980,28 +6123,42 @@ pub(crate) struct FallbackFontRun<'a> {
 }
 
 fn css_font_runs_with_boundaries<'a>(
-    text: &'a str, primary: &Typeface, style: &Style, boundaries: &[usize],
+    text: &'a str,
+    primary: &Typeface,
+    style: &Style,
+    boundaries: &[usize],
 ) -> Vec<FallbackFontRun<'a>> {
     // Font fallback and resolved bidi segments are independent partitions.
     // A neutral/Latin direction transition can occur inside one font run;
     // keeping it merged skips the segment's LayoutUnit origin and shaping
     // boundary. Preserve raw precision only inside each resolved segment.
-    let mut result=Vec::new();
-    let mut offset=0;
-    for run in css_font_runs(text,primary,style) {
-        let end=offset+run.text.len();
-        let mut start=offset;
-        for boundary in boundaries.iter().copied().filter(|boundary|*boundary>offset&&*boundary<end)
-            .chain(std::iter::once(end)) {
-            result.push(FallbackFontRun {text:&text[start..boundary],typeface:run.typeface.clone()});
-            start=boundary;
+    let mut result = Vec::new();
+    let mut offset = 0;
+    for run in css_font_runs(text, primary, style) {
+        let end = offset + run.text.len();
+        let mut start = offset;
+        for boundary in boundaries
+            .iter()
+            .copied()
+            .filter(|boundary| *boundary > offset && *boundary < end)
+            .chain(std::iter::once(end))
+        {
+            result.push(FallbackFontRun {
+                text: &text[start..boundary],
+                typeface: run.typeface.clone(),
+            });
+            start = boundary;
         }
-        offset=end;
+        offset = end;
     }
     result
 }
 
-pub(crate) fn css_font_runs<'a>(text: &'a str, primary: &Typeface, style: &Style) -> Vec<FallbackFontRun<'a>> {
+pub(crate) fn css_font_runs<'a>(
+    text: &'a str,
+    primary: &Typeface,
+    style: &Style,
+) -> Vec<FallbackFontRun<'a>> {
     let generic = generic_serif_typeface(style);
     let primary = generic.as_ref().unwrap_or(primary);
     let mut runs = Vec::new();
@@ -5066,7 +6223,9 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
         None => {
             let style = FontStyle::new(
                 (font_weight.clamp(1, 1000) as i32).into(),
-                skia_safe::font_style::Width::NORMAL, primary.font_style().slant());
+                skia_safe::font_style::Width::NORMAL,
+                primary.font_style().slant(),
+            );
             // A missing nominal cmap entry does not imply a missing shaped
             // cluster: HarfBuzz may canonically decompose it into base/mark
             // glyphs already present in this face. Canonical aliases can
@@ -5075,17 +6234,33 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
             // coverage of a missing character.
             // Keep the original UTF-8
             // text and clusters; do not rewrite the DOM or force NFD globally.
-            let probe_style = Style { font_size: 16.0, font_weight,
-                ..Style::default() };
+            let probe_style = Style {
+                font_size: 16.0,
+                font_weight,
+                ..Style::default()
+            };
             let covered = font_weight == 400
-                && crate::skia_text_run::shape_visual_run(&character.to_string(), primary, &probe_style)
-                    .is_some_and(|run| (run.glyphs.len() > 1
-                        || run.glyphs.first().is_some_and(|glyph|
-                            *glyph != primary.unichar_to_glyph(' ' as i32)))
-                        && run.glyphs.iter().all(|glyph| *glyph != 0));
-            let matched = if covered { Some(primary.clone()) } else {
+                && crate::skia_text_run::shape_visual_run(
+                    &character.to_string(),
+                    primary,
+                    &probe_style,
+                )
+                .is_some_and(|run| {
+                    (run.glyphs.len() > 1
+                        || run
+                            .glyphs
+                            .first()
+                            .is_some_and(|glyph| *glyph != primary.unichar_to_glyph(' ' as i32)))
+                        && run.glyphs.iter().all(|glyph| *glyph != 0)
+                });
+            let matched = if covered {
+                Some(primary.clone())
+            } else {
                 FontMgr::default().match_family_style_character(
-                    &primary.family_name(), style, &["en", "zh-Hans"], character as i32,
+                    &primary.family_name(),
+                    style,
+                    &["en", "zh-Hans"],
+                    character as i32,
                 )
             };
             FONT_FALLBACK_CACHE.with(|cache| {
@@ -5344,9 +6519,13 @@ fn draw_rounded_rect(canvas: &Canvas, rect: LayoutRect, radii: [f32; 4], paint: 
     let rounded = RRect::new_rect_radii(to_rect(rect), &radii);
     let corner_radii = rounded.radii_ref();
     let uniform_stroke = paint.style() == paint::Style::Stroke
-        && corner_radii.iter().all(|radius| radius.x == radius.y && *radius == corner_radii[0]);
+        && corner_radii
+            .iter()
+            .all(|radius| radius.x == radius.y && *radius == corner_radii[0]);
     if !analytic_ellipse::draw(canvas, &rounded, paint)
-        && !(uniform_stroke && analytic_round_rect::draw(canvas, *rounded.rect(), corner_radii[0].x, paint)) {
+        && !(uniform_stroke
+            && analytic_round_rect::draw(canvas, *rounded.rect(), corner_radii[0].x, paint))
+    {
         canvas.draw_rrect(rounded, paint);
     }
 }
@@ -5377,7 +6556,9 @@ fn opacity_layer_paint(opacity: f32) -> Paint {
     let opacity = opacity.clamp(0.0, 1.0);
     if opacity < 1.0 {
         CSS_OPACITY_SRC_OVER.with(|blender| {
-            if let Some(blender) = blender { paint.set_blender(blender.clone()); }
+            if let Some(blender) = blender {
+                paint.set_blender(blender.clone());
+            }
         });
     }
     paint.set_alpha_f(opacity);
@@ -5386,11 +6567,19 @@ fn opacity_layer_paint(opacity: f32) -> Paint {
 
 pub(crate) fn text_color_paint(style: &Style, opacity: f32) -> Paint {
     let mut paint = color_paint(style.color, opacity);
-    if let Some([r,g,b,a]) = style.color_rgba.filter(|channels|
-        channels.iter().all(|channel| channel.is_finite() && (0.0..=1.0).contains(channel))
-            && channels.iter().zip([style.color.r,style.color.g,style.color.b,style.color.a])
-                .all(|(channel, byte)| (*channel * 255.0).round() as u8 == byte)) {
-        paint.set_color4f(skia_safe::Color4f::new(r,g,b,a * opacity.clamp(0.0,1.0)), None);
+    if let Some([r, g, b, a]) = style.color_rgba.filter(|channels| {
+        channels
+            .iter()
+            .all(|channel| channel.is_finite() && (0.0..=1.0).contains(channel))
+            && channels
+                .iter()
+                .zip([style.color.r, style.color.g, style.color.b, style.color.a])
+                .all(|(channel, byte)| (*channel * 255.0).round() as u8 == byte)
+    }) {
+        paint.set_color4f(
+            skia_safe::Color4f::new(r, g, b, a * opacity.clamp(0.0, 1.0)),
+            None,
+        );
     }
     paint
 }
@@ -5398,16 +6587,23 @@ pub(crate) fn text_color_paint(style: &Style, opacity: f32) -> Paint {
 #[path = "fractional_text_composite.rs"]
 mod fractional_text_composite;
 
-pub(crate) fn draw_fractional_text(canvas: &Canvas, style: &Style, paint: &Paint,
-    ink: Option<Rect>, draw_glyphs: impl Fn(&Canvas,&Paint)) {
-    fractional_text_composite::draw(canvas,style,paint,ink,draw_glyphs);
+pub(crate) fn draw_fractional_text(
+    canvas: &Canvas,
+    style: &Style,
+    paint: &Paint,
+    ink: Option<Rect>,
+    draw_glyphs: impl Fn(&Canvas, &Paint),
+) {
+    fractional_text_composite::draw(canvas, style, paint, ink, draw_glyphs);
 }
 
 pub(crate) fn color_paint(color: w3cos_std::color::Color, opacity: f32) -> Paint {
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
     CSS_SRC_OVER.with(|blender| {
-        if let Some(blender) = blender { paint.set_blender(blender.clone()); }
+        if let Some(blender) = blender {
+            paint.set_blender(blender.clone());
+        }
     });
     paint.set_color(Color::from_argb(
         (color.a as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
@@ -5435,130 +6631,251 @@ mod tests {
         let path = std::env::var("W3COS_COLOR_BROWSER_PNG").expect("browser PNG path");
         let bytes = std::fs::read(&path).unwrap();
         let image = skia_safe::Image::from_encoded(skia_safe::Data::new_copy(&bytes)).unwrap();
-        let info = skia_safe::ImageInfo::new((800,600),skia_safe::ColorType::RGBA8888,
-            skia_safe::AlphaType::Premul,None);
-        let mut browser = vec![0_u8;800*600*4];
-        assert!(image.read_pixels(&info,&mut browser,800*4,(0,0),
-            skia_safe::image::CachingHint::Disallow));
-        let mut rounding_gaps = [0_usize;3];
-        let mut arithmetic_gaps = [0_usize;16];
-        for y in 54..76 { for x in 0..800 {
-            let offset = (y*800+x)*4;
-            let sum = 255_u16 + u16::from(browser[offset]);
-            let floor = sum / 2;
-            let ceil = sum.div_ceil(2);
-            let even = if sum % 2 == 0 || floor % 2 == 0 { floor } else { ceil };
-            for (index,value) in [floor,ceil,even].into_iter().enumerate() {
-                rounding_gaps[index] += usize::from(value as u8 != browser[offset+1]);
+        let info = skia_safe::ImageInfo::new(
+            (800, 600),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut browser = vec![0_u8; 800 * 600 * 4];
+        assert!(image.read_pixels(
+            &info,
+            &mut browser,
+            800 * 4,
+            (0, 0),
+            skia_safe::image::CachingHint::Disallow
+        ));
+        let mut rounding_gaps = [0_usize; 3];
+        let mut arithmetic_gaps = [0_usize; 16];
+        for y in 54..76 {
+            for x in 0..800 {
+                let offset = (y * 800 + x) * 4;
+                let sum = 255_u16 + u16::from(browser[offset]);
+                let floor = sum / 2;
+                let ceil = sum.div_ceil(2);
+                let even = if sum % 2 == 0 || floor % 2 == 0 {
+                    floor
+                } else {
+                    ceil
+                };
+                for (index, value) in [floor, ceil, even].into_iter().enumerate() {
+                    rounding_gaps[index] += usize::from(value as u8 != browser[offset + 1]);
+                }
+                let coverage = (255 - browser[offset]) as f32 * (1.0_f32 / 255.0);
+                let divided_coverage = (255 - browser[offset]) as f32 / 255.0_f32;
+                let values = [
+                    (-0.5_f32).mul_add(coverage, 1.0),
+                    0.5 * coverage + (1.0 - coverage),
+                    (1.0 - coverage).mul_add(1.0, 0.5 * coverage),
+                    0.5 * coverage + browser[offset] as f32 * (1.0_f32 / 255.0),
+                    (-0.5_f32).mul_add(divided_coverage, 1.0),
+                    0.5 * divided_coverage + (1.0 - divided_coverage),
+                    (1.0 - divided_coverage).mul_add(1.0, 0.5 * divided_coverage),
+                    0.5 * divided_coverage + browser[offset] as f32 / 255.0_f32,
+                ];
+                for (index, value) in values.into_iter().enumerate() {
+                    arithmetic_gaps[index * 2] +=
+                        usize::from((value * 255.0).round_ties_even() as u8 != browser[offset + 1]);
+                    arithmetic_gaps[index * 2 + 1] +=
+                        usize::from((value * 255.0).round() as u8 != browser[offset + 1]);
+                }
             }
-            let coverage = (255-browser[offset]) as f32 * (1.0_f32/255.0);
-            let divided_coverage = (255-browser[offset]) as f32 / 255.0_f32;
-            let values = [(-0.5_f32).mul_add(coverage,1.0),
-                0.5*coverage+(1.0-coverage),
-                (1.0-coverage).mul_add(1.0,0.5*coverage),
-                0.5*coverage+browser[offset] as f32*(1.0_f32/255.0),
-                (-0.5_f32).mul_add(divided_coverage,1.0),
-                0.5*divided_coverage+(1.0-divided_coverage),
-                (1.0-divided_coverage).mul_add(1.0,0.5*divided_coverage),
-                0.5*divided_coverage+browser[offset] as f32/255.0_f32];
-            for (index,value) in values.into_iter().enumerate() {
-                arithmetic_gaps[index*2] += usize::from((value*255.0).round_ties_even() as u8 != browser[offset+1]);
-                arithmetic_gaps[index*2+1] += usize::from((value*255.0).round() as u8 != browser[offset+1]);
-            }
-        } }
+        }
         eprintln!("FRACTIONAL_COLOR_ROUNDING floor_ceil_even={rounding_gaps:?}");
         eprintln!("FRACTIONAL_COLOR_ARITHMETIC post_pre_fma_dest_even_away={arithmetic_gaps:?}");
-        let style = w3cos_std::Style { font_size:16.0,
-            color:w3cos_std::Color::rgb(0,128,0),color_rgba:Some([0.0,0.5,0.0,1.0]),
-            custom_properties:Some(std::collections::HashMap::from([(
-                "--w3cos-internal-html-standard-font".into(),"1".into(),
-            )])), ..Default::default() };
+        let style = w3cos_std::Style {
+            font_size: 16.0,
+            color: w3cos_std::Color::rgb(0, 128, 0),
+            color_rgba: Some([0.0, 0.5, 0.0, 1.0]),
+            custom_properties: Some(std::collections::HashMap::from([(
+                "--w3cos-internal-html-standard-font".into(),
+                "1".into(),
+            )])),
+            ..Default::default()
+        };
         let face = super::generic_serif_typeface(&style).unwrap();
-        let baseline = super::text_baseline(54.0,16.0,&face,&style,"Filler Text");
+        let baseline = super::text_baseline(54.0, 16.0, &face, &style, "Filler Text");
         let mut current_gap = 0;
         let mut calibrated_mask_pre_gap = None;
-        for variant in ["current","standard","opacity","shader-current","shader-standard","filter-standard","filter-current","f16-current","f16-standard","f32-current","f32-standard","uniform-filter-standard","uniform-filter-current","f32-double-current","f32-double-standard","mask-pre","calibrated-mask-pre","a8-mask-pre","rgba-alpha-mask-pre","a8-mask-shader"] {
-            let mut paint = super::text_color_paint(&style,1.0);
+        for variant in [
+            "current",
+            "standard",
+            "opacity",
+            "shader-current",
+            "shader-standard",
+            "filter-standard",
+            "filter-current",
+            "f16-current",
+            "f16-standard",
+            "f32-current",
+            "f32-standard",
+            "uniform-filter-standard",
+            "uniform-filter-current",
+            "f32-double-current",
+            "f32-double-standard",
+            "mask-pre",
+            "calibrated-mask-pre",
+            "a8-mask-pre",
+            "rgba-alpha-mask-pre",
+            "a8-mask-shader",
+        ] {
+            let mut paint = super::text_color_paint(&style, 1.0);
             if variant == "mask-pre" {
-                paint = super::color_paint(w3cos_std::Color::BLACK,1.0);
+                paint = super::color_paint(w3cos_std::Color::BLACK, 1.0);
             }
-            if variant == "standard" { paint.set_blend_mode(skia_safe::BlendMode::SrcOver); }
-            if variant == "f16-standard" || variant == "f32-standard" { paint.set_blend_mode(skia_safe::BlendMode::SrcOver); }
-            if variant == "f32-double-standard" { paint.set_blend_mode(skia_safe::BlendMode::SrcOver); }
-            if variant == "opacity" { super::CSS_OPACITY_SRC_OVER.with(|blender|
-                paint.set_blender(blender.clone())); }
+            if variant == "standard" {
+                paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
+            }
+            if variant == "f16-standard" || variant == "f32-standard" {
+                paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
+            }
+            if variant == "f32-double-standard" {
+                paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
+            }
+            if variant == "opacity" {
+                super::CSS_OPACITY_SRC_OVER.with(|blender| paint.set_blender(blender.clone()));
+            }
             if variant.starts_with("shader-") {
                 let effect = skia_safe::RuntimeEffect::make_for_shader(
-                    "uniform float4 color; half4 main(float2 p) { return half4(color); }",None).unwrap();
-                let bytes = [0.0_f32,0.5,0.0,1.0].into_iter()
-                    .flat_map(f32::to_ne_bytes).collect::<Vec<_>>();
-                paint.set_shader(effect.make_shader(skia_safe::Data::new_copy(&bytes),&[],None));
-                if variant == "shader-standard" { paint.set_blend_mode(skia_safe::BlendMode::SrcOver); }
+                    "uniform float4 color; half4 main(float2 p) { return half4(color); }",
+                    None,
+                )
+                .unwrap();
+                let bytes = [0.0_f32, 0.5, 0.0, 1.0]
+                    .into_iter()
+                    .flat_map(f32::to_ne_bytes)
+                    .collect::<Vec<_>>();
+                paint.set_shader(effect.make_shader(skia_safe::Data::new_copy(&bytes), &[], None));
+                if variant == "shader-standard" {
+                    paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
+                }
             }
             if variant.starts_with("filter-") {
                 let effect = skia_safe::RuntimeEffect::make_for_color_filter(
-                    "half4 main(half4 color) { return color; }",None).unwrap();
-                paint.set_color_filter(effect.make_color_filter(skia_safe::Data::new_empty(),None).unwrap());
-                if variant == "filter-standard" { paint.set_blend_mode(skia_safe::BlendMode::SrcOver); }
+                    "half4 main(half4 color) { return color; }",
+                    None,
+                )
+                .unwrap();
+                paint.set_color_filter(
+                    effect
+                        .make_color_filter(skia_safe::Data::new_empty(), None)
+                        .unwrap(),
+                );
+                if variant == "filter-standard" {
+                    paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
+                }
             }
             if variant.starts_with("uniform-filter-") {
                 let effect = skia_safe::RuntimeEffect::make_for_color_filter(
-                    "uniform float gain; half4 main(half4 color) { return color * gain; }",None).unwrap();
-                paint.set_color_filter(effect.make_color_filter(
-                    skia_safe::Data::new_copy(&1.0_f32.to_ne_bytes()),None).unwrap());
-                if variant == "uniform-filter-standard" { paint.set_blend_mode(skia_safe::BlendMode::SrcOver); }
+                    "uniform float gain; half4 main(half4 color) { return color * gain; }",
+                    None,
+                )
+                .unwrap();
+                paint.set_color_filter(
+                    effect
+                        .make_color_filter(skia_safe::Data::new_copy(&1.0_f32.to_ne_bytes()), None)
+                        .unwrap(),
+                );
+                if variant == "uniform-filter-standard" {
+                    paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
+                }
             }
             let mut surface = if variant.starts_with("a8-mask-") {
-                let mask_info = skia_safe::ImageInfo::new((800,600),
-                    skia_safe::ColorType::Alpha8,skia_safe::AlphaType::Premul,None);
-                skia_safe::surfaces::raster(&mask_info,None,None).unwrap()
+                let mask_info = skia_safe::ImageInfo::new(
+                    (800, 600),
+                    skia_safe::ColorType::Alpha8,
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                skia_safe::surfaces::raster(&mask_info, None, None).unwrap()
             } else if variant.starts_with("f16-") || variant.starts_with("f32-") {
-                let float_info = skia_safe::ImageInfo::new((800,600),
-                    if variant.starts_with("f32-") { skia_safe::ColorType::RGBAF32 }
-                    else { skia_safe::ColorType::RGBAF16 },skia_safe::AlphaType::Premul,None);
-                skia_safe::surfaces::raster(&float_info,None,None).unwrap()
+                let float_info = skia_safe::ImageInfo::new(
+                    (800, 600),
+                    if variant.starts_with("f32-") {
+                        skia_safe::ColorType::RGBAF32
+                    } else {
+                        skia_safe::ColorType::RGBAF16
+                    },
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                skia_safe::surfaces::raster(&float_info, None, None).unwrap()
             } else {
-                skia_safe::Surface::new_raster_n32_premul((800,600)).unwrap()
+                skia_safe::Surface::new_raster_n32_premul((800, 600)).unwrap()
             };
-            surface.canvas().clear(if variant.starts_with("a8-mask-") || variant == "rgba-alpha-mask-pre" {
-                skia_safe::Color::TRANSPARENT
-            } else { skia_safe::Color::WHITE });
-            super::draw_font_stack_runs(surface.canvas(),8.0,baseline,"Filler Text",16.0,
-                &face,&style,&paint);
+            surface.canvas().clear(
+                if variant.starts_with("a8-mask-") || variant == "rgba-alpha-mask-pre" {
+                    skia_safe::Color::TRANSPARENT
+                } else {
+                    skia_safe::Color::WHITE
+                },
+            );
+            super::draw_font_stack_runs(
+                surface.canvas(),
+                8.0,
+                baseline,
+                "Filler Text",
+                16.0,
+                &face,
+                &style,
+                &paint,
+            );
             if variant == "a8-mask-shader" {
                 let image = surface.image_snapshot();
-                let mask_shader = image.to_shader((skia_safe::TileMode::Clamp,skia_safe::TileMode::Clamp),
-                    skia_safe::SamplingOptions::default(),None).unwrap();
+                let mask_shader = image
+                    .to_shader(
+                        (skia_safe::TileMode::Clamp, skia_safe::TileMode::Clamp),
+                        skia_safe::SamplingOptions::default(),
+                        None,
+                    )
+                    .unwrap();
                 let effect = skia_safe::RuntimeEffect::make_for_shader(
                     "uniform shader mask; uniform float4 color; uniform float divisor; half4 main(float2 p) { float coverage = floor(mask.eval(p).a * 255 + .5) / divisor; return half4(color.rgb * color.a * coverage, color.a * coverage); }",None).unwrap();
-                let bytes = [0.0_f32,0.5,0.0,1.0,255.0].into_iter()
-                    .flat_map(f32::to_ne_bytes).collect::<Vec<_>>();
-                let shader = effect.make_shader(skia_safe::Data::new_copy(&bytes),
-                    &[mask_shader.into()],None).unwrap();
+                let bytes = [0.0_f32, 0.5, 0.0, 1.0, 255.0]
+                    .into_iter()
+                    .flat_map(f32::to_ne_bytes)
+                    .collect::<Vec<_>>();
+                let shader = effect
+                    .make_shader(
+                        skia_safe::Data::new_copy(&bytes),
+                        &[mask_shader.into()],
+                        None,
+                    )
+                    .unwrap();
                 let mut composite = Paint::default();
                 composite.set_shader(shader);
                 super::CSS_OPACITY_SRC_OVER.with(|blender| composite.set_blender(blender.clone()));
-                surface = skia_safe::Surface::new_raster_n32_premul((800,600)).unwrap();
+                surface = skia_safe::Surface::new_raster_n32_premul((800, 600)).unwrap();
                 surface.canvas().clear(skia_safe::Color::WHITE);
-                surface.canvas().draw_rect(skia_safe::Rect::from_xywh(0.0,0.0,800.0,600.0),&composite);
+                surface.canvas().draw_rect(
+                    skia_safe::Rect::from_xywh(0.0, 0.0, 800.0, 600.0),
+                    &composite,
+                );
             }
-            let mut actual = vec![0_u8;800*600*4];
-            assert!(surface.read_pixels(&info,&mut actual,800*4,(0,0)));
+            let mut actual = vec![0_u8; 800 * 600 * 4];
+            assert!(surface.read_pixels(&info, &mut actual, 800 * 4, (0, 0)));
             if variant.starts_with("f32-double-") {
                 // Diagnostic: preserve the float framebuffer until UNORM
                 // conversion, rather than multiplying by255 in float32 and
                 // creating a false exact tie before rounding to eight bits.
-                let float_info = skia_safe::ImageInfo::new((800,600),
-                    skia_safe::ColorType::RGBAF32,skia_safe::AlphaType::Premul,None);
-                let mut floats = vec![0_u8;800*600*16];
-                assert!(surface.read_pixels(&float_info,&mut floats,800*16,(0,0)));
+                let float_info = skia_safe::ImageInfo::new(
+                    (800, 600),
+                    skia_safe::ColorType::RGBAF32,
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                let mut floats = vec![0_u8; 800 * 600 * 16];
+                assert!(surface.read_pixels(&float_info, &mut floats, 800 * 16, (0, 0)));
                 for (channel, value) in actual.iter_mut().zip(floats.chunks_exact(4)) {
                     let value = f32::from_ne_bytes(value.try_into().unwrap());
-                    *channel = (f64::from(value).clamp(0.0,1.0)*255.0).round_ties_even() as u8;
+                    *channel = (f64::from(value).clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
                 }
             }
-            if variant == "mask-pre" || variant == "calibrated-mask-pre"
-                || variant == "a8-mask-pre" || variant == "rgba-alpha-mask-pre" {
+            if variant == "mask-pre"
+                || variant == "calibrated-mask-pre"
+                || variant == "a8-mask-pre"
+                || variant == "rgba-alpha-mask-pre"
+            {
                 // Independently render the same glyphs. The calibrated form
                 // retains the authored paint luminance for Skia's glyph-mask
                 // gamma selection, extracting coverage from its zero-red
@@ -5566,61 +6883,96 @@ mod tests {
                 // Pre-scale the source before SrcOver, then quantize without
                 // an intervening float32 multiply-by255 false-half rounding.
                 for pixel in actual.chunks_exact_mut(4) {
-                    let coverage_byte = if variant == "a8-mask-pre" || variant == "rgba-alpha-mask-pre" {
-                        pixel[3]
-                    } else { 255-pixel[0] };
+                    let coverage_byte =
+                        if variant == "a8-mask-pre" || variant == "rgba-alpha-mask-pre" {
+                            pixel[3]
+                        } else {
+                            255 - pixel[0]
+                        };
                     let coverage = f32::from(coverage_byte) / 255.0;
-                    for (channel, source) in pixel[..3].iter_mut().zip([0.0_f32,0.5,0.0]) {
+                    for (channel, source) in pixel[..3].iter_mut().zip([0.0_f32, 0.5, 0.0]) {
                         let scaled_source = source * coverage;
                         let destination = 1.0_f32 - coverage;
                         let result = scaled_source + destination;
-                        *channel = (f64::from(result)*255.0).round_ties_even() as u8;
+                        *channel = (f64::from(result) * 255.0).round_ties_even() as u8;
                     }
                     pixel[3] = 255;
                 }
             }
             let mut gap = 0;
-            let mut channel_gaps = [0_usize;4];
-            for y in 54..76 { for x in 0..800 {
-                let offset = (y*800+x)*4;
-                gap += usize::from(actual[offset..offset+4] != browser[offset..offset+4]);
-                for channel in 0..4 {
-                    channel_gaps[channel] += usize::from(actual[offset+channel] != browser[offset+channel]);
+            let mut channel_gaps = [0_usize; 4];
+            for y in 54..76 {
+                for x in 0..800 {
+                    let offset = (y * 800 + x) * 4;
+                    gap += usize::from(actual[offset..offset + 4] != browser[offset..offset + 4]);
+                    for channel in 0..4 {
+                        channel_gaps[channel] +=
+                            usize::from(actual[offset + channel] != browser[offset + channel]);
+                    }
                 }
-            } }
-            eprintln!("FRACTIONAL_COLOR_DIAGNOSTIC variant={variant} pixels={gap} channels={channel_gaps:?} font={} baseline={baseline} input={path}",face.family_name());
-            if variant == "current" { current_gap = gap; }
-            if variant == "calibrated-mask-pre" { calibrated_mask_pre_gap = Some(gap); }
+            }
+            eprintln!(
+                "FRACTIONAL_COLOR_DIAGNOSTIC variant={variant} pixels={gap} channels={channel_gaps:?} font={} baseline={baseline} input={path}",
+                face.family_name()
+            );
+            if variant == "current" {
+                current_gap = gap;
+            }
+            if variant == "calibrated-mask-pre" {
+                calibrated_mask_pre_gap = Some(gap);
+            }
         }
-        assert_eq!(calibrated_mask_pre_gap,Some(0),"independent color-calibrated coverage diagnostic");
-        assert_eq!(current_gap,0,"current fractional foreground must match frozen browser pixels");
+        assert_eq!(
+            calibrated_mask_pre_gap,
+            Some(0),
+            "independent color-calibrated coverage diagnostic"
+        );
+        assert_eq!(
+            current_gap, 0,
+            "current fractional foreground must match frozen browser pixels"
+        );
     }
 
     #[test]
     fn outside_text_marker_does_not_apply_line_leading_twice() {
-        for kind in ["string","decimal"] {
-            for line_height in [1.0,3.0] {
-                let style = Style { display:Display::Inline,position:w3cos_std::style::Position::Absolute,
-                    font_size:32.0,line_height,line_height_is_normal:false,
-                    custom_properties:Some(std::collections::HashMap::from([
-                        ("--w3cos-internal-html-standard-font".into(),"1".into()),
-                        ("--w3cos-internal-outside-list-marker".into(),kind.into()),
-                    ])),..Style::default() };
-                assert_eq!(line_box_half_leading(&style),0.0,
-                    "{kind}/{line_height}: shared marker layout already supplies its content-box baseline");
+        for kind in ["string", "decimal"] {
+            for line_height in [1.0, 3.0] {
+                let style = Style {
+                    display: Display::Inline,
+                    position: w3cos_std::style::Position::Absolute,
+                    font_size: 32.0,
+                    line_height,
+                    line_height_is_normal: false,
+                    custom_properties: Some(std::collections::HashMap::from([
+                        ("--w3cos-internal-html-standard-font".into(), "1".into()),
+                        ("--w3cos-internal-outside-list-marker".into(), kind.into()),
+                    ])),
+                    ..Style::default()
+                };
+                assert_eq!(
+                    line_box_half_leading(&style),
+                    0.0,
+                    "{kind}/{line_height}: shared marker layout already supplies its content-box baseline"
+                );
             }
         }
     }
 
     #[test]
     fn fractional_foreground_paint_uses_unquantized_rgba() {
-        let mut style = w3cos_std::Style { color: w3cos_std::Color::rgb(0,128,0),
-            color_rgba: Some([0.0,0.5,0.0,1.0]), ..Default::default() };
-        assert_eq!(super::text_color_paint(&style,1.0).color4f().g,0.5);
-        assert_eq!(super::text_color_paint(&style,0.5).color4f().a,0.5);
-        style.color = w3cos_std::Color::rgb(255,0,0);
-        assert_eq!(super::text_color_paint(&style,1.0).color4f().g,0.0,
-            "stale precision must not override a different computed color");
+        let mut style = w3cos_std::Style {
+            color: w3cos_std::Color::rgb(0, 128, 0),
+            color_rgba: Some([0.0, 0.5, 0.0, 1.0]),
+            ..Default::default()
+        };
+        assert_eq!(super::text_color_paint(&style, 1.0).color4f().g, 0.5);
+        assert_eq!(super::text_color_paint(&style, 0.5).color4f().a, 0.5);
+        style.color = w3cos_std::Color::rgb(255, 0, 0);
+        assert_eq!(
+            super::text_color_paint(&style, 1.0).color4f().g,
+            0.0,
+            "stale precision must not override a different computed color"
+        );
     }
 
     use super::*;
@@ -5629,81 +6981,157 @@ mod tests {
 
     #[test]
     fn fractional_square_three_dimensional_border_matches_snapped_paint_box() {
-        for line_style in [w3cos_std::style::BorderLineStyle::Inset,w3cos_std::style::BorderLineStyle::Outset] {
-            let render=|width:f32| {
-                let mut surface=Surface::new_raster_n32_premul((80,220)).unwrap();
+        for line_style in [
+            w3cos_std::style::BorderLineStyle::Inset,
+            w3cos_std::style::BorderLineStyle::Outset,
+        ] {
+            let render = |width: f32| {
+                let mut surface = Surface::new_raster_n32_premul((80, 220)).unwrap();
                 surface.canvas().clear(Color::WHITE);
-                let style=Style {border_width:1.0,border_color:w3cos_std::Color::rgb(128,128,128),
-                    border_styles:[Some(line_style);4],..Style::default()};
-                draw_box_border(surface.canvas(),LayoutRect {x:8.0,y:8.0,width,height:200.0},&style);
-                let mut pixels=vec![0_u8;80*220*4];
-                let info=ImageInfo::new((80,220),ColorType::RGBA8888,AlphaType::Premul,None);
-                assert!(surface.read_pixels(&info,&mut pixels,80*4,(0,0)));
+                let style = Style {
+                    border_width: 1.0,
+                    border_color: w3cos_std::Color::rgb(128, 128, 128),
+                    border_styles: [Some(line_style); 4],
+                    ..Style::default()
+                };
+                draw_box_border(
+                    surface.canvas(),
+                    LayoutRect {
+                        x: 8.0,
+                        y: 8.0,
+                        width,
+                        height: 200.0,
+                    },
+                    &style,
+                );
+                let mut pixels = vec![0_u8; 80 * 220 * 4];
+                let info = ImageInfo::new((80, 220), ColorType::RGBA8888, AlphaType::Premul, None);
+                assert!(surface.read_pixels(&info, &mut pixels, 80 * 4, (0, 0)));
                 pixels
             };
-            let expected=render(55.0);
-            for width in [55.328125,55.359375] {
-                let actual=render(width);
-                assert_eq!(actual.chunks_exact(4).zip(expected.chunks_exact(4)).filter(|(a,b)|a!=b).count(),0,
-                    "{line_style:?} border paint endpoints must match the original browser command log");
+            let expected = render(55.0);
+            for width in [55.328125, 55.359375] {
+                let actual = render(width);
+                assert_eq!(
+                    actual
+                        .chunks_exact(4)
+                        .zip(expected.chunks_exact(4))
+                        .filter(|(a, b)| a != b)
+                        .count(),
+                    0,
+                    "{line_style:?} border paint endpoints must match the original browser command log"
+                );
             }
         }
     }
 
     #[test]
     fn relative_zero_outline_width_overrides_shorthand_medium() {
-        for width in ["0em","-0em","+0em","0ex","-0ex","+0ex"] {
-            let mut declaration=w3cos_dom::css_style::CSSStyleDeclaration::new();
-            declaration.set_property("outline","solid red");
-            declaration.set_property("outline-width",width);
-            assert_eq!(declaration.inner.outline_width,0.0,"{width} must override medium");
+        for width in ["0em", "-0em", "+0em", "0ex", "-0ex", "+0ex"] {
+            let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
+            declaration.set_property("outline", "solid red");
+            declaration.set_property("outline-width", width);
+            assert_eq!(
+                declaration.inner.outline_width, 0.0,
+                "{width} must override medium"
+            );
         }
     }
 
     #[test]
     fn opaque_four_color_solid_border_joins_diagonally_without_a_white_seam() {
-        let mut surface=Surface::new_raster_n32_premul((24,24)).unwrap();
+        let mut surface = Surface::new_raster_n32_premul((24, 24)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        let style=Style {border_width:5.0,
-            border_top_color:Some(w3cos_std::Color::rgb(255,165,0)),
-            border_right_color:Some(w3cos_std::Color::rgb(128,0,128)),
-            border_bottom_color:Some(w3cos_std::Color::rgb(0,128,128)),
-            border_left_color:Some(w3cos_std::Color::rgb(255,255,0)),..Style::default()};
-        draw_box_border(surface.canvas(),LayoutRect {x:2.0,y:2.0,width:20.0,height:20.0},&style);
-        let info=ImageInfo::new((24,24),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels=vec![0u8;24*24*4];
-        assert!(surface.read_pixels(&info,&mut pixels,24*4,(0,0)));
-        let pixel=|x:usize,y:usize| &pixels[(y*24+x)*4..(y*24+x+1)*4];
-        assert_eq!(pixel(3,2),[255,165,0,255],"top owns the corner above the miter");
-        assert_eq!(pixel(2,3),[255,255,0,255],"left owns the corner below the miter");
-        assert_eq!(pixel(2,2),[255,210,0,255],"AA join blends the two sides, not the white background");
-        assert_eq!(pixel(2,21),[128,192,64,255],
-            "Chromium141 rounds the 50% yellow/teal miter coverage to the nearest channel");
+        let style = Style {
+            border_width: 5.0,
+            border_top_color: Some(w3cos_std::Color::rgb(255, 165, 0)),
+            border_right_color: Some(w3cos_std::Color::rgb(128, 0, 128)),
+            border_bottom_color: Some(w3cos_std::Color::rgb(0, 128, 128)),
+            border_left_color: Some(w3cos_std::Color::rgb(255, 255, 0)),
+            ..Style::default()
+        };
+        draw_box_border(
+            surface.canvas(),
+            LayoutRect {
+                x: 2.0,
+                y: 2.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            &style,
+        );
+        let info = ImageInfo::new((24, 24), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0u8; 24 * 24 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 24 * 4, (0, 0)));
+        let pixel = |x: usize, y: usize| &pixels[(y * 24 + x) * 4..(y * 24 + x + 1) * 4];
+        assert_eq!(
+            pixel(3, 2),
+            [255, 165, 0, 255],
+            "top owns the corner above the miter"
+        );
+        assert_eq!(
+            pixel(2, 3),
+            [255, 255, 0, 255],
+            "left owns the corner below the miter"
+        );
+        assert_eq!(
+            pixel(2, 2),
+            [255, 210, 0, 255],
+            "AA join blends the two sides, not the white background"
+        );
+        assert_eq!(
+            pixel(2, 21),
+            [128, 192, 64, 255],
+            "Chromium141 rounds the 50% yellow/teal miter coverage to the nearest channel"
+        );
     }
 
     #[test]
     fn structural_table_columns_do_not_paint_outlines() {
-        for display in [Display::TableColumn,Display::TableColumnGroup] {
-            let mut surface=Surface::new_raster_n32_premul((40,30)).unwrap();
+        for display in [Display::TableColumn, Display::TableColumnGroup] {
+            let mut surface = Surface::new_raster_n32_premul((40, 30)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            let style=Style {display,outline_width:4.0,
-                outline_style:w3cos_std::style::OutlineStyle::Solid,
-                outline_color:w3cos_std::Color::rgb(128,0,128),..Style::default()};
-            draw_box_outline(surface.canvas(),LayoutRect {x:8.0,y:8.0,width:24.0,height:16.0},&style);
-            let info=ImageInfo::new((40,30),ColorType::RGBA8888,AlphaType::Premul,None);
-            let mut pixels=vec![0_u8;40*30*4];
-            assert!(surface.read_pixels(&info,&mut pixels,40*4,(0,0)));
-            assert!(pixels.chunks_exact(4).all(|pixel|pixel==[255,255,255,255]));
+            let style = Style {
+                display,
+                outline_width: 4.0,
+                outline_style: w3cos_std::style::OutlineStyle::Solid,
+                outline_color: w3cos_std::Color::rgb(128, 0, 128),
+                ..Style::default()
+            };
+            draw_box_outline(
+                surface.canvas(),
+                LayoutRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 24.0,
+                    height: 16.0,
+                },
+                &style,
+            );
+            let info = ImageInfo::new((40, 30), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 40 * 30 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 40 * 4, (0, 0)));
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .all(|pixel| pixel == [255, 255, 255, 255])
+            );
         }
     }
 
     #[test]
     fn outline_shorthand_reaches_runtime_style() {
-        let mut declaration=w3cos_dom::css_style::CSSStyleDeclaration::new();
-        declaration.set_property("outline","solid purple 4px");
-        assert_eq!(declaration.inner.outline_width,4.0);
-        assert_eq!(declaration.inner.outline_style,w3cos_std::style::OutlineStyle::Solid);
-        assert_eq!(declaration.inner.outline_color,w3cos_std::Color::rgb(128,0,128));
+        let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
+        declaration.set_property("outline", "solid purple 4px");
+        assert_eq!(declaration.inner.outline_width, 4.0);
+        assert_eq!(
+            declaration.inner.outline_style,
+            w3cos_std::style::OutlineStyle::Solid
+        );
+        assert_eq!(
+            declaration.inner.outline_color,
+            w3cos_std::Color::rgb(128, 0, 128)
+        );
     }
 
     #[test]
@@ -5712,259 +7140,517 @@ mod tests {
         let metrics = test_font();
         let mut surface = Surface::new_raster_n32_premul((40, 30)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        let style = Style { outline_width: 4.0,
+        let style = Style {
+            outline_width: 4.0,
             outline_style: w3cos_std::style::OutlineStyle::Solid,
-            outline_color: w3cos_std::Color::rgb(128,0,128), ..Style::default() };
-        render_node(surface.canvas(),0,LayoutRect { x:8.0,y:12.0,width:24.0,height:0.0 },
-            &ComponentKind::Box,&style,&face,&metrics,None,false,true);
-        let info = ImageInfo::new((40,30),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels=vec![0_u8;40*30*4];
-        assert!(surface.read_pixels(&info,&mut pixels,40*4,(0,0)));
-        let purple=pixels.chunks_exact(4).filter(|p|*p==[128,0,128,255]).count();
-        assert_eq!(purple,32*8,"empty border box retains outward outline ink");
+            outline_color: w3cos_std::Color::rgb(128, 0, 128),
+            ..Style::default()
+        };
+        render_node(
+            surface.canvas(),
+            0,
+            LayoutRect {
+                x: 8.0,
+                y: 12.0,
+                width: 24.0,
+                height: 0.0,
+            },
+            &ComponentKind::Box,
+            &style,
+            &face,
+            &metrics,
+            None,
+            false,
+            true,
+        );
+        let info = ImageInfo::new((40, 30), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 40 * 30 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 40 * 4, (0, 0)));
+        let purple = pixels
+            .chunks_exact(4)
+            .filter(|p| *p == [128, 0, 128, 255])
+            .count();
+        assert_eq!(
+            purple,
+            32 * 8,
+            "empty border box retains outward outline ink"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn multiline_normal_text_includes_each_lines_resolved_fallback_metrics() {
-        let style=Style {font_size:15.6,font_weight:700,font_family:Some("monospace".into()),
-            white_space:w3cos_std::style::WhiteSpace::Pre,
-            line_height:18.0/15.6,line_height_is_normal:true,..Style::default()};
-        let text="א + - × ÷ \u{a0}\n\u{a0} + - × ÷ ת";
-        assert_eq!(resolved_text_font_geometry("א + - × ÷ \u{a0}",&style).unwrap().line_spacing(),19.0);
-        assert_eq!(measure_skia_text_intrinsic_size(text,&style).1,38.0,
-            "Chromium141: two normal lines containing the fallback face occupy 38px");
-        assert_eq!(measure_skia_wrapped_text_height(text,200.0,&style),38.0);
-        let explicit=Style {line_height_is_normal:false,..style.clone()};
-        assert_eq!(measure_skia_text_intrinsic_size(text,&explicit).1,
+        let style = Style {
+            font_size: 15.6,
+            font_weight: 700,
+            font_family: Some("monospace".into()),
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            line_height: 18.0 / 15.6,
+            line_height_is_normal: true,
+            ..Style::default()
+        };
+        let text = "א + - × ÷ \u{a0}\n\u{a0} + - × ÷ ת";
+        assert_eq!(
+            resolved_text_font_geometry("א + - × ÷ \u{a0}", &style)
+                .unwrap()
+                .line_spacing(),
+            19.0
+        );
+        assert_eq!(
+            measure_skia_text_intrinsic_size(text, &style).1,
+            38.0,
+            "Chromium141: two normal lines containing the fallback face occupy 38px"
+        );
+        assert_eq!(measure_skia_wrapped_text_height(text, 200.0, &style), 38.0);
+        let explicit = Style {
+            line_height_is_normal: false,
+            ..style.clone()
+        };
+        assert_eq!(
+            measure_skia_text_intrinsic_size(text, &explicit).1,
             2.0 * crate::layout::inline_style_line_height(&explicit),
-            "explicit line-height must not expand to fallback metrics");
+            "explicit line-height must not expand to fallback metrics"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn trailing_bidi_control_keeps_a_fitting_complete_run_on_one_line() {
-        let style=Style { font_size:15.6,font_weight:700,font_family:Some("monospace".into()),
-            line_height:18.0/15.6,line_height_is_normal:true,..Style::default() };
-        let text="ת + - × ÷ \u{a0}\u{200f}";
-        let (width,height)=measure_skia_text_intrinsic_size(text,&style);
-        assert_eq!(measure_skia_wrapped_text_height(text,
-            text_layout::inline_layout_advance(width),&style),height,
-            "prefix shaping must not break a complete run that fits after its trailing control");
+        let style = Style {
+            font_size: 15.6,
+            font_weight: 700,
+            font_family: Some("monospace".into()),
+            line_height: 18.0 / 15.6,
+            line_height_is_normal: true,
+            ..Style::default()
+        };
+        let text = "ת + - × ÷ \u{a0}\u{200f}";
+        let (width, height) = measure_skia_text_intrinsic_size(text, &style);
+        assert_eq!(
+            measure_skia_wrapped_text_height(
+                text,
+                text_layout::inline_layout_advance(width),
+                &style
+            ),
+            height,
+            "prefix shaping must not break a complete run that fits after its trailing control"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn rtl_marked_fallback_line_preserves_one_resolved_segment_advance() {
-        let style = Style { font_size:15.6, font_weight:700,
-            font_family:Some("monospace".into()), ..Style::default() };
+        let style = Style {
+            font_size: 15.6,
+            font_weight: 700,
+            font_family: Some("monospace".into()),
+            ..Style::default()
+        };
         let mut visual = style.clone();
-        visual.custom_properties.get_or_insert_with(Default::default)
-            .insert("--w3cos-internal-bidi-visual-order".into(),"1".into());
-        let logical="\u{200f}\u{a0} + - × ÷ א";
-        let rendered=text_layout::font_render_text_for_style(logical,&style);
-        assert_eq!(rendered,"א ÷ × - +  ");
-        let natural=crate::layout::text_intrinsic_size(logical,&style).0;
+        visual
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-bidi-visual-order".into(), "1".into());
+        let logical = "\u{200f}\u{a0} + - × ÷ א";
+        let rendered = text_layout::font_render_text_for_style(logical, &style);
+        assert_eq!(rendered, "א ÷ × - +  ");
+        let natural = crate::layout::text_intrinsic_size(logical, &style).0;
         // Keep the authored NBSP until CSS white-space processing, just as
         // the override control does; rendered ordinary spaces would collapse.
-        let override_width=crate::layout::text_intrinsic_size("א ÷ × - + \u{a0}",&visual).0;
-        assert_eq!(natural,override_width,
-            "removing RLM must not invent a second bidi segment boundary");
+        let override_width = crate::layout::text_intrinsic_size("א ÷ × - + \u{a0}", &visual).0;
+        assert_eq!(
+            natural, override_width,
+            "removing RLM must not invent a second bidi segment boundary"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn mirrored_rtl_paragraph_matches_equivalent_ltr_glyph_pixels() {
-        let primary=host_typeface().unwrap();
-        let mut captures=Vec::new();
-        for (text,direction) in [("(a b א) c d",w3cos_std::style::TextDirection::Ltr),
-            ("c d (א a b)",w3cos_std::style::TextDirection::Rtl)] {
-            let style=Style {font_size:16.0,direction,..Style::default()};
-            let mut surface=Surface::new_raster_n32_premul((160,40)).unwrap();
+        let primary = host_typeface().unwrap();
+        let mut captures = Vec::new();
+        for (text, direction) in [
+            ("(a b א) c d", w3cos_std::style::TextDirection::Ltr),
+            ("c d (א a b)", w3cos_std::style::TextDirection::Rtl),
+        ] {
+            let style = Style {
+                font_size: 16.0,
+                direction,
+                ..Style::default()
+            };
+            let mut surface = Surface::new_raster_n32_premul((160, 40)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            let advance=draw_text_glyph_line(surface.canvas(),8.0,8.0,text,16.0,
-                w3cos_std::Color::BLACK,1.0,&primary,&style);
-            let info=ImageInfo::new((160,40),ColorType::RGBA8888,AlphaType::Premul,None);
-            let mut pixels=vec![0;160*40*4];
-            assert!(surface.read_pixels(&info,&mut pixels,160*4,(0,0)));
-            captures.push((advance,pixels));
+            let advance = draw_text_glyph_line(
+                surface.canvas(),
+                8.0,
+                8.0,
+                text,
+                16.0,
+                w3cos_std::Color::BLACK,
+                1.0,
+                &primary,
+                &style,
+            );
+            let info = ImageInfo::new((160, 40), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0; 160 * 40 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 160 * 4, (0, 0)));
+            captures.push((advance, pixels));
         }
-        assert_eq!(captures[0].1.iter().zip(&captures[1].1).filter(|(a,b)|a!=b).count(),0,
+        assert_eq!(
+            captures[0]
+                .1
+                .iter()
+                .zip(&captures[1].1)
+                .filter(|(a, b)| a != b)
+                .count(),
+            0,
             "Chromium bidi-glyph-mirroring-002 renders both equivalent paragraphs identically; advances {:?}",
-            [captures[0].0,captures[1].0]);
+            [captures[0].0, captures[1].0]
+        );
     }
 
     #[test]
     fn fractional_normal_inline_origin_keeps_the_browser_bottom_border_row() {
-        let rect=floor_inline_decoration_origin(LayoutRect {
-            x:151.4375,y:83.40625,width:120.421875,height:41.1875});
-        let style=Style {border_width:3.0,border_color:w3cos_std::Color::rgb(255,165,0),
-            background:w3cos_std::Color::rgb(255,255,0),..Style::default()};
-        let mut surface=Surface::new_raster_n32_premul((300,140)).unwrap();
+        let rect = floor_inline_decoration_origin(LayoutRect {
+            x: 151.4375,
+            y: 83.40625,
+            width: 120.421875,
+            height: 41.1875,
+        });
+        let style = Style {
+            border_width: 3.0,
+            border_color: w3cos_std::Color::rgb(255, 165, 0),
+            background: w3cos_std::Color::rgb(255, 255, 0),
+            ..Style::default()
+        };
+        let mut surface = Surface::new_raster_n32_premul((300, 140)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        draw_rounded_rect(surface.canvas(),rect,[0.0;4],&color_paint(style.background,1.0));
-        draw_box_border(surface.canvas(),rect,&style);
-        let info=ImageInfo::new((300,140),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels=vec![0;300*140*4];
-        assert!(surface.read_pixels(&info,&mut pixels,300*4,(0,0)));
-        let pixel=|x:usize,y:usize|&pixels[(y*300+x)*4..(y*300+x)*4+4];
-        assert_eq!(pixel(160,121),[255,255,0,255],"Chromium bidi011: interior above bottom border");
-        assert_eq!(pixel(160,124),[255,165,0,255],"Chromium bidi011: last bottom border row");
+        draw_rounded_rect(
+            surface.canvas(),
+            rect,
+            [0.0; 4],
+            &color_paint(style.background, 1.0),
+        );
+        draw_box_border(surface.canvas(), rect, &style);
+        let info = ImageInfo::new((300, 140), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0; 300 * 140 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 300 * 4, (0, 0)));
+        let pixel = |x: usize, y: usize| &pixels[(y * 300 + x) * 4..(y * 300 + x) * 4 + 4];
+        assert_eq!(
+            pixel(160, 121),
+            [255, 255, 0, 255],
+            "Chromium bidi011: interior above bottom border"
+        );
+        assert_eq!(
+            pixel(160, 124),
+            [255, 165, 0, 255],
+            "Chromium bidi011: last bottom border row"
+        );
     }
 
     #[test]
     fn inline_border_half_pixel_uses_layout_advance_before_snapping() {
-        let style=Style {display:Display::Inline,border_width:3.0,
-            border_right_width:Some(1.0),border_color:w3cos_std::Color::BLACK,
-            border_styles:[Some(w3cos_std::style::BorderLineStyle::Solid);4],
-            ..Style::default()};
-        let fragment=text_layout::inline_fragment_background_box(
-            LayoutRect {x:11.0,y:16.0,width:784.0,height:22.0},
-            301.49997,&style,true,true);
-        let mut surface=Surface::new_raster_n32_premul((330,50)).unwrap();
+        let style = Style {
+            display: Display::Inline,
+            border_width: 3.0,
+            border_right_width: Some(1.0),
+            border_color: w3cos_std::Color::BLACK,
+            border_styles: [Some(w3cos_std::style::BorderLineStyle::Solid); 4],
+            ..Style::default()
+        };
+        let fragment = text_layout::inline_fragment_background_box(
+            LayoutRect {
+                x: 11.0,
+                y: 16.0,
+                width: 784.0,
+                height: 22.0,
+            },
+            301.49997,
+            &style,
+            true,
+            true,
+        );
+        let mut surface = Surface::new_raster_n32_premul((330, 50)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        draw_box_border(surface.canvas(),fragment,&style);
-        let info=ImageInfo::new((330,50),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels=vec![0;330*50*4];
-        assert!(surface.read_pixels(&info,&mut pixels,330*4,(0,0)));
-        let pixel=|x:usize,y:usize|&pixels[(y*330+x)*4..(y*330+x)*4+4];
-        assert_eq!(pixel(313,16),[0,0,0,255],"V4063 Chrome right-border column");
-        assert_eq!(pixel(312,16),[255,255,255,255],"interior is not the border");
+        draw_box_border(surface.canvas(), fragment, &style);
+        let info = ImageInfo::new((330, 50), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0; 330 * 50 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 330 * 4, (0, 0)));
+        let pixel = |x: usize, y: usize| &pixels[(y * 330 + x) * 4..(y * 330 + x) * 4 + 4];
+        assert_eq!(
+            pixel(313, 16),
+            [0, 0, 0, 255],
+            "V4063 Chrome right-border column"
+        );
+        assert_eq!(
+            pixel(312, 16),
+            [255, 255, 255, 255],
+            "interior is not the border"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn right_aligned_standard_text_keeps_browser_final_glyph_coverage() {
-        let face=host_typeface().unwrap();
-        let mut style=Style {display:Display::Block,text_align:TextAlign::Right,color:w3cos_std::Color::BLACK,
-            font_size:16.0,line_height:1.375,line_height_is_normal:true,..Style::default()};
-        style.custom_properties.get_or_insert_with(Default::default)
-            .insert(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),"1".into());
-        let mut surface=Surface::new_raster_n32_premul((800,100)).unwrap();
+        let face = host_typeface().unwrap();
+        let mut style = Style {
+            display: Display::Block,
+            text_align: TextAlign::Right,
+            color: w3cos_std::Color::BLACK,
+            font_size: 16.0,
+            line_height: 1.375,
+            line_height_is_normal: true,
+            ..Style::default()
+        };
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
+                "1".into(),
+            );
+        let mut surface = Surface::new_raster_n32_premul((800, 100)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        draw_text_in_rect(surface.canvas(),LayoutRect {x:8.0,y:54.0,width:784.0,height:22.0},
-            "PASS PASS",&style,&face,crate::layout::layout_font());
-        let info=ImageInfo::new((800,100),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels=vec![0;800*100*4];
-        assert!(surface.read_pixels(&info,&mut pixels,800*4,(0,0)));
-        assert_eq!(&pixels[(58*800+785)*4..(58*800+785)*4+4],&[241,241,241,255],
+        draw_text_in_rect(
+            surface.canvas(),
+            LayoutRect {
+                x: 8.0,
+                y: 54.0,
+                width: 784.0,
+                height: 22.0,
+            },
+            "PASS PASS",
+            &style,
+            &face,
+            crate::layout::layout_font(),
+        );
+        let info = ImageInfo::new((800, 100), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0; 800 * 100 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 800 * 4, (0, 0)));
+        assert_eq!(
+            &pixels[(58 * 800 + 785) * 4..(58 * 800 + 785) * 4 + 4],
+            &[241, 241, 241, 255],
             "Chromium unicode-bidi-applies-to009 final S; advance={}",
-            measure_skia_text_advance("PASS PASS",&face,&style));
+            measure_skia_text_advance("PASS PASS", &face, &style)
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn centered_standard_text_uses_browser_layout_width_and_glyph_phase() {
-        let face=host_typeface().unwrap();
-        let mut style=Style {display:Display::Block,text_align:TextAlign::Center,
-            color:w3cos_std::Color::WHITE,font_size:16.0,line_height:1.375,
-            line_height_is_normal:true,..Style::default()};
-        style.custom_properties.get_or_insert_with(Default::default)
-            .insert(w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),"1".into());
-        let rect=LayoutRect {x:208.0,y:120.0,width:60.0,height:22.0};
-        let advance=measure_skia_text_advance("Blue",&face,&style);
-        assert_eq!(aligned_text_x(rect,TextAlign::Center,0.0,advance),221.78125,
-            "V4071 Chrome text range uses32.4375px layout advance");
-        let mut surface=Surface::new_raster_n32_premul((320,160)).unwrap();
+        let face = host_typeface().unwrap();
+        let mut style = Style {
+            display: Display::Block,
+            text_align: TextAlign::Center,
+            color: w3cos_std::Color::WHITE,
+            font_size: 16.0,
+            line_height: 1.375,
+            line_height_is_normal: true,
+            ..Style::default()
+        };
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
+                "1".into(),
+            );
+        let rect = LayoutRect {
+            x: 208.0,
+            y: 120.0,
+            width: 60.0,
+            height: 22.0,
+        };
+        let advance = measure_skia_text_advance("Blue", &face, &style);
+        assert_eq!(
+            aligned_text_x(rect, TextAlign::Center, 0.0, advance),
+            221.78125,
+            "V4071 Chrome text range uses32.4375px layout advance"
+        );
+        let mut surface = Surface::new_raster_n32_premul((320, 160)).unwrap();
         surface.canvas().clear(Color::BLUE);
-        draw_text_in_rect(surface.canvas(),rect,"Blue",&style,&face,crate::layout::layout_font());
-        let info=ImageInfo::new((320,160),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels=vec![0;320*160*4];
-        assert!(surface.read_pixels(&info,&mut pixels,320*4,(0,0)));
-        assert_eq!(&pixels[(128*320+237)*4..(128*320+237)*4+4],&[217,217,255,255],
-            "V4066 original Blue glyph coverage");
+        draw_text_in_rect(
+            surface.canvas(),
+            rect,
+            "Blue",
+            &style,
+            &face,
+            crate::layout::layout_font(),
+        );
+        let info = ImageInfo::new((320, 160), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0; 320 * 160 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 320 * 4, (0, 0)));
+        assert_eq!(
+            &pixels[(128 * 320 + 237) * 4..(128 * 320 + 237) * 4 + 4],
+            &[217, 217, 255, 255],
+            "V4066 original Blue glyph coverage"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn hebrew_fallback_keeps_browser_following_run_origin() {
-        let primary = FontMgr::default().match_family_style("PingFang SC", FontStyle::normal()).unwrap();
-        let style = Style { font_size: 16.0, font_weight: 400, ..Style::default() };
+        let primary = FontMgr::default()
+            .match_family_style("PingFang SC", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            font_size: 16.0,
+            font_weight: 400,
+            ..Style::default()
+        };
         let prefix = "There should be a perfect 6×6 grid of squares below. (Force bidi: א";
         let cursor = font_stack_advance(prefix, &primary, &style);
-        assert_eq!(text_layout::inline_layout_advance(cursor), 503.125,
-            "Chromium141 v2028: following parenthesis starts at 511.125 from body origin 8px");
+        assert_eq!(
+            text_layout::inline_layout_advance(cursor),
+            503.125,
+            "Chromium141 v2028: following parenthesis starts at 511.125 from body origin 8px"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn browser_times_bold_normal_metrics_keep_the_same_16px_line_height() {
         for weight in [400, 700] {
-            let primary = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
+            let primary = FontMgr::default()
+                .match_family_style("Times", FontStyle::normal())
+                .unwrap();
             let face = typeface_for_character(&primary, 'x', weight);
             let metrics = typeface_font_geometry(&face, 16.0);
-            assert_eq!(metrics.line_spacing(), 18.0,
-                "Chromium141 v1996: Times regular/bold share the 18px normal line");
-            let style = Style { font_size: 16.0, font_weight: weight,
-                font_family: Some("serif".into()), line_height_is_normal: true,
-                ..Style::default() };
-            assert_eq!(resolved_text_font_geometry(". (Force bidi: א)", &style).unwrap().line_spacing(), 18.0,
-                "Chromium141 v1996: the Hebrew fallback preserves the 18px paragraph");
+            assert_eq!(
+                metrics.line_spacing(),
+                18.0,
+                "Chromium141 v1996: Times regular/bold share the 18px normal line"
+            );
+            let style = Style {
+                font_size: 16.0,
+                font_weight: weight,
+                font_family: Some("serif".into()),
+                line_height_is_normal: true,
+                ..Style::default()
+            };
+            assert_eq!(
+                resolved_text_font_geometry(". (Force bidi: א)", &style)
+                    .unwrap()
+                    .line_spacing(),
+                18.0,
+                "Chromium141 v1996: the Hebrew fallback preserves the 18px paragraph"
+            );
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn punctuation_fallback_faces_and_advances_match_browser() {
-        let primary = FontMgr::default().match_family_style("PingFang SC", FontStyle::normal()).unwrap();
-        let style = Style { font_size: 36.0, font_weight: 400,
-            font_family: Some("PingFang SC".into()), ..Style::default() };
-        for (character, family, width) in [('\u{060d}', "Geeza Pro", 16.09375),
-            ('\u{061f}', "Geeza Pro", 12.625), ('\u{0708}', "Noto Sans Syriac", 13.546875),
-            ('\u{0709}', "Noto Sans Syriac", 13.546875), ('\u{070a}', "Noto Sans Syriac", 20.859375),
+        let primary = FontMgr::default()
+            .match_family_style("PingFang SC", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            font_size: 36.0,
+            font_weight: 400,
+            font_family: Some("PingFang SC".into()),
+            ..Style::default()
+        };
+        for (character, family, width) in [
+            ('\u{060d}', "Geeza Pro", 16.09375),
+            ('\u{061f}', "Geeza Pro", 12.625),
+            ('\u{0708}', "Noto Sans Syriac", 13.546875),
+            ('\u{0709}', "Noto Sans Syriac", 13.546875),
+            ('\u{070a}', "Noto Sans Syriac", 20.859375),
             ('\u{10a51}', "Noto Sans Kharoshthi", 13.046875),
             ('\u{10a52}', "Noto Sans Kharoshthi", 22.046875),
             ('\u{10a53}', "Noto Sans Kharoshthi", 28.921875),
             ('\u{10a54}', "Noto Sans Kharoshthi", 24.8125),
             ('\u{10a57}', "Noto Sans Kharoshthi", 17.078125),
-            ('\u{10a58}', "Noto Sans Kharoshthi", 36.375)] {
+            ('\u{10a58}', "Noto Sans Kharoshthi", 36.375),
+        ] {
             let face = typeface_for_character(&primary, character, 400);
             let raw = font_stack_advance(&character.to_string(), &primary, &style);
-            eprintln!("{character:?}: family={}, raw={raw}, layout={}", face.family_name(),
-                text_layout::inline_layout_advance(raw));
+            eprintln!(
+                "{character:?}: family={}, raw={raw}, layout={}",
+                face.family_name(),
+                text_layout::inline_layout_advance(raw)
+            );
             assert_eq!(face.family_name(), family, "Chrome155 V3784, {character:?}");
-            assert_eq!(text_layout::inline_layout_advance(raw), width, "Chrome155 V3784, {character:?}");
+            assert_eq!(
+                text_layout::inline_layout_advance(raw),
+                width,
+                "Chrome155 V3784, {character:?}"
+            );
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn font_fallback_retains_single_glyph_canonical_coverage() {
-        let primary = FontMgr::default().match_family_style("PingFang SC", FontStyle::normal()).unwrap();
-        let style = Style { font_size: 36.0, font_weight: 400,
-            font_family: Some("PingFang SC".into()), ..Style::default() };
-        for (character, counterpart, advance) in [('\u{0387}', '\u{00b7}', 18.0),
-            ('\u{232a}', '\u{3009}', 36.0)] {
-            assert_eq!(primary.unichar_to_glyph(character as i32), 0,
-                "the regression requires absent nominal cmap coverage");
-            let run = crate::skia_text_run::shape_visual_run(&character.to_string(), &primary, &style).unwrap();
+        let primary = FontMgr::default()
+            .match_family_style("PingFang SC", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            font_size: 36.0,
+            font_weight: 400,
+            font_family: Some("PingFang SC".into()),
+            ..Style::default()
+        };
+        for (character, counterpart, advance) in [
+            ('\u{0387}', '\u{00b7}', 18.0),
+            ('\u{232a}', '\u{3009}', 36.0),
+        ] {
+            assert_eq!(
+                primary.unichar_to_glyph(character as i32),
+                0,
+                "the regression requires absent nominal cmap coverage"
+            );
+            let run =
+                crate::skia_text_run::shape_visual_run(&character.to_string(), &primary, &style)
+                    .unwrap();
             assert_eq!(run.glyphs.len(), 1);
             assert_eq!(run.glyphs[0], primary.unichar_to_glyph(counterpart as i32));
             assert_ne!(run.glyphs[0], primary.unichar_to_glyph(' ' as i32));
             assert_eq!(run.advance, advance, "Chrome155 V3775, {character:?}");
             let actual = typeface_for_character(&primary, character, 400);
-            assert_eq!(actual.unique_id(), primary.unique_id(),
-                "{character:?}: existing shaped glyph coverage must precede fallback to {}", actual.family_name());
-            assert_eq!(font_stack_advance(&character.to_string(), &primary, &style), advance);
+            assert_eq!(
+                actual.unique_id(),
+                primary.unique_id(),
+                "{character:?}: existing shaped glyph coverage must precede fallback to {}",
+                actual.family_name()
+            );
+            assert_eq!(
+                font_stack_advance(&character.to_string(), &primary, &style),
+                advance
+            );
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn font_fallback_retains_primary_canonical_decomposition() {
-        let primary = FontMgr::default().match_family_style("PingFang SC", FontStyle::normal()).unwrap();
-        let style = Style { font_size: 16.0, font_weight: 400,
-            font_family: Some("PingFang SC".into()), ..Style::default() };
-        for character in ['Ć','Ĉ','Č','Ď'] {
-            assert_eq!(primary.unichar_to_glyph(character as i32), 0,
-                "fixture requires a character absent from the nominal cmap");
+        let primary = FontMgr::default()
+            .match_family_style("PingFang SC", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            font_size: 16.0,
+            font_weight: 400,
+            font_family: Some("PingFang SC".into()),
+            ..Style::default()
+        };
+        for character in ['Ć', 'Ĉ', 'Č', 'Ď'] {
+            assert_eq!(
+                primary.unichar_to_glyph(character as i32),
+                0,
+                "fixture requires a character absent from the nominal cmap"
+            );
             let text = character.to_string();
             let run = crate::skia_text_run::shape_visual_run(&text, &primary, &style).unwrap();
-            assert!(run.glyphs.len()>1 && run.glyphs.iter().all(|glyph| *glyph!=0),
-                "primary must cover the canonical base/mark cluster for {character}");
+            assert!(
+                run.glyphs.len() > 1 && run.glyphs.iter().all(|glyph| *glyph != 0),
+                "primary must cover the canonical base/mark cluster for {character}"
+            );
             let actual = typeface_for_character(&primary, character, 400);
-            assert_eq!(actual.unique_id(), primary.unique_id(),
-                "{character}: successful shaping must precede system fallback");
+            assert_eq!(
+                actual.unique_id(),
+                primary.unique_id(),
+                "{character}: successful shaping must precede system fallback"
+            );
         }
     }
 
@@ -5973,27 +7659,66 @@ mod tests {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         for enabled in [true, false] {
             let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::from_style(
-                w3cos_dom::user_agent::html_default_style("textarea"));
-            if !enabled { declaration.set_property("resize", "none"); }
+                w3cos_dom::user_agent::html_default_style("textarea"),
+            );
+            if !enabled {
+                declaration.set_property("resize", "none");
+            }
             let mut style = declaration.to_style();
-            style.custom_properties.get_or_insert_with(Default::default)
-                .insert(w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY.into(), "textarea".into());
-            let kind = ComponentKind::TextInput { value: String::new(), placeholder: String::new(), secure: false };
-            let mut surface = Surface::new_raster_n32_premul((500,160)).unwrap();
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY.into(),
+                    "textarea".into(),
+                );
+            let kind = ComponentKind::TextInput {
+                value: String::new(),
+                placeholder: String::new(),
+                secure: false,
+            };
+            let mut surface = Surface::new_raster_n32_premul((500, 160)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            render_node(surface.canvas(),0,LayoutRect { x:9.0,y:9.0,width:480.0,height:133.328125 },
-                &kind,&style,&typeface,&test_font(),None,false,false);
-            let info = ImageInfo::new((500,160),ColorType::RGBA8888,AlphaType::Premul,None);
-            let mut pixels = vec![0;500*160*4];
-            assert!(surface.read_pixels(&info,&mut pixels,500*4,(0,0)));
-            let coverage = (131..140).flat_map(|y| (479..487).map(move |x| (x,y)))
-                .filter_map(|(x,y)| { let gray = pixels[(y*500+x)*4];
-                    (gray != 255).then_some((x,y,gray)) }).collect::<Vec<_>>();
-            for (x,y,gray) in [(485,131,217),(485,132,125),(485,133,240),(479,138,102)] {
+            render_node(
+                surface.canvas(),
+                0,
+                LayoutRect {
+                    x: 9.0,
+                    y: 9.0,
+                    width: 480.0,
+                    height: 133.328125,
+                },
+                &kind,
+                &style,
+                &typeface,
+                &test_font(),
+                None,
+                false,
+                false,
+            );
+            let info = ImageInfo::new((500, 160), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0; 500 * 160 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 500 * 4, (0, 0)));
+            let coverage = (131..140)
+                .flat_map(|y| (479..487).map(move |x| (x, y)))
+                .filter_map(|(x, y)| {
+                    let gray = pixels[(y * 500 + x) * 4];
+                    (gray != 255).then_some((x, y, gray))
+                })
+                .collect::<Vec<_>>();
+            for (x, y, gray) in [
+                (485, 131, 217),
+                (485, 132, 125),
+                (485, 133, 240),
+                (479, 138, 102),
+            ] {
                 let expected = if enabled { gray } else { 255 };
-                let offset = (y*500+x)*4;
-                assert_eq!(&pixels[offset..offset+4],&[expected,expected,expected,255],
-                    "Chrome155 resize indicator: enabled={enabled}, x={x}, y={y}, coverage={coverage:?}");
+                let offset = (y * 500 + x) * 4;
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &[expected, expected, expected, 255],
+                    "Chrome155 resize indicator: enabled={enabled}, x={x}, y={y}, coverage={coverage:?}"
+                );
             }
         }
     }
@@ -6002,59 +7727,184 @@ mod tests {
     fn html_textarea_auto_theme_matches_browser_on_colored_background() {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let mut style = w3cos_dom::user_agent::html_default_style("textarea");
-        style.custom_properties.get_or_insert_with(Default::default)
-            .insert(w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY.into(), "textarea".into());
-        let kind = ComponentKind::TextInput { value: String::new(), placeholder: String::new(), secure: false };
-        let mut surface = Surface::new_raster_n32_premul((500,160)).unwrap();
-        surface.canvas().clear(to_skia_color(w3cos_std::Color::rgb(0,255,0),1.0));
-        render_node(surface.canvas(),0,LayoutRect { x:9.0,y:9.0,width:480.0,height:133.328125 },
-            &kind,&style,&typeface,&test_font(),None,false,false);
-        let info = ImageInfo::new((500,160),ColorType::RGBA8888,AlphaType::Premul,None);
-        let mut pixels = vec![0;500*160*4];
-        assert!(surface.read_pixels(&info,&mut pixels,500*4,(0,0)));
-        for (x,y,expected) in [(9,9,[21,231,21,255]),(10,9,[92,148,92,255]),(10,10,[106,199,106,255])] {
-            let offset = (y*500+x)*4;
-            let corner_samples = [(9,9),(10,9),(10,10)].map(|(sx,sy)| {
-                let offset = (sy*500+sx)*4;
-                [pixels[offset],pixels[offset+1],pixels[offset+2],pixels[offset+3]]
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY.into(),
+                "textarea".into(),
+            );
+        let kind = ComponentKind::TextInput {
+            value: String::new(),
+            placeholder: String::new(),
+            secure: false,
+        };
+        let mut surface = Surface::new_raster_n32_premul((500, 160)).unwrap();
+        surface
+            .canvas()
+            .clear(to_skia_color(w3cos_std::Color::rgb(0, 255, 0), 1.0));
+        render_node(
+            surface.canvas(),
+            0,
+            LayoutRect {
+                x: 9.0,
+                y: 9.0,
+                width: 480.0,
+                height: 133.328125,
+            },
+            &kind,
+            &style,
+            &typeface,
+            &test_font(),
+            None,
+            false,
+            false,
+        );
+        let info = ImageInfo::new((500, 160), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0; 500 * 160 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 500 * 4, (0, 0)));
+        for (x, y, expected) in [
+            (9, 9, [21, 231, 21, 255]),
+            (10, 9, [92, 148, 92, 255]),
+            (10, 10, [106, 199, 106, 255]),
+        ] {
+            let offset = (y * 500 + x) * 4;
+            let corner_samples = [(9, 9), (10, 9), (10, 10)].map(|(sx, sy)| {
+                let offset = (sy * 500 + sx) * 4;
+                [
+                    pixels[offset],
+                    pixels[offset + 1],
+                    pixels[offset + 2],
+                    pixels[offset + 3],
+                ]
             });
-            assert_eq!(&pixels[offset..offset+4],&expected,
-                "Chrome155 original textarea over lime: x={x}, y={y}, corners={corner_samples:?}");
+            assert_eq!(
+                &pixels[offset..offset + 4],
+                &expected,
+                "Chrome155 original textarea over lime: x={x}, y={y}, corners={corner_samples:?}"
+            );
         }
     }
 
     #[test]
     fn resize_peer_sampling_is_shared_only_inside_the_same_raster_effect() {
         use crate::paint_artifact::PaintNode;
-        for (peer, isolated, expected) in [(false,false,[20,232,20,255]),
-            (true,false,[21,231,21,255]),(true,true,[20,232,20,255])] {
+        for (peer, isolated, expected) in [
+            (false, false, [20, 232, 20, 255]),
+            (true, false, [21, 231, 21, 255]),
+            (true, true, [20, 232, 20, 255]),
+        ] {
             let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::from_style(
-                w3cos_dom::user_agent::html_default_style("textarea"));
-            declaration.set_property("resize","none");
+                w3cos_dom::user_agent::html_default_style("textarea"),
+            );
+            declaration.set_property("resize", "none");
             let mut textarea = declaration.to_style();
-            textarea.custom_properties.get_or_insert_with(Default::default)
-                .insert(w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY.into(),"textarea".into());
-            let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::from_style(Style::default());
-            declaration.set_property("overflow","auto");
-            declaration.set_property("resize",if peer {"both"} else {"none"});
-            if isolated {declaration.set_property("will-change","transform");}
-            let artifact = PaintArtifact::build([
-                PaintNode {kind:ComponentKind::Root,style:Style::default(),parent:None,sticky_counter_signal:None},
-                PaintNode {kind:ComponentKind::TextInput {value:String::new(),placeholder:String::new(),secure:false},
-                    style:textarea,parent:Some(0),sticky_counter_signal:None},
-                PaintNode {kind:ComponentKind::Box,style:declaration.to_style(),parent:Some(0),sticky_counter_signal:None},
-            ],&[(LayoutRect{x:0.0,y:0.0,width:500.0,height:260.0},0),
-                (LayoutRect{x:9.0,y:9.0,width:480.0,height:133.328125},1),
-                (LayoutRect{x:9.0,y:200.0,width:80.0,height:60.0},2)],1);
-            let nodes=artifact.nodes.iter().enumerate().map(|(i,node)|
-                (i,artifact.rect_by_index[i].unwrap(),&node.kind,&node.style)).collect::<Vec<_>>();
-            let mut rasterizer=SkiaRasterizer::new(TEST_FONT).unwrap();
+            textarea
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY.into(),
+                    "textarea".into(),
+                );
+            let mut declaration =
+                w3cos_dom::css_style::CSSStyleDeclaration::from_style(Style::default());
+            declaration.set_property("overflow", "auto");
+            declaration.set_property("resize", if peer { "both" } else { "none" });
+            if isolated {
+                declaration.set_property("will-change", "transform");
+            }
+            let artifact = PaintArtifact::build(
+                [
+                    PaintNode {
+                        kind: ComponentKind::Root,
+                        style: Style::default(),
+                        parent: None,
+                        sticky_counter_signal: None,
+                    },
+                    PaintNode {
+                        kind: ComponentKind::TextInput {
+                            value: String::new(),
+                            placeholder: String::new(),
+                            secure: false,
+                        },
+                        style: textarea,
+                        parent: Some(0),
+                        sticky_counter_signal: None,
+                    },
+                    PaintNode {
+                        kind: ComponentKind::Box,
+                        style: declaration.to_style(),
+                        parent: Some(0),
+                        sticky_counter_signal: None,
+                    },
+                ],
+                &[
+                    (
+                        LayoutRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 500.0,
+                            height: 260.0,
+                        },
+                        0,
+                    ),
+                    (
+                        LayoutRect {
+                            x: 9.0,
+                            y: 9.0,
+                            width: 480.0,
+                            height: 133.328125,
+                        },
+                        1,
+                    ),
+                    (
+                        LayoutRect {
+                            x: 9.0,
+                            y: 200.0,
+                            width: 80.0,
+                            height: 60.0,
+                        },
+                        2,
+                    ),
+                ],
+                1,
+            );
+            let nodes = artifact
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, node)| {
+                    (
+                        i,
+                        artifact.rect_by_index[i].unwrap(),
+                        &node.kind,
+                        &node.style,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
             for _ in 0..2 {
-                let pixels=rasterizer.render_frame(500,260,&nodes,&test_font(),&[],&HashMap::new(),None,
-                    w3cos_std::Color::rgb(0,255,0),Some(&artifact),None,1.0).unwrap();
-                let offset=(9*500+9)*4;
-                assert_eq!(&pixels[offset..offset+4],&expected,
-                    "Chrome155 peer={peer}, isolated={isolated}, retained paint group");
+                let pixels = rasterizer
+                    .render_frame(
+                        500,
+                        260,
+                        &nodes,
+                        &test_font(),
+                        &[],
+                        &HashMap::new(),
+                        None,
+                        w3cos_std::Color::rgb(0, 255, 0),
+                        Some(&artifact),
+                        None,
+                        1.0,
+                    )
+                    .unwrap();
+                let offset = (9 * 500 + 9) * 4;
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &expected,
+                    "Chrome155 peer={peer}, isolated={isolated}, retained paint group"
+                );
             }
         }
     }
@@ -6064,25 +7914,68 @@ mod tests {
         // Browser141 actual/reference captures in v1862, not a tolerance.
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         for (part, kind, fill, grays) in [
-            ("textfield", ComponentKind::TextInput { value: String::new(), placeholder: String::new(), secure: false }, w3cos_std::Color::WHITE, [232,148,118]),
-            ("button", ComponentKind::Button { label: String::new() }, w3cos_std::Color::rgb(239,239,239), [232,147,118]),
+            (
+                "textfield",
+                ComponentKind::TextInput {
+                    value: String::new(),
+                    placeholder: String::new(),
+                    secure: false,
+                },
+                w3cos_std::Color::WHITE,
+                [232, 148, 118],
+            ),
+            (
+                "button",
+                ComponentKind::Button {
+                    label: String::new(),
+                },
+                w3cos_std::Color::rgb(239, 239, 239),
+                [232, 147, 118],
+            ),
         ] {
             for (x, width) in [(3.0, 30.0), (7.0, 37.0)] {
-                let mut style = Style { background: fill, border_width: 2.0,
-                    border_color: w3cos_std::Color::rgb(118,118,118), ..Style::default() };
-                style.custom_properties.get_or_insert_with(Default::default)
-                    .insert("--w3cos-internal-html-control-appearance".into(), part.into());
-                let mut surface = Surface::new_raster_n32_premul((60,30)).unwrap();
+                let mut style = Style {
+                    background: fill,
+                    border_width: 2.0,
+                    border_color: w3cos_std::Color::rgb(118, 118, 118),
+                    ..Style::default()
+                };
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-html-control-appearance".into(),
+                        part.into(),
+                    );
+                let mut surface = Surface::new_raster_n32_premul((60, 30)).unwrap();
                 surface.canvas().clear(Color::WHITE);
-                render_node(surface.canvas(), 0, LayoutRect { x, y: 3.0, width, height: 21.0 },
-                    &kind, &style, &typeface, &test_font(), None, false, false);
-                let info = ImageInfo::new((60,30), ColorType::RGBA8888, AlphaType::Premul, None);
-                let mut pixels = vec![0_u8; 60*30*4];
-                assert!(surface.read_pixels(&info, &mut pixels, 60*4, (0,0)));
+                render_node(
+                    surface.canvas(),
+                    0,
+                    LayoutRect {
+                        x,
+                        y: 3.0,
+                        width,
+                        height: 21.0,
+                    },
+                    &kind,
+                    &style,
+                    &typeface,
+                    &test_font(),
+                    None,
+                    false,
+                    false,
+                );
+                let info = ImageInfo::new((60, 30), ColorType::RGBA8888, AlphaType::Premul, None);
+                let mut pixels = vec![0_u8; 60 * 30 * 4];
+                assert!(surface.read_pixels(&info, &mut pixels, 60 * 4, (0, 0)));
                 for (dx, gray) in grays.into_iter().enumerate() {
-                    let offset = (3*60+x as usize+dx)*4;
-                    assert_eq!(&pixels[offset..offset+4], &[gray,gray,gray,255],
-                        "{part}: x={x}, width={width}, corner column={dx}");
+                    let offset = (3 * 60 + x as usize + dx) * 4;
+                    assert_eq!(
+                        &pixels[offset..offset + 4],
+                        &[gray, gray, gray, 255],
+                        "{part}: x={x}, width={width}, corner column={dx}"
+                    );
                 }
             }
         }
@@ -6092,12 +7985,28 @@ mod tests {
     fn html_button_centers_font_line_not_label_ink() {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let metrics = test_font();
-        let mut style = Style { font_size: 16.0, line_height: 1.5, color: w3cos_std::Color::BLACK,
-            font_family: Some("Inter".into()), padding: w3cos_std::style::Edges::all(2.0),
-            border_width: 2.0, ..Style::default() };
-        style.custom_properties.get_or_insert_with(Default::default)
-            .insert("--w3cos-internal-html-control-appearance".into(), "button".into());
-        let rect = LayoutRect { x: 3.0, y: 3.0, width: 100.0, height: 42.0 };
+        let mut style = Style {
+            font_size: 16.0,
+            line_height: 1.5,
+            color: w3cos_std::Color::BLACK,
+            font_family: Some("Inter".into()),
+            padding: w3cos_std::style::Edges::all(2.0),
+            border_width: 2.0,
+            ..Style::default()
+        };
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-html-control-appearance".into(),
+                "button".into(),
+            );
+        let rect = LayoutRect {
+            x: 3.0,
+            y: 3.0,
+            width: 100.0,
+            height: 42.0,
+        };
         let content = text_paint_box(rect, &style);
         let font_height = resolved_font_geometry(&style).unwrap().height();
         for text in ["A", "gy", "Av"] {
@@ -6107,18 +8016,31 @@ mod tests {
             expected.canvas().clear(Color::WHITE);
             draw_centered_text(actual.canvas(), rect, text, &style, &typeface, &metrics);
             let advance = measure_skia_text_advance(text, &typeface, &style);
-            draw_text_line(expected.canvas(), content.x + (content.width - advance) * 0.5,
+            draw_text_line(
+                expected.canvas(),
+                content.x + (content.width - advance) * 0.5,
                 content.y + (content.height - font_height) * 0.5,
-                text, style.font_size, style.color, style.opacity, &typeface, &style);
+                text,
+                style.font_size,
+                style.color,
+                style.opacity,
+                &typeface,
+                &style,
+            );
             let info = ImageInfo::new((110, 50), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut a = vec![0_u8; 110 * 50 * 4];
             let mut b = a.clone();
             assert!(actual.read_pixels(&info, &mut a, 110 * 4, (0, 0)));
             assert!(expected.read_pixels(&info, &mut b, 110 * 4, (0, 0)));
-            assert!(a.chunks_exact(4).any(|pixel| pixel[..3] != [255, 255, 255]),
-                "{text}: a blank raster cannot prove label alignment");
-            assert_eq!(a.iter().zip(&b).filter(|(a,b)| a != b).count(), 0,
-                "{text}: label ink must not move the shared font baseline");
+            assert!(
+                a.chunks_exact(4).any(|pixel| pixel[..3] != [255, 255, 255]),
+                "{text}: a blank raster cannot prove label alignment"
+            );
+            assert_eq!(
+                a.iter().zip(&b).filter(|(a, b)| a != b).count(),
+                0,
+                "{text}: label ink must not move the shared font baseline"
+            );
         }
     }
 
@@ -6126,23 +8048,67 @@ mod tests {
     fn html_auto_control_theme_keeps_layout_border_but_paints_one_pixel() {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         for (part, kind, fill) in [
-            ("textfield", ComponentKind::TextInput { value: String::new(), placeholder: String::new(), secure: false }, w3cos_std::Color::WHITE),
-            ("button", ComponentKind::Button { label: String::new() }, w3cos_std::Color::rgb(239, 239, 239)),
+            (
+                "textfield",
+                ComponentKind::TextInput {
+                    value: String::new(),
+                    placeholder: String::new(),
+                    secure: false,
+                },
+                w3cos_std::Color::WHITE,
+            ),
+            (
+                "button",
+                ComponentKind::Button {
+                    label: String::new(),
+                },
+                w3cos_std::Color::rgb(239, 239, 239),
+            ),
         ] {
-            let mut style = Style { background: fill, border_width: 2.0,
-                border_color: w3cos_std::Color::rgb(118, 118, 118), ..Style::default() };
-            style.custom_properties.get_or_insert_with(Default::default)
-                .insert("--w3cos-internal-html-control-appearance".into(), part.into());
+            let mut style = Style {
+                background: fill,
+                border_width: 2.0,
+                border_color: w3cos_std::Color::rgb(118, 118, 118),
+                ..Style::default()
+            };
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-html-control-appearance".into(),
+                    part.into(),
+                );
             let mut surface = Surface::new_raster_n32_premul((40, 30)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            render_node(surface.canvas(), 0, LayoutRect { x: 3.0, y: 3.0, width: 30.0, height: 21.0 },
-                &kind, &style, &typeface, &test_font(), None, false, false);
+            render_node(
+                surface.canvas(),
+                0,
+                LayoutRect {
+                    x: 3.0,
+                    y: 3.0,
+                    width: 30.0,
+                    height: 21.0,
+                },
+                &kind,
+                &style,
+                &typeface,
+                &test_font(),
+                None,
+                false,
+                false,
+            );
             let info = ImageInfo::new((40, 30), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 40 * 30 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 40 * 4, (0, 0)));
-            assert_eq!(&pixels[(4 * 40 + 15) * 4..(4 * 40 + 15) * 4 + 4],
-                &[fill.r, fill.g, fill.b, 255], "{part}: second border row must be control fill");
-            assert_eq!(style.border_width, 2.0, "theme painting must not mutate layout");
+            assert_eq!(
+                &pixels[(4 * 40 + 15) * 4..(4 * 40 + 15) * 4 + 4],
+                &[fill.r, fill.g, fill.b, 255],
+                "{part}: second border row must be control fill"
+            );
+            assert_eq!(
+                style.border_width, 2.0,
+                "theme painting must not mutate layout"
+            );
         }
     }
 
@@ -6151,31 +8117,55 @@ mod tests {
         // V4016 browser c563 first circle, x29..36/y144..151. Native uses
         // the centerline x30/y145/6x6 with a1px stroke. Translate it to3/3.
         let expected = [
-            [255,255,204,137,137,204,255,255],
-            [255,137,29,115,115,29,137,255],
-            [204,29,233,255,255,233,29,204],
-            [137,115,255,255,255,255,115,137],
-            [137,115,255,255,255,255,115,137],
-            [204,29,233,255,255,233,29,204],
-            [255,137,29,115,115,29,137,255],
-            [255,255,204,137,137,204,255,255],
+            [255, 255, 204, 137, 137, 204, 255, 255],
+            [255, 137, 29, 115, 115, 29, 137, 255],
+            [204, 29, 233, 255, 255, 233, 29, 204],
+            [137, 115, 255, 255, 255, 255, 115, 137],
+            [137, 115, 255, 255, 255, 255, 115, 137],
+            [204, 29, 233, 255, 255, 233, 29, 204],
+            [255, 137, 29, 115, 115, 29, 137, 255],
+            [255, 255, 204, 137, 137, 204, 255, 255],
         ];
-        let mut surface = skia_safe::surfaces::raster_n32_premul((16,16)).unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((16, 16)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        let mut stroke = color_paint(w3cos_std::Color::rgb(0,0,128),1.0);
+        let mut stroke = color_paint(w3cos_std::Color::rgb(0, 0, 128), 1.0);
         stroke.set_style(paint::Style::Stroke).set_stroke_width(1.0);
-        draw_rounded_rect(surface.canvas(), LayoutRect {x:3.0,y:3.0,width:6.0,height:6.0},
-            [3.0;4], &stroke);
-        let info = skia_safe::ImageInfo::new((16,16),skia_safe::ColorType::RGBA8888,
-            skia_safe::AlphaType::Premul,None);
-        let mut pixels = [0u8;16*16*4];
-        assert!(surface.read_pixels(&info,&mut pixels,16*4,(0,0)));
-        for (y,row) in expected.iter().enumerate() {
-            for (x,&red) in row.iter().enumerate() {
-                let blue = match red {255=>255,204=>230,137=>196,29=>142,115=>185,233=>244,_=>unreachable!()};
-                let offset = ((y+2)*16+x+2)*4;
-                assert_eq!(&pixels[offset..offset+4], &[red,red,blue,255],
-                    "browser circle stroke pixel({x},{y})");
+        draw_rounded_rect(
+            surface.canvas(),
+            LayoutRect {
+                x: 3.0,
+                y: 3.0,
+                width: 6.0,
+                height: 6.0,
+            },
+            [3.0; 4],
+            &stroke,
+        );
+        let info = skia_safe::ImageInfo::new(
+            (16, 16),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut pixels = [0u8; 16 * 16 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 16 * 4, (0, 0)));
+        for (y, row) in expected.iter().enumerate() {
+            for (x, &red) in row.iter().enumerate() {
+                let blue = match red {
+                    255 => 255,
+                    204 => 230,
+                    137 => 196,
+                    29 => 142,
+                    115 => 185,
+                    233 => 244,
+                    _ => unreachable!(),
+                };
+                let offset = ((y + 2) * 16 + x + 2) * 4;
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &[red, red, blue, 255],
+                    "browser circle stroke pixel({x},{y})"
+                );
             }
         }
     }
@@ -6184,68 +8174,180 @@ mod tests {
     fn filled_circle_edges_match_default_graphite_browser() {
         // V605 DEFAULT Chromium141 capture, V613 backend attestation.
         // All channels are exact, not a tolerance around legacy raster AA.
-        for (size, x, y, gray) in [(4.0, 3, 3, 158u8), (4.0, 4, 3, 7),
-                                  (8.0, 4, 3, 205), (8.0, 5, 3, 77)] {
+        for (size, x, y, gray) in [
+            (4.0, 3, 3, 158u8),
+            (4.0, 4, 3, 7),
+            (8.0, 4, 3, 205),
+            (8.0, 5, 3, 77),
+        ] {
             let mut surface = Surface::new_raster_n32_premul((16, 16)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            draw_rounded_rect(surface.canvas(),
-                LayoutRect { x: 3.0, y: 3.0, width: size, height: size },
+            draw_rounded_rect(
+                surface.canvas(),
+                LayoutRect {
+                    x: 3.0,
+                    y: 3.0,
+                    width: size,
+                    height: size,
+                },
                 [size * 0.5; 4],
-                &color_paint(w3cos_std::Color { r: 0, g: 0, b: 0, a: 255 }, 1.0));
-            let info = skia_safe::ImageInfo::new((16, 16), skia_safe::ColorType::RGBA8888,
-                skia_safe::AlphaType::Premul, None);
+                &color_paint(
+                    w3cos_std::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                    1.0,
+                ),
+            );
+            let info = skia_safe::ImageInfo::new(
+                (16, 16),
+                skia_safe::ColorType::RGBA8888,
+                skia_safe::AlphaType::Premul,
+                None,
+            );
             let mut pixels = [0u8; 16 * 16 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 16 * 4, (0, 0)));
             let offset = (y * 16 + x) * 4;
-            assert_eq!(&pixels[offset..offset + 4], &[gray, gray, gray, 255],
-                "DEFAULT Graphite circle size={size}, pixel=({x},{y})");
+            assert_eq!(
+                &pixels[offset..offset + 4],
+                &[gray, gray, gray, 255],
+                "DEFAULT Graphite circle size={size}, pixel=({x},{y})"
+            );
         }
     }
 
     #[test]
     fn composited_oval_preserves_background_layer_boundary() {
         use crate::paint_artifact::PaintNode;
-        let host = LayoutRect { x: 0.0, y: 0.0, width: 16.0, height: 16.0 };
-        let oval = LayoutRect { x: 3.0, y: 3.0, width: 6.0, height: 6.0 };
+        let host = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        let oval = LayoutRect {
+            x: 3.0,
+            y: 3.0,
+            width: 6.0,
+            height: 6.0,
+        };
         // V745 DEFAULT browser: a separately composited oval quantizes its
         // transparent surface before blend; an opaque parent shared with the
         // background does not quantize the intermediate coverage.
         for owner in [None, Some(1), Some(0)] {
-            let mut host_style = Style { background: w3cos_std::Color::rgb(255, 165, 0),
-                ..Style::default() };
-            let mut oval_style = Style { background: w3cos_std::Color::BLACK,
-                border_radius: 3.0, ..Style::default() };
-            if owner == Some(0) { host_style.will_change.transform = true; }
-            if owner == Some(1) { oval_style.will_change.transform = true; }
-            let artifact = PaintArtifact::build([
-                PaintNode { kind: ComponentKind::Root, style: Style::default(), parent: None, sticky_counter_signal: None },
-                PaintNode { kind: ComponentKind::Column, style: host_style, parent: Some(0), sticky_counter_signal: None },
-                PaintNode { kind: ComponentKind::Box, style: oval_style, parent: Some(1), sticky_counter_signal: None },
-            ], &[(host, 0), (host, 1), (oval, 2)], 1);
-            let nodes = artifact.nodes.iter().enumerate().map(|(i, n)|
-                (i, artifact.rect_by_index[i].unwrap(), &n.kind, &n.style)).collect::<Vec<_>>();
-            let metrics = fontdue::Font::from_bytes(TEST_FONT, fontdue::FontSettings::default()).unwrap();
+            let mut host_style = Style {
+                background: w3cos_std::Color::rgb(255, 165, 0),
+                ..Style::default()
+            };
+            let mut oval_style = Style {
+                background: w3cos_std::Color::BLACK,
+                border_radius: 3.0,
+                ..Style::default()
+            };
+            if owner == Some(0) {
+                host_style.will_change.transform = true;
+            }
+            if owner == Some(1) {
+                oval_style.will_change.transform = true;
+            }
+            let artifact = PaintArtifact::build(
+                [
+                    PaintNode {
+                        kind: ComponentKind::Root,
+                        style: Style::default(),
+                        parent: None,
+                        sticky_counter_signal: None,
+                    },
+                    PaintNode {
+                        kind: ComponentKind::Column,
+                        style: host_style,
+                        parent: Some(0),
+                        sticky_counter_signal: None,
+                    },
+                    PaintNode {
+                        kind: ComponentKind::Box,
+                        style: oval_style,
+                        parent: Some(1),
+                        sticky_counter_signal: None,
+                    },
+                ],
+                &[(host, 0), (host, 1), (oval, 2)],
+                1,
+            );
+            let nodes = artifact
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i, artifact.rect_by_index[i].unwrap(), &n.kind, &n.style))
+                .collect::<Vec<_>>();
+            let metrics =
+                fontdue::Font::from_bytes(TEST_FONT, fontdue::FontSettings::default()).unwrap();
             let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-            let pixels = rasterizer.render_frame(16, 16, &nodes, &metrics, &[None, None, None],
-                &HashMap::new(), None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
+            let pixels = rasterizer
+                .render_frame(
+                    16,
+                    16,
+                    &nodes,
+                    &metrics,
+                    &[None, None, None],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap();
             let green = if owner == Some(1) { [69, 1] } else { [68, 2] };
             for (x, red, expected_green) in [(4, 106, green[0]), (5, 2, green[1])] {
                 let offset = (3 * 16 + x) * 4;
-                assert_eq!(&pixels[offset..offset + 4], &[red, expected_green, 0, 255],
-                    "browser surface owner={owner:?}, pixel=({x},3)");
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &[red, expected_green, 0, 255],
+                    "browser surface owner={owner:?}, pixel=({x},3)"
+                );
             }
             let expected = pixels.to_vec();
-            let replayed = rasterizer.render_frame(16, 16, &nodes, &metrics, &[None, None, None],
-                &HashMap::new(), None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
-            assert_eq!(replayed, expected, "retained surface replay owner={owner:?}");
+            let replayed = rasterizer
+                .render_frame(
+                    16,
+                    16,
+                    &nodes,
+                    &metrics,
+                    &[None, None, None],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap();
+            assert_eq!(
+                replayed, expected,
+                "retained surface replay owner={owner:?}"
+            );
             assert_eq!(rasterizer.retained_replays(), 1);
             let mut surface = Surface::new_raster_n32_premul((16, 16)).unwrap();
-            paint_display_list(surface.canvas(), &primary_typeface(TEST_FONT).unwrap(), ReplayFrame {
-                nodes: &nodes, metrics_font: &metrics, scroll_info: &[None, None, None],
-                text_input_values: &HashMap::new(), focused_index: None,
-                background: w3cos_std::Color::WHITE, artifact: Some(&artifact),
-                retained: None, compositor_overrides: None, scale_factor: 1.0,
-            }, true);
+            paint_display_list(
+                surface.canvas(),
+                &primary_typeface(TEST_FONT).unwrap(),
+                ReplayFrame {
+                    nodes: &nodes,
+                    metrics_font: &metrics,
+                    scroll_info: &[None, None, None],
+                    text_input_values: &HashMap::new(),
+                    focused_index: None,
+                    background: w3cos_std::Color::WHITE,
+                    artifact: Some(&artifact),
+                    retained: None,
+                    compositor_overrides: None,
+                    scale_factor: 1.0,
+                },
+                true,
+            );
             let info = ImageInfo::new((16, 16), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut baked = vec![0u8; 16 * 16 * 4];
             assert!(surface.read_pixels(&info, &mut baked, 16 * 4, (0, 0)));
@@ -6256,31 +8358,74 @@ mod tests {
     #[test]
     fn glyph_clip_keeps_filtered_ink_conservative() {
         use crate::paint_artifact::PaintNode;
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 20.0, height: 20.0 };
-        let mut artifact = PaintArtifact::build([
-            PaintNode { kind: ComponentKind::Column, style: Style::default(), parent: None, sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Column, style: Style { filter: Some("blur(4px)".into()),
-                ..Style::default() }, parent: Some(0), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "H".into() }, style: Style::default(),
-                parent: Some(1), sticky_counter_signal: None },
-        ], &[(rect, 0), (rect, 1), (rect, 2)], 1);
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let mut artifact = PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style::default(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style {
+                        filter: Some("blur(4px)".into()),
+                        ..Style::default()
+                    },
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Text {
+                        content: "H".into(),
+                    },
+                    style: Style::default(),
+                    parent: Some(1),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[(rect, 0), (rect, 1), (rect, 2)],
+            1,
+        );
         let layer = crate::retained_layers::CompositorLayer {
-            id: 0, bounds: rect, properties: artifact.node_properties[2], chunk_ids: Vec::new(),
-            client_indices: vec![2], sticky_owner: None, effect_owner: None,
-            transform_owner: None, scroll_host: None,
+            id: 0,
+            bounds: rect,
+            properties: artifact.node_properties[2],
+            chunk_ids: Vec::new(),
+            client_indices: vec![2],
+            sticky_owner: None,
+            effect_owner: None,
+            transform_owner: None,
+            scroll_host: None,
         };
         let viewport = Rect::from_xywh(0.0, 0.0, 20.0, 20.0);
         let overrides = CompositorOverrides::default();
-        assert!(layer_glyph_clip(&layer, &artifact, &[], &overrides, 1.0, viewport).is_none(),
-            "inherited filters can spread glyph ink into the viewport");
-        for effect in &mut artifact.properties.effects { effect.filter = None; }
-        assert_eq!(layer_glyph_clip(&layer, &artifact, &[], &overrides, 1.0, viewport), Some(viewport));
+        assert!(
+            layer_glyph_clip(&layer, &artifact, &[], &overrides, 1.0, viewport).is_none(),
+            "inherited filters can spread glyph ink into the viewport"
+        );
+        for effect in &mut artifact.properties.effects {
+            effect.filter = None;
+        }
+        assert_eq!(
+            layer_glyph_clip(&layer, &artifact, &[], &overrides, 1.0, viewport),
+            Some(viewport)
+        );
     }
 
     #[test]
     fn glyph_clip_recording_preserves_reentry_and_reuses_unchanged_visibility() {
         let face = primary_typeface(TEST_FONT).unwrap();
-        let style = Style { font_size: 20.0, ..Style::default() };
+        let style = Style {
+            font_size: 20.0,
+            ..Style::default()
+        };
         let font = crate::skia_text_run::css_font(&face, 20.0);
         let run = crate::skia_text_run::shape_visual_run("H", &face, &style).unwrap();
         let ink = run.geometric_ink_bounds(&font).unwrap();
@@ -6288,49 +8433,157 @@ mod tests {
         let clip = Rect::new(13.0, 0.0, 113.0, 64.0);
         let x = 113.0 - ink.left;
         let recording = GlyphClipRecordingScope::new(Some(clip));
-        assert!(!glyph_run_intersects_clip(surface.canvas(), &font, &run, x, 32.0));
+        assert!(!glyph_run_intersects_clip(
+            surface.canvas(),
+            &font,
+            &run,
+            x,
+            32.0
+        ));
         let decisions = recording.finish();
         assert_eq!(decisions.len(), 1);
         assert!(glyph_clip_decisions_match(&decisions, Some(clip)));
-        assert!(glyph_clip_decisions_match(&decisions, Some(Rect::new(0.0, 0.0, 100.0, 64.0))));
+        assert!(glyph_clip_decisions_match(
+            &decisions,
+            Some(Rect::new(0.0, 0.0, 100.0, 64.0))
+        ));
         let shifted = Rect::new(13.0, 0.0, 123.0, 64.0);
-        assert!(!glyph_clip_decisions_match(&decisions, Some(shifted)), "entering ink must invalidate the recording");
+        assert!(
+            !glyph_clip_decisions_match(&decisions, Some(shifted)),
+            "entering ink must invalidate the recording"
+        );
         let recording = GlyphClipRecordingScope::new(Some(shifted));
-        assert!(glyph_run_intersects_clip(surface.canvas(), &font, &run, x, 32.0));
+        assert!(glyph_run_intersects_clip(
+            surface.canvas(),
+            &font,
+            &run,
+            x,
+            32.0
+        ));
         let visible = recording.finish();
-        assert!(!glyph_clip_decisions_match(&visible, Some(clip)), "leaving ink must invalidate the recording");
-        assert!(glyph_run_intersects_clip(surface.canvas(), &font, &run, x, 32.0), "scope must restore ordinary drawing");
+        assert!(
+            !glyph_clip_decisions_match(&visible, Some(clip)),
+            "leaving ink must invalidate the recording"
+        );
+        assert!(
+            glyph_run_intersects_clip(surface.canvas(), &font, &run, x, 32.0),
+            "scope must restore ordinary drawing"
+        );
     }
 
     #[test]
     fn glyph_clip_retained_scroll_reentry_never_loses_text() {
         use crate::paint_artifact::PaintNode;
-        let host = LayoutRect { x: 0.0, y: 0.0, width: 8.0, height: 8.0 };
-        let text = LayoutRect { x: 1.0, y: 10.0, width: 6.0, height: 4.0 };
-        let artifact = PaintArtifact::build([
-            PaintNode { kind: ComponentKind::Column, style: Style::default(), parent: None, sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Column, style: Style { overflow: w3cos_std::style::Overflow::Hidden,
-                ..Style::default() }, parent: Some(0), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "H".into() }, style: Style { display: Display::Block,
-                font_size: 4.0, line_height: 1.0, color: w3cos_std::Color::rgb(255, 0, 0), ..Style::default() },
-                parent: Some(1), sticky_counter_signal: None },
-        ], &[(host, 0), (host, 1), (text, 2)], 1);
-        let nodes = artifact.nodes.iter().enumerate().filter_map(|(index, node)|
-            Some((index, artifact.rect_by_index[index]?, &node.kind, &node.style))).collect::<Vec<_>>();
-        let metrics = fontdue::Font::from_bytes(TEST_FONT, fontdue::FontSettings::default()).unwrap();
+        let host = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 8.0,
+        };
+        let text = LayoutRect {
+            x: 1.0,
+            y: 10.0,
+            width: 6.0,
+            height: 4.0,
+        };
+        let artifact = PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style::default(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style {
+                        overflow: w3cos_std::style::Overflow::Hidden,
+                        ..Style::default()
+                    },
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Text {
+                        content: "H".into(),
+                    },
+                    style: Style {
+                        display: Display::Block,
+                        font_size: 4.0,
+                        line_height: 1.0,
+                        color: w3cos_std::Color::rgb(255, 0, 0),
+                        ..Style::default()
+                    },
+                    parent: Some(1),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[(host, 0), (host, 1), (text, 2)],
+            1,
+        );
+        let nodes = artifact
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                Some((
+                    index,
+                    artifact.rect_by_index[index]?,
+                    &node.kind,
+                    &node.style,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let metrics =
+            fontdue::Font::from_bytes(TEST_FONT, fontdue::FontSettings::default()).unwrap();
         let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-        let mut render = |offset| rasterizer.render_frame(8, 8, &nodes, &metrics,
-            &[None, None, Some((0.0, offset, host))], &HashMap::new(), None,
-            w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap().to_vec();
+        let mut render = |offset| {
+            rasterizer
+                .render_frame(
+                    8,
+                    8,
+                    &nodes,
+                    &metrics,
+                    &[None, None, Some((0.0, offset, host))],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap()
+                .to_vec()
+        };
         let hidden = render(0.0);
-        assert!(hidden.chunks_exact(4).all(|pixel| pixel == [255, 255, 255, 255]));
+        assert!(
+            hidden
+                .chunks_exact(4)
+                .all(|pixel| pixel == [255, 255, 255, 255])
+        );
         let entered = render(6.0);
-        assert!(entered.chunks_exact(4).any(|pixel| pixel != [255, 255, 255, 255]));
+        assert!(
+            entered
+                .chunks_exact(4)
+                .any(|pixel| pixel != [255, 255, 255, 255])
+        );
         render(6.125);
         assert_eq!(render(0.0), hidden);
-        assert_eq!(render(6.0), entered, "repeated scroll reentry must restore the exact glyphs");
-        assert_eq!(rasterizer.retained_replays(), 1, "unchanged visibility reuses the recording");
-        assert_eq!(rasterizer.retained_rebuilds(), 4, "only visibility transitions rerecord");
+        assert_eq!(
+            render(6.0),
+            entered,
+            "repeated scroll reentry must restore the exact glyphs"
+        );
+        assert_eq!(
+            rasterizer.retained_replays(),
+            1,
+            "unchanged visibility reuses the recording"
+        );
+        assert_eq!(
+            rasterizer.retained_rebuilds(),
+            4,
+            "only visibility transitions rerecord"
+        );
     }
 
     #[test]
@@ -6338,21 +8591,38 @@ mod tests {
     fn html_standard_light_weight_selects_real_platform_face() {
         let mut style = w3cos_dom::user_agent::html_default_style("html");
         style.font_weight = 100;
-        style.custom_properties.get_or_insert_with(Default::default)
-            .insert(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(), "zh-CN".into());
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(),
+                "zh-CN".into(),
+            );
         let base = generic_serif_typeface(&style).unwrap();
-        let expected = FontMgr::default().match_family_style(&base.family_name(),
-            FontStyle::new(100.into(), skia_safe::font_style::Width::NORMAL,
-                skia_safe::font_style::Slant::Upright)).unwrap();
+        let expected = FontMgr::default()
+            .match_family_style(
+                &base.family_name(),
+                FontStyle::new(
+                    100.into(),
+                    skia_safe::font_style::Width::NORMAL,
+                    skia_safe::font_style::Slant::Upright,
+                ),
+            )
+            .unwrap();
         assert!(expected.font_style().weight() < base.font_style().weight());
         for run in css_font_runs("Filler Text", &base, &style) {
-            assert_eq!(run.typeface.font_style(), expected.font_style(),
-                "light text must use the installed light face across measurement and paint");
+            assert_eq!(
+                run.typeface.font_style(),
+                expected.font_style(),
+                "light text must use the installed light face across measurement and paint"
+            );
         }
         let metrics = resolved_font_geometry(&style).unwrap();
         let expected_metrics = typeface_font_geometry(&expected, style.font_size);
-        assert_eq!((metrics.ascent, metrics.descent),
-            (expected_metrics.ascent, expected_metrics.descent));
+        assert_eq!(
+            (metrics.ascent, metrics.descent),
+            (expected_metrics.ascent, expected_metrics.descent)
+        );
     }
 
     #[test]
@@ -6364,19 +8634,37 @@ mod tests {
                 style.font_family = family.map(str::to_string);
                 style.font_style = w3cos_std::style::FontStyle::Italic;
                 style.font_weight = weight;
-                style.custom_properties.get_or_insert_with(Default::default)
-                    .insert(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(), "es".into());
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(),
+                        "es".into(),
+                    );
                 let base = generic_serif_typeface(&style).unwrap();
-                let expected = FontMgr::default().match_family_style(&base.family_name(),
-                    FontStyle::new((weight as i32).into(), skia_safe::font_style::Width::NORMAL,
-                        skia_safe::font_style::Slant::Italic)).unwrap();
+                let expected = FontMgr::default()
+                    .match_family_style(
+                        &base.family_name(),
+                        FontStyle::new(
+                            (weight as i32).into(),
+                            skia_safe::font_style::Width::NORMAL,
+                            skia_safe::font_style::Slant::Italic,
+                        ),
+                    )
+                    .unwrap();
                 let runs = css_font_runs("and this should be green", &base, &style);
                 assert!(!runs.is_empty());
                 for run in runs {
-                    assert_eq!(run.typeface.font_style(), expected.font_style(),
-                        "generic={family:?}, weight={weight}: use the installed italic, not a sheared normal face");
-                    assert_eq!(crate::skia_text_run::css_font_for_style(&run.typeface,
-                        16.0, &style).skew_x(), 0.0);
+                    assert_eq!(
+                        run.typeface.font_style(),
+                        expected.font_style(),
+                        "generic={family:?}, weight={weight}: use the installed italic, not a sheared normal face"
+                    );
+                    assert_eq!(
+                        crate::skia_text_run::css_font_for_style(&run.typeface, 16.0, &style)
+                            .skew_x(),
+                        0.0
+                    );
                 }
             }
         }
@@ -6384,56 +8672,131 @@ mod tests {
 
     #[test]
     fn explicit_sans_uses_host_browser_metrics_for_short_line_height() {
-        let style = Style { font_family: Some("sans-serif".into()), font_size: 32.0,
-            font_weight: 900, line_height: 1.0, display: Display::Block, ..Style::default() };
-        let face = HTML_STANDARD_TYPEFACE.with(Clone::clone).expect("host browser font");
-        assert_eq!(generic_serif_typeface(&style).unwrap().unique_id(), face.unique_id());
+        let style = Style {
+            font_family: Some("sans-serif".into()),
+            font_size: 32.0,
+            font_weight: 900,
+            line_height: 1.0,
+            display: Display::Block,
+            ..Style::default()
+        };
+        let face = HTML_STANDARD_TYPEFACE
+            .with(Clone::clone)
+            .expect("host browser font");
+        assert_eq!(
+            generic_serif_typeface(&style).unwrap().unique_id(),
+            face.unique_id()
+        );
         let bold = typeface_for_character(&face, 'x', style.font_weight);
         let expected = typeface_font_geometry(&bold, style.font_size);
         let actual = resolved_font_geometry(&style).expect("explicit sans font metrics");
         assert_eq!(actual.ascent, expected.ascent);
         assert_eq!(actual.descent, expected.descent);
-        assert_eq!(text_baseline(0.0, 32.0, &face, &style, "PASS"), expected.ascent);
-        assert_eq!(line_box_half_leading(&style), ((32.0 - expected.height()) * 0.5).floor());
+        assert_eq!(
+            text_baseline(0.0, 32.0, &face, &style, "PASS"),
+            expected.ascent
+        );
+        assert_eq!(
+            line_box_half_leading(&style),
+            ((32.0 - expected.height()) * 0.5).floor()
+        );
     }
 
     #[test]
     fn opacity_layer_composition_matches_browser_pixels_and_retained_replay() {
         CSS_OPACITY_SRC_OVER.with(|blender| assert!(blender.is_some()));
         use crate::paint_artifact::PaintNode;
-        let rect = LayoutRect { x: 1.0, y: 1.0, width: 4.0, height: 4.0 };
+        let rect = LayoutRect {
+            x: 1.0,
+            y: 1.0,
+            width: 4.0,
+            height: 4.0,
+        };
         for (opacity, color, expected) in [
-            (0.5, w3cos_std::Color::rgb(0,128,0), [128,191,128,255]),
-            (0.9, w3cos_std::Color::rgb(0,0,255), [26,26,255,255]),
-            (1.0, w3cos_std::Color::rgb(0,128,0), [0,128,0,255]),
+            (0.5, w3cos_std::Color::rgb(0, 128, 0), [128, 191, 128, 255]),
+            (0.9, w3cos_std::Color::rgb(0, 0, 255), [26, 26, 255, 255]),
+            (1.0, w3cos_std::Color::rgb(0, 128, 0), [0, 128, 0, 255]),
         ] {
-            let artifact = PaintArtifact::build([
-                PaintNode { kind: ComponentKind::Box, style: Style { opacity,
-                    ..Style::default() }, parent: None, sticky_counter_signal: None },
-                PaintNode { kind: ComponentKind::Box, style: Style { background: color,
-                    ..Style::default() }, parent: Some(0), sticky_counter_signal: None },
-            ], &[(rect,0),(rect,1)], 1);
-            let nodes = artifact.nodes.iter().enumerate().map(|(i,n)|
-                (i,rect,&n.kind,&n.style)).collect::<Vec<_>>();
+            let artifact = PaintArtifact::build(
+                [
+                    PaintNode {
+                        kind: ComponentKind::Box,
+                        style: Style {
+                            opacity,
+                            ..Style::default()
+                        },
+                        parent: None,
+                        sticky_counter_signal: None,
+                    },
+                    PaintNode {
+                        kind: ComponentKind::Box,
+                        style: Style {
+                            background: color,
+                            ..Style::default()
+                        },
+                        parent: Some(0),
+                        sticky_counter_signal: None,
+                    },
+                ],
+                &[(rect, 0), (rect, 1)],
+                1,
+            );
+            let nodes = artifact
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i, rect, &n.kind, &n.style))
+                .collect::<Vec<_>>();
             let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
             for _ in 0..2 {
-                let pixels = rasterizer.render_frame(8,8,&nodes,&test_font(),&[],
-                    &HashMap::new(),None,w3cos_std::Color::WHITE,Some(&artifact),None,1.0).unwrap();
-                assert_eq!(&pixels[(2*8+2)*4..(2*8+2)*4+4], &expected,
-                    "browser opacity layer {opacity}");
+                let pixels = rasterizer
+                    .render_frame(
+                        8,
+                        8,
+                        &nodes,
+                        &test_font(),
+                        &[],
+                        &HashMap::new(),
+                        None,
+                        w3cos_std::Color::WHITE,
+                        Some(&artifact),
+                        None,
+                        1.0,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    &pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4],
+                    &expected,
+                    "browser opacity layer {opacity}"
+                );
             }
-            assert_eq!(rasterizer.retained_replays(),1);
-            let mut surface = Surface::new_raster_n32_premul((8,8)).unwrap();
-            paint_display_list(surface.canvas(), &primary_typeface(TEST_FONT).unwrap(), ReplayFrame {
-                nodes:&nodes,metrics_font:&test_font(),scroll_info:&[],text_input_values:&HashMap::new(),
-                focused_index:None,background:w3cos_std::Color::WHITE,artifact:Some(&artifact),
-                retained:None,compositor_overrides:None,scale_factor:1.0,
-            },true);
-            let mut pixels = [0u8;8*8*4];
-            let info = ImageInfo::new((8,8),ColorType::RGBA8888,AlphaType::Premul,None);
-            assert!(surface.read_pixels(&info,&mut pixels,8*4,(0,0)));
-            assert_eq!(&pixels[(2*8+2)*4..(2*8+2)*4+4],&expected,
-                "baked opacity layer {opacity}");
+            assert_eq!(rasterizer.retained_replays(), 1);
+            let mut surface = Surface::new_raster_n32_premul((8, 8)).unwrap();
+            paint_display_list(
+                surface.canvas(),
+                &primary_typeface(TEST_FONT).unwrap(),
+                ReplayFrame {
+                    nodes: &nodes,
+                    metrics_font: &test_font(),
+                    scroll_info: &[],
+                    text_input_values: &HashMap::new(),
+                    focused_index: None,
+                    background: w3cos_std::Color::WHITE,
+                    artifact: Some(&artifact),
+                    retained: None,
+                    compositor_overrides: None,
+                    scale_factor: 1.0,
+                },
+                true,
+            );
+            let mut pixels = [0u8; 8 * 8 * 4];
+            let info = ImageInfo::new((8, 8), ColorType::RGBA8888, AlphaType::Premul, None);
+            assert!(surface.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
+            assert_eq!(
+                &pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4],
+                &expected,
+                "baked opacity layer {opacity}"
+            );
         }
     }
 
@@ -6443,40 +8806,113 @@ mod tests {
         // Chromium141 V2647: four colors, two destinations, five opacities.
         // These independent screenshot bytes are not generated by the shader.
         let expected = [
-            [229,242,229],[191,223,191],[128,191,128],[102,179,102],[26,141,26],
-            [12,51,78],[10,64,65],[7,85,44],[5,94,35],[1,119,9],
-            [229,229,255],[191,191,255],[128,128,255],[102,102,255],[26,26,255],
-            [12,38,104],[10,32,129],[7,21,171],[5,17,188],[1,4,238],
-            [233,239,251],[200,216,244],[146,177,233],[124,161,229],[59,115,215],
-            [15,48,99],[19,56,118],[25,71,149],[27,76,161],[35,93,199],
-            [255,246,229],[255,233,191],[255,210,128],[255,201,102],[255,174,26],
-            [37,54,78],[74,73,65],[134,104,44],[158,116,35],[231,153,9],
+            [229, 242, 229],
+            [191, 223, 191],
+            [128, 191, 128],
+            [102, 179, 102],
+            [26, 141, 26],
+            [12, 51, 78],
+            [10, 64, 65],
+            [7, 85, 44],
+            [5, 94, 35],
+            [1, 119, 9],
+            [229, 229, 255],
+            [191, 191, 255],
+            [128, 128, 255],
+            [102, 102, 255],
+            [26, 26, 255],
+            [12, 38, 104],
+            [10, 32, 129],
+            [7, 21, 171],
+            [5, 17, 188],
+            [1, 4, 238],
+            [233, 239, 251],
+            [200, 216, 244],
+            [146, 177, 233],
+            [124, 161, 229],
+            [59, 115, 215],
+            [15, 48, 99],
+            [19, 56, 118],
+            [25, 71, 149],
+            [27, 76, 161],
+            [35, 93, 199],
+            [255, 246, 229],
+            [255, 233, 191],
+            [255, 210, 128],
+            [255, 201, 102],
+            [255, 174, 26],
+            [37, 54, 78],
+            [74, 73, 65],
+            [134, 104, 44],
+            [158, 116, 35],
+            [231, 153, 9],
         ];
-        let rect = LayoutRect { x:1.0,y:1.0,width:4.0,height:4.0 };
+        let rect = LayoutRect {
+            x: 1.0,
+            y: 1.0,
+            width: 4.0,
+            height: 4.0,
+        };
         let mut case = 0;
-        for color in [[0,128,0],[0,0,255],[37,99,211],[255,165,0]] {
-            for bg in [[255,255,255],[13,42,87]] {
-                for opacity in [0.1,0.25,0.5,0.6,0.9] {
-                    let artifact = PaintArtifact::build([
-                        PaintNode { kind:ComponentKind::Box,style:Style { opacity,
-                            ..Style::default() },parent:None,sticky_counter_signal:None },
-                        PaintNode { kind:ComponentKind::Box,style:Style {
-                            background:w3cos_std::Color::rgb(color[0],color[1],color[2]),
-                            ..Style::default() },parent:Some(0),sticky_counter_signal:None },
-                    ],&[(rect,0),(rect,1)],1);
-                    let nodes = artifact.nodes.iter().enumerate().map(|(i,n)|
-                        (i,rect,&n.kind,&n.style)).collect::<Vec<_>>();
+        for color in [[0, 128, 0], [0, 0, 255], [37, 99, 211], [255, 165, 0]] {
+            for bg in [[255, 255, 255], [13, 42, 87]] {
+                for opacity in [0.1, 0.25, 0.5, 0.6, 0.9] {
+                    let artifact = PaintArtifact::build(
+                        [
+                            PaintNode {
+                                kind: ComponentKind::Box,
+                                style: Style {
+                                    opacity,
+                                    ..Style::default()
+                                },
+                                parent: None,
+                                sticky_counter_signal: None,
+                            },
+                            PaintNode {
+                                kind: ComponentKind::Box,
+                                style: Style {
+                                    background: w3cos_std::Color::rgb(color[0], color[1], color[2]),
+                                    ..Style::default()
+                                },
+                                parent: Some(0),
+                                sticky_counter_signal: None,
+                            },
+                        ],
+                        &[(rect, 0), (rect, 1)],
+                        1,
+                    );
+                    let nodes = artifact
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| (i, rect, &n.kind, &n.style))
+                        .collect::<Vec<_>>();
                     let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-                    let pixels = rasterizer.render_frame(8,8,&nodes,&test_font(),&[],
-                        &HashMap::new(),None,w3cos_std::Color::rgb(bg[0],bg[1],bg[2]),
-                        Some(&artifact),None,1.0).unwrap();
-                    assert_eq!(&pixels[(2*8+2)*4..(2*8+2)*4+3],&expected[case],
-                        "browser calibration {case}: {color:?} over {bg:?}, opacity={opacity}");
+                    let pixels = rasterizer
+                        .render_frame(
+                            8,
+                            8,
+                            &nodes,
+                            &test_font(),
+                            &[],
+                            &HashMap::new(),
+                            None,
+                            w3cos_std::Color::rgb(bg[0], bg[1], bg[2]),
+                            Some(&artifact),
+                            None,
+                            1.0,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        &pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 3],
+                        &expected[case],
+                        "browser calibration {case}: {color:?} over {bg:?}, opacity={opacity}"
+                    );
                     case += 1;
                 }
             }
         }
-        assert_eq!(case,40);
+        assert_eq!(case, 40);
     }
 
     #[test]
@@ -6485,8 +8921,10 @@ mod tests {
         let mut surface = Surface::new_raster_n32_premul((256, 1)).unwrap();
         surface.canvas().clear(Color::from_rgb(255, 165, 0));
         for alpha in 0..256 {
-            surface.canvas().draw_rect(Rect::from_xywh(alpha as f32, 0.0, 1.0, 1.0),
-                &color_paint(w3cos_std::Color::rgba(0, 0, 0, alpha as u8), 1.0));
+            surface.canvas().draw_rect(
+                Rect::from_xywh(alpha as f32, 0.0, 1.0, 1.0),
+                &color_paint(w3cos_std::Color::rgba(0, 0, 0, alpha as u8), 1.0),
+            );
         }
         let info = ImageInfo::new((256, 1), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut pixels = vec![0_u8; 1024];
@@ -6500,7 +8938,10 @@ mod tests {
     #[test]
     fn glyph_clip_rejects_vector_ink_outside_but_keeps_partial_overlap() {
         let face = primary_typeface(TEST_FONT).unwrap();
-        let style = Style { font_size: 20.0, ..Style::default() };
+        let style = Style {
+            font_size: 20.0,
+            ..Style::default()
+        };
         let font = crate::skia_text_run::css_font(&face, 20.0);
         let run = crate::skia_text_run::shape_visual_run("H", &face, &style).unwrap();
         let ink = run.geometric_ink_bounds(&font).unwrap();
@@ -6509,40 +8950,70 @@ mod tests {
         canvas.clear(Color::WHITE);
         canvas.clip_rect(Rect::new(13.0, 0.0, 113.0, 64.0), None, Some(false));
         let boundary = 113.0 - ink.left;
-        assert!(!glyph_run_intersects_clip(canvas, &font, &run, boundary, 32.0));
-        assert!(glyph_run_intersects_clip(canvas, &font, &run, boundary - 0.5, 32.0));
+        assert!(!glyph_run_intersects_clip(
+            canvas, &font, &run, boundary, 32.0
+        ));
+        assert!(glyph_run_intersects_clip(
+            canvas,
+            &font,
+            &run,
+            boundary - 0.5,
+            32.0
+        ));
         // A translated canvas must compare device-space ink and clip bounds.
         canvas.translate((10.0, 0.0));
-        assert!(!glyph_run_intersects_clip(canvas, &font, &run, boundary, 32.0));
-        assert!(glyph_run_intersects_clip(canvas, &font, &run, boundary - 10.5, 32.0));
+        assert!(!glyph_run_intersects_clip(
+            canvas, &font, &run, boundary, 32.0
+        ));
+        assert!(glyph_run_intersects_clip(
+            canvas,
+            &font,
+            &run,
+            boundary - 10.5,
+            32.0
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn glyph_clip_preserves_a_real_negative_bearing() {
-        let face = FontMgr::default().match_family_style("Times", FontStyle::italic()).unwrap();
-        let style = Style { font_size: 20.0, ..Style::default() };
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::italic())
+            .unwrap();
+        let style = Style {
+            font_size: 20.0,
+            ..Style::default()
+        };
         let font = crate::skia_text_run::css_font(&face, 20.0);
         let run = crate::skia_text_run::shape_visual_run("j", &face, &style).unwrap();
         assert!(run.geometric_ink_bounds(&font).unwrap().left < 0.0);
         let mut surface = Surface::new_raster_n32_premul((160, 64)).unwrap();
         let canvas = surface.canvas();
         canvas.clip_rect(Rect::new(13.0, 0.0, 113.0, 64.0), None, Some(false));
-        assert!(glyph_run_intersects_clip(canvas, &font, &run, 113.0, 32.0),
-            "a real overhang is ink inside the clip even when its advance origin lies outside");
+        assert!(
+            glyph_run_intersects_clip(canvas, &font, &run, 113.0, 32.0),
+            "a real overhang is ink inside the clip even when its advance origin lies outside"
+        );
     }
 
     #[test]
     fn native_embedding_strut_uses_the_intrinsic_measurement_primary() {
         for size in [10.0, 16.0, 24.0] {
-            let style = Style { font_size: size, ..Style::default() };
-            assert!(generic_serif_typeface(&style).is_none(),
-                "native embedding must not acquire an HTML serif default");
-            let expected = with_text_typeface("x", &style,
-                |face| typeface_font_geometry(face, size));
+            let style = Style {
+                font_size: size,
+                ..Style::default()
+            };
+            assert!(
+                generic_serif_typeface(&style).is_none(),
+                "native embedding must not acquire an HTML serif default"
+            );
+            let expected =
+                with_text_typeface("x", &style, |face| typeface_font_geometry(face, size));
             let actual = resolved_font_geometry(&style).expect("intrinsic embedding metrics");
-            assert_eq!((actual.ascent, actual.descent, actual.line_gap),
-                (expected.ascent, expected.descent, expected.line_gap));
+            assert_eq!(
+                (actual.ascent, actual.descent, actual.line_gap),
+                (expected.ascent, expected.descent, expected.line_gap)
+            );
         }
     }
 
@@ -6560,8 +9031,10 @@ mod tests {
         let explicit = generic_serif_typeface(&style).expect("explicit serif face");
         let expected_serif = GENERIC_SERIF_TYPEFACE.with(Clone::clone).unwrap();
         assert_eq!(explicit.family_name(), expected_serif.family_name());
-        assert!(generic_serif_typeface(&Style::default()).is_none(),
-            "native embeddings retain their supplied primary font");
+        assert!(
+            generic_serif_typeface(&Style::default()).is_none(),
+            "native embeddings retain their supplied primary font"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -6569,25 +9042,44 @@ mod tests {
     fn language_generic_faces_share_measurement_and_metrics() {
         use browser_font_defaults::GenericFamily;
         for language in ["en", "zh-CN", "zh-Hant", "ja", "ko", "zh-Latn"] {
-            for (css, generic) in [(None, GenericFamily::Standard),
-                (Some("serif"), GenericFamily::Serif), (Some("sans-serif"), GenericFamily::Sans),
-                (Some("monospace"), GenericFamily::Monospace)] {
+            for (css, generic) in [
+                (None, GenericFamily::Standard),
+                (Some("serif"), GenericFamily::Serif),
+                (Some("sans-serif"), GenericFamily::Sans),
+                (Some("monospace"), GenericFamily::Monospace),
+            ] {
                 let mut style = w3cos_dom::user_agent::html_default_style("html");
                 style.font_family = css.map(str::to_string);
-                style.custom_properties.get_or_insert_with(Default::default)
-                    .insert(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.to_string(), language.to_string());
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.to_string(),
+                        language.to_string(),
+                    );
                 let wanted = browser_font_defaults::family(language, generic).unwrap();
-                let expected = FontMgr::default().match_family_style(wanted, FontStyle::normal()).unwrap();
+                let expected = FontMgr::default()
+                    .match_family_style(wanted, FontStyle::normal())
+                    .unwrap();
                 let face = generic_serif_typeface(&style).expect("language generic face");
-                assert_eq!(face.family_name(), expected.family_name(), "{language}: {css:?}");
+                assert_eq!(
+                    face.family_name(),
+                    expected.family_name(),
+                    "{language}: {css:?}"
+                );
                 let actual = resolved_font_geometry(&style).unwrap();
                 let metrics = typeface_font_geometry(&expected, style.font_size);
                 assert_eq!(actual.ascent, metrics.ascent);
                 assert_eq!(actual.descent, metrics.descent);
-                assert_eq!(font_stack_advance("This text should be green.", &face, &style),
-                    font_stack_advance("This text should be green.", &expected, &style));
+                assert_eq!(
+                    font_stack_advance("This text should be green.", &face, &style),
+                    font_stack_advance("This text should be green.", &expected, &style)
+                );
                 style.font_family = Some("Arial".into());
-                assert!(generic_serif_typeface(&style).is_none(), "authored named font keeps its cascade");
+                assert!(
+                    generic_serif_typeface(&style).is_none(),
+                    "authored named font keeps its cascade"
+                );
             }
         }
     }
@@ -6596,15 +9088,30 @@ mod tests {
     fn registered_ahem_normal_line_includes_uncovered_font_metrics() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610080112;
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf")).expect("pinned Ahem font");
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wpt/fonts/Ahem.ttf"
+        ))
+        .expect("pinned Ahem font");
         let registry = FontRegistry::global();
-        registry.register_for_owner(OWNER, FontFace { family: "Ahem".into(),
-            src: FontSource::Bytes(bytes), ..Default::default() }).unwrap();
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let mut results = Vec::new();
         for family in ["Times New Roman", "Arial", "Courier New"] {
-            let style = Style { font_family: Some(format!("Ahem, \"{family}\"")),
-                font_size: 64.0, line_height_is_normal: true, ..Style::default() };
+            let style = Style {
+                font_family: Some(format!("Ahem, \"{family}\"")),
+                font_size: 64.0,
+                line_height_is_normal: true,
+                ..Style::default()
+            };
             let primary = registered_typeface(&style).unwrap().1;
             let mut expected = resolved_font_geometry(&style).unwrap().normal_line_box();
             for run in css_font_runs("Ţęşţ", &primary, &style) {
@@ -6613,26 +9120,38 @@ mod tests {
                 expected.descent = expected.descent.max(fallback.descent);
             }
             let embedding = primary_typeface(TEST_FONT).unwrap();
-            results.push((family, resolved_text_font_geometry("Ţęşţ", &style).unwrap(), expected,
+            results.push((
+                family,
+                resolved_text_font_geometry("Ţęşţ", &style).unwrap(),
+                expected,
                 text_baseline(0.0, 64.0, &embedding, &style, "Ţęşţ"),
-                typeface_font_geometry(&primary, 64.0).ascent));
+                typeface_font_geometry(&primary, 64.0).ascent,
+            ));
         }
         registry.clear_owner(OWNER);
         for (family, actual, expected, painted_baseline, primary_ascent) in results {
-            assert_eq!((actual.ascent, actual.descent, actual.line_gap),
+            assert_eq!(
+                (actual.ascent, actual.descent, actual.line_gap),
                 (expected.ascent, expected.descent, expected.line_gap),
-                "normal Ahem stack must include uncovered {family} line metrics");
-            assert_eq!(painted_baseline, primary_ascent,
-                "uncovered {family} glyphs share the registered primary strut baseline, not embedding metrics");
+                "normal Ahem stack must include uncovered {family} line metrics"
+            );
+            assert_eq!(
+                painted_baseline, primary_ascent,
+                "uncovered {family} glyphs share the registered primary strut baseline, not embedding metrics"
+            );
         }
     }
 
     #[test]
     fn mirrored_rtl_font_fallback_matches_equivalent_ltr_visual_glyphs() {
-        let mut style = Style { font_size: 16.0, ..Style::default() };
-        style.custom_properties = Some(std::collections::HashMap::from([
-            (w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.to_string(), "1".to_string()),
-        ]));
+        let mut style = Style {
+            font_size: 16.0,
+            ..Style::default()
+        };
+        style.custom_properties = Some(std::collections::HashMap::from([(
+            w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.to_string(),
+            "1".to_string(),
+        )]));
         let face = primary_typeface(TEST_FONT).unwrap();
         let mut captures = Vec::new();
         for (direction, text) in [
@@ -6642,48 +9161,112 @@ mod tests {
             style.direction = direction;
             let mut surface = Surface::new_raster_n32_premul((128, 40)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            draw_text_glyph_line(surface.canvas(), 8.0, 8.0, text, 16.0,
-                w3cos_std::Color::BLACK, 1.0, &face, &style);
+            draw_text_glyph_line(
+                surface.canvas(),
+                8.0,
+                8.0,
+                text,
+                16.0,
+                w3cos_std::Color::BLACK,
+                1.0,
+                &face,
+                &style,
+            );
             let info = ImageInfo::new((128, 40), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 128 * 40 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 128 * 4, (0, 0)));
             captures.push(pixels);
         }
-        let different = captures[0].chunks_exact(4).zip(captures[1].chunks_exact(4))
-            .filter(|(left, right)| left != right).count();
-        assert_eq!(different, 0,
-            "equivalent visual glyphs must retain the same fallback-font origin");
+        let different = captures[0]
+            .chunks_exact(4)
+            .zip(captures[1].chunks_exact(4))
+            .filter(|(left, right)| left != right)
+            .count();
+        assert_eq!(
+            different, 0,
+            "equivalent visual glyphs must retain the same fallback-font origin"
+        );
     }
 
     #[test]
     fn registered_ahem_inline_glyph_covers_its_integer_em_background() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 2026100802290;
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf")).expect("pinned Ahem font");
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wpt/fonts/Ahem.ttf"
+        ))
+        .expect("pinned Ahem font");
         let registry = FontRegistry::global();
-        registry.register_for_owner(OWNER, FontFace { family: "Ahem".into(),
-            src: FontSource::Bytes(bytes), ..Default::default() }).unwrap();
-        let style = Style { display: Display::Inline, font_family: Some("Ahem".into()),
-            font_size: 20.0, line_height: 1.0, line_height_is_normal: false,
-            color: w3cos_std::Color::WHITE, ..Style::default() };
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let style = Style {
+            display: Display::Inline,
+            font_family: Some("Ahem".into()),
+            font_size: 20.0,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            color: w3cos_std::Color::WHITE,
+            ..Style::default()
+        };
         let face = primary_typeface(TEST_FONT).unwrap();
         let mut captures = Vec::new();
         for pipeline in [false, true] {
             let mut surface = Surface::new_raster_n32_premul((40, 90)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            surface.canvas().draw_rect(Rect::from_xywh(8.0, 55.0, 20.0, 20.0),
-                &color_paint(w3cos_std::Color::rgb(255, 0, 0), 1.0));
-            let rect = LayoutRect { x: 8.0, y: 55.0, width: 20.0, height: 20.0 };
+            surface.canvas().draw_rect(
+                Rect::from_xywh(8.0, 55.0, 20.0, 20.0),
+                &color_paint(w3cos_std::Color::rgb(255, 0, 0), 1.0),
+            );
+            let rect = LayoutRect {
+                x: 8.0,
+                y: 55.0,
+                width: 20.0,
+                height: 20.0,
+            };
             if pipeline {
-                render_node_with_line_context(surface.canvas(), 0, rect,
-                    &ComponentKind::Text { content: "A".into() }, &style, &face,
-                    crate::layout::layout_font(), None, false, true, None,
-                    Some(LayoutRect { x: 8.0, y: 54.0, width: 784.0, height: 22.0 }),
-                    true, true, &[], None);
+                render_node_with_line_context(
+                    surface.canvas(),
+                    0,
+                    rect,
+                    &ComponentKind::Text {
+                        content: "A".into(),
+                    },
+                    &style,
+                    &face,
+                    crate::layout::layout_font(),
+                    None,
+                    false,
+                    true,
+                    None,
+                    Some(LayoutRect {
+                        x: 8.0,
+                        y: 54.0,
+                        width: 784.0,
+                        height: 22.0,
+                    }),
+                    true,
+                    true,
+                    &[],
+                    None,
+                );
             } else {
-                draw_text_in_rect(surface.canvas(), rect, "A", &style, &face,
-                    crate::layout::layout_font());
+                draw_text_in_rect(
+                    surface.canvas(),
+                    rect,
+                    "A",
+                    &style,
+                    &face,
+                    crate::layout::layout_font(),
+                );
             }
             let info = ImageInfo::new((40, 90), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 40 * 90 * 4];
@@ -6692,10 +9275,14 @@ mod tests {
         }
         registry.clear_owner(OWNER);
         for (pipeline, pixels) in captures {
-            let red: Vec<_> = (55..75).flat_map(|y| (8..28).map(move |x| (x, y)))
+            let red: Vec<_> = (55..75)
+                .flat_map(|y| (8..28).map(move |x| (x, y)))
                 .filter(|(x, y)| pixels[(y * 40 + x) * 4..(y * 40 + x) * 4 + 4] != [255; 4])
                 .collect();
-            assert!(red.is_empty(), "explicit inline baseline must not be centered again: pipeline={pipeline}, red={red:?}");
+            assert!(
+                red.is_empty(),
+                "explicit inline baseline must not be centered again: pipeline={pipeline}, red={red:?}"
+            );
         }
     }
 
@@ -6703,42 +9290,80 @@ mod tests {
     fn registered_ahem_picture_bounds_preserve_shared_edge_pixels() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 2026101003884;
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf")).expect("pinned Ahem font");
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wpt/fonts/Ahem.ttf"
+        ))
+        .expect("pinned Ahem font");
         let registry = FontRegistry::global();
-        registry.register_for_owner(OWNER, FontFace { family: "Ahem".into(),
-            src: FontSource::Bytes(bytes), ..Default::default() }).unwrap();
-        let style = Style { font_family: Some("Ahem".into()), font_size: 20.0,
-            color: w3cos_std::Color::rgb(255,255,0), ..Style::default() };
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let style = Style {
+            font_family: Some("Ahem".into()),
+            font_size: 20.0,
+            color: w3cos_std::Color::rgb(255, 255, 0),
+            ..Style::default()
+        };
         let (_, face) = registered_typeface_covering(&style, "B").unwrap();
         let mut captures = Vec::new();
-        for bounds in [None, Some(Rect::new(-65.0,-65.0,865.0,295.0)),
-            Some(Rect::new(6.0,26.0,216.0,186.0))] {
-            let mut surface = Surface::new_raster_n32_premul((160,150)).unwrap();
+        for bounds in [
+            None,
+            Some(Rect::new(-65.0, -65.0, 865.0, 295.0)),
+            Some(Rect::new(6.0, 26.0, 216.0, 186.0)),
+        ] {
+            let mut surface = Surface::new_raster_n32_premul((160, 150)).unwrap();
             surface.canvas().clear(Color::BLUE);
-            surface.canvas().draw_rect(Rect::from_xywh(71.0,91.0,40.0,10.0),
-                &color_paint(w3cos_std::Color::rgb(255,165,0),1.0));
+            surface.canvas().draw_rect(
+                Rect::from_xywh(71.0, 91.0, 40.0, 10.0),
+                &color_paint(w3cos_std::Color::rgb(255, 165, 0), 1.0),
+            );
             let draw = |canvas: &Canvas| {
-                draw_ahem_cells(canvas,71.0,101.0,"B",20.0,&style,
-                    &color_paint(style.color,1.0));
+                draw_ahem_cells(
+                    canvas,
+                    71.0,
+                    101.0,
+                    "B",
+                    20.0,
+                    &style,
+                    &color_paint(style.color, 1.0),
+                );
             };
             if let Some(bounds) = bounds {
                 let mut recorder = PictureRecorder::new();
-                draw(recorder.begin_recording(bounds,false));
+                draw(recorder.begin_recording(bounds, false));
                 let picture = recorder.finish_recording_as_picture(None).unwrap();
-                surface.canvas().draw_picture(&picture,None,None);
-            } else { draw(surface.canvas()); }
-            let info = ImageInfo::new((160,150),ColorType::RGBA8888,AlphaType::Premul,None);
-            let mut pixels = vec![0;160*150*4];
-            assert!(surface.read_pixels(&info,&mut pixels,160*4,(0,0)));
-            eprintln!("AHEM_PICTURE_EDGE bounds={bounds:?} left={:?} corner={:?} family={:?}",
-                &pixels[(100*160+70)*4..(100*160+70)*4+4],
-                &pixels[(100*160+71)*4..(100*160+71)*4+4],face.family_name());
+                surface.canvas().draw_picture(&picture, None, None);
+            } else {
+                draw(surface.canvas());
+            }
+            let info = ImageInfo::new((160, 150), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0; 160 * 150 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 160 * 4, (0, 0)));
+            eprintln!(
+                "AHEM_PICTURE_EDGE bounds={bounds:?} left={:?} corner={:?} family={:?}",
+                &pixels[(100 * 160 + 70) * 4..(100 * 160 + 70) * 4 + 4],
+                &pixels[(100 * 160 + 71) * 4..(100 * 160 + 71) * 4 + 4],
+                face.family_name()
+            );
             captures.push(pixels);
         }
         registry.clear_owner(OWNER);
-        assert_eq!(captures[0],captures[1],"recording must preserve direct glyph raster");
-        assert_eq!(captures[0],captures[2],"non-intersecting picture bounds must not change glyph edges");
+        assert_eq!(
+            captures[0], captures[1],
+            "recording must preserve direct glyph raster"
+        );
+        assert_eq!(
+            captures[0], captures[2],
+            "non-intersecting picture bounds must not change glyph edges"
+        );
     }
 
     #[test]
@@ -6751,12 +9376,24 @@ mod tests {
             return;
         };
         let registry = FontRegistry::global();
-        registry.register_for_owner(OWNER, FontFace { family: "Ahem".into(),
-            src: FontSource::Bytes(bytes), ..Default::default() }).unwrap();
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let mut captures = Vec::new();
         for origin in [23.0, 23.375] {
-            let style = Style { font_family: Some("Ahem".into()), font_size: 15.0,
-                font_weight: 400, ..Style::default() };
+            let style = Style {
+                font_family: Some("Ahem".into()),
+                font_size: 15.0,
+                font_weight: 400,
+                ..Style::default()
+            };
             let (_, face) = registered_typeface_covering(&style, "xx xx").unwrap();
             let mut images = Vec::new();
             for reference in [false, true] {
@@ -6764,12 +9401,18 @@ mod tests {
                 surface.canvas().clear(Color::WHITE);
                 let paint = color_paint(w3cos_std::Color::BLACK, 1.0);
                 let advance = if reference {
-                    draw_font_stack_runs(surface.canvas(), origin,
+                    draw_font_stack_runs(
+                        surface.canvas(),
+                        origin,
                         text_baseline(8.0, 15.0, &face, &style, "xx xx"),
-                        "xx xx", 15.0, &face, &style, &paint)
+                        "xx xx",
+                        15.0,
+                        &face,
+                        &style,
+                        &paint,
+                    )
                 } else {
-                    draw_ahem_cells(surface.canvas(), origin, 8.0, "xx xx", 15.0,
-                        &style, &paint)
+                    draw_ahem_cells(surface.canvas(), origin, 8.0, "xx xx", 15.0, &style, &paint)
                 };
                 let info = ImageInfo::new((128, 40), ColorType::RGBA8888, AlphaType::Premul, None);
                 let mut pixels = vec![0_u8; 128 * 40 * 4];
@@ -6781,173 +9424,404 @@ mod tests {
         registry.clear_owner(OWNER);
         for (origin, images) in captures {
             assert_eq!(images[0].0, images[1].0, "registered Ahem advance");
-            assert_eq!(images[0].1.iter().zip(&images[1].1).filter(|(a, b)| a != b).count(), 0,
-                "registered normal face must not substitute snapped rectangles, x={origin}");
+            assert_eq!(
+                images[0]
+                    .1
+                    .iter()
+                    .zip(&images[1].1)
+                    .filter(|(a, b)| a != b)
+                    .count(),
+                0,
+                "registered normal face must not substitute snapped rectangles, x={origin}"
+            );
         }
     }
 
     #[cfg(feature = "dynamic-js")]
     #[test]
     fn overlapping_fractional_ahem_background_covers_previous_glyph_fringe() {
-        use crate::font_face::{FontFace,FontRegistry,FontSource};
-        const OWNER:u64=202610100061;
-        let bytes=std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf")).expect("pinned WPT Ahem");
-        let registry=FontRegistry::global();
-        registry.register_for_owner(OWNER,FontFace{family:"Ahem".into(),
-            src:FontSource::Bytes(bytes),..Default::default()}).unwrap();
-        let style=Style{font_family:Some("Ahem".into()),font_size:10.0,
-            line_height:1.0,..Style::default()};
-        let glyph=color_paint(w3cos_std::Color::rgb(255,165,0),1.0);
-        let aqua=color_paint(w3cos_std::Color::rgb(0,255,255),1.0);
-        let mut samples=Vec::new();
+        use crate::font_face::{FontFace, FontRegistry, FontSource};
+        const OWNER: u64 = 202610100061;
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wpt/fonts/Ahem.ttf"
+        ))
+        .expect("pinned WPT Ahem");
+        let registry = FontRegistry::global();
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let style = Style {
+            font_family: Some("Ahem".into()),
+            font_size: 10.0,
+            line_height: 1.0,
+            ..Style::default()
+        };
+        let glyph = color_paint(w3cos_std::Color::rgb(255, 165, 0), 1.0);
+        let aqua = color_paint(w3cos_std::Color::rgb(0, 255, 255), 1.0);
+        let mut samples = Vec::new();
         for order in 0..3 {
-            let mut surface=Surface::new_raster_n32_premul((800,340)).unwrap();
+            let mut surface = Surface::new_raster_n32_premul((800, 340)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            let background=LayoutRect{x:13.0,y:294.9921875,width:100.0,height:20.0};
-            if order==1 {
-                draw_ahem_cells(surface.canvas(),13.0,294.9921875,"xxxxxxx",10.0,&style,&glyph);
+            let background = LayoutRect {
+                x: 13.0,
+                y: 294.9921875,
+                width: 100.0,
+                height: 20.0,
+            };
+            if order == 1 {
+                draw_ahem_cells(
+                    surface.canvas(),
+                    13.0,
+                    294.9921875,
+                    "xxxxxxx",
+                    10.0,
+                    &style,
+                    &glyph,
+                );
             }
-            draw_rounded_rect(surface.canvas(),background,[0.0;4],&aqua);
-            draw_ahem_cells(surface.canvas(),13.0,294.9921875,"xxxxxxx",10.0,&style,&glyph);
-            if order==2 {
-                draw_ahem_cells(surface.canvas(),13.0,294.9921875,"xxxxxxx",10.0,&style,&glyph);
+            draw_rounded_rect(surface.canvas(), background, [0.0; 4], &aqua);
+            draw_ahem_cells(
+                surface.canvas(),
+                13.0,
+                294.9921875,
+                "xxxxxxx",
+                10.0,
+                &style,
+                &glyph,
+            );
+            if order == 2 {
+                draw_ahem_cells(
+                    surface.canvas(),
+                    13.0,
+                    294.9921875,
+                    "xxxxxxx",
+                    10.0,
+                    &style,
+                    &glyph,
+                );
             }
-            let info=ImageInfo::new((800,340),ColorType::RGBA8888,AlphaType::Premul,None);
-            let mut pixels=vec![0_u8;800*340*4];
-            assert!(surface.read_pixels(&info,&mut pixels,800*4,(0,0)));
-            samples.push((pixels[(295*800+83)*4..(295*800+83)*4+4].to_vec(),
-                pixels[(294*800+53)*4..(294*800+53)*4+4].to_vec()));
+            let info = ImageInfo::new((800, 340), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0_u8; 800 * 340 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 800 * 4, (0, 0)));
+            samples.push((
+                pixels[(295 * 800 + 83) * 4..(295 * 800 + 83) * 4 + 4].to_vec(),
+                pixels[(294 * 800 + 53) * 4..(294 * 800 + 53) * 4 + 4].to_vec(),
+            ));
         }
-        let kinds=[ComponentKind::Text{content:"xxxxxxx".into()},
-            ComponentKind::Text{content:"xxxxxxx xxxx".into()}];
-        let styles=[Style{display:Display::Block,background:w3cos_std::Color::rgb(0,128,128),
-            color:w3cos_std::Color::rgb(255,165,0),..style.clone()},
-            Style{display:Display::Block,background:w3cos_std::Color::rgb(0,255,255),
-            color:w3cos_std::Color::rgb(255,165,0),..style.clone()}];
-        let nodes:Vec<_>=(0..2).map(|index|(index,LayoutRect{x:13.0,y:294.9921875,
-            width:100.0,height:if index==0 {10.0} else {20.0}},&kinds[index],&styles[index])).collect();
-        let mut raster=SkiaRasterizer::new_host().unwrap();
-        let rgba=raster.render_frame(800,340,&nodes,crate::layout::layout_font(),&[],
-            &HashMap::new(),None,w3cos_std::Color::WHITE,None,None,1.0).unwrap();
-        let replay=rgba[(295*800+83)*4..(295*800+83)*4+4].to_vec();
-        let root_kind=ComponentKind::Box;
-        let root_style=Style{display:Display::Block,..Style::default()};
-        let root_rect=LayoutRect{x:0.0,y:0.0,width:800.0,height:340.0};
-        let mut artifact_nodes=vec![crate::paint_artifact::PaintNode{
-            kind:root_kind.clone(),style:root_style.clone(),parent:None,sticky_counter_signal:None}];
-        artifact_nodes.extend((0..2).map(|i|crate::paint_artifact::PaintNode{
-            kind:kinds[i].clone(),style:styles[i].clone(),parent:Some(0),sticky_counter_signal:None}));
-        let mut layouts=vec![(root_rect,0)];
-        layouts.extend(nodes.iter().map(|(index,rect,_,_)|(*rect,index+1)));
-        let artifact=PaintArtifact::build(artifact_nodes,&layouts,1);
-        let frame_nodes=vec![(0,root_rect,&root_kind,&root_style),
-            (1,nodes[0].1,&kinds[0],&styles[0]),(2,nodes[1].1,&kinds[1],&styles[1])];
-        let mut raster=SkiaRasterizer::new_host().unwrap();
-        let rgba=raster.render_frame(800,340,&frame_nodes,crate::layout::layout_font(),&[],
-            &HashMap::new(),None,w3cos_std::Color::WHITE,Some(&artifact),None,1.0).unwrap();
-        let retained=rgba[(295*800+83)*4..(295*800+83)*4+4].to_vec();
+        let kinds = [
+            ComponentKind::Text {
+                content: "xxxxxxx".into(),
+            },
+            ComponentKind::Text {
+                content: "xxxxxxx xxxx".into(),
+            },
+        ];
+        let styles = [
+            Style {
+                display: Display::Block,
+                background: w3cos_std::Color::rgb(0, 128, 128),
+                color: w3cos_std::Color::rgb(255, 165, 0),
+                ..style.clone()
+            },
+            Style {
+                display: Display::Block,
+                background: w3cos_std::Color::rgb(0, 255, 255),
+                color: w3cos_std::Color::rgb(255, 165, 0),
+                ..style.clone()
+            },
+        ];
+        let nodes: Vec<_> = (0..2)
+            .map(|index| {
+                (
+                    index,
+                    LayoutRect {
+                        x: 13.0,
+                        y: 294.9921875,
+                        width: 100.0,
+                        height: if index == 0 { 10.0 } else { 20.0 },
+                    },
+                    &kinds[index],
+                    &styles[index],
+                )
+            })
+            .collect();
+        let mut raster = SkiaRasterizer::new_host().unwrap();
+        let rgba = raster
+            .render_frame(
+                800,
+                340,
+                &nodes,
+                crate::layout::layout_font(),
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::Color::WHITE,
+                None,
+                None,
+                1.0,
+            )
+            .unwrap();
+        let replay = rgba[(295 * 800 + 83) * 4..(295 * 800 + 83) * 4 + 4].to_vec();
+        let root_kind = ComponentKind::Box;
+        let root_style = Style {
+            display: Display::Block,
+            ..Style::default()
+        };
+        let root_rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 340.0,
+        };
+        let mut artifact_nodes = vec![crate::paint_artifact::PaintNode {
+            kind: root_kind.clone(),
+            style: root_style.clone(),
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        artifact_nodes.extend((0..2).map(|i| crate::paint_artifact::PaintNode {
+            kind: kinds[i].clone(),
+            style: styles[i].clone(),
+            parent: Some(0),
+            sticky_counter_signal: None,
+        }));
+        let mut layouts = vec![(root_rect, 0)];
+        layouts.extend(nodes.iter().map(|(index, rect, _, _)| (*rect, index + 1)));
+        let artifact = PaintArtifact::build(artifact_nodes, &layouts, 1);
+        let frame_nodes = vec![
+            (0, root_rect, &root_kind, &root_style),
+            (1, nodes[0].1, &kinds[0], &styles[0]),
+            (2, nodes[1].1, &kinds[1], &styles[1]),
+        ];
+        let mut raster = SkiaRasterizer::new_host().unwrap();
+        let rgba = raster
+            .render_frame(
+                800,
+                340,
+                &frame_nodes,
+                crate::layout::layout_font(),
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::Color::WHITE,
+                Some(&artifact),
+                None,
+                1.0,
+            )
+            .unwrap();
+        let retained = rgba[(295 * 800 + 83) * 4..(295 * 800 + 83) * 4 + 4].to_vec();
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         crate::dom::set_html_document(false);
         crate::jsdom::set_document_content_type("application/xhtml+xml");
-        let _=crate::jsdom::document_value();
-        let source=std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/css/CSS2/css1/c5501-mrgn-t-000.xht")).unwrap();
-        let mut parser=crate::xml_tree_builder::StreamingXmlDocumentParser::from_started_navigation(
-            std::rc::Rc::new(crate::html_parser_host::InertParserScriptHost),
-            "https://example.test/margin.xht");
+        let _ = crate::jsdom::document_value();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wpt/css/CSS2/css1/c5501-mrgn-t-000.xht"
+        ))
+        .unwrap();
+        let mut parser =
+            crate::xml_tree_builder::StreamingXmlDocumentParser::from_started_navigation(
+                std::rc::Rc::new(crate::html_parser_host::InertParserScriptHost),
+                "https://example.test/margin.xht",
+            );
         parser.write(&source).unwrap();
         parser.finish().unwrap();
         // The inert host intentionally does not install stylesheets. Mirror
         // the navigation loader's compiler/owner registration for this XML
         // fixture, without altering its CSS or switching to an HTML parser.
         for node in crate::dom::get_elements_by_tag_name("style") {
-            let css=crate::dom::inner_text(node);
-            for rule in w3cos_compiler::esm_css::parse_css_source(&css,"inline <style>").rules {
-                let declarations:Vec<_>=rule.declarations.iter()
-                    .map(|(property,value)|(property.as_str(),value.as_str())).collect();
-                w3cos_dom::stylesheet::register_rule_for_owner(OWNER,&rule.selector,&declarations);
+            let css = crate::dom::inner_text(node);
+            for rule in w3cos_compiler::esm_css::parse_css_source(&css, "inline <style>").rules {
+                let declarations: Vec<_> = rule
+                    .declarations
+                    .iter()
+                    .map(|(property, value)| (property.as_str(), value.as_str()))
+                    .collect();
+                w3cos_dom::stylesheet::register_rule_for_owner(
+                    OWNER,
+                    &rule.selector,
+                    &declarations,
+                );
             }
         }
-        let root=crate::dom::to_component_tree();
-        let flat=crate::layout::pre_flatten(&root);
-        let layouts=crate::layout::compute(&root,800.0,600.0).unwrap();
-        let body_index=flat.iter().position(|node|matches!(node.on_click,
-            w3cos_std::EventAction::NativeHost{id,..} if *id==u64::from(crate::dom::body_id())));
-        let artifact=PaintArtifact::build_with_body_background_and_viewport(flat.iter().map(|node|crate::paint_artifact::PaintNode{
-            kind:node.kind.clone(),style:node.style.clone(),parent:node.parent,
-            sticky_counter_signal:node.sticky_counter_signal}),&layouts,1,body_index,Some((800.0,600.0)));
-        let mut nodes:Vec<_>=artifact.rect_by_index.iter().enumerate().filter_map(|(index,rect)|{
-            let node=&artifact.nodes[index];
-            rect.map(|rect|(index,rect,&node.kind,&node.style))
-        }).collect();
-        nodes.sort_by(|a,b|artifact.paint_order_key(a.0).cmp(artifact.paint_order_key(b.0)));
-        let table=crate::table_paint::replay(&nodes,&artifact);
-        let table_nodes:Vec<_>=table.iter().map(|node|(node.index,node.rect,
-            node.kind.as_ref(),node.style.as_ref())).collect();
-        let bidi=crate::bidi_paint::replay(&table_nodes,&artifact);
-        let nodes:Vec<_>=bidi.iter().map(|node|(node.index,node.rect,
-            node.kind.as_ref(),node.style.as_ref())).collect();
-        let negative=nodes.iter().find(|(_,_,kind,style)|matches!(kind,ComponentKind::Text{..})
-            && style.margin.top==w3cos_std::style::Spacing::Px(-10.0)).unwrap();
-        let row=negative.1.y.floor() as usize+1;
-        let column=(negative.1.x+70.0) as usize;
-        let mut raster=SkiaRasterizer::new_host().unwrap();
-        let rgba=raster.render_frame(800,600,&nodes,crate::layout::layout_font(),&[],
-            &HashMap::new(),None,w3cos_std::Color::WHITE,Some(&artifact),None,1.0).unwrap();
-        let original=rgba[(row*800+column)*4..(row*800+column)*4+4].to_vec();
-        let live_frame=crate::headless::render_document_rgba(800,600).unwrap();
-        let live=live_frame.rgba[(row*800+column)*4..(row*800+column)*4+4].to_vec();
+        let root = crate::dom::to_component_tree();
+        let flat = crate::layout::pre_flatten(&root);
+        let layouts = crate::layout::compute(&root, 800.0, 600.0).unwrap();
+        let body_index = flat.iter().position(|node| {
+            matches!(node.on_click,
+            w3cos_std::EventAction::NativeHost{id,..} if *id==u64::from(crate::dom::body_id()))
+        });
+        let artifact = PaintArtifact::build_with_body_background_and_viewport(
+            flat.iter().map(|node| crate::paint_artifact::PaintNode {
+                kind: node.kind.clone(),
+                style: node.style.clone(),
+                parent: node.parent,
+                sticky_counter_signal: node.sticky_counter_signal,
+            }),
+            &layouts,
+            1,
+            body_index,
+            Some((800.0, 600.0)),
+        );
+        let mut nodes: Vec<_> = artifact
+            .rect_by_index
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rect)| {
+                let node = &artifact.nodes[index];
+                rect.map(|rect| (index, rect, &node.kind, &node.style))
+            })
+            .collect();
+        nodes.sort_by(|a, b| {
+            artifact
+                .paint_order_key(a.0)
+                .cmp(artifact.paint_order_key(b.0))
+        });
+        let table = crate::table_paint::replay(&nodes, &artifact);
+        let table_nodes: Vec<_> = table
+            .iter()
+            .map(|node| {
+                (
+                    node.index,
+                    node.rect,
+                    node.kind.as_ref(),
+                    node.style.as_ref(),
+                )
+            })
+            .collect();
+        let bidi = crate::bidi_paint::replay(&table_nodes, &artifact);
+        let nodes: Vec<_> = bidi
+            .iter()
+            .map(|node| {
+                (
+                    node.index,
+                    node.rect,
+                    node.kind.as_ref(),
+                    node.style.as_ref(),
+                )
+            })
+            .collect();
+        let negative = nodes
+            .iter()
+            .find(|(_, _, kind, style)| {
+                matches!(kind, ComponentKind::Text { .. })
+                    && style.margin.top == w3cos_std::style::Spacing::Px(-10.0)
+            })
+            .unwrap();
+        let row = negative.1.y.floor() as usize + 1;
+        let column = (negative.1.x + 70.0) as usize;
+        let mut raster = SkiaRasterizer::new_host().unwrap();
+        let rgba = raster
+            .render_frame(
+                800,
+                600,
+                &nodes,
+                crate::layout::layout_font(),
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::Color::WHITE,
+                Some(&artifact),
+                None,
+                1.0,
+            )
+            .unwrap();
+        let original = rgba[(row * 800 + column) * 4..(row * 800 + column) * 4 + 4].to_vec();
+        let live_frame = crate::headless::render_document_rgba(800, 600).unwrap();
+        let live = live_frame.rgba[(row * 800 + column) * 4..(row * 800 + column) * 4 + 4].to_vec();
         w3cos_dom::stylesheet::clear_owner(OWNER);
         registry.clear_owner(OWNER);
-        eprintln!("W3COS_MARGIN_OVERLAP single/interleaved/grouped={samples:?} replay={replay:?} retained={retained:?} original={original:?} rect={:?}",negative.1);
-        assert_eq!(samples[1].0,samples[0].0,
-            "opaque later block background must cover a preceding glyph fringe");
-        assert_eq!(samples[0].0,vec![18,249,237,255],
-            "single foreground coverage control, not browser overlap acceptance");
-        assert_eq!(replay,samples[0].0,"folded block text retains later background coverage");
-        assert_eq!(retained,samples[2].0,"block backgrounds precede both retained foregrounds");
-        assert_eq!(original,samples[2].0,"original folded paragraphs retain both foregrounds");
-        assert_eq!(live,samples[2].0,"live headless replay retains both foregrounds");
+        eprintln!(
+            "W3COS_MARGIN_OVERLAP single/interleaved/grouped={samples:?} replay={replay:?} retained={retained:?} original={original:?} rect={:?}",
+            negative.1
+        );
+        assert_eq!(
+            samples[1].0, samples[0].0,
+            "opaque later block background must cover a preceding glyph fringe"
+        );
+        assert_eq!(
+            samples[0].0,
+            vec![18, 249, 237, 255],
+            "single foreground coverage control, not browser overlap acceptance"
+        );
+        assert_eq!(
+            replay, samples[0].0,
+            "folded block text retains later background coverage"
+        );
+        assert_eq!(
+            retained, samples[2].0,
+            "block backgrounds precede both retained foregrounds"
+        );
+        assert_eq!(
+            original, samples[2].0,
+            "original folded paragraphs retain both foregrounds"
+        );
+        assert_eq!(
+            live, samples[2].0,
+            "live headless replay retains both foregrounds"
+        );
     }
 
     #[cfg(feature = "dynamic-js")]
     #[test]
     fn navigated_negative_margin_ahem_covers_previous_glyph_fringe() {
-        use std::io::{Read,Write};
-        use std::time::{Duration,Instant};
-        use crate::dynamic_script::{DocumentLoader,DocumentLoaderOptions,DocumentLoadProgress,ScriptPolicy};
-        let root=std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"),"/../../../wpt"));
-        let resources=[
-            ("/margin.xht","css/CSS2/css1/c5501-mrgn-t-000.xht","application/xhtml+xml"),
-            ("/fonts/ahem.css","fonts/ahem.css","text/css"),
-            ("/fonts/Ahem.ttf","fonts/Ahem.ttf","font/ttf"),
-        ].map(|(url,path,mime)|(url,std::fs::read(root.join(path)).unwrap(),mime));
-        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address=listener.local_addr().unwrap();
+        use crate::dynamic_script::{
+            DocumentLoadProgress, DocumentLoader, DocumentLoaderOptions, ScriptPolicy,
+        };
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt"));
+        let resources = [
+            (
+                "/margin.xht",
+                "css/CSS2/css1/c5501-mrgn-t-000.xht",
+                "application/xhtml+xml",
+            ),
+            ("/fonts/ahem.css", "fonts/ahem.css", "text/css"),
+            ("/fonts/Ahem.ttf", "fonts/Ahem.ttf", "font/ttf"),
+        ]
+        .map(|(url, path, mime)| (url, std::fs::read(root.join(path)).unwrap(), mime));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        let server=std::thread::spawn(move||{
-            let deadline=Instant::now()+Duration::from_secs(10);
-            let mut served=Vec::new();
-            while served.len()<3 && Instant::now()<deadline {
-                let Ok((mut stream,_))=listener.accept() else {
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = Vec::new();
+            while served.len() < 3 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut request=Vec::new();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
                 loop {
-                    let mut bytes=[0;1024];
-                    let length=stream.read(&mut bytes).unwrap();
-                    if length==0 {break;}
+                    let mut bytes = [0; 1024];
+                    let length = stream.read(&mut bytes).unwrap();
+                    if length == 0 {
+                        break;
+                    }
                     request.extend_from_slice(&bytes[..length]);
-                    if request.windows(4).any(|part|part==b"\r\n\r\n") {break;}
-                    assert!(request.len()<8192);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(request.len() < 8192);
                 }
-                let request=String::from_utf8(request).unwrap();
-                let url=request.split_whitespace().nth(1).unwrap();
-                let (_,body,mime)=resources.iter().find(|resource|resource.0==url)
+                let request = String::from_utf8(request).unwrap();
+                let url = request.split_whitespace().nth(1).unwrap();
+                let (_, body, mime) = resources
+                    .iter()
+                    .find(|resource| resource.0 == url)
                     .expect("only original document and font resources requested");
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
                 stream.write_all(body).unwrap();
@@ -6955,36 +9829,45 @@ mod tests {
             }
             served
         });
-        let mut loader=DocumentLoader::new(ScriptPolicy::default(),DocumentLoaderOptions::default());
-        loader.navigate(&format!("http://{address}/margin.xht")).unwrap();
-        crate::jsdom::set_viewport(800.0,600.0);
-        let deadline=Instant::now()+Duration::from_secs(10);
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/margin.xht"))
+            .unwrap();
+        crate::jsdom::set_viewport(800.0, 600.0);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match loader.poll() {
-                DocumentLoadProgress::Complete=>break,
-                DocumentLoadProgress::Failed(error)=>panic!("navigation failed: {error}"),
-                _=>assert!(Instant::now()<deadline,"navigation timeout"),
+                DocumentLoadProgress::Complete => break,
+                DocumentLoadProgress::Failed(error) => panic!("navigation failed: {error}"),
+                _ => assert!(Instant::now() < deadline, "navigation timeout"),
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        let ready=crate::jsdom::document_value().get_property("fonts").get_property("ready");
+        let ready = crate::jsdom::document_value()
+            .get_property("fonts")
+            .get_property("ready");
         loop {
             crate::dynamic_script::poll_script_fetches();
             crate::jsdom::drain_microtasks();
             match w3cos_core::promise::status(&ready) {
-                Some(w3cos_core::promise::PromiseStatus::Fulfilled(_))=>break,
-                Some(w3cos_core::promise::PromiseStatus::Pending)=>{},
-                _=>panic!("document font readiness failed"),
+                Some(w3cos_core::promise::PromiseStatus::Fulfilled(_)) => break,
+                Some(w3cos_core::promise::PromiseStatus::Pending) => {}
+                _ => panic!("document font readiness failed"),
             }
-            assert!(Instant::now()<deadline,"font timeout");
+            assert!(Instant::now() < deadline, "font timeout");
             std::thread::sleep(Duration::from_millis(1));
         }
-        let frame=crate::headless::render_document_rgba(800,600).unwrap();
-        let fringe=frame.rgba[(295*800+83)*4..(295*800+83)*4+4].to_vec();
-        let served=server.join().unwrap();
+        let frame = crate::headless::render_document_rgba(800, 600).unwrap();
+        let fringe = frame.rgba[(295 * 800 + 83) * 4..(295 * 800 + 83) * 4 + 4].to_vec();
+        let served = server.join().unwrap();
         drop(loader);
-        assert_eq!(served.len(),3,"original linked Ahem resource loaded");
-        assert_eq!(fringe,vec![35,243,220,255],"browser actual capture V3973 retains both overlapping foregrounds");
+        assert_eq!(served.len(), 3, "original linked Ahem resource loaded");
+        assert_eq!(
+            fringe,
+            vec![35, 243, 220, 255],
+            "browser actual capture V3973 retains both overlapping foregrounds"
+        );
     }
 
     #[test]
@@ -6997,26 +9880,53 @@ mod tests {
             return;
         };
         let registry = FontRegistry::global();
-        registry.register_for_owner(OWNER, FontFace { family: "Ahem".into(),
-            src: FontSource::Bytes(bytes), ..Default::default() }).unwrap();
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let face = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let mut images = Vec::new();
         let mut advances = Vec::new();
         for weight in [400, 900] {
-            let style = Style { font_family: Some("Ahem".into()), font_size: 24.0,
-                font_weight: weight, ..Style::default() };
+            let style = Style {
+                font_family: Some("Ahem".into()),
+                font_size: 24.0,
+                font_weight: weight,
+                ..Style::default()
+            };
             let mut surface = Surface::new_raster_n32_premul((96, 64)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            advances.push(draw_text_line(surface.canvas(), 8.375, 8.0, "XX", 24.0,
-                w3cos_std::Color::BLACK, 1.0, &face, &style));
+            advances.push(draw_text_line(
+                surface.canvas(),
+                8.375,
+                8.0,
+                "XX",
+                24.0,
+                w3cos_std::Color::BLACK,
+                1.0,
+                &face,
+                &style,
+            ));
             let info = ImageInfo::new((96, 64), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![255_u8; 96 * 64 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 96 * 4, (0, 0)));
             images.push(pixels);
         }
         registry.clear_owner(OWNER);
-        assert_eq!(advances[0], advances[1], "synthetic bold must not expand the text advance");
-        assert_ne!(images[0], images[1], "registered normal face ignored requested synthetic bold");
+        assert_eq!(
+            advances[0], advances[1],
+            "synthetic bold must not expand the text advance"
+        );
+        assert_ne!(
+            images[0], images[1],
+            "registered normal face ignored requested synthetic bold"
+        );
     }
 
     #[test]
@@ -7024,13 +9934,15 @@ mod tests {
         use w3cos_std::style::{Float, Position, TextDecoration};
         for boundary in ["flow", "inline-block", "float", "absolute"] {
             let owner = Style {
-                display: Display::Block, font_size: 16.0,
+                display: Display::Block,
+                font_size: 16.0,
                 color: w3cos_std::Color::rgb(0, 128, 0),
                 text_decoration: TextDecoration::Underline,
                 ..Style::default()
             };
             let mut child = Style {
-                display: Display::Inline, font_size: 24.0,
+                display: Display::Inline,
+                font_size: 24.0,
                 color: w3cos_std::Color::rgb(0, 0, 255),
                 ..Style::default()
             };
@@ -7040,27 +9952,71 @@ mod tests {
                 "absolute" => child.position = Position::Absolute,
                 _ => {}
             }
-            let kinds = [ComponentKind::Box, ComponentKind::Text { content: "    ".into() }];
+            let kinds = [
+                ComponentKind::Box,
+                ComponentKind::Text {
+                    content: "    ".into(),
+                },
+            ];
             let styles = [owner, child];
             let rects = [
-                LayoutRect { x: 8.0, y: 8.0, width: 100.0, height: 40.0 },
-                LayoutRect { x: 8.0, y: 8.0, width: 80.0, height: 28.8 },
+                LayoutRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                LayoutRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 80.0,
+                    height: 28.8,
+                },
             ];
             let layouts = [(rects[0], 0), (rects[1], 1)];
-            let artifact = PaintArtifact::build((0..2).map(|i| crate::paint_artifact::PaintNode {
-                kind: kinds[i].clone(), style: styles[i].clone(),
-                parent: if i == 0 { None } else { Some(0) }, sticky_counter_signal: None,
-            }), &layouts, 1);
-            let nodes = [(0, rects[0], &kinds[0], &styles[0]), (1, rects[1], &kinds[1], &styles[1])];
+            let artifact = PaintArtifact::build(
+                (0..2).map(|i| crate::paint_artifact::PaintNode {
+                    kind: kinds[i].clone(),
+                    style: styles[i].clone(),
+                    parent: if i == 0 { None } else { Some(0) },
+                    sticky_counter_signal: None,
+                }),
+                &layouts,
+                1,
+            );
+            let nodes = [
+                (0, rects[0], &kinds[0], &styles[0]),
+                (1, rects[1], &kinds[1], &styles[1]),
+            ];
             let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-            let pixels = rasterizer.render_frame(128, 64, &nodes, &test_font(), &[],
-                &HashMap::new(), None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
-            let rows = (0..64).filter(|y| (0..128).any(|x| {
-                let pixel = &pixels[(y * 128 + x) * 4..(y * 128 + x) * 4 + 3];
-                pixel == [0, 128, 0]
-            })).count();
-            assert_eq!(rows, if boundary == "flow" { 1 } else { 0 },
-                "owner underline thickness/color or isolation lost for {boundary}");
+            let pixels = rasterizer
+                .render_frame(
+                    128,
+                    64,
+                    &nodes,
+                    &test_font(),
+                    &[],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap();
+            let rows = (0..64)
+                .filter(|y| {
+                    (0..128).any(|x| {
+                        let pixel = &pixels[(y * 128 + x) * 4..(y * 128 + x) * 4 + 3];
+                        pixel == [0, 128, 0]
+                    })
+                })
+                .count();
+            assert_eq!(
+                rows,
+                if boundary == "flow" { 1 } else { 0 },
+                "owner underline thickness/color or isolation lost for {boundary}"
+            );
         }
     }
 
@@ -7084,18 +10040,25 @@ mod tests {
             let mut surface = Surface::new_raster_n32_premul((128, 80)).unwrap();
             surface.canvas().clear(Color::WHITE);
             let advance = draw_text_line(
-                surface.canvas(), 8.0, 16.0, "    ", 32.0,
-                w3cos_std::Color::BLACK, 1.0, &typeface, &style,
+                surface.canvas(),
+                8.0,
+                16.0,
+                "    ",
+                32.0,
+                w3cos_std::Color::BLACK,
+                1.0,
+                &typeface,
+                &style,
             );
             let expected_advance = *undecorated_advance.get_or_insert(advance);
             assert_eq!(advance, expected_advance, "decoration changed text advance");
-            let info = ImageInfo::new(
-                (128, 80), ColorType::RGBA8888, AlphaType::Premul, None,
-            );
+            let info = ImageInfo::new((128, 80), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![255_u8; 128 * 80 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 128 * 4, (0, 0)));
-            let painted = pixels.chunks_exact(4)
-                .filter(|pixel| pixel[..3] != [255, 255, 255]).count();
+            let painted = pixels
+                .chunks_exact(4)
+                .filter(|pixel| pixel[..3] != [255, 255, 255])
+                .count();
             if decoration == TextDecoration::None {
                 assert_eq!(painted, 0, "spaces unexpectedly painted glyphs");
             } else {
@@ -7113,32 +10076,97 @@ mod tests {
         use crate::paint_artifact::PaintNode;
         use w3cos_std::style::{ColumnFill, Dimension};
         let kind = ComponentKind::Column;
-        let root_style = Style { display: Display::Block, width: Dimension::Px(300.0),
-            height: Dimension::Px(100.0), column_width: Dimension::Px(100.0),
-            column_gap: Some(0.0), column_fill: ColumnFill::Auto, ..Style::default() };
-        let child_style = Style { display: Display::Block,
+        let root_style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            height: Dimension::Px(100.0),
+            column_width: Dimension::Px(100.0),
+            column_gap: Some(0.0),
+            column_fill: ColumnFill::Auto,
+            ..Style::default()
+        };
+        let child_style = Style {
+            display: Display::Block,
             background: w3cos_std::Color::rgb(0, 255, 255),
-            border_bottom_width: Some(3.0), border_color: w3cos_std::Color::rgb(255, 128, 0),
-            ..Style::default() };
-        let root = LayoutRect { x: 0.0, y: 0.0, width: 300.0, height: 100.0 };
-        let child = LayoutRect { x: 0.0, y: 0.0, width: 15.0, height: 250.0 };
-        let artifact = PaintArtifact::build([
-            PaintNode { kind: kind.clone(), style: root_style.clone(), parent: None, sticky_counter_signal: None },
-            PaintNode { kind: kind.clone(), style: child_style.clone(), parent: Some(0), sticky_counter_signal: None },
-        ], &[(root, 0), (child, 1)], 1);
-        let nodes = [(0, root, &kind, &root_style), (1, child, &kind, &child_style)];
+            border_bottom_width: Some(3.0),
+            border_color: w3cos_std::Color::rgb(255, 128, 0),
+            ..Style::default()
+        };
+        let root = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 300.0,
+            height: 100.0,
+        };
+        let child = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 15.0,
+            height: 250.0,
+        };
+        let artifact = PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: kind.clone(),
+                    style: root_style.clone(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: kind.clone(),
+                    style: child_style.clone(),
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[(root, 0), (child, 1)],
+            1,
+        );
+        let nodes = [
+            (0, root, &kind, &root_style),
+            (1, child, &kind, &child_style),
+        ];
         let font = test_font();
         let values = HashMap::new();
         let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
         for _ in 0..2 {
-            let rgba = rasterizer.render_frame(300, 300, &nodes, &font, &[], &values,
-                None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
+            let rgba = rasterizer
+                .render_frame(
+                    300,
+                    300,
+                    &nodes,
+                    &font,
+                    &[],
+                    &values,
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap();
             let pixel = |x: usize, y: usize| &rgba[(y * 300 + x) * 4..(y * 300 + x) * 4 + 4];
-            for x in [5, 105, 205] { assert_eq!(pixel(x, 25), &[0, 255, 255, 255]); }
-            for x in [5, 105] { assert_eq!(pixel(x, 99), &[0, 255, 255, 255], "border repeated at column break"); }
-            assert_eq!(pixel(205, 49), &[255, 128, 0, 255], "bottom border must appear only at final slice");
+            for x in [5, 105, 205] {
+                assert_eq!(pixel(x, 25), &[0, 255, 255, 255]);
+            }
+            for x in [5, 105] {
+                assert_eq!(
+                    pixel(x, 99),
+                    &[0, 255, 255, 255],
+                    "border repeated at column break"
+                );
+            }
+            assert_eq!(
+                pixel(205, 49),
+                &[255, 128, 0, 255],
+                "bottom border must appear only at final slice"
+            );
             assert_eq!(pixel(205, 75), &[255, 255, 255, 255]);
-            assert_eq!(pixel(5, 150), &[255, 255, 255, 255], "unfragmented paint leaked below column");
+            assert_eq!(
+                pixel(5, 150),
+                &[255, 255, 255, 255],
+                "unfragmented paint leaked below column"
+            );
         }
     }
 
@@ -7146,57 +10174,186 @@ mod tests {
     fn first_line_background_uses_principal_font_box_across_large_glyph() {
         use crate::paint_artifact::PaintNode;
         for background_image in [None, Some("none")] {
-        let text_style = |size| Style { display: Display::Inline,
-            font_family: Some("Ahem".into()), font_size: size, line_height: 1.0,
-            background_image: background_image.map(str::to_owned),
-            line_height_is_normal: false, background: w3cos_std::Color::rgb(255, 0, 0),
-            color: w3cos_std::Color::rgb(0, 128, 0),
-            custom_properties: Some(HashMap::from([
-                ("--w3cos-internal-inline-background-group".into(), "first-line".into()),
-            ])), ..Style::default() };
-        let kinds = [ComponentKind::Box, ComponentKind::Text { content: "X".into() },
-            ComponentKind::Text { content: "p".into() }, ComponentKind::Text { content: "X".into() }];
-        let styles = [Style { display: Display::Block, font_family: Some("Ahem".into()),
-            font_size: 20.0, ..Style::default() }, text_style(20.0), text_style(100.0), text_style(20.0)];
-        let rects = [LayoutRect { x: 8.0, y: 0.0, width: 140.0, height: 100.0 },
-            LayoutRect { x: 8.0, y: 80.0, width: 20.0, height: 20.0 },
-            LayoutRect { x: 28.0, y: 0.0, width: 100.0, height: 100.0 },
-            LayoutRect { x: 128.0, y: 80.0, width: 20.0, height: 20.0 }];
-        let layouts = rects.iter().copied().enumerate().map(|(i,r)| (r,i)).collect::<Vec<_>>();
-        let artifact = PaintArtifact::build((0..4).map(|i| PaintNode {
-            kind: kinds[i].clone(), style: styles[i].clone(),
-            parent: (i != 0).then_some(0), sticky_counter_signal: None,
-        }), &layouts, 1);
-        let nodes = (0..4).map(|i| (i, rects[i], &kinds[i], &styles[i])).collect::<Vec<_>>();
-        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-        let pixels = rasterizer.render_frame(160, 110, &nodes, &test_font(), &[],
-            &HashMap::new(), None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
-        let pixel = |x: usize,y: usize| &pixels[(y*160+x)*4..(y*160+x)*4+4];
-        assert_eq!(pixel(30, 10), &[255,255,255,255], "large glyph must not enlarge pseudo background");
-        assert_eq!(pixel(30, 90), &[0,128,0,255], "large glyph keeps its independent ink position");
+            let text_style = |size| Style {
+                display: Display::Inline,
+                font_family: Some("Ahem".into()),
+                font_size: size,
+                line_height: 1.0,
+                background_image: background_image.map(str::to_owned),
+                line_height_is_normal: false,
+                background: w3cos_std::Color::rgb(255, 0, 0),
+                color: w3cos_std::Color::rgb(0, 128, 0),
+                custom_properties: Some(HashMap::from([(
+                    "--w3cos-internal-inline-background-group".into(),
+                    "first-line".into(),
+                )])),
+                ..Style::default()
+            };
+            let kinds = [
+                ComponentKind::Box,
+                ComponentKind::Text {
+                    content: "X".into(),
+                },
+                ComponentKind::Text {
+                    content: "p".into(),
+                },
+                ComponentKind::Text {
+                    content: "X".into(),
+                },
+            ];
+            let styles = [
+                Style {
+                    display: Display::Block,
+                    font_family: Some("Ahem".into()),
+                    font_size: 20.0,
+                    ..Style::default()
+                },
+                text_style(20.0),
+                text_style(100.0),
+                text_style(20.0),
+            ];
+            let rects = [
+                LayoutRect {
+                    x: 8.0,
+                    y: 0.0,
+                    width: 140.0,
+                    height: 100.0,
+                },
+                LayoutRect {
+                    x: 8.0,
+                    y: 80.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                LayoutRect {
+                    x: 28.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                LayoutRect {
+                    x: 128.0,
+                    y: 80.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+            ];
+            let layouts = rects
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, r)| (r, i))
+                .collect::<Vec<_>>();
+            let artifact = PaintArtifact::build(
+                (0..4).map(|i| PaintNode {
+                    kind: kinds[i].clone(),
+                    style: styles[i].clone(),
+                    parent: (i != 0).then_some(0),
+                    sticky_counter_signal: None,
+                }),
+                &layouts,
+                1,
+            );
+            let nodes = (0..4)
+                .map(|i| (i, rects[i], &kinds[i], &styles[i]))
+                .collect::<Vec<_>>();
+            let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+            let pixels = rasterizer
+                .render_frame(
+                    160,
+                    110,
+                    &nodes,
+                    &test_font(),
+                    &[],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap();
+            let pixel = |x: usize, y: usize| &pixels[(y * 160 + x) * 4..(y * 160 + x) * 4 + 4];
+            assert_eq!(
+                pixel(30, 10),
+                &[255, 255, 255, 255],
+                "large glyph must not enlarge pseudo background"
+            );
+            assert_eq!(
+                pixel(30, 90),
+                &[0, 128, 0, 255],
+                "large glyph keeps its independent ink position"
+            );
         }
     }
 
     #[test]
     fn resolved_inline_border_font_box_does_not_snap_to_parent_line_top() {
         use crate::paint_artifact::PaintNode;
-        let style = Style { display: Display::Inline, font_size: 20.0,
-            font_family: Some("Ahem".into()), line_height: 1.0,
-            line_height_is_normal: false, border_width: 2.0,
-            border_color: w3cos_std::Color::rgb(0, 0, 255), ..Style::default() };
+        let style = Style {
+            display: Display::Inline,
+            font_size: 20.0,
+            font_family: Some("Ahem".into()),
+            line_height: 1.0,
+            line_height_is_normal: false,
+            border_width: 2.0,
+            border_color: w3cos_std::Color::rgb(0, 0, 255),
+            ..Style::default()
+        };
         let font_height = crate::layout::inline_font_height(&style);
-        let rect = LayoutRect { x: 8.0, y: 75.0, width: 364.0, height: font_height + 4.0 };
-        let parent = LayoutRect { x: 8.0, y: 76.0, width: 784.0, height: font_height + 2.0 };
-        let child = LayoutRect { x: 10.0, y: 77.0, width: 120.0, height: font_height };
+        let rect = LayoutRect {
+            x: 8.0,
+            y: 75.0,
+            width: 364.0,
+            height: font_height + 4.0,
+        };
+        let parent = LayoutRect {
+            x: 8.0,
+            y: 76.0,
+            width: 784.0,
+            height: font_height + 2.0,
+        };
+        let child = LayoutRect {
+            x: 10.0,
+            y: 77.0,
+            width: 120.0,
+            height: font_height,
+        };
         let kind = ComponentKind::Row;
-        let artifact = PaintArtifact::build(vec![
-            PaintNode { kind: kind.clone(), style: Style::default(), parent: None, sticky_counter_signal: None },
-            PaintNode { kind: kind.clone(), style: style.clone(), parent: Some(0), sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "XXXXXX".into() },
-                style: Style { border_width: 0.0, ..style.clone() }, parent: Some(1), sticky_counter_signal: None },
-        ], &[(parent, 0), (rect, 1), (child, 2)], 1);
-        assert_eq!(inline_background_union_rect(Some(&artifact), 1, rect, &kind, &style), rect,
-            "a resolved inline font/edge box is independent of the containing strut top");
+        let artifact = PaintArtifact::build(
+            vec![
+                PaintNode {
+                    kind: kind.clone(),
+                    style: Style::default(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: kind.clone(),
+                    style: style.clone(),
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Text {
+                        content: "XXXXXX".into(),
+                    },
+                    style: Style {
+                        border_width: 0.0,
+                        ..style.clone()
+                    },
+                    parent: Some(1),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[(parent, 0), (rect, 1), (child, 2)],
+            1,
+        );
+        assert_eq!(
+            inline_background_union_rect(Some(&artifact), 1, rect, &kind, &style),
+            rect,
+            "a resolved inline font/edge box is independent of the containing strut top"
+        );
     }
 
     #[test]
@@ -7216,20 +10373,51 @@ mod tests {
             ..style.clone()
         };
         let kind = ComponentKind::Row;
-        let rect = LayoutRect { x: 0.0, y: 80.0, width: 140.0, height: 20.0 };
-        let child_rect = LayoutRect { x: 20.0, y: 0.0, width: 100.0, height: 100.0 };
-        let artifact = crate::paint_artifact::PaintArtifact::build(vec![
-            PaintNode { kind: kind.clone(), style: style.clone(), parent: None, sticky_counter_signal: None },
-            PaintNode { kind: ComponentKind::Text { content: "p".into() }, style: child_style, parent: Some(0), sticky_counter_signal: None },
-        ], &[(rect, 0), (child_rect, 1)], 1);
-        assert_eq!(inline_background_union_rect(Some(&artifact), 0, rect, &kind, &style), rect);
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 80.0,
+            width: 140.0,
+            height: 20.0,
+        };
+        let child_rect = LayoutRect {
+            x: 20.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let artifact = crate::paint_artifact::PaintArtifact::build(
+            vec![
+                PaintNode {
+                    kind: kind.clone(),
+                    style: style.clone(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Text {
+                        content: "p".into(),
+                    },
+                    style: child_style,
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[(rect, 0), (child_rect, 1)],
+            1,
+        );
+        assert_eq!(
+            inline_background_union_rect(Some(&artifact), 0, rect, &kind, &style),
+            rect
+        );
     }
 
     #[test]
     fn overlapping_absolute_text_keeps_ink_under_later_whitespace() {
         use crate::paint_artifact::PaintNode;
         let parent = ComponentKind::Box;
-        let earlier = ComponentKind::Text { content: "X".into() };
+        let earlier = ComponentKind::Text {
+            content: "X".into(),
+        };
         let parent_style = Style::default();
         let style = Style {
             position: w3cos_std::style::Position::Absolute,
@@ -7240,36 +10428,77 @@ mod tests {
             white_space: w3cos_std::style::WhiteSpace::Pre,
             ..Style::default()
         };
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 160.0, height: 40.0 };
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 160.0,
+            height: 40.0,
+        };
         let font = test_font();
         let render = |later: Option<&ComponentKind>| {
             let mut paint_nodes = vec![
-                PaintNode { kind: parent.clone(), style: parent_style.clone(), parent: None, sticky_counter_signal: None },
-                PaintNode { kind: earlier.clone(), style: style.clone(), parent: Some(0), sticky_counter_signal: None },
+                PaintNode {
+                    kind: parent.clone(),
+                    style: parent_style.clone(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: earlier.clone(),
+                    style: style.clone(),
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
             ];
             let mut layouts = vec![(rect, 0), (rect, 1)];
-            let mut nodes = vec![(0, rect, &parent, &parent_style), (1, rect, &earlier, &style)];
+            let mut nodes = vec![
+                (0, rect, &parent, &parent_style),
+                (1, rect, &earlier, &style),
+            ];
             if let Some(later) = later {
-                paint_nodes.push(PaintNode { kind: later.clone(), style: style.clone(), parent: Some(0), sticky_counter_signal: None });
+                paint_nodes.push(PaintNode {
+                    kind: later.clone(),
+                    style: style.clone(),
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                });
                 layouts.push((rect, 2));
                 nodes.push((2, rect, later, &style));
             }
             let artifact = PaintArtifact::build(paint_nodes, &layouts, 1);
-            SkiaRasterizer::new(TEST_FONT).unwrap().render_frame(
-                160, 40, &nodes, &font, &[], &HashMap::new(), None,
-                w3cos_std::Color::WHITE, Some(&artifact), None, 1.0,
-            ).unwrap().to_vec()
+            SkiaRasterizer::new(TEST_FONT)
+                .unwrap()
+                .render_frame(
+                    160,
+                    40,
+                    &nodes,
+                    &font,
+                    &[],
+                    &HashMap::new(),
+                    None,
+                    w3cos_std::Color::WHITE,
+                    Some(&artifact),
+                    None,
+                    1.0,
+                )
+                .unwrap()
+                .to_vec()
         };
         let earlier_pixels = render(None);
         assert!(earlier_pixels.chunks_exact(4).any(|pixel| pixel[0] < 200));
         for content in ["          ", "          X"] {
-            let later = ComponentKind::Text { content: content.into() };
+            let later = ComponentKind::Text {
+                content: content.into(),
+            };
             let combined = render(Some(&later));
             for y in 0..40 {
                 for x in 0..20 {
                     let offset = (y * 160 + x) * 4;
-                    assert_eq!(&combined[offset..offset + 4], &earlier_pixels[offset..offset + 4],
-                        "earlier ink must survive transparent later whitespace at ({x},{y}), later={content:?}");
+                    assert_eq!(
+                        &combined[offset..offset + 4],
+                        &earlier_pixels[offset..offset + 4],
+                        "earlier ink must survive transparent later whitespace at ({x},{y}), later={content:?}"
+                    );
                 }
             }
         }
@@ -7504,8 +10733,10 @@ mod tests {
     fn resolved_system_font_geometry_matches_browser_normal_box() {
         for line_height in [1.0, 1.2, 2.0] {
             let style = Style {
-                font_family: Some("serif".into()), font_size: 16.0,
-                line_height, ..Style::default()
+                font_family: Some("serif".into()),
+                font_size: 16.0,
+                line_height,
+                ..Style::default()
             };
             let metrics = resolved_font_geometry(&style).expect("system Times face");
             assert_eq!(metrics.ascent, 14.0);
@@ -7513,13 +10744,29 @@ mod tests {
             assert_eq!(metrics.height(), 18.0);
             assert_eq!(metrics.line_spacing(), 18.0);
         }
-        assert!(resolved_font_geometry(&Style { font_size: 0.0, ..Style::default() }).is_none());
+        assert!(
+            resolved_font_geometry(&Style {
+                font_size: 0.0,
+                ..Style::default()
+            })
+            .is_none()
+        );
     }
 
     #[test]
     fn continuation_inline_text_preserves_its_projected_line_origin() {
-        let line = LayoutRect { x: 0.0, y: 50.0, width: 200.0, height: 54.0 };
-        let text = |y| LayoutRect { x: 0.0, y, width: 40.0, height: 18.0 };
+        let line = LayoutRect {
+            x: 0.0,
+            y: 50.0,
+            width: 200.0,
+            height: 54.0,
+        };
+        let text = |y| LayoutRect {
+            x: 0.0,
+            y,
+            width: 40.0,
+            height: 18.0,
+        };
         assert!(inline_text_is_in_first_strut(text(50.0), line, 18.0));
         assert!(inline_text_is_in_first_strut(text(51.0), line, 18.0));
         assert!(!inline_text_is_in_first_strut(text(68.0), line, 18.0));
@@ -7532,25 +10779,54 @@ mod tests {
         let typeface = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         for (normal, top_aligned) in [(false, false), (false, true), (true, false), (true, true)] {
             let mut style = Style {
-                display: Display::Inline, font_family: Some("Ahem".into()),
-                font_size: 16.0, line_height: 1.0, color: w3cos_std::Color::BLACK,
+                display: Display::Inline,
+                font_family: Some("Ahem".into()),
+                font_size: 16.0,
+                line_height: 1.0,
+                color: w3cos_std::Color::BLACK,
                 line_height_is_normal: normal,
                 ..Style::default()
             };
             if top_aligned {
-                style.custom_properties.get_or_insert_with(Default::default).insert(
-                    "--w3cos-internal-vertical-align-keyword".into(), "top".into(),
-                );
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-vertical-align-keyword".into(),
+                        "top".into(),
+                    );
             }
             let mut surface = Surface::new_raster_n32_premul((64, 48)).unwrap();
             surface.canvas().clear(Color::WHITE);
             render_node_with_line_context(
-                surface.canvas(), 0,
-                LayoutRect { x: 4.0, y: 7.0, width: 16.0, height: 16.0 },
-                &ComponentKind::Text { content: "X".into() }, &style, &typeface,
-                crate::layout::layout_font(), None, false, true, None,
-                Some(LayoutRect { x: 0.0, y: 0.0, width: 64.0, height: 40.0 }),
-                true, true, &[], None,
+                surface.canvas(),
+                0,
+                LayoutRect {
+                    x: 4.0,
+                    y: 7.0,
+                    width: 16.0,
+                    height: 16.0,
+                },
+                &ComponentKind::Text {
+                    content: "X".into(),
+                },
+                &style,
+                &typeface,
+                crate::layout::layout_font(),
+                None,
+                false,
+                true,
+                None,
+                Some(LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 40.0,
+                }),
+                true,
+                true,
+                &[],
+                None,
             );
             let info = ImageInfo::new((64, 48), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 64 * 48 * 4];
@@ -7560,8 +10836,11 @@ mod tests {
             // branch covered separately rather than asserting it for both.
             let top = if normal && !top_aligned { 19 } else { 7 };
             for (y, red) in [(top - 1, 255), (top, 0), (top + 15, 0), (top + 16, 255)] {
-                assert_eq!(pixels[(y * 64 + 10) * 4], red,
-                    "normal={normal}, top_aligned={top_aligned}, y={y}");
+                assert_eq!(
+                    pixels[(y * 64 + 10) * 4],
+                    red,
+                    "normal={normal}, top_aligned={top_aligned}, y={y}"
+                );
             }
         }
     }
@@ -7578,18 +10857,42 @@ mod tests {
                 background: w3cos_std::Color::rgb(0, 128, 0),
                 ..Style::default()
             };
-            style.custom_properties.get_or_insert_with(Default::default).insert(
-                "--w3cos-internal-vertical-align-keyword".into(), "top".into(),
-            );
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-vertical-align-keyword".into(),
+                    "top".into(),
+                );
             let mut surface = Surface::new_raster_n32_premul((64, 48)).unwrap();
             surface.canvas().clear(Color::WHITE);
             render_node_with_line_context(
-                surface.canvas(), 0,
-                LayoutRect { x: 4.0, y: 7.0, width: 40.0, height: 16.0 },
-                &ComponentKind::Row, &style, &typeface, crate::layout::layout_font(),
-                None, false, true, None,
-                Some(LayoutRect { x: 0.0, y: 0.0, width: 64.0, height: 40.0 }),
-                false, true, &[], None,
+                surface.canvas(),
+                0,
+                LayoutRect {
+                    x: 4.0,
+                    y: 7.0,
+                    width: 40.0,
+                    height: 16.0,
+                },
+                &ComponentKind::Row,
+                &style,
+                &typeface,
+                crate::layout::layout_font(),
+                None,
+                false,
+                true,
+                None,
+                Some(LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 40.0,
+                }),
+                false,
+                true,
+                &[],
+                None,
             );
             let info = ImageInfo::new((64, 48), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 64 * 48 * 4];
@@ -7601,8 +10904,11 @@ mod tests {
                 (23, [255, 255, 255, 255]),
                 (39, [255, 255, 255, 255]),
             ] {
-                assert_eq!(&pixels[(y * 64 + 10) * 4..(y * 64 + 10) * 4 + 4], &expected,
-                    "top-aligned sample y={y}, normal={normal}");
+                assert_eq!(
+                    &pixels[(y * 64 + 10) * 4..(y * 64 + 10) * 4 + 4],
+                    &expected,
+                    "top-aligned sample y={y}, normal={normal}"
+                );
             }
         }
     }
@@ -7623,12 +10929,32 @@ mod tests {
             let mut surface = Surface::new_raster_n32_premul((64, 48)).unwrap();
             surface.canvas().clear(Color::WHITE);
             render_node_with_line_context(
-                surface.canvas(), 0,
-                LayoutRect { x: 4.0, y: 12.0, width: 40.0, height: 16.0 },
-                &ComponentKind::Row, &style, &typeface, crate::layout::layout_font(),
-                None, false, true, None,
-                Some(LayoutRect { x: 0.0, y: 0.0, width: 64.0, height: 40.0 }),
-                false, has_content, &[], None,
+                surface.canvas(),
+                0,
+                LayoutRect {
+                    x: 4.0,
+                    y: 12.0,
+                    width: 40.0,
+                    height: 16.0,
+                },
+                &ComponentKind::Row,
+                &style,
+                &typeface,
+                crate::layout::layout_font(),
+                None,
+                false,
+                true,
+                None,
+                Some(LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 40.0,
+                }),
+                false,
+                has_content,
+                &[],
+                None,
             );
             let info = ImageInfo::new((64, 48), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 64 * 48 * 4];
@@ -7641,8 +10967,11 @@ mod tests {
                 (20, 12, [255, 255, 255, 255]),
                 (20, 27, [255, 255, 255, 255]),
             ] {
-                assert_eq!(&pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4], &expected,
-                    "side-border sample ({x},{y}), content={has_content}");
+                assert_eq!(
+                    &pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4],
+                    &expected,
+                    "side-border sample ({x},{y}), content={has_content}"
+                );
             }
         }
     }
@@ -7720,26 +11049,47 @@ mod tests {
     #[test]
     fn html_unresolved_font_stack_uses_standard_context_not_explicit_serif() {
         let mut standard = w3cos_dom::user_agent::html_default_style("html");
-        standard.custom_properties.get_or_insert_with(Default::default)
-            .insert(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(), "zh-CN".into());
+        standard
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY.into(),
+                "zh-CN".into(),
+            );
         let expected = generic_serif_typeface(&standard).expect("HTML standard face");
         // DEFAULT Chromium141 original unresolved-family pages and references,
         // screenshot-bound V2088: PingFang SC with a22px normal16px line box.
         assert_eq!(expected.family_name(), "PingFang SC");
-        for stack in ["Definitely Missing Font Family", "Missing Font One, Missing Font Two"] {
-            let style = Style { font_family: Some(stack.into()), ..standard.clone() };
+        for stack in [
+            "Definitely Missing Font Family",
+            "Missing Font One, Missing Font Two",
+        ] {
+            let style = Style {
+                font_family: Some(stack.into()),
+                ..standard.clone()
+            };
             let actual = generic_serif_typeface(&style).expect("unresolved stack fallback");
             assert_eq!(actual.family_name(), expected.family_name(), "{stack}");
             let geometry = resolved_font_geometry(&style).unwrap().normal_line_box();
             let expected_geometry = resolved_font_geometry(&standard).unwrap().normal_line_box();
             assert_eq!(geometry.ascent, expected_geometry.ascent);
             assert_eq!(geometry.descent, expected_geometry.descent);
-            assert_eq!(measure_skia_text_intrinsic_size("X", &style),
-                measure_skia_text_intrinsic_size("X", &standard));
+            assert_eq!(
+                measure_skia_text_intrinsic_size("X", &style),
+                measure_skia_text_intrinsic_size("X", &standard)
+            );
         }
-        let explicit_serif = Style { font_family: Some("Missing Font One, serif".into()), ..standard };
-        assert_eq!(generic_serif_typeface(&explicit_serif).unwrap().family_name(), "Times",
-            "an explicit generic serif is not the HTML standard default");
+        let explicit_serif = Style {
+            font_family: Some("Missing Font One, serif".into()),
+            ..standard
+        };
+        assert_eq!(
+            generic_serif_typeface(&explicit_serif)
+                .unwrap()
+                .family_name(),
+            "Times",
+            "an explicit generic serif is not the HTML standard default"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -7808,25 +11158,54 @@ mod tests {
         for paragraph_height in [36.0, 72.0] {
             let mut surface = Surface::new_raster_n32_premul((80, 100)).unwrap();
             surface.canvas().clear(Color::WHITE);
-            let rect = LayoutRect { x: 8.0, y: 8.0, width: 40.0, height: paragraph_height };
+            let rect = LayoutRect {
+                x: 8.0,
+                y: 8.0,
+                width: 40.0,
+                height: paragraph_height,
+            };
             let context = crate::paint_artifact::InlineLineContext {
-                line_box: rect, first_line_box: rect,
-                direction: style.direction, text_align: style.text_align,
+                line_box: rect,
+                first_line_box: rect,
+                direction: style.direction,
+                text_align: style.text_align,
                 line_advance: None,
                 tab_stops: tab_stops_for_style(&style),
             };
-            render_node_with_line_context(surface.canvas(), 0, rect,
-                &ComponentKind::Text { content: "a\u{2028}a".into() },
-                &style, &typeface, crate::layout::layout_font(), None, false, false,
-                Some(context), None, false, true, &[], None);
+            render_node_with_line_context(
+                surface.canvas(),
+                0,
+                rect,
+                &ComponentKind::Text {
+                    content: "a\u{2028}a".into(),
+                },
+                &style,
+                &typeface,
+                crate::layout::layout_font(),
+                None,
+                false,
+                false,
+                Some(context),
+                None,
+                false,
+                true,
+                &[],
+                None,
+            );
             let info = ImageInfo::new((80, 100), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 80 * 100 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 80 * 4, (0, 0)));
             let pixel = |x: usize, y: usize| &pixels[(y * 80 + x) * 4..(y * 80 + x) * 4 + 4];
-            assert_eq!(pixel(10, 26), &[255, 255, 0, 255],
-                "second fragment follows the18px glyph advance, paragraph={paragraph_height}");
-            assert_eq!(pixel(10, 44), &[255, 255, 255, 255],
-                "no phantom decoration at the paragraph-height advance");
+            assert_eq!(
+                pixel(10, 26),
+                &[255, 255, 0, 255],
+                "second fragment follows the18px glyph advance, paragraph={paragraph_height}"
+            );
+            assert_eq!(
+                pixel(10, 44),
+                &[255, 255, 255, 255],
+                "no phantom decoration at the paragraph-height advance"
+            );
         }
     }
 
@@ -8018,30 +11397,71 @@ mod tests {
     #[test]
     fn passive_split_inline_background_excludes_unused_line_width() {
         use crate::paint_artifact::{PaintArtifact, PaintNode};
-        let host = Style { display: Display::Flex,
+        let host = Style {
+            display: Display::Flex,
             background: w3cos_std::Color::rgb(0, 0, 255),
-            font_family: Some("serif".into()), font_size: 16.0,
+            font_family: Some("serif".into()),
+            font_size: 16.0,
             custom_properties: Some(HashMap::from([
                 ("--w3cos-internal-split-inline-fragment".into(), "1".into()),
                 ("--w3cos-internal-split-inline-edge".into(), "1".into()),
-            ])), ..Style::default() };
-        let text = Style { display: Display::Inline,
-            background: w3cos_std::Color::TRANSPARENT, custom_properties: None,
-            ..host.clone() };
-        let kinds = [ComponentKind::Row, ComponentKind::Text { content: "Line 1".into() }];
+            ])),
+            ..Style::default()
+        };
+        let text = Style {
+            display: Display::Inline,
+            background: w3cos_std::Color::TRANSPARENT,
+            custom_properties: None,
+            ..host.clone()
+        };
+        let kinds = [
+            ComponentKind::Row,
+            ComponentKind::Text {
+                content: "Line 1".into(),
+            },
+        ];
         let styles = [host, text];
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 22.0 };
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 192.0,
+            height: 22.0,
+        };
         let layouts = vec![(rect, 0), (rect, 1)];
-        let artifact = PaintArtifact::build((0..2).map(|index| PaintNode {
-            kind: kinds[index].clone(), style: styles[index].clone(),
-            parent: (index == 1).then_some(0), sticky_counter_signal: None,
-        }), &layouts, 1);
-        let nodes = (0..2).map(|index| (index, rect, &kinds[index], &styles[index])).collect::<Vec<_>>();
+        let artifact = PaintArtifact::build(
+            (0..2).map(|index| PaintNode {
+                kind: kinds[index].clone(),
+                style: styles[index].clone(),
+                parent: (index == 1).then_some(0),
+                sticky_counter_signal: None,
+            }),
+            &layouts,
+            1,
+        );
+        let nodes = (0..2)
+            .map(|index| (index, rect, &kinds[index], &styles[index]))
+            .collect::<Vec<_>>();
         let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-        let pixels = rasterizer.render_frame(200, 30, &nodes, &test_font(), &[],
-            &HashMap::new(), None, w3cos_std::Color::WHITE, Some(&artifact), None, 1.0).unwrap();
-        assert_eq!(&pixels[(8 * 200 + 100) * 4..(8 * 200 + 100) * 4 + 4],
-            &[255, 255, 255, 255], "anonymous line width is not inline decoration width");
+        let pixels = rasterizer
+            .render_frame(
+                200,
+                30,
+                &nodes,
+                &test_font(),
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::Color::WHITE,
+                Some(&artifact),
+                None,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(
+            &pixels[(8 * 200 + 100) * 4..(8 * 200 + 100) * 4 + 4],
+            &[255, 255, 255, 255],
+            "anonymous line width is not inline decoration width"
+        );
     }
 
     #[test]
@@ -8059,37 +11479,107 @@ mod tests {
         use w3cos_std::style::Position;
         let blue = w3cos_std::Color::rgba(0, 0, 255, alpha);
         let orange = w3cos_std::Color::rgb(255, 165, 0);
-        let inline = Style { display: Display::Inline, position: Position::Relative,
-            font_family: Some("serif".into()), font_size: 16.0,
-            line_height: 1.125, line_height_is_normal: true,
-            background: blue, ..Style::default() };
-        let text = Style { position: Position::Static, background: w3cos_std::Color::TRANSPARENT,
-            ..inline.clone() };
-        let block = Style { display: Display::Block, background: orange, ..text.clone() };
-        let kinds = [ComponentKind::Row,
-            ComponentKind::Text { content: "Filler Text".into() },
+        let inline = Style {
+            display: Display::Inline,
+            position: Position::Relative,
+            font_family: Some("serif".into()),
+            font_size: 16.0,
+            line_height: 1.125,
+            line_height_is_normal: true,
+            background: blue,
+            ..Style::default()
+        };
+        let text = Style {
+            position: Position::Static,
+            background: w3cos_std::Color::TRANSPARENT,
+            ..inline.clone()
+        };
+        let block = Style {
+            display: Display::Block,
+            background: orange,
+            ..text.clone()
+        };
+        let kinds = [
             ComponentKind::Row,
-            ComponentKind::Text { content: "Filler Text".into() },
-            ComponentKind::Text { content: "Filler Text".into() }];
+            ComponentKind::Text {
+                content: "Filler Text".into(),
+            },
+            ComponentKind::Row,
+            ComponentKind::Text {
+                content: "Filler Text".into(),
+            },
+            ComponentKind::Text {
+                content: "Filler Text".into(),
+            },
+        ];
         let styles = [inline, text.clone(), block, text.clone(), text];
         let parents = [None, Some(0), Some(0), Some(2), Some(0)];
-        let rects = [0.0, 0.0, 18.0, 18.0, 36.0].map(|y|
-            LayoutRect { x: 0.0, y, width: 192.0, height: 18.0 });
-        let layouts = rects.iter().enumerate().map(|(i,r)| (*r,i)).collect::<Vec<_>>();
-        let artifact = PaintArtifact::build((0..5).map(|i| PaintNode {
-            kind: kinds[i].clone(), style: styles[i].clone(), parent: parents[i],
-            sticky_counter_signal: None,
-        }), &layouts, 1);
-        let nodes = (0..5).map(|i| (i,rects[i],&kinds[i],&styles[i])).collect::<Vec<_>>();
+        let rects = [0.0, 0.0, 18.0, 18.0, 36.0].map(|y| LayoutRect {
+            x: 0.0,
+            y,
+            width: 192.0,
+            height: 18.0,
+        });
+        let layouts = rects
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (*r, i))
+            .collect::<Vec<_>>();
+        let artifact = PaintArtifact::build(
+            (0..5).map(|i| PaintNode {
+                kind: kinds[i].clone(),
+                style: styles[i].clone(),
+                parent: parents[i],
+                sticky_counter_signal: None,
+            }),
+            &layouts,
+            1,
+        );
+        let nodes = (0..5)
+            .map(|i| (i, rects[i], &kinds[i], &styles[i]))
+            .collect::<Vec<_>>();
         let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
-        let pixels = rasterizer.render_frame(200,60,&nodes,&test_font(),&[],
-            &HashMap::new(),None,w3cos_std::Color::WHITE,Some(&artifact),None,1.0).unwrap();
-        let pixel = |x: usize,y: usize| &pixels[(y*200+x)*4..(y*200+x)*4+4];
-        assert_eq!(pixel(100,8), &[255,255,255,255], "first inline fragment excludes unused line width");
-        assert_eq!(pixel(100,26), &[255,165,0,255], "intervening block keeps its full background");
-        assert_eq!(pixel(100,44), &[255,255,255,255], "continuation fragment remains short");
-        assert_eq!(pixel(5,0), &[255-alpha,255-alpha,255,255], "first fragment paints exactly once");
-        assert_eq!(pixel(5,36), &[255-alpha,255-alpha,255,255], "continuation paints exactly once");
+        let pixels = rasterizer
+            .render_frame(
+                200,
+                60,
+                &nodes,
+                &test_font(),
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::Color::WHITE,
+                Some(&artifact),
+                None,
+                1.0,
+            )
+            .unwrap();
+        let pixel = |x: usize, y: usize| &pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 4];
+        assert_eq!(
+            pixel(100, 8),
+            &[255, 255, 255, 255],
+            "first inline fragment excludes unused line width"
+        );
+        assert_eq!(
+            pixel(100, 26),
+            &[255, 165, 0, 255],
+            "intervening block keeps its full background"
+        );
+        assert_eq!(
+            pixel(100, 44),
+            &[255, 255, 255, 255],
+            "continuation fragment remains short"
+        );
+        assert_eq!(
+            pixel(5, 0),
+            &[255 - alpha, 255 - alpha, 255, 255],
+            "first fragment paints exactly once"
+        );
+        assert_eq!(
+            pixel(5, 36),
+            &[255 - alpha, 255 - alpha, 255, 255],
+            "continuation paints exactly once"
+        );
     }
 
     #[test]
@@ -8432,18 +11922,30 @@ mod tests {
     #[test]
     fn anisotropic_replaced_image_upscale_matches_browser_edge_samples() {
         crate::image_loader::clear_cache();
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/css/CSS2/css1/support/square-teal.png")).unwrap();
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wpt/css/CSS2/css1/support/square-teal.png"
+        ))
+        .unwrap();
         crate::image_loader::decode_and_install("anisotropic-teal.png", &bytes).unwrap();
         let mut surface = Surface::new_raster_n32_premul((160, 16)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        draw_image(surface.canvas(), LayoutRect { x: 0.0, y: 0.0,
-            width: 160.0, height: 16.0 }, "anisotropic-teal.png", 1.0);
-        let info = ImageInfo::new((160,16), ColorType::RGBA8888, AlphaType::Premul, None);
-        let mut pixels = vec![0_u8;160*16*4];
-        assert!(surface.read_pixels(&info, &mut pixels,160*4,(0,0)));
+        draw_image(
+            surface.canvas(),
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 160.0,
+                height: 16.0,
+            },
+            "anisotropic-teal.png",
+            1.0,
+        );
+        let info = ImageInfo::new((160, 16), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 160 * 16 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 160 * 4, (0, 0)));
         // Original Chrome155 V3436 comparison: x32/y70 is image x8/y0.
-        assert_eq!(&pixels[8*4..9*4], &[0,253,253,255]);
+        assert_eq!(&pixels[8 * 4..9 * 4], &[0, 253, 253, 255]);
         crate::image_loader::clear_cache();
     }
 
@@ -8497,23 +11999,44 @@ mod tests {
             surface.canvas().clear(Color::RED);
             if background {
                 let rect = LayoutRect {
-                    x: 0.0, y: 0.0, width: 80.0, height: 100.0,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 100.0,
                 };
-                draw_background_image(surface.canvas(), rect, rect, 0.0, &Style {
-                    background_image: Some("url(viewport.svg)".into()),
-                    background_repeat: Some("no-repeat".into()),
-                    ..Style::default()
-                }, 1.0);
+                draw_background_image(
+                    surface.canvas(),
+                    rect,
+                    rect,
+                    0.0,
+                    &Style {
+                        background_image: Some("url(viewport.svg)".into()),
+                        background_repeat: Some("no-repeat".into()),
+                        ..Style::default()
+                    },
+                    1.0,
+                );
             } else {
-                draw_image(surface.canvas(), LayoutRect {
-                    x: 0.0, y: 0.0, width, height,
-                }, "viewport.svg", 1.0);
+                draw_image(
+                    surface.canvas(),
+                    LayoutRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width,
+                        height,
+                    },
+                    "viewport.svg",
+                    1.0,
+                );
             }
             let info = ImageInfo::new((80, 100), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0_u8; 80 * 100 * 4];
             assert!(surface.read_pixels(&info, &mut pixels, 80 * 4, (0, 0)));
             assert_eq!(&pixels[..4], &edge, "background={background}");
-            assert_eq!(&pixels[(1 * 80 + 1) * 4..(1 * 80 + 1) * 4 + 4], &[0, 128, 0, 255]);
+            assert_eq!(
+                &pixels[(1 * 80 + 1) * 4..(1 * 80 + 1) * 4 + 4],
+                &[0, 128, 0, 255]
+            );
         }
         crate::image_loader::clear_cache();
     }
@@ -8584,23 +12107,41 @@ mod tests {
             }
         }
         let mut bytes = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        crate::image_loader::decode_and_install("centered-midpoint.png", &bytes.into_inner()).unwrap();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install("centered-midpoint.png", &bytes.into_inner())
+            .unwrap();
         let mut surface = Surface::new_raster_n32_premul((800, 40)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 800.0, height: 40.0 };
-        draw_background_image(surface.canvas(), rect, rect, 0.0, &Style {
-            background_image: Some("url(centered-midpoint.png)".into()),
-            background_position: Some("center top".into()),
-            background_repeat: Some("repeat-x".into()),
-            ..Style::default()
-        }, 1.0);
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 40.0,
+        };
+        draw_background_image(
+            surface.canvas(),
+            rect,
+            rect,
+            0.0,
+            &Style {
+                background_image: Some("url(centered-midpoint.png)".into()),
+                background_position: Some("center top".into()),
+                background_repeat: Some("repeat-x".into()),
+                ..Style::default()
+            },
+            1.0,
+        );
         let info = ImageInfo::new((800, 40), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut pixels = vec![0_u8; 800 * 40 * 4];
         assert!(surface.read_pixels(&info, &mut pixels, 800 * 4, (0, 0)));
         // Browser raw PNG diagnostics V3805/V3806: odd-width tile centered at
         // 391.5px has the same 191 midpoint as the small 2x1 texture.
-        assert_eq!(&pixels[(800 + 1) * 4..(800 + 1) * 4 + 4], &[0, 191, 191, 255]);
+        assert_eq!(
+            &pixels[(800 + 1) * 4..(800 + 1) * 4 + 4],
+            &[0, 191, 191, 255]
+        );
         crate::image_loader::clear_cache();
     }
 
@@ -8618,12 +12159,24 @@ mod tests {
             .unwrap();
         let mut surface = Surface::new_raster_n32_premul((8, 2)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 8.0, height: 2.0 };
-        draw_background_image(surface.canvas(), rect, rect, 0.0, &Style {
-            background_image: Some("url(fractional-texels.png)".into()),
-            background_position: Some("0.5px 0".into()),
-            ..Style::default()
-        }, 1.0);
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 2.0,
+        };
+        draw_background_image(
+            surface.canvas(),
+            rect,
+            rect,
+            0.0,
+            &Style {
+                background_image: Some("url(fractional-texels.png)".into()),
+                background_position: Some("0.5px 0".into()),
+                ..Style::default()
+            },
+            1.0,
+        );
         let info = ImageInfo::new((8, 2), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut pixels = vec![0_u8; 8 * 2 * 4];
         assert!(surface.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
@@ -8646,20 +12199,46 @@ mod tests {
             let mut surface = Surface::new_raster_n32_premul((8, 2)).unwrap();
             surface.canvas().clear(Color::WHITE);
             if background {
-                let rect = LayoutRect { x: 0.0, y: 0.0, width: 8.0, height: 2.0 };
-                draw_background_image(surface.canvas(), rect, rect, 0.0, &Style {
-                    background_image: Some("url(snapped-raster.png)".into()),
-                    background_position: Some("0.5px 0".into()),
-                    background_repeat: Some("no-repeat".into()),
-                    ..Style::default()
-                }, 1.0);
+                let rect = LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 8.0,
+                    height: 2.0,
+                };
+                draw_background_image(
+                    surface.canvas(),
+                    rect,
+                    rect,
+                    0.0,
+                    &Style {
+                        background_image: Some("url(snapped-raster.png)".into()),
+                        background_position: Some("0.5px 0".into()),
+                        background_repeat: Some("no-repeat".into()),
+                        ..Style::default()
+                    },
+                    1.0,
+                );
             } else {
-                draw_image(surface.canvas(), LayoutRect { x: 0.5, y: 0.0, width: 2.0, height: 1.0 }, "snapped-raster.png", 1.0);
+                draw_image(
+                    surface.canvas(),
+                    LayoutRect {
+                        x: 0.5,
+                        y: 0.0,
+                        width: 2.0,
+                        height: 1.0,
+                    },
+                    "snapped-raster.png",
+                    1.0,
+                );
             }
             let info = ImageInfo::new((8, 2), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = [0_u8; 64];
             assert!(surface.read_pixels(&info, &mut pixels, 32, (0, 0)));
-            assert_eq!(&pixels[..12], &[255, 255, 255, 255, 0, 128, 128, 255, 0, 255, 255, 255], "background={background}");
+            assert_eq!(
+                &pixels[..12],
+                &[255, 255, 255, 255, 0, 128, 128, 255, 0, 255, 255, 255],
+                "background={background}"
+            );
         }
         crate::image_loader::clear_cache();
     }
@@ -8777,16 +12356,32 @@ mod tests {
             background: w3cos_std::color::Color::rgb(0, 0, 255),
             ..Style::default()
         };
-        draw_text_in_rect(surface.canvas(), LayoutRect {
-            x: 8.0, y: 5.0, width: 15.0, height: 15.0,
-        }, " ", &style, &typeface, &font);
+        draw_text_in_rect(
+            surface.canvas(),
+            LayoutRect {
+                x: 8.0,
+                y: 5.0,
+                width: 15.0,
+                height: 15.0,
+            },
+            " ",
+            &style,
+            &typeface,
+            &font,
+        );
         let info = ImageInfo::new((40, 30), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut pixels = vec![0_u8; 40 * 30 * 4];
         assert!(surface.read_pixels(&info, &mut pixels, 40 * 4, (0, 0)));
-        assert_eq!(&pixels[(10 * 40 + 8) * 4..(10 * 40 + 8) * 4 + 4],
-            &[0, 0, 255, 255], "a laid-out separator must paint its assigned background");
-        assert_eq!(&pixels[(10 * 40 + 23) * 4..(10 * 40 + 23) * 4 + 4],
-            &[255, 255, 255, 255], "separator must not expand beyond assigned advance");
+        assert_eq!(
+            &pixels[(10 * 40 + 8) * 4..(10 * 40 + 8) * 4 + 4],
+            &[0, 0, 255, 255],
+            "a laid-out separator must paint its assigned background"
+        );
+        assert_eq!(
+            &pixels[(10 * 40 + 23) * 4..(10 * 40 + 23) * 4 + 4],
+            &[255, 255, 255, 255],
+            "separator must not expand beyond assigned advance"
+        );
     }
 
     #[test]
@@ -8796,12 +12391,24 @@ mod tests {
         const CHILD: &str = "W3COS_TEST_INLINE_BACKGROUND_FONT_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "render_skia::tests::split_inline_background_precedes_all_its_glyph_fragments", "--nocapture"])
-                .env(CHILD, "1").output().unwrap();
-            assert!(output.status.success(), "isolated registered-font regression failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("skipped:"),
-                "registered-font regression needs the pinned WPT font");
+                .args([
+                    "--exact",
+                    "render_skia::tests::split_inline_background_precedes_all_its_glyph_fragments",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated registered-font regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("skipped:"),
+                "registered-font regression needs the pinned WPT font"
+            );
             return;
         }
         use crate::font_face::{FontFace, FontRegistry, FontSource};
@@ -8817,32 +12424,59 @@ mod tests {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         let mut parser = StreamingDocumentParser::new_with_script_host(
-            Rc::new(InertParserScriptHost), "https://example.test/inline-separator.html",
-        ).unwrap();
+            Rc::new(InertParserScriptHost),
+            "https://example.test/inline-separator.html",
+        )
+        .unwrap();
         parser.write("<!doctype html><body style='margin:0'><div style='margin-left:23px;margin-top:50px;width:180px;font:15px/1 Ahem'><p style='margin:0;background:yellow;color:lime'>xx <span style='margin-right:-60px;background:blue;color:orange'>xx xx xx </span> xx</p></div>").unwrap();
         parser.finish().unwrap();
         let registry = FontRegistry::global();
-        registry.register_for_owner(OWNER, FontFace { family: "Ahem".into(),
-            src: FontSource::Bytes(bytes), ..Default::default() }).unwrap();
+        registry
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let frame = crate::headless::render_document_rgba(240, 90).unwrap();
         let mut expected = Surface::new_raster_n32_premul((240, 90)).unwrap();
         expected.canvas().clear(Color::WHITE);
-        expected.canvas().draw_rect(Rect::from_xywh(68.0, 50.0, 135.0, 15.0),
-            &color_paint(w3cos_std::Color::rgb(0, 0, 255), 1.0));
-        let style = Style { font_family: Some("Ahem".into()), font_size: 15.0,
-            line_height: 1.0, color: w3cos_std::Color::rgb(255, 165, 0),
-            ..Style::default() };
+        expected.canvas().draw_rect(
+            Rect::from_xywh(68.0, 50.0, 135.0, 15.0),
+            &color_paint(w3cos_std::Color::rgb(0, 0, 255), 1.0),
+        );
+        let style = Style {
+            font_family: Some("Ahem".into()),
+            font_size: 15.0,
+            line_height: 1.0,
+            color: w3cos_std::Color::rgb(255, 165, 0),
+            ..Style::default()
+        };
         let (_, face) = registered_typeface_covering(&style, "xx xx xx ").unwrap();
-        draw_text_line(expected.canvas(), 68.0, 50.0, "xx xx xx ", 15.0,
-            style.color, 1.0, &face, &style);
+        draw_text_line(
+            expected.canvas(),
+            68.0,
+            50.0,
+            "xx xx xx ",
+            15.0,
+            style.color,
+            1.0,
+            &face,
+            &style,
+        );
         let info = ImageInfo::new((240, 90), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut expected_pixels = vec![0_u8; 240 * 90 * 4];
         assert!(expected.read_pixels(&info, &mut expected_pixels, 240 * 4, (0, 0)));
         registry.clear_owner(OWNER);
         for x in [98, 188] {
-            assert_eq!(&frame.rgba[(55 * 240 + x) * 4..(55 * 240 + x) * 4 + 4],
+            assert_eq!(
+                &frame.rgba[(55 * 240 + x) * 4..(55 * 240 + x) * 4 + 4],
                 &expected_pixels[(55 * 240 + x) * 4..(55 * 240 + x) * 4 + 4],
-                "one inline background must precede all its glyph fragments at {x}");
+                "one inline background must precede all its glyph fragments at {x}"
+            );
         }
     }
 
@@ -9175,8 +12809,10 @@ mod tests {
             ..Style::default()
         };
         assert_eq!(line_box_half_leading(&style), 45.0);
-        assert_eq!(resolved_font_geometry(&style).unwrap().ascent
-            + line_box_half_leading(&style), 69.0);
+        assert_eq!(
+            resolved_font_geometry(&style).unwrap().ascent + line_box_half_leading(&style),
+            69.0
+        );
 
         let inline = Style {
             display: Display::Inline,
@@ -9187,16 +12823,27 @@ mod tests {
 
     #[test]
     fn line_box_block_upper_leading_matches_inline_baseline() {
-        for position in [w3cos_std::style::Position::Static,
-            w3cos_std::style::Position::Absolute, w3cos_std::style::Position::Fixed] {
-            let style = Style { display: Display::Block, position,
-                font_family: Some("monospace".into()), font_size: 32.0,
-                font_weight: 700, line_height: 1.0, line_height_is_normal: false,
-                ..Style::default() };
+        for position in [
+            w3cos_std::style::Position::Static,
+            w3cos_std::style::Position::Absolute,
+            w3cos_std::style::Position::Fixed,
+        ] {
+            let style = Style {
+                display: Display::Block,
+                position,
+                font_family: Some("monospace".into()),
+                font_size: 32.0,
+                font_weight: 700,
+                line_height: 1.0,
+                line_height_is_normal: false,
+                ..Style::default()
+            };
             let metrics = resolved_font_geometry(&style).unwrap();
-            assert_eq!(metrics.ascent + line_box_half_leading(&style),
+            assert_eq!(
+                metrics.ascent + line_box_half_leading(&style),
                 crate::layout::inline_font_baseline_from_line_top(&style, 32.0),
-                "block/absolute text and the anonymous inline strut need one baseline");
+                "block/absolute text and the anonymous inline strut need one baseline"
+            );
         }
     }
 
@@ -9232,19 +12879,41 @@ mod tests {
     #[test]
     fn blockified_text_preserves_the_concrete_font_baseline() {
         for family in [None, Some("serif".into()), Some("sans-serif".into())] {
-            let block = Style { display: Display::Block, font_family: family,
-                font_size: 30.0, line_height: 4.0, line_height_is_normal: false,
-                ..Style::default() };
+            let block = Style {
+                display: Display::Block,
+                font_family: family,
+                font_size: 30.0,
+                line_height: 4.0,
+                line_height_is_normal: false,
+                ..Style::default()
+            };
             let metrics = resolved_font_geometry(&block).unwrap();
             let baseline = crate::layout::inline_font_baseline_from_line_top(&block, 120.0);
             for (position, float) in [
-                (w3cos_std::style::Position::Absolute, w3cos_std::style::Float::None),
-                (w3cos_std::style::Position::Fixed, w3cos_std::style::Float::None),
-                (w3cos_std::style::Position::Static, w3cos_std::style::Float::Left),
+                (
+                    w3cos_std::style::Position::Absolute,
+                    w3cos_std::style::Float::None,
+                ),
+                (
+                    w3cos_std::style::Position::Fixed,
+                    w3cos_std::style::Float::None,
+                ),
+                (
+                    w3cos_std::style::Position::Static,
+                    w3cos_std::style::Float::Left,
+                ),
             ] {
-                let style = Style { display: Display::Inline, position, float, ..block.clone() };
-                assert_eq!(metrics.ascent + line_box_half_leading(&style), baseline,
-                    "blockification must preserve the same concrete font baseline");
+                let style = Style {
+                    display: Display::Inline,
+                    position,
+                    float,
+                    ..block.clone()
+                };
+                assert_eq!(
+                    metrics.ascent + line_box_half_leading(&style),
+                    baseline,
+                    "blockification must preserve the same concrete font baseline"
+                );
             }
         }
     }
@@ -9428,7 +13097,11 @@ mod tests {
         };
         let block = raster(Display::Block, 32.0, 19.2);
         let font_height = resolved_font_geometry(&style).unwrap().height();
-        let inline = raster(Display::Inline, 32.0 + (19.2 - font_height) * 0.5, font_height);
+        let inline = raster(
+            Display::Inline,
+            32.0 + (19.2 - font_height) * 0.5,
+            font_height,
+        );
         assert!(
             block
                 .chunks_exact(4)
@@ -9462,25 +13135,56 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn justified_line_paint_matches_contextual_word_spacing() {
-        let primary = FontMgr::default().match_family_style("Times",
-            skia_safe::FontStyle::normal()).unwrap();
+        let primary = FontMgr::default()
+            .match_family_style("Times", skia_safe::FontStyle::normal())
+            .unwrap();
         let text = "Some words justified";
-        let style = Style { font_family: Some("serif".into()), font_size: 20.0,
-            ..Style::default() };
-        let available = text_layout::inline_layout_advance(
-            measure_skia_text_advance(text, &primary, &style)) + 20.0;
-        let expansion = text_layout::justification_expansion(text, available,
-            measure_skia_text_advance(text, &primary, &style)).unwrap();
+        let style = Style {
+            font_family: Some("serif".into()),
+            font_size: 20.0,
+            ..Style::default()
+        };
+        let available =
+            text_layout::inline_layout_advance(measure_skia_text_advance(text, &primary, &style))
+                + 20.0;
+        let expansion = text_layout::justification_expansion(
+            text,
+            available,
+            measure_skia_text_advance(text, &primary, &style),
+        )
+        .unwrap();
         let raster = |expanded| {
             let mut surface = Surface::new_raster_n32_premul((400, 60)).unwrap();
             surface.canvas().clear(Color::WHITE);
             if expanded {
-                draw_justified_text_line(surface.canvas(), 8.375, 4.0, text, 20.0,
-                    w3cos_std::Color::BLACK, 1.0, &primary, &style, expansion);
+                draw_justified_text_line(
+                    surface.canvas(),
+                    8.375,
+                    4.0,
+                    text,
+                    20.0,
+                    w3cos_std::Color::BLACK,
+                    1.0,
+                    &primary,
+                    &style,
+                    expansion,
+                );
             } else {
-                let reference = Style { word_spacing: 10.0, ..style.clone() };
-                draw_text_line(surface.canvas(), 8.375, 4.0, text, 20.0,
-                    w3cos_std::Color::BLACK, 1.0, &primary, &reference);
+                let reference = Style {
+                    word_spacing: 10.0,
+                    ..style.clone()
+                };
+                draw_text_line(
+                    surface.canvas(),
+                    8.375,
+                    4.0,
+                    text,
+                    20.0,
+                    w3cos_std::Color::BLACK,
+                    1.0,
+                    &primary,
+                    &reference,
+                );
             }
             let info = ImageInfo::new((400, 60), ColorType::RGBA8888, AlphaType::Premul, None);
             let mut pixels = vec![0; 400 * 60 * 4];
@@ -9495,26 +13199,49 @@ mod tests {
         let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let style = Style {
             display: Display::Inline,
-            font_family: Some("Ahem".into()), font_size: 20.0,
+            font_family: Some("Ahem".into()),
+            font_size: 20.0,
             white_space: w3cos_std::style::WhiteSpace::Pre,
             background: w3cos_std::Color::rgb(0, 0, 255),
             ..Style::default()
         };
-        let fragment = LayoutRect { x: 80.0, y: 10.0, width: 80.0, height: 20.0 };
+        let fragment = LayoutRect {
+            x: 80.0,
+            y: 10.0,
+            width: 80.0,
+            height: 20.0,
+        };
         let mut surface = Surface::new_raster_n32_premul((300, 60)).unwrap();
         surface.canvas().clear(Color::WHITE);
-        render_node_with_line_context(surface.canvas(), 0, fragment,
-            &ComponentKind::Row, &style, &primary, crate::layout::layout_font(),
-            None, false, false, None, None, false, true,
-            &[(fragment, "\tB".into())], None);
+        render_node_with_line_context(
+            surface.canvas(),
+            0,
+            fragment,
+            &ComponentKind::Row,
+            &style,
+            &primary,
+            crate::layout::layout_font(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            false,
+            true,
+            &[(fragment, "\tB".into())],
+            None,
+        );
         let info = ImageInfo::new((300, 60), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut pixels = vec![0; 300 * 60 * 4];
         assert!(surface.read_pixels(&info, &mut pixels, 300 * 4, (0, 0)));
         let pixel = |x: usize| &pixels[(15 * 300 + x) * 4..(15 * 300 + x) * 4 + 4];
         assert_eq!(pixel(80), &[0, 0, 255, 255]);
         assert_eq!(pixel(159), &[0, 0, 255, 255]);
-        assert_eq!(pixel(160), &[255, 255, 255, 255],
-            "background must stop at the resolved fragment, not remeasure a tab from zero");
+        assert_eq!(
+            pixel(160),
+            &[255, 255, 255, 255],
+            "background must stop at the resolved fragment, not remeasure a tab from zero"
+        );
     }
 
     #[test]
@@ -9522,23 +13249,52 @@ mod tests {
     fn authored_coalesced_text_paints_the_layout_unit_fragment_origins() {
         let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let text = "All the words are aligned on the same baseline.";
-        let mut style = Style { font_family: Some("serif".into()), font_size: 15.0,
-            white_space: w3cos_std::style::WhiteSpace::NoWrap, ..Style::default() };
+        let mut style = Style {
+            font_family: Some("serif".into()),
+            font_size: 15.0,
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            ..Style::default()
+        };
         w3cos_std::inline_text::set_fragment_ends(&mut style, text, &[8, 13, text.len()]);
         let render = |coalesced| {
             let mut surface = Surface::new_raster_n32_premul((400, 40)).unwrap();
             surface.canvas().clear(Color::WHITE);
             if coalesced {
-                let advance = draw_text_line(surface.canvas(), 8.0, 4.0, text, 15.0,
-                    w3cos_std::Color::BLACK, 1.0, &primary, &style);
+                let advance = draw_text_line(
+                    surface.canvas(),
+                    8.0,
+                    4.0,
+                    text,
+                    15.0,
+                    w3cos_std::Color::BLACK,
+                    1.0,
+                    &primary,
+                    &style,
+                );
                 assert!((advance - 283.6875).abs() < 0.001, "advance={advance}");
             } else {
                 let mut plain = style.clone();
-                plain.custom_properties.as_mut().unwrap().remove(w3cos_std::inline_text::FRAGMENT_ENDS);
-                for (x, part) in [(8.0, "All the "), (53.0, "words"),
-                    (89.671875, " are aligned on the same baseline.")] {
-                    draw_text_line(surface.canvas(), x, 4.0, part, 15.0,
-                        w3cos_std::Color::BLACK, 1.0, &primary, &plain);
+                plain
+                    .custom_properties
+                    .as_mut()
+                    .unwrap()
+                    .remove(w3cos_std::inline_text::FRAGMENT_ENDS);
+                for (x, part) in [
+                    (8.0, "All the "),
+                    (53.0, "words"),
+                    (89.671875, " are aligned on the same baseline."),
+                ] {
+                    draw_text_line(
+                        surface.canvas(),
+                        x,
+                        4.0,
+                        part,
+                        15.0,
+                        w3cos_std::Color::BLACK,
+                        1.0,
+                        &primary,
+                        &plain,
+                    );
                 }
             }
             let info = ImageInfo::new((400, 40), ColorType::RGBA8888, AlphaType::Premul, None);
@@ -9565,30 +13321,57 @@ mod tests {
                 let text = "A\tB\tC";
                 let expected = 2.0 * stop + measure_skia_text_advance("C", &primary, &style);
                 let actual = measure_skia_text_advance(text, &primary, &style);
-                assert!((actual - expected).abs() < 0.01,
-                    "family={family}, spacing={spacing}, measured={actual}, expected={expected}");
+                assert!(
+                    (actual - expected).abs() < 0.01,
+                    "family={family}, spacing={spacing}, measured={actual}, expected={expected}"
+                );
                 let ink = measure_skia_text_ink_bounds(text, 20.0, &primary, 400, Some(&style));
                 let last = measure_skia_text_ink_bounds("C", 20.0, &primary, 400, Some(&style));
-                assert!((ink.left + ink.width - (2.0 * stop + last.left + last.width)).abs() < 0.01);
+                assert!(
+                    (ink.left + ink.width - (2.0 * stop + last.left + last.width)).abs() < 0.01
+                );
                 let raster = |tabbed| {
                     let mut surface = Surface::new_raster_n32_premul((900, 40)).unwrap();
                     surface.canvas().clear(Color::WHITE);
                     if tabbed {
-                        let advance = draw_text_line(surface.canvas(), 8.0, 4.0, text, 20.0,
-                            w3cos_std::Color::BLACK, 1.0, &primary, &style);
+                        let advance = draw_text_line(
+                            surface.canvas(),
+                            8.0,
+                            4.0,
+                            text,
+                            20.0,
+                            w3cos_std::Color::BLACK,
+                            1.0,
+                            &primary,
+                            &style,
+                        );
                         assert!((advance - expected).abs() < 0.01);
                     } else {
                         for (offset, text) in [(0.0, "A"), (stop, "B"), (2.0 * stop, "C")] {
-                            draw_text_line(surface.canvas(), 8.0 + offset, 4.0, text, 20.0,
-                                w3cos_std::Color::BLACK, 1.0, &primary, &style);
+                            draw_text_line(
+                                surface.canvas(),
+                                8.0 + offset,
+                                4.0,
+                                text,
+                                20.0,
+                                w3cos_std::Color::BLACK,
+                                1.0,
+                                &primary,
+                                &style,
+                            );
                         }
                     }
-                    let info = ImageInfo::new((900, 40), ColorType::RGBA8888, AlphaType::Premul, None);
+                    let info =
+                        ImageInfo::new((900, 40), ColorType::RGBA8888, AlphaType::Premul, None);
                     let mut pixels = vec![0; 900 * 40 * 4];
                     assert!(surface.read_pixels(&info, &mut pixels, 900 * 4, (0, 0)));
                     pixels
                 };
-                assert_eq!(raster(true), raster(false), "family={family}, spacing={spacing}");
+                assert_eq!(
+                    raster(true),
+                    raster(false),
+                    "family={family}, spacing={spacing}"
+                );
             }
         }
     }
@@ -9598,7 +13381,8 @@ mod tests {
     fn generic_monospace_resolves_platform_face_for_shared_metrics() {
         let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
         let courier = FontMgr::default()
-            .match_family_style("Courier", FontStyle::normal()).unwrap();
+            .match_family_style("Courier", FontStyle::normal())
+            .unwrap();
         for size in [13.0, 16.0] {
             let style = Style {
                 font_family: Some("monospace".into()),
@@ -9606,13 +13390,24 @@ mod tests {
                 ..Style::default()
             };
             let runs = css_font_runs("0W", &primary, &style);
-            assert!(runs.iter().all(|run| run.typeface.family_name() == "Courier"),
-                "generic fixed family must not use the embedding's primary face");
-            let expected = crate::skia_text_run::css_font(&courier, size).measure_str("0W", None).0;
+            assert!(
+                runs.iter()
+                    .all(|run| run.typeface.family_name() == "Courier"),
+                "generic fixed family must not use the embedding's primary face"
+            );
+            let expected = crate::skia_text_run::css_font(&courier, size)
+                .measure_str("0W", None)
+                .0;
             let measured = measure_skia_text_intrinsic_size("0W", &style).0;
-            assert!((measured - expected).abs() < 0.01, "{measured} != {expected}");
+            assert!(
+                (measured - expected).abs() < 0.01,
+                "{measured} != {expected}"
+            );
             let geometry = resolved_font_geometry(&style).expect("resolved fixed font metrics");
-            assert_eq!(geometry.line_spacing(), if size == 13.0 { 15.0 } else { 18.0 });
+            assert_eq!(
+                geometry.line_spacing(),
+                if size == 13.0 { 15.0 } else { 18.0 }
+            );
         }
     }
 
@@ -9834,39 +13629,62 @@ mod tests {
     #[ignore = "diagnostic only: requires source-bound browser/native PNG inputs"]
     fn fractional_monospace_raster_policy_diagnostic() {
         let browser = image::open(std::env::var("W3COS_FONT_RASTER_BROWSER_PNG").unwrap())
-            .unwrap().to_rgba8();
+            .unwrap()
+            .to_rgba8();
         let native = image::open(std::env::var("W3COS_FONT_RASTER_NATIVE_PNG").unwrap())
-            .unwrap().to_rgba8();
+            .unwrap()
+            .to_rgba8();
         assert_eq!(browser.dimensions(), (800, 600));
         assert_eq!(native.dimensions(), (800, 600));
-        let face = FontMgr::default().match_family_style("Courier", FontStyle::normal()).unwrap();
-        let style = Style { font_family: Some("monospace".into()),
+        let face = FontMgr::default()
+            .match_family_style("Courier", FontStyle::normal())
+            .unwrap();
+        let style = Style {
+            font_family: Some("monospace".into()),
             font_size: (10.0_f64 * 96.0 / 72.0) as f32,
-            color: w3cos_std::color::Color::BLACK, ..Style::default() };
+            color: w3cos_std::color::Color::BLACK,
+            ..Style::default()
+        };
         let text = " The   spacing  on      these         two  sentences need to be the    same!  ";
         let shaped = crate::skia_text_run::shape_visual_run(text, &face, &style).unwrap();
         let geometry = typeface_font_geometry(&face, style.font_size);
         let baseline = 54.0 + geometry.ascent;
         let info = ImageInfo::new((800, 600), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut rows = Vec::new();
-        for hinting in [skia_safe::FontHinting::None, skia_safe::FontHinting::Slight,
-            skia_safe::FontHinting::Normal, skia_safe::FontHinting::Full] {
-            for edging in [skia_safe::font::Edging::AntiAlias, skia_safe::font::Edging::SubpixelAntiAlias] {
+        for hinting in [
+            skia_safe::FontHinting::None,
+            skia_safe::FontHinting::Slight,
+            skia_safe::FontHinting::Normal,
+            skia_safe::FontHinting::Full,
+        ] {
+            for edging in [
+                skia_safe::font::Edging::AntiAlias,
+                skia_safe::font::Edging::SubpixelAntiAlias,
+            ] {
                 for subpixel in [false, true] {
                     for linear in [false, true] {
                         for precise_blend in [false, true] {
                             let mut font = crate::skia_text_run::css_font(&face, style.font_size);
-                            font.set_hinting(hinting).set_edging(edging)
-                                .set_subpixel(subpixel).set_linear_metrics(linear);
-                            let paint = if precise_blend { color_paint(style.color, 1.0) } else {
+                            font.set_hinting(hinting)
+                                .set_edging(edging)
+                                .set_subpixel(subpixel)
+                                .set_linear_metrics(linear);
+                            let paint = if precise_blend {
+                                color_paint(style.color, 1.0)
+                            } else {
                                 let mut paint = Paint::default();
                                 paint.set_anti_alias(true).set_color(Color::BLACK);
                                 paint
                             };
                             let mut surface = Surface::new_raster_n32_premul((800, 600)).unwrap();
                             surface.canvas().clear(Color::WHITE);
-                            surface.canvas().draw_glyphs_at(&shaped.glyphs,
-                                shaped.positions.as_slice(), (8.0, baseline), &font, &paint);
+                            surface.canvas().draw_glyphs_at(
+                                &shaped.glyphs,
+                                shaped.positions.as_slice(),
+                                (8.0, baseline),
+                                &font,
+                                &paint,
+                            );
                             let mut rgba = vec![0; 800 * 600 * 4];
                             assert!(surface.read_pixels(&info, &mut rgba, 800 * 4, (0, 0)));
                             let mut browser_pixels = 0;
@@ -9881,7 +13699,8 @@ mod tests {
                                     browser_pixels += usize::from(actual != expected);
                                     native_pixels += usize::from(actual != original);
                                     for channel in 0..4 {
-                                        max_difference = max_difference.max(actual[channel].abs_diff(expected[channel]));
+                                        max_difference = max_difference
+                                            .max(actual[channel].abs_diff(expected[channel]));
                                     }
                                 }
                             }
@@ -9894,25 +13713,39 @@ mod tests {
                 }
             }
         }
-        assert!(rows.iter().any(|row| row["native_pixels"] == 0),
-            "diagnostic must reproduce the original native row before comparing alternatives");
-        eprintln!("MONOSPACE_RASTER_DIAGNOSTIC {}", serde_json::json!({
+        assert!(
+            rows.iter().any(|row| row["native_pixels"] == 0),
+            "diagnostic must reproduce the original native row before comparing alternatives"
+        );
+        eprintln!(
+            "MONOSPACE_RASTER_DIAGNOSTIC {}",
+            serde_json::json!({
             "baseline":baseline,"font_size":style.font_size,"advance":shaped.advance,
-            "glyph_positions":shaped.positions.iter().map(|point| point.x).collect::<Vec<_>>(),"rows":rows}));
+            "glyph_positions":shaped.positions.iter().map(|point| point.x).collect::<Vec<_>>(),"rows":rows})
+        );
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn macos_css_text_preserves_fractional_glyph_origins() {
-        let face = FontMgr::default().match_family_style("Times", FontStyle::normal()).unwrap();
+        let face = FontMgr::default()
+            .match_family_style("Times", FontStyle::normal())
+            .unwrap();
         for size in [16.0, 24.0, 96.0] {
-            let style = Style { font_family: Some("serif".into()), font_size: size,
-                color: w3cos_std::color::Color::rgb(0, 128, 0), ..Style::default() };
-            let shaped = crate::skia_text_run::shape_visual_run("Filler Text", &face, &style).unwrap();
+            let style = Style {
+                font_family: Some("serif".into()),
+                font_size: size,
+                color: w3cos_std::color::Color::rgb(0, 128, 0),
+                ..Style::default()
+            };
+            let shaped =
+                crate::skia_text_run::shape_visual_run("Filler Text", &face, &style).unwrap();
             // Chromium 141 FontPlatformData::CreateSkFont on macOS. Glyphs
             // and shaping are identical: only the raster font policy differs.
             let mut expected_font = Font::new(&face, size);
-            expected_font.set_subpixel(true).set_linear_metrics(true)
+            expected_font
+                .set_subpixel(true)
+                .set_linear_metrics(true)
                 .set_embedded_bitmaps(false)
                 .set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
             for x in [8.0, 8.25, 8.5] {
@@ -9921,43 +13754,84 @@ mod tests {
                 actual.canvas().clear(Color::WHITE);
                 expected.canvas().clear(Color::WHITE);
                 let paint = color_paint(style.color, style.opacity);
-                draw_font_stack_runs(actual.canvas(), x, 100.0, "Filler Text", size,
-                    &face, &style, &paint);
-                expected.canvas().draw_glyphs_at(&shaped.glyphs, shaped.positions.as_slice(),
-                    (x, 100.0), &expected_font, &paint);
+                draw_font_stack_runs(
+                    actual.canvas(),
+                    x,
+                    100.0,
+                    "Filler Text",
+                    size,
+                    &face,
+                    &style,
+                    &paint,
+                );
+                expected.canvas().draw_glyphs_at(
+                    &shaped.glyphs,
+                    shaped.positions.as_slice(),
+                    (x, 100.0),
+                    &expected_font,
+                    &paint,
+                );
                 let info = ImageInfo::new((440, 130), ColorType::RGBA8888, AlphaType::Premul, None);
                 let mut a = vec![0; 440 * 130 * 4];
                 let mut b = a.clone();
                 assert!(actual.read_pixels(&info, &mut a, 440 * 4, (0, 0)));
                 assert!(expected.read_pixels(&info, &mut b, 440 * 4, (0, 0)));
-                let pixels = a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(a,b)| a != b).count();
-                assert_eq!(pixels, 0, "macOS fractional glyph positions: size={size}, x={x}");
+                let pixels = a
+                    .chunks_exact(4)
+                    .zip(b.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(
+                    pixels, 0,
+                    "macOS fractional glyph positions: size={size}, x={x}"
+                );
             }
         }
     }
 
     #[test]
     fn primary_font_strut_skips_unicode_subsets_without_space() {
-        const OWNER:u64 = 0x5354_5255_5453_5043;
-        const FAMILY:&str = "W3COS Strut Space Subset";
-        let fallback_style = Style { font_size:100.0,
-            custom_properties:Some(std::collections::HashMap::from([
-                ("--w3cos-internal-html-standard-font".into(),"1".into()),
-            ])),..Style::default() };
+        const OWNER: u64 = 0x5354_5255_5453_5043;
+        const FAMILY: &str = "W3COS Strut Space Subset";
+        let fallback_style = Style {
+            font_size: 100.0,
+            custom_properties: Some(std::collections::HashMap::from([(
+                "--w3cos-internal-html-standard-font".into(),
+                "1".into(),
+            )])),
+            ..Style::default()
+        };
         let fallback = resolved_font_geometry(&fallback_style).unwrap();
-        let style = Style { font_family:Some(FAMILY.into()),..fallback_style };
-        for (range,includes_space) in [("U+0061, U+0020",true),("U+0061",false)] {
+        let style = Style {
+            font_family: Some(FAMILY.into()),
+            ..fallback_style
+        };
+        for (range, includes_space) in [("U+0061, U+0020", true), ("U+0061", false)] {
             crate::font_face::FontRegistry::global().clear_owner(OWNER);
-            crate::font_face::FontRegistry::global().register_for_owner(OWNER,
-                crate::font_face::FontFace { family:FAMILY.into(),
-                    src:crate::font_face::FontSource::Bytes(TEST_FONT.to_vec()),
-                    unicode_range:Some(range.into()),..Default::default() }).unwrap();
-            let (_,glyph_face) = registered_typeface_covering(&style,"a").expect("a still uses the custom face");
-            let expected = if includes_space { typeface_font_geometry(&glyph_face,100.0) } else { fallback };
+            crate::font_face::FontRegistry::global()
+                .register_for_owner(
+                    OWNER,
+                    crate::font_face::FontFace {
+                        family: FAMILY.into(),
+                        src: crate::font_face::FontSource::Bytes(TEST_FONT.to_vec()),
+                        unicode_range: Some(range.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let (_, glyph_face) =
+                registered_typeface_covering(&style, "a").expect("a still uses the custom face");
+            let expected = if includes_space {
+                typeface_font_geometry(&glyph_face, 100.0)
+            } else {
+                fallback
+            };
             let actual = resolved_font_geometry(&style).unwrap();
-            assert_eq!((actual.ascent,actual.descent,actual.line_gap),
-                (expected.ascent,expected.descent,expected.line_gap),
-                "{range}: the primary line strut selects a face eligible for U+0020, independently of glyph a");
+            assert_eq!(
+                (actual.ascent, actual.descent, actual.line_gap),
+                (expected.ascent, expected.descent, expected.line_gap),
+                "{range}: the primary line strut selects a face eligible for U+0020, independently of glyph a"
+            );
         }
         crate::font_face::FontRegistry::global().clear_owner(OWNER);
     }
@@ -10205,14 +14079,38 @@ mod tests {
 
     #[test]
     fn empty_source_image_paints_browser_missing_resource_frame() {
-        let mut surface=skia_safe::surfaces::raster_n32_premul((32,24)).unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((32, 24)).unwrap();
         surface.canvas().clear(skia_safe::Color::WHITE);
-        draw_image(surface.canvas(),LayoutRect {x:4.0,y:4.0,width:24.0,height:16.0},"",1.0);
-        let mut pixels=vec![0u8;32*24*4];
-        let info=skia_safe::ImageInfo::new((32,24),skia_safe::ColorType::RGBA8888,skia_safe::AlphaType::Premul,None);
-        assert!(surface.read_pixels(&info,&mut pixels,32*4,(0,0)));
-        assert_eq!(pixels.chunks_exact(4).filter(|p|*p==[192,192,192,255]).count(),24*16-22*14);
-        assert_eq!(&pixels[(8*32+8)*4..(8*32+8)*4+4],&[255,255,255,255]);
+        draw_image(
+            surface.canvas(),
+            LayoutRect {
+                x: 4.0,
+                y: 4.0,
+                width: 24.0,
+                height: 16.0,
+            },
+            "",
+            1.0,
+        );
+        let mut pixels = vec![0u8; 32 * 24 * 4];
+        let info = skia_safe::ImageInfo::new(
+            (32, 24),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        assert!(surface.read_pixels(&info, &mut pixels, 32 * 4, (0, 0)));
+        assert_eq!(
+            pixels
+                .chunks_exact(4)
+                .filter(|p| *p == [192, 192, 192, 255])
+                .count(),
+            24 * 16 - 22 * 14
+        );
+        assert_eq!(
+            &pixels[(8 * 32 + 8) * 4..(8 * 32 + 8) * 4 + 4],
+            &[255, 255, 255, 255]
+        );
     }
 
     #[test]
@@ -10320,13 +14218,27 @@ mod tests {
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let decoded = crate::image_loader::decode_and_install("premul-cache.png", &bytes.into_inner()).unwrap();
+        let decoded =
+            crate::image_loader::decode_and_install("premul-cache.png", &bytes.into_inner())
+                .unwrap();
         let texture = super::cached_skia_image(&decoded).unwrap();
         assert_eq!(texture.alpha_type(), AlphaType::Premul);
         assert_eq!(decoded.data.as_slice(), &[128, 64, 0, 128]);
         let mut surface = Surface::new_raster_n32_premul((1, 1)).unwrap();
         surface.canvas().clear(Color::TRANSPARENT);
-        draw_decoded_image(surface.canvas(), LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }, &decoded, 1.0, false, (false, false));
+        draw_decoded_image(
+            surface.canvas(),
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            &decoded,
+            1.0,
+            false,
+            (false, false),
+        );
         let info = ImageInfo::new((1, 1), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut pixel = [0_u8; 4];
         assert!(surface.read_pixels(&info, &mut pixel, 4, (0, 0)));
@@ -10362,15 +14274,24 @@ mod tests {
         reset_image_texture_stats();
         let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 128, 128, 255]));
         let mut bytes = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        let decoded = crate::image_loader::decode_and_install("sampling-cache.png", &bytes.into_inner()).unwrap();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let decoded =
+            crate::image_loader::decode_and_install("sampling-cache.png", &bytes.into_inner())
+                .unwrap();
         let translated = cached_skia_image_for_sampling(&decoded, false).unwrap();
         let scaled = cached_skia_image_for_sampling(&decoded, true).unwrap();
         assert_eq!(translated.alpha_type(), AlphaType::Premul);
         assert_eq!(scaled.alpha_type(), AlphaType::Unpremul);
         assert_ne!(translated.unique_id(), scaled.unique_id());
         for (mode, image) in [(false, &translated), (true, &scaled)] {
-            assert_eq!(cached_skia_image_for_sampling(&decoded, mode).unwrap().unique_id(), image.unique_id());
+            assert_eq!(
+                cached_skia_image_for_sampling(&decoded, mode)
+                    .unwrap()
+                    .unique_id(),
+                image.unique_id()
+            );
         }
         assert_eq!(skia_image_upload_count(), 2);
         assert_eq!(skia_image_reuse_count(), 2);
@@ -10378,17 +14299,35 @@ mod tests {
         assert!(SKIA_IMAGES.with(|cache| cache.borrow().is_empty()));
         for scaled in [false, true] {
             let mut surface = Surface::new_raster_n32_premul((8, 4)).unwrap();
-            if scaled { surface.canvas().scale((2.0, 2.0)); }
-            draw_decoded_image(surface.canvas(), LayoutRect {
-                x: 0.0, y: 0.0, width: 2.0, height: 1.0,
-            }, &decoded, 1.0, false, (false, false));
-            assert!(SKIA_IMAGES.with(|cache| {
-                let cache = cache.borrow();
-                cache.len() == 1 && cache.contains_key(&(decoded.pixels_id(), scaled))
-            }), "canvas transform, not only the CSS destination size, selects sampling");
+            if scaled {
+                surface.canvas().scale((2.0, 2.0));
+            }
+            draw_decoded_image(
+                surface.canvas(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2.0,
+                    height: 1.0,
+                },
+                &decoded,
+                1.0,
+                false,
+                (false, false),
+            );
+            assert!(
+                SKIA_IMAGES.with(|cache| {
+                    let cache = cache.borrow();
+                    cache.len() == 1 && cache.contains_key(&(decoded.pixels_id(), scaled))
+                }),
+                "canvas transform, not only the CSS destination size, selects sampling"
+            );
             invalidate_image_texture(decoded.pixels_id());
         }
-        assert_eq!(decoded.data.as_slice(), &[0, 128, 128, 255, 0, 128, 128, 255]);
+        assert_eq!(
+            decoded.data.as_slice(),
+            &[0, 128, 128, 255, 0, 128, 128, 255]
+        );
         crate::image_loader::clear_cache();
     }
 

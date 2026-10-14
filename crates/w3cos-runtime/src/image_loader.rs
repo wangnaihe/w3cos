@@ -39,7 +39,10 @@ pub(crate) struct SvgIntrinsicSize {
 impl SvgIntrinsicSize {
     pub(crate) fn uses_default_image_size(self) -> bool {
         self.preserve_aspect_ratio_none
-            && !matches!((self.width, self.height), (SvgIntrinsicLength::Px(_), SvgIntrinsicLength::Px(_)))
+            && !matches!(
+                (self.width, self.height),
+                (SvgIntrinsicLength::Px(_), SvgIntrinsicLength::Px(_))
+            )
     }
 }
 
@@ -258,8 +261,16 @@ fn decode_svg(bytes: &[u8]) -> Result<DecodedImage, String> {
     Ok(DecodedImage {
         width,
         height,
-        intrinsic_width: if intrinsic_size.uses_default_image_size() { 300 } else { width },
-        intrinsic_height: if intrinsic_size.uses_default_image_size() { 150 } else { height },
+        intrinsic_width: if intrinsic_size.uses_default_image_size() {
+            300
+        } else {
+            width
+        },
+        intrinsic_height: if intrinsic_size.uses_default_image_size() {
+            150
+        } else {
+            height
+        },
         svg_intrinsic_size: Some(intrinsic_size),
         svg_source: std::str::from_utf8(bytes).ok().map(Arc::from),
         data: Arc::new(rgba),
@@ -316,8 +327,10 @@ pub(crate) fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
                         "width" => width = parse_svg_intrinsic_length(&value),
                         "height" => height = parse_svg_intrinsic_length(&value),
                         "preserveAspectRatio" => {
-                            preserve_aspect_ratio_none = value.split_ascii_whitespace()
-                                .find(|token| *token != "defer") == Some("none");
+                            preserve_aspect_ratio_none = value
+                                .split_ascii_whitespace()
+                                .find(|token| *token != "defer")
+                                == Some("none");
                         }
                         "viewBox" => {
                             let values = value

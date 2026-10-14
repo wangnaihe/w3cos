@@ -430,16 +430,26 @@ struct HitNode {
 
 fn physical_column_hit_nodes(nodes: Vec<HitNode>, artifact: &PaintArtifact) -> Vec<HitNode> {
     let mut seen = HashSet::new();
-    nodes.into_iter().filter(|node| seen.insert(node.index)).flat_map(|node| {
-        let fragments = artifact.column_fragments.get(node.index)
-            .filter(|fragments| !fragments.is_empty());
-        match fragments {
-            Some(fragments) => fragments.iter().map(|fragment| HitNode {
-                rect: fragment.visual_rect, ..node.clone()
-            }).collect::<Vec<_>>(),
-            None => vec![node],
-        }
-    }).collect()
+    nodes
+        .into_iter()
+        .filter(|node| seen.insert(node.index))
+        .flat_map(|node| {
+            let fragments = artifact
+                .column_fragments
+                .get(node.index)
+                .filter(|fragments| !fragments.is_empty());
+            match fragments {
+                Some(fragments) => fragments
+                    .iter()
+                    .map(|fragment| HitNode {
+                        rect: fragment.visual_rect,
+                        ..node.clone()
+                    })
+                    .collect::<Vec<_>>(),
+                None => vec![node],
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -2891,7 +2901,10 @@ impl App {
                     }),
             )
         };
-        let had_column_fragments = self.paint_artifact.column_fragments.iter()
+        let had_column_fragments = self
+            .paint_artifact
+            .column_fragments
+            .iter()
             .any(|fragments| !fragments.is_empty());
         self.paint_artifact = PaintArtifact::build_with_body_background_and_viewport(
             paint_nodes,
@@ -2900,9 +2913,17 @@ impl App {
             canvas_body_index,
             Some((w, layout_h)),
         );
-        if had_column_fragments || self.paint_artifact.column_fragments.iter().any(|fragments| !fragments.is_empty()) {
+        if had_column_fragments
+            || self
+                .paint_artifact
+                .column_fragments
+                .iter()
+                .any(|fragments| !fragments.is_empty())
+        {
             self.hit_nodes = physical_column_hit_nodes(
-                std::mem::take(&mut self.hit_nodes), &self.paint_artifact);
+                std::mem::take(&mut self.hit_nodes),
+                &self.paint_artifact,
+            );
             self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
         }
         for (scroll_index, correction) in virtual_anchor_corrections {
@@ -3776,15 +3797,15 @@ impl App {
                 // The existing culler consumes document-space overflow clips.
                 // Do not discard content using that space while the viewport
                 // transform is nonzero; Skia applies it to content and clips.
-                self.paint_artifact.viewport_scroll != (0.0, 0.0) ||
-                node_intersects_paint_cull(
-                    idx,
-                    rect,
-                    &scroll_info_raw,
-                    self.viewport.layout_w,
-                    self.viewport.layout_h,
-                    64.0,
-                )
+                self.paint_artifact.viewport_scroll != (0.0, 0.0)
+                    || node_intersects_paint_cull(
+                        idx,
+                        rect,
+                        &scroll_info_raw,
+                        self.viewport.layout_w,
+                        self.viewport.layout_h,
+                        64.0,
+                    )
             })
             .collect();
 
@@ -3839,12 +3860,24 @@ impl App {
                 .collect();
         let paint_z = &self.paint_artifact.z_order;
         for (idx, node) in self.paint_artifact.nodes.iter().enumerate() {
-            if node.style.custom_properties.as_ref().is_some_and(|p|
-                p.contains_key("--w3cos-internal-media-controls-layer"))
+            if node
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|p| p.contains_key("--w3cos-internal-media-controls-layer"))
                 && let Some(rect) = self.paint_artifact.rect_by_index[idx]
             {
-                render_nodes.push((idx, LayoutRect { x: rect.x * scale, y: rect.y * scale,
-                    width: rect.width * scale, height: rect.height * scale }, &node.kind, &node.style));
+                render_nodes.push((
+                    idx,
+                    LayoutRect {
+                        x: rect.x * scale,
+                        y: rect.y * scale,
+                        width: rect.width * scale,
+                        height: rect.height * scale,
+                    },
+                    &node.kind,
+                    &node.style,
+                ));
             }
         }
         render_nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
@@ -5645,7 +5678,9 @@ impl App {
         {
             let (layout_x, layout_y) = self.viewport_to_layout(self.mouse_x, self.mouse_y);
             let content = crate::svg_renderer::content_box(*rect, node.style);
-            if content.width <= 0.0 || content.height <= 0.0 { return Vec::new(); }
+            if content.width <= 0.0 || content.height <= 0.0 {
+                return Vec::new();
+            }
             let width = content.width.ceil().max(1.0) as u32;
             let height = content.height.ceil().max(1.0) as u32;
             let raster_x = (layout_x - content.x) * width as f32 / content.width;
@@ -6252,21 +6287,51 @@ fn paint_nodes_as_flat<'a>(
 fn retained_layout_excludes_video_controls_paint_children() {
     use w3cos_std::style::Style;
     let nodes = vec![
-        PaintNode { kind: ComponentKind::Root, style: Style::default(), parent: None, sticky_counter_signal: None },
-        PaintNode { kind: ComponentKind::Box, style: Style {
-            custom_properties: Some(HashMap::from([("--w3cos-internal-video-controls".into(), "no-source".into())])),
-            ..Style::default()
-        }, parent: Some(0), sticky_counter_signal: None },
-        PaintNode { kind: ComponentKind::Box, style: Style::default(), parent: Some(0), sticky_counter_signal: None },
+        PaintNode {
+            kind: ComponentKind::Root,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        },
+        PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                custom_properties: Some(HashMap::from([(
+                    "--w3cos-internal-video-controls".into(),
+                    "no-source".into(),
+                )])),
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        },
+        PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: Some(0),
+            sticky_counter_signal: None,
+        },
     ];
-    let rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
-    let artifact = PaintArtifact::build(nodes, &[(rect,0),(rect,1),(rect,2)], 1);
+    let rect = LayoutRect {
+        x: 0.0,
+        y: 0.0,
+        width: 100.0,
+        height: 100.0,
+    };
+    let artifact = PaintArtifact::build(nodes, &[(rect, 0), (rect, 1), (rect, 2)], 1);
     assert_eq!(artifact.nodes.len(), 4);
     let action = EventAction::None;
     let flat = paint_nodes_as_flat(&artifact.nodes, &action);
-    assert_eq!(flat.len(), 3, "UA paint children must never enter layout reuse");
+    assert_eq!(
+        flat.len(),
+        3,
+        "UA paint children must never enter layout reuse"
+    );
     assert_eq!(flat[2].parent, Some(0));
-    assert!(std::ptr::eq(flat[2].style, &artifact.nodes[2].style), "source indices must remain stable");
+    assert!(
+        std::ptr::eq(flat[2].style, &artifact.nodes[2].style),
+        "source indices must remain stable"
+    );
 }
 
 trait PaintNodeView {
@@ -8617,16 +8682,37 @@ mod scroll_physics_tests {
     #[test]
     fn fixed_auto_multicol_hit_regions_keep_identity_and_remove_logical_overflow() {
         use crate::paint_artifact::ColumnFragment;
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 15.0, height: 250.0 };
-        let node = HitNode { rect, index: 0, is_interactive: true,
-            is_host_target: true, is_focusable: true, on_click: EventAction::None };
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 15.0,
+            height: 250.0,
+        };
+        let node = HitNode {
+            rect,
+            index: 0,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: true,
+            on_click: EventAction::None,
+        };
         let mut artifact = PaintArtifact::default();
-        artifact.column_fragments = vec![(0..3).map(|column| ColumnFragment {
-            visual_rect: LayoutRect { x: column as f32 * 100.0, y: 0.0,
-                width: 15.0, height: if column == 2 { 50.0 } else { 100.0 } },
-            translate_x: column as f32 * 100.0, translate_y: -(column as f32 * 100.0),
-            clip_top: 0.0, clip_bottom: 100.0,
-        }).collect()];
+        artifact.column_fragments = vec![
+            (0..3)
+                .map(|column| ColumnFragment {
+                    visual_rect: LayoutRect {
+                        x: column as f32 * 100.0,
+                        y: 0.0,
+                        width: 15.0,
+                        height: if column == 2 { 50.0 } else { 100.0 },
+                    },
+                    translate_x: column as f32 * 100.0,
+                    translate_y: -(column as f32 * 100.0),
+                    clip_top: 0.0,
+                    clip_bottom: 100.0,
+                })
+                .collect(),
+        ];
         let hits = physical_column_hit_nodes(vec![node.clone(), node], &artifact);
         assert_eq!(hits.len(), 3, "retained fragments must not expand twice");
         assert!(hits.iter().all(|hit| hit.index == 0 && hit.is_focusable));

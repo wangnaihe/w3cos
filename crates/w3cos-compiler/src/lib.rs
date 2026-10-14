@@ -768,12 +768,16 @@ edition = "2024"
             runtime_features.push("gpu".to_string());
         }
         if flags.needs_web_graphics_advanced
-            && !runtime_features.iter().any(|feature| feature == "web-graphics-advanced")
+            && !runtime_features
+                .iter()
+                .any(|feature| feature == "web-graphics-advanced")
         {
             runtime_features.push("web-graphics-advanced".to_string());
         }
         if flags.needs_web_media_advanced
-            && !runtime_features.iter().any(|feature| feature == "web-media-advanced")
+            && !runtime_features
+                .iter()
+                .any(|feature| feature == "web-media-advanced")
         {
             runtime_features.push("web-media-advanced".to_string());
         }
@@ -1969,8 +1973,7 @@ export function main() {
             "missing DOM-mode main: {main_rs}"
         );
         assert!(
-            main_rs.contains("prepare_headless_entry")
-                && main_rs.contains("finish_headless_entry"),
+            main_rs.contains("prepare_headless_entry") && main_rs.contains("finish_headless_entry"),
             "headless entry must pump through the runtime: {main_rs}"
         );
         assert!(

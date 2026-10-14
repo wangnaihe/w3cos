@@ -1,10 +1,10 @@
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
 use crate::document::Document;
-use crate::stylesheet;
 use crate::dom_rect::DOMRect;
 use crate::events::{Event, EventHandler, EventType};
 use crate::node::{NodeId, NodeType};
+use crate::stylesheet;
 
 fn cached_attr_name(name: &str) -> Atom {
     match name {

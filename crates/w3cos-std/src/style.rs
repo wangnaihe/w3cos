@@ -1134,7 +1134,11 @@ pub struct Edges {
 /// Quantize a resolved margin/padding length at the used box-value boundary.
 /// Computed CSS lengths and glyph/letter-spacing advances stay unmodified.
 pub fn used_box_spacing(value: f32) -> f32 {
-    if value.is_finite() { (value * 64.0).trunc() / 64.0 } else { value }
+    if value.is_finite() {
+        (value * 64.0).trunc() / 64.0
+    } else {
+        value
+    }
 }
 
 impl Edges {
@@ -1172,16 +1176,14 @@ impl Edges {
         }
     }
 
-    fn resolve_lengths_with_style(
-        &self,
-        insets: &SafeAreaInsets,
-        style: &Style,
-    ) -> EdgeLengths {
-        let resolve = |value: Spacing| used_box_spacing(match value {
-            Spacing::Em(value) => value * style.font_size,
-            Spacing::Ch(value) => value * style.ch_advance(),
-            other => other.resolve(insets),
-        });
+    fn resolve_lengths_with_style(&self, insets: &SafeAreaInsets, style: &Style) -> EdgeLengths {
+        let resolve = |value: Spacing| {
+            used_box_spacing(match value {
+                Spacing::Em(value) => value * style.font_size,
+                Spacing::Ch(value) => value * style.ch_advance(),
+                other => other.resolve(insets),
+            })
+        };
         EdgeLengths {
             top: resolve(self.top),
             right: resolve(self.right),
@@ -1194,7 +1196,9 @@ impl Edges {
 impl Style {
     /// Resolve against the current font, never cached pixels from an ancestor.
     pub fn ch_advance(&self) -> f32 {
-        CH_ADVANCE_PROVIDER.with(|slot| slot.get()).and_then(|provider| provider(self))
+        CH_ADVANCE_PROVIDER
+            .with(|slot| slot.get())
+            .and_then(|provider| provider(self))
             .filter(|advance| advance.is_finite() && *advance >= 0.0)
             .unwrap_or(self.font_size * 0.5)
     }
@@ -1245,9 +1249,15 @@ mod tests {
 
     #[test]
     fn absolute_length_conversion_rounds_only_the_final_pixel_value() {
-        for (unit, scale) in [("pt", 96.0_f64 / 72.0), ("cm", 96.0 / 2.54),
-            ("mm", 96.0 / 25.4), ("q", 96.0 / 101.6), ("in", 96.0),
-            ("pc", 16.0), ("px", 1.0)] {
+        for (unit, scale) in [
+            ("pt", 96.0_f64 / 72.0),
+            ("cm", 96.0 / 2.54),
+            ("mm", 96.0 / 25.4),
+            ("q", 96.0 / 101.6),
+            ("in", 96.0),
+            ("pc", 16.0),
+            ("px", 1.0),
+        ] {
             for number in ["10", "1.1", "-1.2345678901", "0.000017", "123.456789"] {
                 let expected = (number.parse::<f64>().unwrap() * scale) as f32;
                 let actual = super::parse_absolute_length_px(&format!("{number}{unit}")).unwrap();

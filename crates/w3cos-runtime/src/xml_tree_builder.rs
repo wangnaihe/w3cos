@@ -382,10 +382,24 @@ mod tests {
             .unwrap();
         let span = crate::dom::first_child(parent).unwrap();
         let children = crate::dom::children(span);
-        assert_eq!(children.iter().map(|id| crate::dom::node_type(*id)).collect::<Vec<_>>(),
-            vec![3, 1, 3, 8, 3, 4, 3]);
-        for (index, text) in [(0, "--> AB&"), (2, "tail<"), (4, "after&"), (5, "cdata"), (6, "last>")] {
-            assert_eq!(crate::dom::get_text_content(children[index]).as_deref(), Some(text));
+        assert_eq!(
+            children
+                .iter()
+                .map(|id| crate::dom::node_type(*id))
+                .collect::<Vec<_>>(),
+            vec![3, 1, 3, 8, 3, 4, 3]
+        );
+        for (index, text) in [
+            (0, "--> AB&"),
+            (2, "tail<"),
+            (4, "after&"),
+            (5, "cdata"),
+            (6, "last>"),
+        ] {
+            assert_eq!(
+                crate::dom::get_text_content(children[index]).as_deref(),
+                Some(text)
+            );
         }
     }
 

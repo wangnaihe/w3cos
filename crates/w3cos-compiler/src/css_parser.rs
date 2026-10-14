@@ -1021,7 +1021,9 @@ fn parse_declarations(block: &str) -> StyleDecl {
 }
 
 fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
-    if !w3cos_dom::css_style::valid_multicol_declaration(property, value) { return; }
+    if !w3cos_dom::css_style::valid_multicol_declaration(property, value) {
+        return;
+    }
     if property.starts_with("--") {
         let props = style.custom_properties.get_or_insert_with(HashMap::new);
         props.insert(property.to_string(), value.to_string());
@@ -1102,7 +1104,7 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "font-style" => style.font_style = Some(value.to_string()),
         "font-variant" => match value.trim().to_ascii_lowercase().as_str() {
             "normal" | "small-caps" => style.font_variant = Some(value.trim().to_ascii_lowercase()),
-            _ => {},
+            _ => {}
         },
         "color" => style.color = Some(value.to_string()),
         "background" => {
@@ -1523,27 +1525,57 @@ fn parse_font_weight(value: &str) -> Option<u16> {
 }
 
 fn apply_font_shorthand(style: &mut StyleDecl, value: &str) {
-    let (before_line_height, after_slash) = value.split_once('/')
+    let (before_line_height, after_slash) = value
+        .split_once('/')
         .map_or((value, None), |(before, after)| (before, Some(after)));
-    let parts = before_line_height.split_ascii_whitespace().collect::<Vec<_>>();
-    let size_index = if after_slash.is_some() { parts.len().checked_sub(1) } else {
-        parts.iter().position(|token| ["px", "pt", "pc", "in", "cm", "mm", "q", "em", "rem", "%"]
-            .into_iter().any(|unit| token.strip_suffix(unit).is_some_and(|value| value.parse::<f32>().is_ok())))
+    let parts = before_line_height
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    let size_index = if after_slash.is_some() {
+        parts.len().checked_sub(1)
+    } else {
+        parts.iter().position(|token| {
+            ["px", "pt", "pc", "in", "cm", "mm", "q", "em", "rem", "%"]
+                .into_iter()
+                .any(|unit| {
+                    token
+                        .strip_suffix(unit)
+                        .is_some_and(|value| value.parse::<f32>().is_ok())
+                })
+        })
     };
-    let Some(size_index) = size_index else { return; };
+    let Some(size_index) = size_index else {
+        return;
+    };
     let size = parts[size_index];
-    if parts[..size_index].iter().any(|token|
-        !matches!(*token, "normal" | "italic" | "oblique" | "small-caps" | "bold" | "bolder" | "lighter")
-            && parse_font_weight(token).is_none()) { return; }
+    if parts[..size_index].iter().any(|token| {
+        !matches!(
+            *token,
+            "normal" | "italic" | "oblique" | "small-caps" | "bold" | "bolder" | "lighter"
+        ) && parse_font_weight(token).is_none()
+    }) {
+        return;
+    }
     let family = if let Some(after_slash) = after_slash {
         let after_slash = after_slash.trim_start();
-        let line_height_end = after_slash.find(char::is_whitespace).unwrap_or(after_slash.len());
+        let line_height_end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
         after_slash[line_height_end..].trim().to_string()
-    } else { parts[size_index + 1..].join(" ") };
-    if family.is_empty() { return; }
-    style.font_variant = Some(if parts[..size_index].contains(&"small-caps") {
-        "small-caps"
-    } else { "normal" }.to_string());
+    } else {
+        parts[size_index + 1..].join(" ")
+    };
+    if family.is_empty() {
+        return;
+    }
+    style.font_variant = Some(
+        if parts[..size_index].contains(&"small-caps") {
+            "small-caps"
+        } else {
+            "normal"
+        }
+        .to_string(),
+    );
     if let Some(size) = w3cos_std::style::parse_absolute_length_px(size) {
         style.font_size = Some(size);
     }
@@ -1678,10 +1710,16 @@ mod tests {
 
     #[test]
     fn small_caps_survive_longhand_and_both_font_shorthand_forms() {
-        for value in ["font-variant:small-caps", "font:small-caps 96px serif",
-            "font:small-caps 96px/1 serif"] {
+        for value in [
+            "font-variant:small-caps",
+            "font:small-caps 96px serif",
+            "font:small-caps 96px/1 serif",
+        ] {
             let sheet = parse_css(&format!("p {{{value}}}"));
-            assert_eq!(sheet.rules[0].style.font_variant.as_deref(), Some("small-caps"));
+            assert_eq!(
+                sheet.rules[0].style.font_variant.as_deref(),
+                Some("small-caps")
+            );
         }
         let sheet = parse_css("p {font-variant:small-caps; font:16px serif}");
         assert_eq!(sheet.rules[0].style.font_variant.as_deref(), Some("normal"));
@@ -1706,16 +1744,27 @@ mod tests {
 
     #[test]
     fn multicol_static_css_preserves_valid_values_and_shorthand_resets() {
-        let sheet = parse_css("div { columns: 3 100px; column-width: 20%; column-count: 0; column-fill: auto; }");
+        let sheet = parse_css(
+            "div { columns: 3 100px; column-width: 20%; column-count: 0; column-fill: auto; }",
+        );
         let style = &sheet.rules[0].style;
-        assert_eq!(style.column_width, Some(w3cos_std::style::Dimension::Px(100.0)));
-        assert_eq!(style.column_count, Some(crate::parser::ColumnCount::Count(3)));
+        assert_eq!(
+            style.column_width,
+            Some(w3cos_std::style::Dimension::Px(100.0))
+        );
+        assert_eq!(
+            style.column_count,
+            Some(crate::parser::ColumnCount::Count(3))
+        );
         assert_eq!(style.column_fill, Some(w3cos_std::style::ColumnFill::Auto));
         let sheet = parse_css("div { columns: 3 100px; columns: auto; column-fill: unset; }");
         let style = &sheet.rules[0].style;
         assert_eq!(style.column_width, Some(w3cos_std::style::Dimension::Auto));
         assert_eq!(style.column_count, Some(crate::parser::ColumnCount::Auto));
-        assert_eq!(style.column_fill, Some(w3cos_std::style::ColumnFill::Balance));
+        assert_eq!(
+            style.column_fill,
+            Some(w3cos_std::style::ColumnFill::Balance)
+        );
     }
 
     #[test]

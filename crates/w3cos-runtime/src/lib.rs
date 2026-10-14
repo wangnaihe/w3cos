@@ -77,9 +77,15 @@ mod html_parser_state;
 mod html_tree_builder;
 pub mod image_decoder_web;
 pub mod image_loader;
+pub mod incremental_layout;
 pub mod indexed_db;
 mod indexed_db_sqlite;
 pub mod indexed_db_web;
+mod inline_line_metrics;
+#[cfg(feature = "skia")]
+mod inline_shaping;
+mod inline_table_baseline;
+mod inline_whitespace;
 #[cfg(target_os = "ios")]
 mod ios_input;
 #[cfg(all(
@@ -87,10 +93,10 @@ mod ios_input;
     not(target_env = "ohos")
 ))]
 pub mod ipc;
-pub mod incremental_layout;
 pub mod jsdom;
 pub mod launch_handler_web;
 pub mod layout;
+mod list_marker;
 pub mod locks_web;
 pub mod manifest;
 pub mod media;
@@ -144,12 +150,6 @@ pub mod sensors_web;
 pub mod service_worker_web;
 #[cfg(feature = "skia")]
 mod skia_text_run;
-#[cfg(feature = "skia")]
-mod inline_shaping;
-mod inline_line_metrics;
-mod inline_table_baseline;
-mod inline_whitespace;
-mod list_marker;
 pub mod speech;
 pub mod speech_synthesis_web;
 pub mod speech_web;
@@ -159,9 +159,9 @@ pub mod storage_buckets_web;
 pub mod storage_manager_web;
 pub mod streams;
 pub mod streams_web;
-pub mod svg_renderer;
 #[cfg(feature = "skia")]
 mod svg_image_document;
+pub mod svg_renderer;
 pub mod svg_values_web;
 mod table_grid;
 mod table_paint;

@@ -84,7 +84,8 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         Some((width as f32, height as f32)),
     );
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
-    let mut nodes = artifact.rect_by_index
+    let mut nodes = artifact
+        .rect_by_index
         .iter()
         .enumerate()
         .filter_map(|(index, rect)| {
@@ -125,12 +126,25 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         .collect::<Vec<_>>();
     if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
         for (index, rect, kind, style) in &nodes {
-            eprintln!("W3COS_HEADLESS_REPLAY index={index} rect={rect:?} kind={kind:?} color={:?} background={:?} opacity={} properties={:?} text_decoration={:?} applied_decorations={:?}",
-                style.color, style.background, style.opacity, style.custom_properties,
+            eprintln!(
+                "W3COS_HEADLESS_REPLAY index={index} rect={rect:?} kind={kind:?} color={:?} background={:?} opacity={} properties={:?} text_decoration={:?} applied_decorations={:?}",
+                style.color,
+                style.background,
+                style.opacity,
+                style.custom_properties,
                 style.text_decoration,
-                artifact.ancestor_text_decorations(*index).iter().map(|owner|
-                    (owner.style.text_decoration, owner.style.color, owner.style.font_size,
-                        owner.style.font_family.as_deref(), owner.baseline_shift)).collect::<Vec<_>>());
+                artifact
+                    .ancestor_text_decorations(*index)
+                    .iter()
+                    .map(|owner| (
+                        owner.style.text_decoration,
+                        owner.style.color,
+                        owner.style.font_size,
+                        owner.style.font_family.as_deref(),
+                        owner.baseline_shift
+                    ))
+                    .collect::<Vec<_>>()
+            );
         }
     }
     let scroll_offsets = layout_results
@@ -167,7 +181,12 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
 fn rasterize_prepared_frame(
     width: u32,
     height: u32,
-    nodes: &[(usize, LayoutRect, &w3cos_std::component::ComponentKind, &w3cos_std::style::Style)],
+    nodes: &[(
+        usize,
+        LayoutRect,
+        &w3cos_std::component::ComponentKind,
+        &w3cos_std::style::Style,
+    )],
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
     artifact: &PaintArtifact,
 ) -> Result<Vec<u8>> {
@@ -213,10 +232,7 @@ fn rasterize_prepared_frame(
         );
         return Ok(pixmap.take());
     }
-    #[cfg(not(any(
-        feature = "skia",
-        all(feature = "cpu-render", not(feature = "skia"))
-    )))]
+    #[cfg(not(any(feature = "skia", all(feature = "cpu-render", not(feature = "skia")))))]
     {
         let _ = (width, height, nodes, scroll_info, artifact);
         bail!("headless rasterizer is not compiled in");
@@ -305,7 +321,10 @@ mod tests {
         let window = crate::jsdom::window_value();
         window.call_method(
             "scrollTo",
-            vec![w3cos_core::Value::Number(0.0), w3cos_core::Value::Number(20.0)],
+            vec![
+                w3cos_core::Value::Number(0.0),
+                w3cos_core::Value::Number(20.0),
+            ],
         );
         assert_eq!(window.get_property("scrollY").to_number(), 20.0);
         let after = render_document_rgba(64, 64).unwrap();
@@ -329,26 +348,39 @@ mod tests {
         crate::dom::set_style_property(body, "height", "200px");
         let fixed = crate::dom::create_element("div");
         for (name, value) in [
-            ("position", "fixed"), ("top", "10px"), ("left", "10px"),
-            ("width", "20px"), ("height", "20px"), ("background", "red"),
+            ("position", "fixed"),
+            ("top", "10px"),
+            ("left", "10px"),
+            ("width", "20px"),
+            ("height", "20px"),
+            ("background", "red"),
         ] {
             crate::dom::set_style_property(fixed, name, value);
         }
         let child = crate::dom::create_element("div");
         for (name, value) in [
-            ("width", "10px"), ("height", "10px"), ("background", "green"),
+            ("width", "10px"),
+            ("height", "10px"),
+            ("background", "green"),
         ] {
             crate::dom::set_style_property(child, name, value);
         }
         crate::dom::append_child(fixed, child);
         crate::dom::append_child(body, fixed);
         let before = render_document_rgba(64, 64).unwrap();
-        crate::jsdom::window_value().call_method("scrollTo", vec![
-            w3cos_core::Value::Number(0.0), w3cos_core::Value::Number(20.0),
-        ]);
+        crate::jsdom::window_value().call_method(
+            "scrollTo",
+            vec![
+                w3cos_core::Value::Number(0.0),
+                w3cos_core::Value::Number(20.0),
+            ],
+        );
         let after = render_document_rgba(64, 64).unwrap();
         crate::jsdom::reset_bridge();
-        assert_eq!(before.rgba, after.rgba, "fixed subtree must not scroll with the document");
+        assert_eq!(
+            before.rgba, after.rgba,
+            "fixed subtree must not scroll with the document"
+        );
         let pixel = (15 * 64 + 15) * 4;
         assert_eq!(&after.rgba[pixel..pixel + 4], &[0, 128, 0, 255]);
     }
@@ -363,26 +395,40 @@ mod tests {
         crate::dom::set_style_property(body, "height", "200px");
         let container = crate::dom::create_element("div");
         for (name, value) in [
-            ("position", "absolute"), ("top", "30px"), ("left", "0"),
-            ("width", "20px"), ("height", "20px"), ("overflow", "hidden"),
+            ("position", "absolute"),
+            ("top", "30px"),
+            ("left", "0"),
+            ("width", "20px"),
+            ("height", "20px"),
+            ("overflow", "hidden"),
         ] {
             crate::dom::set_style_property(container, name, value);
         }
         let child = crate::dom::create_element("div");
         for (name, value) in [
-            ("width", "20px"), ("height", "40px"), ("background", "green"),
+            ("width", "20px"),
+            ("height", "40px"),
+            ("background", "green"),
         ] {
             crate::dom::set_style_property(child, name, value);
         }
         crate::dom::append_child(container, child);
         crate::dom::append_child(body, container);
-        crate::jsdom::window_value().call_method("scrollTo", vec![
-            w3cos_core::Value::Number(0.0), w3cos_core::Value::Number(20.0),
-        ]);
+        crate::jsdom::window_value().call_method(
+            "scrollTo",
+            vec![
+                w3cos_core::Value::Number(0.0),
+                w3cos_core::Value::Number(20.0),
+            ],
+        );
         let frame = render_document_rgba(64, 64).unwrap();
         crate::jsdom::reset_bridge();
-        for (y, expected) in [(5, [255,255,255,255]), (15, [0,128,0,255]),
-            (25, [0,128,0,255]), (35, [255,255,255,255])] {
+        for (y, expected) in [
+            (5, [255, 255, 255, 255]),
+            (15, [0, 128, 0, 255]),
+            (25, [0, 128, 0, 255]),
+            (35, [255, 255, 255, 255]),
+        ] {
             let pixel = (y * 64 + 10) * 4;
             assert_eq!(&frame.rgba[pixel..pixel + 4], &expected, "clip at y={y}");
         }

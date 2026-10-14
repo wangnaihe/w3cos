@@ -792,7 +792,8 @@ fn render_node(
     let opacity = style.opacity;
     let color_chain = if in_layer { None } else { css_filter.as_ref() };
     let bg = node_color(style.background, opacity, color_chain);
-    for background_rect in crate::paint_artifact::box_background_paint_rects(style, decoration_rect) {
+    for background_rect in crate::paint_artifact::box_background_paint_rects(style, decoration_rect)
+    {
         if bg.a > 0 {
             draw_rect(pixmap, background_rect, bg, style.border_radius, clip_mask);
         }
@@ -1077,7 +1078,10 @@ fn render_node(
         ComponentKind::SvgDocument { source, .. } => {
             let rect = crate::svg_renderer::content_box(rect, style);
             if let Some(raster) = crate::svg_renderer::get_or_render_inline(
-                source, rect.width.ceil().max(1.0) as u32, rect.height.ceil().max(1.0) as u32) {
+                source,
+                rect.width.ceil().max(1.0) as u32,
+                rect.height.ceil().max(1.0) as u32,
+            ) {
                 draw_image_pixels(
                     pixmap,
                     rect,

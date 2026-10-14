@@ -19,23 +19,38 @@ pub(crate) use w3cos_std::inline_text::explicit_hyphen_break_end;
 /// item advance is rounded upward, as in Blink ShapeResult::SnappedWidth.
 pub(crate) fn inline_layout_advance(advance: f32) -> f32 {
     let units = advance * 64.0;
-    if units.is_finite() { units.ceil() / 64.0 } else { advance }
+    if units.is_finite() {
+        units.ceil() / 64.0
+    } else {
+        advance
+    }
 }
 
 /// Carry source boundaries through whitespace preparation and soft line cuts.
 /// Line matching is monotonic, so repeated text maps to its own source range.
-pub(crate) fn authored_line_styles(text: &str, style: &Style, lines: &[String]) -> Option<Vec<Style>> {
+pub(crate) fn authored_line_styles(
+    text: &str,
+    style: &Style,
+    lines: &[String],
+) -> Option<Vec<Style>> {
     let ends = w3cos_std::inline_text::fragment_ends(text, style)?;
     let normalized = prepare_text_for_white_space(text, style.white_space);
-    let ends = ends.into_iter().map(|end|
-        prepare_text_for_white_space(&text[..end], style.white_space).len()).collect::<Vec<_>>();
+    let ends = ends
+        .into_iter()
+        .map(|end| prepare_text_for_white_space(&text[..end], style.white_space).len())
+        .collect::<Vec<_>>();
     let mut cursor = 0;
     let mut result = Vec::with_capacity(lines.len());
     for line in lines {
         let start = cursor + normalized.get(cursor..)?.find(line.as_str())?;
         let end = start + line.len();
-        let local_ends = ends.iter().copied().filter(|offset| *offset > start && *offset < end)
-            .map(|offset| offset - start).chain(std::iter::once(line.len())).collect::<Vec<_>>();
+        let local_ends = ends
+            .iter()
+            .copied()
+            .filter(|offset| *offset > start && *offset < end)
+            .map(|offset| offset - start)
+            .chain(std::iter::once(line.len()))
+            .collect::<Vec<_>>();
         let mut line_style = style.clone();
         w3cos_std::inline_text::set_fragment_ends(&mut line_style, line, &local_ends);
         result.push(line_style);
@@ -167,7 +182,12 @@ impl JustificationExpansion {
     }
 
     pub(crate) fn at_space(self, byte_offset: usize) -> f64 {
-        self.ordinary + if byte_offset == self.last_space { self.residual } else { 0.0 }
+        self.ordinary
+            + if byte_offset == self.last_space {
+                self.residual
+            } else {
+                0.0
+            }
     }
 }
 
@@ -316,7 +336,9 @@ fn collapse_css_whitespace_sequences(text: &str) -> String {
             pending_space = true;
         } else {
             if pending_space {
-                if !output.ends_with(FORCED_LINE_BREAK) { output.push(' '); }
+                if !output.ends_with(FORCED_LINE_BREAK) {
+                    output.push(' ');
+                }
                 pending_space = false;
             }
             output.push(character);
@@ -472,9 +494,19 @@ where
         // Finite narrow widths are real CSS constraints, not an unbounded
         // layout sentinel. Keep unbreakable words overflowing intact while
         // still taking ordinary spaces and CJK break opportunities.
-        return wrap_greedy_with_line_width(text, 1, false,
-            |index| if index == 0 { first_line_width } else { max_width },
-            |run| run.chars().map(&mut char_width).sum());
+        return wrap_greedy_with_line_width(
+            text,
+            1,
+            false,
+            |index| {
+                if index == 0 {
+                    first_line_width
+                } else {
+                    max_width
+                }
+            },
+            |run| run.chars().map(&mut char_width).sum(),
+        );
     }
 
     let mut lines: Vec<String> = Vec::new();
@@ -576,9 +608,9 @@ fn defer_unbreakable_word_to_available_band(
     run_width: &mut impl FnMut(&str) -> f32,
 ) {
     if word.is_empty()
-        || word.chars().any(|ch| {
-            (ch.is_whitespace() && ch != '\u{00a0}') || is_cjk_line_break_character(ch)
-        })
+        || word
+            .chars()
+            .any(|ch| (ch.is_whitespace() && ch != '\u{00a0}') || is_cjk_line_break_character(ch))
     {
         return;
     }
@@ -607,7 +639,11 @@ fn wrap_greedy_with_line_width(
     // change neutral resolution and reduce the complete run's advance. Never
     // invent a soft break when that complete run fits the first available band.
     // Mandatory breaks still take the ordinary line-by-line path below.
-    if !text.is_empty() && !text.chars().any(|ch| matches!(ch, '\n' | FORCED_LINE_BREAK)) {
+    if !text.is_empty()
+        && !text
+            .chars()
+            .any(|ch| matches!(ch, '\n' | FORCED_LINE_BREAK))
+    {
         let available_width = line_width(0).max(1.0);
         let fitting_roundoff = available_width * f32::EPSILON * 4.0;
         if run_width(text) <= available_width + fitting_roundoff {
@@ -644,9 +680,7 @@ fn wrap_greedy_with_line_width(
         // ulps; do not turn that numerical loss into a CSS soft break. This is
         // far below a 1/64px LayoutUnit, so genuinely narrower lines still wrap.
         let fitting_roundoff = available_width.max(1.0) * f32::EPSILON * 4.0;
-        if current.chars().count() > 1
-            && run_width(&current) > available_width + fitting_roundoff
-        {
+        if current.chars().count() > 1 && run_width(&current) > available_width + fitting_roundoff {
             if preserve_spaces && ch == ' ' {
                 continue;
             }
@@ -659,7 +693,9 @@ fn wrap_greedy_with_line_width(
                     Some((index + 1, if preserve_spaces { index + 1 } else { index }))
                 } else if let Some(end) = explicit_hyphen_break_end(&current, index) {
                     Some((end, end))
-                } else { None }
+                } else {
+                    None
+                }
             });
             if let Some((next_start, line_end)) = soft_break {
                 let remainder = current[next_start..].trim_start_matches(' ').to_string();
@@ -833,7 +869,9 @@ fn font_render_text_with_boundaries(
         for local_index in unicode_bidi::BidiInfo::reorder_visual(levels) {
             let index = start + local_index;
             let character = logical[index];
-            if is_non_rendering_format_character(character) { continue; }
+            if is_non_rendering_format_character(character) {
+                continue;
+            }
             let rtl = levels[local_index].is_rtl();
             if previous_rtl.is_some_and(|previous| previous != rtl) {
                 boundaries.push(rendered.len());
@@ -841,7 +879,9 @@ fn font_render_text_with_boundaries(
             previous_rtl = Some(rtl);
             let character = if rtl {
                 unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
-            } else { character };
+            } else {
+                character
+            };
             rendered.push(font_glyph_character(character));
         }
     }
@@ -886,7 +926,10 @@ pub(crate) fn font_render_text_for_style_with_boundaries<'a>(
             .chars()
             .any(|character| font_glyph_character(character) != character)
         {
-            return (Cow::Owned(transformed.chars().map(font_glyph_character).collect()), Vec::new());
+            return (
+                Cow::Owned(transformed.chars().map(font_glyph_character).collect()),
+                Vec::new(),
+            );
         }
         return (transformed, Vec::new());
     }
@@ -950,8 +993,8 @@ pub fn wrapped_block_height_estimate(content: &str, width: f32, style: &Style) -
         style.line_height,
         style.white_space,
     );
-    let h =
-        used_text_line_count(content, style, &lines) as f32 * crate::layout::inline_style_line_height(&style);
+    let h = used_text_line_count(content, style, &lines) as f32
+        * crate::layout::inline_style_line_height(&style);
     h + style.padding_lengths().top + style.padding_lengths().bottom
 }
 
@@ -965,8 +1008,8 @@ pub fn text_intrinsic_size_estimate(content: &str, style: &Style, wrap_width: f3
         style.line_height,
         style.white_space,
     );
-    let h =
-        used_text_line_count(content, style, &lines) as f32 * crate::layout::inline_style_line_height(&style);
+    let h = used_text_line_count(content, style, &lines) as f32
+        * crate::layout::inline_style_line_height(&style);
     let max_line_w = lines
         .iter()
         .map(|line| measure_text_width_estimate(line, style.font_size))
@@ -1215,8 +1258,13 @@ pub fn wrap_text_with_char_width(
             .collect();
     }
     if white_space == WhiteSpace::PreWrap && max_width <= 1.0 {
-        return wrap_greedy_with_line_width(&text, 1, true, |_| max_width,
-            |run| run.chars().map(&mut char_width).sum());
+        return wrap_greedy_with_line_width(
+            &text,
+            1,
+            true,
+            |_| max_width,
+            |run| run.chars().map(&mut char_width).sum(),
+        );
     }
     wrap_greedy(&text, max_width, max_width, char_width)
 }
@@ -1236,9 +1284,19 @@ pub fn wrap_text_with_char_width_and_first_line(
             .collect();
     }
     if white_space == WhiteSpace::PreWrap && max_width <= 1.0 {
-        return wrap_greedy_with_line_width(&text, 1, true,
-            |index| if index == 0 { first_line_width } else { max_width },
-            |run| run.chars().map(&mut char_width).sum());
+        return wrap_greedy_with_line_width(
+            &text,
+            1,
+            true,
+            |index| {
+                if index == 0 {
+                    first_line_width
+                } else {
+                    max_width
+                }
+            },
+            |run| run.chars().map(&mut char_width).sum(),
+        );
     }
     wrap_greedy(&text, max_width, first_line_width.max(1.0), char_width)
 }
@@ -1562,24 +1620,49 @@ mod tests {
             for &(text, expected) in cases {
                 let expected = if white_space == WhiteSpace::PreWrap && text == "a left-hand" {
                     vec!["a ", "left-", "hand"]
-                } else { expected.to_vec() };
+                } else {
+                    expected.to_vec()
+                };
                 let measure = |run: &str| run.chars().count() as f32 * 12.0;
-                assert_eq!(wrap_text_with_run_width(text, 72.0, white_space, measure), expected,
-                    "{white_space:?}: {text:?}");
-                assert_eq!(wrap_text_with_run_width_and_first_line(text, 72.0, 72.0,
-                    white_space, measure), expected);
-                assert_eq!(wrap_text_with_run_width_and_line_widths(text, 72.0, &[72.0],
-                    white_space, measure), expected);
+                assert_eq!(
+                    wrap_text_with_run_width(text, 72.0, white_space, measure),
+                    expected,
+                    "{white_space:?}: {text:?}"
+                );
+                assert_eq!(
+                    wrap_text_with_run_width_and_first_line(text, 72.0, 72.0, white_space, measure),
+                    expected
+                );
+                assert_eq!(
+                    wrap_text_with_run_width_and_line_widths(
+                        text,
+                        72.0,
+                        &[72.0],
+                        white_space,
+                        measure
+                    ),
+                    expected
+                );
             }
         }
         for white_space in [WhiteSpace::Pre, WhiteSpace::NoWrap] {
             for &(text, _) in cases {
-                assert_eq!(wrap_text_with_run_width(text, 72.0, white_space,
-                    |run| run.chars().count() as f32 * 12.0), [text]);
+                assert_eq!(
+                    wrap_text_with_run_width(text, 72.0, white_space, |run| run.chars().count()
+                        as f32
+                        * 12.0),
+                    [text]
+                );
             }
         }
-        assert_eq!(wrap_text_with_run_width("a left-hand", 96.0, WhiteSpace::Normal,
-            |run| run.chars().count() as f32 * 12.0), ["a left-", "hand"]);
+        assert_eq!(
+            wrap_text_with_run_width("a left-hand", 96.0, WhiteSpace::Normal, |run| run
+                .chars()
+                .count()
+                as f32
+                * 12.0),
+            ["a left-", "hand"]
+        );
     }
 
     #[test]
@@ -1589,14 +1672,19 @@ mod tests {
         w3cos_std::inline_text::set_fragment_ends(&mut style, text, &[11, 16, text.len()]);
         let lines = vec!["All the words are aligned.".into()];
         let styles = authored_line_styles(text, &style, &lines).unwrap();
-        assert_eq!(w3cos_std::inline_text::fragment_ends(&lines[0], &styles[0]),
-            Some(vec![8, 13, lines[0].len()]));
+        assert_eq!(
+            w3cos_std::inline_text::fragment_ends(&lines[0], &styles[0]),
+            Some(vec![8, 13, lines[0].len()])
+        );
         let repeated = "one two one two";
         w3cos_std::inline_text::set_fragment_ends(&mut style, repeated, &[3, 7, 11, 15]);
         let lines = vec!["one two".into(), "one two".into()];
         let styles = authored_line_styles(repeated, &style, &lines).unwrap();
         for (line, style) in lines.iter().zip(styles) {
-            assert_eq!(w3cos_std::inline_text::fragment_ends(line, &style), Some(vec![3, 7]));
+            assert_eq!(
+                w3cos_std::inline_text::fragment_ends(line, &style),
+                Some(vec![3, 7])
+            );
         }
     }
 
@@ -1607,25 +1695,63 @@ mod tests {
         for width in [0.0, 0.5, 1.0] {
             for white_space in [WhiteSpace::Normal, WhiteSpace::PreLine] {
                 let expected = ["lorem\u{00a0}ipsum", "lastline"];
-                assert_eq!(wrap_text_with_run_width(text, width, white_space, measure), expected);
-                assert_eq!(wrap_text_with_run_width_and_first_line(text, width, width,
-                    white_space, measure), expected);
-                assert_eq!(wrap_text_with_run_width_and_line_widths(text, width, &[width],
-                    white_space, measure), expected);
-                assert_eq!(wrap_text_with_char_width(text, width, white_space, |_| 10.0), expected);
+                assert_eq!(
+                    wrap_text_with_run_width(text, width, white_space, measure),
+                    expected
+                );
+                assert_eq!(
+                    wrap_text_with_run_width_and_first_line(
+                        text,
+                        width,
+                        width,
+                        white_space,
+                        measure
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    wrap_text_with_run_width_and_line_widths(
+                        text,
+                        width,
+                        &[width],
+                        white_space,
+                        measure
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    wrap_text_with_char_width(text, width, white_space, |_| 10.0),
+                    expected
+                );
             }
             for white_space in [WhiteSpace::NoWrap, WhiteSpace::Pre] {
-                assert_eq!(wrap_text_with_run_width(text, width, white_space, measure), [text]);
+                assert_eq!(
+                    wrap_text_with_run_width(text, width, white_space, measure),
+                    [text]
+                );
             }
             let preserved = "  a b  ";
             let expected = wrap_text_with_run_width(preserved, width, WhiteSpace::PreWrap, measure);
             assert_eq!(expected.concat(), preserved);
-            assert_eq!(wrap_text_with_char_width(preserved, width, WhiteSpace::PreWrap,
-                |_| 10.0), expected);
-            assert_eq!(wrap_text_with_char_width_and_first_line(preserved, width, width,
-                WhiteSpace::PreWrap, |_| 10.0), expected);
+            assert_eq!(
+                wrap_text_with_char_width(preserved, width, WhiteSpace::PreWrap, |_| 10.0),
+                expected
+            );
+            assert_eq!(
+                wrap_text_with_char_width_and_first_line(
+                    preserved,
+                    width,
+                    width,
+                    WhiteSpace::PreWrap,
+                    |_| 10.0
+                ),
+                expected
+            );
         }
-        assert_eq!(wrap_text_with_run_width(text, f32::INFINITY, WhiteSpace::Normal, measure), [text]);
+        assert_eq!(
+            wrap_text_with_run_width(text, f32::INFINITY, WhiteSpace::Normal, measure),
+            [text]
+        );
     }
 
     #[test]
@@ -2050,14 +2176,22 @@ mod tests {
 
     #[test]
     fn resolved_bidi_boundaries_keep_control_effect_after_glyph_normalization() {
-        let style=w3cos_std::style::Style::default();
-        let (text,boundaries)=font_render_text_for_style_with_boundaries(
-            "\u{200f}\u{a0} + - × ÷ א",&style);
-        assert_eq!(text,"א ÷ × - +  ");
-        assert!(boundaries.is_empty(),"one RTL segment remains one segment after RLM removal");
-        let (text,boundaries)=font_render_text_for_style_with_boundaries("א + - × ÷ \u{a0}",&style);
-        assert_eq!(text,"א + - × ÷  ");
-        assert_eq!(boundaries,vec!["א".len()],"an actual logical level boundary is retained");
+        let style = w3cos_std::style::Style::default();
+        let (text, boundaries) =
+            font_render_text_for_style_with_boundaries("\u{200f}\u{a0} + - × ÷ א", &style);
+        assert_eq!(text, "א ÷ × - +  ");
+        assert!(
+            boundaries.is_empty(),
+            "one RTL segment remains one segment after RLM removal"
+        );
+        let (text, boundaries) =
+            font_render_text_for_style_with_boundaries("א + - × ÷ \u{a0}", &style);
+        assert_eq!(text, "א + - × ÷  ");
+        assert_eq!(
+            boundaries,
+            vec!["א".len()],
+            "an actual logical level boundary is retained"
+        );
     }
 
     #[test]
@@ -2183,34 +2317,70 @@ mod tests {
         let text = "first \u{2028} wonderful to see \u{2028}third";
         let expected = vec!["first", "wonderful to see", "third"];
         for white_space in [WhiteSpace::Normal, WhiteSpace::NoWrap, WhiteSpace::PreLine] {
-            assert_eq!(wrap_text_with_char_width(text, 1000.0, white_space, |_| 1.0), expected);
-            assert_eq!(wrap_text_with_char_width_and_first_line(text, 1000.0, 900.0,
-                white_space, |_| 1.0), expected);
-            assert_eq!(wrap_text_with_run_width(text, 1000.0, white_space,
-                |run| run.len() as f32), expected);
-            assert_eq!(wrap_text_with_run_width_and_first_line(text, 1000.0, 900.0,
-                white_space, |run| run.len() as f32), expected);
-            assert_eq!(wrap_text_with_run_width_and_line_widths(text, 1000.0,
-                &[900.0, 950.0], white_space, |run| run.len() as f32), expected);
+            assert_eq!(
+                wrap_text_with_char_width(text, 1000.0, white_space, |_| 1.0),
+                expected
+            );
+            assert_eq!(
+                wrap_text_with_char_width_and_first_line(text, 1000.0, 900.0, white_space, |_| 1.0),
+                expected
+            );
+            assert_eq!(
+                wrap_text_with_run_width(text, 1000.0, white_space, |run| run.len() as f32),
+                expected
+            );
+            assert_eq!(
+                wrap_text_with_run_width_and_first_line(
+                    text,
+                    1000.0,
+                    900.0,
+                    white_space,
+                    |run| run.len() as f32
+                ),
+                expected
+            );
+            assert_eq!(
+                wrap_text_with_run_width_and_line_widths(
+                    text,
+                    1000.0,
+                    &[900.0, 950.0],
+                    white_space,
+                    |run| run.len() as f32
+                ),
+                expected
+            );
         }
         for white_space in [WhiteSpace::Pre, WhiteSpace::PreWrap] {
-            assert_eq!(wrap_text_with_run_width(text, 1000.0, white_space,
-                |run| run.len() as f32), vec!["first ", " wonderful to see ", "third"]);
+            assert_eq!(
+                wrap_text_with_run_width(text, 1000.0, white_space, |run| run.len() as f32),
+                vec!["first ", " wonderful to see ", "third"]
+            );
         }
     }
 
     #[test]
     fn authored_ps_keeps_bidi_paragraphs_without_a_css_forced_break() {
-        let text="א + - × ÷ \u{a0}\u{2029}\u{a0} + - × ÷ ת";
-        let lines=wrap_text_with_run_width(text,1000.0,WhiteSpace::Pre,|run|run.chars().count() as f32);
-        assert_eq!(lines,vec![text.to_string()],
-            "Chromium141 preserves authored PS in one CSS line; it is not a BR marker");
-        assert_eq!(font_render_text(text,w3cos_std::style::TextDirection::Ltr),
+        let text = "א + - × ÷ \u{a0}\u{2029}\u{a0} + - × ÷ ת";
+        let lines = wrap_text_with_run_width(text, 1000.0, WhiteSpace::Pre, |run| {
+            run.chars().count() as f32
+        });
+        assert_eq!(
+            lines,
+            vec![text.to_string()],
+            "Chromium141 preserves authored PS in one CSS line; it is not a BR marker"
+        );
+        assert_eq!(
+            font_render_text(text, w3cos_std::style::TextDirection::Ltr),
             "א + - × ÷     + - × ÷ ת",
-            "each bidi paragraph resolves independently before the PS space glyph is emitted");
-        let (rendered,boundaries)=font_render_text_with_boundaries(text,w3cos_std::style::TextDirection::Ltr);
-        assert_eq!(boundaries,vec!["א".len(),rendered.len()-"ת".len()],
-            "a PS preserves independent resolution but not a fictitious same-direction paint segment");
+            "each bidi paragraph resolves independently before the PS space glyph is emitted"
+        );
+        let (rendered, boundaries) =
+            font_render_text_with_boundaries(text, w3cos_std::style::TextDirection::Ltr);
+        assert_eq!(
+            boundaries,
+            vec!["א".len(), rendered.len() - "ת".len()],
+            "a PS preserves independent resolution but not a fictitious same-direction paint segment"
+        );
     }
 
     #[test]

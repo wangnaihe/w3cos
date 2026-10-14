@@ -16,11 +16,17 @@ thread_local! {
 fn new_host_document() -> Document {
     // Embedders may select browser-equivalent readability preferences without
     // changing CSS keyword tables or baking a locale into the generic DOM.
-    let preference = |name| std::env::var(name).ok()
-        .and_then(|value| value.parse::<f32>().ok()).unwrap_or(0.0);
+    let preference = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.0)
+    };
     let mut document = Document::new();
-    document.set_font_size_minimums(preference("W3COS_MINIMUM_FONT_SIZE"),
-        preference("W3COS_MINIMUM_LOGICAL_FONT_SIZE"));
+    document.set_font_size_minimums(
+        preference("W3COS_MINIMUM_FONT_SIZE"),
+        preference("W3COS_MINIMUM_LOGICAL_FONT_SIZE"),
+    );
     document.set_css_image_dimensions_provider(crate::image_loader::dimensions);
     document
 }
@@ -407,8 +413,18 @@ fn inline_style_change_is_local(prop: &str) -> bool {
     // The frame loop writes these names already in kebab case.
     if matches!(
         prop,
-        "top" | "right" | "bottom" | "left" | "width" | "height" | "flex" | "display"
-            | "position" | "overflow" | "margin" | "padding"
+        "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "width"
+            | "height"
+            | "flex"
+            | "display"
+            | "position"
+            | "overflow"
+            | "margin"
+            | "padding"
     ) {
         return true;
     }

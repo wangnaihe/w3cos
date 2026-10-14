@@ -12,8 +12,11 @@ const CELL_ROLE: &str = "--w3cos-internal-replaced-table-cell";
 pub(super) fn lower_image_style(style: &mut Style) {
     // Replaced elements create image layout boxes, not structural columns.
     // Keep the authored role in CSSOM, but allow their own box decorations.
-    if matches!(style.display,Display::TableColumn | Display::TableColumnGroup) {
-        style.display=Display::Block;
+    if matches!(
+        style.display,
+        Display::TableColumn | Display::TableColumnGroup
+    ) {
+        style.display = Display::Block;
     }
     if style.display == Display::TableCell {
         style.display = Display::Block;

@@ -326,7 +326,10 @@ fn replacing_separator_text_with_whitespace_rejoins_the_table_run() {
     for child in [first, separator, last] {
         parent.append_child(&mut document, child);
     }
-    assert_eq!(count_display(&document.to_component_subtree(parent.id), Display::Table), 2);
+    assert_eq!(
+        count_display(&document.to_component_subtree(parent.id), Display::Table),
+        2
+    );
     separator.set_text_content(&mut document, " ");
     assert_eq!(
         count_display(&document.to_component_subtree(parent.id), Display::Table),

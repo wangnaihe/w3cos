@@ -75,17 +75,30 @@ fn replaced_table_cell_images_stack_in_one_anonymous_cell() {
 
 #[test]
 fn replaced_column_images_have_block_used_display_without_changing_cssom() {
-    for (css,display) in [("table-column",Display::TableColumn),("table-column-group",Display::TableColumnGroup)] {
-        let mut document=Document::new();
-        let image=document.create_element("img");
-        image.style_mut(&mut document).set_property("display",css);
-        document.body().append_child(&mut document,image);
-        let root=document.to_component_tree();
-        let mut nodes=vec![];
-        collect(&root,&mut nodes);
-        let used=nodes.iter().find(|node| matches!(node.kind,ComponentKind::Image {..})).unwrap();
-        assert_eq!(document.computed_style(image.id,&[],None).display,display);
-        assert_eq!(used.style.display,Display::Block,"replaced column role must not suppress its image outline");
+    for (css, display) in [
+        ("table-column", Display::TableColumn),
+        ("table-column-group", Display::TableColumnGroup),
+    ] {
+        let mut document = Document::new();
+        let image = document.create_element("img");
+        image.style_mut(&mut document).set_property("display", css);
+        document.body().append_child(&mut document, image);
+        let root = document.to_component_tree();
+        let mut nodes = vec![];
+        collect(&root, &mut nodes);
+        let used = nodes
+            .iter()
+            .find(|node| matches!(node.kind, ComponentKind::Image { .. }))
+            .unwrap();
+        assert_eq!(
+            document.computed_style(image.id, &[], None).display,
+            display
+        );
+        assert_eq!(
+            used.style.display,
+            Display::Block,
+            "replaced column role must not suppress its image outline"
+        );
     }
 }
 

@@ -452,7 +452,9 @@ impl Value {
     pub fn object_identity_bits(&self) -> Option<u64> {
         match self {
             Value::Object(object) => Some(Rc::as_ptr(object) as u64),
-            Value::Imm(imm) => imm.object_handle().map(|handle| (handle as u64) | (1 << 63)),
+            Value::Imm(imm) => imm
+                .object_handle()
+                .map(|handle| (handle as u64) | (1 << 63)),
             _ => None,
         }
     }
@@ -2177,10 +2179,7 @@ impl Value {
 
     /// Arena object with a shared proxy. Own properties are written directly
     /// so the trap can read them without re-entering.
-    pub fn proxied_object(
-        entries: &[(&str, Value)],
-        handler: crate::proxy::ProxyHandler,
-    ) -> Self {
+    pub fn proxied_object(entries: &[(&str, Value)], handler: crate::proxy::ProxyHandler) -> Self {
         let mut object = crate::JsObject::new();
         object.proxy_handler = Some(handler);
         for (key, value) in entries {
@@ -3574,7 +3573,6 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
     owned.push_str(right_text);
     Value::from_js_string(JsString::intern(&owned))
 }
-
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).

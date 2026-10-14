@@ -8851,7 +8851,8 @@ export function main() { return editor.createModel(4).getLineCount(); }"#,
             "api init should use one coalesced live-binding segment: {body}"
         );
         assert!(
-            !code.contains("w3cos_vm") && !code.contains("w3cos_ir")
+            !code.contains("w3cos_vm")
+                && !code.contains("w3cos_ir")
                 && !body.contains("W3IR module-init chunk"),
             "editor assignment must compile to the native Core ABI: {body}"
         );

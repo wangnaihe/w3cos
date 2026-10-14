@@ -139,8 +139,12 @@ pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
             .and_then(|item| artifact.sticky_owner.get(item.client_index).copied())
             .flatten();
         let same_as_current = layers.last().is_some_and(|layer: &CompositorLayer| {
-            layer.properties == chunk.properties && layer.sticky_owner == sticky
-                && layer.client_indices.first().zip(artifact.display_items.get(chunk.begin))
+            layer.properties == chunk.properties
+                && layer.sticky_owner == sticky
+                && layer
+                    .client_indices
+                    .first()
+                    .zip(artifact.display_items.get(chunk.begin))
                     .is_some_and(|(previous, item)| {
                         artifact.viewport_attached(*previous)
                             == artifact.viewport_attached(item.client_index)
@@ -496,17 +500,27 @@ mod tests {
 
     #[test]
     fn outline_color_and_line_style_invalidate_paint_fingerprint() {
-        let fingerprint=|style:&Style| {
-            let mut hash=std::collections::hash_map::DefaultHasher::new();
-            hash_paint_style(style,&mut hash);hash.finish()
+        let fingerprint = |style: &Style| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            hash_paint_style(style, &mut hash);
+            hash.finish()
         };
-        let base=Style {outline_width:4.0,
-            outline_style:w3cos_std::style::OutlineStyle::Solid,
-            outline_color:w3cos_std::Color::rgb(128,0,128),..Style::default()};
-        let recolored=Style {outline_color:w3cos_std::Color::BLACK,..base.clone()};
-        let dashed=Style {outline_style:w3cos_std::style::OutlineStyle::Dashed,..base.clone()};
-        assert_ne!(fingerprint(&base),fingerprint(&recolored));
-        assert_ne!(fingerprint(&base),fingerprint(&dashed));
+        let base = Style {
+            outline_width: 4.0,
+            outline_style: w3cos_std::style::OutlineStyle::Solid,
+            outline_color: w3cos_std::Color::rgb(128, 0, 128),
+            ..Style::default()
+        };
+        let recolored = Style {
+            outline_color: w3cos_std::Color::BLACK,
+            ..base.clone()
+        };
+        let dashed = Style {
+            outline_style: w3cos_std::style::OutlineStyle::Dashed,
+            ..base.clone()
+        };
+        assert_ne!(fingerprint(&base), fingerprint(&recolored));
+        assert_ne!(fingerprint(&base), fingerprint(&dashed));
     }
 
     fn rect(y: f32) -> LayoutRect {

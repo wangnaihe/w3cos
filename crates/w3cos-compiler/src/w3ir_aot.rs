@@ -232,14 +232,12 @@ fn stores_are_numbers(function: &Function, binding: u32, number_regs: &HashSet<u
     for block in &function.blocks {
         for instruction in &block.instructions {
             let source = match instruction {
-                Instruction::InitializeBinding {
-                    binding: id,
-                    value,
+                Instruction::InitializeBinding { binding: id, value }
+                | Instruction::StoreBinding { binding: id, value }
+                    if id.0 == binding =>
+                {
+                    Some(value.0)
                 }
-                | Instruction::StoreBinding {
-                    binding: id,
-                    value,
-                } if id.0 == binding => Some(value.0),
                 _ => None,
             };
             let Some(source) = source else {
@@ -375,11 +373,7 @@ fn loads_after_numeric_store(
         }
     }
     for region in &function.exception_regions {
-        for block_id in region
-            .catch_block
-            .into_iter()
-            .chain(region.finally_block)
-        {
+        for block_id in region.catch_block.into_iter().chain(region.finally_block) {
             let Some(block) = function.blocks.iter().find(|block| block.id == block_id) else {
                 continue;
             };
@@ -581,9 +575,7 @@ fn promote_unboxed_locals(code: &str) -> Option<(String, String, String)> {
                     return None;
                 }
                 let after = index + prefix.len();
-                let end = code[after..]
-                    .find(']')
-                    .map(|offset| after + offset)?;
+                let end = code[after..].find(']').map(|offset| after + offset)?;
                 let slot: u32 = code[after..end].parse().ok()?;
                 let name = if prefix.starts_with("self.num_bindings") {
                     binds.push(slot);
@@ -602,7 +594,11 @@ fn promote_unboxed_locals(code: &str) -> Option<(String, String, String)> {
             index = next;
         } else {
             rewritten.push(bytes[index] as char);
-            index += code[index..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+            index += code[index..]
+                .chars()
+                .next()
+                .map(|ch| ch.len_utf8())
+                .unwrap_or(1);
         }
     }
     if rewritten.contains("self.") {
@@ -1798,8 +1794,8 @@ fn generate_sync_function_with_factories(
     let mut direct_body = None;
     for (block_id, instructions) in &sync_blocks {
         let exception_target = exception_target_for_block(function, *block_id);
-        let native = find_native_loop(*block_id, instructions, &sync_blocks, function).and_then(
-            |native| {
+        let native =
+            find_native_loop(*block_id, instructions, &sync_blocks, function).and_then(|native| {
                 emit_native_sync_loop(
                     instructions,
                     &sync_blocks,
@@ -1814,8 +1810,7 @@ fn generate_sync_function_with_factories(
                 )
                 .ok()
                 .flatten()
-            },
-        );
+            });
         let emitted = if let Some(native) = native {
             native
         } else {
@@ -3970,7 +3965,10 @@ fn hoist_binding_lookups(lines: &[String]) -> (String, Vec<String>) {
         let mut start = 0;
         while let Some(pos) = text[start..].find(marker) {
             let digits = &text[start + pos + marker.len()..];
-            let id: String = digits.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            let id: String = digits
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect();
             if !id.is_empty() && text[start + pos + marker.len() + id.len()..].starts_with(')') {
                 if !ids.contains(&id) {
                     ids.push(id.clone());
@@ -4054,7 +4052,10 @@ fn outline_numeric_loop(prologue: &str, body: &str, epilogue: &str) -> String {
     let mut prelude = String::new();
     let mut internal = String::new();
     for (name, ty, _) in &locals {
-        if carried.iter().any(|(carried_name, _, _)| carried_name == name) {
+        if carried
+            .iter()
+            .any(|(carried_name, _, _)| carried_name == name)
+        {
             continue;
         }
         if rewritten.contains(name) {
@@ -4079,7 +4080,9 @@ fn outline_numeric_loop(prologue: &str, body: &str, epilogue: &str) -> String {
     } else {
         format!("loop {{\n{rewritten}}}\n")
     };
-    let fused_fast = trip.as_ref().map(|(_, _, fast)| fuse_dependent_mul_add(fast));
+    let fused_fast = trip
+        .as_ref()
+        .map(|(_, _, fast)| fuse_dependent_mul_add(fast));
     let fused_loop = match (&trip, &fused_fast) {
         (Some((counter, limit, fast)), Some(fused)) if fused != fast => {
             Some(counted_numeric_loop(counter, limit, fused, &rewritten))
@@ -4371,7 +4374,9 @@ fn normalize_numeric_body(body: &str) -> String {
             out.push('\n');
             continue;
         }
-        if let Some((dst, rhs)) = trimmed.strip_suffix(';').and_then(|assign| assign.split_once('='))
+        if let Some((dst, rhs)) = trimmed
+            .strip_suffix(';')
+            .and_then(|assign| assign.split_once('='))
         {
             let dst = dst.trim();
             if !dst.contains(' ') {
@@ -4468,7 +4473,10 @@ fn parens_balanced(expr: &str) -> bool {
 /// The counter is a pure integer induction variable and the limit is an
 /// unchanged f64 local. Callers still guard that both values are integers
 /// inside the i32 range before using the fast body.
-fn integer_trip(body: &str, locals: &[(String, String, String)]) -> Option<(String, String, String)> {
+fn integer_trip(
+    body: &str,
+    locals: &[(String, String, String)],
+) -> Option<(String, String, String)> {
     let f64_names: Vec<&str> = locals
         .iter()
         .filter(|(_, ty, _)| *ty == "f64")
@@ -4657,7 +4665,9 @@ fn emit_instruction(
             register(*dst),
             emit_boxed_use(plan, src.0, last_uses.contains(&src.0))
         ),
-        Instruction::LoadBinding { dst, binding } if num_binding_slot(plan, binding.0).is_some() => {
+        Instruction::LoadBinding { dst, binding }
+            if num_binding_slot(plan, binding.0).is_some() =>
+        {
             emit_numeric_binding_load(plan, dst.0, num_binding_slot(plan, binding.0).unwrap())
         }
         Instruction::LoadBinding { dst, binding } if plan.constants.contains_key(&binding.0) => {
@@ -6995,7 +7005,8 @@ fn main() {{
             .iter()
             .find(|function| function.name.as_deref() == Some("domOnce"))
             .unwrap();
-        let generated = generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
         assert!(
             generated.contains("dom_build_guarded")
                 && generated.contains("dom_shape_epoch")

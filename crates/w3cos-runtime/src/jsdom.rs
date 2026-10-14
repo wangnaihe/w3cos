@@ -1088,9 +1088,7 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
     let object = object.borrow();
     let direct = object.get_direct("__node_id");
     let generation = object.get_direct("__w3cos_realm_generation");
-    if direct.is_number()
-        && generation.is_number()
-        && bridge_realm_is_current(generation.to_u32())
+    if direct.is_number() && generation.is_number() && bridge_realm_is_current(generation.to_u32())
     {
         return Some(direct.to_u32());
     }
@@ -1205,9 +1203,7 @@ fn dom_imm_materialize(node: u32) -> Value {
 fn pin_dom_wrapper(node: u32) {
     let value = element_value(node);
     ELEMENT_VALUES.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(node, ElementMemo::Strong(value));
+        cache.borrow_mut().insert(node, ElementMemo::Strong(value));
     });
 }
 
@@ -1273,13 +1269,13 @@ fn fast_create_element(object: &Value, tag: &str) -> Value {
         dom_exception("The element name is not valid", "InvalidCharacterError");
     }
     let lowered;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            tag
+        };
     let id = dom::create_element(tag);
     if tag == "template" {
         ensure_template_content(id);
@@ -1327,10 +1323,14 @@ fn fast_build_appended(
 ) -> Value {
     let mut id_buf = [0u8; 96];
     let mut text_buf = [0u8; 96];
-    let Some(id_text) = w3cos_core::intrinsics::format_prefix_index(id_prefix, id_index, &mut id_buf) else {
+    let Some(id_text) =
+        w3cos_core::intrinsics::format_prefix_index(id_prefix, id_index, &mut id_buf)
+    else {
         return Value::Undefined;
     };
-    let Some(text) = w3cos_core::intrinsics::format_prefix_index(text_prefix, text_index, &mut text_buf) else {
+    let Some(text) =
+        w3cos_core::intrinsics::format_prefix_index(text_prefix, text_index, &mut text_buf)
+    else {
         return Value::Undefined;
     };
     if !is_document_value(document)
@@ -1348,13 +1348,13 @@ fn fast_build_appended(
         dom_exception("The element name is not valid", "InvalidCharacterError");
     }
     let lowered;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            tag
+        };
     let child = dom::with_document_mut(|doc| {
         doc.append_labeled_element(
             w3cos_dom::NodeId::from_u32(parent_id),
@@ -1417,14 +1417,14 @@ fn fast_build_guarded(
     let parent_id = node_id_of(parent).expect("parent checked");
     let lowered;
     let mut tag_atom = tag_atom;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        tag_atom = u32::MAX;
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
     let child = dom::with_document_mut(|doc| {
         doc.append_labeled_unhashed(
             w3cos_dom::NodeId::from_u32(parent_id),
@@ -1466,14 +1466,14 @@ fn fast_build_block_guarded(
     let parent_id = node_id_of(parent).expect("parent checked");
     let lowered;
     let mut tag_atom = tag_atom;
-    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        lowered = tag.to_ascii_lowercase();
-        tag_atom = u32::MAX;
-        lowered.as_str()
-    } else {
-        tag
-    };
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
     let text = text.to_js_string();
     let Some(child) = dom::with_document_mut(|doc| {
         doc.append_fixed_text_block(
@@ -2367,9 +2367,9 @@ fn matches_simple(selector: &str, node: u32, scope: Option<u32>) -> bool {
             ":popover-open" => popover_is_open(node),
             ":modal" => dialog_is_modal(node),
             ":focus-within" => element_has_focus_within(node),
-            ":focus-visible" => dom::with_document(|document| {
-                document.is_focus_visible(NodeId::from_u32(node))
-            }),
+            ":focus-visible" => {
+                dom::with_document(|document| document.is_focus_visible(NodeId::from_u32(node)))
+            }
             ":focus" => element_has_focus(node),
             _ => false,
         };
@@ -3640,9 +3640,7 @@ fn remember_tree_method(node: u32, key: &str, value: &Value) {
         return;
     }
     TREE_METHOD_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert((node, slot), value.clone());
+        cache.borrow_mut().insert((node, slot), value.clone());
     });
 }
 
@@ -3670,9 +3668,7 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             // before any getter or computed callback runs.
             let (generation, node, own_getter, stored) = {
                 let object = object.borrow();
-                let generation = object
-                    .get_direct("__w3cos_realm_generation")
-                    .to_number() as u32;
+                let generation = object.get_direct("__w3cos_realm_generation").to_number() as u32;
                 let node = object.get_direct("__node_id").to_number() as u32;
                 let own_getter = object.own_getter(key);
                 let stored = if own_getter.is_some() {
@@ -3722,9 +3718,7 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             };
             let (generation, node) = {
                 let object = object.borrow();
-                let generation = object
-                    .get_direct("__w3cos_realm_generation")
-                    .to_number() as u32;
+                let generation = object.get_direct("__w3cos_realm_generation").to_number() as u32;
                 let node = object.get_direct("__node_id").to_number() as u32;
                 (generation, node)
             };
@@ -3772,10 +3766,7 @@ fn build_element_value(node: u32) -> Value {
     let value = Value::proxied_host_object(
         &[
             ("__node_id", Value::Number(node as f64)),
-            (
-                "__w3cos_realm_generation",
-                Value::Number(generation as f64),
-            ),
+            ("__w3cos_realm_generation", Value::Number(generation as f64)),
         ],
         shared_element_proxy(),
     );
@@ -3991,8 +3982,7 @@ fn subtree_has_element_memo(root: u32) -> bool {
 
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
     let foreign_owner = parent != 0
-        && get_expando(parent, "ownerDocument")
-            .is_some_and(|owner| !is_default_document(&owner));
+        && get_expando(parent, "ownerDocument").is_some_and(|owner| !is_default_document(&owner));
     if reference.is_none() && !foreign_owner && fresh_simple_element(parent, child) {
         dom::append_child(parent, child);
         if subtree_has_element_memo(child) {
@@ -6770,7 +6760,10 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     if value.trim().is_empty() {
         return false;
     }
-    if matches!(property.as_str(), "columns" | "column-width" | "column-count" | "column-fill") {
+    if matches!(
+        property.as_str(),
+        "columns" | "column-width" | "column-count" | "column-fill"
+    ) {
         return w3cos_dom::css_style::valid_multicol_declaration(&property, value);
     }
     matches!(
@@ -8597,7 +8590,10 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
 
 /// Border box of a definite px width and height whose position is unchanged
 /// by the current dirty set. Returns `None` when layout must run.
-fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Option<w3cos_dom::DOMRect> {
+fn definite_independent_border_box(
+    node: u32,
+    live: w3cos_dom::DOMRect,
+) -> Option<w3cos_dom::DOMRect> {
     if live.width == 0.0 && live.height == 0.0 && live.x == 0.0 && live.y == 0.0 {
         return None;
     }
@@ -8629,9 +8625,8 @@ fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Optio
             style.position,
             w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
         ) {
-            let mut sibling = w3cos_dom::node::sib(
-                document.get_node(NodeId::from_u32(node)).prev_sibling,
-            );
+            let mut sibling =
+                w3cos_dom::node::sib(document.get_node(NodeId::from_u32(node)).prev_sibling);
             while let Some(id) = sibling {
                 if document.precise_dirty_contains(id) {
                     return true;
@@ -8656,7 +8651,9 @@ fn definite_independent_border_box(node: u32, live: w3cos_dom::DOMRect) -> Optio
             (height + padding.top + padding.bottom + border_top + border_bottom).max(0.0),
         ),
     };
-    Some(w3cos_dom::DOMRect::new(live.x, live.y, box_width, box_height))
+    Some(w3cos_dom::DOMRect::new(
+        live.x, live.y, box_width, box_height,
+    ))
 }
 
 fn offset_parent_node(node: u32) -> Option<u32> {
@@ -10545,7 +10542,8 @@ fn option_atom() -> w3cos_dom::atom::Atom {
 
 pub(crate) fn sync_style_element(node: u32) {
     let style = style_atom();
-    let is_style = dom::with_document(|doc| doc.get_node(w3cos_dom::NodeId::from_u32(node)).tag == style);
+    let is_style =
+        dom::with_document(|doc| doc.get_node(w3cos_dom::NodeId::from_u32(node)).tag == style);
     if !is_style {
         return;
     }
@@ -12557,9 +12555,8 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                 let text = if readonly {
                     dom::computed_style_property(node, &name)
                 } else {
-                    STYLE_CACHE.with(|cache| {
-                        cache.borrow().get_value(node, &name).unwrap_or_default()
-                    })
+                    STYLE_CACHE
+                        .with(|cache| cache.borrow().get_value(node, &name).unwrap_or_default())
                 };
                 callback.call(
                     this_arg.clone(),
@@ -12604,9 +12601,8 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                     .map(crate::css_typed_om_web::serialize_value)
                     .collect::<Vec<_>>()
                     .join(" ");
-                let current = STYLE_CACHE.with(|cache| {
-                    cache.borrow().get_value(node, &name).unwrap_or_default()
-                });
+                let current = STYLE_CACHE
+                    .with(|cache| cache.borrow().get_value(node, &name).unwrap_or_default());
                 style_apply(
                     node,
                     &name,
@@ -12697,9 +12693,9 @@ fn style_value(node: u32) -> Value {
                     Value::string(&old)
                 }),
                 "cssText" => Value::string(&style_css_text(node)),
-                "length" => Value::Number(
-                    STYLE_CACHE.with(|c| c.borrow().count_nonempty(node)) as f64
-                ),
+                "length" => {
+                    Value::Number(STYLE_CACHE.with(|c| c.borrow().count_nonempty(node)) as f64)
+                }
                 // Magic w3cos-core convention keys must stay Undefined:
                 // returning "" (a non-undefined value) for `__w3cos_setter_*`
                 // makes `Value::set_property` "call" the empty string and
@@ -12904,8 +12900,7 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
         }
         if cleared
             || flow_distance
-                >= sibling_rect.height
-                    + resolve(sibling_style.margin.bottom, &sibling_style)
+                >= sibling_rect.height + resolve(sibling_style.margin.bottom, &sibling_style)
         {
             continue;
         }
@@ -13392,10 +13387,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     js_ev.set_property("target", target_value.clone());
     js_ev.set_property("srcElement", target_value.clone());
     let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
-        LISTENERS.with(|l| {
-            l.borrow()
-                .handlers(node_id, ev.event_type, capture_phase)
-        })
+        LISTENERS.with(|l| l.borrow().handlers(node_id, ev.event_type, capture_phase))
     };
     let has_capture = LISTENERS.with(|l| l.borrow().has_capture());
     // A non-bubbling event with no capture listeners stays on the target.
@@ -13535,7 +13527,10 @@ fn focus_element(node: u32) {
         blur_element(previous);
     }
     ACTIVE_ELEMENT.with(|active| *active.borrow_mut() = Some(node));
-    update_focus_style(node, previous_visible || KEYBOARD_FOCUS_MODALITY.with(Cell::get));
+    update_focus_style(
+        node,
+        previous_visible || KEYBOARD_FOCUS_MODALITY.with(Cell::get),
+    );
     dispatch_sync(node, EventType::Focus, EventData::Focus);
     dispatch_sync(node, EventType::FocusIn, EventData::Focus);
 }
@@ -13544,9 +13539,19 @@ fn update_focus_style(node: u32, indicate: bool) {
     let tag = dom::tag_name(node);
     let text_input = if tag.eq_ignore_ascii_case("input") {
         let kind = dom::get_attribute(node, "type").unwrap_or_else(|| "text".into());
-        !matches!(kind.to_ascii_lowercase().as_str(),
-            "button" | "checkbox" | "color" | "file" | "hidden" | "image" |
-            "radio" | "range" | "reset" | "submit")
+        !matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "button"
+                | "checkbox"
+                | "color"
+                | "file"
+                | "hidden"
+                | "image"
+                | "radio"
+                | "range"
+                | "reset"
+                | "submit"
+        )
     } else {
         tag.eq_ignore_ascii_case("textarea")
     };
@@ -20555,8 +20560,14 @@ fn process_cpu_ms() -> f64 {
     };
     let mut fields = stat[end + 1..].split_whitespace();
     // Fields after `comm`: state is field 3, utime field 14, stime field 15.
-    let utime: u64 = fields.nth(11).and_then(|value| value.parse().ok()).unwrap_or(0);
-    let stime: u64 = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+    let utime: u64 = fields
+        .nth(11)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let stime: u64 = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     if ticks <= 0 {
         return 0.0;
     }
@@ -20571,9 +20582,17 @@ fn process_rss_kb() -> (u64, u64) {
     let mut hwm = 0u64;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
-            rss = value.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            rss = value
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
         } else if let Some(value) = line.strip_prefix("VmHWM:") {
-            hwm = value.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            hwm = value
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
         }
     }
     (rss, hwm)
@@ -20614,7 +20633,8 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     {
         let started = Instant::now();
-        let frame = crate::headless::render_document_rgba(width, height).map_err(|error| error.to_string())?;
+        let frame = crate::headless::render_document_rgba(width, height)
+            .map_err(|error| error.to_string())?;
         let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut checksum = frame.rgba.len() as u64;
         for (index, byte) in frame.rgba.iter().enumerate() {
@@ -21192,9 +21212,11 @@ mod tests {
             assert!(console.strict_eq(&window_value().get_property("console")));
             for name in ["log", "info", "warn", "error", "debug"] {
                 assert!(console.get_property(name).is_callable());
-                assert!(console
-                    .call_method(name, vec![Value::string("console-bridge-probe")])
-                    .is_undefined());
+                assert!(
+                    console
+                        .call_method(name, vec![Value::string("console-bridge-probe")])
+                        .is_undefined()
+                );
             }
             return;
         }
@@ -21203,7 +21225,11 @@ mod tests {
         for enabled in [false, true] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
-                .args(["--exact", "jsdom::tests::window_console_routes_esm_diagnostics_to_core_sink", "--nocapture"])
+                .args([
+                    "--exact",
+                    "jsdom::tests::window_console_routes_esm_diagnostics_to_core_sink",
+                    "--nocapture",
+                ])
                 .env(PROBE, "1")
                 .env_remove("W3COS_JS_CONSOLE");
             if enabled {
@@ -22191,7 +22217,10 @@ mod tests {
     }
 
     fn assert_child_nodes_contents(list: &Value, expected: &[Value]) {
-        assert_eq!(list.get_property("length").to_u32() as usize, expected.len());
+        assert_eq!(
+            list.get_property("length").to_u32() as usize,
+            expected.len()
+        );
         let object = list.as_object().expect("childNodes must be an object");
         let keys = object
             .borrow()
@@ -22277,7 +22306,12 @@ mod tests {
         parent.call_method("replaceChild", vec![replacement.clone(), first.clone()]);
         assert_child_nodes_contents(
             &list,
-            &[second.clone(), replacement.clone(), comment.clone(), text.clone()],
+            &[
+                second.clone(),
+                replacement.clone(),
+                comment.clone(),
+                text.clone(),
+            ],
         );
         destination.call_method("appendChild", vec![comment.clone()]);
         assert_child_nodes_contents(&list, &[second.clone(), replacement.clone(), text.clone()]);
@@ -22547,7 +22581,10 @@ mod tests {
             assert!(first.strict_eq(&document.get_property("location")));
             assert!(first.strict_eq(&window.get_property("location")));
             assert!(first.strict_eq(&location_value()));
-            assert!(w3cos_core::class::instance_of(&first, &window.get_property("Location")));
+            assert!(w3cos_core::class::instance_of(
+                &first,
+                &window.get_property("Location")
+            ));
         }
     }
 
@@ -22557,7 +22594,10 @@ mod tests {
         let document = document_value();
         let location = document.get_property("location");
         let window = window_value();
-        location.call_method("assign", vec![Value::string("https://example.test:8000/base?x=1#old")]);
+        location.call_method(
+            "assign",
+            vec![Value::string("https://example.test:8000/base?x=1#old")],
+        );
         assert_eq!(location.get_property("hash"), Value::string("#old"));
         for (name, input, expected) in [
             ("protocol", "http", "http:"),
@@ -22568,18 +22608,29 @@ mod tests {
             ("search", "q=2", "?q=2"),
             ("hash", "new", "#new"),
         ] {
-            document.get_property("location").set_property(name, Value::string(input));
+            document
+                .get_property("location")
+                .set_property(name, Value::string(input));
             assert_eq!(location.get_property(name), Value::string(expected));
-            assert_eq!(window.get_property("location").get_property(name), Value::string(expected));
+            assert_eq!(
+                window.get_property("location").get_property(name),
+                Value::string(expected)
+            );
         }
-        assert_eq!(location.get_property("origin"), Value::string("http://final.test:8080"));
+        assert_eq!(
+            location.get_property("origin"),
+            Value::string("http://final.test:8080")
+        );
         let before_replace = crate::history::get_length();
         location.call_method("replace", vec![Value::string("/replaced#replacement")]);
         assert_eq!(crate::history::get_length(), before_replace);
         assert_eq!(location.get_property("hash"), Value::string("#replacement"));
         location.set_property("href", Value::string("https://new.test/end#last"));
         assert_eq!(location.get_property("hostname"), Value::string("new.test"));
-        assert_eq!(location.call_method("toString", vec![]), location.get_property("href"));
+        assert_eq!(
+            location.call_method("toString", vec![]),
+            location.get_property("href")
+        );
         assert!(crate::history::back());
         assert_eq!(location.get_property("hash"), Value::string("#replacement"));
         assert!(crate::history::forward());
@@ -22600,15 +22651,23 @@ mod tests {
         let assign = old.get_property("assign");
         let replace = old.get_property("replace");
         old.set_property("__page_marker", Value::Bool(true));
-        crate::dom_constructors::prototype("Location").set_property("__page_marker", Value::Bool(true));
+        crate::dom_constructors::prototype("Location")
+            .set_property("__page_marker", Value::Bool(true));
         reset_bridge();
         assert!(LOCATION_VALUE.with(|slot| slot.borrow().is_none()));
-        assert!(old_weak.upgrade().is_none(), "old arena object must be invalidated");
+        assert!(
+            old_weak.upgrade().is_none(),
+            "old arena object must be invalidated"
+        );
         crate::history::reset();
         let next = location_value();
         assert!(next.get_property("__page_marker").is_undefined());
         for method in [getter, href_getter, setter, assign, replace] {
-            assert!(method.call(old.clone(), vec![Value::string("https://stale.test/#bad")]).is_undefined());
+            assert!(
+                method
+                    .call(old.clone(), vec![Value::string("https://stale.test/#bad")])
+                    .is_undefined()
+            );
         }
         old.set_property("hash", Value::string("bad"));
         assert_eq!(next.get_property("href"), Value::string("w3cos://app/"));
@@ -22623,7 +22682,10 @@ mod tests {
             drop(location);
             reset_bridge();
             assert!(LOCATION_VALUE.with(|slot| slot.borrow().is_none()));
-            assert!(weak.upgrade().is_none(), "reset must release the cached facade");
+            assert!(
+                weak.upgrade().is_none(),
+                "reset must release the cached facade"
+            );
             let after = w3cos_core::heap::heap_snapshot();
             assert_eq!(after.live_objects, baseline.live_objects);
             assert_eq!(after.live_functions, baseline.live_functions);
@@ -22669,20 +22731,48 @@ mod tests {
             "text/html",
             "https://example.test/frame#child-target",
         );
-        install_frame_document(node_id_of(&iframe).unwrap(), frame.clone(), "https://example.test/frame#child-target");
+        install_frame_document(
+            node_id_of(&iframe).unwrap(),
+            frame.clone(),
+            "https://example.test/frame#child-target",
+        );
         let child_location = frame.get_property("location");
         assert!(!child_location.strict_eq(&parent_location));
-        assert!(child_location.strict_eq(&iframe.get_property("contentWindow").get_property("location")));
+        assert!(
+            child_location.strict_eq(
+                &iframe
+                    .get_property("contentWindow")
+                    .get_property("location")
+            )
+        );
         let child = frame.call_method("getElementById", vec![Value::string("child-target")]);
         assert!(child.get_property("ownerDocument").strict_eq(&frame));
-        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
-        assert_eq!(parent_target.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        assert_eq!(
+            child.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            parent_target.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(true)
+        );
         parent_location.set_property("hash", Value::string("other-parent"));
-        assert_eq!(child_location.get_property("hash"), Value::string("#child-target"));
-        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(true));
+        assert_eq!(
+            child_location.get_property("hash"),
+            Value::string("#child-target")
+        );
+        assert_eq!(
+            child.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(true)
+        );
         child_location.set_property("hash", Value::string("#different-child"));
-        assert_eq!(child.call_method("matches", vec![Value::string(":target")]), Value::Bool(false));
-        assert_eq!(parent_location.get_property("hash"), Value::string("#other-parent"));
+        assert_eq!(
+            child.call_method("matches", vec![Value::string(":target")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parent_location.get_property("hash"),
+            Value::string("#other-parent")
+        );
         let detached = parse_document("<html><body></body></html>", "text/html");
         assert!(detached.get_property("location").is_null());
     }
@@ -22694,17 +22784,31 @@ mod tests {
         let window = window_value();
         let location = document.get_property("location");
         location.set_property("marker", Value::Number(42.0));
-        assert_eq!(window.get_property("location").get_property("marker"), Value::Number(42.0));
-        let replacement = Value::object(HashMap::from([("hash".into(), Value::string("#override"))]));
+        assert_eq!(
+            window.get_property("location").get_property("marker"),
+            Value::Number(42.0)
+        );
+        let replacement =
+            Value::object(HashMap::from([("hash".into(), Value::string("#override"))]));
         document.set_property("location", replacement.clone());
         assert!(document.get_property("location").strict_eq(&replacement));
         assert!(window.get_property("location").strict_eq(&location));
         document.delete_property("location");
         assert!(document.get_property("location").strict_eq(&location));
         location.set_property("assign", func(|_, _| Value::Number(17.0)));
-        assert_eq!(document.get_property("location").call_method("assign", vec![]), Value::Number(17.0));
+        assert_eq!(
+            document
+                .get_property("location")
+                .call_method("assign", vec![]),
+            Value::Number(17.0)
+        );
         window.get_property("location").delete_property("assign");
-        assert!(document.get_property("location").get_property("assign").is_undefined());
+        assert!(
+            document
+                .get_property("location")
+                .get_property("assign")
+                .is_undefined()
+        );
         window.delete_property("location");
         assert!(window_value().get_property("location").is_undefined());
         assert!(document.get_property("location").strict_eq(&location));
@@ -22719,33 +22823,59 @@ mod tests {
         let reads = Rc::new(Cell::new(0));
         let observed = Rc::clone(&reads);
         let original = document.get_property("__w3cos_getter_location");
-        document.set_property("__w3cos_getter_location", func(move |_, _| {
-            observed.set(observed.get() + 1);
-            w3cos_core::throw_value(Value::string("authored location getter"))
-        }));
+        document.set_property(
+            "__w3cos_getter_location",
+            func(move |_, _| {
+                observed.set(observed.get() + 1);
+                w3cos_core::throw_value(Value::string("authored location getter"))
+            }),
+        );
         let missing = w3cos_core::catch_js(|| element.call_method("matches", vec![])).unwrap_err();
         assert_eq!(missing.get_property("name"), Value::string("TypeError"));
-        assert_eq!(missing.get_property("message"), Value::string("matches requires one argument"));
+        assert_eq!(
+            missing.get_property("message"),
+            Value::string("matches requires one argument")
+        );
         assert_eq!(reads.get(), 0);
-        let error = w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")])).unwrap_err();
+        let error =
+            w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")]))
+                .unwrap_err();
         assert_eq!(error, Value::string("authored location getter"));
         assert_eq!(reads.get(), 1);
         document.set_property("__w3cos_getter_location", original);
-        let invalid = w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")])).unwrap_err();
+        let invalid =
+            w3cos_core::catch_js(|| element.call_method("matches", vec![Value::string("[")]))
+                .unwrap_err();
         assert_eq!(invalid.get_property("name"), Value::string("SyntaxError"));
-        assert_eq!(invalid.get_property("message"), Value::string("Invalid selector"));
+        assert_eq!(
+            invalid.get_property("message"),
+            Value::string("Invalid selector")
+        );
         let hash_reads = Rc::new(Cell::new(0));
         let observed = Rc::clone(&hash_reads);
-        document.set_property("location", Value::object(HashMap::from([(
-            "__w3cos_getter_hash".into(),
-            func(move |_, _| {
-                observed.set(observed.get() + 1);
-                Value::string("")
-            }),
-        )])));
-        assert_eq!(element.call_method("matches", vec![Value::string(".active")]), Value::Bool(true));
-        assert_eq!(element.call_method("matches", vec![Value::string(".inactive")]), Value::Bool(false));
-        assert_eq!(hash_reads.get(), 2, "even simple selectors must retain observable property reads");
+        document.set_property(
+            "location",
+            Value::object(HashMap::from([(
+                "__w3cos_getter_hash".into(),
+                func(move |_, _| {
+                    observed.set(observed.get() + 1);
+                    Value::string("")
+                }),
+            )])),
+        );
+        assert_eq!(
+            element.call_method("matches", vec![Value::string(".active")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            element.call_method("matches", vec![Value::string(".inactive")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            hash_reads.get(),
+            2,
+            "even simple selectors must retain observable property reads"
+        );
     }
 
     #[test]
@@ -24572,9 +24702,15 @@ mod tests {
         for (node, css) in [
             (&target, "width:100px;display:flex"),
             (&moved, "display:contents"),
-            (&item, "display:inline;background:green;height:100px;flex-grow:1"),
+            (
+                &item,
+                "display:inline;background:green;height:100px;flex-grow:1",
+            ),
         ] {
-            node.call_method("setAttribute", vec![Value::string("style"), Value::string(css)]);
+            node.call_method(
+                "setAttribute",
+                vec![Value::string("style"), Value::string(css)],
+            );
         }
         moved.call_method("appendChild", vec![item.clone()]);
         source.call_method("appendChild", vec![moved.clone()]);
@@ -24584,8 +24720,10 @@ mod tests {
         assert!(item.get_property("parentNode") == moved);
         let tree = dom::to_component_tree();
         let flat = crate::layout::pre_flatten(&tree);
-        let index = flat.iter().position(|node|
-            node.style.background == w3cos_std::Color::rgb(0, 128, 0)).unwrap();
+        let index = flat
+            .iter()
+            .position(|node| node.style.background == w3cos_std::Color::rgb(0, 128, 0))
+            .unwrap();
         assert_eq!(flat[index].style.display, w3cos_std::style::Display::Block);
         let layouts = crate::layout::compute(&tree, 800.0, 600.0).unwrap();
         let rect = layouts.iter().find(|(_, node)| *node == index).unwrap().0;
@@ -25740,8 +25878,11 @@ try {
             .call_method("getBoundingClientRect", Vec::new())
             .get_property("top")
             .to_number();
-        assert_eq!(with_text_top - wrapper_top, 100.0,
-            "inserting real preceding text must restore the used line height");
+        assert_eq!(
+            with_text_top - wrapper_top,
+            100.0,
+            "inserting real preceding text must restore the used line height"
+        );
     }
 
     #[test]
@@ -28285,10 +28426,7 @@ try {
     fn focused_text_input_outline_survives_state_preserving_move() {
         setup();
         w3cos_dom::stylesheet::clear_rules();
-        w3cos_dom::stylesheet::register_rule(
-            ":focus-visible",
-            &[("outline", "2px solid green")],
-        );
+        w3cos_dom::stylesheet::register_rule(":focus-visible", &[("outline", "2px solid green")]);
         let document = document_value();
         let origin = create_in_body("div");
         let destination = create_in_body("div");
@@ -28297,18 +28435,29 @@ try {
         movable.call_method("appendChild", vec![input.clone()]);
         origin.call_method("appendChild", vec![movable.clone()]);
         let input_id = NodeId::from_u32(node_id_of(&input).unwrap());
-        let outline_width = || {
-            dom::with_document(|tree| tree.computed_style_for(input_id).outline_width)
-        };
+        let outline_width =
+            || dom::with_document(|tree| tree.computed_style_for(input_id).outline_width);
         assert_eq!(outline_width(), 0.0);
         input.call_method("focus", vec![]);
         assert!(document.get_property("activeElement") == input);
-        assert_eq!(outline_width(), 2.0, "focused text input must match :focus-visible");
+        assert_eq!(
+            outline_width(),
+            2.0,
+            "focused text input must match :focus-visible"
+        );
         destination.call_method("moveBefore", vec![movable, Value::Null]);
         assert!(document.get_property("activeElement") == input);
-        assert_eq!(outline_width(), 2.0, "moveBefore must preserve focus styling");
+        assert_eq!(
+            outline_width(),
+            2.0,
+            "moveBefore must preserve focus styling"
+        );
         input.call_method("blur", vec![]);
-        assert_eq!(outline_width(), 0.0, "blur must invalidate cached focus styling");
+        assert_eq!(
+            outline_width(),
+            0.0,
+            "blur must invalidate cached focus styling"
+        );
         w3cos_dom::stylesheet::clear_rules();
     }
 
@@ -28321,7 +28470,9 @@ try {
         let input = document.call_method("createElement", vec![Value::string("input")]);
         origin.call_method("appendChild", vec![input.clone()]);
         let matches = |element: &Value, selector: &str| {
-            element.call_method("matches", vec![Value::string(selector)]).to_bool()
+            element
+                .call_method("matches", vec![Value::string(selector)])
+                .to_bool()
         };
         assert!(!matches(&input, ":focus"));
         input.call_method("focus", vec![]);
@@ -28344,30 +28495,61 @@ try {
         let input = create_in_body("input");
         let button_id = node_id_of(&button).unwrap();
         let visible = |element: &Value| {
-            element.call_method("matches", vec![Value::string(":focus-visible")]).to_bool()
+            element
+                .call_method("matches", vec![Value::string(":focus-visible")])
+                .to_bool()
         };
         button.call_method("focus", vec![]);
-        assert!(visible(&button), "initial programmatic focus indicates focus");
-        dispatch_native_pointer(button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1,
-            0.5, true, false, false, false, false);
+        assert!(
+            visible(&button),
+            "initial programmatic focus indicates focus"
+        );
+        dispatch_native_pointer(
+            button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1, 0.5, true, false, false, false, false,
+        );
         dispatch_native_focus(button_id, true);
-        assert!(!visible(&button), "pointer-focused button does not indicate focus");
-        dispatch_sync(button_id, EventType::KeyDown, EventData::Keyboard(
-            w3cos_dom::events::KeyboardEventData {
-                key: "a".into(), code: "KeyA".into(), ctrl_key: false,
-                shift_key: false, alt_key: false, meta_key: false,
-                repeat: false, location: 0,
-            },
-        ));
-        assert!(!visible(&button), "synthetic keyboard dispatch must not change modality");
-        dispatch_native_key(button_id, "a", "KeyA", false, false, false, false, false, true);
-        assert!(visible(&button), "trusted keyboard input indicates existing focus");
-        dispatch_native_pointer(button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1,
-            0.5, true, false, false, false, false);
+        assert!(
+            !visible(&button),
+            "pointer-focused button does not indicate focus"
+        );
+        dispatch_sync(
+            button_id,
+            EventType::KeyDown,
+            EventData::Keyboard(w3cos_dom::events::KeyboardEventData {
+                key: "a".into(),
+                code: "KeyA".into(),
+                ctrl_key: false,
+                shift_key: false,
+                alt_key: false,
+                meta_key: false,
+                repeat: false,
+                location: 0,
+            }),
+        );
+        assert!(
+            !visible(&button),
+            "synthetic keyboard dispatch must not change modality"
+        );
+        dispatch_native_key(
+            button_id, "a", "KeyA", false, false, false, false, false, true,
+        );
+        assert!(
+            visible(&button),
+            "trusted keyboard input indicates existing focus"
+        );
+        dispatch_native_pointer(
+            button_id, "down", 0.0, 0.0, 1, "mouse", 0, 1, 0.5, true, false, false, false, false,
+        );
         input.call_method("focus", vec![]);
-        assert!(visible(&input), "text inputs indicate focus even in pointer modality");
+        assert!(
+            visible(&input),
+            "text inputs indicate focus even in pointer modality"
+        );
         button.call_method("focus", vec![]);
-        assert!(visible(&button), "script focus transfer preserves prior indication");
+        assert!(
+            visible(&button),
+            "script focus transfer preserves prior indication"
+        );
     }
 
     #[test]
@@ -28740,18 +28922,34 @@ try {
     #[test]
     fn multicol_cssom_and_supports_use_same_property_grammar() {
         setup();
-        for (property, value) in [("columns", "3 100px"), ("column-width", "2em"),
-            ("column-count", "auto"), ("column-fill", "balance-all")] {
-            assert!(css_property_supported(property, value), "{property}:{value}");
+        for (property, value) in [
+            ("columns", "3 100px"),
+            ("column-width", "2em"),
+            ("column-count", "auto"),
+            ("column-fill", "balance-all"),
+        ] {
+            assert!(
+                css_property_supported(property, value),
+                "{property}:{value}"
+            );
         }
-        for (property, value) in [("columns", "3 4"), ("column-width", "20%"),
-            ("column-count", "0"), ("column-fill", "stretch")] {
-            assert!(!css_property_supported(property, value), "{property}:{value}");
+        for (property, value) in [
+            ("columns", "3 4"),
+            ("column-width", "20%"),
+            ("column-count", "0"),
+            ("column-fill", "stretch"),
+        ] {
+            assert!(
+                !css_property_supported(property, value),
+                "{property}:{value}"
+            );
         }
         let parent = create_in_body("div");
         let child = document_value().call_method("createElement", vec![Value::string("div")]);
         parent.call_method("appendChild", vec![child.clone()]);
-        parent.get_property("style").set_property("columns", Value::string("3 100px"));
+        parent
+            .get_property("style")
+            .set_property("columns", Value::string("3 100px"));
         let style = child.get_property("style");
         style.set_property("columns", Value::string("inherit"));
         style.set_property("columnWidth", Value::string("120px"));
@@ -28759,7 +28957,10 @@ try {
         let computed = window_value().call_method("getComputedStyle", vec![child]);
         assert_eq!(computed.get_property("columnWidth"), Value::string("120px"));
         assert_eq!(computed.get_property("columnCount"), Value::string("3"));
-        assert_eq!(computed.get_property("columnFill"), Value::string("balance"));
+        assert_eq!(
+            computed.get_property("columnFill"),
+            Value::string("balance")
+        );
     }
 
     #[test]

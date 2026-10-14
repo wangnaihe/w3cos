@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(canvas.device_clip_bounds(), clip);
         let pixels = pixels(&mut surface);
         let at = |x: usize, y: usize| &pixels[(y * 24 + x) * 4..(y * 24 + x) * 4 + 4];
-        let foreground = [0.3_f32, 0.5, 0.7, 1.0]
-            .map(|channel| (f64::from(channel) * 255.0).round() as u8);
+        let foreground =
+            [0.3_f32, 0.5, 0.7, 1.0].map(|channel| (f64::from(channel) * 255.0).round() as u8);
         assert_eq!(at(4, 5), foreground);
         assert_eq!(at(11, 5), [255, 255, 255, 255]);
         assert_eq!(at(4, 12), [255, 255, 255, 255]);
