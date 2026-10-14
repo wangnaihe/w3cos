@@ -29,6 +29,8 @@ const IMPACT_SIGNAL: usize = 7;
 const NOTICE_SIGNAL: usize = 8;
 const RECEIPT_SIGNAL: usize = 9;
 const STORAGE_SIGNAL: usize = 11;
+const SUBJECT_SIGNAL: usize = 12;
+const ENROLL_SIGNAL: usize = 13;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -44,6 +46,7 @@ const OP_CHIP_CONTEXT: u8 = 13;
 const OP_TOGGLE_TASKS: u8 = 14;
 const OP_CHIP_TERMINAL: u8 = 15;
 const OP_CHIP_SETTINGS: u8 = 16;
+const OP_ENROLL: u8 = 17;
 
 fn main() {
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
@@ -112,6 +115,8 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("No receipts yet.");
         let _ = state::create_signal(1);
         let _ = state::create_text_signal("memory");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -200,6 +205,14 @@ fn on_shell_intent(code: u8, draft: &str) {
                 );
             }
         }
+        OP_ENROLL => {
+            session.note_passkey_enrollment();
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                "已记下注册意向。Enrollment noted.",
+            );
+        }
         _ => {}
     });
 }
@@ -245,6 +258,8 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
     state::set_text_signal(NOTICE_SIGNAL, notice);
     state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(12));
     state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
+    state::set_text_signal(SUBJECT_SIGNAL, session.actor());
+    state::set_text_signal(ENROLL_SIGNAL, session.enrollment_copy());
 }
 
 fn now_ms() -> u64 {
@@ -734,6 +749,19 @@ fn build_settings_app() -> Component {
         "system" => "system",
         _ => "observer",
     };
+    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+    let subject_label = if subject_owned.is_empty() {
+        LocalIdentityStub::SUBJECT.to_string()
+    } else {
+        subject_owned
+    };
+    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
+    let enroll_label = if enroll_owned.is_empty() {
+        "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
+            .to_string()
+    } else {
+        enroll_owned
+    };
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -782,13 +810,23 @@ fn build_settings_app() -> Component {
                                 },
                             ),
                             Component::text(
-                                "没有账号，也没有链。Passkey / did:key 仍是下一步。",
+                                "没有账号，也没有链。WebAuthn 仪式还没做。",
                                 Style {
                                     font_size: 13.0,
                                     color: Color::from_hex("#d5dee8"),
                                     ..Style::default()
                                 },
                             ),
+                            settings_row("主体 Subject", &subject_label),
+                            Component::text(
+                                enroll_label,
+                                Style {
+                                    font_size: 13.0,
+                                    color: Color::from_hex("#d5dee8"),
+                                    ..Style::default()
+                                },
+                            ),
+                            chrome_button("记下注册意向 Enroll", OP_ENROLL, "#3d5570"),
                             settings_row("身份 Identity", "PBKDF2 · not a passkey"),
                             settings_row("夜间模式 Night", night),
                             settings_row("AI 权限 Bridge", bridge),
@@ -1093,9 +1131,9 @@ fn build_task_center() -> Component {
         ),
         Component::text(
             if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
-                "L0 无模型 · 加密文件 Encrypted file"
+                "本地 L0/L1 · 无模型 · 加密文件"
             } else {
-                "L0 无模型 · 仅内存 Memory"
+                "本地 L0/L1 · 无模型 · 仅内存"
             },
             Style {
                 font_size: 12.0,
@@ -1113,15 +1151,22 @@ fn build_task_center() -> Component {
             },
         ),
         Component::text(
-            format!(
-                "{} · {} · 口令经 KDF 保存，还不是 passkey",
-                LocalIdentityStub::SUBJECT,
-                if unlocked {
-                    "stub unlocked"
+            {
+                let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+                let subject_label = if subject_owned.is_empty() {
+                    LocalIdentityStub::SUBJECT.to_string()
                 } else {
-                    "locked"
-                }
-            ),
+                    subject_owned
+                };
+                format!(
+                    "{subject_label} · {} · 口令经 KDF 保存，还不是 passkey",
+                    if unlocked {
+                        "stub unlocked"
+                    } else {
+                        "locked"
+                    }
+                )
+            },
             Style {
                 font_size: 12.0,
                 color: muted_ink(),

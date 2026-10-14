@@ -5,16 +5,30 @@
 //! WebAuthn assertion. The subject string is intentionally not a real DID.
 //!
 //! The unlock string is not stored. The stub keeps a PBKDF2-HMAC-SHA256
-//! verifier (salt + hash). Passkey / `did:key` is still the next step; this
-//! is only so a copied stub file is not the password itself.
+//! verifier (salt + hash). The subject is a `did:key:` string that can be
+//! replaced later. Receipts already written keep the actor they recorded.
+//! WebAuthn enrollment here is a note, not a ceremony.
+
+use serde::{Deserialize, Serialize};
 
 /// How a local subject was established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityMethod {
     /// Placeholder until a passkey-backed `did:key` exists.
     Stub,
     DidKey,
     Passkey,
+}
+
+/// How far passkey enrollment has gone. `AwaitingPasskey` is a note, not a
+/// WebAuthn credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentState {
+    #[default]
+    Stub,
+    AwaitingPasskey,
 }
 
 /// What the shell needs from a local identity service.
@@ -30,6 +44,8 @@ pub trait LocalIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalIdentityStub {
     subject: String,
+    method: IdentityMethod,
+    enrollment: EnrollmentState,
     unlocked: bool,
     /// `pbkdf2-sha256$iterations$salt$hash`. Not the unlock string.
     verifier: Option<String>,
@@ -41,9 +57,57 @@ impl LocalIdentityStub {
     pub fn new() -> Self {
         Self {
             subject: Self::SUBJECT.to_string(),
+            method: IdentityMethod::Stub,
+            enrollment: EnrollmentState::Stub,
             unlocked: false,
             verifier: None,
         }
+    }
+
+    pub fn enrollment(&self) -> EnrollmentState {
+        self.enrollment
+    }
+
+    /// Copy for the Settings identity section. This does not start WebAuthn.
+    pub fn enrollment_copy(&self) -> &'static str {
+        match self.enrollment {
+            EnrollmentState::Stub => {
+                "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
+            }
+            EnrollmentState::AwaitingPasskey => {
+                "已记下注册意向。仍然没有 WebAuthn 凭证。Enrollment noted. No credential was created."
+            }
+        }
+    }
+
+    /// Remember that the user asked to enroll. Does not create a credential.
+    pub fn note_passkey_enrollment(&mut self) {
+        self.enrollment = EnrollmentState::AwaitingPasskey;
+    }
+
+    pub fn restore_enrollment(&mut self, state: EnrollmentState) {
+        self.enrollment = state;
+    }
+
+    /// Install a persisted `did:key:` subject. Returns false when `subject`
+    /// is not a did:key. Does not touch receipts.
+    pub fn restore_subject(&mut self, subject: &str) -> bool {
+        self.install_subject(subject)
+    }
+
+    /// Replace the stub subject with another `did:key:`. Existing receipt
+    /// records are left alone; only later actions use the new subject.
+    pub fn install_subject(&mut self, subject: &str) -> bool {
+        if !is_did_key(subject) {
+            return false;
+        }
+        self.method = if subject.contains("stub") {
+            IdentityMethod::Stub
+        } else {
+            IdentityMethod::DidKey
+        };
+        self.subject = subject.to_string();
+        true
     }
 
     pub fn lock(&mut self) {
@@ -102,6 +166,14 @@ const VERIFIER_PREFIX: &str = "pbkdf2-sha256$";
 
 fn is_verifier(stored: &str) -> bool {
     stored.starts_with(VERIFIER_PREFIX)
+}
+
+fn is_did_key(subject: &str) -> bool {
+    let Some(rest) = subject.strip_prefix("did:key:") else {
+        return false;
+    };
+    let len = rest.len();
+    (8..=200).contains(&len) && rest.chars().all(|ch| !ch.is_whitespace())
 }
 
 fn seal_pin(assertion: &str) -> Option<String> {
@@ -205,7 +277,7 @@ impl LocalIdentity for LocalIdentityStub {
     }
 
     fn method(&self) -> IdentityMethod {
-        IdentityMethod::Stub
+        self.method
     }
 
     fn unlocked(&self) -> bool {
@@ -271,5 +343,26 @@ mod tests {
         assert!(legacy.unlock_with_passkey_stub("alpha"));
         assert!(!legacy.restore_locked_pin("beta"));
         assert_eq!(legacy.remembered_pin(), Some(migrated.as_str()));
+    }
+
+    #[test]
+    fn a_did_key_can_replace_the_stub_without_a_ceremony() {
+        let mut id = LocalIdentityStub::new();
+        assert!(!id.install_subject("not-a-did"));
+        assert!(!id.install_subject("did:key:short"));
+        assert!(!id.install_subject("did:key:has space"));
+        assert_eq!(id.subject(), LocalIdentityStub::SUBJECT);
+        assert_eq!(id.method(), IdentityMethod::Stub);
+        assert!(id.install_subject("did:key:z6Mkexample"));
+        assert_eq!(id.subject(), "did:key:z6Mkexample");
+        assert_eq!(id.method(), IdentityMethod::DidKey);
+        assert!(!id.unlocked());
+        assert!(id.remembered_pin().is_none());
+        id.note_passkey_enrollment();
+        assert_eq!(id.enrollment(), EnrollmentState::AwaitingPasskey);
+        assert!(!id.unlocked());
+        assert!(id.remembered_pin().is_none());
+        assert!(id.enrollment_copy().contains("Enrollment noted"));
+        assert!(id.enrollment_copy().contains("没有 WebAuthn"));
     }
 }

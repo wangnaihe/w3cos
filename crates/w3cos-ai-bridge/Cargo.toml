@@ -9,6 +9,10 @@ description = "W3C OS AI bridge — structured DOM access, accessibility tree, a
 name = "w3cos-ai-mcp"
 path = "src/bin/w3cos-ai-mcp.rs"
 
+[features]
+default = []
+l1 = []
+
 [dependencies]
 w3cos-dom = { workspace = true }
 w3cos-std = { workspace = true }

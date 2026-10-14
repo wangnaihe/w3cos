@@ -74,6 +74,10 @@ W3COS_AI_TOKEN=demo-token ./target/debug/w3cos-shell --ai-port 9222 --ai-token d
 W3COS_AI_PORT=9222 W3COS_AI_TOKEN=demo-token cargo run -p w3cos-ai-bridge --bin w3cos-ai-mcp
 ```
 
+The shell intent bar uses the L0 rule table first. Phrases that miss it can
+fall through to a local L1 synonym matcher (no model, no network).
+`W3COS_L1=0` keeps the rule table only.
+
 `a11y_index` and `screenshot_annotated` are readable by an observer.
 `propose_intent`, `confirm_intent`, `click`, and `type` use the bridge's
 interaction permission, so an observer token is rejected before the shell runs

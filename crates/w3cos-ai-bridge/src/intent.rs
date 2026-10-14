@@ -111,6 +111,33 @@ pub enum ShellCommand {
     Help,
 }
 
+/// Which local tier produced a command. `Unspecified` is a legacy receipt
+/// or a proposal that never resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentTier {
+    #[default]
+    Unspecified,
+    /// Fixed rule table.
+    L0,
+    /// Synonym / typo resolver, still not a model.
+    L1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedIntent {
+    pub command: ShellCommand,
+    pub tier: IntentTier,
+}
+
+/// Pluggable step behind the L0 rule table.
+///
+/// Implementations run only from [`IntentSession::propose`]. Typing, layout,
+/// and paint do not call this.
+pub trait IntentResolver {
+    fn resolve(&self, normalized: &str) -> Option<ResolvedIntent>;
+}
+
 impl ShellCommand {
     pub fn name(&self) -> String {
         match self {
@@ -157,6 +184,9 @@ pub struct ActionReceipt {
     pub decision: Decision,
     pub confirmed: bool,
     pub outcome: String,
+    /// Missing on receipts written before the L0/L1 log existed.
+    #[serde(default)]
+    pub tier: IntentTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +195,7 @@ pub struct Proposal {
     pub command: ShellCommand,
     pub summary: String,
     pub impact: String,
+    pub tier: IntentTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +215,12 @@ pub struct ExecuteResult {
 struct LedgerSnapshot {
     pin: Option<String>,
     receipts: Vec<ActionReceipt>,
+    /// Current subject. Older files omit this and keep the stub.
+    /// Replacing it does not rewrite `receipts`.
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    enrollment: crate::identity::EnrollmentState,
 }
 
 pub struct IntentSession {
@@ -195,6 +232,7 @@ pub struct IntentSession {
     receipts: Vec<ActionReceipt>,
     next_id: u64,
     ledger: Option<ReceiptLedger>,
+    l1_enabled: bool,
 }
 
 impl IntentSession {
@@ -208,6 +246,24 @@ impl IntentSession {
             receipts: Vec::new(),
             next_id: 1,
             ledger: None,
+            l1_enabled: false,
+        }
+    }
+
+    /// Turn on the local L1 synonym resolver when this crate was built with
+    /// the `l1` feature. `W3COS_L1=0` keeps the rule table only.
+    /// The resolver runs inside [`propose`](Self::propose), not while typing.
+    pub fn with_l1(self) -> Self {
+        #[cfg(feature = "l1")]
+        {
+            let mut session = self;
+            let disabled = std::env::var("W3COS_L1").ok().as_deref() == Some("0");
+            session.l1_enabled = !disabled;
+            return session;
+        }
+        #[cfg(not(feature = "l1"))]
+        {
+            self
         }
     }
 
@@ -215,12 +271,14 @@ impl IntentSession {
     /// available. Tests keep using [`new`](Self::new), which stays in memory.
     pub fn open_local(permissions: AgentPermissions, identity: LocalIdentityStub) -> Self {
         match ReceiptLedger::open_default() {
-            Ok(ledger) => Self::new(permissions, identity).with_ledger(ledger),
+            Ok(ledger) => Self::new(permissions, identity)
+                .with_l1()
+                .with_ledger(ledger),
             Err(err) => {
                 eprintln!(
                     "[intent] receipt ledger unavailable ({err}); keeping receipts in memory"
                 );
-                Self::new(permissions, identity)
+                Self::new(permissions, identity).with_l1()
             }
         }
     }
@@ -233,6 +291,10 @@ impl IntentSession {
                     if let Some(pin) = snapshot.pin.as_deref() {
                         migrated = self.identity.restore_locked_pin(pin);
                     }
+                    if let Some(subject) = snapshot.subject.as_deref() {
+                        self.identity.restore_subject(subject);
+                    }
+                    self.identity.restore_enrollment(snapshot.enrollment);
                     if let Some(next) = snapshot
                         .receipts
                         .iter()
@@ -283,6 +345,25 @@ impl IntentSession {
         self.identity.lock();
     }
 
+    pub fn note_passkey_enrollment(&mut self) {
+        self.identity.note_passkey_enrollment();
+        self.persist();
+    }
+
+    pub fn enrollment_copy(&self) -> &'static str {
+        self.identity.enrollment_copy()
+    }
+
+    /// Point later actions at a new `did:key:`. Receipts already stored keep
+    /// the actor they were written with.
+    pub fn replace_subject(&mut self, subject: &str) -> bool {
+        if !self.identity.install_subject(subject) {
+            return false;
+        }
+        self.persist();
+        true
+    }
+
     pub fn unlock_identity_stub(&mut self, assertion: &str) -> bool {
         let unlocked = self.identity.unlock_with_passkey_stub(assertion);
         if unlocked {
@@ -299,6 +380,7 @@ impl IntentSession {
             Decision::Allowed,
             true,
             "Context hidden from the agent.",
+            IntentTier::Unspecified,
         );
     }
 
@@ -310,27 +392,40 @@ impl IntentSession {
             Decision::Allowed,
             true,
             "Context shared with the agent again.",
+            IntentTier::Unspecified,
         );
     }
 
     pub fn propose(&mut self, utterance: &str, ctx: &ShellContext) -> ProposeResult {
         let utterance = normalize(utterance);
-        let Some(command) = match_command(&utterance) else {
+        let Some(resolved) = resolve_intent(&utterance, self.l1_enabled) else {
+            eprintln!("[intent] tier=none utterance={utterance:?}");
             let receipt = self.push(
                 &utterance,
                 "none",
                 Decision::Unrecognized,
                 false,
                 "No matching command. Nothing ran.",
+                IntentTier::Unspecified,
             );
             self.proposal = None;
             return ProposeResult::Unrecognized { receipt };
         };
+        eprintln!(
+            "[intent] tier={} command={} utterance={utterance:?}",
+            tier_label(resolved.tier),
+            resolved.command.name(),
+        );
         let proposal = Proposal {
-            summary: summary_for(&command, ctx, self.context_shared),
-            impact: impact_for(&command, self.context_shared),
+            summary: format!(
+                "{} · {}",
+                tier_label(resolved.tier),
+                summary_for(&resolved.command, ctx, self.context_shared)
+            ),
+            impact: impact_for(&resolved.command, self.context_shared, resolved.tier),
             utterance,
-            command,
+            command: resolved.command,
+            tier: resolved.tier,
         };
         self.proposal = Some(proposal.clone());
         ProposeResult::Confirm(proposal)
@@ -363,6 +458,7 @@ impl IntentSession {
             Decision::Allowed,
             true,
             &outcome,
+            proposal.tier,
         );
         Some(ExecuteResult {
             receipt,
@@ -379,6 +475,7 @@ impl IntentSession {
             Decision::Cancelled,
             false,
             "Cancelled. Nothing was changed.",
+            proposal.tier,
         ))
     }
 
@@ -402,10 +499,11 @@ impl IntentSession {
         }
         for receipt in &self.receipts[skip..] {
             lines.push(format!(
-                "#{} {} {} actor={} confirmed={} — {}",
+                "#{} {} {} tier={} actor={} confirmed={} — {}",
                 receipt.operation_id,
                 receipt.decision.as_str(),
                 receipt.command,
+                tier_label(receipt.tier),
                 receipt.actor,
                 receipt.confirmed,
                 receipt.outcome
@@ -421,6 +519,7 @@ impl IntentSession {
             Decision::Denied,
             true,
             &format!("Denied: {reason}. Nothing was changed."),
+            proposal.tier,
         );
         ExecuteResult {
             receipt,
@@ -436,6 +535,7 @@ impl IntentSession {
         decision: Decision,
         confirmed: bool,
         outcome: &str,
+        tier: IntentTier,
     ) -> ActionReceipt {
         let receipt = ActionReceipt {
             operation_id: self.next_id,
@@ -445,6 +545,7 @@ impl IntentSession {
             decision,
             confirmed,
             outcome: outcome.to_string(),
+            tier,
         };
         self.next_id += 1;
         self.receipts.push(receipt.clone());
@@ -459,6 +560,8 @@ impl IntentSession {
         let snapshot = LedgerSnapshot {
             pin: self.identity.remembered_pin().map(str::to_string),
             receipts: self.receipts.clone(),
+            subject: Some(self.identity.subject().to_string()),
+            enrollment: self.identity.enrollment(),
         };
         let Ok(bytes) = serde_json::to_vec(&snapshot) else {
             eprintln!("[intent] receipt ledger skipped a write: snapshot did not encode");
@@ -540,8 +643,32 @@ fn summary_for(command: &ShellCommand, ctx: &ShellContext, shared: bool) -> Stri
     }
 }
 
-fn impact_for(command: &ShellCommand, shared: bool) -> String {
-    match command {
+fn tier_label(tier: IntentTier) -> &'static str {
+    match tier {
+        IntentTier::L0 => "L0",
+        IntentTier::L1 => "L1",
+        IntentTier::Unspecified => "none",
+    }
+}
+
+fn resolve_intent(normalized: &str, l1_enabled: bool) -> Option<ResolvedIntent> {
+    if let Some(command) = match_command(normalized) {
+        return Some(ResolvedIntent {
+            command,
+            tier: IntentTier::L0,
+        });
+    }
+    #[cfg(feature = "l1")]
+    if l1_enabled {
+        return crate::l1::FuzzySynonymResolver::new().resolve(normalized);
+    }
+    #[cfg(not(feature = "l1"))]
+    let _ = l1_enabled;
+    None
+}
+
+fn impact_for(command: &ShellCommand, shared: bool, tier: IntentTier) -> String {
+    let body = match command {
         ShellCommand::OpenApp(_) => {
             "会切换当前窗口，再打开别的应用即可回来。Switches the visible app.".to_string()
         }
@@ -556,6 +683,10 @@ fn impact_for(command: &ShellCommand, shared: bool) -> String {
             "上下文已隐藏，确认只会记下拒绝，不会说出应用名。Context is revoked.".to_string()
         }
         ShellCommand::Help => "列出这条栏能匹配的命令，不调用模型。No model is called.".to_string(),
+    };
+    match tier {
+        IntentTier::L1 => format!("L1 本地同义词，没有模型。Local synonyms, no model. {body}"),
+        _ => body,
     }
 }
 
@@ -915,5 +1046,113 @@ mod tests {
         assert!(!session.unlock_identity_stub("beta"));
         assert!(session.unlock_identity_stub("alpha"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn l0_misses_the_synonym_phrases_and_stays_off_without_l1() {
+        assert!(match_command("file manager").is_none());
+        assert!(match_command("dark theme").is_none());
+        assert!(match_command("settigns").is_none());
+        let mut session = session(AgentPermissions::interactive());
+        match session.propose("file manager", &ctx()) {
+            ProposeResult::Unrecognized { receipt } => {
+                assert_eq!(receipt.tier, IntentTier::Unspecified);
+            }
+            ProposeResult::Confirm(_) => panic!("memory session resolved an L1 phrase"),
+        }
+        session.propose("open files", &ctx());
+        let proposal = session.proposal().expect("l0 proposal");
+        assert_eq!(proposal.tier, IntentTier::L0);
+        assert!(proposal.summary.starts_with("L0"));
+    }
+
+    #[cfg(feature = "l1")]
+    #[test]
+    fn l1_resolves_a_rule_miss_and_records_the_tier() {
+        let mut session = session(AgentPermissions::interactive()).with_l1();
+        match session.propose("file manager", &ctx()) {
+            ProposeResult::Confirm(proposal) => {
+                assert_eq!(proposal.command, ShellCommand::OpenApp(ShellApp::Files));
+                assert_eq!(proposal.tier, IntentTier::L1);
+                assert!(proposal.summary.starts_with("L1"), "{}", proposal.summary);
+                assert!(
+                    proposal.impact.contains("Local synonyms, no model."),
+                    "{}",
+                    proposal.impact
+                );
+            }
+            ProposeResult::Unrecognized { receipt } => panic!("{}", receipt.outcome),
+        }
+        match session.propose("dark theme", &ctx()) {
+            ProposeResult::Confirm(proposal) => {
+                assert_eq!(proposal.command, ShellCommand::ToggleNight);
+                assert_eq!(proposal.tier, IntentTier::L1);
+            }
+            ProposeResult::Unrecognized { receipt } => panic!("{}", receipt.outcome),
+        }
+        match session.propose("make me a sandwich", &ctx()) {
+            ProposeResult::Unrecognized { .. } => {}
+            ProposeResult::Confirm(_) => panic!("unrelated text became a command"),
+        }
+        match session.propose("click #secret", &ctx()) {
+            ProposeResult::Unrecognized { .. } => {}
+            ProposeResult::Confirm(_) => panic!("selector smuggling became a command"),
+        }
+        session.propose("help me", &ctx());
+        let effect = session.confirm(&ctx(), 1_000).unwrap();
+        assert_eq!(effect.receipt.tier, IntentTier::L1);
+        assert!(effect.receipt.outcome.contains("No model"));
+        session.propose("file manager", &ctx());
+        let effect = session.confirm(&ctx(), 2_000).unwrap();
+        assert_eq!(effect.receipt.tier, IntentTier::L1);
+        assert_eq!(effect.navigate, Some(ShellApp::Files));
+    }
+
+    #[test]
+    fn replacing_the_subject_does_not_rewrite_old_receipts() {
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "subject"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("ledger"));
+        assert!(session.unlock_identity_stub("alpha"));
+        let effect = confirm_open(&mut session, "open files");
+        assert_eq!(effect.receipt.actor, LocalIdentityStub::SUBJECT);
+        assert!(session.replace_subject("did:key:z6Mkexample"));
+        assert!(!session.replace_subject("not-a-did"));
+        assert_eq!(session.actor(), "did:key:z6Mkexample");
+        assert_eq!(session.receipts()[0].actor, LocalIdentityStub::SUBJECT);
+        session.note_passkey_enrollment();
+        assert!(session.identity_unlocked());
+        drop(session);
+
+        let reloaded =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("reopen"));
+        assert_eq!(reloaded.actor(), "did:key:z6Mkexample");
+        assert_eq!(reloaded.receipts()[0].actor, LocalIdentityStub::SUBJECT);
+        assert!(reloaded.enrollment_copy().contains("Enrollment noted"));
+        assert!(!reloaded.identity_unlocked());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let legacy_dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "legacy-subject"
+        ));
+        let _ = std::fs::remove_dir_all(&legacy_dir);
+        ReceiptLedger::open(&legacy_dir)
+            .expect("ledger")
+            .store(br#"{"pin":null,"receipts":[]}"#)
+            .expect("store");
+        let legacy = IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+            .with_ledger(ReceiptLedger::open(&legacy_dir).expect("reopen"));
+        assert_eq!(legacy.actor(), LocalIdentityStub::SUBJECT);
+        assert!(legacy.enrollment_copy().contains("not implemented"));
+        let _ = std::fs::remove_dir_all(&legacy_dir);
     }
 }
