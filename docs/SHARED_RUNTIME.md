@@ -131,6 +131,8 @@ ISO 带的是 `system/rootfs_overlay/usr/share/fonts/truetype/w3cos/DroidSansFal
 
 Noto Color Emoji 是 CBDT 彩色位图。CPU 栅格器画不出它的轮廓时不会选它，避免再画出空方框。系统里如果没有可栅格的轮廓 emoji，U+1F600 仍然没有字形。符号（例如 ✓）走 DejaVu。
 
+Xvfb 上重画了桌面、任务中心和设置。顶栏「打开文件 / 打开终端 / 任务」、任务中心「任务中心 / 解锁才能执行 / 收据」、设置「设置 / 本机 / 身份」都是可读汉字，不再是方框。拉丁字母仍走原来的 Noto Sans。
+
 ## 测量
 
 机器：x86_64，rustc 1.99。`CARGO_PROFILE_RELEASE_LTO=off`、`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`、`CARGO_PROFILE_RELEASE_PANIC=unwind`。workspace 的 `opt-level` 是 3。
