@@ -70,6 +70,50 @@ fn dispatch(target: &Value, event_type: &str, data: Option<Value>) {
     target.call_method("dispatchEvent", vec![event]);
 }
 
+fn captured_photo_blob(track: &Value) -> Option<Value> {
+    let (_, _, png) =
+        crate::media_devices_web::captured_frame(&track.get_property("id").to_js_string())?;
+    let buffer = w3cos_core::binary::array_buffer_value(png);
+    let view = w3cos_core::class::construct(
+        &w3cos_core::binary::typed_array_class("Uint8Array"),
+        vec![buffer],
+    );
+    Some(w3cos_core::class::construct(
+        &crate::files::blob_class(),
+        vec![
+            Value::array(vec![view]),
+            Value::object(HashMap::from([("type".into(), Value::string("image/png"))])),
+        ],
+    ))
+}
+
+fn captured_image_data(track: &Value) -> Option<Value> {
+    let (width, height, png) =
+        crate::media_devices_web::captured_frame(&track.get_property("id").to_js_string())?;
+    let image = image::load_from_memory(&png).ok()?;
+    let rgba = image.to_rgba8();
+    let (decoded_width, decoded_height) = rgba.dimensions();
+    let buffer = w3cos_core::binary::array_buffer_value(rgba.into_raw());
+    let data = w3cos_core::class::construct(
+        &w3cos_core::binary::typed_array_class("Uint8ClampedArray"),
+        vec![buffer],
+    );
+    Some(w3cos_core::web::image_data_value(
+        data,
+        if decoded_width == 0 {
+            width
+        } else {
+            decoded_width
+        },
+        if decoded_height == 0 {
+            height
+        } else {
+            decoded_height
+        },
+        "srgb",
+    ))
+}
+
 fn empty_blob(mime_type: &str) -> Value {
     w3cos_core::class::construct(
         &crate::files::blob_class(),
@@ -268,14 +312,20 @@ pub fn image_capture_class() -> Value {
             }
             this.set_property(
                 "takePhoto",
-                realm_recording_function(|_, _| {
+                realm_recording_function(|this, _| {
+                    if let Some(blob) = captured_photo_blob(&this.get_property("track")) {
+                        return w3cos_core::promise::resolve(vec![blob]);
+                    }
                     warning();
                     w3cos_core::promise::resolve(vec![empty_blob("image/png")])
                 }),
             );
             this.set_property(
                 "grabFrame",
-                realm_recording_function(|_, _| {
+                realm_recording_function(|this, _| {
+                    if let Some(frame) = captured_image_data(&this.get_property("track")) {
+                        return w3cos_core::promise::resolve(vec![frame]);
+                    }
                     warning();
                     w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                         "No native video frame provider is registered",

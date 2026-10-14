@@ -2,8 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Once;
-
 use w3cos_core::Value;
 
 thread_local! {
@@ -320,15 +318,90 @@ pub fn screen_details_value() -> Value {
     })
 }
 
+fn detailed_from(display: &crate::platform_host::DisplayInfo, primary_fallback: bool) -> Value {
+    let width = f64::from(display.width);
+    let height = f64::from(display.height);
+    let left = f64::from(display.left);
+    let top = f64::from(display.top);
+    let value = Value::object(HashMap::from([
+        ("colorDepth".into(), Value::Number(24.0)),
+        ("pixelDepth".into(), Value::Number(24.0)),
+        (
+            "isPrimary".into(),
+            Value::Bool(display.primary || primary_fallback),
+        ),
+        ("isInternal".into(), Value::Bool(display.internal)),
+        ("label".into(), Value::string(&display.label)),
+        ("left".into(), Value::Number(left)),
+        ("top".into(), Value::Number(top)),
+        ("availLeft".into(), Value::Number(left)),
+        ("availTop".into(), Value::Number(top)),
+    ]));
+    value.set_property(
+        "__w3cos_getter_width",
+        Value::function(move |_, _| Value::Number(width)),
+    );
+    value.set_property(
+        "__w3cos_getter_height",
+        Value::function(move |_, _| Value::Number(height)),
+    );
+    value.set_property(
+        "__w3cos_getter_availWidth",
+        Value::function(move |_, _| Value::Number(width)),
+    );
+    value.set_property(
+        "__w3cos_getter_availHeight",
+        Value::function(move |_, _| Value::Number(height)),
+    );
+    value.set_property(
+        "__w3cos_getter_devicePixelRatio",
+        Value::function(|_, _| Value::Number(crate::jsdom::viewport().2)),
+    );
+    w3cos_core::class::set_prototype_of(&value, &screen_detailed_class().get_property("prototype"));
+    value
+}
+
 pub fn get_screen_details() -> Value {
-    static WARNING: Once = Once::new();
-    WARNING.call_once(|| {
-        eprintln!(
-            "[w3cos] warning: getScreenDetails exposes the current display only; \
-             multi-display enumeration and topology changes require a host window-management adapter"
-        );
-    });
-    w3cos_core::promise::resolve(vec![screen_details_value()])
+    if let Some(rejected) = crate::capability_gate::reject_unless_granted("window-management") {
+        return rejected;
+    }
+    match crate::platform_host::list_displays() {
+        Ok(displays) => {
+            let screens = displays
+                .iter()
+                .enumerate()
+                .map(|(index, display)| detailed_from(display, index == 0))
+                .collect::<Vec<_>>();
+            let current = screens
+                .first()
+                .cloned()
+                .unwrap_or_else(detailed_screen_value);
+            let extended = screens.len() > 1;
+            let value = Value::object(HashMap::from([
+                ("currentScreen".into(), current),
+                ("screens".into(), Value::array(screens)),
+                ("oncurrentscreenchange".into(), Value::Null),
+                ("onscreenschange".into(), Value::Null),
+                ("isExtended".into(), Value::Bool(extended)),
+            ]));
+            crate::web_events::event_target_class().call(value.clone(), vec![]);
+            w3cos_core::class::set_prototype_of(
+                &value,
+                &screen_details_class().get_property("prototype"),
+            );
+            w3cos_core::promise::resolve(vec![value])
+        }
+        Err(message) => {
+            w3cos_core::promise::reject(vec![type_error_named("NotSupportedError", &message)])
+        }
+    }
+}
+
+fn type_error_named(name: &str, message: &str) -> Value {
+    Value::object(HashMap::from([
+        ("name".into(), Value::string(name)),
+        ("message".into(), Value::string(message)),
+    ]))
 }
 
 /// Release Realm-owned screen wrappers and listeners while retaining the
@@ -375,5 +448,80 @@ mod tests {
                 .to_js_string(),
             "portrait-primary"
         );
+    }
+
+    #[test]
+    fn window_management_lists_granted_displays_and_refuses_without_permission() {
+        crate::capability_gate::reset();
+        crate::platform_host::reset_overrides();
+        let denied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let denied_for_catch = std::rc::Rc::clone(&denied);
+        get_screen_details().call_method(
+            "catch",
+            vec![Value::function(move |_, args| {
+                *denied_for_catch.borrow_mut() = args[0].get_property("name").to_js_string();
+                Value::Undefined
+            })],
+        );
+        crate::jsdom::drain_microtasks();
+        assert_eq!(&*denied.borrow(), "NotAllowedError");
+
+        crate::capability_gate::grant("window-management");
+        crate::platform_host::set_display_override(Some(vec![
+            crate::platform_host::DisplayInfo {
+                label: "internal".into(),
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+                primary: true,
+                internal: true,
+            },
+            crate::platform_host::DisplayInfo {
+                label: "external".into(),
+                left: 1920,
+                top: 0,
+                width: 1280,
+                height: 800,
+                primary: false,
+                internal: false,
+            },
+        ]));
+        let details = std::rc::Rc::new(std::cell::RefCell::new(Value::Undefined));
+        let details_for_then = std::rc::Rc::clone(&details);
+        get_screen_details().call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *details_for_then.borrow_mut() = args[0].clone();
+                Value::Undefined
+            })],
+        );
+        crate::jsdom::drain_microtasks();
+        let details = details.borrow().clone();
+        assert_eq!(
+            details
+                .get_property("screens")
+                .get_property("length")
+                .to_number(),
+            2.0
+        );
+        assert_eq!(
+            details
+                .get_property("screens")
+                .get_property("1")
+                .get_property("label")
+                .to_js_string(),
+            "external"
+        );
+        assert_eq!(
+            details
+                .get_property("screens")
+                .get_property("1")
+                .get_property("width")
+                .to_number(),
+            1280.0
+        );
+        crate::capability_gate::reset();
+        crate::platform_host::reset_overrides();
     }
 }

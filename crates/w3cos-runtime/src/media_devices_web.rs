@@ -32,7 +32,14 @@ struct TrackGeneratorState {
     processors: Vec<Rc<TrackProcessorState>>,
 }
 
+struct CapturedFrame {
+    width: u32,
+    height: u32,
+    png: Vec<u8>,
+}
+
 thread_local! {
+    static CAPTURED_FRAMES: RefCell<HashMap<String, CapturedFrame>> = RefCell::new(HashMap::new());
     static DEVICES: RefCell<Vec<MediaDevice>> = const { RefCell::new(Vec::new()) };
     static PERMISSION_DENIED: Cell<bool> = const { Cell::new(false) };
     static NEXT_TRACK_ID: Cell<u64> = const { Cell::new(1) };
@@ -534,6 +541,23 @@ pub fn input_device_info_class() -> Value {
     })
 }
 
+fn store_capture_frame(id: &str, width: u32, height: u32, png: Vec<u8>) {
+    CAPTURED_FRAMES.with(|frames| {
+        frames
+            .borrow_mut()
+            .insert(id.to_string(), CapturedFrame { width, height, png });
+    });
+}
+
+pub(crate) fn captured_frame(id: &str) -> Option<(u32, u32, Vec<u8>)> {
+    CAPTURED_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .get(id)
+            .map(|frame| (frame.width, frame.height, frame.png.clone()))
+    })
+}
+
 fn next_track_id() -> String {
     NEXT_TRACK_ID.with(|next| {
         let id = next.get();
@@ -596,10 +620,14 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
     value.set_property(
         "getSettings",
         realm_media_function(|this, _| {
-            Value::object(HashMap::from([(
-                "deviceId".to_string(),
-                this.get_property("id"),
-            )]))
+            let id = this.get_property("id").to_js_string();
+            let mut settings = HashMap::from([("deviceId".to_string(), this.get_property("id"))]);
+            if let Some((width, height, _)) = captured_frame(&id) {
+                settings.insert("displaySurface".into(), Value::string("monitor"));
+                settings.insert("width".into(), Value::Number(f64::from(width)));
+                settings.insert("height".into(), Value::Number(f64::from(height)));
+            }
+            Value::object(settings)
         }),
     );
     value.set_property(
@@ -924,17 +952,26 @@ pub fn media_devices_value() -> Value {
                     "getDisplayMedia requires a video track",
                 )]);
             }
-            static WARNING: Once = Once::new();
-            WARNING.call_once(|| {
-                eprintln!(
-                    "[w3cos] warning: getDisplayMedia requires a host screen-capture picker and \
-                     capture-stream adapter"
-                );
-            });
-            w3cos_core::promise::reject(vec![named_error(
-                "NotSupportedError",
-                "Screen capture is unavailable without a host adapter",
-            )])
+            if let Some(rejected) = crate::capability_gate::reject_unless_granted("display-capture")
+            {
+                return rejected;
+            }
+            match crate::platform_host::capture_display() {
+                Ok(image) => {
+                    let track =
+                        track_value("video", &format!("screen {}x{}", image.width, image.height));
+                    store_capture_frame(
+                        &track.get_property("id").to_js_string(),
+                        image.width,
+                        image.height,
+                        image.png,
+                    );
+                    w3cos_core::promise::resolve(vec![stream_value(vec![track])])
+                }
+                Err(message) => {
+                    w3cos_core::promise::reject(vec![named_error("NotSupportedError", &message)])
+                }
+            }
         }),
     );
     value.set_property(
@@ -982,6 +1019,7 @@ pub fn reset() {
     DEVICES.with(|devices| devices.borrow_mut().clear());
     TRACK_GENERATORS.with(|generators| generators.borrow_mut().clear());
     PERMISSION_DENIED.with(|permission| permission.set(false));
+    CAPTURED_FRAMES.with(|frames| frames.borrow_mut().clear());
     NEXT_TRACK_ID.with(|next| next.set(1));
     for slot in [
         &MEDIA_STREAM_CLASS,
@@ -1210,7 +1248,7 @@ mod tests {
         crate::jsdom::drain_microtasks();
         assert_eq!(
             &*errors.borrow(),
-            &["TypeError", "NotSupportedError", "NotFoundError"]
+            &["TypeError", "NotAllowedError", "NotFoundError"]
         );
     }
 

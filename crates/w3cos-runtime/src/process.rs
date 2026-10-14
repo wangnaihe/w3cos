@@ -66,6 +66,11 @@ impl ChildProcess {
         read_available(&mut self.child.stderr)
     }
 
+    /// Close the child's stdin so it observes EOF.
+    pub fn close_stdin(&mut self) {
+        self.child.stdin.take();
+    }
+
     /// Write to stdin.
     pub fn write_stdin(&mut self, data: &str) -> Result<(), String> {
         use std::io::Write;

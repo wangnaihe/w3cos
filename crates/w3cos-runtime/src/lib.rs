@@ -13,6 +13,7 @@ pub(crate) mod browser_http_cache;
 #[cfg(feature = "dynamic-js")]
 pub mod browser_page_domain;
 pub mod cache_web;
+pub mod capability_gate;
 pub mod canvas2d;
 pub mod canvas_web;
 #[cfg(all(
@@ -34,6 +35,7 @@ pub mod device_access_web;
 #[cfg(feature = "devtools")]
 pub mod devtools;
 pub mod dialog;
+pub mod direct_sockets_web;
 pub mod document_context;
 pub mod dom;
 pub mod dom_constructors;
@@ -120,6 +122,7 @@ pub mod paint_artifact;
 pub mod payment_web;
 pub mod perf;
 pub mod permissions_web;
+pub mod platform_host;
 pub mod presentation_web;
 pub mod pressure_web;
 #[cfg(all(
@@ -178,6 +181,7 @@ pub mod user_activation_web;
 pub mod user_mediated_web;
 pub mod view_transition_web;
 pub mod virtual_list;
+pub mod w3cos_extensions;
 pub mod wake_lock_web;
 pub mod web_events;
 pub mod web_nfc;
@@ -187,6 +191,7 @@ pub mod webcodecs_web;
 mod webgl_constants_generated;
 pub mod webgl_web;
 pub mod webgpu_web;
+pub mod webnn_web;
 pub mod webrtc_web;
 pub mod websocket;
 pub mod webxr_web;

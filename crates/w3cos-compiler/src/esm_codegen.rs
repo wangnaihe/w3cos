@@ -5524,6 +5524,8 @@ export function wakeLockShape() {
     sentinel.addEventListener("release", () => { wakeLockLog += ":R"; });
     sentinel.release();
     wakeLockLog += ":" + sentinel.released;
+  }).catch((error) => {
+    wakeLockLog = error.name;
   });
   navigator.wakeLock.request("system").catch((error) => {
     wakeLockLog += ":" + error.name;
@@ -5671,6 +5673,8 @@ export function batteryShape() {
       battery.charging + ":" + battery.chargingTime + ":" +
       battery.dischargingTime + ":" + battery.level + ":" +
       typeof battery.addEventListener;
+  }).catch((error) => {
+    batteryLog = error.name;
   });
   return typeof BatteryManager + ":" + typeof navigator.getBattery + ":" + batteryLog;
 }
@@ -6514,6 +6518,8 @@ export function screenDetailsShape() {
       (details.currentScreen instanceof ScreenDetailed) + ":" +
       details.screens.length + ":" +
       (details.currentScreen.devicePixelRatio > 0);
+  }).catch((error) => {
+    screenDetailsLog += ":" + error.name;
   });
   return typeof Screen + ":" + typeof ScreenOrientation + ":" +
     typeof ScreenDetailed + ":" + typeof ScreenDetails + ":" +
@@ -7687,8 +7693,8 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getWakeLockLog(vec![]);
     assert!(
-        matches_js_string!(&r, s, s == "true:screen:false:R:true:NotSupportedError"),
-        "Screen Wake Lock request, release event and invalid-type lifecycle: {r:?}"
+        matches_js_string!(&r, s, s == "NotAllowedError:NotSupportedError"),
+        "Screen Wake Lock refuses without a grant and rejects the system type: {r:?}"
     );
     let r = m0::m0_badgingShape(vec![]);
     assert!(
@@ -7762,8 +7768,8 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getBatteryLog(vec![]);
     assert!(
-        matches_js_string!(&r, s, s == "true:true:0:Infinity:1:function"),
-        "BatteryManager default telemetry and EventTarget identity: {r:?}"
+        matches_js_string!(&r, s, s == "NotAllowedError"),
+        "Battery Status refuses without an explicit battery grant: {r:?}"
     );
     let r = m0::m0_credentialShape(vec![]);
     assert!(
@@ -8093,8 +8099,8 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getScreenDetailsLog(vec![]);
     assert!(
-        matches_js_string!(&r, s, s == "L:true:true:1:true"),
-        "ScreenDetails Promise snapshot and detailed screen identity: {r:?}"
+        matches_js_string!(&r, s, s == "L:NotAllowedError"),
+        "getScreenDetails refuses without a window-management grant: {r:?}"
     );
     let r = m0::m0_pressureShape(vec![]);
     assert!(
@@ -8305,8 +8311,8 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getMediaHostLog(vec![]);
     assert!(
-        matches_js_string!(&r, s, s == "TypeError:NotSupportedError:NotFoundError"),
-        "MediaDevices validates and explicitly rejects missing host adapters: {r:?}"
+        matches_js_string!(&r, s, s == "TypeError:NotAllowedError:NotFoundError"),
+        "MediaDevices validates video, refuses display capture without a grant, and rejects a missing audio output: {r:?}"
     );
     let r = m0::m0_workerShape(vec![]);
     assert!(

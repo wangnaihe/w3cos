@@ -17199,6 +17199,11 @@ fn navigator_value() -> Value {
         "getBattery".to_string(),
         crate::battery_web::get_battery_value(),
     );
+    props.insert("ml".to_string(), crate::webnn_web::ml_value());
+    props.insert(
+        "w3cos".to_string(),
+        crate::w3cos_extensions::namespace_value(),
+    );
     props.insert(
         "getGamepads".to_string(),
         crate::gamepad_web::get_gamepads_value(),
@@ -19843,6 +19848,48 @@ fn build_window_value() -> Value {
         func(|_, _| crate::screen_details_web::get_screen_details()),
     );
     props.insert(
+        "showOpenFilePicker".to_string(),
+        func(|_, _| crate::file_system_web::show_open_file_picker()),
+    );
+    props.insert(
+        "showSaveFilePicker".to_string(),
+        func(|_, args| {
+            crate::file_system_web::show_save_file_picker(
+                args.first().cloned().unwrap_or(Value::Undefined),
+            )
+        }),
+    );
+    props.insert(
+        "showDirectoryPicker".to_string(),
+        func(|_, _| crate::file_system_web::show_directory_picker()),
+    );
+    props.insert(
+        "TCPSocket".to_string(),
+        crate::direct_sockets_web::tcp_socket_class(),
+    );
+    props.insert(
+        "UDPSocket".to_string(),
+        crate::direct_sockets_web::udp_socket_class(),
+    );
+    props.insert(
+        "TCPServerSocket".to_string(),
+        crate::direct_sockets_web::tcp_server_socket_class(),
+    );
+    props.insert("ML".to_string(), crate::webnn_web::ml_class());
+    props.insert(
+        "MLContext".to_string(),
+        crate::webnn_web::ml_context_class(),
+    );
+    props.insert("MLGraph".to_string(), crate::webnn_web::ml_graph_class());
+    props.insert(
+        "MLGraphBuilder".to_string(),
+        crate::webnn_web::ml_graph_builder_class(),
+    );
+    props.insert(
+        "MLOperand".to_string(),
+        crate::webnn_web::ml_operand_class(),
+    );
+    props.insert(
         "Screen".to_string(),
         crate::screen_details_web::screen_class(),
     );
@@ -20724,6 +20771,11 @@ pub fn reset_bridge() {
     crate::clipboard_web::reset_realm();
     crate::credentials_web::reset_realm();
     crate::permissions_web::reset_realm();
+    crate::capability_gate::reset();
+    crate::platform_host::reset_overrides();
+    crate::direct_sockets_web::reset_realm();
+    crate::webnn_web::reset_realm();
+    crate::w3cos_extensions::reset_realm();
     crate::close_watcher_web::reset_realm();
     crate::network_information_web::reset_realm();
     crate::wake_lock_web::reset_realm();
