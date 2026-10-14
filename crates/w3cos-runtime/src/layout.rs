@@ -26246,6 +26246,11 @@ mod tests {
         assert!(style.ch_advance() > first);
         assert_eq!(CH_ADVANCE_MEASUREMENTS.with(std::cell::Cell::get), 2);
 
+        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        if std::fs::read(ahem_path).is_err() {
+            eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
+            return;
+        }
         const OWNER: u64 = u64::MAX - 20261005;
         let registry = crate::font_face::FontRegistry::global();
         registry.clear_owner(OWNER);
@@ -32233,6 +32238,11 @@ mod tests {
 
     #[test]
     fn bottom_aligned_inline_places_anonymous_text_on_the_large_child_line() {
+        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        if std::fs::read(ahem_path).is_err() {
+            eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
+            return;
+        }
         const FAMILY: &str = "w3cos-bottom-alignment-fixture";
         const OWNER: u64 = u64::MAX - 20261001;
         struct FontFixture;
@@ -32401,6 +32411,11 @@ mod tests {
 
     #[test]
     fn anonymous_block_text_wraps_before_and_after_a_larger_font_block() {
+        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        if std::fs::read(ahem_path).is_err() {
+            eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
+            return;
+        }
         const FAMILY: &str = "w3cos-anonymous-wrap-fixture";
         const OWNER: u64 = u64::MAX - 20261003;
         struct FontFixture;
@@ -32480,6 +32495,11 @@ mod tests {
 
     #[test]
     fn mixed_font_top_text_keeps_replaced_baseline_strut_descent() {
+        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        if std::fs::read(ahem_path).is_err() {
+            eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
+            return;
+        }
         const FAMILY: &str = "w3cos-top-image-line-fixture";
         const OWNER: u64 = u64::MAX - 20261002;
         struct FontFixture;

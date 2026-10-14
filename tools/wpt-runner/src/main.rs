@@ -99,7 +99,7 @@ mod font_fixture_tests {
             family: family.into(),
             path: PathBuf::from(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../../wpt/fonts/Ahem.ttf"
+                "/../../crates/w3cos-runtime/assets/Inter-Regular.ttf"
             )),
         }];
         let lookup = || {
