@@ -120,6 +120,9 @@ fn boot_session_once() {
 }
 
 fn on_shell_intent(code: u8, draft: &str) {
+    if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+        eprintln!("[W3C OS][INTENT] code={code} draft={draft:?}");
+    }
     ensure_shell_signals();
     if code == OP_TOGGLE_TASKS {
         let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);

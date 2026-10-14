@@ -5536,7 +5536,12 @@ impl App {
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     fn claim_desktop_text_focus(&self, window: &Window) {
         window.focus_window();
-        window.set_ime_allowed(true);
+        // XSetInputFocus is what lets Xvfb and xdotool reach this window.
+        // Turning on the XIM context filters those raw key events, and with
+        // no input method running they never come back as committed text.
+        // Set W3COS_IME=1 when a real input method should own the field.
+        let allow_ime = std::env::var_os("W3COS_IME").is_some();
+        window.set_ime_allowed(allow_ime);
         claim_x11_keyboard_focus(window);
     }
 
@@ -8430,6 +8435,9 @@ impl ApplicationHandler for App {
                                     return;
                                 }
                                 if let Some(ref text) = event.text {
+                                    if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                                        eprintln!("[W3C OS][IME] key text={text:?}");
+                                    }
                                     if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
                                         let next = if self.dom_mode {
                                             self.native_host_chain(focus_idx)
