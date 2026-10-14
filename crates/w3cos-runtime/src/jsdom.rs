@@ -117,12 +117,180 @@ fn initial_event_counts() -> HashMap<String, u64> {
 
 // ── Bridge state (all thread-local, matching the thread-local Document) ────
 
+/// Inline style cache keyed by an interned property name.
+struct StyleCache {
+    names: Vec<String>,
+    /// Built on first use. `None` keeps the thread-local initializer const.
+    ids: Option<HashMap<String, u32>>,
+    values: Option<HashMap<(u32, u32), String>>,
+}
+
+impl StyleCache {
+    fn ids(&mut self) -> &mut HashMap<String, u32> {
+        self.ids.get_or_insert_with(HashMap::new)
+    }
+
+    fn values(&mut self) -> &mut HashMap<(u32, u32), String> {
+        self.values.get_or_insert_with(HashMap::new)
+    }
+
+    fn prop_id(&mut self, name: &str) -> u32 {
+        if let Some(id) = self.ids.as_ref().and_then(|ids| ids.get(name).copied()) {
+            return id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(name.to_string());
+        let key = self.names[id as usize].clone();
+        self.ids().insert(key, id);
+        id
+    }
+
+    fn insert_value(&mut self, node: u32, property: &str, value: String) {
+        let id = self.prop_id(property);
+        self.values().insert((node, id), value);
+    }
+
+    fn get_value(&self, node: u32, property: &str) -> Option<String> {
+        let id = self.ids.as_ref()?.get(property).copied()?;
+        self.values.as_ref()?.get(&(node, id)).cloned()
+    }
+
+    fn contains(&self, node: u32, property: &str) -> bool {
+        let Some(id) = self.ids.as_ref().and_then(|ids| ids.get(property).copied()) else {
+            return false;
+        };
+        self.values
+            .as_ref()
+            .is_some_and(|values| values.contains_key(&(node, id)))
+    }
+
+    fn count_nonempty(&self, node: u32) -> usize {
+        self.values
+            .as_ref()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Non-empty declarations for `node`, sorted by property name.
+    fn nonempty_pairs(&self, node: u32) -> Vec<(String, String)> {
+        let Some(values) = self.values.as_ref() else {
+            return Vec::new();
+        };
+        let mut pairs = values
+            .iter()
+            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+            .map(|((_, id), value)| (self.names[*id as usize].clone(), value.clone()))
+            .collect::<Vec<_>>();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        pairs
+    }
+
+    fn retain_other_nodes(&mut self, node: u32) {
+        if let Some(values) = self.values.as_mut() {
+            values.retain(|(id, _), _| *id != node);
+        }
+    }
+
+    fn clear_entries(&mut self) {
+        self.values = None;
+    }
+}
+
 struct JsListener {
     node: u32,
     event_type: EventType,
     handler: Value,
     capture: bool,
     inline: bool,
+}
+
+/// Listeners grouped by `(node, event type)` so dispatch does not scan every
+/// handler on the page for each ancestor. The index stays in registration order.
+struct ListenerStore {
+    items: Vec<JsListener>,
+    /// Built on the first mutation. `None` keeps the thread-local initializer const.
+    index: Option<HashMap<(u32, EventType), Vec<u32>>>,
+    capture_count: u32,
+}
+
+impl ListenerStore {
+    const fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            index: None,
+            capture_count: 0,
+        }
+    }
+
+    fn push(&mut self, listener: JsListener) {
+        if listener.capture {
+            self.capture_count = self.capture_count.saturating_add(1);
+        }
+        let key = (listener.node, listener.event_type);
+        let idx = self.items.len() as u32;
+        self.index
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_default()
+            .push(idx);
+        self.items.push(listener);
+    }
+
+    fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
+        self.items.retain(|listener| pred(listener));
+        self.reindex();
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.index = None;
+        self.capture_count = 0;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &JsListener> {
+        self.items.iter()
+    }
+
+    fn has_capture(&self) -> bool {
+        self.capture_count > 0
+    }
+
+    fn handlers(&self, node: u32, event_type: EventType, capture: Option<bool>) -> Vec<Value> {
+        let Some(index) = self.index.as_ref() else {
+            return Vec::new();
+        };
+        let Some(idxs) = index.get(&(node, event_type)) else {
+            return Vec::new();
+        };
+        idxs.iter()
+            .filter_map(|&idx| {
+                let listener = &self.items[idx as usize];
+                capture
+                    .is_none_or(|flag| listener.capture == flag)
+                    .then(|| listener.handler.clone())
+            })
+            .collect()
+    }
+
+    fn reindex(&mut self) {
+        let mut index: HashMap<(u32, EventType), Vec<u32>> = HashMap::new();
+        self.capture_count = 0;
+        for (idx, listener) in self.items.iter().enumerate() {
+            if listener.capture {
+                self.capture_count = self.capture_count.saturating_add(1);
+            }
+            index
+                .entry((listener.node, listener.event_type))
+                .or_default()
+                .push(idx as u32);
+        }
+        self.index = Some(index);
+    }
 }
 
 struct JsTimer {
@@ -225,10 +393,17 @@ thread_local! {
     /// Repeated access through `attributes`, `getAttributeNode`, and
     /// `getAttributeNodeNS` must return the same JS object until it is removed.
     static ATTRIBUTE_VALUES: RefCell<HashMap<(u32, Option<String>, String), Value>> = RefCell::new(HashMap::new());
-    /// (node, kebab-prop) → raw CSS value cache. `CSSStyleDeclaration` drops
-    /// properties it does not know, so reads of e.g. `lineHeight` would
-    /// otherwise come back "".
-    static STYLE_CACHE: RefCell<HashMap<(u32, String), String>> = RefCell::new(HashMap::new());
+    /// (node, property id) → raw CSS value cache. Property names are interned
+    /// so a repeated `style.top` write does not allocate a new map key.
+    /// `CSSStyleDeclaration` drops properties it does not know, so reads of
+    /// e.g. `lineHeight` would otherwise come back "".
+    static STYLE_CACHE: RefCell<StyleCache> = const {
+        RefCell::new(StyleCache {
+            names: Vec::new(),
+            ids: None,
+            values: None,
+        })
+    };
     /// CSSStyleDeclaration object identity → element node. The AOT style
     /// setter reads this instead of entering the declaration proxy.
     static STYLE_OBJECT_NODES: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
@@ -239,7 +414,7 @@ thread_local! {
     static DISCRETE_CSS_TRANSITIONS: RefCell<Vec<DiscreteCssTransition>> = const { RefCell::new(Vec::new()) };
     /// JS event listener registry. Delivery for native events consults this
     /// at drain time; `dispatchEvent` consults it synchronously.
-    static LISTENERS: RefCell<Vec<JsListener>> = RefCell::new(Vec::new());
+    static LISTENERS: RefCell<ListenerStore> = RefCell::new(ListenerStore::new());
     /// (node, event_type) pairs that already have a native snapshot closure
     /// registered inside w3cos-dom's EventRegistry.
     static NATIVELY_REGISTERED: RefCell<HashSet<(u32, EventType)>> = RefCell::new(HashSet::new());
@@ -794,6 +969,15 @@ fn root_node_value(node: u32, composed: bool) -> Value {
     }
 }
 
+pub(crate) fn event_composed_path(target: u32, composed: bool) -> Value {
+    js_array(
+        shadow_event_chain(target, composed)
+            .into_iter()
+            .map(element_value)
+            .collect(),
+    )
+}
+
 fn shadow_event_chain(target: u32, composed: bool) -> Vec<u32> {
     let mut chain = vec![target];
     let mut current = target;
@@ -1327,7 +1511,7 @@ fn fast_set_style(object: &Value, name: &str, value: &Value) -> bool {
     }) else {
         return false;
     };
-    style_apply(node, &camel_to_kebab(name), &value.to_js_string());
+    style_apply(node, &style_property_name(name), &value.to_js_string());
     true
 }
 
@@ -1335,8 +1519,17 @@ fn fast_set_element_style(element: &Value, name: &str, value: &Value) -> bool {
     let Some(node) = node_id_of(element) else {
         return false;
     };
-    style_apply(node, &camel_to_kebab(name), &value.to_js_string());
+    style_apply(node, &style_property_name(name), &value.to_js_string());
     true
+}
+
+/// `top` / `height` stay borrowed. Camel-case names still allocate once.
+fn style_property_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().all(|byte| !byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(camel_to_kebab(name))
+    }
 }
 
 pub(crate) fn performance_now() -> f64 {
@@ -2744,7 +2937,7 @@ fn release_element_wrapper(node: u32) {
 fn purge_detached_node_js(node: u32) {
     ELEMENT_PROPS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
     KNOWN_EXPANDS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
-    STYLE_CACHE.with(|cache| cache.borrow_mut().retain(|(id, _), _| *id != node));
+    STYLE_CACHE.with(|cache| cache.borrow_mut().retain_other_nodes(node));
     LISTENERS.with(|listeners| {
         listeners
             .borrow_mut()
@@ -12004,13 +12197,13 @@ pub(crate) fn commit_css_motion_style(node: u32, pseudo: Option<&str>, property:
     STYLE_CACHE.with(|cache| {
         cache
             .borrow_mut()
-            .insert((node, property.to_string()), value.clone());
+            .insert_value(node, property, value.clone());
     });
     dom::set_style_property(node, property, &value);
 }
 
 fn style_read(node: u32, kebab: &str) -> String {
-    if let Some(v) = STYLE_CACHE.with(|c| c.borrow().get(&(node, kebab.to_string())).cloned()) {
+    if let Some(v) = STYLE_CACHE.with(|c| c.borrow().get_value(node, kebab)) {
         return v;
     }
     dom::with_document(|doc| {
@@ -12041,13 +12234,19 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
         tracks_discrete_motion.then(|| inline_computed_style_fallback(node, kebab));
     let tracks_motion = matches!(kebab, "left" | "transform");
     let before = tracks_motion.then(|| capture_transition_snapshots(node));
-    STYLE_CACHE.with(|c| {
-        c.borrow_mut()
-            .insert((node, kebab.to_string()), value.clone());
-    });
+    // Observers can read cssText while the attribute notification runs, so the
+    // cache is published first in that case. The common path moves the string
+    // in after the typed write and does not clone it.
+    let observers = !crate::observers_web::mutation_observers_empty();
+    if observers {
+        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value.clone()));
+    }
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, &value);
+    if !observers {
+        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value));
+    }
     if let Some(before) = discrete_before {
         start_discrete_css_transition(
             node,
@@ -12099,13 +12298,7 @@ fn css_easing(value: &str) -> w3cos_std::style::Easing {
 }
 
 fn cached_style_value(node: u32, property: &str) -> String {
-    STYLE_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .get(&(node, property.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    })
+    STYLE_CACHE.with(|cache| cache.borrow().get_value(node, property).unwrap_or_default())
 }
 
 fn start_discrete_css_transition(node: u32, property: &str, from: String, to: String) {
@@ -12243,18 +12436,11 @@ fn normalize_inline_style_property(property: &str, value: &str) -> Option<String
 
 fn style_css_text(node: u32) -> String {
     STYLE_CACHE.with(|c| {
-        let cache = c.borrow();
-        let mut pairs: Vec<(&String, &String)> = cache
-            .iter()
-            .filter(|((n, _), value)| *n == node && !value.is_empty())
-            .map(|((_, k), v)| (k, v))
-            .collect();
-        pairs.sort();
         let mut out = String::new();
-        for (k, v) in pairs {
-            out.push_str(k);
+        for (k, v) in c.borrow().nonempty_pairs(node) {
+            out.push_str(&k);
             out.push_str(": ");
-            out.push_str(v);
+            out.push_str(&v);
             out.push_str("; ");
         }
         out
@@ -12263,14 +12449,12 @@ fn style_css_text(node: u32) -> String {
 
 fn style_property_names(node: u32) -> Vec<String> {
     STYLE_CACHE.with(|cache| {
-        let mut names = cache
+        cache
             .borrow()
-            .iter()
-            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
-            .map(|((_, name), _)| name.clone())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
+            .nonempty_pairs(node)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     })
 }
 
@@ -12288,13 +12472,7 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
         if readonly {
             dom::computed_style_property(node, name)
         } else {
-            STYLE_CACHE.with(|cache| {
-                cache
-                    .borrow()
-                    .get(&(node, name.to_string()))
-                    .cloned()
-                    .unwrap_or_default()
-            })
+            STYLE_CACHE.with(|cache| cache.borrow().get_value(node, name).unwrap_or_default())
         }
     };
     let read_get = read;
@@ -12347,11 +12525,7 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                             dom::computed_style_property(node, &name)
                         } else {
                             STYLE_CACHE.with(|cache| {
-                                cache
-                                    .borrow()
-                                    .get(&(node, name.clone()))
-                                    .cloned()
-                                    .unwrap_or_default()
+                                cache.borrow().get_value(node, &name).unwrap_or_default()
                             })
                         });
                         match method {
@@ -12384,11 +12558,7 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                     dom::computed_style_property(node, &name)
                 } else {
                     STYLE_CACHE.with(|cache| {
-                        cache
-                            .borrow()
-                            .get(&(node, name.clone()))
-                            .cloned()
-                            .unwrap_or_default()
+                        cache.borrow().get_value(node, &name).unwrap_or_default()
                     })
                 };
                 callback.call(
@@ -12435,11 +12605,7 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let current = STYLE_CACHE.with(|cache| {
-                    cache
-                        .borrow()
-                        .get(&(node, name.clone()))
-                        .cloned()
-                        .unwrap_or_default()
+                    cache.borrow().get_value(node, &name).unwrap_or_default()
                 });
                 style_apply(
                     node,
@@ -12531,12 +12697,9 @@ fn style_value(node: u32) -> Value {
                     Value::string(&old)
                 }),
                 "cssText" => Value::string(&style_css_text(node)),
-                "length" => Value::Number(STYLE_CACHE.with(|c| {
-                    c.borrow()
-                        .iter()
-                        .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
-                        .count()
-                }) as f64),
+                "length" => Value::Number(
+                    STYLE_CACHE.with(|c| c.borrow().count_nonempty(node)) as f64
+                ),
                 // Magic w3cos-core convention keys must stay Undefined:
                 // returning "" (a non-undefined value) for `__w3cos_setter_*`
                 // makes `Value::set_property` "call" the empty string and
@@ -12554,8 +12717,7 @@ fn style_value(node: u32) -> Value {
             }
             let property = camel_to_kebab(key);
             css_property_supported(&property, "initial")
-                || STYLE_CACHE
-                    .with(|cache| cache.borrow().contains_key(&(node, property.to_string())))
+                || STYLE_CACHE.with(|cache| cache.borrow().contains(node, &property))
         })
         .set(move |_target, key, value, _receiver| {
             if bridge_realm_is_current(generation) {
@@ -13168,30 +13330,98 @@ fn dispatch_event_to_js(ev: Event) -> bool {
     dispatch_event_value_to_js(&ev, js_ev)
 }
 
+fn input_trace_enabled() -> bool {
+    thread_local! {
+        static TRACE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    TRACE.with(|cell| {
+        if let Some(value) = cell.get() {
+            return value;
+        }
+        let value = std::env::var_os("W3COS_INPUT_TRACE").is_some();
+        cell.set(Some(value));
+        value
+    })
+}
+
+fn trace_dispatched_event(ev: &Event, js_ev: &Value, target: u32, listener_calls: usize) {
+    if !input_trace_enabled() {
+        return;
+    }
+    if !matches!(
+        ev.event_type,
+        EventType::Focus
+            | EventType::Blur
+            | EventType::PointerDown
+            | EventType::PointerUp
+            | EventType::MouseDown
+            | EventType::MouseUp
+            | EventType::Click
+            | EventType::KeyDown
+            | EventType::KeyUp
+            | EventType::BeforeInput
+            | EventType::Input
+    ) {
+        return;
+    }
+    eprintln!(
+        "[W3C OS][DOM INPUT] target={target} type={} listeners={listener_calls} prevented={}",
+        event_type_name(ev.event_type),
+        js_ev.get_property("__pd").to_bool()
+    );
+}
+
 fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
-    if js_ev.get_property("isTrusted").to_bool() {
+    let trusted = js_ev.get_property("isTrusted").to_bool();
+    if trusted {
         record_event_count(&js_ev.get_property("type").to_js_string());
     }
-    let _activation = (js_ev.get_property("isTrusted").to_bool()
+    let _activation = (trusted
         && matches!(
             ev.event_type,
             EventType::KeyDown | EventType::MouseDown | EventType::PointerUp | EventType::TouchEnd
         ))
     .then(crate::user_activation_web::begin_transient_activation);
     let target = ev.target.as_u32();
-    let trace = std::env::var_os("W3COS_INPUT_TRACE").is_some();
     let mut listener_calls = 0usize;
-    // [target, parent, ..., root], crossing shadow boundaries only for
-    // composed events.
-    let chain = shadow_event_chain(target, ev.composed);
-    js_ev.set_property(
-        "__w3cos_path",
-        js_array(chain.iter().copied().map(element_value).collect()),
-    );
+    // The path array is built when composedPath() reads it. Dispatch only
+    // stores the target id so 400 clicks do not wrap every ancestor.
+    js_ev.set_property("__w3cos_target_id", Value::Number(target as f64));
 
     let target_value = element_value(target);
     js_ev.set_property("target", target_value.clone());
-    js_ev.set_property("srcElement", target_value);
+    js_ev.set_property("srcElement", target_value.clone());
+    let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
+        LISTENERS.with(|l| {
+            l.borrow()
+                .handlers(node_id, ev.event_type, capture_phase)
+        })
+    };
+    let has_capture = LISTENERS.with(|l| l.borrow().has_capture());
+    // A non-bubbling event with no capture listeners stays on the target.
+    // Ancestor wrappers and the propagation chain are not built.
+    if !has_capture && !ev.bubbles {
+        js_ev.set_property("currentTarget", target_value.clone());
+        js_ev.set_property("eventPhase", Value::Number(2.0));
+        if !js_ev.get_property("__sp").to_bool() {
+            for h in snapshot_listeners(target, None) {
+                listener_calls += 1;
+                h.call(Value::Undefined, vec![js_ev.clone()]);
+                if js_ev.get_property("__sip").to_bool() {
+                    break;
+                }
+            }
+        }
+        js_ev.set_property("eventPhase", Value::Number(0.0));
+        js_ev.set_property("target", target_value.clone());
+        js_ev.set_property("srcElement", target_value);
+        trace_dispatched_event(ev, &js_ev, target, listener_calls);
+        return !js_ev.get_property("__pd").to_bool();
+    }
+
+    // [target, parent, ..., root], crossing shadow boundaries only for
+    // composed events.
+    let chain = shadow_event_chain(target, ev.composed);
     let stopped = |v: &Value| v.get_property("__sp").to_bool();
     let immediate = |v: &Value| v.get_property("__sip").to_bool();
     let set_current_target = |event: &Value, id: u32, phase: f64| {
@@ -13201,31 +13431,24 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
         event.set_property("eventPhase", Value::Number(phase));
     };
 
-    let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
-        LISTENERS.with(|l| {
-            l.borrow()
-                .iter()
-                .filter(|jl| {
-                    jl.node == node_id
-                        && jl.event_type == ev.event_type
-                        && capture_phase.is_none_or(|cp| jl.capture == cp)
-                })
-                .map(|jl| jl.handler.clone())
-                .collect()
-        })
-    };
-
-    // Phase 1: capture, root → parent (skip target).
-    for &id in chain.iter().rev().skip(1) {
-        if stopped(&js_ev) {
-            break;
-        }
-        set_current_target(&js_ev, id, 1.0);
-        for h in snapshot_listeners(id, Some(true)) {
-            listener_calls += 1;
-            h.call(Value::Undefined, vec![js_ev.clone()]);
-            if immediate(&js_ev) {
+    // Phase 1: capture, root → parent (skip target). Ancestors with no
+    // capture listeners are not wrapped.
+    if has_capture {
+        for &id in chain.iter().rev().skip(1) {
+            if stopped(&js_ev) {
                 break;
+            }
+            let handlers = snapshot_listeners(id, Some(true));
+            if handlers.is_empty() {
+                continue;
+            }
+            set_current_target(&js_ev, id, 1.0);
+            for h in handlers {
+                listener_calls += 1;
+                h.call(Value::Undefined, vec![js_ev.clone()]);
+                if immediate(&js_ev) {
+                    break;
+                }
             }
         }
     }
@@ -13248,8 +13471,12 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
             if stopped(&js_ev) {
                 break;
             }
+            let handlers = snapshot_listeners(id, Some(false));
+            if handlers.is_empty() {
+                continue;
+            }
             set_current_target(&js_ev, id, 3.0);
-            for h in snapshot_listeners(id, Some(false)) {
+            for h in handlers {
                 listener_calls += 1;
                 h.call(Value::Undefined, vec![js_ev.clone()]);
                 if immediate(&js_ev) {
@@ -13260,30 +13487,9 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     }
 
     js_ev.set_property("eventPhase", Value::Number(0.0));
-    js_ev.set_property("target", element_value(target));
-    js_ev.set_property("srcElement", element_value(target));
-    if trace
-        && matches!(
-            ev.event_type,
-            EventType::Focus
-                | EventType::Blur
-                | EventType::PointerDown
-                | EventType::PointerUp
-                | EventType::MouseDown
-                | EventType::MouseUp
-                | EventType::Click
-                | EventType::KeyDown
-                | EventType::KeyUp
-                | EventType::BeforeInput
-                | EventType::Input
-        )
-    {
-        eprintln!(
-            "[W3C OS][DOM INPUT] target={target} type={} listeners={listener_calls} prevented={}",
-            event_type_name(ev.event_type),
-            js_ev.get_property("__pd").to_bool()
-        );
-    }
+    js_ev.set_property("target", target_value.clone());
+    js_ev.set_property("srcElement", target_value);
+    trace_dispatched_event(ev, &js_ev, target, listener_calls);
     !js_ev.get_property("__pd").to_bool()
 }
 
@@ -14181,6 +14387,16 @@ pub(crate) fn dispatch_native_input(
 /// `element.dispatchEvent(eventValue)` — reads `.type` (and `.detail`,
 /// `.bubbles`) from the given object and dispatches synchronously.
 fn install_compat_event_controls(event: &Value) {
+    // `new Event` already wrote the flags, and the methods live on
+    // `Event.prototype`. Skip the per-dispatch prototype walks in that case.
+    if !event.get_property("__pd").is_undefined()
+        && event.get_property("preventDefault").is_function()
+        && !event
+            .get_property("__w3cos_getter_defaultPrevented")
+            .is_undefined()
+    {
+        return;
+    }
     for (name, default) in [
         ("__pd", Value::Bool(false)),
         ("__sp", Value::Bool(false)),
@@ -14247,6 +14463,22 @@ fn install_compat_event_controls(event: &Value) {
     }
 }
 
+fn event_was_canceled(event_val: &Value) -> bool {
+    let own_default_prevented = event_val
+        .as_object()
+        .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"));
+    if own_default_prevented {
+        return event_val.get_property("defaultPrevented").to_bool();
+    }
+    if !event_val
+        .get_property("__w3cos_getter_defaultPrevented")
+        .is_undefined()
+    {
+        return event_val.get_property("__pd").to_bool();
+    }
+    event_val.get_property("defaultPrevented").to_bool()
+}
+
 fn js_dispatch_event(node: u32, event_val: Value) -> bool {
     let type_name = event_val.get_property("type").to_js_string();
     if type_name.is_empty() || type_name == "undefined" {
@@ -14276,7 +14508,7 @@ fn js_dispatch_event(node: u32, event_val: Value) -> bool {
     if !composed.is_undefined() {
         ev.composed = composed.to_bool();
     }
-    let was_canceled = event_val.get_property("defaultPrevented").to_bool();
+    let was_canceled = event_was_canceled(&event_val);
     let dispatched = dispatch_event_value_to_js(&ev, event_val.clone());
     if !dispatched {
         event_val.set_property("__pd", Value::Bool(true));
@@ -14300,20 +14532,15 @@ fn deliver_pending_events() -> usize {
         });
         let Some(ev) = ev else { break };
         let listeners: Vec<Value> = LISTENERS.with(|l| {
+            let capture = match ev.event_phase {
+                w3cos_dom::events::EventPhase::Capturing => Some(true),
+                w3cos_dom::events::EventPhase::Bubbling | w3cos_dom::events::EventPhase::None => {
+                    Some(false)
+                }
+                w3cos_dom::events::EventPhase::AtTarget => None,
+            };
             l.borrow()
-                .iter()
-                .filter(|jl| {
-                    jl.node == ev.current_target.as_u32()
-                        && jl.event_type == ev.event_type
-                        && match ev.event_phase {
-                            w3cos_dom::events::EventPhase::Capturing => jl.capture,
-                            w3cos_dom::events::EventPhase::Bubbling
-                            | w3cos_dom::events::EventPhase::None => !jl.capture,
-                            w3cos_dom::events::EventPhase::AtTarget => true,
-                        }
-                })
-                .map(|jl| jl.handler.clone())
-                .collect()
+                .handlers(ev.current_target.as_u32(), ev.event_type, capture)
         });
         if listeners.is_empty() {
             continue;
@@ -20684,7 +20911,7 @@ pub fn reset_bridge() {
     ATTRIBUTE_VALUES.with(|cache| cache.borrow_mut().clear());
     SELECTOR_ID_CACHE.with(|cache| cache.borrow_mut().clear());
     SELECTOR_ID_CACHE_GENERATION.with(|generation| generation.set(0));
-    STYLE_CACHE.with(|c| c.borrow_mut().clear());
+    STYLE_CACHE.with(|c| c.borrow_mut().clear_entries());
     STYLE_OBJECT_NODES.with(|nodes| nodes.borrow_mut().clear());
     HTML_CREATE_ELEMENT_FOLD.with(|fold| fold.set(None));
     CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
@@ -25243,6 +25470,89 @@ try {
             8.0
         );
         assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+    }
+
+    #[test]
+    fn column_flex_fixed_rows_sum_offset_height() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("display", Value::string("flex"));
+        root_style.set_property("flexDirection", Value::string("column"));
+        for i in 0..8 {
+            let row = document.call_method("createElement", vec![Value::string("div")]);
+            row.set_property("textContent", Value::string(&format!("f {i}")));
+            let style = row.get_property("style");
+            style.set_property("height", Value::string("18px"));
+            style.set_property("flex", Value::string("0 0 auto"));
+            root.call_method("appendChild", vec![row]);
+        }
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            8.0
+        );
+        assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+    }
+
+    #[test]
+    fn overflow_and_absolute_layer_keep_definite_border_boxes() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let scroller = create_in_body("div");
+        let scroller_style = scroller.get_property("style");
+        scroller_style.set_property("width", Value::string("400px"));
+        scroller_style.set_property("height", Value::string("300px"));
+        scroller_style.set_property("overflow", Value::string("auto"));
+        for i in 0..12 {
+            let row = document.call_method("createElement", vec![Value::string("div")]);
+            row.set_property("textContent", Value::string(&format!("row {i}")));
+            row.get_property("style")
+                .set_property("height", Value::string("28px"));
+            scroller.call_method("appendChild", vec![row]);
+        }
+        let layer = create_in_body("div");
+        let layer_style = layer.get_property("style");
+        layer_style.set_property("position", Value::string("relative"));
+        layer_style.set_property("width", Value::string("400px"));
+        layer_style.set_property("height", Value::string("200px"));
+        let box_el = document.call_method("createElement", vec![Value::string("div")]);
+        let box_style = box_el.get_property("style");
+        box_style.set_property("position", Value::string("absolute"));
+        box_style.set_property("width", Value::string("16px"));
+        box_style.set_property("height", Value::string("16px"));
+        box_style.set_property("left", Value::string("20px"));
+        box_style.set_property("top", Value::string("0px"));
+        layer.call_method("appendChild", vec![box_el.clone()]);
+        assert_eq!(scroller.get_property("offsetHeight").to_number(), 300.0);
+        assert_eq!(layer.get_property("offsetHeight").to_number(), 200.0);
+        assert_eq!(scroller.get_property("scrollHeight").to_number(), 336.0);
+        box_style.set_property("top", Value::string("40px"));
+        assert_eq!(layer.get_property("offsetHeight").to_number(), 200.0);
+        assert_eq!(scroller.get_property("offsetHeight").to_number(), 300.0);
+        let layer_top = layer
+            .call_method("getBoundingClientRect", vec![])
+            .get_property("top")
+            .to_number();
+        let box_top = box_el
+            .call_method("getBoundingClientRect", vec![])
+            .get_property("top")
+            .to_number();
+        assert_eq!(box_top - layer_top, 40.0);
     }
 
     #[test]

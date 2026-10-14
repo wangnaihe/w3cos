@@ -404,6 +404,14 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
 /// Known non-inherited properties. Everything else, including custom
 /// properties and `font`/`color`, still restyles the descendant subtree.
 fn inline_style_change_is_local(prop: &str) -> bool {
+    // The frame loop writes these names already in kebab case.
+    if matches!(
+        prop,
+        "top" | "right" | "bottom" | "left" | "width" | "height" | "flex" | "display"
+            | "position" | "overflow" | "margin" | "padding"
+    ) {
+        return true;
+    }
     let prop = prop.trim().to_ascii_lowercase();
     if prop.starts_with("--") || prop == "all" {
         return false;

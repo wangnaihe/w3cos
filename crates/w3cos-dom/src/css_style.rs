@@ -77,7 +77,48 @@ impl CSSStyleDeclaration {
         }
     }
 
+    /// Replace an existing `top`/`right`/`bottom`/`left` px declaration without
+    /// scanning shorthand validity. The first write still takes the full parser.
+    /// A value that is not a finite px length, or a duplicate name, falls through.
+    fn replace_existing_inset(&mut self, name: &str, value: &str) -> bool {
+        if value.contains('!') || !matches!(name, "top" | "right" | "bottom" | "left") {
+            return false;
+        }
+        let mut found = None;
+        for (index, (existing, _)) in self.inline_declarations.iter().enumerate() {
+            if existing != name {
+                continue;
+            }
+            if found.is_some() {
+                return false;
+            }
+            found = Some(index);
+        }
+        let Some(index) = found else {
+            return false;
+        };
+        let Some(Dimension::Px(px)) = parse_dimension_checked(value) else {
+            return false;
+        };
+        if !px.is_finite() {
+            return false;
+        }
+        self.inline_declarations[index].1.clear();
+        self.inline_declarations[index].1.push_str(value);
+        match name {
+            "top" => self.inner.top = Dimension::Px(px),
+            "right" => self.inner.right = Dimension::Px(px),
+            "bottom" => self.inner.bottom = Dimension::Px(px),
+            "left" => self.inner.left = Dimension::Px(px),
+            _ => return false,
+        }
+        true
+    }
+
     pub fn set_property(&mut self, name: &str, value: &str) {
+        if self.replace_existing_inset(name, value) {
+            return;
+        }
         let raw_value = value;
         let (parsed_value, important) = crate::stylesheet::declaration_value_and_importance(value);
         let value = if important { parsed_value } else { value };

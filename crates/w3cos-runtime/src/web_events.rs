@@ -274,17 +274,20 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
         };
         this.set_property("detail", detail);
     }
+}
 
+/// Methods and phase constants live on `Event.prototype`. `new Event` then
+/// only writes the per-instance slots.
+fn install_event_prototype(prototype: &Value) {
     for (name, value) in [
         ("NONE", 0.0),
         ("CAPTURING_PHASE", 1.0),
         ("AT_TARGET", 2.0),
         ("BUBBLING_PHASE", 3.0),
     ] {
-        this.set_property(name, Value::Number(value));
+        prototype.set_property(name, Value::Number(value));
     }
-
-    this.set_property(
+    prototype.set_property(
         "preventDefault",
         realm_event_function(|this, _| {
             if this.get_property("cancelable").to_bool() {
@@ -294,14 +297,14 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "stopPropagation",
         realm_event_function(|this, _| {
             this.set_property("__sp", Value::Bool(true));
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "stopImmediatePropagation",
         realm_event_function(|this, _| {
             this.set_property("__sp", Value::Bool(true));
@@ -309,12 +312,22 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "composedPath",
         realm_event_function(|this, _| {
             let path = this.get_property("__w3cos_path");
             if !path.is_undefined() {
                 return path;
+            }
+            let id = this.get_property("__w3cos_target_id");
+            if !id.is_undefined() && !id.is_nullish() {
+                let node = id.to_number();
+                if node.is_finite() && node >= 0.0 {
+                    return crate::jsdom::event_composed_path(
+                        node as u32,
+                        this.get_property("composed").to_bool(),
+                    );
+                }
             }
             let target = this.get_property("target");
             if target.is_nullish() {
@@ -324,7 +337,7 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
             }
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "initEvent",
         realm_event_function(|this, args| {
             this.set_property("type", Value::string(&arg(&args, 0).to_js_string()));
@@ -337,15 +350,15 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
             Value::Undefined
         }),
     );
-    this.set_property(
+    prototype.set_property(
         "__w3cos_getter_defaultPrevented",
         realm_event_function(|this, _| this.get_property("__pd")),
     );
-    this.set_property(
+    prototype.set_property(
         "__w3cos_getter_cancelBubble",
         realm_event_function(|this, _| this.get_property("__sp")),
     );
-    this.set_property(
+    prototype.set_property(
         "__w3cos_setter_cancelBubble",
         realm_event_function(|this, args| {
             if arg(&args, 0).to_bool() {
@@ -1225,24 +1238,12 @@ fn make_event_constructor(custom: bool) -> Value {
     } else {
         install_prototype_members(
             &prototype,
+            &[],
             &[
-                "composedPath",
-                "initEvent",
-                "preventDefault",
-                "stopImmediatePropagation",
-                "stopPropagation",
-            ],
-            &[
-                "AT_TARGET",
-                "BUBBLING_PHASE",
-                "CAPTURING_PHASE",
-                "NONE",
                 "bubbles",
-                "cancelBubble",
                 "cancelable",
                 "composed",
                 "currentTarget",
-                "defaultPrevented",
                 "eventPhase",
                 "returnValue",
                 "srcElement",
@@ -1251,6 +1252,7 @@ fn make_event_constructor(custom: bool) -> Value {
                 "type",
             ],
         );
+        install_event_prototype(&prototype);
     }
     constructor.set_property("prototype", prototype);
     for (name, value) in [
