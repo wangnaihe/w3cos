@@ -31,7 +31,9 @@ pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
 pub use reactive::{Computed, Effect, Signal, batch, watch};
 pub use value::{
-    AotCaptureMap, AotFactory, ArrayStorage, Completion, FunctionData, Immediate, JsArrayRef,
-    JsFunction, JsObjectRef, PanicValue, Value, WeakJsObject, catch_js, catch_js_result,
-    js_string_from_utf16_units, js_string_utf16_units, throw_value, type_of, unwrap_or_throw,
+    AotCapture, AotCaptureMap, AotFactory, ArrayStorage, Completion, FunctionData, Immediate,
+    JsArrayRef, JsFunction, JsObjectRef, PanicValue, Value, WeakJsObject, catch_js,
+    catch_js_result, fast_collection_get, install_fast_collection_get, install_fast_dom_dispatch,
+    install_length_write_hook, js_string_from_utf16_units, js_string_utf16_units, throw_value,
+    type_of, unwrap_or_throw,
 };

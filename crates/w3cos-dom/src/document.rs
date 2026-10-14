@@ -15,6 +15,20 @@ use crate::selection::{Range, Selection};
 use crate::stylesheet;
 use crate::user_agent;
 
+thread_local! {
+    static STRUCTURE_TICK: Cell<u64> = const { Cell::new(1) };
+}
+
+/// Monotonic tree-shape counter. Readers can invalidate a child-id cache
+/// without borrowing the document. Direct `append_child` bumps it too.
+pub fn structure_tick() -> u64 {
+    STRUCTURE_TICK.with(Cell::get)
+}
+
+pub fn bump_structure_tick() {
+    STRUCTURE_TICK.with(|tick| tick.set(tick.get().wrapping_add(1)));
+}
+
 #[derive(Clone, Default)]
 struct CounterSnapshot {
     scopes: Vec<HashMap<String, i32>>,
@@ -1459,6 +1473,7 @@ impl Document {
     pub fn note_structure_change(&mut self) {
         self.structure_generation = self.structure_generation.wrapping_add(1);
         self.cascade_generation = self.cascade_generation.wrapping_add(1);
+        bump_structure_tick();
     }
 
     /// Inherited or selector-matched styles may have changed below `id`.

@@ -118,7 +118,20 @@ pub fn negate(value: &Value) -> Value {
 }
 
 pub fn get_property(object: &Value, key: &Value) -> Value {
+    if let Some(index) = canonical_number_index(key)
+        && let Some(value) = crate::fast_collection_get(object, Some(index))
+    {
+        return value;
+    }
     object.get_property(&key.to_js_string())
+}
+
+fn canonical_number_index(key: &Value) -> Option<usize> {
+    let n = key.as_number()?;
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n >= u32::MAX as f64 {
+        return None;
+    }
+    Some(n as usize)
 }
 
 pub fn get_property_checked(object: &Value, key: &Value) -> Value {

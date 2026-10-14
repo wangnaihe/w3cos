@@ -68,6 +68,7 @@ pub fn clear_document_dirty() {
 pub fn reset_document() {
     DOCUMENT.with(|d| *d.borrow_mut() = new_host_document());
     DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
+    w3cos_dom::document::bump_structure_tick();
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
     crate::incremental_layout::invalidate();

@@ -277,6 +277,36 @@ impl ListenerStore {
             .collect()
     }
 
+    /// Copy matching handlers into `out` and return how many matched.
+    /// A single click listener stays on the stack; a longer list falls
+    /// back to [`Self::handlers`].
+    fn copy_handlers(
+        &self,
+        node: u32,
+        event_type: EventType,
+        capture: Option<bool>,
+        out: &mut [Option<Value>],
+    ) -> usize {
+        let Some(index) = self.index.as_ref() else {
+            return 0;
+        };
+        let Some(idxs) = index.get(&(node, event_type)) else {
+            return 0;
+        };
+        let mut total = 0usize;
+        for &idx in idxs {
+            let listener = &self.items[idx as usize];
+            if !capture.is_none_or(|flag| listener.capture == flag) {
+                continue;
+            }
+            if total < out.len() {
+                out[total] = Some(listener.handler.clone());
+            }
+            total += 1;
+        }
+        total
+    }
+
     fn reindex(&mut self) {
         let mut index: HashMap<(u32, EventType), Vec<u32>> = HashMap::new();
         self.capture_count = 0;
@@ -889,6 +919,9 @@ fn get_expando(node: u32, key: &str) -> Option<Value> {
 }
 
 fn set_expando(node: u32, key: &str, value: Value) {
+    if key == "dispatchEvent" {
+        note_dispatch_override();
+    }
     if key == "ownerDocument" && is_default_document(&value) {
         return;
     }
@@ -1108,6 +1141,9 @@ fn dom_handle(node: u32) -> Value {
 }
 
 fn dom_imm_get(node: u32, key: &str) -> Value {
+    if key == "dispatchEvent" {
+        return element_dispatch_method(node);
+    }
     if matches!(key, "__proto__" | "constructor") {
         return dom_imm_materialize(node).get_property(key);
     }
@@ -1136,6 +1172,9 @@ fn dom_imm_get(node: u32, key: &str) -> Value {
 }
 
 fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
+    if key == "dispatchEvent" {
+        note_dispatch_override();
+    }
     if key == "__proto__" {
         return dom_imm_materialize(node).try_set_property(key, value);
     }
@@ -1211,7 +1250,111 @@ fn dom_node_of(value: &Value) -> Option<u32> {
     node_id_of(value)
 }
 
+fn try_fast_dom_dispatch(node: u32, event: &Value) -> Option<bool> {
+    if DISPATCH_OVERRIDE.with(Cell::get) {
+        return None;
+    }
+    Some(js_dispatch_event(node, event.clone()))
+}
+
+fn note_collection_length_write(value: &Value) {
+    let Some(bits) = value.object_identity_bits() else {
+        return;
+    };
+    let relevant = COLLECTION_ROOTS.with(|roots| {
+        let roots = roots.borrow();
+        if roots.is_empty() {
+            return false;
+        }
+        // Own length on a live list, or length on a prototype those lists share.
+        // Unrelated `length` writes (functions, arrays) miss and stay off the
+        // read path. An empty shadow set keeps `childNodes.length` O(1).
+        roots.contains_key(&bits)
+            || roots
+                .values()
+                .any(|(_, collection)| prototype_chain_contains(collection, bits))
+    });
+    if relevant {
+        LENGTH_SHADOWS.with(|shadows| shadows.borrow_mut().insert(bits));
+    }
+}
+
+fn collection_length_shadowed(value: &Value) -> bool {
+    LENGTH_SHADOWS.with(|shadows| {
+        let shadows = shadows.borrow();
+        if shadows.is_empty() {
+            return false;
+        }
+        let mut current = value.clone();
+        for _ in 0..16 {
+            let Some(bits) = current.object_identity_bits() else {
+                return false;
+            };
+            if shadows.contains(&bits) {
+                return true;
+            }
+            let Some(object) = current.as_object() else {
+                return false;
+            };
+            let prototype = object.borrow().get_prototype_of();
+            if prototype.is_nullish() {
+                return false;
+            }
+            current = prototype;
+        }
+        false
+    })
+}
+
+fn prototype_chain_contains(value: &Value, bits: u64) -> bool {
+    let mut current = value.clone();
+    for _ in 0..16 {
+        let Some(object) = current.as_object() else {
+            return false;
+        };
+        let prototype = object.borrow().get_prototype_of();
+        if prototype.object_identity_bits() == Some(bits) {
+            return true;
+        }
+        if prototype.is_nullish() {
+            return false;
+        }
+        current = prototype;
+    }
+    false
+}
+
+fn try_fast_collection(value: &Value, index: Option<usize>) -> Option<Value> {
+    let bits = value.object_identity_bits()?;
+    let root = COLLECTION_ROOTS.with(|roots| roots.borrow().get(&bits).map(|(root, _)| *root))?;
+    if !bridge_realm_is_current(realm_generation()) {
+        return Some(Value::Undefined);
+    }
+    match index {
+        None if collection_length_shadowed(value) => None,
+        None => Some(Value::Number(child_node_count(root) as f64)),
+        Some(index) => {
+            ensure_dom_fast();
+            Some(
+                child_node_at(root, index)
+                    .map(|id| Value::dom_node(id, realm_generation()))
+                    .unwrap_or(Value::Undefined),
+            )
+        }
+    }
+}
+
+fn register_child_collection(value: &Value, root: u32) {
+    let Some(bits) = value.object_identity_bits() else {
+        return;
+    };
+    COLLECTION_ROOTS.with(|roots| roots.borrow_mut().insert(bits, (root, value.clone())));
+}
+
 fn ensure_dom_fast() {
+    let _ = w3cos_core::install_fast_collection_get(try_fast_collection);
+    let _ = w3cos_core::install_length_write_hook(note_collection_length_write);
+    let _ = w3cos_core::install_fast_dom_dispatch(try_fast_dom_dispatch);
     w3cos_core::intrinsics::install_dom_fast(w3cos_core::intrinsics::DomFast {
         create_element: fast_create_element,
         create_text: fast_create_text,
@@ -1710,7 +1853,10 @@ fn collection_value(
                     items.get(index).cloned().unwrap_or(Value::Undefined)
                 } else if let Some(node) = child_nodes_root {
                     child_node_at(node, index)
-                        .map(element_value)
+                        .map(|id| {
+                            ensure_dom_fast();
+                            Value::dom_node(id, generation)
+                        })
                         .unwrap_or(Value::Undefined)
                 } else {
                     get_provider()
@@ -1838,6 +1984,9 @@ fn collection_value(
         &value,
         &dom_collection_class(class_name).get_property("prototype"),
     );
+    if let Some(root) = child_nodes_root {
+        register_child_collection(&value, root);
+    }
     value
 }
 
@@ -1869,33 +2018,61 @@ fn element_or_null(node: Option<u32>) -> Value {
     }
 }
 
-// Read the current sibling chain without allocating a full child snapshot or
-// materializing unrelated JS wrappers. Returning the ID releases the document
-// borrow before element_value builds or retrieves the selected wrapper.
-fn child_node_at(node: u32, index: usize) -> Option<u32> {
-    dom::with_document(|document| {
-        let mut child = document.get_node(NodeId::from_u32(node)).first_child;
-        let mut remaining = index;
+// Child ids for one parent, invalidated by `structure_generation`. Indexed
+// `childNodes[n]` on a stable parent is then O(1) instead of a sibling walk.
+thread_local! {
+    static CHILD_INDEX: RefCell<Option<(u32, u64, Vec<u32>)>> = const { RefCell::new(None) };
+    static COLLECTION_ROOTS: RefCell<HashMap<u64, (u32, Value)>> = RefCell::new(HashMap::new());
+    static LENGTH_SHADOWS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+fn ensure_child_index(parent: u32) {
+    // Direct document mutations bump this counter inside `note_structure_change`,
+    // so a cache hit does not borrow the document.
+    let generation = w3cos_dom::document::structure_tick();
+    let fresh = CHILD_INDEX.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|(node, cached_generation, _)| {
+                *node == parent && *cached_generation == generation
+            })
+    });
+    if fresh {
+        return;
+    }
+    let ids = dom::with_document(|document| {
+        let mut ids = Vec::new();
+        let mut child = document.get_node(NodeId::from_u32(parent)).first_child;
         while let Some(id) = child {
-            if remaining == 0 {
-                return Some(id.as_u32());
-            }
-            remaining -= 1;
+            ids.push(id.as_u32());
             child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
         }
-        None
+        ids
+    });
+    CHILD_INDEX.with(|cache| {
+        *cache.borrow_mut() = Some((parent, generation, ids));
+    });
+}
+
+fn child_node_at(node: u32, index: usize) -> Option<u32> {
+    ensure_child_index(node);
+    CHILD_INDEX.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|(_, _, ids)| ids.get(index).copied())
     })
 }
 
 fn child_node_count(node: u32) -> usize {
-    dom::with_document(|document| {
-        let mut child = document.get_node(NodeId::from_u32(node)).first_child;
-        let mut count = 0;
-        while let Some(id) = child {
-            count += 1;
-            child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
-        }
-        count
+    ensure_child_index(node);
+    CHILD_INDEX.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .map(|(_, _, ids)| ids.len())
+            .unwrap_or(0)
     })
 }
 
@@ -3657,6 +3834,56 @@ fn shared_element_proxy() -> w3cos_core::ProxyHandler {
     })
 }
 
+thread_local! {
+    static DISPATCH_METHOD: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static DISPATCH_OVERRIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn note_dispatch_override() {
+    DISPATCH_OVERRIDE.with(|flag| flag.set(true));
+}
+
+/// One `dispatchEvent` function for every element. The receiver carries the
+/// node, so a property get does not allocate a closure per lookup.
+fn element_dispatch_method(node: u32) -> Value {
+    if DISPATCH_OVERRIDE.with(Cell::get) {
+        if get_expando(node, "dispatchEvent").is_some() {
+            return element_value(node).get_property("dispatchEvent");
+        }
+        if let Some(wrapper) = memoized_element(node) {
+            let own_override = wrapper.as_object().is_some_and(|object| {
+                let object = object.borrow();
+                object.own_getter("dispatchEvent").is_some()
+                    || object.has_own_property("dispatchEvent")
+            });
+            if own_override {
+                return wrapper.get_property("dispatchEvent");
+            }
+        }
+        let inherited = inherited_prototype_value(node, "dispatchEvent");
+        if inherited.is_callable() {
+            return inherited;
+        }
+    }
+    shared_dispatch_event()
+}
+
+fn shared_dispatch_event() -> Value {
+    DISPATCH_METHOD.with(|slot| {
+        if let Some(method) = slot.borrow().clone() {
+            return method;
+        }
+        let method = func(|this, args| {
+            let Some(node) = node_id_of(&this) else {
+                return Value::Bool(true);
+            };
+            Value::Bool(js_dispatch_event(node, arg(&args, 0)))
+        });
+        *slot.borrow_mut() = Some(method.clone());
+        method
+    })
+}
+
 fn build_element_proxy() -> w3cos_core::ProxyHandler {
     ProxyBuilder::new()
         .live_target()
@@ -3680,6 +3907,13 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             };
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
+            }
+            if key == "dispatchEvent"
+                && own_getter.is_none()
+                && stored.is_undefined()
+                && !DISPATCH_OVERRIDE.with(Cell::get)
+            {
+                return element_dispatch_method(node);
             }
             if dom::tag_name(node) == "object" {
                 if key == "contentDocument" {
@@ -3723,6 +3957,9 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
                 (generation, node)
             };
             if bridge_realm_is_current(generation) {
+                if key == "dispatchEvent" {
+                    note_dispatch_override();
+                }
                 element_computed_set(node, key, value)
             } else {
                 // The old Realm is already gone. Accept the write as an inert
@@ -13366,10 +13603,64 @@ fn trace_dispatched_event(ev: &Event, js_ev: &Value, target: u32, listener_calls
     );
 }
 
+fn invoke_phase_listeners(
+    node: u32,
+    event_type: EventType,
+    capture: Option<bool>,
+    js_ev: &Value,
+    slotted: bool,
+) -> usize {
+    let mut inline = [None, None, None, None];
+    let total = LISTENERS.with(|listeners| {
+        listeners
+            .borrow()
+            .copy_handlers(node, event_type, capture, &mut inline)
+    });
+    let mut calls = 0usize;
+    let stopped_immediate = |handler: &Value| {
+        handler.call_slice(Value::Undefined, std::slice::from_ref(js_ev));
+        if slotted {
+            crate::web_events::event_stopped_immediate(js_ev)
+        } else {
+            js_ev.get_property("__sip").to_bool()
+        }
+    };
+    if total <= inline.len() {
+        for handler in inline.iter().take(total).flatten() {
+            calls += 1;
+            if stopped_immediate(handler) {
+                break;
+            }
+        }
+        return calls;
+    }
+    for handler in
+        LISTENERS.with(|listeners| listeners.borrow().handlers(node, event_type, capture))
+    {
+        calls += 1;
+        if stopped_immediate(&handler) {
+            break;
+        }
+    }
+    calls
+}
+
 fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
-    let trusted = js_ev.get_property("isTrusted").to_bool();
+    let slotted = crate::web_events::has_event_slot(&js_ev);
+    let trusted = if slotted {
+        crate::web_events::event_slot_trusted(&js_ev).unwrap_or(false)
+    } else {
+        js_ev.get_property("isTrusted").to_bool()
+    };
     if trusted {
-        record_event_count(&js_ev.get_property("type").to_js_string());
+        let type_name = if slotted {
+            crate::web_events::event_slot_head(&js_ev)
+                .map(|head| head.type_name.as_str().to_string())
+                .unwrap_or_default()
+        } else {
+            js_ev.get_property("type").to_js_string()
+        };
+        record_event_count(&type_name);
     }
     let _activation = (trusted
         && matches!(
@@ -13379,37 +13670,70 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     .then(crate::user_activation_web::begin_transient_activation);
     let target = ev.target.as_u32();
     let mut listener_calls = 0usize;
-    // The path array is built when composedPath() reads it. Dispatch only
-    // stores the target id so 400 clicks do not wrap every ancestor.
-    js_ev.set_property("__w3cos_target_id", Value::Number(target as f64));
-
-    let target_value = element_value(target);
-    js_ev.set_property("target", target_value.clone());
-    js_ev.set_property("srcElement", target_value.clone());
-    let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
-        LISTENERS.with(|l| l.borrow().handlers(node_id, ev.event_type, capture_phase))
+    let stopped = |event: &Value| {
+        if slotted {
+            crate::web_events::event_stopped(event)
+        } else {
+            event.get_property("__sp").to_bool()
+        }
+    };
+    let canceled = |event: &Value| {
+        if slotted {
+            if event
+                .as_object()
+                .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"))
+            {
+                return event.get_property("defaultPrevented").to_bool();
+            }
+            crate::web_events::event_slot_canceled(event).unwrap_or(false)
+        } else {
+            event.get_property("__pd").to_bool()
+        }
     };
     let has_capture = LISTENERS.with(|l| l.borrow().has_capture());
     // A non-bubbling event with no capture listeners stays on the target.
-    // Ancestor wrappers and the propagation chain are not built.
+    // Slotted events keep the target as a node id until script reads it.
     if !has_capture && !ev.bubbles {
-        js_ev.set_property("currentTarget", target_value.clone());
-        js_ev.set_property("eventPhase", Value::Number(2.0));
-        if !js_ev.get_property("__sp").to_bool() {
-            for h in snapshot_listeners(target, None) {
-                listener_calls += 1;
-                h.call(Value::Undefined, vec![js_ev.clone()]);
-                if js_ev.get_property("__sip").to_bool() {
-                    break;
-                }
-            }
+        if slotted {
+            let _ = crate::web_events::set_dispatch_nodes(&js_ev, target, target, 2);
+        } else {
+            js_ev.set_property("__w3cos_target_id", Value::Number(target as f64));
+            let target_value = element_value(target);
+            js_ev.set_property("target", target_value.clone());
+            js_ev.set_property("srcElement", target_value.clone());
+            js_ev.set_property("currentTarget", target_value);
+            js_ev.set_property("eventPhase", Value::Number(2.0));
         }
-        js_ev.set_property("eventPhase", Value::Number(0.0));
-        js_ev.set_property("target", target_value.clone());
-        js_ev.set_property("srcElement", target_value);
+        if !stopped(&js_ev) {
+            listener_calls += invoke_phase_listeners(target, ev.event_type, None, &js_ev, slotted);
+        }
+        if slotted {
+            let _ = crate::web_events::finish_dispatch(&js_ev);
+        } else {
+            let target_value = element_value(target);
+            js_ev.set_property("eventPhase", Value::Number(0.0));
+            js_ev.set_property("target", target_value.clone());
+            js_ev.set_property("srcElement", target_value);
+        }
         trace_dispatched_event(ev, &js_ev, target, listener_calls);
-        return !js_ev.get_property("__pd").to_bool();
+        return !canceled(&js_ev);
     }
+
+    if slotted {
+        // Bubbling and capture still need the original target id so
+        // composedPath can walk the chain. Own `target` properties retarget.
+        let _ = crate::web_events::set_dispatch_nodes(&js_ev, target, target, 2);
+    } else {
+        js_ev.set_property("__w3cos_target_id", Value::Number(target as f64));
+    }
+    let target_value = element_value(target);
+    if !slotted {
+        js_ev.set_property("target", target_value.clone());
+        js_ev.set_property("srcElement", target_value.clone());
+    }
+    let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
+        LISTENERS.with(|l| l.borrow().handlers(node_id, ev.event_type, capture_phase))
+    };
 
     // [target, parent, ..., root], crossing shadow boundaries only for
     // composed events.
@@ -13437,7 +13761,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
             set_current_target(&js_ev, id, 1.0);
             for h in handlers {
                 listener_calls += 1;
-                h.call(Value::Undefined, vec![js_ev.clone()]);
+                h.call_slice(Value::Undefined, std::slice::from_ref(&js_ev));
                 if immediate(&js_ev) {
                     break;
                 }
@@ -13448,13 +13772,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     // Phase 2: at target (both capture and bubble listeners).
     if !stopped(&js_ev) {
         set_current_target(&js_ev, target, 2.0);
-        for h in snapshot_listeners(target, None) {
-            listener_calls += 1;
-            h.call(Value::Undefined, vec![js_ev.clone()]);
-            if immediate(&js_ev) {
-                break;
-            }
-        }
+        listener_calls += invoke_phase_listeners(target, ev.event_type, None, &js_ev, slotted);
     }
 
     // Phase 3: bubble, parent → root.
@@ -13470,7 +13788,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
             set_current_target(&js_ev, id, 3.0);
             for h in handlers {
                 listener_calls += 1;
-                h.call(Value::Undefined, vec![js_ev.clone()]);
+                h.call_slice(Value::Undefined, std::slice::from_ref(&js_ev));
                 if immediate(&js_ev) {
                     break;
                 }
@@ -13478,11 +13796,15 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
         }
     }
 
-    js_ev.set_property("eventPhase", Value::Number(0.0));
-    js_ev.set_property("target", target_value.clone());
-    js_ev.set_property("srcElement", target_value);
+    if slotted {
+        let _ = crate::web_events::finish_dispatch(&js_ev);
+    } else {
+        js_ev.set_property("eventPhase", Value::Number(0.0));
+        js_ev.set_property("target", target_value.clone());
+        js_ev.set_property("srcElement", target_value);
+    }
     trace_dispatched_event(ev, &js_ev, target, listener_calls);
-    !js_ev.get_property("__pd").to_bool()
+    !canceled(&js_ev)
 }
 
 fn record_event_count(event_type: &str) {
@@ -14392,6 +14714,9 @@ pub(crate) fn dispatch_native_input(
 /// `element.dispatchEvent(eventValue)` — reads `.type` (and `.detail`,
 /// `.bubbles`) from the given object and dispatches synchronously.
 fn install_compat_event_controls(event: &Value) {
+    if crate::web_events::has_event_slot(event) {
+        return;
+    }
     // `new Event` already wrote the flags, and the methods live on
     // `Event.prototype`. Skip the per-dispatch prototype walks in that case.
     if !event.get_property("__pd").is_undefined()
@@ -14469,6 +14794,15 @@ fn install_compat_event_controls(event: &Value) {
 }
 
 fn event_was_canceled(event_val: &Value) -> bool {
+    if crate::web_events::has_event_slot(event_val) {
+        let own_default_prevented = event_val
+            .as_object()
+            .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"));
+        if own_default_prevented {
+            return event_val.get_property("defaultPrevented").to_bool();
+        }
+        return crate::web_events::event_slot_canceled(event_val).unwrap_or(false);
+    }
     let own_default_prevented = event_val
         .as_object()
         .is_some_and(|object| object.borrow().has_own_property("defaultPrevented"));
@@ -14484,7 +14818,43 @@ fn event_was_canceled(event_val: &Value) -> bool {
     event_val.get_property("defaultPrevented").to_bool()
 }
 
+fn event_slot_overridden(event_val: &Value) -> bool {
+    event_val.as_object().is_some_and(|object| {
+        let object = object.borrow();
+        if object.is_empty() {
+            return false;
+        }
+        object.has_own_property("type")
+            || object.has_own_property("bubbles")
+            || object.has_own_property("cancelable")
+            || object.has_own_property("composed")
+            || object.has_own_property("detail")
+    })
+}
+
 fn js_dispatch_event(node: u32, event_val: Value) -> bool {
+    if let Some(head) = crate::web_events::event_slot_head(&event_val)
+        && !event_slot_overridden(&event_val)
+    {
+        let type_name = head.type_name.as_str();
+        if type_name.is_empty() || type_name == "undefined" {
+            return true;
+        }
+        let et = event_type_for(type_name);
+        let data = if head.detail.is_nullish() {
+            EventData::None
+        } else {
+            EventData::Custom {
+                detail: Some(head.detail.to_js_string()),
+            }
+        };
+        let mut ev = Event::new(et, NodeId::from_u32(node));
+        ev.data = data;
+        ev.bubbles = head.bubbles;
+        ev.cancelable = head.cancelable;
+        ev.composed = head.composed;
+        return dispatch_event_value_to_js(&ev, event_val);
+    }
     let type_name = event_val.get_property("type").to_js_string();
     if type_name.is_empty() || type_name == "undefined" {
         return true;
@@ -20413,16 +20783,25 @@ fn build_window_value() -> Value {
     );
 
     let handler = ProxyBuilder::new()
-        .get(|target, key, _| {
-            let has_stored_property = target.as_object().is_some_and(|object| {
-                let object = object.borrow();
-                object.has_direct(key) || object.own_getter(key).is_some()
-            });
-            if has_stored_property {
-                target.get_property(key)
-            } else {
-                window_named_property(key).unwrap_or(Value::Undefined)
+        .live_target()
+        .get(|target, key, receiver| {
+            // Own data and the prototype chain, without cloning the window's
+            // property map. `get_direct` does not re-enter this trap.
+            let Some(object) = target.as_object() else {
+                return window_named_property(key).unwrap_or(Value::Undefined);
+            };
+            let value = object.borrow().get_direct(key);
+            if !value.is_undefined() {
+                return value;
             }
+            let getter = object.borrow().get_direct(&format!("__w3cos_getter_{key}"));
+            if !getter.is_undefined() {
+                return getter.call(receiver.clone(), vec![]);
+            }
+            if object.borrow().has_direct(key) {
+                return value;
+            }
+            window_named_property(key).unwrap_or(Value::Undefined)
         })
         .has(|target, key| {
             target.as_object().is_some_and(|object| {
@@ -20924,6 +21303,11 @@ pub fn reset_bridge() {
     w3cos_core::promise::advance_realm_generation();
     ELEMENT_VALUES.with(|c| c.borrow_mut().clear());
     TREE_METHOD_CACHE.with(|cache| cache.borrow_mut().clear());
+    DISPATCH_METHOD.with(|slot| slot.borrow_mut().take());
+    DISPATCH_OVERRIDE.with(|flag| flag.set(false));
+    CHILD_INDEX.with(|cache| cache.borrow_mut().take());
+    COLLECTION_ROOTS.with(|roots| roots.borrow_mut().clear());
+    LENGTH_SHADOWS.with(|shadows| shadows.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
     KNOWN_EXPANDS.with(|c| c.borrow_mut().clear());
     OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().clear());
@@ -21112,7 +21496,7 @@ mod tests {
             assert_eq!(host.get_property("contentDocument").is_null(), !readable);
         }
     }
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     fn setup() {
@@ -29162,5 +29546,76 @@ try {
         );
         assert_eq!(container.get_property("scrollTop").to_number(), 170.0);
         assert_eq!(scroll_events.get(), 1);
+    }
+
+    #[test]
+    #[ignore = "manual split of the 400-click dispatch path"]
+    fn profile_click_dispatch_split() {
+        setup();
+        let document = document_value();
+        let root = document.call_method("createElement", vec![Value::string("div")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![root.clone()]);
+        let hits = Rc::new(Cell::new(0u32));
+        for i in 0..400 {
+            let el = document.call_method("createElement", vec![Value::string("button")]);
+            let hits = Rc::clone(&hits);
+            el.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("click"),
+                    func(move |_, _| {
+                        hits.set(hits.get() + 1);
+                        Value::Undefined
+                    }),
+                ],
+            );
+            let _ = i;
+            root.call_method("appendChild", vec![el]);
+        }
+        let nodes = root.get_property("childNodes");
+        let length = nodes.get_property("length").to_number() as usize;
+        let index_started = std::time::Instant::now();
+        for n in 0..length {
+            let _ = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
+        }
+        let index = index_started.elapsed();
+        let window = window_value();
+        let class = window.get_property("Event");
+        let lookup_started = std::time::Instant::now();
+        for _ in 0..length {
+            let _ = window.get_property("Event");
+        }
+        let lookup = lookup_started.elapsed();
+        let direct_started = std::time::Instant::now();
+        let object = window.as_object().expect("window");
+        for _ in 0..length {
+            let _ = object.borrow().get_direct("Event");
+        }
+        let direct = direct_started.elapsed();
+        eprintln!("PROFILE window_get={lookup:?} direct={direct:?}");
+        let construct_started = std::time::Instant::now();
+        for _ in 0..length {
+            let _ = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+        }
+        let construct = construct_started.elapsed();
+        hits.set(0);
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            hits.set(0);
+            let started = std::time::Instant::now();
+            for n in 0..length {
+                let node = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
+                let event = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+                let _ = node.call_method_slice("dispatchEvent", &[event]);
+            }
+            samples.push(started.elapsed());
+        }
+        eprintln!(
+            "PROFILE events index={index:?} event_get={lookup:?} construct={construct:?} dispatch={samples:?} hits={}",
+            hits.get()
+        );
+        assert_eq!(hits.get(), 400);
     }
 }

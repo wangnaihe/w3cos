@@ -1292,7 +1292,7 @@ fn emit_w3ir_module_init_statements(
     )?;
     Ok(W3irModuleInitStatement {
         helper,
-        expression: format!("{factory}(w3cos_core::Value::Undefined, Vec::new(), &{captures})"),
+        expression: format!("{factory}(w3cos_core::Value::Undefined, &[], &{captures})"),
         is_async: entry.is_async,
     })
 }
@@ -1387,7 +1387,7 @@ fn module_init_capture_map(
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
             Ok(format!(
-                "({}, (w3cos_core::Value::function(move |_, _| {getter}), {setter}))",
+                "({}, w3cos_core::AotCapture::Accessors(w3cos_core::Value::function(move |_, _| {getter}), {setter}))",
                 import.local.0
             ))
         })
@@ -2140,7 +2140,7 @@ fn emit_w3ir_generator_symbol(
     let mut output = String::new();
     output.push_str(&state_machine);
     output.push_str(&format!(
-        "\n    /// generator {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, __args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
+        "\n    /// generator {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
@@ -2213,7 +2213,7 @@ fn emit_w3ir_async_symbol(
     let mut output = String::new();
     output.push_str(&state_machine);
     output.push_str(&format!(
-        "\n    /// async function {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, __args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
+        "\n    /// async function {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
@@ -2286,7 +2286,7 @@ fn emit_w3ir_sync_symbol(
     let mut output = String::new();
     output.push_str(&state_machine);
     output.push_str(&format!(
-        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, __args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
+        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
@@ -2427,7 +2427,10 @@ fn generator_capture_map_with_synthetic(
                 .iter()
                 .find(|binding| binding.id == *capture)?;
             if let Some((getter, setter)) = synthetic.get(&binding.name) {
-                return Some(format!("({}, ({getter}, {setter}))", capture.0));
+                return Some(format!(
+                    "({}, w3cos_core::AotCapture::Accessors({getter}, {setter}))",
+                    capture.0
+                ));
             }
             if binding.name.starts_with('*') {
                 return None;
@@ -2463,7 +2466,7 @@ fn generator_capture_map_with_synthetic(
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
             Some(format!(
-                "({}, (w3cos_core::Value::function(move |_, _| {load}), {setter}))",
+                "({}, w3cos_core::AotCapture::Accessors(w3cos_core::Value::function(move |_, _| {load}), {setter}))",
                 capture.0
             ))
         })
@@ -2903,9 +2906,7 @@ fn emit_class(
                 "w3cos_core::Value::aot_function({factory}, {captures})"
             ));
         } else {
-            static_initializers.push(format!(
-                "{factory}(__class.clone(), Vec::new(), &{captures});"
-            ));
+            static_initializers.push(format!("{factory}(__class.clone(), &[], &{captures});"));
         }
     }
 
@@ -2983,7 +2984,7 @@ fn emit_class(
         let (state_machine, captures) = emitted;
         out.push_str(&state_machine);
         out.push_str(&format!(
-            "    /// class member {} compiled from W3IR\n    fn {}(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
+            "    /// class member {} compiled from W3IR\n    fn {}(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
             def.w3ir_name.as_deref().unwrap_or("<computed>"),
             def.fn_name
         ));
@@ -3057,7 +3058,7 @@ fn emit_class(
         let (state_machine, captures) = emitted;
         out.push_str(&state_machine);
         out.push_str(&format!(
-            "    /// class constructor {}.constructor compiled from W3IR\n    fn {bundled}__ctor(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
+            "    /// class constructor {}.constructor compiled from W3IR\n    fn {bundled}__ctor(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
             sym.original_name
         ));
     } else {
@@ -3071,7 +3072,7 @@ fn emit_class(
     ));
     if let Some((factory, captures)) = &definition_factory {
         out.push_str(&format!(
-            "        let __definition_values = {factory}(w3cos_core::Value::Undefined, Vec::new(), &{captures});\n"
+            "        let __definition_values = {factory}(w3cos_core::Value::Undefined, &[], &{captures});\n"
         ));
     }
     if has_parent {
