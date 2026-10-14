@@ -178,6 +178,8 @@ class WorkloadServer(threading.Thread):
 
     def _handler(self):
         source = self.source
+        noto = Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf")
+        noto_bytes = noto.read_bytes() if noto.is_file() else b""
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
@@ -188,6 +190,9 @@ class WorkloadServer(threading.Thread):
                 if path == "/workloads.ts":
                     body = source.encode()
                     content_type = "text/javascript; charset=utf-8"
+                elif path == "/NotoSans-Regular.ttf":
+                    body = noto_bytes
+                    content_type = "font/ttf"
                 else:
                     workload = "startup"
                     if "workload=" in self.path:

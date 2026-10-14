@@ -476,6 +476,7 @@ pub fn define_field(this: &Value, key: &str, value: Value) {
 
 /// Set `obj`'s prototype link from generated code (`obj` must be an object).
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
+    crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
         if let Some(node) = obj.live_dom_node() {
@@ -503,6 +504,7 @@ pub fn get_own_property_descriptor(obj: &Value, key: &str) -> Value {
 /// `Object.defineProperty(obj, key, descriptor)`: define `key` from a
 /// `{value}`/`{get}`/`{set}` descriptor (best-effort), returning `obj`.
 pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
+    crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
         let proxy_define = {
             let object = object.borrow();

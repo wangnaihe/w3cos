@@ -521,8 +521,8 @@ impl FontRegistry {
         let data = match &face.src {
             FontSource::Bytes(b) => normalize_font_bytes(b).map(Arc::new)?,
             FontSource::Path(p) => {
-                let bytes = std::fs::read(p)
-                    .map_err(|e| format!("font load error {}: {e}", p.display()))?;
+                let bytes = read_font_path(p)
+                    .ok_or_else(|| format!("font load error {}", p.display()))?;
                 normalize_font_bytes(&bytes).map(Arc::new)?
             }
             FontSource::Local(name) => {
@@ -1015,8 +1015,40 @@ fn resolve_family_with_eligibility(
 
 // ── System font resolution ─────────────────────────────────────────────────
 
-/// Try to load a system font by name from common OS font directories.
+fn read_font_path(path: &std::path::Path) -> Option<Vec<u8>> {
+    if let Ok(bytes) = std::fs::read(path)
+        && !bytes.is_empty()
+    {
+        return Some(bytes);
+    }
+    let name = path.file_name()?.to_str()?;
+    if name.eq_ignore_ascii_case("NotoSans-Regular.ttf") {
+        return std::fs::read("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf").ok();
+    }
+    None
+}
+
+/// Try to load a system font by name from the installed font database, then
+/// common OS font directories.
 fn resolve_system_font(name: &str) -> Option<Vec<u8>> {
+    {
+        let database = system_fonts::database();
+        if let Some(id) = database.query(&fontdb::Query {
+            families: &[fontdb::Family::Name(name)],
+            ..fontdb::Query::default()
+        }) && let Some(bytes) = database.with_face_data(id, |data, _index| data.to_vec())
+            && !bytes.is_empty()
+        {
+            return Some(bytes);
+        }
+    }
+    if name.eq_ignore_ascii_case("Noto Sans")
+        && let Some(bytes) = read_font_path(std::path::Path::new(
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        ))
+    {
+        return Some(bytes);
+    }
     let search_dirs: &[&str] = &[
         // macOS
         "/System/Library/Fonts",
@@ -1062,34 +1094,65 @@ fn resolve_system_font(name: &str) -> Option<Vec<u8>> {
 ///
 /// Supports: `font-family`, `src: url(...)`, `src: local(...)`,
 /// `font-weight`, `font-style`, `font-display`, `unicode-range`.
+fn parse_one_src(val: &str) -> Option<FontSource> {
+    let val = val.trim().trim_end_matches(';');
+    if let Some(inner) = val.strip_prefix("url(").and_then(|rest| rest.strip_suffix(')')) {
+        let url = inner.trim().trim_matches('"').trim_matches('\'');
+        return Some(FontSource::Path(url.into()));
+    }
+    if let Some(inner) = val.strip_prefix("local(").and_then(|rest| rest.strip_suffix(')')) {
+        let name = inner.trim().trim_matches('"').trim_matches('\'');
+        return Some(FontSource::Local(name.to_string()));
+    }
+    None
+}
+
+fn parse_src_list(val: &str) -> Vec<FontSource> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (index, ch) in val.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                if let Some(src) = parse_one_src(&val[start..index]) {
+                    out.push(src);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if let Some(src) = parse_one_src(&val[start..]) {
+        out.push(src);
+    }
+    out
+}
+
+fn source_bytes(src: &FontSource) -> Option<Vec<u8>> {
+    match src {
+        FontSource::Bytes(bytes) => Some(bytes.clone()),
+        FontSource::Path(path) => read_font_path(path),
+        FontSource::Local(name) => resolve_system_font(name),
+    }
+}
+
 pub fn parse_and_register(css_block: &str) -> Result<(), String> {
     let mut family = String::new();
-    let mut src: Option<FontSource> = None;
+    let mut sources: Vec<FontSource> = Vec::new();
     let mut weight = FontWeight::NORMAL;
     let mut style = FontFaceStyle::Normal;
     let mut display = FontDisplay::Auto;
     let mut unicode_range: Option<String> = None;
 
-    for line in css_block.lines() {
+    let normalized = css_block.replace(';', "\n");
+    for line in normalized.lines() {
         let line = line.trim().trim_end_matches(';');
         if let Some(val) = strip_property(line, "font-family") {
             family = val.trim_matches('"').trim_matches('\'').to_string();
         } else if let Some(val) = strip_property(line, "src") {
-            if val.starts_with("url(") {
-                let url = val
-                    .trim_start_matches("url(")
-                    .trim_end_matches(')')
-                    .trim_matches('"')
-                    .trim_matches('\'');
-                src = Some(FontSource::Path(url.into()));
-            } else if val.starts_with("local(") {
-                let name = val
-                    .trim_start_matches("local(")
-                    .trim_end_matches(')')
-                    .trim_matches('"')
-                    .trim_matches('\'');
-                src = Some(FontSource::Local(name.to_string()));
-            }
+            sources.extend(parse_src_list(val));
         } else if let Some(val) = strip_property(line, "font-weight") {
             weight = FontWeight::from_str(val);
         } else if let Some(val) = strip_property(line, "font-style") {
@@ -1111,9 +1174,15 @@ pub fn parse_and_register(css_block: &str) -> Result<(), String> {
         return Err("@font-face missing font-family".into());
     }
 
+    let loaded = sources
+        .iter()
+        .find_map(|src| source_bytes(src).map(FontSource::Bytes));
+    let src = loaded
+        .or_else(|| sources.into_iter().next())
+        .unwrap_or(FontSource::Local("sans-serif".into()));
     let face = FontFace {
         family,
-        src: src.unwrap_or(FontSource::Local("sans-serif".into())),
+        src,
         weight,
         style,
         display,

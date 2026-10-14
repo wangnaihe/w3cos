@@ -23,9 +23,29 @@ use serde::Deserialize;
 
 impl Atom {
     pub const EMPTY: Self = Self(0);
+    /// Pre-interned `"#text"`.
+    pub const TEXT: Self = Self(2);
+    /// Pre-interned `"div"` (see `InternTable::new`).
+    pub const DIV: Self = Self(4);
+    /// Pre-interned `"id"`.
+    pub const ID: Self = Self(37);
+    /// Pre-interned `"class"`.
+    pub const CLASS: Self = Self(38);
 
     pub fn intern(s: &str) -> Self {
         INTERN_TABLE.with(|t| Self(t.borrow_mut().intern(s)))
+    }
+
+    /// Intern `s` using a hash computed at AOT time. A miss or a mismatched
+    /// hash falls back to `hash_str`, so a wrong literal cannot corrupt the table.
+    pub fn intern_prehashed(s: &str, hash: u64) -> Self {
+        INTERN_TABLE.with(|t| Self(t.borrow_mut().intern_prehashed(s, hash)))
+    }
+
+    /// Bump the bytes into the arena without inserting a hash slot.
+    /// Lookup atomizes; the create loop does not hash unique ids.
+    pub fn store_unhashed(s: &str) -> Self {
+        INTERN_TABLE.with(|t| Self(t.borrow_mut().store_unhashed(s)))
     }
 
     pub fn as_str(&self) -> String {
@@ -167,8 +187,17 @@ impl InternTable {
     }
 
     fn intern(&mut self, s: &str) -> u32 {
-        let hash = hash_str(s);
+        self.intern_prehashed(s, hash_str(s))
+    }
+
+    fn intern_prehashed(&mut self, s: &str, hash: u64) -> u32 {
         if let Some(id) = self.lookup_hash(hash, s) {
+            return id;
+        }
+        let real = hash_str(s);
+        if real != hash
+            && let Some(id) = self.lookup_hash(real, s)
+        {
             return id;
         }
         if (self.len + 1) * 10 >= self.slots.len() * 7 {
@@ -176,8 +205,14 @@ impl InternTable {
         }
         let id = self.ranges.len() as u32;
         self.push_bytes(s.as_bytes());
-        self.insert_slot(hash, id);
+        self.insert_slot(real, id);
         self.len += 1;
+        id
+    }
+
+    fn store_unhashed(&mut self, s: &str) -> u32 {
+        let id = self.ranges.len() as u32;
+        self.push_bytes(s.as_bytes());
         id
     }
 
@@ -319,5 +354,36 @@ mod tests {
     #[test]
     fn empty_atom() {
         assert_eq!(Atom::EMPTY.as_str(), "");
+    }
+
+    #[test]
+    fn const_atoms_match_preintern_order() {
+        assert_eq!(Atom::TEXT, Atom::intern("#text"));
+        assert_eq!(Atom::DIV, Atom::intern("div"));
+        assert_eq!(Atom::ID, Atom::intern("id"));
+        assert_eq!(Atom::CLASS, Atom::intern("class"));
+    }
+
+    #[test]
+    fn prehashed_hit_matches_intern_and_a_wrong_hash_does_not_alias() {
+        let hashed = hash_str("row");
+        let row = Atom::intern_prehashed("row", hashed);
+        assert_eq!(row, Atom::intern("row"));
+        let unique = "w3cos-prehash-mismatch-row";
+        let stored = Atom::intern_prehashed(unique, 1);
+        assert_eq!(stored, Atom::intern(unique));
+        assert_ne!(stored, row);
+    }
+
+    #[test]
+    fn unhashed_bytes_roundtrip_and_stay_distinct_until_lookup() {
+        let first = Atom::store_unhashed("row-7");
+        let second = Atom::store_unhashed("row-7");
+        assert_eq!(first.as_str(), "row-7");
+        assert_eq!(second.as_str(), "row-7");
+        assert_ne!(first, second);
+        let interned = Atom::intern("row-7");
+        assert_ne!(interned, first);
+        assert_eq!(interned.as_str(), "row-7");
     }
 }

@@ -1039,6 +1039,7 @@ fn ensure_dom_fast() {
         set_data: fast_set_data,
         set_data_str: fast_set_data_str,
         build_appended: fast_build_appended,
+        build_guarded: fast_build_guarded,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -1183,6 +1184,71 @@ fn fast_build_appended(
         set_expando(child, "__w3cos_force_async", Value::Bool(true));
     }
     crate::custom_elements_web::upgrade_created_element(tag, dom_handle(child))
+}
+
+fn fast_build_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_hash: u64,
+    id_prefix: &str,
+    id_index: f64,
+    class_name: &str,
+    class_hash: u64,
+    text_prefix: &str,
+    text_index: f64,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let mut id_buf = [0u8; 96];
+    let mut text_buf = [0u8; 96];
+    let Some(id_text) =
+        w3cos_core::intrinsics::format_prefix_index(id_prefix, id_index, &mut id_buf)
+    else {
+        return Value::Undefined;
+    };
+    let Some(text) =
+        w3cos_core::intrinsics::format_prefix_index(text_prefix, text_index, &mut text_buf)
+    else {
+        return Value::Undefined;
+    };
+    // Undefined forces the ordinary createElement / set / appendChild / push
+    // path. Do not fall through to fast_create_element: that skips the
+    // prototype and proxy checks the stamp is standing in for.
+    if !is_document_value(document)
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::has_rules()
+        || node_id_of(parent).is_none()
+        || !valid_element_name(tag)
+    {
+        return Value::Undefined;
+    }
+    let parent_id = node_id_of(parent).expect("parent checked");
+    let lowered;
+    let tag = if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        lowered = tag.to_ascii_lowercase();
+        lowered.as_str()
+    } else {
+        tag
+    };
+    let child = dom::with_document_mut(|doc| {
+        doc.append_labeled_unhashed(
+            w3cos_dom::NodeId::from_u32(parent_id),
+            tag,
+            tag_hash,
+            id_text,
+            class_name,
+            class_hash,
+            text,
+        )
+        .as_u32()
+    });
+    dom::mark_dom_dirty();
+    dom_handle(child)
 }
 
 fn fast_set_data_str(object: &Value, name: &str, text: &str) -> bool {
@@ -10249,6 +10315,10 @@ fn register_author_sheet(owner: u64, css: &str) {
         };
         let selector = selector.trim();
         if selector.is_empty() {
+            continue;
+        }
+        if selector.starts_with("@font-face") {
+            let _ = crate::font_face::parse_and_register(body);
             continue;
         }
         let mut declarations = Vec::new();

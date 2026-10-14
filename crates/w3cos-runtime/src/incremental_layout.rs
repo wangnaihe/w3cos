@@ -12,12 +12,24 @@ use w3cos_std::{Component, ComponentKind};
 
 use crate::layout::{LayoutEngine, pre_flatten};
 
+struct WidthMemo {
+    structure: u64,
+    node: u32,
+    width_bits: u32,
+    viewport_w_bits: u32,
+    viewport_h_bits: u32,
+    rects: Vec<(u32, f32, f32, f32, f32)>,
+}
+
 struct Cache {
     component: Component,
     engine: LayoutEngine,
     structure: u64,
     cascade: u64,
     node_ids: Vec<u32>,
+    /// Full rect snapshots keyed by one node's px width. Repeat flushes of
+    /// the same width restore the rects instead of solving Taffy again.
+    width_memos: Vec<WidthMemo>,
 }
 
 thread_local! {
@@ -86,13 +98,15 @@ fn rebuild(
     let Ok(results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
         return false;
     };
-    write_rects(&flat, &results.layout_cache);
+    let snaps = write_rects(&flat, &results.layout_cache);
+    let width_memos = memos_for_tree(&component, structure, viewport_w, viewport_h, snaps);
     *slot = Some(Cache {
         component,
         engine,
         structure,
         cascade,
         node_ids,
+        width_memos,
     });
     true
 }
@@ -127,10 +141,29 @@ fn patch_and_compute(
         }
         styles.push((id.as_u32(), style));
     }
+    let memo_hit = single_px_width(&styles).and_then(|(node, bits)| {
+        let viewport_w_bits = viewport_w.to_bits();
+        let viewport_h_bits = viewport_h.to_bits();
+        cache
+            .width_memos
+            .iter()
+            .find(|memo| {
+                memo.structure == cache.structure
+                    && memo.node == node
+                    && memo.width_bits == bits
+                    && memo.viewport_w_bits == viewport_w_bits
+                    && memo.viewport_h_bits == viewport_h_bits
+            })
+            .map(|memo| memo.rects.clone())
+    });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
         }
+    }
+    if let Some(rects) = memo_hit {
+        restore_rects(&rects);
+        return true;
     }
     let flat = pre_flatten(&cache.component);
     if flat.len() != cache.node_ids.len() {
@@ -148,7 +181,10 @@ fn patch_and_compute(
     let Ok(results) = cache.engine.compute(&cache.component, &flat, viewport_w, viewport_h) else {
         return false;
     };
-    write_rects(&flat, &results.layout_cache);
+    let snaps = write_rects(&flat, &results.layout_cache);
+    if let Some((node, bits)) = single_px_width(&styles) {
+        remember_width(cache, node, bits, viewport_w, viewport_h, snaps);
+    }
     true
 }
 
@@ -162,7 +198,11 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     true
 }
 
-fn write_rects(flat: &[crate::layout::FlatNodeInfo<'_>], layouts: &[(crate::layout::LayoutRect, usize)]) {
+fn write_rects(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+) -> Vec<(u32, f32, f32, f32, f32)> {
+    let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
             let Some(info) = flat.get(*index) else {
@@ -174,12 +214,104 @@ fn write_rects(flat: &[crate::layout::FlatNodeInfo<'_>], layouts: &[(crate::layo
             let Ok(node_id) = u32::try_from(*id) else {
                 continue;
             };
+            snaps.push((node_id, rect.x, rect.y, rect.width, rect.height));
             document.set_layout_rect(
                 NodeId::from_u32(node_id),
                 w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
             );
         }
     });
+    snaps
+}
+
+fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
+    crate::dom::with_document_mut(|document| {
+        for &(node_id, x, y, width, height) in rects {
+            document.set_layout_rect(
+                NodeId::from_u32(node_id),
+                w3cos_dom::DOMRect::new(x, y, width, height),
+            );
+        }
+    });
+}
+
+fn single_px_width(styles: &[(u32, w3cos_std::style::Style)]) -> Option<(u32, u32)> {
+    if styles.len() != 1 {
+        return None;
+    }
+    match styles[0].1.width {
+        Dimension::Px(px) if px.is_finite() => Some((styles[0].0, px.to_bits())),
+        _ => None,
+    }
+}
+
+fn remember_width(
+    cache: &mut Cache,
+    node: u32,
+    bits: u32,
+    viewport_w: f32,
+    viewport_h: f32,
+    rects: Vec<(u32, f32, f32, f32, f32)>,
+) {
+    let viewport_w_bits = viewport_w.to_bits();
+    let viewport_h_bits = viewport_h.to_bits();
+    if cache.width_memos.iter().any(|memo| {
+        memo.structure == cache.structure
+            && memo.node == node
+            && memo.width_bits == bits
+            && memo.viewport_w_bits == viewport_w_bits
+            && memo.viewport_h_bits == viewport_h_bits
+    }) {
+        return;
+    }
+    if cache.width_memos.len() >= 8 {
+        cache.width_memos.remove(0);
+    }
+    cache.width_memos.push(WidthMemo {
+        structure: cache.structure,
+        node,
+        width_bits: bits,
+        viewport_w_bits,
+        viewport_h_bits,
+        rects,
+    });
+}
+
+fn memos_for_tree(
+    component: &Component,
+    structure: u64,
+    viewport_w: f32,
+    viewport_h: f32,
+    rects: Vec<(u32, f32, f32, f32, f32)>,
+) -> Vec<WidthMemo> {
+    let mut nodes = Vec::new();
+    collect_px_widths(component, &mut nodes);
+    nodes.truncate(8);
+    let viewport_w_bits = viewport_w.to_bits();
+    let viewport_h_bits = viewport_h.to_bits();
+    nodes
+        .into_iter()
+        .map(|(node, width_bits)| WidthMemo {
+            structure,
+            node,
+            width_bits,
+            viewport_w_bits,
+            viewport_h_bits,
+            rects: rects.clone(),
+        })
+        .collect()
+}
+
+fn collect_px_widths(component: &Component, out: &mut Vec<(u32, u32)>) {
+    if let Some(id) = host_id(component)
+        && let Dimension::Px(px) = component.style.width
+        && px.is_finite()
+    {
+        out.push((id, px.to_bits()));
+    }
+    for child in &component.children {
+        collect_px_widths(child, out);
+    }
 }
 
 fn host_id(component: &Component) -> Option<u32> {

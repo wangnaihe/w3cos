@@ -262,6 +262,9 @@ pub struct Document {
     body_id: NodeId,
     // Fast lookup indexes
     id_index: AtomMap<NodeId>,
+    /// Ids whose bytes were bump-stored without a hash slot. `get_element_by_id`
+    /// scans these and atomizes only the query string.
+    raw_ids: Vec<(NodeId, Atom)>,
     class_index: AtomMap<Vec<NodeId>>,
     tag_index: AtomMap<Vec<NodeId>>,
     // The selected responsive-image source used by component lowering. This
@@ -384,6 +387,7 @@ impl Document {
             events: EventRegistry::new(),
             body_id: NodeId(0),
             id_index: HashMap::with_capacity_and_hasher(32768, AtomBuildHasher),
+            raw_ids: Vec::with_capacity(PAGE_SLOTS),
             class_index: HashMap::with_hasher(AtomBuildHasher),
             tag_index: HashMap::with_hasher(AtomBuildHasher),
             image_render_sources: HashMap::new(),
@@ -500,7 +504,13 @@ impl Document {
     /// O(1) lookup via HashMap index.
     pub fn get_element_by_id(&self, id: &str) -> Option<Element> {
         let atom = Atom::intern(id);
-        self.id_index.get(&atom).map(|&nid| Element::new(nid))
+        if let Some(&nid) = self.id_index.get(&atom) {
+            return Some(Element::new(nid));
+        }
+        self.raw_ids
+            .iter()
+            .find(|(_, raw)| raw.as_static() == id)
+            .map(|(nid, _)| Element::new(*nid))
     }
 
     pub fn query_selector(&self, selector: &str) -> Option<Element> {
@@ -818,6 +828,72 @@ impl Document {
         element.id
     }
 
+    /// `append_labeled_element` for the guarded create loop.
+    ///
+    /// The id bytes are stored without hashing. Static names use the pre-interned
+    /// atoms, and `class_hash` is the FNV of `class_name` so the hit path skips
+    /// `hash_str`. Callers that have author rules must use the ordinary path:
+    /// this helper still invalidates when rules exist, but it does not re-check
+    /// prototype setters.
+    pub fn append_labeled_unhashed(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        tag_hash: u64,
+        id_value: &str,
+        class_name: &str,
+        class_hash: u64,
+        text: &str,
+    ) -> NodeId {
+        let _ = if tag == "div" {
+            Atom::DIV
+        } else {
+            Atom::intern_prehashed(tag, tag_hash)
+        };
+        let element = self.create_element(tag);
+        if !id_value.is_empty() {
+            let id_atom = Atom::store_unhashed(id_value);
+            self.get_node_mut(element.id)
+                .attributes
+                .push((Atom::ID, crate::node::AttrValue::from_atom(id_atom)));
+            self.raw_ids.push((element.id, id_atom));
+        }
+        if !class_name.is_empty()
+            && !class_name
+                .bytes()
+                .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+        {
+            let class_atom = Atom::intern_prehashed(class_name, class_hash);
+            {
+                let node = self.get_node_mut(element.id);
+                node.attributes
+                    .push((Atom::CLASS, crate::node::AttrValue::from_atom(class_atom)));
+                node.class_list.push(class_atom);
+            }
+            self.add_to_class_index(element.id, &class_atom);
+            if stylesheet::has_rules() {
+                self.mark_selector_dirty(element.id);
+            }
+        } else if !class_name.is_empty() {
+            element.set_class_name(self, class_name);
+        }
+        if stylesheet::has_rules() {
+            if !text.is_empty() {
+                let _ = self.set_inline_text_child(element.id, text);
+            }
+            self.append_child(parent, element.id);
+            return element.id;
+        }
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element.id, text_id);
+        }
+        self.link_fresh_child(parent, element.id);
+        self.mark_dirty(parent);
+        self.note_structure_change();
+        element.id
+    }
+
     /// Link a node that has no parent and no descendants that already point
     /// back. The caller has just allocated it, so a cycle check cannot fail.
     fn link_fresh_child(&mut self, parent: NodeId, child: NodeId) {
@@ -983,6 +1059,7 @@ impl Document {
             if let Some(id_atom) = id_atom_key {
                 self.id_index.remove(&id_atom);
             }
+            self.raw_ids.retain(|(nid, _)| *nid != id);
             // Remove from class index
             for class in &node.class_list {
                 if let Some(ids) = self.class_index.get_mut(class) {
@@ -1078,6 +1155,7 @@ impl Document {
         if let Some(old) = old_id {
             self.id_index.remove(&old);
         }
+        self.raw_ids.retain(|(id, _)| *id != node_id);
         self.id_index.insert(new_id, node_id);
     }
 
@@ -25122,5 +25200,34 @@ mod tree_mutation_tests {
         assert_eq!(document.get_node(parent).last_child, Some(child));
         assert_eq!(document.get_node(child).parent, Some(parent));
         assert_eq!(document.get_node(child).next_sibling, 0);
+    }
+
+    #[test]
+    fn unhashed_id_is_found_until_a_later_attribute_replaces_it() {
+        let mut document = Document::new();
+        let parent = document.body().id;
+        let child = document.append_labeled_unhashed(parent, "div", 0, "row-3", "row", 0, "item 3");
+        let found = document.get_element_by_id("row-3").expect("raw id");
+        assert_eq!(found.id, child);
+        assert_eq!(document.get_node(child).get_attribute("id"), Some("row-3"));
+        assert_eq!(
+            document
+                .get_node(child)
+                .class_list
+                .iter()
+                .map(|atom| atom.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "row"
+        );
+        let text = document.get_node(child).first_child.expect("text child");
+        assert_eq!(document.get_node(text).text_content.as_deref(), Some("item 3"));
+        assert!(document.get_node(child).text_content.is_none());
+        Element::new(child).set_attribute(&mut document, "id", "renamed");
+        assert!(document.get_element_by_id("row-3").is_none());
+        assert_eq!(
+            document.get_element_by_id("renamed").map(|element| element.id),
+            Some(child)
+        );
     }
 }

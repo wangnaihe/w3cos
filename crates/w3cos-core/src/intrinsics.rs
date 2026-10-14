@@ -578,11 +578,31 @@ pub struct DomFast {
     /// One create + id + class + text + append. The create loop uses this
     /// instead of five document borrows and three string interns.
     pub build_appended: fn(&Value, &Value, &str, &str, f64, &str, &str, f64) -> Value,
+    /// Fused create used only when `epoch` still matches [`dom_shape_epoch`].
+    /// Returns [`Value::Undefined`] when the stamp is stale or the fast path
+    /// refuses, so the caller runs the ordinary lookup.
+    pub build_guarded: fn(&Value, &Value, &str, u64, &str, f64, &str, u64, &str, f64, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
 
 static DOM_FAST: std::sync::OnceLock<DomFast> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// Bumped by `defineProperty`, `setPrototypeOf`, and assignments that
+    /// override the element/document/array surface the fused create path uses.
+    static DOM_SHAPE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Stamp sampled once per fused create loop. The fast path compares it on
+/// every iteration and falls back when it has moved.
+pub fn dom_shape_epoch() -> u64 {
+    DOM_SHAPE_EPOCH.with(std::cell::Cell::get)
+}
+
+pub fn bump_dom_shape() {
+    DOM_SHAPE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
 
 pub fn install_dom_fast(fast: DomFast) {
     let _ = DOM_FAST.set(fast);
@@ -694,6 +714,42 @@ pub fn dom_build_appended(
         &Value::Number(text_index),
     );
     dom_append_child(parent, &element)
+}
+
+/// Fused create + id + class + text + append, or [`Value::Undefined`] when
+/// `epoch` is stale or the runtime refuses the fast path.
+pub fn dom_build_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_hash: u64,
+    id_prefix: &str,
+    id_index: f64,
+    class_name: &str,
+    class_hash: u64,
+    text_prefix: &str,
+    text_index: f64,
+    epoch: u64,
+) -> Value {
+    if dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let Some(fast) = DOM_FAST.get() else {
+        return Value::Undefined;
+    };
+    (fast.build_guarded)(
+        document,
+        parent,
+        tag,
+        tag_hash,
+        id_prefix,
+        id_index,
+        class_name,
+        class_hash,
+        text_prefix,
+        text_index,
+        epoch,
+    )
 }
 
 /// `array.push(value)` without allocating an arguments `Vec`.

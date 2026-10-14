@@ -573,22 +573,9 @@ pub struct DomNode {
 }
 
 fn cached_tag(tag: &str) -> Atom {
-    thread_local! {
-        static DIV: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
-        static TEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
-    }
-    fn load(slot: &std::cell::Cell<u32>, tag: &str) -> Atom {
-        let id = slot.get();
-        if id != u32::MAX {
-            return Atom::from_u32(id);
-        }
-        let atom = Atom::intern(tag);
-        slot.set(atom.as_u32());
-        atom
-    }
     match tag {
-        "div" => DIV.with(|slot| load(slot, tag)),
-        "#text" => TEXT.with(|slot| load(slot, tag)),
+        "div" => Atom::DIV,
+        "#text" => Atom::TEXT,
         _ => Atom::intern(tag),
     }
 }

@@ -7,22 +7,9 @@ use crate::events::{Event, EventHandler, EventType};
 use crate::node::{NodeId, NodeType};
 
 fn cached_attr_name(name: &str) -> Atom {
-    thread_local! {
-        static ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
-        static CLASS: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
-    }
-    fn load(slot: &std::cell::Cell<u32>, name: &str) -> Atom {
-        let id = slot.get();
-        if id != u32::MAX {
-            return Atom::from_u32(id);
-        }
-        let atom = Atom::intern(name);
-        slot.set(atom.as_u32());
-        atom
-    }
     match name {
-        "id" => ID.with(|slot| load(slot, name)),
-        "class" => CLASS.with(|slot| load(slot, name)),
+        "id" => Atom::ID,
+        "class" => Atom::CLASS,
         _ => Atom::intern(name),
     }
 }

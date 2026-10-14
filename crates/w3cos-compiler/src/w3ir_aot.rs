@@ -3253,6 +3253,327 @@ fn emit_block_instructions(
     Ok(output)
 }
 
+fn fnv1a(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+struct AppendedShape {
+    document_binding: u32,
+    parent_binding: u32,
+    nodes_binding: u32,
+    element_reg: u32,
+    index_binding: u32,
+    tag: String,
+    id_prefix: String,
+    class_name: String,
+    text_prefix: String,
+    store_at: usize,
+    tail_at: usize,
+}
+
+fn load_binding_inst(inst: &Instruction) -> Option<(u32, u32)> {
+    match inst {
+        Instruction::LoadBinding { dst, binding } => Some((dst.0, binding.0)),
+        _ => None,
+    }
+}
+
+fn load_string_inst(inst: &Instruction) -> Option<(u32, String)> {
+    match inst {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::String(text),
+        } => Some((dst.0, text.clone())),
+        _ => None,
+    }
+}
+
+/// `createElement` + id/class/text + `appendChild` + `push` with one integer index.
+fn pull<'a>(body: &'a [Instruction], i: &mut usize) -> Option<&'a Instruction> {
+    let inst = body.get(*i)?;
+    *i += 1;
+    Some(inst)
+}
+
+fn match_appended_element(body: &[Instruction]) -> Option<AppendedShape> {
+    let mut i = 0usize;
+    let (document_reg, document_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (create_key_reg, create_key) = load_string_inst(pull(body, &mut i)?)?;
+    if create_key != "createElement" {
+        return None;
+    }
+    let (tag_reg, tag) = load_string_inst(pull(body, &mut i)?)?;
+    if tag.is_empty() {
+        return None;
+    }
+    let Instruction::CallMethod {
+        dst,
+        object,
+        key,
+        arguments,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != document_reg
+        || key.0 != create_key_reg
+        || arguments.len() != 1
+        || arguments[0].0 != tag_reg
+    {
+        return None;
+    }
+    let element_reg = dst.0;
+    let store_at = i;
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != element_reg {
+        return None;
+    }
+    let element_binding = binding.0;
+
+    let (id_object, id_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if id_bind != element_binding {
+        return None;
+    }
+    let (id_key_reg, id_key) = load_string_inst(pull(body, &mut i)?)?;
+    if id_key != "id" {
+        return None;
+    }
+    let (id_prefix_reg, id_prefix) = load_string_inst(pull(body, &mut i)?)?;
+    let (id_index_reg, index_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let Instruction::Add { dst, lhs, rhs } = pull(body, &mut i)? else {
+        return None;
+    };
+    if lhs.0 != id_prefix_reg || rhs.0 != id_index_reg {
+        return None;
+    }
+    let id_value = dst.0;
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if *strict || object.0 != id_object || key.0 != id_key_reg || value.0 != id_value {
+        return None;
+    }
+
+    let (class_object, class_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if class_bind != element_binding {
+        return None;
+    }
+    let (class_key_reg, class_key) = load_string_inst(pull(body, &mut i)?)?;
+    if class_key != "className" {
+        return None;
+    }
+    let (class_reg, class_name) = load_string_inst(pull(body, &mut i)?)?;
+    if class_name.is_empty()
+        || class_name
+            .bytes()
+            .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+    {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if *strict || object.0 != class_object || key.0 != class_key_reg || value.0 != class_reg {
+        return None;
+    }
+
+    let (text_object, text_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_bind != element_binding {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let (text_prefix_reg, text_prefix) = load_string_inst(pull(body, &mut i)?)?;
+    let (text_index_reg, text_index_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_index_binding != index_binding {
+        return None;
+    }
+    let Instruction::Add { dst, lhs, rhs } = pull(body, &mut i)? else {
+        return None;
+    };
+    if lhs.0 != text_prefix_reg || rhs.0 != text_index_reg {
+        return None;
+    }
+    let text_value = dst.0;
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if *strict || object.0 != text_object || key.0 != text_key_reg || value.0 != text_value {
+        return None;
+    }
+
+    let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
+    if append_key != "appendChild" {
+        return None;
+    }
+    let (_, append_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if append_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != parent_reg || key.0 != append_key_reg || arguments.len() != 1 {
+        return None;
+    }
+
+    let (nodes_reg, nodes_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (push_key_reg, push_key) = load_string_inst(pull(body, &mut i)?)?;
+    if push_key != "push" {
+        return None;
+    }
+    let (_, push_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if push_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_reg || key.0 != push_key_reg || arguments.len() != 1 {
+        return None;
+    }
+    let tail_at = i;
+    let tail_stores_index = body[tail_at..].iter().any(|inst| {
+        matches!(inst, Instruction::StoreBinding { binding, .. } if binding.0 == index_binding)
+    });
+    let tail_is_arithmetic = body[tail_at..].iter().all(|inst| {
+        matches!(
+            inst,
+            Instruction::LoadConstant { .. }
+                | Instruction::LoadBinding { .. }
+                | Instruction::Add { .. }
+                | Instruction::Binary { .. }
+                | Instruction::StoreBinding { .. }
+                | Instruction::Move { .. }
+        )
+    });
+    if tail_at >= body.len() || !tail_stores_index || !tail_is_arithmetic {
+        return None;
+    }
+    Some(AppendedShape {
+        document_binding,
+        parent_binding,
+        nodes_binding,
+        element_reg,
+        index_binding,
+        tag,
+        id_prefix,
+        class_name,
+        text_prefix,
+        store_at,
+        tail_at,
+    })
+}
+
+fn emit_stable_binding(name: &str, id: u32) -> String {
+    format!(
+        "let __w3cos_{name} = if let Some(getter) = __w3cos_cg_{id}.as_ref() {{ match w3cos_core::catch_js(|| getter.call(w3cos_core::Value::Undefined, Vec::new())) {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => {{ return Err(__w3cos_exception); }} }} }} else if let Some(cell) = __w3cos_cb_{id}.as_ref() {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }} }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }};\n"
+    )
+}
+
+/// Stamp-guarded fused create. The else branch is the ordinary lookup body.
+fn emit_guarded_append(
+    body: &[Instruction],
+    slow: &str,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
+) -> Result<Option<(String, String)>> {
+    let Some(shape) = match_appended_element(body) else {
+        return Ok(None);
+    };
+    let Some(index_slot) = num_binding_slot(plan, shape.index_binding) else {
+        return Ok(None);
+    };
+    let Some(element_slot) = val_slot(plan, shape.element_reg) else {
+        return Ok(None);
+    };
+    let store = emit_block_instructions(
+        &body[shape.store_at..shape.store_at + 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tail = emit_block_instructions(
+        &body[shape.tail_at..],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tag_hash = fnv1a(&shape.tag);
+    let class_hash = fnv1a(&shape.class_name);
+    let prelude = format!(
+        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\n{}{}{}",
+        emit_stable_binding("doc", shape.document_binding),
+        emit_stable_binding("parent", shape.parent_binding),
+        emit_stable_binding("nodes", shape.nodes_binding),
+    );
+    let fast = format!(
+        "let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, {tag_hash}_u64, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, {class_hash}_u64, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n",
+        tag = shape.tag,
+        id_prefix = shape.id_prefix,
+        class_name = shape.class_name,
+        text_prefix = shape.text_prefix,
+    );
+    Ok(Some((prelude, fast)))
+}
+
 fn emit_native_sync_loop(
     header: &[Instruction],
     blocks: &[(w3cos_ir::BlockId, Vec<Instruction>)],
@@ -3305,11 +3626,29 @@ fn emit_native_sync_loop(
     } else {
         format!("if {condition} {{ break; }}")
     };
-    let loop_body = format!("{header_code}{gate}\n{body_code}");
+    let guarded = emit_guarded_append(
+        &body[..body.len() - 1],
+        &body_code,
+        function,
+        factories,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let loop_body = if let Some((_, fast)) = &guarded {
+        format!("{header_code}{gate}\n{fast}")
+    } else {
+        format!("{header_code}{gate}\n{body_code}")
+    };
     if loop_body.contains("continue 'drive") || loop_body.contains("self.block") {
         return Ok(None);
     }
-    let (hoisted, loop_body) = tighten_native_loop(&loop_body);
+    let (mut hoisted, loop_body) = tighten_native_loop(&loop_body);
+    if let Some((prelude, _)) = &guarded {
+        hoisted.push_str(prelude);
+    }
     let (mut prologue, loop_body, epilogue) = promote_unboxed_locals(&loop_body)
         .unwrap_or_else(|| (String::new(), loop_body.clone(), String::new()));
     prologue.insert_str(0, &hoisted);
@@ -3477,10 +3816,14 @@ fn outline_numeric_loop(prologue: &str, body: &str, epilogue: &str) -> String {
         )
     };
     let loop_code = if let Some((counter, limit, fast)) = &trip {
-        // Four exact copies hide the taken branch. The scalar tail keeps the
-        // same left-to-right f64 operations, so the checksum does not change.
+        // Sixteen exact copies hide the taken branch. The scalar tail keeps
+        // the same left-to-right f64 operations, so the checksum does not change.
+        let mut unrolled = String::new();
+        for _ in 0..16 {
+            unrolled.push_str(fast);
+        }
         format!(
-            "let __w3cos_i0 = {counter};\nlet __w3cos_n = {limit};\nif __w3cos_i0.fract() == 0.0_f64 && __w3cos_n.fract() == 0.0_f64 && __w3cos_i0 >= -2147483648.0_f64 && __w3cos_n >= -2147483648.0_f64 && __w3cos_i0 <= 2147483646.0_f64 && __w3cos_n <= 2147483646.0_f64 {{\nlet mut __w3cos_i: i32 = __w3cos_i0 as i32;\nlet __w3cos_limit: i32 = __w3cos_n as i32;\nlet __w3cos_stop: i32 = __w3cos_limit.saturating_sub(3);\nif __w3cos_i <= __w3cos_stop {{\nloop {{\n{fast}{fast}{fast}{fast}__w3cos_i = __w3cos_i.wrapping_add(4);\nif __w3cos_i > __w3cos_stop {{ break; }}\n}}\n}}\nwhile __w3cos_i <= __w3cos_limit {{\n{fast}__w3cos_i = __w3cos_i.wrapping_add(1);\n}}\n{counter} = __w3cos_i as f64;\n}} else {{\nloop {{\n{rewritten}}}\n}}\n"
+            "let __w3cos_i0 = {counter};\nlet __w3cos_n = {limit};\nif __w3cos_i0.fract() == 0.0_f64 && __w3cos_n.fract() == 0.0_f64 && __w3cos_i0 >= -2147483648.0_f64 && __w3cos_n >= -2147483648.0_f64 && __w3cos_i0 <= 2147483646.0_f64 && __w3cos_n <= 2147483646.0_f64 {{\nlet mut __w3cos_i: i32 = __w3cos_i0 as i32;\nlet __w3cos_limit: i32 = __w3cos_n as i32;\nlet __w3cos_stop: i32 = __w3cos_limit.saturating_sub(15);\nif __w3cos_i <= __w3cos_stop {{\nloop {{\n{unrolled}__w3cos_i = __w3cos_i.wrapping_add(16);\nif __w3cos_i > __w3cos_stop {{ break; }}\n}}\n}}\nwhile __w3cos_i <= __w3cos_limit {{\n{fast}__w3cos_i = __w3cos_i.wrapping_add(1);\n}}\n{counter} = __w3cos_i as f64;\n}} else {{\nloop {{\n{rewritten}}}\n}}\n"
         )
     } else {
         format!("loop {{\n{rewritten}}}\n")
@@ -6278,8 +6621,16 @@ fn main() {{
             "element create loop should be native: {generated}"
         );
         assert!(
+            generated.contains("dom_shape_epoch") && generated.contains("dom_build_guarded"),
+            "the fused create must be behind a shape stamp: {generated}"
+        );
+        assert!(
+            generated.contains("is_undefined()"),
+            "a stale stamp must fall back to ordinary lookup: {generated}"
+        );
+        assert!(
             generated.contains(".call_method(\"createElement\""),
-            "createElement must stay an ordinary method call: {generated}"
+            "createElement must stay an ordinary method call on the fallback: {generated}"
         );
         assert!(
             generated.contains(".call_method(\"appendChild\""),

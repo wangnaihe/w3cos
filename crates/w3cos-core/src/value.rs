@@ -1592,6 +1592,25 @@ impl fmt::Debug for FunctionData {
 
 // ── Type coercion ──────────────────────────────────────────────────────
 
+fn dom_shape_method_key(key: &str) -> bool {
+    matches!(
+        key,
+        "appendChild"
+            | "insertBefore"
+            | "removeChild"
+            | "replaceChild"
+            | "createElement"
+            | "createElementNS"
+            | "createTextNode"
+            | "push"
+            | "__proto__"
+    )
+}
+
+fn dom_shape_data_key(key: &str) -> bool {
+    matches!(key, "id" | "className" | "textContent")
+}
+
 impl Value {
     /// Stable identity hash with ECMAScript `Object.is` semantics.
     ///
@@ -2003,10 +2022,16 @@ impl Value {
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
     pub fn try_set_property(&self, key: &str, value: Value) -> bool {
+        if dom_shape_method_key(key) {
+            crate::intrinsics::bump_dom_shape();
+        }
         if let Some(node) = self.live_dom_node()
             && crate::intrinsics::dom_set(node, key, value.clone())
         {
             return true;
+        }
+        if dom_shape_data_key(key) {
+            crate::intrinsics::bump_dom_shape();
         }
         if let Some(o) = self.as_object() {
             let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
