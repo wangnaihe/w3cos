@@ -1197,12 +1197,12 @@ fn dom_imm_get(node: u32, key: &str) -> Value {
     // Own accessors and prototype data win over the builtin surface. An
     // undefined prototype placeholder still falls through to the computed
     // property, matching the element wrapper.
-    let inherited = inherited_prototype_value(node, key);
-    if !inherited.is_undefined() {
-        return inherited;
-    }
     if let Some(value) = get_expando(node, key) {
         return value;
+    }
+    let receiver = Value::dom_node(node, realm_generation());
+    if let Some(inherited) = inherited_prototype_value(node, key, &receiver) {
+        return inherited;
     }
     if let Some(cached) = cached_tree_method(node, key) {
         return cached;
@@ -1227,39 +1227,80 @@ fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
         return true;
     }
     let setter_key = format!("__w3cos_setter_{key}");
-    let setter = inherited_prototype_value(node, &setter_key);
-    if setter.is_callable() {
-        let wrapper = dom_imm_materialize(node);
-        wrapper.set_property(key, value);
+    let receiver = Value::dom_node(node, realm_generation());
+    if let Some(setter) = inherited_prototype_value(node, &setter_key, &receiver)
+        && setter.is_callable()
+    {
+        setter.call(receiver, vec![value]);
         return true;
     }
     element_computed_set(node, key, value)
 }
 
-fn inherited_prototype_value(node: u32, key: &str) -> Value {
-    let prototype = cached_node_prototype(node);
-    prototype
-        .as_object()
-        .map(|object| object.borrow().get_direct(key))
-        .unwrap_or(Value::Undefined)
+// Some(undefined) is an observed accessor/trap result, not a miss. Release
+// object borrows before user code so it can redefine the receiver/prototype.
+fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Option<Value> {
+    let mut current = prototype.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(object) = current.as_object() {
+        if !seen.insert(object.identity()) {
+            return None;
+        }
+        let (proxy, getter, data, accessor, next) = {
+            let object = object.borrow();
+            (
+                object.has_get_trap(),
+                object.own_getter(key),
+                object.own_data(key),
+                object.has_own_property(key),
+                object.get_prototype_of(),
+            )
+        };
+        if proxy {
+            return Some(current.get_property_with_receiver(key, receiver));
+        }
+        if let Some(getter) = getter {
+            return Some(getter.call(receiver.clone(), vec![]));
+        }
+        if let Some(data) = data {
+            // Builtin DOM prototypes have undefined data placeholders; the
+            // bridge computes those properties after a descriptor miss.
+            return (!data.is_undefined()).then_some(data);
+        }
+        if accessor {
+            return Some(Value::Undefined); // setter-only descriptor
+        }
+        current = next;
+    }
+    None
+}
+
+fn inherited_prototype_value(node: u32, key: &str, receiver: &Value) -> Option<Value> {
+    lookup_dom_prototype(&cached_node_prototype(node), key, receiver)
 }
 
 fn cached_node_prototype(node: u32) -> Value {
     thread_local! {
-        static DIV_PROTO: RefCell<Option<Value>> = const { RefCell::new(None) };
-        static OTHER: RefCell<HashMap<(u16, String), Value>> = RefCell::new(HashMap::new());
+        static DIV_PROTO: RefCell<Option<(u32, Value)>> = const { RefCell::new(None) };
+        static OTHER: RefCell<(u32, HashMap<(u16, String), Value>)> =
+            RefCell::new((0, HashMap::new()));
     }
+    // Namespaces/local names choose a different prototype even for identical
+    // tag bytes. Keep those nodes on the ordinary selection path.
+    if get_expando(node, "namespaceURI").is_some() || get_expando(node, "localName").is_some() {
+        return element_prototype(node);
+    }
+    let generation = realm_generation();
     let node_type = dom::node_type(node);
-    // HTML `div` is the create-loop tag. The cached object is the live
-    // prototype, so later writes on it stay visible. A namespaced element
-    // does not use this slot.
-    if node_type == 1 && get_expando(node, "namespaceURI").is_none() && dom::tag_is(node, "div") {
+    if node_type == 1 && dom::tag_is(node, "div") {
         return DIV_PROTO.with(|slot| {
-            if let Some(prototype) = slot.borrow().clone() {
-                return prototype;
+            if let Some((owner, prototype)) = slot.borrow().as_ref()
+                && *owner == generation
+            {
+                return prototype.clone();
             }
             let prototype = element_prototype(node);
-            *slot.borrow_mut() = Some(prototype.clone());
+            *slot.borrow_mut() = Some((generation, prototype.clone()));
             prototype
         });
     }
@@ -1270,11 +1311,18 @@ fn cached_node_prototype(node: u32) -> Value {
     };
     let key = (node_type, tag);
     OTHER.with(|cache| {
-        if let Some(prototype) = cache.borrow().get(&key) {
-            return prototype.clone();
+        {
+            let mut state = cache.borrow_mut();
+            if state.0 != generation {
+                state.1.clear();
+                state.0 = generation;
+            }
+            if let Some(prototype) = state.1.get(&key) {
+                return prototype.clone();
+            }
         }
         let prototype = element_prototype(node);
-        cache.borrow_mut().insert(key, prototype.clone());
+        cache.borrow_mut().1.insert(key, prototype.clone());
         prototype
     })
 }
@@ -3950,8 +3998,10 @@ fn element_dispatch_method(node: u32) -> Value {
                 return wrapper.get_property("dispatchEvent");
             }
         }
-        let inherited = inherited_prototype_value(node, "dispatchEvent");
-        if inherited.is_callable() {
+        let receiver = dom_handle(node);
+        if let Some(inherited) = inherited_prototype_value(node, "dispatchEvent", &receiver)
+            && inherited.is_callable()
+        {
             return inherited;
         }
     }
@@ -3983,24 +4033,30 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
             };
             // Read own state without cloning the wrapper. The borrow ends
             // before any getter or computed callback runs.
-            let (generation, node, own_getter, stored) = {
+            let (generation, node, own_getter, stored, own_accessor, prototype) = {
                 let object = object.borrow();
                 let generation = object.get_direct("__w3cos_realm_generation").to_number() as u32;
                 let node = object.get_direct("__node_id").to_number() as u32;
                 let own_getter = object.own_getter(key);
-                let stored = if own_getter.is_some() {
-                    Value::Undefined
-                } else {
-                    object.get_direct(key)
-                };
-                (generation, node, own_getter, stored)
+                let stored = object.own_data(key);
+                let own_accessor = object.has_own_property(key);
+                let prototype = object.get_prototype_of();
+                (
+                    generation,
+                    node,
+                    own_getter,
+                    stored,
+                    own_accessor,
+                    prototype,
+                )
             };
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
             }
             if key == "dispatchEvent"
                 && own_getter.is_none()
-                && stored.is_undefined()
+                && stored.is_none()
+                && !own_accessor
                 && !DISPATCH_OVERRIDE.with(Cell::get)
             {
                 return element_dispatch_method(node);
@@ -4013,10 +4069,8 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
                     return Value::Undefined;
                 }
             }
-            // 1. JS expandos / bridge-cached sub-objects (style, classList).
-            if let Some(v) = get_expando(node, key) {
-                return v;
-            }
+            // Authored own descriptors win over bridge caches and prototype
+            // properties. An undefined accessor/data result is authoritative.
             // Own accessors shadow prototype data and computed DOM properties.
             // Invoke only after the object borrow has ended, with the real
             // wrapper as receiver; an undefined result is still authoritative.
@@ -4024,8 +4078,17 @@ fn build_element_proxy() -> w3cos_core::ProxyHandler {
                 return getter.call(receiver.clone(), vec![]);
             }
             // 2. Stored props and prototype data (e.g. __node_id, overrides).
-            if !stored.is_undefined() {
+            if let Some(stored) = stored {
                 return stored;
+            }
+            if own_accessor {
+                return Value::Undefined;
+            }
+            if let Some(value) = get_expando(node, key) {
+                return value;
+            }
+            if let Some(value) = lookup_dom_prototype(&prototype, key, receiver) {
+                return value;
             }
             // 3. Computed DOM surface. The prototype miss above is the check
             // that a user override is absent, so a cached builtin is safe.
@@ -21608,6 +21671,91 @@ pub fn reset_bridge() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immediate_inherited_getters_keep_receiver_undefined_and_throw() {
+        setup();
+        let element = document_value().call_method("createElement", vec![Value::string("div")]);
+        let prototype = window_value()
+            .get_property("Element")
+            .get_property("prototype");
+        let expected = element.clone();
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        w3cos_core::class::define_property(
+            &prototype,
+            "nodeType",
+            &Value::object(HashMap::from([
+                (
+                    "get".into(),
+                    Value::function(move |this, _| {
+                        assert!(this.strict_eq(&expected));
+                        seen.set(seen.get() + 1);
+                        this.set_property("getterSide", Value::Number(7.0));
+                        Value::Undefined
+                    }),
+                ),
+                ("configurable".into(), Value::Bool(true)),
+            ])),
+        );
+        assert!(element.get_property("nodeType").is_undefined());
+        let _ = w3cos_core::class::get_prototype_of(&element);
+        assert!(element.get_property("nodeType").is_undefined());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(element.get_property("getterSide"), Value::Number(7.0));
+        w3cos_core::class::define_property(
+            &prototype,
+            "throwProbe",
+            &Value::object(HashMap::from([(
+                "get".into(),
+                Value::function(|_, _| w3cos_core::throw_value(Value::string("prototype-token"))),
+            )])),
+        );
+        let thrown = w3cos_core::catch_js(|| element.get_property("throwProbe")).unwrap_err();
+        assert_eq!(thrown, Value::string("prototype-token"));
+    }
+
+    #[test]
+    fn prototype_cache_respects_new_realm_for_div_and_other_tags() {
+        setup();
+        let prototype = window_value()
+            .get_property("Element")
+            .get_property("prototype");
+        prototype.set_property("realmProbe", Value::Number(9.0));
+        for tag in ["div", "span"] {
+            let element = document_value().call_method("createElement", vec![Value::string(tag)]);
+            assert_eq!(element.get_property("realmProbe"), Value::Number(9.0));
+        }
+        setup();
+        for tag in ["div", "span"] {
+            let element = document_value().call_method("createElement", vec![Value::string(tag)]);
+            assert!(element.get_property("realmProbe").is_undefined());
+        }
+    }
+
+    #[test]
+    fn authored_proxy_prototype_keeps_actual_receiver_and_undefined() {
+        setup();
+        let element = document_value().call_method("createElement", vec![Value::string("div")]);
+        let expected = element.clone();
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        let handler = ProxyBuilder::new()
+            .get(move |_, key, receiver| {
+                assert_eq!(key, "nodeType");
+                assert!(receiver.strict_eq(&expected));
+                seen.set(seen.get() + 1);
+                Value::Undefined
+            })
+            .build();
+        let prototype = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        w3cos_core::class::set_prototype_of(&element, &prototype);
+        assert!(element.get_property("nodeType").is_undefined());
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn html_object_content_document_requires_same_origin_and_is_read_only() {

@@ -200,6 +200,18 @@ impl JsObject {
             .cloned()
     }
 
+    /// Own data only, without invoking accessors, traps, or prototype lookup.
+    pub fn own_data(&self, key: &str) -> Option<Value> {
+        self.properties.get(key).cloned()
+    }
+
+    /// Read-only test used before delegating a prototype lookup to user code.
+    pub fn has_get_trap(&self) -> bool {
+        self.proxy_handler
+            .as_ref()
+            .is_some_and(|handler| handler.get.is_some())
+    }
+
     /// Direct property lookup (no proxy), with prototype chain fallback.
     pub fn get_direct(&self, key: &str) -> Value {
         if let Some(val) = self.properties.get(key) {

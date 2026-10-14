@@ -2035,6 +2035,12 @@ impl Value {
         if let Some(value) = fast_known_collection_key(self, key) {
             return value;
         }
+        self.get_property_with_receiver(key, self)
+    }
+
+    /// Read an object/proxy property while preserving the caller's receiver.
+    /// Used by the DOM bridge when lookup starts on a prototype.
+    pub fn get_property_with_receiver(&self, key: &str, receiver: &Value) -> Value {
         if let Some(node) = self.live_dom_node() {
             if let Some(value) = crate::intrinsics::dom_get(node, key) {
                 return value;
@@ -2063,9 +2069,9 @@ impl Value {
             };
             if let Some((trap, live, target)) = proxy_get {
                 if live {
-                    return trap(self, key, self);
+                    return trap(self, key, receiver);
                 }
-                return trap(&target, key, self);
+                return trap(&target, key, receiver);
             }
             let value = o.borrow().get_direct(key);
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
@@ -2073,9 +2079,9 @@ impl Value {
             } else {
                 let getter = o
                     .borrow()
-                    .get(&format!("__w3cos_getter_{key}"), self)
+                    .get(&format!("__w3cos_getter_{key}"), receiver)
                     .clone();
-                getter.call(self.clone(), vec![])
+                getter.call(receiver.clone(), vec![])
             };
         }
         if let Some(arr) = self.as_array() {
@@ -4130,6 +4136,45 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_receiver_lookup_preserves_undefined_and_proxy_exception() {
+        let receiver = Value::object(HashMap::new());
+        let prototype = Value::object(HashMap::new());
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let expected = receiver.clone();
+        prototype.set_property(
+            "__w3cos_getter_probe",
+            Value::function(move |this, _| {
+                assert!(this.strict_eq(&expected));
+                seen.set(seen.get() + 1);
+                Value::Undefined
+            }),
+        );
+        assert!(
+            prototype
+                .get_property_with_receiver("probe", &receiver)
+                .is_undefined()
+        );
+        assert_eq!(calls.get(), 1);
+        let expected = receiver.clone();
+        let trap = crate::ProxyBuilder::new()
+            .get(move |_, _, actual| {
+                assert!(actual.strict_eq(&expected));
+                actual.set_property("side", Value::Number(7.0));
+                crate::throw_value(Value::string("receiver-token"))
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::new(),
+            trap,
+        ))));
+        let thrown =
+            crate::catch_js(|| proxy.get_property_with_receiver("probe", &receiver)).unwrap_err();
+        assert_eq!(thrown, Value::string("receiver-token"));
+        assert_eq!(receiver.get_property("side"), Value::Number(7.0));
+    }
 
     #[test]
     fn internal_js_string_round_trips_isolated_and_paired_surrogates() {

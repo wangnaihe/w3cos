@@ -4396,42 +4396,23 @@ fn emit_native_sync_loop(
     } else {
         format!("if {condition} {{ break; }}")
     };
-    let guarded = match emit_guarded_append(
-        &body[..body.len() - 1],
-        &body_code,
-        function,
-        factories,
-        module_specifier,
-        type_name,
-        storage,
-        plan,
-        back_edges,
-    )? {
-        some @ Some(_) => some,
-        None => emit_guarded_block(
-            &body[..body.len() - 1],
-            &body_code,
-            function,
-            factories,
-            module_specifier,
-            type_name,
-            storage,
-            plan,
-            back_edges,
-        )?,
-    };
-    let loop_body = if let Some((_, fast)) = &guarded {
-        format!("{header_code}{gate}\n{fast}")
-    } else {
-        format!("{header_code}{gate}\n{body_code}")
-    };
-    if loop_body.contains("continue 'drive") || loop_body.contains("self.block") {
-        return Ok(None);
-    }
-    let (mut hoisted, loop_body) = tighten_native_loop(&loop_body);
-    if let Some((prelude, _)) = &guarded {
-        hoisted.push_str(prelude);
-    }
+    // A sampled shape epoch cannot prove that methods/accessors were still
+    // builtin before entering this loop. Keep ordinary operations until that
+    // proof exists; in particular, body-only reads must stay after the gate.
+    let loop_body = format!("{header_code}{gate}\n{body_code}");
+    // A per-iteration environment replaces its Rc cell. Initializers can also
+    // install a previously missing cell. Neither lookup is invariant.
+    let replaced_bindings = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            Instruction::RefreshBinding { binding }
+            | Instruction::InitializeBinding { binding, .. } => Some(binding.0),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let (hoisted, loop_body) = tighten_native_loop(&loop_body, &replaced_bindings);
     let (mut prologue, loop_body, epilogue) = promote_unboxed_locals(&loop_body)
         .unwrap_or_else(|| (String::new(), loop_body.clone(), String::new()));
     prologue.insert_str(0, &hoisted);
@@ -4446,13 +4427,13 @@ fn emit_native_sync_loop(
 ///
 /// DOM property writes and method calls stay on the ordinary lookup path so
 /// own accessors, prototype overrides, and exceptions still run.
-fn tighten_native_loop(body: &str) -> (String, String) {
+fn tighten_native_loop(body: &str, replaced_bindings: &HashSet<u32>) -> (String, String) {
     let lines: Vec<String> = body
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect();
-    let (hoisted, lines) = hoist_binding_lookups(&lines);
+    let (hoisted, lines) = hoist_binding_lookups(&lines, replaced_bindings);
     let mut out = String::new();
     for line in lines {
         out.push_str(&line);
@@ -4575,7 +4556,10 @@ fn direct_length_test(lines: &[&str], rest: &[&str]) -> Option<String> {
     ))
 }
 
-fn hoist_binding_lookups(lines: &[String]) -> (String, Vec<String>) {
+fn hoist_binding_lookups(
+    lines: &[String],
+    replaced_bindings: &HashSet<u32>,
+) -> (String, Vec<String>) {
     let text = lines.join("\n");
     let mut ids = Vec::new();
     for marker in [
@@ -4591,7 +4575,11 @@ fn hoist_binding_lookups(lines: &[String]) -> (String, Vec<String>) {
                 .take_while(|ch| ch.is_ascii_digit())
                 .collect();
             if !id.is_empty() && text[start + pos + marker.len() + id.len()..].starts_with(')') {
-                if !ids.contains(&id) {
+                if id
+                    .parse::<u32>()
+                    .is_ok_and(|binding| !replaced_bindings.contains(&binding))
+                    && !ids.contains(&id)
+                {
                     ids.push(id.clone());
                 }
             }
@@ -7794,7 +7782,45 @@ fn main() {{
     }
 
     #[test]
-    fn native_dom_loop_with_binding_limit_is_guarded() {
+    fn native_loop_does_not_cache_replaced_capture_cells() {
+        let module = crate::w3ir_lowering::lower_script(
+            "function make() { var refs = []; for (let i = 0; i < 3; i++) { refs.push(function() { return i; }); } return refs; } make;",
+            "app:///fresh-capture-loop.js",
+        ).unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|f| f.name.as_deref() == Some("make"))
+            .unwrap();
+        let refreshed = function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| {
+                if let Instruction::RefreshBinding { binding } = i {
+                    Some(binding.0)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !refreshed.is_empty(),
+            "must cover a real per-iteration environment"
+        );
+        let generated =
+            generate_sync_function_from_module(&module, function, "fresh_capture_aot").unwrap();
+        for id in refreshed {
+            assert!(
+                !generated.contains(&format!("let __w3cos_cb_{id} =")),
+                "a refreshed cell cannot be cached outside the loop: {generated}"
+            );
+        }
+        assert!(generated.contains("let refreshed = binding.borrow().clone()"));
+    }
+
+    #[test]
+    fn native_dom_loop_with_binding_limit_keeps_ordinary_lookup() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
                 "use strict";
@@ -7825,17 +7851,11 @@ fn main() {{
         let generated =
             generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
         assert!(
-            generated.contains("dom_build_guarded")
-                && generated.contains("dom_shape_epoch")
-                && generated.contains("is_undefined()")
+            generated.contains(".call_method(\"createElement\"")
                 && generated.contains("set_property_strict")
-                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;")
-                && generated.contains("dom_intern_prehashed("),
-            "strict create loop should fuse behind the stamp, use the static div id, and intern the class once: {generated}"
-        );
-        assert!(
-            !generated.contains("dom_build_appended"),
-            "unguarded fusion must stay out of the strict loop"
+                && !generated.contains("dom_build_guarded")
+                && !generated.contains("dom_shape_epoch"),
+            "without a pristine proof the loop must use observable operations: {generated}"
         );
     }
 
@@ -7870,12 +7890,8 @@ fn main() {{
             "element create loop should be native: {generated}"
         );
         assert!(
-            generated.contains("dom_shape_epoch") && generated.contains("dom_build_guarded"),
-            "the fused create must be behind a shape stamp: {generated}"
-        );
-        assert!(
-            generated.contains("is_undefined()"),
-            "a stale stamp must fall back to ordinary lookup: {generated}"
+            !generated.contains("dom_build_guarded") && !generated.contains("__w3cos_doc ="),
+            "body reads and operations must not be pulled into an unproven prologue: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"createElement\""),
@@ -7916,7 +7932,7 @@ fn main() {{
     }
 
     #[test]
-    fn native_fixed_block_loop_is_guarded() {
+    fn native_fixed_block_loop_keeps_observable_body() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
                 "use strict";
@@ -7942,11 +7958,12 @@ fn main() {{
         let generated =
             generate_sync_function_from_module(&module, function, "memory_block_aot").unwrap();
         assert!(
-            generated.contains("dom_build_block_guarded")
-                && generated.contains("dom_shape_epoch")
-                && generated.contains("is_undefined()")
-                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;"),
-            "fixed block loop should fuse behind the stamp: {generated}"
+            generated.contains("loop {")
+                && !generated.contains("dom_build_block_guarded")
+                && !generated.contains("dom_shape_epoch")
+                && !generated.contains("let __w3cos_doc =")
+                && !generated.contains("let __w3cos_parent ="),
+            "an unproven fixed-block fusion must keep the observable loop body: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"createElement\"")
@@ -7963,7 +7980,7 @@ fn main() {{
     }
 
     #[test]
-    fn native_fixed_block_module_loop_is_guarded() {
+    fn native_fixed_block_module_loop_keeps_observable_body() {
         let module = crate::w3ir_lowering::lower_module(
             r#"
                 export {};
@@ -7989,11 +8006,12 @@ fn main() {{
             generate_sync_function_from_module(&module, function, "memory_block_module_aot")
                 .unwrap();
         assert!(
-            generated.contains("dom_build_block_guarded")
-                && generated.contains("dom_shape_epoch")
-                && generated.contains("is_undefined()")
-                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;"),
-            "module block loop should fuse behind the stamp: {generated}"
+            generated.contains("loop {")
+                && !generated.contains("dom_build_block_guarded")
+                && !generated.contains("dom_shape_epoch")
+                && !generated.contains("let __w3cos_doc =")
+                && !generated.contains("let __w3cos_parent ="),
+            "an unproven fixed-block fusion must keep the observable loop body: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"createElement\"")
