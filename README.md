@@ -60,6 +60,50 @@ cargo build --release
 ./showcase    # Opens a native window — no browser involved
 ```
 
+## AI Bridge
+
+The shell can listen on loopback for an agent. Permissions come from
+`W3COS_AI_PERMISSIONS` (`observer` when unset). The bearer token is
+`W3COS_AI_TOKEN` or `--ai-token`.
+
+```bash
+cargo build -p w3cos-shell --no-default-features --features cpu-render,ai-bridge
+W3COS_AI_TOKEN=demo-token ./target/debug/w3cos-shell --ai-port 9222 --ai-token demo-token
+
+# stdio MCP adapter. It only forwards to that listener.
+W3COS_AI_PORT=9222 W3COS_AI_TOKEN=demo-token cargo run -p w3cos-ai-bridge --bin w3cos-ai-mcp
+```
+
+The shell intent bar uses the L0 rule table first. Phrases that miss it can
+fall through to a local L1 synonym matcher (no model, no network).
+`W3COS_L1=0` keeps the rule table only. An L1 hit shows an `L1 本地 Local`
+badge on the confirm card. The task center starts locked; the orange
+`解锁才能执行` button unlocks the local stub.
+
+### Xvfb demo (Codespaces or any Linux VM)
+
+The shell is a native window, not a browser page. Rust 1.85+ is required
+(`edition = "2024"`). In a Codespace:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y xvfb xdotool libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev
+cargo build -p w3cos-shell --no-default-features --features cpu-render,ai-bridge
+Xvfb :99 -screen 0 1280x800x24 -ac &
+export DISPLAY=:99 WINIT_UNIX_BACKEND=x11
+mkdir -p /tmp/w3cos-receipts
+W3COS_RECEIPT_DIR=/tmp/w3cos-receipts ./target/debug/w3cos-shell --ai-port 9222 --ai-token demo-token
+```
+
+Type `file manager` and press Propose. That phrase misses the rule table, so
+the confirm card is the L1 badge. Leave `W3COS_AI_PERMISSIONS` unset; the HTTP
+listener stays `observer`.
+
+`a11y_index` and `screenshot_annotated` are readable by an observer.
+`propose_intent`, `confirm_intent`, `click`, and `type` use the bridge's
+interaction permission, so an observer token is rejected before the shell runs
+the command.
+
 ## Mobile (Android / iOS / HarmonyOS)
 
 Native **shell + AOT app** — generic platform, no product-specific examples.

@@ -4,33 +4,297 @@
 //! Click an app icon → the app UI replaces the desktop area.
 //! Click "W3C Apps" in taskbar → return to desktop.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
+use w3cos_ai_bridge::identity::LocalIdentityStub;
+use w3cos_ai_bridge::intent::{
+    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
+    INTENT_INPUT_PLACEHOLDER,
+};
+use w3cos_ai_bridge::permissions::AgentPermissions;
+use w3cos_runtime::state;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
 use w3cos_std::{Component, EventAction, Style};
 
+const APP_SIGNAL: usize = 0;
+const NIGHT_SIGNAL: usize = 1;
+const PHASE_SIGNAL: usize = 2;
+const CONTEXT_SIGNAL: usize = 3;
+const UNLOCKED_SIGNAL: usize = 4;
+const TASKS_SIGNAL: usize = 10;
+const DRAFT_SIGNAL: usize = 5;
+const SUMMARY_SIGNAL: usize = 6;
+const IMPACT_SIGNAL: usize = 7;
+const NOTICE_SIGNAL: usize = 8;
+const RECEIPT_SIGNAL: usize = 9;
+const STORAGE_SIGNAL: usize = 11;
+const SUBJECT_SIGNAL: usize = 12;
+const ENROLL_SIGNAL: usize = 13;
+const TIER_SIGNAL: usize = 14;
+
+const OP_PROPOSE: u8 = 1;
+const OP_CONFIRM: u8 = 2;
+const OP_CANCEL: u8 = 3;
+const OP_REVOKE: u8 = 4;
+const OP_RESTORE: u8 = 5;
+const OP_LOCK: u8 = 6;
+const OP_UNLOCK: u8 = 7;
+const OP_CHIP_FILES: u8 = 10;
+const OP_CHIP_NIGHT: u8 = 11;
+const OP_CHIP_APPS: u8 = 12;
+const OP_CHIP_CONTEXT: u8 = 13;
+const OP_TOGGLE_TASKS: u8 = 14;
+const OP_CHIP_TERMINAL: u8 = 15;
+const OP_CHIP_SETTINGS: u8 = 16;
+const OP_ENROLL: u8 = 17;
+
 fn main() {
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
 
+    let mut ai_port = None;
+    let mut ai_token = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--ai-port" {
-            if let Some(port_str) = args.next() {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    w3cos_runtime::enable_ai_bridge(port);
-                    eprintln!("[AI Bridge] Will start on port {port}");
-                }
-            }
+        match arg.as_str() {
+            "--ai-port" => ai_port = args.next(),
+            "--ai-token" => ai_token = args.next(),
+            _ => {}
         }
     }
+    if let Some(token) = ai_token.filter(|token| !token.is_empty()) {
+        // The process is still single-threaded here. The bridge reads this
+        // when the window starts the loopback listener.
+        unsafe { std::env::set_var("W3COS_AI_TOKEN", token) };
+    }
+    if let Some(port_str) = ai_port
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        w3cos_runtime::enable_ai_bridge(port);
+        eprintln!("[AI Bridge] Will start on port {port}");
+    }
 
+    state::set_invoke_hook(on_shell_intent);
+    w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     w3cos_runtime::run_app(build_shell).expect("W3C OS Shell crashed");
 }
 
-const APP_SIGNAL: usize = 0;
+fn bridge_propose(utterance: &str) -> String {
+    on_shell_intent(OP_PROPOSE, utterance);
+    let summary = state::get_signal_text(SUMMARY_SIGNAL);
+    if !summary.is_empty() {
+        return summary;
+    }
+    state::get_signal_text(NOTICE_SIGNAL)
+}
+
+fn bridge_confirm() -> String {
+    on_shell_intent(OP_CONFIRM, "");
+    let notice = state::get_signal_text(NOTICE_SIGNAL);
+    if !notice.is_empty() {
+        return notice;
+    }
+    state::get_signal_text(SUMMARY_SIGNAL)
+}
+
+thread_local! {
+    static SESSION: RefCell<Option<IntentSession>> = const { RefCell::new(None) };
+    static SESSION_BOOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn ensure_shell_signals() {
+    state::ensure_signals(|| {
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(1);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("No receipts yet.");
+        let _ = state::create_signal(1);
+        let _ = state::create_text_signal("memory");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+    });
+}
+
+fn with_session(body: impl FnOnce(&mut IntentSession)) {
+    SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(IntentSession::open_local(
+                AgentPermissions::interactive(),
+                LocalIdentityStub::new(),
+            ));
+        }
+        body(slot.as_mut().expect("shell intent session"));
+    });
+}
+
+fn boot_session_once() {
+    let already = SESSION_BOOTED.with(|booted| {
+        let seen = booted.get();
+        booted.set(true);
+        seen
+    });
+    if already {
+        return;
+    }
+    with_session(|session| sync_session(session, 0, ""));
+}
+
+fn on_shell_intent(code: u8, draft: &str) {
+    if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+        eprintln!("[W3C OS][INTENT] code={code} draft={draft:?}");
+    }
+    ensure_shell_signals();
+    if code == OP_TOGGLE_TASKS {
+        let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);
+        state::set_signal(TASKS_SIGNAL, next);
+        return;
+    }
+    let ctx = ShellContext {
+        app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
+        night: state::get_signal(NIGHT_SIGNAL) != 0,
+    };
+    with_session(|session| match code {
+        OP_PROPOSE => apply_propose(session, draft, &ctx),
+        OP_CHIP_FILES => apply_propose(session, "open files", &ctx),
+        OP_CHIP_NIGHT => apply_propose(session, "night mode", &ctx),
+        OP_CHIP_APPS => apply_propose(session, "list apps", &ctx),
+        OP_CHIP_CONTEXT => apply_propose(session, "where am i", &ctx),
+        OP_CHIP_TERMINAL => apply_propose(session, "打开终端", &ctx),
+        OP_CHIP_SETTINGS => apply_propose(session, "打开设置", &ctx),
+        OP_CONFIRM => apply_confirm(session, &ctx),
+        OP_CANCEL => {
+            session.cancel();
+            sync_session(session, 0, "");
+        }
+        OP_REVOKE => {
+            session.revoke_context();
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                "上下文已隐藏。Context hidden.",
+            );
+        }
+        OP_RESTORE => {
+            session.restore_context();
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                "上下文已恢复。Context shared.",
+            );
+        }
+        OP_LOCK => {
+            session.lock_identity();
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                "身份已锁定。Identity locked.",
+            );
+        }
+        OP_UNLOCK => {
+            if session.unlock_identity_stub("stub-passkey") {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    "已解锁（不是 passkey）。Unlocked stub.",
+                );
+            }
+        }
+        OP_ENROLL => {
+            let notice = if session.begin_passkey_enrollment().is_some() {
+                "已生成注册挑战。还没有验证断言。Challenge ready."
+            } else {
+                "挑战没有生成。Challenge was not created."
+            };
+            sync_session(session, state::get_signal(PHASE_SIGNAL), notice);
+        }
+        _ => {}
+    });
+}
+
+fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContext) {
+    state::set_text_signal(DRAFT_SIGNAL, utterance);
+    match session.propose(utterance, ctx) {
+        ProposeResult::Confirm(proposal) => {
+            state::set_text_signal(SUMMARY_SIGNAL, proposal.summary);
+            state::set_text_signal(IMPACT_SIGNAL, proposal.impact);
+            state::set_text_signal(TIER_SIGNAL, tier_name(proposal.tier));
+            sync_session(session, 1, "");
+        }
+        ProposeResult::Unrecognized { receipt } => {
+            state::set_text_signal(SUMMARY_SIGNAL, "");
+            state::set_text_signal(IMPACT_SIGNAL, "");
+            state::set_text_signal(TIER_SIGNAL, "");
+            sync_session(session, 2, &receipt.outcome);
+        }
+    }
+}
+
+fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
+    let Some(effect) = session.confirm(ctx, now_ms()) else {
+        sync_session(session, 0, "");
+        return;
+    };
+    apply_effect(&effect);
+    sync_session(session, 2, &effect.receipt.outcome);
+}
+
+fn tier_name(tier: IntentTier) -> &'static str {
+    match tier {
+        IntentTier::L1 => "L1",
+        IntentTier::L0 => "L0",
+        IntentTier::Unspecified => "",
+    }
+}
+
+fn apply_effect(effect: &ExecuteResult) {
+    if let Some(app) = effect.navigate {
+        state::set_signal(APP_SIGNAL, app.signal_value());
+    }
+    if let Some(night) = effect.night {
+        state::set_signal(NIGHT_SIGNAL, i64::from(night));
+    }
+}
+
+fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
+    state::set_signal(PHASE_SIGNAL, phase);
+    state::set_signal(CONTEXT_SIGNAL, i64::from(session.context_shared()));
+    state::set_signal(UNLOCKED_SIGNAL, i64::from(session.identity_unlocked()));
+    state::set_text_signal(NOTICE_SIGNAL, notice);
+    state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(12));
+    state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
+    state::set_text_signal(SUBJECT_SIGNAL, session.actor());
+    state::set_text_signal(ENROLL_SIGNAL, session.enrollment_copy());
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn invoke(code: u8) -> EventAction {
+    EventAction::Invoke {
+        code,
+        input_placeholder: String::new(),
+    }
+}
 
 fn build_shell() -> Component {
-    let _ = w3cos_runtime::state::create_signal(0);
-    let current = w3cos_runtime::state::get_signal(APP_SIGNAL);
+    ensure_shell_signals();
+    boot_session_once();
+    let current = state::get_signal(APP_SIGNAL);
+    let night = state::get_signal(NIGHT_SIGNAL) != 0;
+    let tasks_open = state::get_signal(TASKS_SIGNAL) != 0;
 
     let content = match current {
         0 => build_desktop(),
@@ -47,11 +311,28 @@ fn build_shell() -> Component {
         Style {
             width: Dimension::Vw(100.0),
             height: Dimension::Vh(100.0),
-            background: Color::from_hex("#0a0a14"),
+            background: Color::from_hex(if night { "#15202c" } else { "#1a2836" }),
             gap: 0.0,
             ..Style::default()
         },
-        vec![content, build_taskbar(current)],
+        vec![
+            build_context_header(current, night),
+            build_intent_bar(),
+            Component::row(
+                Style {
+                    flex_grow: 1.0,
+                    gap: 0.0,
+                    align_items: AlignItems::Stretch,
+                    ..Style::default()
+                },
+                if tasks_open {
+                    vec![content, build_task_center()]
+                } else {
+                    vec![content]
+                },
+            ),
+            build_taskbar(current),
+        ],
     )
 }
 
@@ -60,17 +341,29 @@ fn build_shell() -> Component {
 // ==========================================================================
 
 fn build_desktop() -> Component {
+    let night = state::get_signal(NIGHT_SIGNAL) != 0;
+    let mut children = vec![build_desktop_icons(), build_system_info(), build_branding()];
+    if night {
+        children.push(Component::text(
+            "Night mode is on",
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#a29bfe"),
+                ..Style::default()
+            },
+        ));
+    }
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0f1923"),
+            background: Color::from_hex(if night { "#1a3048" } else { "#24506e" }),
             padding: Edges::all(60.0),
             gap: 40.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
             ..Style::default()
         },
-        vec![build_desktop_icons(), build_system_info(), build_branding()],
+        children,
     )
 }
 
@@ -151,7 +444,7 @@ fn info_card(title: &str, value: &str, accent: &str) -> Component {
     Component::column(
         Style {
             padding: Edges::all(20.0),
-            background: Color::from_hex("#16162a"),
+            background: Color::from_hex("#2c4158"),
             border_radius: 12.0,
             gap: 8.0,
             min_width: Dimension::Px(160.0),
@@ -163,7 +456,7 @@ fn info_card(title: &str, value: &str, accent: &str) -> Component {
                 title,
                 Style {
                     font_size: 13.0,
-                    color: Color::from_hex("#808090"),
+                    color: Color::from_hex("#d5dee8"),
                     ..Style::default()
                 },
             ),
@@ -299,8 +592,8 @@ fn build_files_app() -> Component {
 }
 
 fn sidebar_item(name: &str, active: bool) -> Component {
-    let bg = if active { "#6c5ce7" } else { "#10101c" };
-    let color = if active { "#ffffff" } else { "#a0a0c0" };
+    let bg = if active { "#3d5570" } else { "#243447" };
+    let color = if active { "#f4f7fb" } else { "#d5dee8" };
     Component::text(
         name,
         Style {
@@ -370,129 +663,70 @@ fn build_terminal_app() -> Component {
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0c0c14"),
+            background: Color::from_hex("#24384a"),
             gap: 0.0,
             ..Style::default()
         },
         vec![
-            app_titlebar("Terminal", "#2ecc71"),
+            app_titlebar("终端 Terminal", "#1c8f62"),
             Component::column(
                 Style {
                     flex_grow: 1.0,
                     padding: Edges::all(16.0),
-                    gap: 2.0,
-                    overflow: Overflow::Scroll,
+                    gap: 10.0,
                     ..Style::default()
                 },
                 vec![
                     Component::text(
-                        "W3C OS Terminal v0.1.0",
+                        "本机终端占位。命令还不会执行。",
                         Style {
-                            font_size: 14.0,
-                            color: Color::from_hex("#00b894"),
+                            font_size: 16.0,
+                            font_weight: 700,
+                            color: Color::from_hex("#f4f7fb"),
                             ..Style::default()
                         },
                     ),
                     Component::text(
-                        "Type 'help' for available commands.",
+                        "Local terminal placeholder. Typed commands stay on this page.",
                         Style {
                             font_size: 13.0,
-                            color: Color::from_hex("#606080"),
+                            color: Color::from_hex("#d5dee8"),
                             ..Style::default()
                         },
                     ),
                     Component::text(
-                        "",
+                        "w3cos shell ready",
                         Style {
                             font_size: 13.0,
-                            ..Style::default()
-                        },
-                    ),
-                    term_prompt("cargo build --release"),
-                    Component::text(
-                        "   Compiling w3cos-std v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "   Compiling w3cos-dom v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "   Compiling w3cos-runtime v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "   Compiling w3cos-shell v0.1.0",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "    Finished release [optimized] in 42.3s",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#00b894"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "",
-                        Style {
-                            font_size: 13.0,
-                            ..Style::default()
-                        },
-                    ),
-                    term_prompt("./target/release/w3cos-shell"),
-                    Component::text(
-                        "W3C OS Desktop Shell v0.1.0 -- starting...",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "",
-                        Style {
-                            font_size: 13.0,
+                            color: Color::from_hex("#b7f0d8"),
                             ..Style::default()
                         },
                     ),
                     Component::row(
                         Style {
-                            gap: 0.0,
+                            gap: 8.0,
+                            padding: Edges::xy(12.0, 10.0),
+                            background: Color::from_hex("#1b2c3e"),
+                            border_radius: 8.0,
+                            align_items: AlignItems::Center,
                             ..Style::default()
                         },
                         vec![
                             Component::text(
-                                "user@w3cos:~$ ",
+                                "user@w3cos:~$",
                                 Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#6c5ce7"),
+                                    font_size: 14.0,
+                                    color: Color::from_hex("#9eb6ff"),
                                     ..Style::default()
                                 },
                             ),
                             Component::text_input(
                                 "",
-                                "",
+                                "help",
                                 Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#d0d0e0"),
-                                    background: Color::from_hex("#0c0c14"),
+                                    font_size: 14.0,
+                                    color: Color::from_hex("#f4f7fb"),
+                                    background: Color::from_hex("#1b2c3e"),
                                     flex_grow: 1.0,
                                     ..Style::default()
                                 },
@@ -505,47 +739,51 @@ fn build_terminal_app() -> Component {
     )
 }
 
-fn term_prompt(cmd: &str) -> Component {
-    Component::row(
-        Style {
-            gap: 0.0,
-            ..Style::default()
-        },
-        vec![
-            Component::text(
-                "user@w3cos:~$ ",
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#6c5ce7"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                cmd,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
-}
-
 // ==========================================================================
 // Settings App
 // ==========================================================================
 
 fn build_settings_app() -> Component {
+    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
+        "开 On"
+    } else {
+        "关 Off"
+    };
+    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
+    let storage_label = if storage_owned.is_empty() {
+        "memory".to_string()
+    } else {
+        storage_owned
+    };
+    let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
+    let bridge = match bridge.trim() {
+        "" | "observer" => "observer",
+        "interactive" => "interactive",
+        "system" => "system",
+        _ => "observer",
+    };
+    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+    let subject_label = if subject_owned.is_empty() {
+        LocalIdentityStub::SUBJECT.to_string()
+    } else {
+        subject_owned
+    };
+    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
+    let enroll_label = if enroll_owned.is_empty() {
+        "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
+            .to_string()
+    } else {
+        enroll_owned
+    };
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0f0f1a"),
+            background: Color::from_hex("#24384a"),
             gap: 0.0,
             ..Style::default()
         },
         vec![
-            app_titlebar("Settings", "#9b59b6"),
+            app_titlebar("设置 Settings", "#5b4fe0"),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -553,48 +791,59 @@ fn build_settings_app() -> Component {
                     ..Style::default()
                 },
                 vec![
-                    // Settings sidebar
                     Component::column(
                         Style {
                             width: Dimension::Px(200.0),
-                            background: Color::from_hex("#10101c"),
+                            background: Color::from_hex("#1b2c3e"),
                             padding: Edges::all(12.0),
                             gap: 4.0,
                             ..Style::default()
                         },
                         vec![
-                            sidebar_item("Display", true),
-                            sidebar_item("Network", false),
-                            sidebar_item("Sound", false),
-                            sidebar_item("AI Agents", false),
-                            sidebar_item("About", false),
+                            sidebar_item("本机 Local", true),
+                            sidebar_item("身份 Identity", false),
+                            sidebar_item("桥接 Bridge", false),
                         ],
                     ),
-                    // Settings content
                     Component::column(
                         Style {
                             flex_grow: 1.0,
-                            padding: Edges::all(24.0),
-                            gap: 20.0,
+                            padding: Edges::all(20.0),
+                            gap: 12.0,
                             ..Style::default()
                         },
                         vec![
                             Component::text(
-                                "Display Settings",
+                                "本机设置 · Local preferences",
                                 Style {
-                                    font_size: 20.0,
-                                    color: Color::from_hex("#f0f0ff"),
+                                    font_size: 18.0,
+                                    color: Color::from_hex("#f4f7fb"),
                                     font_weight: 700,
                                     ..Style::default()
                                 },
                             ),
-                            settings_row("Theme", "Dark"),
-                            settings_row("Font Size", "14px"),
-                            settings_row("Resolution", "1920 x 1080"),
-                            settings_row("Scale", "100%"),
-                            settings_row("Refresh Rate", "60 Hz"),
-                            settings_toggle("Enable Animations", true),
-                            settings_toggle("Reduce Motion", false),
+                            Component::text(
+                                "没有账号，也没有链。WebAuthn 仪式还没做。",
+                                Style {
+                                    font_size: 13.0,
+                                    color: Color::from_hex("#d5dee8"),
+                                    ..Style::default()
+                                },
+                            ),
+                            settings_row("主体 Subject", &subject_label),
+                            Component::text(
+                                enroll_label,
+                                Style {
+                                    font_size: 13.0,
+                                    color: Color::from_hex("#d5dee8"),
+                                    ..Style::default()
+                                },
+                            ),
+                            chrome_button("生成注册挑战 Challenge", OP_ENROLL, "#3d5570"),
+                            settings_row("身份 Identity", "PBKDF2 · not a passkey"),
+                            settings_row("夜间模式 Night", night),
+                            settings_row("AI 权限 Bridge", bridge),
+                            settings_row("收据 Receipts", &storage_label),
                         ],
                     ),
                 ],
@@ -607,7 +856,7 @@ fn settings_row(label: &str, value: &str) -> Component {
     Component::row(
         Style {
             padding: Edges::all(14.0),
-            background: Color::from_hex("#16162a"),
+            background: Color::from_hex("#31475e"),
             border_radius: 8.0,
             justify_content: JustifyContent::SpaceBetween,
             align_items: AlignItems::Center,
@@ -618,7 +867,7 @@ fn settings_row(label: &str, value: &str) -> Component {
                 label,
                 Style {
                     font_size: 14.0,
-                    color: Color::from_hex("#d0d0e0"),
+                    color: Color::from_hex("#f4f7fb"),
                     ..Style::default()
                 },
             ),
@@ -626,41 +875,7 @@ fn settings_row(label: &str, value: &str) -> Component {
                 value,
                 Style {
                     font_size: 14.0,
-                    color: Color::from_hex("#6c5ce7"),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
-}
-
-fn settings_toggle(label: &str, on: bool) -> Component {
-    let indicator = if on { "[ON]" } else { "[OFF]" };
-    let color = if on { "#00b894" } else { "#808090" };
-    Component::row(
-        Style {
-            padding: Edges::all(14.0),
-            background: Color::from_hex("#16162a"),
-            border_radius: 8.0,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            ..Style::default()
-        },
-        vec![
-            Component::text(
-                label,
-                Style {
-                    font_size: 14.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                indicator,
-                Style {
-                    font_size: 14.0,
-                    color: Color::from_hex(color),
-                    font_weight: 700,
+                    color: Color::from_hex("#ffe08a"),
                     ..Style::default()
                 },
             ),
@@ -669,214 +884,472 @@ fn settings_toggle(label: &str, on: bool) -> Component {
 }
 
 // ==========================================================================
-// AI Agent App
+// Chrome: context header, intent bar, and the agent task center.
+// Matching runs in the invoke hook, not while this tree is built.
+// ==========================================================================
+
+fn ink() -> Color {
+    Color::from_hex("#f4f7fb")
+}
+
+fn muted_ink() -> Color {
+    Color::from_hex("#d5dee8")
+}
+
+fn build_context_header(current: i64, night: bool) -> Component {
+    let shared = state::get_signal(CONTEXT_SIGNAL) != 0;
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let app = if shared {
+        ShellApp::from_signal(current).bilingual()
+    } else {
+        "已隐藏 Hidden"
+    };
+    Component::row(
+        Style {
+            padding: Edges::xy(16.0, 8.0),
+            gap: 8.0,
+            background: Color::from_hex("#24384c"),
+            align_items: AlignItems::Center,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                "上下文 Context",
+                Style {
+                    font_size: 13.0,
+                    font_weight: 700,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ),
+            chrome_button(
+                if shared {
+                    format!("{app}  ×")
+                } else {
+                    "恢复上下文 Restore".to_string()
+                },
+                if shared { OP_REVOKE } else { OP_RESTORE },
+                "#3d5570",
+            ),
+            Component::text(
+                if night {
+                    "夜间 开 Night on"
+                } else {
+                    "夜间 关 Night off"
+                },
+                Style {
+                    font_size: 12.0,
+                    color: muted_ink(),
+                    background: Color::from_hex("#31475e"),
+                    border_radius: 8.0,
+                    padding: Edges::xy(10.0, 6.0),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                if unlocked {
+                    "已解锁 Unlocked"
+                } else {
+                    "已锁定 Locked"
+                },
+                Style {
+                    font_size: 12.0,
+                    color: muted_ink(),
+                    background: Color::from_hex("#31475e"),
+                    border_radius: 8.0,
+                    padding: Edges::xy(10.0, 6.0),
+                    ..Style::default()
+                },
+            ),
+            chrome_button(
+                if state::get_signal(TASKS_SIGNAL) != 0 {
+                    "收起任务 Hide"
+                } else {
+                    "任务 Tasks"
+                },
+                OP_TOGGLE_TASKS,
+                "#3d5570",
+            ),
+            Component::text(
+                "实时 Live",
+                Style {
+                    font_size: 12.0,
+                    color: Color::from_hex("#b7f0d8"),
+                    ..Style::default()
+                },
+            ),
+        ],
+    )
+}
+
+fn build_intent_bar() -> Component {
+    let phase = state::get_signal(PHASE_SIGNAL);
+    let mut input_style = Style {
+        flex_grow: 1.0,
+        font_size: 15.0,
+        color: Color::from_hex("#1a2836"),
+        background: Color::from_hex("#f4f7fb"),
+        border_radius: 8.0,
+        padding: Edges::xy(12.0, 8.0),
+        ..Style::default()
+    };
+    input_style.custom_properties = Some(HashMap::from([(
+        "--w3cos-intent-submit".to_string(),
+        OP_PROPOSE.to_string(),
+    )]));
+    let mut rows = vec![
+        Component::row(
+            Style {
+                gap: 8.0,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![
+                Component::text_input(
+                    state::get_signal_text(DRAFT_SIGNAL),
+                    INTENT_INPUT_PLACEHOLDER,
+                    input_style,
+                ),
+                chrome_button("提议 Propose", OP_PROPOSE, "#5b4fe0"),
+            ],
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![
+                chrome_button("打开文件 Files", OP_CHIP_FILES, "#3d5570"),
+                chrome_button("打开终端 Terminal", OP_CHIP_TERMINAL, "#3d5570"),
+                chrome_button("打开设置 Settings", OP_CHIP_SETTINGS, "#3d5570"),
+                chrome_button("夜间模式 Night", OP_CHIP_NIGHT, "#3d5570"),
+                chrome_button("应用列表 Apps", OP_CHIP_APPS, "#3d5570"),
+                chrome_button("我在哪 Where", OP_CHIP_CONTEXT, "#3d5570"),
+            ],
+        ),
+    ];
+    if phase == 1 {
+        rows.push(confirm_card());
+    } else if phase == 2 {
+        let notice = state::get_signal_text(NOTICE_SIGNAL);
+        if !notice.is_empty() {
+            rows.push(result_card(&notice));
+        }
+    }
+    Component::column(
+        Style {
+            padding: Edges::xy(16.0, 10.0),
+            gap: 8.0,
+            background: Color::from_hex("#1e3144"),
+            ..Style::default()
+        },
+        rows,
+    )
+}
+
+fn confirm_card() -> Component {
+    let mut rows = Vec::new();
+    if state::get_signal_text(TIER_SIGNAL) == "L1" {
+        rows.push(Component::row(
+            Style {
+                padding: Edges::xy(8.0, 4.0),
+                background: Color::from_hex("#9a3412"),
+                border_radius: 6.0,
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "L1 本地 Local",
+                Style {
+                    font_size: 12.0,
+                    font_weight: 700,
+                    color: Color::WHITE,
+                    ..Style::default()
+                },
+            )],
+        ));
+    }
+    rows.push(Component::text(
+        "确认后才会执行 · Confirm to run",
+        Style {
+            font_size: 12.0,
+            font_weight: 700,
+            color: Color::from_hex("#ffe08a"),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        state::get_signal_text(SUMMARY_SIGNAL),
+        Style {
+            font_size: 16.0,
+            font_weight: 700,
+            color: ink(),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        state::get_signal_text(IMPACT_SIGNAL),
+        Style {
+            font_size: 13.0,
+            color: muted_ink(),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            ..Style::default()
+        },
+        vec![
+            chrome_button("确认 Confirm", OP_CONFIRM, "#1c8f62"),
+            chrome_button("取消 Cancel", OP_CANCEL, "#3d5570"),
+        ],
+    ));
+    Component::column(
+        Style {
+            gap: 6.0,
+            padding: Edges::all(12.0),
+            background: Color::from_hex("#31475e"),
+            border_radius: 8.0,
+            ..Style::default()
+        },
+        rows,
+    )
+}
+
+fn result_card(notice: &str) -> Component {
+    Component::row(
+        Style {
+            gap: 8.0,
+            padding: Edges::xy(12.0, 8.0),
+            background: Color::from_hex("#31475e"),
+            border_radius: 8.0,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                format!("结果 Result · {notice}"),
+                Style {
+                    font_size: 13.0,
+                    color: ink(),
+                    flex_grow: 1.0,
+                    ..Style::default()
+                },
+            ),
+            chrome_button("关闭 Close", OP_CANCEL, "#3d5570"),
+        ],
+    )
+}
+
+fn build_task_center() -> Component {
+    let phase = state::get_signal(PHASE_SIGNAL);
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let (status, status_color) = match phase {
+        1 => ("等待确认 Awaiting confirm", "#ffe08a"),
+        2 => ("已完成 Done", "#b7f0d8"),
+        _ => ("空闲 Idle", "#d5dee8"),
+    };
+    let mut body = vec![
+        Component::text(
+            "任务中心 Tasks",
+            Style {
+                font_size: 16.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
+                "本地 L0/L1 · 无模型 · 加密文件"
+            } else {
+                "本地 L0/L1 · 无模型 · 仅内存"
+            },
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            status,
+            Style {
+                font_size: 13.0,
+                font_weight: 700,
+                color: Color::from_hex(status_color),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            {
+                let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+                let subject_label = if subject_owned.is_empty() {
+                    LocalIdentityStub::SUBJECT.to_string()
+                } else {
+                    subject_owned
+                };
+                format!(
+                    "{subject_label} · {} · 口令经 KDF 保存，还不是 passkey",
+                    if unlocked {
+                        "stub unlocked"
+                    } else {
+                        "locked"
+                    }
+                )
+            },
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+    ];
+    if !unlocked {
+        body.push(Component::text(
+            "已锁定。确认前请先解锁。Locked — unlock before confirm.",
+            Style {
+                font_size: 13.0,
+                font_weight: 700,
+                color: Color::from_hex("#ffe08a"),
+                ..Style::default()
+            },
+        ));
+    }
+    body.push(chrome_button(
+        if unlocked {
+            "锁定 Lock"
+        } else {
+            "解锁才能执行 Unlock to run"
+        },
+        if unlocked { OP_LOCK } else { OP_UNLOCK },
+        if unlocked { "#3d5570" } else { "#9a3412" },
+    ));
+    body.push(Component::text(
+        "收据 Receipts",
+        Style {
+            font_size: 14.0,
+            font_weight: 700,
+            color: ink(),
+            ..Style::default()
+        },
+    ));
+    let log = state::get_signal_text(RECEIPT_SIGNAL);
+    if log.is_empty() || log == "No receipts yet." {
+        body.push(Component::text(
+            "还没有收据。No receipts yet.",
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+    } else {
+        for line in log.lines().take(8) {
+            body.push(Component::text(
+                line,
+                Style {
+                    font_size: 12.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
+    }
+    if phase == 1 {
+        body.push(chrome_button("停止 Stop", OP_CANCEL, "#a33b45"));
+    }
+    Component::column(
+        Style {
+            width: Dimension::Px(300.0),
+            padding: Edges::all(14.0),
+            gap: 8.0,
+            background: Color::from_hex("#1b2c3e"),
+            ..Style::default()
+        },
+        body,
+    )
+}
+
+fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Component {
+    let action = if code == OP_PROPOSE {
+        EventAction::Invoke {
+            code,
+            input_placeholder: INTENT_INPUT_PLACEHOLDER.to_string(),
+        }
+    } else {
+        invoke(code)
+    };
+    Component::button_with_click(
+        label,
+        Style {
+            background: Color::from_hex(background),
+            border_radius: 8.0,
+            font_size: 13.0,
+            font_weight: 700,
+            color: Color::WHITE,
+            padding: Edges::xy(12.0, 8.0),
+            ..Style::default()
+        },
+        action,
+    )
+}
+
+// ==========================================================================
+// AI Agent window — the task center stays beside whatever page is open.
 // ==========================================================================
 
 fn build_ai_agent_app() -> Component {
     Component::column(
         Style {
             flex_grow: 1.0,
-            background: Color::from_hex("#0a0a12"),
+            background: Color::from_hex("#24506e"),
             gap: 0.0,
             ..Style::default()
         },
         vec![
-            app_titlebar("AI Agent", "#e74c3c"),
-            Component::row(
+            app_titlebar("助手 Agent", "#e07a5f"),
+            Component::column(
                 Style {
                     flex_grow: 1.0,
-                    gap: 0.0,
-                    ..Style::default()
-                },
-                vec![
-                    // Agent sidebar
-                    Component::column(
-                        Style {
-                            width: Dimension::Px(220.0),
-                            background: Color::from_hex("#10101c"),
-                            padding: Edges::all(12.0),
-                            gap: 8.0,
-                            ..Style::default()
-                        },
-                        vec![
-                            Component::text(
-                                "ACTIVE AGENTS",
-                                Style {
-                                    font_size: 11.0,
-                                    color: Color::from_hex("#505070"),
-                                    font_weight: 700,
-                                    ..Style::default()
-                                },
-                            ),
-                            agent_card(
-                                "Code Agent",
-                                "Running",
-                                "#00b894",
-                                "Writing filesystem module...",
-                            ),
-                            agent_card("Review Agent", "Waiting", "#fdcb6e", "Queued: PR #42"),
-                            agent_card("Test Agent", "Running", "#00b894", "47/52 tests passed"),
-                        ],
-                    ),
-                    // Chat area
-                    Component::column(
-                        Style {
-                            flex_grow: 1.0,
-                            padding: Edges::all(20.0),
-                            gap: 16.0,
-                            ..Style::default()
-                        },
-                        vec![
-                            Component::text(
-                                "Agent Conversation",
-                                Style {
-                                    font_size: 18.0,
-                                    color: Color::from_hex("#f0f0ff"),
-                                    font_weight: 700,
-                                    ..Style::default()
-                                },
-                            ),
-                            chat_msg(
-                                "System",
-                                "Agent connected. DOM access granted (Layer 1 + 2). Permission: interactive.",
-                                "#141428",
-                                "#606080",
-                            ),
-                            chat_msg(
-                                "Code Agent",
-                                "I can see 47 DOM elements, 12 interactive buttons, 3 text inputs. All elements properly labeled in the a11y tree.",
-                                "#1c1c34",
-                                "#6c5ce7",
-                            ),
-                            chat_msg(
-                                "You",
-                                "Build a file manager with tree view sidebar.",
-                                "#6c5ce7",
-                                "#ffffff",
-                            ),
-                            chat_msg(
-                                "Code Agent",
-                                "Creating component tree via DOM API... 24 operations completed in 0.3ms.",
-                                "#1c1c34",
-                                "#6c5ce7",
-                            ),
-                            Component::row(
-                                Style {
-                                    gap: 8.0,
-                                    align_items: AlignItems::Center,
-                                    ..Style::default()
-                                },
-                                vec![
-                                    Component::text_input(
-                                        "",
-                                        "Ask the AI agent...",
-                                        Style {
-                                            flex_grow: 1.0,
-                                            font_size: 14.0,
-                                            color: Color::from_hex("#d0d0e0"),
-                                            background: Color::from_hex("#1c1c34"),
-                                            border_radius: 8.0,
-                                            ..Style::default()
-                                        },
-                                    ),
-                                    Component::button(
-                                        "Send",
-                                        Style {
-                                            background: Color::from_hex("#6c5ce7"),
-                                            border_radius: 8.0,
-                                            font_size: 14.0,
-                                            color: Color::WHITE,
-                                            ..Style::default()
-                                        },
-                                    ),
-                                ],
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        ],
-    )
-}
-
-fn agent_card(name: &str, status: &str, status_color: &str, desc: &str) -> Component {
-    Component::column(
-        Style {
-            padding: Edges::all(12.0),
-            background: Color::from_hex("#1c1c34"),
-            border_radius: 8.0,
-            gap: 6.0,
-            ..Style::default()
-        },
-        vec![
-            Component::row(
-                Style {
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
+                    padding: Edges::all(24.0),
+                    gap: 12.0,
                     ..Style::default()
                 },
                 vec![
                     Component::text(
-                        name,
+                        "会话在右侧任务中心。这个窗口只是同一条收据的阅读页。",
+                        Style {
+                            font_size: 16.0,
+                            font_weight: 700,
+                            color: ink(),
+                            ..Style::default()
+                        },
+                    ),
+                    Component::text(
+                        "The live session stays in the task center beside this window.",
+                        Style {
+                            font_size: 14.0,
+                            color: muted_ink(),
+                            ..Style::default()
+                        },
+                    ),
+                    Component::text(
+                        state::get_signal_text(RECEIPT_SIGNAL),
                         Style {
                             font_size: 13.0,
-                            color: Color::from_hex("#d0d0e0"),
-                            font_weight: 600,
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        status,
-                        Style {
-                            font_size: 11.0,
-                            color: Color::from_hex(status_color),
+                            color: ink(),
                             ..Style::default()
                         },
                     ),
                 ],
             ),
-            Component::text(
-                desc,
-                Style {
-                    font_size: 11.0,
-                    color: Color::from_hex("#606080"),
-                    ..Style::default()
-                },
-            ),
         ],
     )
 }
 
-fn chat_msg(sender: &str, text: &str, bg: &str, sender_color: &str) -> Component {
-    Component::column(
-        Style {
-            padding: Edges::all(12.0),
-            background: Color::from_hex(bg),
-            border_radius: 8.0,
-            gap: 4.0,
-            ..Style::default()
-        },
-        vec![
-            Component::text(
-                sender,
-                Style {
-                    font_size: 11.0,
-                    color: Color::from_hex(sender_color),
-                    font_weight: 600,
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                text,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
-}
 
 // ==========================================================================
 // Browser App
@@ -1569,7 +2042,7 @@ fn app_titlebar(title: &str, accent: &str) -> Component {
     Component::row(
         Style {
             height: Dimension::Px(40.0),
-            background: Color::from_hex("#1a1a2e"),
+            background: Color::from_hex("#2a3e52"),
             padding: Edges::xy(16.0, 8.0),
             align_items: AlignItems::Center,
             justify_content: JustifyContent::SpaceBetween,
@@ -1660,7 +2133,7 @@ fn build_taskbar(current: i64) -> Component {
     Component::row(
         Style {
             height: Dimension::Px(56.0),
-            background: Color::from_hex("#12121f"),
+            background: Color::from_hex("#162433"),
             padding: Edges::xy(16.0, 8.0),
             gap: 12.0,
             align_items: AlignItems::Center,
@@ -1698,7 +2171,7 @@ fn build_taskbar(current: i64) -> Component {
                 center_text,
                 Style {
                     font_size: 14.0,
-                    color: Color::from_hex("#808090"),
+                    color: Color::from_hex("#d5dee8"),
                     ..Style::default()
                 },
             ),

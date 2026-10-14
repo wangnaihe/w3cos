@@ -63,7 +63,7 @@ w3cos.iso (~50-100MB)
 ├── Firmware blobs                     — WiFi, GPU, Bluetooth support
 ├── BusyBox                            — minimal shell (for maintenance/SSH)
 ├── W3C OS Shell (w3cos-shell)         — THE system interface (replaces desktop)
-├── SSH server (dropbear)              — remote access for AI agents
+├── SSH server (dropbear, off by default) — set W3COS_ENABLE_SSH=1 to start it
 ├── Default apps (showcase, hello)     — pre-installed W3C OS applications
 └── Boot: BIOS/UEFI → kernel → init → w3cos-shell (fullscreen)
 ```
@@ -79,7 +79,7 @@ Power On
   → Init system starts
   → W3C OS Shell launches (fullscreen)
   → User sees W3C OS interface — no login screen, no desktop
-  → SSH available on port 22 for AI agent access
+  → SSH stays off unless W3COS_ENABLE_SSH=1
 ```
 
 ## System Requirements
@@ -97,7 +97,7 @@ Power On
 
 ## Remote Access (for AI Agents)
 
-The ISO includes an SSH server. After booting:
+The ISO includes dropbear, but boot does not start it. After setting `W3COS_ENABLE_SSH=1`:
 
 ```bash
 # From another machine (or AI agent):

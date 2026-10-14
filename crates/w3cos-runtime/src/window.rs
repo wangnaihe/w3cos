@@ -31,6 +31,95 @@ fn default_logical_size() -> LogicalSize<f64> {
     LogicalSize::new(1200.0, 800.0)
 }
 
+/// `_NET_ACTIVE_WINDOW` is a no-op without a window manager. Xvfb is that
+/// case, so also call `XSetInputFocus` when the handle is an X11 window.
+/// Real window managers still get `Window::focus_window`.
+#[cfg(target_os = "linux")]
+fn claim_x11_keyboard_focus(window: &Window) {
+    use std::ffi::{c_int, c_ulong, c_void, CStr};
+    use std::sync::OnceLock;
+    use winit::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+
+    let Ok(window_handle) = window.window_handle() else {
+        return;
+    };
+    let Ok(display_handle) = window.display_handle() else {
+        return;
+    };
+    let RawWindowHandle::Xlib(xwindow) = window_handle.as_raw() else {
+        return;
+    };
+    let RawDisplayHandle::Xlib(xdisplay) = display_handle.as_raw() else {
+        return;
+    };
+    let Some(display) = xdisplay.display else {
+        return;
+    };
+    let display = display.as_ptr();
+
+    type LockFn = unsafe extern "C" fn(*mut c_void);
+    type SetFn = unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_ulong) -> c_int;
+    type FlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+    struct XlibFocus {
+        lock: LockFn,
+        unlock: LockFn,
+        set_input_focus: SetFn,
+        flush: FlushFn,
+    }
+
+    fn load() -> Option<XlibFocus> {
+        unsafe fn lookup<T>(handle: *mut c_void, name: &[u8]) -> Option<T> {
+            let symbol = CStr::from_bytes_with_nul(name).ok()?;
+            let ptr = libc::dlsym(handle, symbol.as_ptr());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute_copy(&ptr))
+            }
+        }
+        unsafe {
+            let handle = libc::dlopen(
+                CStr::from_bytes_with_nul(b"libX11.so.6\0").ok()?.as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_GLOBAL,
+            );
+            if handle.is_null() {
+                return None;
+            }
+            Some(XlibFocus {
+                lock: lookup(handle, b"XLockDisplay\0")?,
+                unlock: lookup(handle, b"XUnlockDisplay\0")?,
+                set_input_focus: lookup(handle, b"XSetInputFocus\0")?,
+                flush: lookup(handle, b"XFlush\0")?,
+            })
+        }
+    }
+
+    static FNS: OnceLock<Option<XlibFocus>> = OnceLock::new();
+    let Some(fns) = FNS.get_or_init(load).as_ref() else {
+        return;
+    };
+    const REVERT_TO_PARENT: c_int = 2;
+    const CURRENT_TIME: c_ulong = 0;
+    unsafe {
+        (fns.lock)(display);
+        (fns.set_input_focus)(display, xwindow.window, REVERT_TO_PARENT, CURRENT_TIME);
+        (fns.flush)(display);
+        (fns.unlock)(display);
+    }
+    if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+        eprintln!("[W3C OS][IME] XSetInputFocus window={}", xwindow.window);
+    }
+}
+
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "ios", target_os = "android"))
+))]
+fn claim_x11_keyboard_focus(_window: &Window) {}
+
 fn default_window_attributes() -> WindowAttributes {
     let attributes = WindowAttributes::default().with_title("W3C OS");
     #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -286,6 +375,81 @@ use w3cos_std::{Component, ComponentKind, EventAction};
 const ANIMATION_FRAME_INTERVAL_MS: u64 = 16;
 const TOUCH_SCROLL_SLOP: f32 = 8.0;
 const KINETIC_SCROLL_MIN_VELOCITY: f32 = 80.0;
+/// Set on the shell intent field. Read only when Enter is pressed there.
+const INTENT_SUBMIT_PROPERTY: &str = "--w3cos-intent-submit";
+
+fn draft_for_action(
+    root: &Component,
+    values: &HashMap<usize, String>,
+    action: &EventAction,
+) -> String {
+    let EventAction::Invoke {
+        input_placeholder, ..
+    } = action
+    else {
+        return String::new();
+    };
+    if input_placeholder.is_empty() {
+        return String::new();
+    }
+    let Some((index, fallback)) = w3cos_std::find_text_input(root, input_placeholder) else {
+        return String::new();
+    };
+    values
+        .get(&index)
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn intent_submit_draft(
+    root: &Component,
+    values: &HashMap<usize, String>,
+    focus_idx: usize,
+) -> Option<(u8, String)> {
+    let flat = layout::pre_flatten(root);
+    let node = flat.get(focus_idx)?;
+    let ComponentKind::TextInput { value, .. } = node.kind else {
+        return None;
+    };
+    let code = node
+        .style
+        .custom_properties
+        .as_ref()?
+        .get(INTENT_SUBMIT_PROPERTY)?
+        .parse::<u8>()
+        .ok()?;
+    Some((
+        code,
+        values
+            .get(&focus_idx)
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
+    ))
+}
+
+/// After an intent hook rewrites a marked field, copy that value into the
+/// edit buffer. Paint prefers the buffer, and this does not run on keystrokes.
+fn sync_marked_text_inputs(root: &Component, values: &mut HashMap<usize, String>) {
+    fn walk(node: &Component, index: &mut usize, values: &mut HashMap<usize, String>) {
+        let current = *index;
+        *index += 1;
+        let marked = node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key(INTENT_SUBMIT_PROPERTY));
+        if marked
+            && let ComponentKind::TextInput { value, .. } = &node.kind
+        {
+            values.insert(current, value.clone());
+        }
+        for child in &node.children {
+            walk(child, index, values);
+        }
+    }
+    let mut index = 0;
+    walk(root, &mut index, values);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventLoopSchedule {
@@ -1212,6 +1376,98 @@ impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
     fn capture_png(&self) -> Option<Vec<u8>> {
         crate::frame_cache::request_screenshot();
         crate::frame_cache::encode_png()
+    }
+
+    fn capture_annotated(&self) -> w3cos_ai_bridge::server::AnnotatedFrame {
+        use w3cos_ai_bridge::screenshot::ElementAnnotation;
+        use w3cos_ai_bridge::server::AnnotatedFrame;
+        let marks = crate::frame_cache::layout_marks();
+        if marks.is_empty() {
+            return AnnotatedFrame::MissingLayout(
+                "layout bounds are not available for this frame; annotated screenshot was not drawn",
+            );
+        }
+        let Some((width, height, rgba, _)) = crate::frame_cache::snapshot() else {
+            crate::frame_cache::request_screenshot();
+            return AnnotatedFrame::MissingLayout(
+                "framebuffer has not been presented yet; annotated screenshot was not drawn",
+            );
+        };
+        let annotations = marks
+            .into_iter()
+            .map(|mark| ElementAnnotation {
+                index: mark.index,
+                node_id: mark.node_id,
+                label: format!("{}: {}", mark.role, mark.name),
+                bounds: mark.bounds,
+                interactive: true,
+            })
+            .collect();
+        AnnotatedFrame::Ready {
+            width,
+            height,
+            rgba,
+            annotations,
+        }
+    }
+
+    fn layout_index_json(&self) -> Option<String> {
+        let marks = crate::frame_cache::layout_marks();
+        if marks.is_empty() {
+            return None;
+        }
+        let entries: Vec<_> = marks
+            .iter()
+            .map(|mark| {
+                serde_json::json!({
+                    "index": mark.index,
+                    "node_id": mark.node_id,
+                    "role": mark.role,
+                    "name": mark.name,
+                    "interactive": true,
+                })
+            })
+            .collect();
+        Some(serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()))
+    }
+
+    fn layout_summary(&self) -> Option<String> {
+        let marks = crate::frame_cache::layout_marks();
+        if marks.is_empty() {
+            return None;
+        }
+        let mut summary = format!(
+            "UI: {} elements, {} interactive\n---\n",
+            marks.len(),
+            marks.len()
+        );
+        for mark in &marks {
+            summary.push_str(&format!(
+                "[{}] {}: {} [interactive]\n",
+                mark.index, mark.role, mark.name
+            ));
+        }
+        Some(summary)
+    }
+
+    fn invoke_layout_index(
+        &self,
+        index: u32,
+        action: w3cos_ai_bridge::dom_access::ActionType,
+    ) -> w3cos_ai_bridge::server::LayoutInvoke {
+        use w3cos_ai_bridge::dom_access::ActionType;
+        use w3cos_ai_bridge::server::LayoutInvoke;
+        let marks = crate::frame_cache::layout_marks();
+        let Some(mark) = marks.iter().find(|mark| mark.index == index) else {
+            return LayoutInvoke::Absent;
+        };
+        match action {
+            ActionType::Click | ActionType::Focus => {
+                crate::frame_cache::enqueue_layout_click(mark.node_id);
+                LayoutInvoke::Invoked
+            }
+            _ => LayoutInvoke::Rejected("component layout index accepts click or focus"),
+        }
     }
 }
 
@@ -5369,11 +5625,29 @@ impl App {
         }
     }
 
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    fn claim_desktop_text_focus(&self, window: &Window) {
+        window.focus_window();
+        // XSetInputFocus is what lets Xvfb and xdotool reach this window.
+        // Turning on the XIM context filters those raw key events, and with
+        // no input method running they never come back as committed text.
+        // Set W3COS_IME=1 when a real input method should own the field.
+        let allow_ime = std::env::var_os("W3COS_IME").is_some();
+        window.set_ime_allowed(allow_ime);
+        claim_x11_keyboard_focus(window);
+    }
+
     fn focus_text_input(&mut self, idx: usize) {
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
             eprintln!("[W3C OS][IME] TextInput focus index={idx}");
         }
         self.set_focused_index(Some(idx));
+        // set_focused_index returns early when this field is already focused.
+        // Claim again so a second click on Xvfb still pulls keyboard focus.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        if let Some(window) = self.get_window() {
+            self.claim_desktop_text_focus(window);
+        }
         #[cfg(target_os = "ios")]
         {
             self.ios_ime_viewport_poll = Some(IosImeRetry {
@@ -5541,6 +5815,7 @@ impl App {
             }
             if kind_is_button {
                 let action = hit.on_click.clone();
+                let draft = draft_for_action(&self.root, &self.text_input_values, &action);
                 // Focus dispatch can synchronously run React handlers and
                 // rebuild the lowered component tree. Preserve the DOM host
                 // chain captured by pointer-down so the subsequent click is
@@ -5574,15 +5849,20 @@ impl App {
                     click_chain
                 ));
                 if !action.is_none() && !matches!(action, EventAction::NativeHost { .. }) {
-                    state::execute_action(&action);
+                    state::execute_action_with_draft(&action, &draft);
                 } else if !click_prevented && submitted.is_none() {
                     eprintln!("[W3C OS] Click → Button (no action)");
                 }
+                let refreshed = state::is_dirty();
                 self.rebuild_if_dirty();
+                if refreshed && matches!(action, EventAction::Invoke { .. }) {
+                    sync_marked_text_inputs(&self.root, &mut self.text_input_values);
+                }
                 self.repaint_after_interaction();
                 return;
             }
             let action = hit.on_click.clone();
+            let draft = draft_for_action(&self.root, &self.text_input_values, &action);
             // A browser moves focus away from a text control when the user
             // activates a non-focusable surface. Do this before click
             // dispatch so a click handler can still focus another control.
@@ -5601,10 +5881,14 @@ impl App {
             let has_legacy_action =
                 !action.is_none() && !matches!(action, EventAction::NativeHost { .. });
             if has_legacy_action {
-                state::execute_action(&action);
+                state::execute_action_with_draft(&action, &draft);
             }
             if dispatched_native || has_legacy_action {
+                let refreshed = state::is_dirty();
                 self.rebuild_if_dirty();
+                if refreshed && matches!(action, EventAction::Invoke { .. }) {
+                    sync_marked_text_inputs(&self.root, &mut self.text_input_values);
+                }
                 self.repaint_after_interaction();
                 return;
             }
@@ -5751,6 +6035,20 @@ impl App {
             }
         }
         self.sync_soft_keyboard();
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        if let Some(window) = self.get_window() {
+            let text_input = next.is_some_and(|index| {
+                matches!(
+                    self.get_kind_at(index),
+                    Some(ComponentKind::TextInput { .. })
+                )
+            });
+            if text_input {
+                self.claim_desktop_text_focus(window);
+            } else {
+                window.set_ime_allowed(false);
+            }
+        }
         if let Some(current) = next {
             let chain = self.native_host_chain(current);
             if self.dom_mode {
@@ -5812,19 +6110,89 @@ impl App {
 
     #[cfg(feature = "ai-bridge")]
     fn poll_ai_bridge(&mut self) {
-        let handle = match &self.ai_bridge_handle {
-            Some(h) => h,
-            None => return,
-        };
+        if self.ai_bridge_handle.is_none() {
+            return;
+        }
+        // Bounds and pixels are copied here, while answering a bridge request,
+        // not while rasterizing. Markers are drawn later inside the bridge.
+        let (layout, pixels) = w3cos_ai_bridge::server::take_bridge_prep();
+        if layout {
+            self.publish_layout_marks();
+        }
+        if pixels {
+            self.copy_retained_framebuffer();
+        }
 
-        if self.dom_mode {
+        // Component shells such as w3cos-shell are not in DOM mode. The
+        // listener still has to drain the queue: permission checks run here,
+        // and skipping the poll leaves clients blocked until the 5s timeout.
+        if let Some(handle) = &self.ai_bridge_handle {
             crate::dom::with_document_mut(|doc| {
                 handle.poll_and_respond(doc);
             });
         }
+        for node_id in crate::frame_cache::take_layout_clicks() {
+            self.handle_click(node_id as usize);
+        }
         if crate::frame_cache::screenshot_request_pending() {
             self.request_repaint();
         }
+    }
+
+    #[cfg(feature = "ai-bridge")]
+    fn publish_layout_marks(&self) {
+        let mut marks = Vec::new();
+        let mut index = 1u32;
+        for hit in &self.hit_nodes {
+            if !hit.is_interactive || hit.rect.width <= 0.0 || hit.rect.height <= 0.0 {
+                continue;
+            }
+            let (role, name) = match self.get_kind_at(hit.index) {
+                Some(ComponentKind::Button { label }) => ("button", label.clone()),
+                Some(ComponentKind::TextInput {
+                    placeholder,
+                    value,
+                    ..
+                }) => {
+                    let name = if placeholder.is_empty() {
+                        value.clone()
+                    } else {
+                        placeholder.clone()
+                    };
+                    ("textbox", name)
+                }
+                _ => ("generic", String::new()),
+            };
+            let scale = self.scale_factor as f32;
+            marks.push(crate::frame_cache::LayoutMark {
+                index,
+                node_id: hit.index as u32,
+                role: role.to_string(),
+                name,
+                bounds: [
+                    hit.rect.x * scale,
+                    hit.rect.y * scale,
+                    hit.rect.width * scale,
+                    hit.rect.height * scale,
+                ],
+            });
+            index += 1;
+        }
+        crate::frame_cache::store_layout_marks(marks);
+    }
+
+    #[cfg(feature = "ai-bridge")]
+    fn copy_retained_framebuffer(&self) {
+        #[cfg(feature = "cpu-render")]
+        if let Some(pixmap) = self
+            .cpu
+            .as_ref()
+            .and_then(|cpu| cpu.framebuffer.as_ref())
+        {
+            crate::frame_cache::store_from_slice(pixmap.width(), pixmap.height(), pixmap.data());
+            return;
+        }
+        crate::frame_cache::request_screenshot();
     }
 
     #[cfg(feature = "devtools")]
@@ -8191,6 +8559,32 @@ impl ApplicationHandler for App {
                                             "insertLineBreak",
                                             false,
                                         );
+                                    } else if let Some((code, draft)) = intent_submit_draft(
+                                        &self.root,
+                                        &self.text_input_values,
+                                        focus_idx,
+                                    ) {
+                                        // Key repeat must not re-run propose. The matcher
+                                        // stays off the character-input path entirely.
+                                        if !event.repeat {
+                                            state::execute_action_with_draft(
+                                                &EventAction::Invoke {
+                                                    code,
+                                                    input_placeholder: String::new(),
+                                                },
+                                                &draft,
+                                            );
+                                        }
+                                        let refreshed = state::is_dirty();
+                                        self.rebuild_if_dirty();
+                                        if refreshed {
+                                            sync_marked_text_inputs(
+                                                &self.root,
+                                                &mut self.text_input_values,
+                                            );
+                                        }
+                                        self.repaint_after_interaction();
+                                        return;
                                     } else if host_runtime::dispatch_submit_chain(&chain).is_some()
                                     {
                                         self.rebuild_if_dirty();
@@ -8202,6 +8596,9 @@ impl ApplicationHandler for App {
                                     return;
                                 }
                                 if let Some(ref text) = event.text {
+                                    if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                                        eprintln!("[W3C OS][IME] key text={text:?}");
+                                    }
                                     if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
                                         let next = if self.dom_mode {
                                             self.native_host_chain(focus_idx)

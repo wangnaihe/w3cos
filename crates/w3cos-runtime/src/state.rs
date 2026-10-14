@@ -211,8 +211,24 @@ pub fn reset() {
     })
 }
 
+thread_local! {
+    static INVOKE_HOOK: RefCell<Option<fn(u8, &str)>> = const { RefCell::new(None) };
+}
+
+/// Register the shell intent hook. The window calls it from a button click or
+/// an Enter submit, not from layout or paint.
+pub fn set_invoke_hook(hook: fn(u8, &str)) {
+    INVOKE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
 /// Execute an event action against the signal store.
 pub fn execute_action(action: &w3cos_std::EventAction) {
+    execute_action_with_draft(action, "");
+}
+
+/// Like [`execute_action`], but `draft` is the intent-field text for
+/// [`EventAction::Invoke`].
+pub fn execute_action_with_draft(action: &w3cos_std::EventAction, draft: &str) {
     match action {
         w3cos_std::EventAction::None => {}
         w3cos_std::EventAction::Increment(id) => {
@@ -309,6 +325,13 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
                 host_runtime::dispatch_click(*host_id);
             }
         }
+        w3cos_std::EventAction::Invoke { code, .. } => {
+            INVOKE_HOOK.with(|slot| {
+                if let Some(hook) = *slot.borrow() {
+                    hook(*code, draft);
+                }
+            });
+        }
     }
 }
 
@@ -383,6 +406,28 @@ mod tests {
         let _ = create_signal(0);
         execute_action(&parse_action_string("history:push:route:2:/css"));
         assert_eq!(get_signal(0), 2);
+    }
+
+    thread_local! {
+        static SEEN_INVOKE: RefCell<Option<(u8, String)>> = const { RefCell::new(None) };
+    }
+
+    fn record_invoke(code: u8, draft: &str) {
+        SEEN_INVOKE.with(|slot| *slot.borrow_mut() = Some((code, draft.to_string())));
+    }
+
+    #[test]
+    fn invoke_hook_receives_the_draft_without_running_during_reads() {
+        set_invoke_hook(record_invoke);
+        execute_action_with_draft(
+            &w3cos_std::EventAction::Invoke {
+                code: 1,
+                input_placeholder: String::new(),
+            },
+            "open files",
+        );
+        let seen = SEEN_INVOKE.with(|slot| slot.borrow().clone());
+        assert_eq!(seen, Some((1, "open files".to_string())));
     }
 
     #[test]

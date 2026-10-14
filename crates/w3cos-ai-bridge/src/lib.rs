@@ -1,7 +1,13 @@
 pub mod a11y_api;
 pub mod agent;
 pub mod dom_access;
+pub mod identity;
+pub mod intent;
+#[cfg(feature = "l1")]
+pub mod l1;
+pub mod mcp;
 pub mod permissions;
+mod receipt_ledger;
 pub mod screenshot;
 pub mod server;
 

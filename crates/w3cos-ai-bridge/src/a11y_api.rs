@@ -1,4 +1,4 @@
-use w3cos_a11y::tree::{A11yNode, build_a11y_tree, flatten_for_ai};
+use w3cos_a11y::tree::{A11yNode, FlatEntry, build_a11y_tree, flatten_entries, flatten_for_ai};
 use w3cos_dom::document::Document;
 
 /// Layer 2: Accessibility tree API.
@@ -36,6 +36,28 @@ pub fn get_interactive_elements(doc: &Document) -> Vec<String> {
 
 /// Get a compact text summary of the current UI state.
 /// Designed to fit within a single LLM message with minimal tokens.
+/// Numbered rows behind `GET /a11y`. The same `index` is what `POST /click`
+/// accepts. Reading this does not capture a screenshot.
+pub fn index_entries(doc: &Document) -> Vec<FlatEntry> {
+    flatten_entries(&build_a11y_tree(doc))
+}
+
+pub fn index_json(doc: &Document) -> String {
+    let entries: Vec<_> = index_entries(doc)
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "index": entry.index,
+                "node_id": entry.node_id,
+                "role": entry.role,
+                "name": entry.name,
+                "interactive": entry.interactive,
+            })
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
 pub fn get_ui_summary(doc: &Document) -> String {
     let tree = build_a11y_tree(doc);
     let flat = flatten_for_ai(&tree);

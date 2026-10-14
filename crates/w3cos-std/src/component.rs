@@ -57,6 +57,13 @@ pub enum EventAction {
         pointer: bool,
         wheel: bool,
     },
+    /// Shell hook. The runtime does not interpret `code`. When
+    /// `input_placeholder` is non-empty, the click path reads that text
+    /// input and passes the text to the hook. Layout and key-repeat do not.
+    Invoke {
+        code: u8,
+        input_placeholder: String,
+    },
 }
 
 impl EventAction {
@@ -98,6 +105,36 @@ pub struct SvgEventTarget {
 
 fn default_svg_pointer_events() -> String {
     "auto".to_string()
+}
+
+/// Preorder index of the first text input with `placeholder`, plus its
+/// declared value. The index matches `layout::pre_flatten`.
+pub fn find_text_input<'a>(root: &'a Component, placeholder: &str) -> Option<(usize, &'a str)> {
+    fn walk<'a>(
+        node: &'a Component,
+        placeholder: &str,
+        index: &mut usize,
+    ) -> Option<(usize, &'a str)> {
+        let current = *index;
+        *index += 1;
+        if let ComponentKind::TextInput {
+            value,
+            placeholder: field,
+            ..
+        } = &node.kind
+            && field == placeholder
+        {
+            return Some((current, value.as_str()));
+        }
+        for child in &node.children {
+            if let Some(found) = walk(child, placeholder, index) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let mut index = 0;
+    walk(root, placeholder, &mut index)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
