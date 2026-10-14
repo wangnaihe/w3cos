@@ -36,7 +36,7 @@ fn default_logical_size() -> LogicalSize<f64> {
 /// Real window managers still get `Window::focus_window`.
 #[cfg(target_os = "linux")]
 fn claim_x11_keyboard_focus(window: &Window) {
-    use std::ffi::{c_int, c_ulong, c_void, CStr};
+    use std::ffi::{CStr, c_int, c_ulong, c_void};
     use std::sync::OnceLock;
     use winit::raw_window_handle::{
         HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
@@ -438,9 +438,7 @@ fn sync_marked_text_inputs(root: &Component, values: &mut HashMap<usize, String>
             .custom_properties
             .as_ref()
             .is_some_and(|properties| properties.contains_key(INTENT_SUBMIT_PROPERTY));
-        if marked
-            && let ComponentKind::TextInput { value, .. } = &node.kind
-        {
+        if marked && let ComponentKind::TextInput { value, .. } = &node.kind {
             values.insert(current, value.clone());
         }
         for child in &node.children {
@@ -6185,9 +6183,7 @@ impl App {
             let (role, name) = match self.get_kind_at(hit.index) {
                 Some(ComponentKind::Button { label }) => ("button", label.clone()),
                 Some(ComponentKind::TextInput {
-                    placeholder,
-                    value,
-                    ..
+                    placeholder, value, ..
                 }) => {
                     let name = if placeholder.is_empty() {
                         value.clone()
@@ -6219,11 +6215,7 @@ impl App {
     #[cfg(feature = "ai-bridge")]
     fn copy_retained_framebuffer(&self) {
         #[cfg(feature = "cpu-render")]
-        if let Some(pixmap) = self
-            .cpu
-            .as_ref()
-            .and_then(|cpu| cpu.framebuffer.as_ref())
-        {
+        if let Some(pixmap) = self.cpu.as_ref().and_then(|cpu| cpu.framebuffer.as_ref()) {
             crate::frame_cache::store_from_slice(pixmap.width(), pixmap.height(), pixmap.data());
             return;
         }

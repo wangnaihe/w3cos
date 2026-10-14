@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
-    INTENT_INPUT_PLACEHOLDER,
+    ExecuteResult, INTENT_INPUT_PLACEHOLDER, IntentSession, IntentTier, ProposeResult, ShellApp,
+    ShellContext,
 };
 use w3cos_ai_bridge::permissions::AgentPermissions;
 use w3cos_runtime::state;
@@ -1193,11 +1193,7 @@ fn build_task_center() -> Component {
                 };
                 format!(
                     "{subject_label} · {} · 口令经 KDF 保存，还不是 passkey",
-                    if unlocked {
-                        "stub unlocked"
-                    } else {
-                        "locked"
-                    }
+                    if unlocked { "stub unlocked" } else { "locked" }
                 )
             },
             Style {
@@ -1349,7 +1345,6 @@ fn build_ai_agent_app() -> Component {
         ],
     )
 }
-
 
 // ==========================================================================
 // Browser App
