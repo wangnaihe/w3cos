@@ -1,6 +1,6 @@
 //! Value-level implementations of the core Web Events constructors.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +18,11 @@ thread_local! {
     static INPUT_DEVICE_CAPABILITIES_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static EVENT_TARGET_INSTANCES: RefCell<Vec<EventTargetBinding>> = const { RefCell::new(Vec::new()) };
     static EVENT_SLOTS: RefCell<HashMap<u64, EventSlot>> = RefCell::new(HashMap::new());
-    static EVENT_POOL: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// The hot `new Event(type)` object. Its slot lives beside it so dispatch
+    /// does not hash. Demoted into `EVENT_SLOTS` when script keeps the value.
+    static EVENT_POOL: RefCell<Option<PooledEvent>> = const { RefCell::new(None) };
+    static FAST_EVENT_HANDLE: Cell<u32> = const { Cell::new(u32::MAX) };
+    static FAST_EVENT_PROTO: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// `u32::MAX` means the event has no node target yet.
@@ -44,6 +48,12 @@ struct EventSlot {
     src_node: u32,
     related_node: u32,
     detail: Value,
+}
+
+struct PooledEvent {
+    value: Value,
+    id: u64,
+    slot: EventSlot,
 }
 
 pub(crate) struct EventSlotHead {
@@ -72,6 +82,14 @@ fn write_event_slot(value: &Value, slot: EventSlot) {
     let Some(id) = event_identity(value) else {
         return;
     };
+    if pool_has(id) {
+        EVENT_POOL.with(|pool| {
+            if let Some(pooled) = pool.borrow_mut().as_mut() {
+                pooled.slot = slot;
+            }
+        });
+        return;
+    }
     EVENT_SLOTS.with(|slots| {
         slots.borrow_mut().insert(id, slot);
     });
@@ -81,7 +99,7 @@ pub(crate) fn has_event_slot(value: &Value) -> bool {
     let Some(id) = event_identity(value) else {
         return false;
     };
-    EVENT_SLOTS.with(|slots| slots.borrow().contains_key(&id))
+    pool_has(id) || EVENT_SLOTS.with(|slots| slots.borrow().contains_key(&id))
 }
 
 pub(crate) fn event_slot_head(value: &Value) -> Option<EventSlotHead> {
@@ -99,13 +117,27 @@ pub(crate) fn event_slot_head(value: &Value) -> Option<EventSlotHead> {
     })
 }
 
+fn pool_has(id: u64) -> bool {
+    EVENT_POOL.with(|pool| pool.borrow().as_ref().is_some_and(|pooled| pooled.id == id))
+}
+
 fn with_event_slot<R>(value: &Value, read: impl FnOnce(&EventSlot) -> R) -> Option<R> {
     let id = event_identity(value)?;
+    if pool_has(id) {
+        return EVENT_POOL.with(|pool| pool.borrow().as_ref().map(|pooled| read(&pooled.slot)));
+    }
     EVENT_SLOTS.with(|slots| slots.borrow().get(&id).map(read))
 }
 
 fn with_event_slot_mut<R>(value: &Value, update: impl FnOnce(&mut EventSlot) -> R) -> Option<R> {
     let id = event_identity(value)?;
+    if pool_has(id) {
+        return EVENT_POOL.with(|pool| {
+            pool.borrow_mut()
+                .as_mut()
+                .map(|pooled| update(&mut pooled.slot))
+        });
+    }
     EVENT_SLOTS.with(|slots| slots.borrow_mut().get_mut(&id).map(update))
 }
 
@@ -160,80 +192,126 @@ fn fresh_event_object(prototype: &Value) -> Value {
     value
 }
 
-fn pooled_event(type_name: JsString, prototype: &Value) -> Value {
-    let value = EVENT_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if let Some(existing) = pool.as_ref()
-            && let Some(object) = existing.as_object()
-            && let Some((strong, weak)) = object.host_rc_counts()
-            && strong == 1
-            && weak == 0
-            && object.borrow().is_empty()
-        {
-            return existing.clone();
-        }
-        if let Some(discarded) = pool.take()
-            && let Some(id) = event_identity(&discarded)
-        {
-            EVENT_SLOTS.with(|slots| {
-                slots.borrow_mut().remove(&id);
-            });
-        }
-        let created = fresh_event_object(prototype);
-        *pool = Some(created.clone());
-        created
-    });
-    write_event_slot(
-        &value,
-        EventSlot {
-            type_name,
-            bubbles: false,
-            cancelable: false,
-            composed: false,
-            trusted: false,
-            canceled: false,
-            stop: false,
-            stop_immediate: false,
-            return_value: true,
-            phase: 0,
-            time_stamp: event_now(),
-            target_node: NO_EVENT_NODE,
-            current_node: NO_EVENT_NODE,
-            src_node: NO_EVENT_NODE,
-            related_node: NO_EVENT_NODE,
-            detail: Value::Null,
-        },
-    );
-    value
+fn fresh_slot(type_name: JsString) -> EventSlot {
+    EventSlot {
+        type_name,
+        bubbles: false,
+        cancelable: false,
+        composed: false,
+        trusted: false,
+        canceled: false,
+        stop: false,
+        stop_immediate: false,
+        return_value: true,
+        phase: 0,
+        time_stamp: event_now(),
+        target_node: NO_EVENT_NODE,
+        current_node: NO_EVENT_NODE,
+        src_node: NO_EVENT_NODE,
+        related_node: NO_EVENT_NODE,
+        detail: Value::Null,
+    }
 }
 
-thread_local! {
-    static FAST_EVENT: RefCell<Option<(Value, Value)>> = const { RefCell::new(None) };
+/// True when `value` is the host object the pool alone still owns, and script
+/// has not shadowed its prototype getters.
+fn event_uniquely_pooled(value: &Value) -> bool {
+    let Value::Object(rc) = value else {
+        return false;
+    };
+    Rc::strong_count(rc) == 1 && Rc::weak_count(rc) == 0 && rc.borrow().is_empty()
+}
+
+fn pooled_event(type_name: JsString, prototype: impl FnOnce() -> Value) -> Value {
+    let reusable = EVENT_POOL.with(|pool| {
+        pool.borrow()
+            .as_ref()
+            .is_some_and(|pooled| event_uniquely_pooled(&pooled.value))
+    });
+    if reusable {
+        return EVENT_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let pooled = pool.as_mut().expect("reusable event");
+            pooled.slot = fresh_slot(type_name);
+            pooled.value.clone()
+        });
+    }
+    if let Some(old) = EVENT_POOL.with(|pool| pool.borrow_mut().take()) {
+        EVENT_SLOTS.with(|slots| slots.borrow_mut().insert(old.id, old.slot));
+    }
+    let value = fresh_event_object(&prototype());
+    let Some(id) = event_identity(&value) else {
+        return value;
+    };
+    EVENT_POOL.with(|pool| {
+        *pool.borrow_mut() = Some(PooledEvent {
+            value: value.clone(),
+            id,
+            slot: fresh_slot(type_name),
+        });
+    });
+    value
 }
 
 fn try_fast_event_construct(class_value: &Value, args: &[Value]) -> Option<Value> {
     if args.len() != 1 || !args[0].is_string() {
         return None;
     }
-    let type_name = args[0].as_js_string()?;
-    let (class, prototype) = FAST_EVENT.with(|slot| {
-        if let Some(cached) = slot.borrow().clone() {
-            return cached;
-        }
+    let handle = class_value.function_handle()?;
+    if FAST_EVENT_HANDLE.with(Cell::get) != handle {
         let class = event_class();
+        if class.function_handle() != Some(handle) {
+            return None;
+        }
         let prototype = class.get_property("prototype");
-        let cached = (class, prototype);
-        *slot.borrow_mut() = Some(cached.clone());
-        cached
-    });
-    let same = match (class.as_function(), class_value.as_function()) {
-        (Some(left), Some(right)) => left.ptr_eq(&right),
-        _ => false,
-    };
-    if !same {
-        return None;
+        FAST_EVENT_HANDLE.with(|cell| cell.set(handle));
+        FAST_EVENT_PROTO.with(|slot| *slot.borrow_mut() = Some(prototype));
     }
-    Some(pooled_event(type_name, &prototype))
+    let type_name = args[0].as_js_string()?;
+    Some(pooled_event(type_name, || {
+        FAST_EVENT_PROTO
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| event_class().get_property("prototype"))
+    }))
+}
+
+/// Non-bubbling slotted dispatch. Sets the target id before listeners run.
+/// `None` means the caller must use the full capture/bubble path; the slot
+/// is left unchanged in that case.
+pub(crate) struct UnbubbledTarget {
+    pub type_name: JsString,
+    pub invoke: bool,
+}
+
+pub(crate) fn begin_unbubbled_target(value: &Value, target: u32) -> Option<UnbubbledTarget> {
+    with_event_slot_mut(value, |slot| {
+        if slot.bubbles || slot.phase != 0 {
+            return None;
+        }
+        let name = slot.type_name.as_str();
+        if name.is_empty() || name == "undefined" {
+            return None;
+        }
+        let invoke = !slot.stop;
+        slot.target_node = target;
+        slot.src_node = target;
+        slot.current_node = target;
+        slot.phase = 2;
+        Some(UnbubbledTarget {
+            type_name: slot.type_name.clone(),
+            invoke,
+        })
+    })
+    .flatten()
+}
+
+pub(crate) fn end_unbubbled_target(value: &Value) -> bool {
+    with_event_slot_mut(value, |slot| {
+        let canceled = slot.canceled;
+        slot.phase = 0;
+        canceled
+    })
+    .unwrap_or(false)
 }
 
 fn realm_event_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
@@ -1808,7 +1886,8 @@ fn make_event_target_class() -> Value {
 pub(crate) fn reset_realm() {
     EVENT_SLOTS.with(|slots| slots.borrow_mut().clear());
     EVENT_POOL.with(|pool| *pool.borrow_mut() = None);
-    FAST_EVENT.with(|slot| *slot.borrow_mut() = None);
+    FAST_EVENT_HANDLE.with(|cell| cell.set(u32::MAX));
+    FAST_EVENT_PROTO.with(|slot| *slot.borrow_mut() = None);
     let bindings =
         EVENT_TARGET_INSTANCES.with(|instances| std::mem::take(&mut *instances.borrow_mut()));
     for binding in bindings {

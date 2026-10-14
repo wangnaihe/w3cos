@@ -1372,6 +1372,21 @@ enum FunctionBody {
         factory: AotFactory,
         captures: Box<AotCaptureMap>,
     },
+    /// `hits = hits + k` with no other reads. The call ignores `this` and
+    /// arguments, which that shape does not observe.
+    Bump {
+        cell: Rc<Cell<Option<f64>>>,
+        addend: f64,
+    },
+}
+
+fn bump_number(cell: &Cell<Option<f64>>, addend: f64) -> Value {
+    let next = match cell.get() {
+        Some(n) => n + addend,
+        None => f64::NAN,
+    };
+    cell.set(Some(next));
+    Value::Undefined
 }
 
 /// Payload of a JS function object.
@@ -1437,10 +1452,14 @@ impl FunctionData {
         })
     }
 
+    pub fn from_bump(cell: Rc<Cell<Option<f64>>>, addend: f64) -> Self {
+        Self::finish(FunctionBody::Bump { cell, addend })
+    }
+
     #[inline(never)]
     fn finish(body: FunctionBody) -> Self {
         let captures_ref = match &body {
-            FunctionBody::Dyn(_) => None,
+            FunctionBody::Dyn(_) | FunctionBody::Bump { .. } => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         };
         let mut props = PropertyMap::new();
@@ -1464,6 +1483,7 @@ impl FunctionData {
         match &self.body {
             FunctionBody::Dyn(inner) => inner(this, args),
             FunctionBody::Aot { factory, captures } => factory(this, &args, captures),
+            FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
     }
 
@@ -1473,6 +1493,7 @@ impl FunctionData {
         match &self.body {
             FunctionBody::Dyn(inner) => inner(this, args.to_vec()),
             FunctionBody::Aot { factory, captures } => factory(this, args, captures),
+            FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
     }
 
@@ -1519,7 +1540,7 @@ impl FunctionData {
     #[inline]
     fn captures_for_heap(&self) -> Option<&AotCaptureMap> {
         match &self.body {
-            FunctionBody::Dyn(_) => None,
+            FunctionBody::Dyn(_) | FunctionBody::Bump { .. } => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         }
     }
@@ -2356,6 +2377,12 @@ impl Value {
     /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
     pub fn aot_function(factory: AotFactory, captures: AotCaptureMap) -> Self {
         let handle = crate::page_arena::alloc_function(FunctionData::from_aot(factory, captures));
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
+    /// Intern a captured numeric increment. Calling it adds `addend` to `cell`.
+    pub fn number_bump(cell: Rc<Cell<Option<f64>>>, addend: f64) -> Self {
+        let handle = crate::page_arena::alloc_function(FunctionData::from_bump(cell, addend));
         Value::Imm(Immediate::from_function_handle(handle))
     }
 

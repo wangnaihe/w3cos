@@ -92,6 +92,16 @@ fn is_shared_number(id: u32) -> bool {
     SHARED_NUMBERS.with(|numbers| numbers.borrow().contains(&id))
 }
 
+/// Parent-side closure that is only `captured = captured + k`.
+fn number_bump_capture(nested: FunctionId) -> Option<(u32, f64)> {
+    MODULE_FUNCTIONS.with(|functions| {
+        let functions = functions.borrow();
+        let function = functions.iter().find(|function| function.id == nested)?;
+        let (binding, addend) = match_number_increment(function)?;
+        is_shared_number(binding).then_some((binding, addend))
+    })
+}
+
 fn binding_is_used(function: &Function, id: u32) -> bool {
     if captured_binding_ids(function).contains(&id) {
         return true;
@@ -4418,7 +4428,121 @@ fn tighten_native_loop(body: &str) -> (String, String) {
         out.push_str(&line);
         out.push('\n');
     }
-    (hoisted, out)
+    let (literals, out) = hoist_rust_string_ctors(&out);
+    let out = tighten_length_tests(&out);
+    (format!("{hoisted}{literals}"), out)
+}
+
+/// `Value::string("...")` inside a loop is a constant. Intern it once.
+fn hoist_rust_string_ctors(body: &str) -> (String, String) {
+    let marker = "w3cos_core::Value::string(";
+    let mut hoisted = String::new();
+    let mut rewritten = String::new();
+    let mut locals: Vec<String> = Vec::new();
+    let mut index = 0;
+    while let Some(pos) = body[index..].find(marker) {
+        let start = index + pos;
+        rewritten.push_str(&body[index..start]);
+        let literal_at = start + marker.len();
+        let Some(end) = rust_string_literal_end(&body[literal_at..]) else {
+            rewritten.push_str(marker);
+            index = literal_at;
+            continue;
+        };
+        let literal = &body[literal_at..literal_at + end];
+        if !body[literal_at + end..].starts_with(')') {
+            rewritten.push_str(marker);
+            index = literal_at;
+            continue;
+        }
+        let local = if let Some(found) = locals.iter().position(|existing| existing == literal) {
+            found
+        } else {
+            locals.push(literal.to_string());
+            locals.len() - 1
+        };
+        rewritten.push_str(&format!("__w3cos_lit_{local}.clone()"));
+        index = literal_at + end + 1;
+    }
+    rewritten.push_str(&body[index..]);
+    if locals.is_empty() {
+        return (String::new(), body.to_string());
+    }
+    for (slot, literal) in locals.iter().enumerate() {
+        hoisted.push_str(&format!(
+            "let __w3cos_lit_{slot} = w3cos_core::Value::string({literal});\n"
+        ));
+    }
+    (hoisted, rewritten)
+}
+
+fn rust_string_literal_end(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    if chars.next()?.1 != '"' {
+        return None;
+    }
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next()?;
+            }
+            '"' => return Some(offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `n < nodes.length` when `n` is already an f64. Other lengths keep `less_than`.
+fn tighten_length_tests(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if index + 2 < lines.len()
+            && let Some(rewritten) =
+                direct_length_test(&lines[index..=index + 2], &lines[index + 3..])
+        {
+            out.push_str(lines[index]);
+            out.push('\n');
+            out.push_str(&rewritten);
+            out.push('\n');
+            index += 3;
+            continue;
+        }
+        out.push_str(lines[index]);
+        out.push('\n');
+        index += 1;
+    }
+    out
+}
+
+fn direct_length_test(lines: &[&str], rest: &[&str]) -> Option<String> {
+    let load = lines[0].trim();
+    let compare = lines[1].trim();
+    let branch = lines[2].trim();
+    let (len_reg, _) = load.split_once(" = ")?;
+    if !len_reg.starts_with("self.registers[") || !load.contains(".get_property(\"length\")") {
+        return None;
+    }
+    let prefix = "w3cos_core::intrinsics::less_than(&w3cos_core::Value::Number(";
+    let compare = compare.strip_prefix("self.registers[")?;
+    let (bool_slot, compare) = compare.split_once("] = ")?;
+    let compare = compare.strip_prefix(prefix)?;
+    let (lhs, compare) = compare.split_once("), &")?;
+    if compare != format!("{len_reg}.clone());") {
+        return None;
+    }
+    let branch_reg = format!("self.registers[{bool_slot}]");
+    if branch != format!("if !({branch_reg}.clone().to_bool()) {{ break; }}") {
+        return None;
+    }
+    if rest.iter().any(|line| line.contains(&branch_reg)) {
+        return None;
+    }
+    Some(format!(
+        "if !(if let Some(__w3cos_len) = {len_reg}.as_number() {{ ({lhs}) < __w3cos_len }} else {{ w3cos_core::intrinsics::less_than(&w3cos_core::Value::Number({lhs}), &{len_reg}).to_bool() }}) {{ break; }}"
+    ))
 }
 
 fn hoist_binding_lookups(lines: &[String]) -> (String, Vec<String>) {
@@ -5531,10 +5655,20 @@ fn emit_instruction(
                     adapters.push_str(&adapter);
                 }
             }
-            format!(
-                "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);",
-                register(*dst)
-            )
+            let slow = format!(
+                "{{ let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures) }}"
+            );
+            if let Some((binding, addend)) = number_bump_capture(*nested) {
+                format!(
+                    "self.registers[{}] = if let Some(cell) = self.num_cells.get(&{binding}).cloned() {{ w3cos_core::Value::number_bump(cell, {addend:?}) }} else {slow};",
+                    register(*dst)
+                )
+            } else {
+                format!(
+                    "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);",
+                    register(*dst)
+                )
+            }
         }
         Instruction::CreateClass {
             dst,

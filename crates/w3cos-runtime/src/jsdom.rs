@@ -211,10 +211,19 @@ struct JsListener {
 
 /// Listeners grouped by `(node, event type)` so dispatch does not scan every
 /// handler on the page for each ancestor. The index stays in registration order.
+enum OneListener {
+    /// Exactly one non-capture listener on this node.
+    One(EventType, Value),
+    /// More than one, or more than one event type. Dispatch uses the map.
+    Many,
+}
+
 struct ListenerStore {
     items: Vec<JsListener>,
     /// Built on the first mutation. `None` keeps the thread-local initializer const.
     index: Option<HashMap<(u32, EventType), Vec<u32>>>,
+    /// Node id to a single non-capture listener. Misses fall back to `index`.
+    ones: Vec<Option<OneListener>>,
     capture_count: u32,
 }
 
@@ -223,6 +232,7 @@ impl ListenerStore {
         Self {
             items: Vec::new(),
             index: None,
+            ones: Vec::new(),
             capture_count: 0,
         }
     }
@@ -238,7 +248,36 @@ impl ListenerStore {
             .entry(key)
             .or_default()
             .push(idx);
+        Self::note_one(&mut self.ones, &listener);
         self.items.push(listener);
+    }
+
+    fn note_one(ones: &mut Vec<Option<OneListener>>, listener: &JsListener) {
+        if listener.capture {
+            return;
+        }
+        let node = listener.node as usize;
+        if ones.len() <= node {
+            ones.resize_with(node + 1, || None);
+        }
+        ones[node] = Some(match ones[node].take() {
+            None => OneListener::One(listener.event_type, listener.handler.clone()),
+            Some(OneListener::One(event_type, _)) if event_type == listener.event_type => {
+                OneListener::Many
+            }
+            Some(OneListener::One(_, _)) | Some(OneListener::Many) => OneListener::Many,
+        });
+    }
+
+    /// `Ok(None)` is no listener. `Err(())` means the map has more than one.
+    fn one_handler(&self, node: u32, event_type: EventType) -> Result<Option<Value>, ()> {
+        match self.ones.get(node as usize).and_then(|slot| slot.as_ref()) {
+            Some(OneListener::One(kind, handler)) if *kind == event_type => {
+                Ok(Some(handler.clone()))
+            }
+            Some(OneListener::One(_, _)) | None => Ok(None),
+            Some(OneListener::Many) => Err(()),
+        }
     }
 
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
@@ -249,6 +288,7 @@ impl ListenerStore {
     fn clear(&mut self) {
         self.items.clear();
         self.index = None;
+        self.ones.clear();
         self.capture_count = 0;
     }
 
@@ -320,6 +360,10 @@ impl ListenerStore {
                 .push(idx as u32);
         }
         self.index = Some(index);
+        self.ones.clear();
+        for listener in &self.items {
+            Self::note_one(&mut self.ones, listener);
+        }
     }
 }
 
@@ -1250,9 +1294,48 @@ fn dom_node_of(value: &Value) -> Option<u32> {
     node_id_of(value)
 }
 
+fn event_object_empty(value: &Value) -> bool {
+    match value {
+        Value::Object(rc) => rc.borrow().is_empty(),
+        _ => false,
+    }
+}
+
+fn dispatch_unbubbled_slotted(node: u32, event: &Value) -> Option<bool> {
+    if !event_object_empty(event) || LISTENERS.with(|listeners| listeners.borrow().has_capture()) {
+        return None;
+    }
+    let head = crate::web_events::begin_unbubbled_target(event, node)?;
+    let event_type = event_type_for(head.type_name.as_str());
+    let mut calls = 0usize;
+    if head.invoke {
+        let hit = LISTENERS.with(|listeners| listeners.borrow().one_handler(node, event_type));
+        match hit {
+            Ok(Some(handler)) => {
+                handler.call_slice(Value::Undefined, std::slice::from_ref(event));
+                calls = 1;
+            }
+            Ok(None) => {}
+            Err(()) => {
+                calls = invoke_phase_listeners(node, event_type, None, event, true);
+            }
+        }
+    }
+    let canceled = crate::web_events::end_unbubbled_target(event);
+    if input_trace_enabled() {
+        let mut ev = Event::new(event_type, NodeId::from_u32(node));
+        ev.bubbles = false;
+        trace_dispatched_event(&ev, event, node, calls);
+    }
+    Some(!canceled)
+}
+
 fn try_fast_dom_dispatch(node: u32, event: &Value) -> Option<bool> {
     if DISPATCH_OVERRIDE.with(Cell::get) {
         return None;
+    }
+    if let Some(result) = dispatch_unbubbled_slotted(node, event) {
+        return Some(result);
     }
     Some(js_dispatch_event(node, event.clone()))
 }
@@ -29576,44 +29659,87 @@ try {
         }
         let nodes = root.get_property("childNodes");
         let length = nodes.get_property("length").to_number() as usize;
-        let index_started = std::time::Instant::now();
-        for n in 0..length {
-            let _ = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
-        }
-        let index = index_started.elapsed();
         let window = window_value();
         let class = window.get_property("Event");
-        let lookup_started = std::time::Instant::now();
-        for _ in 0..length {
-            let _ = window.get_property("Event");
-        }
-        let lookup = lookup_started.elapsed();
-        let direct_started = std::time::Instant::now();
-        let object = window.as_object().expect("window");
-        for _ in 0..length {
-            let _ = object.borrow().get_direct("Event");
-        }
-        let direct = direct_started.elapsed();
-        eprintln!("PROFILE window_get={lookup:?} direct={direct:?}");
-        let construct_started = std::time::Instant::now();
-        for _ in 0..length {
+        // Warm the intern table and the event pool, then time each slice the
+        // AOT loop pays. The official loop re-reads `window.Event` and
+        // `nodes.length` on every iteration.
+        for n in 0..length {
+            let _ = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
             let _ = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
         }
-        let construct = construct_started.elapsed();
-        hits.set(0);
-        let mut samples = Vec::new();
+        let time = |body: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            body();
+            started.elapsed()
+        };
+        let index = time(&mut || {
+            for n in 0..length {
+                let _ = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
+            }
+        });
+        let length_get = time(&mut || {
+            for _ in 0..length {
+                let loaded = nodes.clone();
+                let len = loaded.get_property("length");
+                let _ = w3cos_core::intrinsics::less_than(&Value::Number(0.0), &len).to_bool();
+            }
+        });
+        let event_get = time(&mut || {
+            for _ in 0..length {
+                let _ =
+                    w3cos_core::intrinsics::get_property(&window_value(), &Value::string("Event"));
+            }
+        });
+        let click_str = time(&mut || {
+            for _ in 0..length {
+                std::hint::black_box(Value::string("click"));
+            }
+        });
+        let construct = time(&mut || {
+            for _ in 0..length {
+                let _ = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+            }
+        });
+        let mut dispatch_only = Vec::new();
+        let mut aot_like = Vec::new();
         for _ in 0..3 {
             hits.set(0);
-            let started = std::time::Instant::now();
-            for n in 0..length {
-                let node = w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64));
-                let event = w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
-                let _ = node.call_method_slice("dispatchEvent", &[event]);
-            }
-            samples.push(started.elapsed());
+            let events: Vec<Value> = (0..length)
+                .map(|_| w3cos_core::class::construct_slice(&class, &[Value::string("click")]))
+                .collect();
+            let nodes_for_dispatch = (0..length)
+                .map(|n| w3cos_core::intrinsics::get_property(&nodes, &Value::Number(n as f64)))
+                .collect::<Vec<_>>();
+            dispatch_only.push(time(&mut || {
+                for (node, event) in nodes_for_dispatch.iter().zip(events.iter()) {
+                    let _ = node.call_method_slice("dispatchEvent", std::slice::from_ref(event));
+                }
+            }));
+            hits.set(0);
+            aot_like.push(time(&mut || {
+                let mut n = 0.0_f64;
+                loop {
+                    let loaded = nodes.clone();
+                    let len = loaded.get_property("length");
+                    if !w3cos_core::intrinsics::less_than(&Value::Number(n), &len).to_bool() {
+                        break;
+                    }
+                    let loaded = nodes.clone();
+                    let node = w3cos_core::intrinsics::get_property(&loaded, &Value::Number(n));
+                    let class = w3cos_core::intrinsics::get_property(
+                        &window_value(),
+                        &Value::string("Event"),
+                    );
+                    let event =
+                        w3cos_core::class::construct_slice(&class, &[Value::string("click")]);
+                    let _ = node.call_method_slice("dispatchEvent", &[event]);
+                    n = n * 1.0 + 1.0;
+                }
+            }));
         }
         eprintln!(
-            "PROFILE events index={index:?} event_get={lookup:?} construct={construct:?} dispatch={samples:?} hits={}",
+            "PROFILE index={index:?} length={length_get:?} event_get={event_get:?} click={click_str:?} construct={construct:?} dispatch_only={dispatch_only:?} aot_like={aot_like:?} hits={}",
             hits.get()
         );
         assert_eq!(hits.get(), 400);
