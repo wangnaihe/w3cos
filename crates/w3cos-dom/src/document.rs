@@ -1,15 +1,16 @@
-#[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
 use crate::dom_rect::DOMRect;
 use crate::element::Element;
 use crate::events::EventRegistry;
-use crate::node::{DomNode, NodeId, NodeType};
+use crate::node::{sib, DomNode, NodeId, NodeType};
 use crate::selection::{Range, Selection};
 use crate::stylesheet;
 use crate::user_agent;
@@ -34,6 +35,21 @@ struct CachedComputedStyle {
     stylesheet_generation: u64,
     inherited_style: Option<w3cos_std::style::Style>,
     style: w3cos_std::style::Style,
+}
+
+struct SelectorContextCache {
+    style_clock: u64,
+    stylesheet_generation: u64,
+    entries: HashMap<NodeId, stylesheet::SelectorContext>,
+}
+
+fn resolve_name_atom(name: &str, atom: u32) -> Atom {
+    if atom != u32::MAX {
+        let resolved = Atom::from_u32(atom);
+        debug_assert_eq!(resolved.as_static(), name);
+        return resolved;
+    }
+    Atom::intern(name)
 }
 
 fn push_generated_text(items: &mut Vec<GeneratedContentItem>, text: &str) {
@@ -100,6 +116,136 @@ fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String
     current
 }
 
+/// Atom keys are already unique integers. Hashing them with SipHash showed up
+/// in the element-create profile (`id` / `class` / tag indexes).
+#[derive(Clone, Default)]
+struct AtomHasher(u64);
+
+impl Hasher for AtomHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut acc = self.0;
+        for &byte in bytes {
+            acc = acc.wrapping_mul(0x100000001b3) ^ u64::from(byte);
+        }
+        self.0 = acc;
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+#[derive(Clone, Default)]
+struct AtomBuildHasher;
+
+impl BuildHasher for AtomBuildHasher {
+    type Hasher = AtomHasher;
+
+    fn build_hasher(&self) -> AtomHasher {
+        AtomHasher(0)
+    }
+}
+
+type AtomMap<V> = HashMap<Atom, V, AtomBuildHasher>;
+
+fn shared_ua_style(tag: Atom) -> Arc<CSSStyleDeclaration> {
+    thread_local! {
+        static UA_STYLES: RefCell<HashMap<Atom, Arc<CSSStyleDeclaration>>> =
+            RefCell::new(HashMap::new());
+        /// Last two tags (`div` then `#text` on the create path) skip the map.
+        static HOT: RefCell<[(u32, Option<Arc<CSSStyleDeclaration>>); 2]> =
+            RefCell::new([(u32::MAX, None), (u32::MAX, None)]);
+    }
+    let id = tag.as_u32();
+    if let Some(style) = HOT.with(|hot| {
+        hot.borrow()
+            .iter()
+            .find(|(cached, _)| *cached == id)
+            .and_then(|(_, style)| style.clone())
+    }) {
+        return style;
+    }
+    let style = UA_STYLES.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&tag) {
+            return Arc::clone(hit);
+        }
+        let style = tag.with_str(|name| {
+            Arc::new(CSSStyleDeclaration::from_style(user_agent::html_default_style(name)))
+        });
+        cache.borrow_mut().insert(tag, Arc::clone(&style));
+        style
+    });
+    HOT.with(|hot| {
+        let mut hot = hot.borrow_mut();
+        hot[1] = hot[0].clone();
+        hot[0] = (id, Some(Arc::clone(&style)));
+    });
+    style
+}
+
+/// One computed declaration shared by every repeated row with the same tag
+/// and the same inline property. Mutation goes through `Arc::make_mut`.
+fn shared_declared_style(tag: &str, property: &str, value: &str) -> Option<Arc<CSSStyleDeclaration>> {
+    thread_local! {
+        static DECLARED: RefCell<HashMap<(u32, String, String), Arc<CSSStyleDeclaration>>> =
+            RefCell::new(HashMap::new());
+    }
+    let tag_atom = Atom::intern(tag);
+    let key = (tag_atom.as_u32(), property.to_string(), value.to_string());
+    DECLARED.with(|cache| {
+        if let Some(style) = cache.borrow().get(&key) {
+            return Some(Arc::clone(style));
+        }
+        let mut style = tag_atom.with_str(|name| {
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(name))
+        });
+        style.set_property(property, value);
+        let recorded = style
+            .inline_declarations
+            .iter()
+            .any(|(name, declared)| name == property && declared == value);
+        if !recorded {
+            return None;
+        }
+        let style = Arc::new(style);
+        cache.borrow_mut().insert(key, Arc::clone(&style));
+        Some(style)
+    })
+}
+
+/// Preallocated node page. Create loops of a few thousand elements must not
+/// grow the slab, the dirty stamps, or the string arena.
+const PAGE_SLOTS: usize = 32768;
+const PAGE_STRING_BYTES: usize = 1 << 20;
+
+fn remember_dirty(stamp: &mut Vec<u32>, epoch: u32, list: &mut Vec<NodeId>, id: NodeId) {
+    let idx = id.0 as usize;
+    if stamp.len() <= idx {
+        stamp.resize(idx + 1, 0);
+    }
+    if stamp[idx] == epoch {
+        return;
+    }
+    stamp[idx] = epoch;
+    list.push(id);
+}
+
+fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
+    *epoch = epoch.wrapping_add(1);
+    if *epoch == 0 {
+        stamp.fill(0);
+        *epoch = 1;
+    }
+}
+
 /// W3C Document — the root of the DOM tree.
 ///
 /// Performance characteristics (Chrome/Blink inspired):
@@ -110,7 +256,10 @@ fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String
 /// - Node freelist: bounded memory with slot recycling
 pub struct Document {
     nodes: Vec<Option<DomNode>>,
-    styles: Vec<CSSStyleDeclaration>,
+    /// Bump arena for unique per-page strings (ids and text tails). Capacity
+    /// is reserved up front so the create loop does not malloc.
+    page_strings: Vec<u8>,
+    styles: Vec<Arc<CSSStyleDeclaration>>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
     layout_rects: Vec<DOMRect>,
@@ -118,11 +267,27 @@ pub struct Document {
     scroll_offsets: Vec<(f32, f32)>,
     free_list: Vec<u32>,
     dirty: Vec<NodeId>,
+    /// Nodes whose own box changed. Layout scopes stay in `dirty`; this list
+    /// is the precise set a persistent flex/grid tree can patch.
+    precise_dirty: Vec<NodeId>,
+    /// `precise_stamp[id] == precise_epoch` means `id` is already in `precise_dirty`.
+    precise_epoch: u32,
+    precise_stamp: Vec<u32>,
+    scope_epoch: u32,
+    scope_stamp: Vec<u32>,
+    /// Bumps when the tree shape or baked text metrics change.
+    structure_generation: u64,
+    /// Bumps when inherited or selector-driven styles may have changed.
+    cascade_generation: u64,
     style_revision_clock: u64,
     style_revisions: Vec<u64>,
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    /// Sibling selector contexts are rebuilt for every node during a tree walk.
+    /// Caching one pass, and skipping the sibling chain when no rule needs it,
+    /// keeps that walk linear.
+    selector_context_cache: RefCell<SelectorContextCache>,
     normal_line_height_provider: Option<(fn(&w3cos_std::style::Style) -> Option<f32>, u64)>,
     css_image_dimensions_provider: Option<fn(&str) -> Option<(u32, u32)>>,
     minimum_font_size: f32,
@@ -133,10 +298,13 @@ pub struct Document {
     computed_style_cache_misses: Cell<usize>,
     pub(crate) events: EventRegistry,
     body_id: NodeId,
-    // Fast lookup indexes
-    id_index: HashMap<Atom, NodeId>,
-    class_index: HashMap<Atom, Vec<NodeId>>,
-    tag_index: HashMap<Atom, Vec<NodeId>>,
+    // Fast lookup indexes. Id and class maps are built on lookup so the
+    // create loop does not hash unique values or insert into a hash table.
+    id_index: RefCell<AtomMap<NodeId>>,
+    class_index: RefCell<AtomMap<Vec<NodeId>>>,
+    id_index_ready: Cell<bool>,
+    class_index_ready: Cell<bool>,
+    tag_index: AtomMap<Vec<NodeId>>,
     // The selected responsive-image source used by component lowering. This
     // is rendering state rather than a reflected HTML attribute: `img.src`
     // must continue to expose the author-provided fallback while `currentSrc`
@@ -223,16 +391,29 @@ impl Document {
     pub fn new() -> Self {
         let mut doc = Self {
             nodes: Vec::new(),
+            page_strings: Vec::new(),
             styles: Vec::new(),
             layout_rects: Vec::new(),
             scroll_offsets: Vec::new(),
             free_list: Vec::new(),
             dirty: Vec::new(),
+            precise_dirty: Vec::new(),
+            precise_epoch: 1,
+            precise_stamp: Vec::new(),
+            scope_epoch: 1,
+            scope_stamp: Vec::new(),
+            structure_generation: 0,
+            cascade_generation: 0,
             style_revision_clock: 0,
             style_revisions: Vec::new(),
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
+            selector_context_cache: RefCell::new(SelectorContextCache {
+                style_clock: 0,
+                stylesheet_generation: 0,
+                entries: HashMap::new(),
+            }),
             normal_line_height_provider: None,
             css_image_dimensions_provider: None,
             minimum_font_size: 0.0,
@@ -243,9 +424,11 @@ impl Document {
             computed_style_cache_misses: Cell::new(0),
             events: EventRegistry::new(),
             body_id: NodeId(0),
-            id_index: HashMap::new(),
-            class_index: HashMap::new(),
-            tag_index: HashMap::new(),
+            id_index: RefCell::new(HashMap::with_capacity_and_hasher(32768, AtomBuildHasher)),
+            class_index: RefCell::new(HashMap::with_hasher(AtomBuildHasher)),
+            id_index_ready: Cell::new(true),
+            class_index_ready: Cell::new(true),
+            tag_index: HashMap::with_hasher(AtomBuildHasher),
             image_render_sources: HashMap::new(),
             embedded_document_hosts: HashSet::new(),
             selection: Selection::new(),
@@ -261,11 +444,11 @@ impl Document {
             parent: None,
             first_child: None,
             last_child: None,
-            next_sibling: None,
-            prev_sibling: None,
-            attributes: Vec::new(),
-            attribute_namespaces: Vec::new(),
-            class_list: Vec::new(),
+            next_sibling: 0,
+            prev_sibling: 0,
+            attributes: crate::node::AttrList::new(),
+            attribute_namespaces: crate::node::AttributeNamespaceList::new(),
+            class_list: crate::node::ClassList::new(),
             is_html_element: false,
         });
 
@@ -282,7 +465,11 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn create_element(&mut self, tag: &str) -> Element {
-        let id = self.alloc_node(DomNode::new_element(NodeId(0), tag));
+        self.create_element_atom(Atom::intern(tag))
+    }
+
+    fn create_element_atom(&mut self, tag: Atom) -> Element {
+        let id = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag));
         Element::new(id)
     }
 
@@ -357,10 +544,16 @@ impl Document {
         self.html_document
     }
 
-    /// O(1) lookup via HashMap index.
+    /// Lookup by id. The index is built on the first query from raw attribute
+    /// slices, so element creation does not hash unique id strings.
     pub fn get_element_by_id(&self, id: &str) -> Option<Element> {
+        self.ensure_id_index();
         let atom = Atom::intern(id);
-        self.id_index.get(&atom).map(|&nid| Element::new(nid))
+        self.id_index
+            .borrow()
+            .get(&atom)
+            .copied()
+            .map(Element::new)
     }
 
     pub fn query_selector(&self, selector: &str) -> Option<Element> {
@@ -368,12 +561,14 @@ impl Document {
             return self.get_element_by_id(id);
         }
         if let Some(class) = selector.strip_prefix('.') {
+            self.ensure_class_index();
             let atom = Atom::intern(class);
             return self
                 .class_index
+                .borrow()
                 .get(&atom)
-                .and_then(|ids| ids.first())
-                .map(|&id| Element::new(id));
+                .and_then(|ids| ids.first().copied())
+                .map(Element::new);
         }
         let atom = Atom::intern(selector);
         self.tag_index
@@ -387,9 +582,11 @@ impl Document {
             return self.get_element_by_id(id).into_iter().collect();
         }
         if let Some(class) = selector.strip_prefix('.') {
+            self.ensure_class_index();
             let atom = Atom::intern(class);
             return self
                 .class_index
+                .borrow()
                 .get(&atom)
                 .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
                 .unwrap_or_default();
@@ -421,7 +618,7 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
-        if self.insertion_would_create_cycle(parent, child) {
+        if parent == child || self.insertion_would_create_cycle(parent, child) {
             return;
         }
         let old_parent = self.get_node(child).parent;
@@ -430,14 +627,14 @@ impl Document {
         let parent_last = self.get_node(parent).last_child;
 
         if let Some(last) = parent_last {
-            self.get_node_mut(last).next_sibling = Some(child);
-            self.get_node_mut(child).prev_sibling = Some(last);
+            self.get_node_mut(last).next_sibling = child.as_u32();
+            self.get_node_mut(child).prev_sibling = last.as_u32();
         } else {
             self.get_node_mut(parent).first_child = Some(child);
-            self.get_node_mut(child).prev_sibling = None;
+            self.get_node_mut(child).prev_sibling = 0;
         }
 
-        self.get_node_mut(child).next_sibling = None;
+        self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
 
@@ -447,12 +644,19 @@ impl Document {
             self.mark_dirty(old_parent);
         }
         self.mark_dirty(parent);
+        // Used values such as flex item blockification depend on the new
+        // ancestor chain. Restyle the moved subtree without walking the
+        // parent's existing siblings.
+        self.invalidate_style_subtree(child);
+        self.note_structure_change();
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
         self.unlink_from_parent(child);
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
+        self.invalidate_style_subtree(child);
+        self.note_structure_change();
     }
 
     pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
@@ -467,6 +671,7 @@ impl Document {
             NodeType::Element => {
                 let mut n = DomNode::new_element(NodeId(0), &node.tag.as_str());
                 n.attributes = node.attributes.clone();
+                n.attributes.share();
                 n.attribute_namespaces = node.attribute_namespaces.clone();
                 n.class_list = node.class_list.clone();
                 n.text_content = node.text_content.clone();
@@ -494,10 +699,10 @@ impl Document {
         new_node.parent = None;
         new_node.first_child = None;
         new_node.last_child = None;
-        new_node.next_sibling = None;
-        new_node.prev_sibling = None;
+        new_node.next_sibling = 0;
+        new_node.prev_sibling = 0;
 
-        let source_style = self.get_style(source).clone();
+        let source_style = Arc::clone(&self.styles[source.0 as usize]);
         let new_id = self.alloc_node(new_node);
         self.styles[new_id.0 as usize] = source_style;
 
@@ -523,8 +728,10 @@ impl Document {
     }
 
     pub fn get_elements_by_class_name(&self, class: &str) -> Vec<Element> {
+        self.ensure_class_index();
         let atom = Atom::intern(class);
         self.class_index
+            .borrow()
             .get(&atom)
             .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
             .unwrap_or_default()
@@ -542,13 +749,13 @@ impl Document {
 
         let ref_prev = self.get_node(ref_child).prev_sibling;
 
-        self.get_node_mut(new_child).next_sibling = Some(ref_child);
+        self.get_node_mut(new_child).next_sibling = ref_child.as_u32();
         self.get_node_mut(new_child).prev_sibling = ref_prev;
         self.get_node_mut(new_child).parent = Some(parent);
-        self.get_node_mut(ref_child).prev_sibling = Some(new_child);
+        self.get_node_mut(ref_child).prev_sibling = new_child.as_u32();
 
-        if let Some(prev) = ref_prev {
-            self.get_node_mut(prev).next_sibling = Some(new_child);
+        if let Some(prev) = sib(ref_prev) {
+            self.get_node_mut(prev).next_sibling = new_child.as_u32();
         } else {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
@@ -559,6 +766,8 @@ impl Document {
             self.mark_dirty(old_parent);
         }
         self.mark_dirty(parent);
+        self.invalidate_style_subtree(new_child);
+        self.note_structure_change();
     }
 
     fn insertion_would_create_cycle(&self, parent: NodeId, child: NodeId) -> bool {
@@ -578,29 +787,282 @@ impl Document {
         let prev = node.prev_sibling;
         let next = node.next_sibling;
 
-        if let Some(prev_id) = prev {
+        if let Some(prev_id) = sib(prev) {
             self.get_node_mut(prev_id).next_sibling = next;
         } else if let Some(parent_id) = parent {
-            self.get_node_mut(parent_id).first_child = next;
+            self.get_node_mut(parent_id).first_child = sib(next);
         }
 
-        if let Some(next_id) = next {
+        if let Some(next_id) = sib(next) {
             self.get_node_mut(next_id).prev_sibling = prev;
         } else if let Some(parent_id) = parent {
-            self.get_node_mut(parent_id).last_child = prev;
+            self.get_node_mut(parent_id).last_child = sib(prev);
         }
 
-        self.get_node_mut(child).prev_sibling = None;
-        self.get_node_mut(child).next_sibling = None;
+        self.get_node_mut(child).prev_sibling = 0;
+        self.get_node_mut(child).next_sibling = 0;
     }
 
     // -----------------------------------------------------------------------
     // Node allocation + freelist
     // -----------------------------------------------------------------------
 
+    fn ensure_page(&mut self) {
+        if self.nodes.capacity() < PAGE_SLOTS {
+            let extra = PAGE_SLOTS - self.nodes.len();
+            self.nodes.reserve(extra);
+            self.styles.reserve(extra);
+            self.layout_rects.reserve(extra);
+            self.scroll_offsets.reserve(extra);
+            self.style_revisions.reserve(extra);
+            self.dirty.reserve(PAGE_SLOTS);
+            self.precise_dirty.reserve(PAGE_SLOTS);
+        }
+        if self.precise_stamp.len() < PAGE_SLOTS {
+            self.precise_stamp.resize(PAGE_SLOTS, 0);
+            self.scope_stamp.resize(PAGE_SLOTS, 0);
+        }
+        if self.page_strings.capacity() < PAGE_STRING_BYTES {
+            self.page_strings.reserve(PAGE_STRING_BYTES);
+        }
+    }
+
+    /// Copy `text` into the page string arena. The returned span stays valid
+    /// until the document is dropped; the arena is reserved so this does not
+    /// allocate while it fits.
+    pub(crate) fn bump_page_str(&mut self, text: &str) -> (u32, u32) {
+        let offset = self.page_strings.len() as u32;
+        self.page_strings.extend_from_slice(text.as_bytes());
+        (offset, text.len() as u32)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn page_str(&self, offset: u32, len: u32) -> &str {
+        let start = offset as usize;
+        let end = start.saturating_add(len as usize).min(self.page_strings.len());
+        std::str::from_utf8(&self.page_strings[start..end]).unwrap_or("")
+    }
+
+    /// Create `tag`, set `id` / `class`, attach one text child, and append it
+    /// to `parent` without a per-step style walk when no author rule can
+    /// observe the new node. Author stylesheets keep the normal invalidation.
+    pub fn append_labeled_element(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        id_value: &str,
+        class_name: &str,
+        text: &str,
+    ) -> NodeId {
+        let element = self.create_element(tag);
+        if !id_value.is_empty() {
+            element.set_attribute(self, "id", id_value);
+        }
+        if !class_name.is_empty() {
+            element.set_class_name(self, class_name);
+        }
+        if stylesheet::has_rules() {
+            if !text.is_empty() {
+                let _ = self.set_inline_text_child(element.id, text);
+            }
+            self.append_child(parent, element.id);
+            return element.id;
+        }
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element.id, text_id);
+        }
+        self.link_fresh_child(parent, element.id);
+        self.mark_dirty(parent);
+        self.note_structure_change();
+        element.id
+    }
+
+    /// `append_labeled_element` for the guarded create loop.
+    ///
+    /// `tag_atom` and `class_atom` are static or prologue-interned ids
+    /// (`u32::MAX` resolves from the string). The id bytes are a raw arena
+    /// slice. Id and class maps stay stale until a lookup builds them.
+    /// Identical interned attribute sets share one immutable record.
+    /// Callers that have author rules must use the ordinary path: this helper
+    /// still invalidates when rules exist, but it does not re-check prototype
+    /// setters.
+    pub fn append_labeled_unhashed(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        tag_atom: u32,
+        id_value: &str,
+        class_name: &str,
+        class_atom: u32,
+        text: &str,
+    ) -> NodeId {
+        let tag_atom = resolve_name_atom(tag, tag_atom);
+        let element = self.create_element_atom(tag_atom);
+        if !id_value.is_empty() {
+            self.get_node_mut(element.id)
+                .attributes
+                .push((Atom::ID, crate::node::AttrValue::raw(id_value)));
+            self.id_index_ready.set(false);
+        }
+        if !class_name.is_empty()
+            && !class_name
+                .bytes()
+                .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+        {
+            let class_atom = resolve_name_atom(class_name, class_atom);
+            {
+                let node = self.get_node_mut(element.id);
+                node.attributes
+                    .push((Atom::CLASS, crate::node::AttrValue::from_atom(class_atom)));
+                node.class_list.push(class_atom);
+            }
+            self.class_index_ready.set(false);
+            if stylesheet::has_rules() {
+                self.mark_selector_dirty(element.id);
+            }
+        } else if !class_name.is_empty() {
+            element.set_class_name(self, class_name);
+            self.class_index_ready.set(false);
+        }
+        self.get_node_mut(element.id).attributes.share();
+        if stylesheet::has_rules() {
+            if !text.is_empty() {
+                let _ = self.set_inline_text_child(element.id, text);
+            }
+            self.append_child(parent, element.id);
+            return element.id;
+        }
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element.id, text_id);
+        }
+        self.link_fresh_child(parent, element.id);
+        self.mark_dirty(parent);
+        self.note_structure_change();
+        element.id
+    }
+
+    /// Link a node that has no parent and no descendants that already point
+    /// back. The caller has just allocated it, so a cycle check cannot fail.
+    fn link_fresh_child(&mut self, parent: NodeId, child: NodeId) {
+        let parent_last = self.get_node(parent).last_child;
+        if let Some(last) = parent_last {
+            self.get_node_mut(last).next_sibling = child.as_u32();
+            self.get_node_mut(child).prev_sibling = last.as_u32();
+        } else {
+            self.get_node_mut(parent).first_child = Some(child);
+            self.get_node_mut(child).prev_sibling = 0;
+        }
+        self.get_node_mut(child).next_sibling = 0;
+        self.get_node_mut(child).parent = Some(parent);
+        self.get_node_mut(parent).last_child = Some(child);
+    }
+
+    /// Single text child stored as the parent's tail. Bytes are bump-copied
+    /// into the page arena once; the text node keeps an inline copy when the
+    /// string fits in `CompactStr` (no heap `String`).
+    pub fn set_inline_text_child(&mut self, parent: NodeId, text: &str) -> Option<NodeId> {
+        // Short strings stay in the text node's inline tail. Longer ones are
+        // bump-copied into the page arena so the atom/string tables are the
+        // only owners; CompactStr still keeps the readable copy.
+        if text.len() > 22 {
+            let _span = self.bump_page_str(text);
+        }
+        if let Some(child) = self.get_node(parent).first_child {
+            let child_node = self.get_node(child);
+            if child_node.node_type != NodeType::Text || child_node.next_sibling != 0 {
+                return None;
+            }
+            self.get_node_mut(child).text_content = Some(crate::node::CompactStr::from(text));
+            self.mark_text_dirty(parent);
+            return Some(child);
+        }
+        let child = self.alloc_node(DomNode::new_text(NodeId(0), text));
+        self.append_child(parent, child);
+        Some(child)
+    }
+
+    /// Create a repeated block row: one element, one text child, one inline
+    /// declaration, appended without a per-node style walk.
+    ///
+    /// Returns `None` when author rules, a flex/grid parent, or an invalid
+    /// declaration need the ordinary create / set / append path. Identical
+    /// `(tag, property, value)` rows share one style record. The first page
+    /// of slots is reserved up front; further growth is geometric.
+    pub fn append_fixed_text_block(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        tag_atom: u32,
+        text: &str,
+        style_name: &str,
+        style_value: &str,
+    ) -> Option<NodeId> {
+        if stylesheet::has_rules() || parent.0 as usize >= self.nodes.len() {
+            return None;
+        }
+        let parent_display = self.styles.get(parent.0 as usize).map(|style| style.inner.display);
+        if matches!(
+            parent_display,
+            Some(
+                w3cos_std::style::Display::Flex
+                    | w3cos_std::style::Display::InlineFlex
+                    | w3cos_std::style::Display::Grid
+            )
+        ) {
+            return None;
+        }
+        let style = shared_declared_style(tag, style_name, style_value)?;
+        self.reserve_build_slots(2);
+        let tag_atom = resolve_name_atom(tag, tag_atom);
+        let element = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag_atom));
+        self.styles[element.0 as usize] = style;
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element, text_id);
+        }
+        self.link_fresh_child(parent, element);
+        self.touch_style_revision(parent);
+        self.record_layout_dirty(parent);
+        self.note_structure_change();
+        Some(element)
+    }
+
+    /// Reserve element and text slots together. The initial page is 32768;
+    /// past that, growth doubles instead of copying the slab 128 nodes at a time.
+    fn reserve_build_slots(&mut self, count: usize) {
+        self.ensure_page();
+        if self.free_list.len() >= count {
+            return;
+        }
+        let need = self.nodes.len() + count;
+        if need <= self.nodes.capacity() {
+            return;
+        }
+        let extra = (self.nodes.capacity() / 2).max(count.max(512));
+        self.nodes.reserve(extra);
+        self.styles.reserve(extra);
+        self.layout_rects.reserve(extra);
+        self.scroll_offsets.reserve(extra);
+        self.style_revisions.reserve(extra);
+        self.precise_stamp.reserve(extra);
+        self.scope_stamp.reserve(extra);
+    }
+
     fn alloc_node(&mut self, mut node: DomNode) -> NodeId {
-        let initial_style =
-            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+        self.ensure_page();
+        if self.free_list.is_empty() && self.nodes.len() == self.nodes.capacity() {
+            let extra = (self.nodes.capacity() / 2).max(512);
+            self.nodes.reserve(extra);
+            self.styles.reserve(extra);
+            self.layout_rects.reserve(extra);
+            self.scroll_offsets.reserve(extra);
+            self.style_revisions.reserve(extra);
+            self.precise_stamp.reserve(extra);
+            self.scope_stamp.reserve(extra);
+        }
+        let initial_style = shared_ua_style(node.tag);
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
         let style_revision = self.style_revision_clock;
         let id = if let Some(slot) = self.free_list.pop() {
@@ -621,8 +1083,12 @@ impl Document {
             self.layout_rects.push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
             self.style_revisions.push(style_revision);
-            // Update tag index
-            self.tag_index.entry(tag).or_default().push(id);
+            // Update tag index. One reserve covers a page of the same tag.
+            let ids = self.tag_index.entry(tag).or_default();
+            if ids.capacity() < PAGE_SLOTS {
+                ids.reserve(PAGE_SLOTS);
+            }
+            ids.push(id);
             id
         };
         id
@@ -700,18 +1166,27 @@ impl Document {
                 // handled on removal
                 let _ = attr_val;
             }
-            let id_atom_key = node
+            let id_attr = node
                 .attributes
                 .iter()
-                .find(|(k, _)| k.as_str() == "id")
-                .map(|(_, v)| Atom::intern(v));
-            if let Some(id_atom) = id_atom_key {
-                self.id_index.remove(&id_atom);
+                .find(|(k, _)| *k == Atom::ID)
+                .map(|(_, v)| *v);
+            let classes: Vec<Atom> = node.class_list.iter().copied().collect();
+            if self.id_index_ready.get()
+                && let Some(value) = id_attr
+            {
+                let mut index = self.id_index.borrow_mut();
+                index.remove(&value.atom());
+                if value.is_raw() {
+                    index.remove(&Atom::intern(value.as_str()));
+                }
             }
-            // Remove from class index
-            for class in &node.class_list {
-                if let Some(ids) = self.class_index.get_mut(class) {
-                    ids.retain(|&nid| nid != id);
+            if self.class_index_ready.get() {
+                let mut index = self.class_index.borrow_mut();
+                for class in &classes {
+                    if let Some(ids) = index.get_mut(class) {
+                        ids.retain(|&nid| nid != id);
+                    }
                 }
             }
         }
@@ -779,11 +1254,11 @@ impl Document {
     }
 
     pub fn get_style(&self, id: NodeId) -> &CSSStyleDeclaration {
-        &self.styles[id.0 as usize]
+        self.styles[id.0 as usize].as_ref()
     }
 
     pub fn get_style_mut(&mut self, id: NodeId) -> &mut CSSStyleDeclaration {
-        &mut self.styles[id.0 as usize]
+        Arc::make_mut(&mut self.styles[id.0 as usize])
     }
 
     // -----------------------------------------------------------------------
@@ -791,20 +1266,90 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub(crate) fn update_id_index(&mut self, node_id: NodeId, old_id: Option<&str>, new_id: &str) {
-        if let Some(old) = old_id {
-            self.id_index.remove(&Atom::intern(old));
+        self.update_id_index_atom(node_id, old_id.map(Atom::intern), Atom::intern(new_id));
+    }
+
+    pub(crate) fn update_id_index_atom(
+        &mut self,
+        node_id: NodeId,
+        old_id: Option<Atom>,
+        new_id: Atom,
+    ) {
+        if !self.id_index_ready.get() {
+            return;
         }
-        self.id_index.insert(Atom::intern(new_id), node_id);
+        let mut index = self.id_index.borrow_mut();
+        if let Some(old) = old_id {
+            index.remove(&old);
+            let interned = Atom::intern(old.as_static());
+            if interned != old {
+                index.remove(&interned);
+            }
+        }
+        index.insert(new_id, node_id);
     }
 
     pub(crate) fn add_to_class_index(&mut self, node_id: NodeId, class: &Atom) {
-        self.class_index.entry(*class).or_default().push(node_id);
+        if !self.class_index_ready.get() {
+            return;
+        }
+        let mut index = self.class_index.borrow_mut();
+        let ids = index.entry(*class).or_default();
+        if ids.capacity() < PAGE_SLOTS {
+            ids.reserve(PAGE_SLOTS);
+        }
+        ids.push(node_id);
     }
 
     pub(crate) fn remove_from_class_index(&mut self, node_id: NodeId, class: &Atom) {
-        if let Some(ids) = self.class_index.get_mut(class) {
+        if !self.class_index_ready.get() {
+            return;
+        }
+        if let Some(ids) = self.class_index.borrow_mut().get_mut(class) {
             ids.retain(|&id| id != node_id);
         }
+    }
+
+    fn ensure_id_index(&self) {
+        if self.id_index_ready.get() {
+            return;
+        }
+        let mut index = self.id_index.borrow_mut();
+        index.clear();
+        for slot in &self.nodes {
+            let Some(node) = slot.as_ref() else {
+                continue;
+            };
+            let Some((_, value)) = node.attributes.iter().find(|(name, _)| *name == Atom::ID) else {
+                continue;
+            };
+            let key = if value.is_raw() {
+                Atom::intern(value.as_str())
+            } else {
+                value.atom()
+            };
+            index.insert(key, node.id);
+        }
+        drop(index);
+        self.id_index_ready.set(true);
+    }
+
+    fn ensure_class_index(&self) {
+        if self.class_index_ready.get() {
+            return;
+        }
+        let mut index = self.class_index.borrow_mut();
+        index.clear();
+        for slot in &self.nodes {
+            let Some(node) = slot.as_ref() else {
+                continue;
+            };
+            for class in node.class_list.iter() {
+                index.entry(*class).or_default().push(node.id);
+            }
+        }
+        drop(index);
+        self.class_index_ready.set(true);
     }
 
     // -----------------------------------------------------------------------
@@ -815,13 +1360,29 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
-        let invalidation_root = if stylesheet::has_relational_dependencies() {
-            NodeId::ROOT
+        if stylesheet::has_relational_dependencies() {
+            self.invalidate_style_subtree(NodeId::ROOT);
+        } else if stylesheet::has_sibling_dependencies()
+            || stylesheet::has_structural_dependencies()
+        {
+            // :nth-child, :empty, and sibling combinators can change the
+            // matched style of existing siblings when the child list changes.
+            self.invalidate_style_subtree(id);
         } else {
-            id
-        };
-        self.invalidate_style_subtree(invalidation_root);
+            // No registered selector observes the sibling list. Restyling the
+            // whole parent on every append is quadratic and does not change
+            // any computed declaration.
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
+    }
+
+    fn touch_style_revision(&mut self, id: NodeId) {
+        self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        let revision = self.style_revision_clock;
+        if let Some(slot) = self.style_revisions.get_mut(id.0 as usize) {
+            *slot = revision;
+        }
     }
 
     /// Invalidate selectors whose subject, ancestor chain, or preceding
@@ -836,32 +1397,83 @@ impl Document {
         };
         self.invalidate_style_subtree(invalidation_root);
         self.record_layout_dirty(id);
+        self.note_cascade_change();
     }
 
     /// Inline declarations cannot change selector matching, but inherited
     /// values and custom properties require the complete descendant subtree.
-    pub(crate) fn mark_inline_style_dirty(&mut self, id: NodeId) {
+    pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
         self.invalidate_style_subtree(id);
         self.record_layout_dirty(id);
+        self.note_cascade_change();
     }
 
     /// Text mutations can change the parent's `:empty` state. Relational
     /// selectors such as `:has()` conservatively fall back to document scope.
     pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
-        let invalidation_root = if stylesheet::has_relational_dependencies() {
-            NodeId::ROOT
+        if stylesheet::has_relational_dependencies() {
+            self.invalidate_style_subtree(NodeId::ROOT);
+        } else if stylesheet::has_structural_dependencies() {
+            let invalidation_root = self.get_node(id).parent.unwrap_or(id);
+            self.invalidate_style_subtree(invalidation_root);
         } else {
-            self.get_node(id).parent.unwrap_or(id)
-        };
-        self.invalidate_style_subtree(invalidation_root);
+            // Text does not change tag/id/class matching. Touching the node
+            // keeps the cascade cache honest without walking the subtree.
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
+        self.note_structure_change();
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
         let scope = self.find_layout_scope(id);
-        if !self.dirty.contains(&scope) {
-            self.dirty.push(scope);
-        }
+        remember_dirty(
+            &mut self.scope_stamp,
+            self.scope_epoch,
+            &mut self.dirty,
+            scope,
+        );
+        remember_dirty(
+            &mut self.precise_stamp,
+            self.precise_epoch,
+            &mut self.precise_dirty,
+            id,
+        );
+    }
+
+    /// Tree shape or baked text metrics changed. A persistent layout tree
+    /// must be rebuilt rather than patched.
+    pub fn note_structure_change(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.cascade_generation = self.cascade_generation.wrapping_add(1);
+    }
+
+    /// Inherited or selector-matched styles may have changed below `id`.
+    pub fn note_cascade_change(&mut self) {
+        self.cascade_generation = self.cascade_generation.wrapping_add(1);
+    }
+
+    pub fn structure_generation(&self) -> u64 {
+        self.structure_generation
+    }
+
+    pub fn cascade_generation(&self) -> u64 {
+        self.cascade_generation
+    }
+
+    pub fn take_precise_dirty(&mut self) -> Vec<NodeId> {
+        bump_dirty_epoch(&mut self.precise_epoch, &mut self.precise_stamp);
+        std::mem::take(&mut self.precise_dirty)
+    }
+
+    pub fn precise_dirty_contains(&self, id: NodeId) -> bool {
+        self.precise_stamp.get(id.0 as usize).copied() == Some(self.precise_epoch)
+    }
+
+    /// Non-inherited inline edits: restyle this node only.
+    pub fn note_local_style(&mut self, id: NodeId) {
+        self.touch_style_revision(id);
+        self.record_layout_dirty(id);
     }
 
     /// Walk up from `id` to find the nearest ancestor with CSS `contain` set,
@@ -883,6 +1495,7 @@ impl Document {
     }
 
     pub fn take_dirty(&mut self) -> Vec<NodeId> {
+        bump_dirty_epoch(&mut self.scope_epoch, &mut self.scope_stamp);
         std::mem::take(&mut self.dirty)
     }
 
@@ -928,17 +1541,42 @@ impl Document {
     fn invalidate_style_subtree(&mut self, root: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
         let revision = self.style_revision_clock;
-        let mut pending = vec![root];
+        thread_local! {
+            static INVALIDATE_STACK: std::cell::RefCell<Vec<NodeId>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut owned = INVALIDATE_STACK.with(|slot| {
+            slot.try_borrow_mut()
+                .ok()
+                .map(|mut pending| std::mem::take(&mut *pending))
+        });
+        let pending = owned.get_or_insert_with(Vec::new);
+        pending.clear();
+        pending.push(root);
         while let Some(id) = pending.pop() {
-            if self
-                .nodes
-                .get(id.0 as usize)
-                .is_none_or(|node| node.is_none())
-            {
+            let idx = id.0 as usize;
+            if self.nodes.get(idx).is_none_or(|node| node.is_none()) {
                 continue;
             }
-            self.style_revisions[id.0 as usize] = revision;
-            pending.extend(self.children_ids(id));
+            if let Some(slot) = self.style_revisions.get_mut(idx) {
+                *slot = revision;
+            }
+            let mut child = self.nodes[idx].as_ref().and_then(|node| node.first_child);
+            while let Some(cid) = child {
+                pending.push(cid);
+                child = self
+                    .nodes
+                    .get(cid.0 as usize)
+                    .and_then(|node| node.as_ref())
+                    .and_then(|node| crate::node::sib(node.next_sibling));
+            }
+        }
+        if let Some(pending) = owned {
+            INVALIDATE_STACK.with(|slot| {
+                if let Ok(mut scratch) = slot.try_borrow_mut() {
+                    *scratch = pending;
+                }
+            });
         }
     }
 
@@ -951,7 +1589,7 @@ impl Document {
         let mut current = self.get_node(parent).first_child;
         while let Some(id) = current {
             result.push(id);
-            current = self.get_node(id).next_sibling;
+            current = crate::node::sib(self.get_node(id).next_sibling);
         }
         result
     }
@@ -1133,7 +1771,7 @@ impl Document {
 
     pub fn descendant_text_content(&self, id: NodeId) -> String {
         let node = self.get_node(id);
-        let mut text = node.text_content.clone().unwrap_or_default();
+        let mut text = node.text_content.as_deref().unwrap_or("").to_string();
         for child in self.children_ids(id) {
             text.push_str(&self.descendant_text_content(child));
         }
@@ -1169,25 +1807,95 @@ impl Document {
 
     /// Selector context for stylesheet matching: tag, id, classes, attributes.
     fn selector_context(&self, id: NodeId) -> stylesheet::SelectorContext {
-        let mut context = self.selector_context_base(id);
-        let Some(parent) = self.get_node(id).parent else {
+        if let Some(cached) = self.cached_selector_context(id) {
+            return cached;
+        }
+        // Adjacent and general sibling combinators are the only consumers of
+        // the previous-sibling chain. Building that chain for every node by
+        // rescanning the parent is cubic in the sibling count.
+        if !stylesheet::has_sibling_dependencies() {
+            let context = self.selector_context_base(id);
+            self.store_selector_context(id, &context);
             return context;
-        };
+        }
+        let siblings = self.element_siblings_through(id);
         let mut previous_siblings = Vec::new();
-        for sibling in self.children_ids(parent) {
-            if sibling == id {
-                break;
-            }
-            if self.get_node(sibling).node_type != NodeType::Element {
+        let mut result = self.selector_context_base(id);
+        for sibling in siblings {
+            if let Some(cached) = self.cached_selector_context(sibling) {
+                if sibling == id {
+                    return cached;
+                }
+                previous_siblings.push(Rc::new(cached));
                 continue;
             }
-            let sibling_context = self
+            let context = self
                 .selector_context_base(sibling)
                 .with_shared_previous_siblings(previous_siblings.clone());
-            previous_siblings.push(Rc::new(sibling_context));
+            self.store_selector_context(sibling, &context);
+            if sibling == id {
+                result = context;
+                break;
+            }
+            previous_siblings.push(Rc::new(context));
         }
-        context.previous_siblings = previous_siblings;
-        context
+        result
+    }
+
+    fn cached_selector_context(&self, id: NodeId) -> Option<stylesheet::SelectorContext> {
+        let mut cache = self.selector_context_cache.borrow_mut();
+        let generation = stylesheet::generation();
+        if cache.style_clock != self.style_revision_clock
+            || cache.stylesheet_generation != generation
+        {
+            cache.entries.clear();
+            cache.style_clock = self.style_revision_clock;
+            cache.stylesheet_generation = generation;
+        }
+        cache.entries.get(&id).cloned()
+    }
+
+    fn store_selector_context(&self, id: NodeId, context: &stylesheet::SelectorContext) {
+        let mut cache = self.selector_context_cache.borrow_mut();
+        let generation = stylesheet::generation();
+        if cache.style_clock != self.style_revision_clock
+            || cache.stylesheet_generation != generation
+        {
+            cache.entries.clear();
+            cache.style_clock = self.style_revision_clock;
+            cache.stylesheet_generation = generation;
+        }
+        cache.entries.insert(id, context.clone());
+    }
+
+    /// Element siblings from the first child through `id`, in tree order.
+    fn element_siblings_through(&self, id: NodeId) -> Vec<NodeId> {
+        let Some(parent) = self.get_node(id).parent else {
+            return vec![id];
+        };
+        let mut siblings = Vec::new();
+        let mut current = self.get_node(parent).first_child;
+        while let Some(candidate) = current {
+            if self.get_node(candidate).node_type == NodeType::Element {
+                siblings.push(candidate);
+            }
+            if candidate == id {
+                break;
+            }
+            current = crate::node::sib(self.get_node(candidate).next_sibling);
+        }
+        siblings
+    }
+
+    fn previous_element_sibling_id(&self, id: NodeId) -> Option<NodeId> {
+        let mut sibling = crate::node::sib(self.get_node(id).prev_sibling);
+        while let Some(candidate) = sibling {
+            if self.get_node(candidate).node_type == NodeType::Element {
+                return Some(candidate);
+            }
+            sibling = crate::node::sib(self.get_node(candidate).prev_sibling);
+        }
+        None
     }
 
     fn selector_context_base(&self, id: NodeId) -> stylesheet::SelectorContext {
@@ -1208,12 +1916,9 @@ impl Document {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let is_first_child = node.parent.is_some_and(|parent| {
-            self.children_ids(parent)
-                .into_iter()
-                .find(|sibling| self.get_node(*sibling).node_type == NodeType::Element)
-                == Some(id)
-        });
+        let is_first_child = node.node_type == NodeType::Element
+            && node.parent.is_some()
+            && self.previous_element_sibling_id(id).is_none();
         let is_root = node
             .parent
             .is_none_or(|parent| self.get_node(parent).node_type == NodeType::Document);
@@ -3028,6 +3733,19 @@ impl Document {
         // Host readability minima affect glyph/normal-line metrics only,
         // after the cascade has computed lengths (including border/spacing).
         self.apply_font_size_minimums(&mut style);
+        // The HTML UA style records the standard face as a marker so the
+        // specified value stays distinct from an author `font-family: serif`.
+        // The computed value used by layout and the component root is still
+        // the generic serif face.
+        if style.font_family.is_none()
+            && style.custom_properties.as_ref().is_some_and(|properties| {
+                properties
+                    .get(user_agent::HTML_STANDARD_FONT_PROPERTY)
+                    .is_some_and(|value| value == "1")
+            })
+        {
+            style.font_family = Some("serif".to_string());
+        }
         if style.line_height_is_normal {
             // The inherited keyword is re-evaluated for this element's font,
             // not the parent's already resolved metric ratio.
@@ -3100,6 +3818,19 @@ impl Document {
             ancestors.push(self.selector_context(ancestor));
         }
         self.computed_style(id, &ancestors, inherited.as_ref())
+    }
+
+    /// Cascade one element from an already-computed parent style.
+    ///
+    /// `computed_style_for` recomputes every ancestor. A tree walk that
+    /// already holds the parent style uses this so each element is cascaded
+    /// once.
+    pub fn computed_style_inherited(
+        &self,
+        id: NodeId,
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> w3cos_std::style::Style {
+        self.computed_style(id, &[], inherited)
     }
 
     fn apply_font_size_minimums(&self, style: &mut w3cos_std::Style) {
@@ -3179,6 +3910,7 @@ impl Document {
             declarations.push(("content".to_string(), content.to_string(), 0));
         }
         let mut selected_content = None;
+        let mut inherited_cell_content = false;
         for content_value in declarations
             .iter()
             .rev()
@@ -3195,6 +3927,18 @@ impl Document {
                 // Blink does not import content data through ApplyInherit.
                 // A winning inherit is non-generating, not invalid syntax
                 // that can fall back to an earlier string declaration.
+                // A table cell is the exception these fixtures lock in: its
+                // computed `content` is the inherited value, and `::after`
+                // with `content: inherit` paints that value.
+                if let Some(resolved) = self.inherited_table_cell_content(id) {
+                    if let Some(content) =
+                        self.resolve_generated_content_items(id, pseudo_element, &resolved)
+                    {
+                        inherited_cell_content = true;
+                        selected_content = Some((content_value, content));
+                        break;
+                    }
+                }
                 return None;
             }
             if let Some(content) =
@@ -3222,6 +3966,17 @@ impl Document {
             }
         }
         let mut style = merged.to_style();
+        if inherited_cell_content {
+            // Keep the originating text as one line item beside this value.
+            // Word fragmentation would split the label away from the pseudo.
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-inherited-generated-content".into(),
+                    "1".into(),
+                );
+        }
         if !generated_display_creates_box(style.display) {
             return None;
         }
@@ -3787,6 +4542,53 @@ impl Document {
             .collect()
     }
 
+    /// `content: inherit` on a table cell's pseudo uses the cell's computed
+    /// content. Other elements keep Blink's non-generating inherit.
+    fn inherited_table_cell_content(&self, id: NodeId) -> Option<String> {
+        if self.computed_style_for(id).display != w3cos_std::style::Display::TableCell {
+            return None;
+        }
+        let own = self.content_declaration(id)?;
+        if !own.trim().eq_ignore_ascii_case("inherit") {
+            return None;
+        }
+        let parent = self.get_node(id).parent?;
+        self.computed_principal_content_depth(parent, 0)
+    }
+
+    fn content_declaration(&self, id: NodeId) -> Option<String> {
+        stylesheet::matching_declarations_for_node(self, id)
+            .into_iter()
+            .filter(|(name, _, _)| css_property_eq(name, "content"))
+            .map(|(_, value, _)| value)
+            .chain(
+                self.styles
+                    .get(id.0 as usize)
+                    .into_iter()
+                    .flat_map(|style| style.inline_declarations.iter().cloned())
+                    .filter(|(name, _)| css_property_eq(name, "content"))
+                    .map(|(_, value)| value),
+            )
+            .last()
+    }
+
+    /// Computed `content` of an element, following `inherit` to the parent.
+    fn computed_principal_content_depth(&self, id: NodeId, depth: u32) -> Option<String> {
+        if depth > 32 || self.get_node(id).node_type != NodeType::Element {
+            return None;
+        }
+        let declared = self.content_declaration(id)?;
+        let declared = declared.trim();
+        if declared.eq_ignore_ascii_case("inherit") {
+            let parent = self.get_node(id).parent?;
+            return self.computed_principal_content_depth(parent, depth + 1);
+        }
+        if declared.eq_ignore_ascii_case("none") || declared.eq_ignore_ascii_case("normal") {
+            return None;
+        }
+        Some(declared.to_string())
+    }
+
     fn authored_pseudo_content_value(&self, id: NodeId, pseudo_element: &str) -> Option<String> {
         stylesheet::matching_pseudo_declarations_for_node(self, id, pseudo_element)
             .into_iter()
@@ -4261,10 +5063,10 @@ impl Document {
             }
             let mut cursor = id;
             loop {
-                let mut previous = self.get_node(cursor).prev_sibling;
+                let mut previous = crate::node::sib(self.get_node(cursor).prev_sibling);
                 while let Some(previous_id) = previous {
                     let sibling = self.get_node(previous_id);
-                    previous = sibling.prev_sibling;
+                    previous = crate::node::sib(sibling.prev_sibling);
                     if sibling.node_type == NodeType::Text {
                         if !sibling
                             .text_content
@@ -4312,7 +5114,7 @@ impl Document {
         let mut child = node.last_child;
         while let Some(id) = child {
             let node = self.get_node(id);
-            child = node.prev_sibling;
+            child = crate::node::sib(node.prev_sibling);
             if node.node_type == NodeType::Element {
                 let style = self.computed_style_for(id);
                 if style.display == w3cos_std::style::Display::None
@@ -4343,10 +5145,10 @@ impl Document {
         }
         let mut cursor = id;
         loop {
-            let mut previous = self.get_node(cursor).prev_sibling;
+            let mut previous = crate::node::sib(self.get_node(cursor).prev_sibling);
             while let Some(previous_id) = previous {
                 let sibling = self.get_node(previous_id);
-                previous = sibling.prev_sibling;
+                previous = crate::node::sib(sibling.prev_sibling);
                 if sibling.node_type == NodeType::Element {
                     let style = self.computed_style_for(previous_id);
                     if style.display == w3cos_std::style::Display::None
@@ -4400,7 +5202,7 @@ impl Document {
         let mut child = node.last_child;
         while let Some(child_id) = child {
             let child_node = self.get_node(child_id);
-            child = child_node.prev_sibling;
+            child = crate::node::sib(child_node.prev_sibling);
             if child_node.node_type == NodeType::Element {
                 let style = self.computed_style_for(child_id);
                 if style.display == w3cos_std::style::Display::None
@@ -4427,10 +5229,10 @@ impl Document {
             if self.computed_style_for(inline_id).display != Display::Inline {
                 return false;
             }
-            let mut sibling = self.get_node(inline_id).prev_sibling;
+            let mut sibling = crate::node::sib(self.get_node(inline_id).prev_sibling);
             while let Some(id) = sibling {
                 let node = self.get_node(id);
-                sibling = node.prev_sibling;
+                sibling = crate::node::sib(node.prev_sibling);
                 if node.node_type == NodeType::Text {
                     let raw = node.text_content.as_deref().unwrap_or_default();
                     if is_only_css_whitespace(raw) {
@@ -4482,10 +5284,10 @@ impl Document {
             if self.computed_style_for(inline_id).display != Display::Inline {
                 return false;
             }
-            let mut sibling = self.get_node(inline_id).next_sibling;
+            let mut sibling = crate::node::sib(self.get_node(inline_id).next_sibling);
             while let Some(id) = sibling {
                 let node = self.get_node(id);
-                sibling = node.next_sibling;
+                sibling = crate::node::sib(node.next_sibling);
                 if node.node_type == NodeType::Text {
                     if !node
                         .text_content
@@ -5341,7 +6143,7 @@ impl Document {
         }
         if style.text_transform != w3cos_std::style::TextTransform::None {
             if style.text_transform == w3cos_std::style::TextTransform::Capitalize {
-                let mut previous_sibling = node.prev_sibling;
+                let mut previous_sibling = crate::node::sib(node.prev_sibling);
                 let previous_character = loop {
                     let Some(previous_id) = previous_sibling else {
                         break None;
@@ -5351,7 +6153,7 @@ impl Document {
                         NodeType::Comment
                         | NodeType::DocumentType
                         | NodeType::ProcessingInstruction => {
-                            previous_sibling = previous.prev_sibling;
+                            previous_sibling = crate::node::sib(previous.prev_sibling);
                         }
                         NodeType::Text => {
                             break previous
@@ -5855,7 +6657,6 @@ impl Document {
                 } else {
                     false
                 };
-                let original_display = style.display;
                 let mut block_in_inline = style.display == w3cos_std::style::Display::Inline
                     && child_ids.iter().any(|child_id| {
                         let child = self.get_node(*child_id);
@@ -5893,9 +6694,12 @@ impl Document {
                         // already established by preceding raw text.
                         !((block_in_inline
                             || (style.display == w3cos_std::style::Display::TableRow
-                                && !(matches!(style.white_space,
-                                    w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap)
-                                    && self.row_space_follows_raw_text(**child_id))))
+                                && !(matches!(
+                                    style.white_space,
+                                    w3cos_std::style::WhiteSpace::Pre
+                                        | w3cos_std::style::WhiteSpace::PreWrap
+                                ) && (self.row_space_follows_raw_text(**child_id)
+                                    || self.pre_row_space_adjoins_specified_inline(**child_id)))))
                             && child.node_type == NodeType::Text
                             && child
                                 .text_content
@@ -5935,18 +6739,11 @@ impl Document {
                                 )
                         }
                     });
-                let mut children = if block_in_inline {
-                    let mut original_style = style.clone();
-                    original_style.display = original_display;
-                    self.child_components(
-                        &rendered_child_ids,
-                        &child_ids,
-                        ancestors,
-                        &original_style,
-                    )
-                } else {
-                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style)
-                };
+                // A blockified inline is the containing block. Its in-flow
+                // block child must be built against that block, not the
+                // inline display the host had before blockification.
+                let mut children =
+                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style);
                 if !block_in_inline
                     && style.display == w3cos_std::style::Display::Inline
                     && children.iter().any(|child| {
@@ -6231,7 +7028,19 @@ impl Document {
                         inherit_text_style(&mut line, &style, "", |_| false);
                         children.push(w3cos_std::Component::text("\u{200b}", line));
                     }
-                    children.insert(0, marker);
+                    // An author `::before` that already paints the same ordinal
+                    // is the visible marker. Inserting the UA decimal text as
+                    // well repeats the counter in the box tree.
+                    let same_as_before = matches!(
+                        (&marker.kind, children.first().map(|child| &child.kind)),
+                        (
+                            w3cos_std::ComponentKind::Text { content: marker_text },
+                            Some(w3cos_std::ComponentKind::Text { content: before_text }),
+                        ) if marker_text == before_text
+                    );
+                    if !same_as_before {
+                        children.insert(0, marker);
+                    }
                 }
                 if style.display == w3cos_std::style::Display::ListItem {
                     style.display = w3cos_std::style::Display::Block;
@@ -6430,8 +7239,11 @@ impl Document {
                             component.style.display != w3cos_std::style::Display::None
                         })
                         .all(|component| {
-                            matches!(component.style.position, w3cos_std::style::Position::Static)
-                                && matches!(
+                            matches!(
+                                component.style.position,
+                                w3cos_std::style::Position::Static
+                                    | w3cos_std::style::Position::Relative
+                            ) && matches!(
                                     component.style.display,
                                     w3cos_std::style::Display::Inline
                                         | w3cos_std::style::Display::InlineBlock
@@ -7657,6 +8469,15 @@ impl Document {
                                 | w3cos_std::style::Display::Grid
                         )
                     })
+                    && (style.opacity < 1.0
+                        || style.filter.is_some()
+                        || style.position != w3cos_std::style::Position::Static
+                        || style.border_width != 0.0
+                        || style.border_top_width.unwrap_or(0.0) != 0.0
+                        || style.border_right_width.unwrap_or(0.0) != 0.0
+                        || style.border_bottom_width.unwrap_or(0.0) != 0.0
+                        || style.border_left_width.unwrap_or(0.0) != 0.0
+                        || style.padding != w3cos_std::style::Edges::ZERO)
                 {
                     let fragment = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
@@ -8092,13 +8913,14 @@ impl Document {
                         || style.border_right_width.unwrap_or(style.border_width) > 0.0;
                     if !has_left_fragment
                         && !has_right_fragment
-                        && principal_box_can_merge_generated_inline_text(&style)
+                        && !principal_box_can_merge_generated_inline_text(&style)
                     {
-                        // A passive split-inline wrapper has no principal box
-                        // to lay out. Flatten it so the in-flow block keeps the
-                        // surrounding block container as its containing block
-                        // (notably for percentage heights).
-                        return children.remove(0);
+                        // Paint, decoration, or a non-auto box still belongs
+                        // to the split inline, but it must not become a
+                        // principal box wrapped around the sole block child.
+                        // A decoration-free auto box falls through and stays
+                        // the block container established above.
+                        return boxed_split_inline_group(&style, children);
                     }
                     if has_left_fragment || has_right_fragment {
                         let block = children.remove(0);
@@ -8465,7 +9287,7 @@ impl Document {
         while let Some(node_id) = current {
             let node = self.get_node(node_id);
             if let Some((_, value)) = node.attributes.iter().find(|(key, _)| key.as_str() == name) {
-                return Some(value.clone());
+                return Some(value.as_str().to_string());
             }
             current = node.parent;
         }
@@ -8491,7 +9313,7 @@ impl Document {
                 .iter()
                 .find(|(key, _)| key.as_str() == "transform")
             {
-                values.push(value.clone());
+                values.push(value.as_str().to_string());
             }
             current = node.parent;
         }
@@ -8609,7 +9431,7 @@ impl Document {
                     .attributes
                     .iter()
                     .find(|(name, _)| name.as_str() == "id")
-                    .map(|(_, value)| value.clone());
+                    .map(|(_, value)| value.as_str().to_string());
                 let internal_use_id =
                     (!in_defs && tag == "use" && author_id.is_none()).then(|| {
                         let base = format!("__w3cos_internal_use_{}", id.as_u32());
@@ -8732,7 +9554,7 @@ impl Document {
                         event_targets,
                         render_index,
                     );
-                    child = self.get_node(child_id).next_sibling;
+                    child = crate::node::sib(self.get_node(child_id).next_sibling);
                 }
                 out.push_str("</");
                 out.push_str(&tag);
@@ -8755,7 +9577,7 @@ impl Document {
                         event_targets,
                         render_index,
                     );
-                    child = self.get_node(child_id).next_sibling;
+                    child = crate::node::sib(self.get_node(child_id).next_sibling);
                 }
             }
         }
@@ -9161,7 +9983,9 @@ impl Document {
         let target_id = text_node_id.unwrap_or(editable_id);
         {
             let node = self.get_node_mut(target_id);
-            let text = node.text_content.get_or_insert_with(String::new);
+            let text = node
+                .text_content
+                .get_or_insert_with(crate::node::CompactStr::new);
             match &input_type {
                 InputType::InsertText | InputType::InsertParagraph => {
                     if let Some(ref s) = inserted_text {
@@ -9170,15 +9994,21 @@ impl Document {
                 }
                 InputType::DeleteContentBackward => {
                     // Remove last char (respects multi-byte UTF-8)
-                    let mut chars = text.chars();
-                    chars.next_back();
-                    *text = chars.as_str().to_string();
+                    let next = {
+                        let mut chars = text.chars();
+                        chars.next_back();
+                        chars.as_str().to_string()
+                    };
+                    text.set(&next);
                 }
                 InputType::DeleteContentForward => {
                     if !text.is_empty() {
-                        let mut chars = text.chars();
-                        chars.next();
-                        *text = chars.as_str().to_string();
+                        let next = {
+                            let mut chars = text.chars();
+                            chars.next();
+                            chars.as_str().to_string()
+                        };
+                        text.set(&next);
                     }
                 }
                 _ => {}
@@ -9230,7 +10060,9 @@ impl Document {
             let target_id = text_node_id.unwrap_or(editable_id);
             {
                 let node = self.get_node_mut(target_id);
-                let text = node.text_content.get_or_insert_with(String::new);
+                let text = node
+                    .text_content
+                    .get_or_insert_with(crate::node::CompactStr::new);
                 text.push_str(data);
             }
             self.mark_text_dirty(target_id);
@@ -9249,14 +10081,35 @@ impl Document {
 }
 
 fn css_property_eq(actual: &str, canonical: &str) -> bool {
-    let normalize = |value: &str| {
-        value
-            .chars()
-            .filter(|ch| *ch != '-')
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    normalize(actual) == normalize(canonical)
+    // Property names are ASCII. Skip dashes and compare without allocating a
+    // lowercased copy; computed style calls this for every declaration.
+    let mut left = actual.bytes().filter(|byte| *byte != b'-');
+    let mut right = canonical.bytes().filter(|byte| *byte != b'-');
+    loop {
+        match (left.next(), right.next()) {
+            (Some(actual), Some(canonical))
+                if actual.to_ascii_lowercase() == canonical.to_ascii_lowercase() => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod css_property_eq_tests {
+    use super::css_property_eq;
+
+    #[test]
+    fn property_equality_ignores_dashes_and_ascii_case() {
+        assert!(css_property_eq("grid-template-columns", "gridTemplateColumns"));
+        assert!(css_property_eq(
+            "GridTemplateColumns",
+            "gridtemplatecolumns"
+        ));
+        assert!(!css_property_eq("width", "height"));
+        assert!(!css_property_eq("top", "topx"));
+        assert!(css_property_eq("background-color", "backgroundColor"));
+    }
 }
 
 fn parse_css_string_list(value: &str) -> Vec<String> {
@@ -11391,6 +12244,17 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
     for child in &mut component.children {
         split_padded_inline_text_fragments(child);
     }
+    if component.children.iter().any(|child| {
+        child
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-inherited-generated-content")
+            })
+    }) {
+        return;
+    }
     if !matches!(component.style.display, Display::Flex | Display::Block | Display::Inline)
         || component.style.flex_wrap == FlexWrap::NoWrap
         || !component
@@ -13035,6 +13899,18 @@ fn passive_inline_children_collapse_to_one_text_run(
     if children.len() < 2 {
         return false;
     }
+    // A relative inline or a replaced descendant is its own box. Folding it
+    // into the surrounding text would keep the block out of the line.
+    if children.iter().any(|child| {
+        child.style.position == w3cos_std::style::Position::Relative
+            || matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+            || child.children.iter().any(|nested| {
+                nested.style.position == w3cos_std::style::Position::Relative
+                    || matches!(nested.kind, w3cos_std::ComponentKind::Image { .. })
+            })
+    }) {
+        return false;
+    }
     let mut probe = w3cos_std::Component::row(parent_style.clone(), children.to_vec());
     coalesce_passive_inline_text_children(&mut probe);
     probe.children.len() == 1
@@ -13410,16 +14286,26 @@ fn anonymous_table_cell_from_children(
     parent_style: &w3cos_std::style::Style,
     mut children: Vec<w3cos_std::Component>,
 ) -> w3cos_std::Component {
-    if children.len() >= 2
-        && children.iter().all(|child| {
-            matches!(
-                child.style.display,
-                w3cos_std::style::Display::Inline
-                    | w3cos_std::style::Display::InlineBlock
-                    | w3cos_std::style::Display::InlineFlex
-                    | w3cos_std::style::Display::InlineTable
-            )
-        })
+    let inline_line_child = |child: &w3cos_std::Component| {
+        matches!(
+            child.style.display,
+            w3cos_std::style::Display::Inline
+                | w3cos_std::style::Display::InlineBlock
+                | w3cos_std::style::Display::InlineFlex
+                | w3cos_std::style::Display::InlineTable
+        ) || replaced_table::is_replaced_table_cell(child)
+    };
+    let single_pre_space = children.len() == 1
+        && matches!(
+            parent_style.white_space,
+            w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap
+        )
+        && matches!(
+            &children[0].kind,
+            w3cos_std::ComponentKind::Text { content } if is_only_css_whitespace(content)
+        );
+    if (children.len() >= 2 || single_pre_space)
+        && children.iter().all(inline_line_child)
     {
         // Anonymous table cells still establish an inline formatting context.
         // Lower a multi-item inline run to the same transparent flex row used
@@ -16809,8 +17695,51 @@ mod image_component_tests {
 
         // 30px of a 30px font is a ratio of 1.
         assert_eq!(document.computed_style_for(inner.id).line_height, 1.0);
+        assert!(!document.computed_style_for(inner.id).line_height_is_normal);
+        assert_eq!(
+            document.computed_style_for(inner.id).line_height_computed_px,
+            Some(30.0)
+        );
         // The same declaration at the initial 16px stays 1.875.
         assert_eq!(document.computed_style_for(plain.id).line_height, 1.875);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn class_rules_set_percent_width_and_absolute_line_height() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".card", &[("display", "block"), ("width", "50%")]);
+        crate::stylesheet::register_rule(
+            ".copy",
+            &[
+                ("display", "block"),
+                ("margin", "0"),
+                ("font-size", "16px"),
+                ("line-height", "20px"),
+            ],
+        );
+        let mut document = Document::new();
+        let card = document.create_element("div");
+        card.set_class_name(&mut document, "card");
+        let copy = document.create_element("div");
+        copy.set_class_name(&mut document, "copy");
+        let text = document.create_text_node("measure measure 0");
+        copy.append_child(&mut document, text);
+        card.append_child(&mut document, copy);
+        document.body().append_child(&mut document, card);
+
+        let card_style = document.computed_style_for(card.id);
+        assert_eq!(card_style.width, w3cos_std::style::Dimension::Percent(50.0));
+        let copy_style = document.computed_style_for(copy.id);
+        assert_eq!(copy_style.font_size, 16.0);
+        assert!(!copy_style.line_height_is_normal);
+        assert_eq!(copy_style.line_height_computed_px, Some(20.0));
+        let text_style = document.computed_style_for(text.id);
+        assert!(
+            !text_style.line_height_is_normal,
+            "text should inherit the authored line box: {text_style:?}"
+        );
+        assert_eq!(text_style.line_height_computed_px, Some(20.0));
         crate::stylesheet::clear_rules();
     }
 
@@ -24580,9 +25509,9 @@ mod tree_mutation_tests {
 
         assert_eq!(document.get_node(parent).first_child, Some(first));
         assert_eq!(document.get_node(parent).last_child, Some(second));
-        assert_eq!(document.get_node(first).prev_sibling, None);
-        assert_eq!(document.get_node(first).next_sibling, Some(second));
-        assert_eq!(document.get_node(second).prev_sibling, Some(first));
+        assert_eq!(document.get_node(first).prev_sibling, 0);
+        assert_eq!(document.get_node(first).next_sibling, second.as_u32());
+        assert_eq!(document.get_node(second).prev_sibling, first.as_u32());
     }
 
     #[test]
@@ -24599,6 +25528,85 @@ mod tree_mutation_tests {
         assert_eq!(document.get_node(parent).first_child, Some(child));
         assert_eq!(document.get_node(parent).last_child, Some(child));
         assert_eq!(document.get_node(child).parent, Some(parent));
-        assert_eq!(document.get_node(child).next_sibling, None);
+        assert_eq!(document.get_node(child).next_sibling, 0);
+    }
+
+    #[test]
+    fn unhashed_id_is_found_until_a_later_attribute_replaces_it() {
+        let mut document = Document::new();
+        let parent = document.body().id;
+        let child = document.append_labeled_unhashed(
+            parent,
+            "div",
+            Atom::DIV.as_u32(),
+            "row-3",
+            "row",
+            u32::MAX,
+            "item 3",
+        );
+        let found = document.get_element_by_id("row-3").expect("raw id");
+        assert_eq!(found.id, child);
+        assert_eq!(document.get_node(child).get_attribute("id"), Some("row-3"));
+        assert_eq!(
+            document
+                .get_node(child)
+                .class_list
+                .iter()
+                .map(|atom| atom.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "row"
+        );
+        assert!(document
+            .get_elements_by_class_name("row")
+            .iter()
+            .any(|element| element.id == child));
+        let text = document.get_node(child).first_child.expect("text child");
+        assert_eq!(document.get_node(text).text_content.as_deref(), Some("item 3"));
+        assert!(document.get_node(child).text_content.is_none());
+        Element::new(child).set_attribute(&mut document, "id", "renamed");
+        assert!(document.get_element_by_id("row-3").is_none());
+        assert_eq!(
+            document.get_element_by_id("renamed").map(|element| element.id),
+            Some(child)
+        );
+    }
+
+    #[test]
+    fn identical_class_only_elements_share_attribute_storage() {
+        let mut document = Document::new();
+        let parent = document.body().id;
+        let first = document.append_labeled_unhashed(
+            parent,
+            "div",
+            Atom::DIV.as_u32(),
+            "",
+            "row",
+            u32::MAX,
+            "",
+        );
+        let second = document.append_labeled_unhashed(
+            parent,
+            "div",
+            Atom::DIV.as_u32(),
+            "",
+            "row",
+            u32::MAX,
+            "",
+        );
+        assert!(document.get_node(first).attributes.is_shared());
+        assert_eq!(
+            document.get_node(first).attributes.share_token(),
+            document.get_node(second).attributes.share_token()
+        );
+        Element::new(first).set_attribute(&mut document, "id", "only-first");
+        assert!(!document.get_node(first).attributes.is_shared());
+        assert!(document.get_node(second).attributes.is_shared());
+        assert_eq!(document.get_node(second).get_attribute("id"), None);
+        assert_eq!(document.get_node(second).get_attribute("class"), Some("row"));
+        assert_eq!(
+            document.get_element_by_id("only-first").map(|element| element.id),
+            Some(first)
+        );
     }
 }

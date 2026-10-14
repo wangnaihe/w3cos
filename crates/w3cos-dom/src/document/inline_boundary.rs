@@ -100,11 +100,11 @@ impl Document {
         };
         while let Some(child_id) = child {
             let child_node = self.get_node(child_id);
-            child = if from_end {
+            child = crate::node::sib(if from_end {
                 child_node.prev_sibling
             } else {
                 child_node.next_sibling
-            };
+            });
             if let Some(boundary) = self.inline_character_boundary(child_id, from_end) {
                 return Some(boundary);
             }

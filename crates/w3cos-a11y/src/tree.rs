@@ -58,21 +58,21 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
         .attributes
         .iter()
         .find(|(k, _)| *k == aria_label_atom)
-        .map(|(_, v)| v.clone())
-        .or_else(|| dom_node.text_content.clone())
+        .map(|(_, v)| v.as_str().to_string())
+        .or_else(|| dom_node.text_content.as_ref().map(|text| text.to_string()))
         .or_else(|| {
             dom_node
                 .attributes
                 .iter()
                 .find(|(k, _)| *k == title_atom || *k == alt_atom || *k == placeholder_atom)
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v.as_str().to_string())
         });
 
     let value = dom_node
         .attributes
         .iter()
         .find(|(k, _)| *k == value_atom)
-        .map(|(_, v)| v.clone());
+        .map(|(_, v)| v.as_str().to_string());
 
     let tag_str = dom_node.tag.as_str();
     let level = match tag_str.as_str() {

@@ -21,6 +21,28 @@ pub struct CSSStyleDeclaration {
     pub inline_declarations: Vec<(String, String)>,
 }
 
+/// CSSOM ignores a declaration whose value is not valid for the property.
+/// CSS-wide keywords stay valid so `inherit` / `unset` can still reset.
+fn invalid_cssom_declaration(name: &str, value: &str) -> bool {
+    let keyword = value.trim().to_ascii_lowercase();
+    if matches!(
+        keyword.as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return false;
+    }
+    match name {
+        "border-top-style" | "borderTopStyle" | "border-right-style" | "borderRightStyle"
+        | "border-bottom-style" | "borderBottomStyle" | "border-left-style"
+        | "borderLeftStyle" => parse_border_line_style(value).is_none(),
+        "text-decoration-color" | "textDecorationColor" => {
+            keyword != "currentcolor" && Color::from_css(value).is_none()
+        }
+        "list-style" | "listStyle" => list_style_properties(value).is_none(),
+        _ => false,
+    }
+}
+
 impl CSSStyleDeclaration {
     pub fn new() -> Self {
         Self {
@@ -92,8 +114,36 @@ impl CSSStyleDeclaration {
             "none" | "both" | "horizontal" | "vertical" | "block" | "inline" | "initial" | "unset") {
             return;
         }
-        self.inline_declarations
-            .push((name.to_string(), raw_value.to_string()));
+        // An invalid longhand or shorthand is dropped at parse time. Replacing
+        // the previous declaration would let a later cascade scan fall through
+        // to an older shorthand and undo a winning physical edge or color.
+        if invalid_cssom_declaration(name, value) {
+            return;
+        }
+        // CSSOM setProperty replaces an existing declaration of the same name.
+        // Appending every write makes animated properties grow without bound
+        // and forces later cascade scans to walk the discarded values.
+        if let Some(index) = self
+            .inline_declarations
+            .iter()
+            .position(|(existing, _)| existing == name)
+        {
+            self.inline_declarations[index].1 = raw_value.to_string();
+            let mut kept = false;
+            self.inline_declarations.retain(|(existing, _)| {
+                if existing != name {
+                    return true;
+                }
+                if kept {
+                    return false;
+                }
+                kept = true;
+                true
+            });
+        } else {
+            self.inline_declarations
+                .push((name.to_string(), raw_value.to_string()));
+        }
         if name.starts_with("--") {
             self.inner
                 .custom_properties
@@ -168,6 +218,13 @@ impl CSSStyleDeclaration {
                 if let Some((width, count)) = parse_columns(value) {
                     self.inner.column_width = width;
                     self.inner.column_count = count;
+                    // A later shorthand resets its longhands. Updating the
+                    // shorthand in its original slot would leave an earlier
+                    // `column-count` winning when the cascade is replayed.
+                    self.promote_shorthand(
+                        name,
+                        &["column-width", "columnWidth", "column-count", "columnCount"],
+                    );
                 }
             }
             "border-spacing" | "borderSpacing" => {
@@ -1014,6 +1071,24 @@ impl CSSStyleDeclaration {
 
             _ => {}
         }
+    }
+
+    /// Move a shorthand to the end of the declaration list and drop the
+    /// longhands it resets, so a replay applies the shorthand last.
+    fn promote_shorthand(&mut self, name: &str, longhands: &[&str]) {
+        let Some(value) = self
+            .inline_declarations
+            .iter()
+            .rev()
+            .find(|(existing, _)| existing == name)
+            .map(|(_, value)| value.clone())
+        else {
+            return;
+        };
+        self.inline_declarations.retain(|(existing, _)| {
+            existing != name && !longhands.iter().any(|longhand| existing == longhand)
+        });
+        self.inline_declarations.push((name.to_string(), value));
     }
 
     pub fn get_property(&self, name: &str) -> String {
@@ -4128,6 +4203,25 @@ mod tests {
             assert_ne!(declaration.inner, initial,
                 "{name}:{value} must affect layout style, not just CSSOM source text");
         }
+    }
+
+    #[test]
+    fn repeated_set_property_replaces_the_same_declaration() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("top", "1px");
+        declaration.set_property("left", "2px");
+        declaration.set_property("top", "4px");
+        declaration.set_property("top", "9px");
+        assert_eq!(declaration.inline_declarations.len(), 2);
+        assert_eq!(
+            declaration
+                .inline_declarations
+                .iter()
+                .find(|(name, _)| name == "top")
+                .map(|(_, value)| value.as_str()),
+            Some("9px")
+        );
+        assert_eq!(declaration.inline_declarations[0].0, "top");
     }
 
     #[test]

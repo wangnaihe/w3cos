@@ -6786,6 +6786,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dynamic-js")]
     #[test]
     fn overlapping_fractional_ahem_background_covers_previous_glyph_fringe() {
         use crate::font_face::{FontFace,FontRegistry,FontSource};
@@ -6911,6 +6912,7 @@ mod tests {
         assert_eq!(live,samples[2].0,"live headless replay retains both foregrounds");
     }
 
+    #[cfg(feature = "dynamic-js")]
     #[test]
     fn navigated_negative_margin_ahem_covers_previous_glyph_fringe() {
         use std::io::{Read,Write};

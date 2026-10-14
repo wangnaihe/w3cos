@@ -64,6 +64,8 @@ pub fn reset_document() {
     DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
+    crate::incremental_layout::invalidate();
+    crate::definite_layout::invalidate();
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +110,62 @@ pub(crate) fn set_quirks_mode(quirks_mode: bool) {
     with_document_mut(|document| document.set_quirks_mode(quirks_mode));
 }
 
+fn cached_atom(slot: &Cell<u32>, text: &str) -> w3cos_dom::atom::Atom {
+    let id = slot.get();
+    if id != u32::MAX {
+        return w3cos_dom::atom::Atom::from_u32(id);
+    }
+    let atom = w3cos_dom::atom::Atom::intern(text);
+    slot.set(atom.as_u32());
+    atom
+}
+
+fn media_audio() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static AUDIO: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    AUDIO.with(|slot| cached_atom(slot, "audio"))
+}
+
+fn media_video() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static VIDEO: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    VIDEO.with(|slot| cached_atom(slot, "video"))
+}
+
+fn style_tag() -> w3cos_dom::atom::Atom {
+    thread_local! {
+        static STYLE: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+    STYLE.with(|slot| cached_atom(slot, "style"))
+}
+
 pub fn append_child(parent: u32, child: u32) {
+    if crate::observers_web::mutation_observers_empty() {
+        let mut media = false;
+        let mut inserted_style = false;
+        with_document_mut(|doc| {
+            let parent_tag = doc.get_node(NodeId::from_u32(parent)).tag;
+            media = parent_tag == media_audio() || parent_tag == media_video();
+            if media {
+                return;
+            }
+            doc.append_child(NodeId::from_u32(parent), NodeId::from_u32(child));
+            inserted_style = doc.get_node(NodeId::from_u32(child)).tag == style_tag();
+        });
+        if !media {
+            mark_dom_dirty();
+            #[cfg(feature = "dynamic-js")]
+            crate::dynamic_script::notify_node_inserted(child);
+            #[cfg(feature = "dynamic-js")]
+            crate::dynamic_script::notify_script_mutated(parent);
+            if inserted_style {
+                crate::jsdom::sync_style_element(child);
+            }
+            return;
+        }
+    }
     let old_parent = parent_node(child);
     let old_previous = previous_sibling(child);
     let old_next = next_sibling(child);
@@ -131,6 +188,7 @@ pub fn append_child(parent: u32, child: u32) {
     crate::dynamic_script::notify_node_inserted(child);
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::notify_script_mutated(parent);
+    crate::jsdom::sync_style_element(child);
 }
 
 pub fn remove_child(parent: u32, child: u32) {
@@ -147,6 +205,7 @@ pub fn remove_child(parent: u32, child: u32) {
         crate::dynamic_script::notify_node_removed(child);
         #[cfg(feature = "dynamic-js")]
         crate::dynamic_script::notify_script_mutated(parent);
+        crate::jsdom::sync_style_element(child);
     }
 }
 
@@ -186,6 +245,14 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
 }
 
 pub fn set_attribute(node: u32, name: &str, value: &str) {
+    if crate::observers_web::mutation_observers_empty() {
+        with_document_mut(|doc| {
+            let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+            el.set_attribute(doc, name, value);
+        });
+        mark_dom_dirty();
+        return;
+    }
     let old_value = get_attribute(node, name);
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
@@ -310,14 +377,101 @@ pub fn get_descendant_text_content(node: u32) -> String {
 }
 
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
-    let old_value = get_attribute(node, "style");
+    // CSSOM writes notify attribute observers with the previous style
+    // attribute. With no observers, serializing that attribute on every
+    // `top`/`height` write is not observable.
+    let notify = !crate::observers_web::mutation_observers_empty();
+    let old_value = if notify {
+        get_attribute(node, "style")
+    } else {
+        None
+    };
     with_document_mut(|doc| {
-        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
-        el.style_mut(doc).set_property(prop, value);
+        let id = NodeId::from_u32(node);
+        doc.get_style_mut(id).set_property(prop, value);
+        if inline_style_change_is_local(prop) {
+            doc.note_local_style(id);
+        } else {
+            doc.mark_inline_style_dirty(id);
+        }
     });
     mark_dom_dirty();
-    let _ = (prop, value);
-    crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
+    if notify {
+        crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
+    }
+}
+
+/// Known non-inherited properties. Everything else, including custom
+/// properties and `font`/`color`, still restyles the descendant subtree.
+fn inline_style_change_is_local(prop: &str) -> bool {
+    let prop = prop.trim().to_ascii_lowercase();
+    if prop.starts_with("--") || prop == "all" {
+        return false;
+    }
+    matches!(
+        prop.as_str(),
+        "width"
+            | "height"
+            | "min-width"
+            | "max-width"
+            | "min-height"
+            | "max-height"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "inset"
+            | "margin"
+            | "padding"
+            | "display"
+            | "position"
+            | "float"
+            | "clear"
+            | "z-index"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
+            | "flex"
+            | "flex-wrap"
+            | "flex-direction"
+            | "flex-grow"
+            | "flex-shrink"
+            | "flex-basis"
+            | "flex-flow"
+            | "justify-content"
+            | "align-items"
+            | "align-self"
+            | "align-content"
+            | "order"
+            | "gap"
+            | "row-gap"
+            | "column-gap"
+            | "grid"
+            | "grid-template"
+            | "grid-template-columns"
+            | "grid-template-rows"
+            | "grid-template-areas"
+            | "grid-column"
+            | "grid-row"
+            | "grid-auto-flow"
+            | "grid-auto-columns"
+            | "grid-auto-rows"
+            | "box-sizing"
+            | "object-fit"
+            | "object-position"
+            | "opacity"
+            | "transform"
+            | "background"
+            | "background-color"
+            | "vertical-align"
+    ) || prop.starts_with("margin-")
+        || prop.starts_with("padding-")
+        || prop.starts_with("border-")
+        || prop.starts_with("border")
+        || prop.starts_with("background-")
+        || prop.starts_with("outline")
+        || prop.starts_with("grid-")
+        || prop.starts_with("flex-")
 }
 
 pub fn class_list_add(node: u32, class: &str) {
@@ -420,6 +574,10 @@ pub fn parent_node(node: u32) -> Option<u32> {
 
 pub fn tag_name(node: u32) -> String {
     with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str())
+}
+
+pub fn tag_is(node: u32, expected: &str) -> bool {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str() == expected)
 }
 
 pub fn node_count() -> usize {
@@ -537,17 +695,15 @@ pub fn get_elements_by_class_name(class: &str) -> Vec<u32> {
 
 pub fn next_sibling(node: u32) -> Option<u32> {
     with_document(|doc| {
-        doc.get_node(NodeId::from_u32(node))
-            .next_sibling
-            .map(|id| id.as_u32())
+        let link = doc.get_node(NodeId::from_u32(node)).next_sibling;
+        (link != 0).then_some(link)
     })
 }
 
 pub fn previous_sibling(node: u32) -> Option<u32> {
     with_document(|doc| {
-        doc.get_node(NodeId::from_u32(node))
-            .prev_sibling
-            .map(|id| id.as_u32())
+        let link = doc.get_node(NodeId::from_u32(node)).prev_sibling;
+        (link != 0).then_some(link)
     })
 }
 

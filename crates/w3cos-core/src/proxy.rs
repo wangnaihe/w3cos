@@ -28,6 +28,7 @@ type TrapBoolFn = dyn Fn(&Value) -> bool;
 ///   - `receiver`/`this_arg`: the proxy itself or the `this` binding
 ///   - return types match the spec (bool for invariant-checked traps, Value otherwise)
 #[allow(clippy::type_complexity)]
+#[derive(Clone)]
 pub struct ProxyHandler {
     pub get: Option<Rc<TrapGetFn>>,
     pub set: Option<Rc<TrapSetFn>>,
@@ -42,6 +43,11 @@ pub struct ProxyHandler {
     pub set_prototype_of: Option<Rc<TrapSetProtoFn>>,
     pub is_extensible: Option<Rc<TrapBoolFn>>,
     pub prevent_extensions: Option<Rc<TrapBoolFn>>,
+    /// Traps receive the live receiver instead of a cloned target snapshot.
+    /// The trap must read own state with direct property access and must not
+    /// call `get_property` on that target, which would re-enter the trap.
+    /// Own getters, expandos, and prototype data are still the trap's job.
+    pub live_target: bool,
 }
 
 impl ProxyHandler {
@@ -60,6 +66,7 @@ impl ProxyHandler {
             set_prototype_of: None,
             is_extensible: None,
             prevent_extensions: None,
+            live_target: false,
         }
     }
 }
@@ -152,6 +159,12 @@ impl ProxyBuilder {
         self
     }
 
+    /// Skip the target snapshot clone. See [`ProxyHandler::live_target`].
+    pub fn live_target(mut self) -> Self {
+        self.handler.live_target = true;
+        self
+    }
+
     pub fn build(self) -> ProxyHandler {
         self.handler
     }
@@ -186,6 +199,43 @@ fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
     }
 
     let mut traps = ProxyHandler::new();
+    let receiver_slot = Rc::new(RefCell::new(None::<std::rc::Weak<RefCell<JsObject>>>));
+
+    // A dynamic Proxy retains the original target in its JS trap closures.
+    // Defining on the receiver must update that target, not the copied map.
+    let define_target = target.clone();
+    let define_handler = handler.clone();
+    let define_receiver = Rc::clone(&receiver_slot);
+    traps.define_property = Some(Rc::new(move |_snapshot, key, descriptor| {
+        let trap = define_handler.get_property("defineProperty");
+        if trap.is_undefined() || trap.is_null() {
+            crate::class::define_property(&define_target, key, descriptor);
+            // Default reflection and absent-get-trap reads still use the
+            // wrapper's copied map. Keep that map consistent without retaining
+            // the proxy strongly or invoking its define trap recursively.
+            let receiver = define_receiver
+                .borrow()
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade);
+            if let Some(receiver) = receiver {
+                receiver
+                    .borrow_mut()
+                    .define_property_direct(key, descriptor);
+            }
+            true
+        } else {
+            if !trap.is_callable() {
+                crate::throw_value(crate::value::type_error(
+                    "defineProperty trap is not callable",
+                ));
+            }
+            trap.call(
+                define_handler.clone(),
+                vec![define_target.clone(), Value::from(key), descriptor.clone()],
+            )
+            .to_bool()
+        }
+    }));
 
     let get = handler.get_property("get");
     if get.is_function() || get.is_object() {
@@ -257,15 +307,109 @@ fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
         }));
     }
 
-    Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
-        properties, traps,
-    ))))
+    let proxy = Rc::new(RefCell::new(JsObject::with_proxy(properties, traps)));
+    *receiver_slot.borrow_mut() = Some(Rc::downgrade(&proxy));
+    Value::Object(proxy)
 }
 
 #[cfg(test)]
 mod dynamic_tests {
     use super::*;
     use crate::class;
+
+    #[test]
+    fn dynamic_proxy_definition_refusal_throws_before_writing() {
+        let target = Value::object(HashMap::new());
+        let handler = Value::object(HashMap::from([(
+            "defineProperty".into(),
+            Value::function(|_, _| Value::Bool(false)),
+        )]));
+        let proxy = class::construct(&proxy_class(), vec![target.clone(), handler]);
+        let error = crate::catch_js(|| {
+            class::define_property(
+                &proxy,
+                "side",
+                &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+            )
+        })
+        .expect_err("Object.defineProperty must reject a false trap result");
+        assert_eq!(error.get_property("name"), Value::string("TypeError"));
+        assert!(target.get_property("side").is_undefined());
+        assert!(proxy.get_property("side").is_undefined());
+    }
+
+    #[test]
+    fn dynamic_proxy_nested_refusal_does_not_update_the_outer_mirror() {
+        let refusing = class::construct(
+            &proxy_class(),
+            vec![
+                Value::object(HashMap::new()),
+                Value::object(HashMap::from([(
+                    "defineProperty".into(),
+                    Value::function(|_, _| Value::Bool(false)),
+                )])),
+            ],
+        );
+        let outer = class::construct(
+            &proxy_class(),
+            vec![refusing, Value::object(HashMap::new())],
+        );
+        let error = crate::catch_js(|| {
+            class::define_property(
+                &outer,
+                "side",
+                &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+            )
+        })
+        .expect_err("inner refusal must propagate");
+        assert_eq!(error.get_property("name"), Value::string("TypeError"));
+        assert!(outer.get_property("side").is_undefined());
+    }
+
+    #[test]
+    fn dynamic_proxy_default_definition_keeps_get_and_reflection_consistent() {
+        let target = Value::object(HashMap::new());
+        let proxy = class::construct(
+            &proxy_class(),
+            vec![target.clone(), Value::object(HashMap::new())],
+        );
+        class::define_property(
+            &proxy,
+            "side",
+            &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+        );
+        assert_eq!(proxy.get_property("side"), Value::Number(7.0));
+        assert_eq!(target.get_property("side"), Value::Number(7.0));
+        assert_eq!(
+            class::get_own_property_descriptor(&proxy, "side").get_property("value"),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn dynamic_proxy_get_can_define_on_receiver_and_preserves_the_original_target() {
+        let target = Value::object(HashMap::new());
+        let handler = Value::object(HashMap::from([(
+            "get".into(),
+            Value::function(|_, args| {
+                let key = args[1].to_js_string();
+                if key == "probe" {
+                    class::define_property(
+                        &args[2],
+                        "side",
+                        &Value::object(HashMap::from([("value".into(), Value::Number(7.0))])),
+                    );
+                    Value::Number(3.0)
+                } else {
+                    args[0].get_property(&key)
+                }
+            }),
+        )]));
+        let proxy = class::construct(&proxy_class(), vec![target.clone(), handler]);
+        assert_eq!(proxy.get_property("probe"), Value::Number(3.0));
+        assert_eq!(proxy.get_property("side"), Value::Number(7.0));
+        assert_eq!(target.get_property("side"), Value::Number(7.0));
+    }
 
     #[test]
     fn dynamic_proxy_forwards_get_set_and_get_prototype_of() {

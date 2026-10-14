@@ -39,8 +39,9 @@ fn join_class(left: RegClass, right: RegClass) -> RegClass {
 }
 
 /// Per-function register lattice. A register is `Number` only when every
-/// definition is Number. Nested closures and bindings stay `Unknown`
-/// (interprocedural analysis is out of scope).
+/// definition is Number. Locals that are captured by a closure stay boxed.
+/// Locals that are only ever numbers, and are assigned before every load,
+/// live in `num_bindings` as bare `f64`s.
 ///
 /// Number and Bool registers occupy compact banks (`num_regs` / `bool_regs`)
 /// and never keep a `Value` slot. Every other IR register maps into the
@@ -54,9 +55,31 @@ struct EscapePlan {
     n_num: u32,
     n_bool: u32,
     n_val: u32,
+    /// Local binding id → slot in `num_bindings`.
+    num_binding_of: HashMap<u32, u32>,
+    n_num_bindings: u32,
+    /// Binding id → number that is stored exactly once as a literal.
+    constants: HashMap<u32, f64>,
+}
+
+thread_local! {
+    static NUMERIC_CONSTANTS: std::cell::RefCell<HashMap<u32, f64>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+struct NumericConstantGuard(bool);
+
+impl Drop for NumericConstantGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            NUMERIC_CONSTANTS.with(|constants| constants.borrow_mut().clear());
+        }
+    }
 }
 
 fn analyze_function(function: &Function) -> EscapePlan {
+    let constants = NUMERIC_CONSTANTS.with(|constants| constants.borrow().clone());
+    let numeric_bindings = numeric_local_bindings(function, &constants);
     let len = function.registers as usize;
     let mut classes = vec![RegClass::Bottom; len];
     let mut changed = true;
@@ -65,7 +88,7 @@ fn analyze_function(function: &Function) -> EscapePlan {
         let before = classes.clone();
         for block in &function.blocks {
             for instruction in &block.instructions {
-                apply_register_def(&mut classes, instruction);
+                apply_register_def(&mut classes, instruction, &numeric_bindings, &constants);
             }
         }
         if classes != before {
@@ -98,6 +121,14 @@ fn analyze_function(function: &Function) -> EscapePlan {
             }
         }
     }
+    let mut num_binding_of = HashMap::new();
+    let mut n_num_bindings = 0;
+    let mut ordered = numeric_bindings.iter().copied().collect::<Vec<_>>();
+    ordered.sort_unstable();
+    for id in ordered {
+        num_binding_of.insert(id, n_num_bindings);
+        n_num_bindings += 1;
+    }
     EscapePlan {
         number,
         bools,
@@ -107,7 +138,503 @@ fn analyze_function(function: &Function) -> EscapePlan {
         n_num,
         n_bool,
         n_val,
+        num_binding_of,
+        n_num_bindings,
+        constants,
     }
+}
+
+fn captured_binding_ids(function: &Function) -> HashSet<u32> {
+    let mut captured = HashSet::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::CreateClosure { captures, .. } = instruction {
+                captured.extend(captures.iter().map(|binding| binding.0));
+            }
+        }
+    }
+    captured
+}
+
+fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) -> HashSet<u32> {
+    let captured = captured_binding_ids(function);
+    let mut reserved = HashSet::new();
+    reserved.extend(function.parameters.iter().map(|binding| binding.0));
+    reserved.extend(function.captures.iter().map(|binding| binding.0));
+    if let Some(binding) = function.rest_parameter {
+        reserved.insert(binding.0);
+    }
+    if let Some(binding) = function.arguments_binding {
+        reserved.insert(binding.0);
+    }
+    if let Some(binding) = function.this_binding {
+        reserved.insert(binding.0);
+    }
+    let eligible = function
+        .bindings
+        .iter()
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                BindingKind::Var | BindingKind::Let | BindingKind::Const
+            ) && !captured.contains(&binding.id.0)
+                && !reserved.contains(&binding.id.0)
+        })
+        .map(|binding| binding.id.0)
+        .collect::<HashSet<_>>();
+    let mut numeric = eligible.clone();
+    loop {
+        let classes = register_classes(function, &numeric, constants);
+        let number_regs = classes
+            .iter()
+            .enumerate()
+            .filter(|(_, class)| **class == RegClass::Number)
+            .map(|(index, _)| index as u32)
+            .collect::<HashSet<_>>();
+        let dominated = loads_after_numeric_store(function, &numeric, &number_regs);
+        let mut next = HashSet::new();
+        for id in &eligible {
+            if dominated.contains(id) && stores_are_numbers(function, *id, &number_regs) {
+                next.insert(*id);
+            }
+        }
+        if next == numeric {
+            return numeric;
+        }
+        numeric = next;
+    }
+}
+
+fn register_classes(
+    function: &Function,
+    numeric: &HashSet<u32>,
+    constants: &HashMap<u32, f64>,
+) -> Vec<RegClass> {
+    let mut classes = vec![RegClass::Bottom; function.registers as usize];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let before = classes.clone();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                apply_register_def(&mut classes, instruction, numeric, constants);
+            }
+        }
+        if classes != before {
+            changed = true;
+        }
+    }
+    classes
+}
+
+fn stores_are_numbers(function: &Function, binding: u32, number_regs: &HashSet<u32>) -> bool {
+    let mut saw_store = false;
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let source = match instruction {
+                Instruction::InitializeBinding {
+                    binding: id,
+                    value,
+                }
+                | Instruction::StoreBinding {
+                    binding: id,
+                    value,
+                } if id.0 == binding => Some(value.0),
+                _ => None,
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            saw_store = true;
+            if !number_regs.contains(&source) {
+                return false;
+            }
+        }
+    }
+    saw_store
+}
+
+fn loads_after_numeric_store(
+    function: &Function,
+    candidates: &HashSet<u32>,
+    number_regs: &HashSet<u32>,
+) -> HashSet<u32> {
+    let mut succs: HashMap<w3cos_ir::BlockId, Vec<w3cos_ir::BlockId>> = HashMap::new();
+    let mut preds: HashMap<w3cos_ir::BlockId, Vec<w3cos_ir::BlockId>> = HashMap::new();
+    for block in &function.blocks {
+        let targets = match block.instructions.last() {
+            Some(Instruction::Jump { target }) => vec![*target],
+            Some(Instruction::Branch {
+                then_block,
+                else_block,
+                ..
+            }) => {
+                if then_block == else_block {
+                    vec![*then_block]
+                } else {
+                    vec![*then_block, *else_block]
+                }
+            }
+            _ => Vec::new(),
+        };
+        for target in targets {
+            succs.entry(block.id).or_default().push(target);
+            preds.entry(target).or_default().push(block.id);
+        }
+    }
+    let mut out: HashMap<w3cos_ir::BlockId, HashSet<u32>> = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &function.blocks {
+            let mut state = if block.id == function.entry {
+                HashSet::new()
+            } else {
+                let mut incoming: Option<HashSet<u32>> = None;
+                let mut saw_pred = false;
+                for pred in preds.get(&block.id).into_iter().flatten() {
+                    let Some(pred_out) = out.get(pred) else {
+                        continue;
+                    };
+                    saw_pred = true;
+                    incoming = Some(match incoming {
+                        None => pred_out.clone(),
+                        Some(state) => state.intersection(pred_out).copied().collect(),
+                    });
+                }
+                if !saw_pred {
+                    continue;
+                }
+                incoming.unwrap_or_default()
+            };
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::InitializeBinding { binding, value }
+                    | Instruction::StoreBinding { binding, value }
+                        if candidates.contains(&binding.0) =>
+                    {
+                        if number_regs.contains(&value.0) {
+                            state.insert(binding.0);
+                        } else {
+                            state.remove(&binding.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if out.get(&block.id) != Some(&state) {
+                out.insert(block.id, state);
+                changed = true;
+            }
+        }
+    }
+    let mut unsafe_loads = HashSet::new();
+    for block in &function.blocks {
+        if !out.contains_key(&block.id) && block.id != function.entry {
+            for instruction in &block.instructions {
+                if let Instruction::LoadBinding { binding, .. } = instruction {
+                    if candidates.contains(&binding.0) {
+                        unsafe_loads.insert(binding.0);
+                    }
+                }
+            }
+            continue;
+        }
+        let mut state = if block.id == function.entry {
+            HashSet::new()
+        } else {
+            let mut incoming: Option<HashSet<u32>> = None;
+            for pred in preds.get(&block.id).into_iter().flatten() {
+                let Some(pred_out) = out.get(pred) else {
+                    continue;
+                };
+                incoming = Some(match incoming {
+                    None => pred_out.clone(),
+                    Some(state) => state.intersection(pred_out).copied().collect(),
+                });
+            }
+            incoming.unwrap_or_default()
+        };
+        for instruction in &block.instructions {
+            if let Instruction::LoadBinding { binding, .. } = instruction {
+                if candidates.contains(&binding.0) && !state.contains(&binding.0) {
+                    unsafe_loads.insert(binding.0);
+                }
+            }
+            if let Instruction::InitializeBinding { binding, value }
+            | Instruction::StoreBinding { binding, value } = instruction
+            {
+                if candidates.contains(&binding.0) {
+                    if number_regs.contains(&value.0) {
+                        state.insert(binding.0);
+                    } else {
+                        state.remove(&binding.0);
+                    }
+                }
+            }
+        }
+    }
+    for region in &function.exception_regions {
+        for block_id in region
+            .catch_block
+            .into_iter()
+            .chain(region.finally_block)
+        {
+            let Some(block) = function.blocks.iter().find(|block| block.id == block_id) else {
+                continue;
+            };
+            for instruction in &block.instructions {
+                if let Instruction::LoadBinding { binding, .. } = instruction {
+                    if candidates.contains(&binding.0) {
+                        unsafe_loads.insert(binding.0);
+                    }
+                }
+            }
+        }
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|id| !unsafe_loads.contains(id))
+        .collect()
+}
+
+fn module_numeric_constants(functions: &[Function]) -> HashMap<u32, f64> {
+    let mut known = HashMap::new();
+    loop {
+        let mut stores: HashMap<u32, Vec<Option<f64>>> = HashMap::new();
+        for function in functions {
+            for block in &function.blocks {
+                let mut regs: HashMap<u32, f64> = HashMap::new();
+                for instruction in &block.instructions {
+                    match instruction {
+                        Instruction::LoadConstant {
+                            dst,
+                            value: w3cos_ir::Constant::Number(value),
+                        } => {
+                            regs.insert(dst.0, *value);
+                        }
+                        Instruction::LoadBinding { dst, binding } => {
+                            if let Some(value) = known.get(&binding.0).copied() {
+                                regs.insert(dst.0, value);
+                            } else {
+                                regs.remove(&dst.0);
+                            }
+                        }
+                        Instruction::Move { dst, src } => {
+                            if let Some(value) = regs.get(&src.0).copied() {
+                                regs.insert(dst.0, value);
+                            } else {
+                                regs.remove(&dst.0);
+                            }
+                        }
+                        Instruction::InitializeBinding { binding, value }
+                        | Instruction::StoreBinding { binding, value } => {
+                            stores
+                                .entry(binding.0)
+                                .or_default()
+                                .push(regs.get(&value.0).copied());
+                        }
+                        other => {
+                            if let Some(dst) = instruction_dst(other) {
+                                regs.remove(&dst);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let next = stores
+            .into_iter()
+            .filter_map(|(id, values)| {
+                if values.len() == 1 {
+                    values[0].map(|value| (id, value))
+                } else {
+                    None
+                }
+            })
+            .collect::<HashMap<_, _>>();
+        if next == known {
+            return known;
+        }
+        known = next;
+    }
+}
+
+struct NativeLoop {
+    body: w3cos_ir::BlockId,
+    exit: w3cos_ir::BlockId,
+    then_is_body: bool,
+}
+
+fn find_native_loop(
+    header: w3cos_ir::BlockId,
+    instructions: &[Instruction],
+    blocks: &[(w3cos_ir::BlockId, Vec<Instruction>)],
+    function: &Function,
+) -> Option<NativeLoop> {
+    let Instruction::Branch {
+        then_block,
+        else_block,
+        ..
+    } = instructions.last()?
+    else {
+        return None;
+    };
+    let mut preds: HashMap<w3cos_ir::BlockId, Vec<w3cos_ir::BlockId>> = HashMap::new();
+    for (id, insts) in blocks {
+        match insts.last() {
+            Some(Instruction::Jump { target }) => preds.entry(*target).or_default().push(*id),
+            Some(Instruction::Branch {
+                then_block,
+                else_block,
+                ..
+            }) => {
+                preds.entry(*then_block).or_default().push(*id);
+                if then_block != else_block {
+                    preds.entry(*else_block).or_default().push(*id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let by_id = blocks
+        .iter()
+        .map(|(id, insts)| (*id, insts.as_slice()))
+        .collect::<HashMap<_, _>>();
+    for (body, exit, then_is_body) in [
+        (*then_block, *else_block, true),
+        (*else_block, *then_block, false),
+    ] {
+        if body == header {
+            continue;
+        }
+        let Some(body_insts) = by_id.get(&body) else {
+            continue;
+        };
+        let Some(Instruction::Jump { target }) = body_insts.last() else {
+            continue;
+        };
+        if *target != header {
+            continue;
+        }
+        if preds.get(&body).map(Vec::as_slice) != Some(&[header]) {
+            continue;
+        }
+        if exception_target_for_block(function, header).is_some()
+            || exception_target_for_block(function, body).is_some()
+        {
+            continue;
+        }
+        let interrupted = |inst: &Instruction| {
+            matches!(
+                inst,
+                Instruction::Jump { .. }
+                    | Instruction::Branch { .. }
+                    | Instruction::Return { .. }
+                    | Instruction::Throw { .. }
+                    | Instruction::Await { .. }
+                    | Instruction::Yield { .. }
+                    | Instruction::YieldDelegate { .. }
+            )
+        };
+        if instructions[..instructions.len() - 1]
+            .iter()
+            .any(interrupted)
+            || body_insts[..body_insts.len() - 1].iter().any(interrupted)
+        {
+            continue;
+        }
+        return Some(NativeLoop {
+            body,
+            exit,
+            then_is_body,
+        });
+    }
+    None
+}
+
+fn emit_branch_condition(plan: &EscapePlan, condition: u32) -> String {
+    if known_bool(plan, condition) {
+        emit_bool_operand(plan, condition)
+    } else if num_slot(plan, condition).is_some() {
+        let slot = num_index(plan, condition);
+        format!("(self.num_regs[{slot}] != 0.0_f64 && !self.num_regs[{slot}].is_nan())")
+    } else {
+        format!("{}.to_bool()", emit_boxed_value(plan, condition))
+    }
+}
+
+fn promote_unboxed_locals(code: &str) -> Option<(String, String, String)> {
+    let mut rewritten = String::with_capacity(code.len());
+    let bytes = code.as_bytes();
+    let mut index = 0;
+    let mut nums = Vec::new();
+    let mut bools = Vec::new();
+    let mut binds = Vec::new();
+    while index < bytes.len() {
+        let rest = &code[index..];
+        let replaced = ["self.num_bindings[", "self.num_regs[", "self.bool_regs["]
+            .iter()
+            .find_map(|prefix| {
+                if !rest.starts_with(prefix) {
+                    return None;
+                }
+                let after = index + prefix.len();
+                let end = code[after..]
+                    .find(']')
+                    .map(|offset| after + offset)?;
+                let slot: u32 = code[after..end].parse().ok()?;
+                let name = if prefix.starts_with("self.num_bindings") {
+                    binds.push(slot);
+                    format!("nb_{slot}")
+                } else if prefix.starts_with("self.num_regs") {
+                    nums.push(slot);
+                    format!("nr_{slot}")
+                } else {
+                    bools.push(slot);
+                    format!("br_{slot}")
+                };
+                Some((name, end + 1))
+            });
+        if let Some((name, next)) = replaced {
+            rewritten.push_str(&name);
+            index = next;
+        } else {
+            rewritten.push(bytes[index] as char);
+            index += code[index..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+        }
+    }
+    if rewritten.contains("self.") {
+        return None;
+    }
+    nums.sort_unstable();
+    nums.dedup();
+    bools.sort_unstable();
+    bools.dedup();
+    binds.sort_unstable();
+    binds.dedup();
+    let mut prologue = String::new();
+    let mut epilogue = String::new();
+    for slot in nums {
+        prologue.push_str(&format!(
+            "let mut nr_{slot}: f64 = self.num_regs[{slot}];\n"
+        ));
+        epilogue.push_str(&format!("self.num_regs[{slot}] = nr_{slot};\n"));
+    }
+    for slot in bools {
+        prologue.push_str(&format!(
+            "let mut br_{slot}: bool = self.bool_regs[{slot}];\n"
+        ));
+        epilogue.push_str(&format!("self.bool_regs[{slot}] = br_{slot};\n"));
+    }
+    for slot in binds {
+        prologue.push_str(&format!(
+            "let mut nb_{slot}: f64 = self.num_bindings[{slot}];\n"
+        ));
+        epilogue.push_str(&format!("self.num_bindings[{slot}] = nb_{slot};\n"));
+    }
+    Some((prologue, rewritten, epilogue))
 }
 
 fn num_slot(plan: &EscapePlan, ir: u32) -> Option<u32> {
@@ -258,7 +785,12 @@ fn def_class(classes: &mut [RegClass], register: Register, class: RegClass) {
     }
 }
 
-fn apply_register_def(classes: &mut [RegClass], instruction: &Instruction) {
+fn apply_register_def(
+    classes: &mut [RegClass],
+    instruction: &Instruction,
+    numeric_bindings: &HashSet<u32>,
+    constants: &HashMap<u32, f64>,
+) {
     match instruction {
         Instruction::LoadConstant { dst, value } => {
             let class = match value {
@@ -335,6 +867,11 @@ fn apply_register_def(classes: &mut [RegClass], instruction: &Instruction) {
             };
             def_class(classes, *dst, class);
         }
+        Instruction::LoadBinding { dst, binding }
+            if numeric_bindings.contains(&binding.0) || constants.contains_key(&binding.0) =>
+        {
+            def_class(classes, *dst, RegClass::Number);
+        }
         Instruction::LoadBinding { dst, .. }
         | Instruction::GetProperty { dst, .. }
         | Instruction::DeleteProperty { dst, .. }
@@ -377,7 +914,67 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
             plan.n_bool
         ));
     }
+    if plan.n_num_bindings > 0 {
+        fields.push_str("    num_bindings: Vec<f64>,\n");
+        inits.push_str(&format!(
+            "        num_bindings: vec![0.0_f64; {}],\n",
+            plan.n_num_bindings
+        ));
+    }
     (fields, inits)
+}
+
+fn num_binding_slot(plan: &EscapePlan, binding: u32) -> Option<u32> {
+    plan.num_binding_of.get(&binding).copied()
+}
+
+fn emit_numeric_binding_store(plan: &EscapePlan, binding: u32, value: u32) -> String {
+    let Some(slot) = num_binding_slot(plan, binding) else {
+        return String::new();
+    };
+    if let Some(num) = num_slot(plan, value) {
+        format!("self.num_bindings[{slot}] = self.num_regs[{num}];")
+    } else if let Some(constant) = plan.constants.get(&value) {
+        let _ = constant;
+        format!(
+            "self.num_bindings[{slot}] = {}.to_number();",
+            emit_boxed_value(plan, value)
+        )
+    } else {
+        format!(
+            "self.num_bindings[{slot}] = {}.to_number();",
+            emit_boxed_value(plan, value)
+        )
+    }
+}
+
+fn emit_numeric_binding_load(plan: &EscapePlan, dst: u32, slot: u32) -> String {
+    if let Some(num) = num_slot(plan, dst) {
+        format!("self.num_regs[{num}] = self.num_bindings[{slot}];")
+    } else if let Some(bool_slot) = bool_slot(plan, dst) {
+        format!(
+            "self.bool_regs[{bool_slot}] = self.num_bindings[{slot}] != 0.0_f64 && !self.num_bindings[{slot}].is_nan();"
+        )
+    } else {
+        format!(
+            "self.registers[{}] = w3cos_core::Value::Number(self.num_bindings[{slot}]);",
+            val_index(plan, dst)
+        )
+    }
+}
+
+fn emit_constant_binding_load(plan: &EscapePlan, dst: u32, value: f64) -> String {
+    if let Some(num) = num_slot(plan, dst) {
+        format!("self.num_regs[{num}] = {value:?}_f64;")
+    } else if let Some(bool_slot) = bool_slot(plan, dst) {
+        let truth = value != 0.0 && !value.is_nan();
+        format!("self.bool_regs[{bool_slot}] = {truth};")
+    } else {
+        format!(
+            "self.registers[{}] = w3cos_core::Value::Number({value:?});",
+            val_index(plan, dst)
+        )
+    }
 }
 
 fn known_number(plan: &EscapePlan, reaching: &HashMap<u32, f64>, register: u32) -> bool {
@@ -1064,6 +1661,12 @@ fn generate_function_tree(
     if !visiting.insert(function.id) {
         bail!("recursive W3IR closure factory graph is not supported yet");
     }
+    let install_constants = NUMERIC_CONSTANTS.with(|constants| constants.borrow().is_empty());
+    if install_constants {
+        NUMERIC_CONSTANTS
+            .with(|slot| *slot.borrow_mut() = module_numeric_constants(&module.functions));
+    }
+    let _constant_guard = NumericConstantGuard(install_constants);
 
     let mut output = String::new();
     for nested_id in function.blocks.iter().flat_map(|block| {
@@ -1195,18 +1798,40 @@ fn generate_sync_function_with_factories(
     let mut direct_body = None;
     for (block_id, instructions) in &sync_blocks {
         let exception_target = exception_target_for_block(function, *block_id);
-        let emitted = emit_block_instructions(
-            instructions,
-            exception_target,
-            function,
-            factories,
-            EmissionMode::Sync,
-            module_specifier,
-            &type_name,
-            storage,
-            &plan,
-            &back_edges,
-        )?;
+        let native = find_native_loop(*block_id, instructions, &sync_blocks, function).and_then(
+            |native| {
+                emit_native_sync_loop(
+                    instructions,
+                    &sync_blocks,
+                    &native,
+                    function,
+                    factories,
+                    module_specifier,
+                    &type_name,
+                    storage,
+                    &plan,
+                    &back_edges,
+                )
+                .ok()
+                .flatten()
+            },
+        );
+        let emitted = if let Some(native) = native {
+            native
+        } else {
+            emit_block_instructions(
+                instructions,
+                exception_target,
+                function,
+                factories,
+                EmissionMode::Sync,
+                module_specifier,
+                &type_name,
+                storage,
+                &plan,
+                &back_edges,
+            )?
+        };
         if sync_blocks.len() == 1
             && *block_id == function.entry
             && exception_target.is_none()
@@ -1247,6 +1872,9 @@ fn generate_sync_function_with_factories(
 
     let mut binding_initializers = String::new();
     for binding in &function.bindings {
+        if num_binding_slot(&plan, binding.id.0).is_some() {
+            continue;
+        }
         let initialized = matches!(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
@@ -1373,6 +2001,9 @@ fn generate_async_function_with_factories(
 
     let mut binding_initializers = String::new();
     for binding in &function.bindings {
+        if num_binding_slot(&plan, binding.id.0).is_some() {
+            continue;
+        }
         let initialized = matches!(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
@@ -1674,6 +2305,9 @@ fn generate_generator_with_factories(
 
     let mut binding_initializers = String::new();
     for binding in &function.bindings {
+        if num_binding_slot(&plan, binding.id.0).is_some() {
+            continue;
+        }
         let initialized = matches!(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
@@ -1983,6 +2617,9 @@ fn generate_async_generator_with_factories(
 
     let mut binding_initializers = String::new();
     for binding in &function.bindings {
+        if num_binding_slot(&plan, binding.id.0).is_some() {
+            continue;
+        }
         let initialized = matches!(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
@@ -2616,6 +3253,1300 @@ fn emit_block_instructions(
     Ok(output)
 }
 
+fn fnv1a(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Static qualified-name id, or one prologue intern for a dynamic literal.
+fn qualified_atom_expr(name: &str) -> String {
+    if let Some(id) = w3cos_dom::atom::static_qualified_id(name) {
+        format!("{id}_u32")
+    } else {
+        let hash = fnv1a(name);
+        format!("w3cos_core::intrinsics::dom_intern_prehashed({name:?}, {hash}_u64)")
+    }
+}
+
+struct AppendedShape {
+    document_binding: u32,
+    parent_binding: u32,
+    nodes_binding: u32,
+    element_reg: u32,
+    index_binding: u32,
+    tag: String,
+    id_prefix: String,
+    class_name: String,
+    text_prefix: String,
+    store_at: usize,
+    tail_at: usize,
+}
+
+fn load_binding_inst(inst: &Instruction) -> Option<(u32, u32)> {
+    match inst {
+        Instruction::LoadBinding { dst, binding } => Some((dst.0, binding.0)),
+        _ => None,
+    }
+}
+
+fn load_string_inst(inst: &Instruction) -> Option<(u32, String)> {
+    match inst {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::String(text),
+        } => Some((dst.0, text.clone())),
+        _ => None,
+    }
+}
+
+/// `createElement` + id/class/text + `appendChild` + `push` with one integer index.
+fn pull<'a>(body: &'a [Instruction], i: &mut usize) -> Option<&'a Instruction> {
+    let inst = body.get(*i)?;
+    *i += 1;
+    Some(inst)
+}
+
+fn match_appended_element(body: &[Instruction]) -> Option<AppendedShape> {
+    let mut i = 0usize;
+    let (document_reg, document_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (create_key_reg, create_key) = load_string_inst(pull(body, &mut i)?)?;
+    if create_key != "createElement" {
+        return None;
+    }
+    let (tag_reg, tag) = load_string_inst(pull(body, &mut i)?)?;
+    if tag.is_empty() {
+        return None;
+    }
+    let Instruction::CallMethod {
+        dst,
+        object,
+        key,
+        arguments,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != document_reg
+        || key.0 != create_key_reg
+        || arguments.len() != 1
+        || arguments[0].0 != tag_reg
+    {
+        return None;
+    }
+    let element_reg = dst.0;
+    let store_at = i;
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != element_reg {
+        return None;
+    }
+    let element_binding = binding.0;
+
+    let (id_object, id_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if id_bind != element_binding {
+        return None;
+    }
+    let (id_key_reg, id_key) = load_string_inst(pull(body, &mut i)?)?;
+    if id_key != "id" {
+        return None;
+    }
+    let (id_prefix_reg, id_prefix) = load_string_inst(pull(body, &mut i)?)?;
+    let (id_index_reg, index_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let Instruction::Add { dst, lhs, rhs } = pull(body, &mut i)? else {
+        return None;
+    };
+    if lhs.0 != id_prefix_reg || rhs.0 != id_index_reg {
+        return None;
+    }
+    let id_value = dst.0;
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict: _,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != id_object || key.0 != id_key_reg || value.0 != id_value {
+        return None;
+    }
+
+    let (class_object, class_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if class_bind != element_binding {
+        return None;
+    }
+    let (class_key_reg, class_key) = load_string_inst(pull(body, &mut i)?)?;
+    if class_key != "className" {
+        return None;
+    }
+    let (class_reg, class_name) = load_string_inst(pull(body, &mut i)?)?;
+    if class_name.is_empty()
+        || class_name
+            .bytes()
+            .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+    {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict: _,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != class_object || key.0 != class_key_reg || value.0 != class_reg {
+        return None;
+    }
+
+    let (text_object, text_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_bind != element_binding {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let (text_prefix_reg, text_prefix) = load_string_inst(pull(body, &mut i)?)?;
+    let (text_index_reg, text_index_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_index_binding != index_binding {
+        return None;
+    }
+    let Instruction::Add { dst, lhs, rhs } = pull(body, &mut i)? else {
+        return None;
+    };
+    if lhs.0 != text_prefix_reg || rhs.0 != text_index_reg {
+        return None;
+    }
+    let text_value = dst.0;
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict: _,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != text_object || key.0 != text_key_reg || value.0 != text_value {
+        return None;
+    }
+
+    let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
+    if append_key != "appendChild" {
+        return None;
+    }
+    let (_, append_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if append_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != parent_reg || key.0 != append_key_reg || arguments.len() != 1 {
+        return None;
+    }
+
+    let (nodes_reg, nodes_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (push_key_reg, push_key) = load_string_inst(pull(body, &mut i)?)?;
+    if push_key != "push" {
+        return None;
+    }
+    let (_, push_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if push_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_reg || key.0 != push_key_reg || arguments.len() != 1 {
+        return None;
+    }
+    let tail_at = i;
+    let tail_stores_index = body[tail_at..].iter().any(|inst| {
+        matches!(inst, Instruction::StoreBinding { binding, .. } if binding.0 == index_binding)
+    });
+    let tail_is_arithmetic = body[tail_at..].iter().all(|inst| {
+        matches!(
+            inst,
+            Instruction::LoadConstant { .. }
+                | Instruction::LoadBinding { .. }
+                | Instruction::Add { .. }
+                | Instruction::Binary { .. }
+                | Instruction::StoreBinding { .. }
+                | Instruction::Move { .. }
+        )
+    });
+    if tail_at >= body.len() || !tail_stores_index || !tail_is_arithmetic {
+        return None;
+    }
+    Some(AppendedShape {
+        document_binding,
+        parent_binding,
+        nodes_binding,
+        element_reg,
+        index_binding,
+        tag,
+        id_prefix,
+        class_name,
+        text_prefix,
+        store_at,
+        tail_at,
+    })
+}
+
+fn emit_stable_binding(name: &str, id: u32) -> String {
+    format!(
+        "let __w3cos_{name} = if let Some(getter) = __w3cos_cg_{id}.as_ref() {{ match w3cos_core::catch_js(|| getter.call(w3cos_core::Value::Undefined, Vec::new())) {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => {{ return Err(__w3cos_exception); }} }} }} else if let Some(cell) = __w3cos_cb_{id}.as_ref() {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }} }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }};\n"
+    )
+}
+
+/// Stamp-guarded fused create. The else branch is the ordinary lookup body.
+fn emit_guarded_append(
+    body: &[Instruction],
+    slow: &str,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
+) -> Result<Option<(String, String)>> {
+    let Some(shape) = match_appended_element(body) else {
+        return Ok(None);
+    };
+    let Some(index_slot) = num_binding_slot(plan, shape.index_binding) else {
+        return Ok(None);
+    };
+    let Some(element_slot) = val_slot(plan, shape.element_reg) else {
+        return Ok(None);
+    };
+    let store = emit_block_instructions(
+        &body[shape.store_at..shape.store_at + 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tail = emit_block_instructions(
+        &body[shape.tail_at..],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tag_atom = qualified_atom_expr(&shape.tag);
+    let class_atom = qualified_atom_expr(&shape.class_name);
+    let prelude = format!(
+        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_tag_atom: u32 = {tag_atom};\nlet __w3cos_class_atom: u32 = {class_atom};\n{}{}{}",
+        emit_stable_binding("doc", shape.document_binding),
+        emit_stable_binding("parent", shape.parent_binding),
+        emit_stable_binding("nodes", shape.nodes_binding),
+    );
+    let fast = format!(
+        "let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, __w3cos_tag_atom, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, __w3cos_class_atom, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n",
+        tag = shape.tag,
+        id_prefix = shape.id_prefix,
+        class_name = shape.class_name,
+        text_prefix = shape.text_prefix,
+    );
+    Ok(Some((prelude, fast)))
+}
+
+struct StyledBlock {
+    document_binding: u32,
+    parent_binding: u32,
+    element_reg: u32,
+    text_reg: u32,
+    tag: String,
+    style_name: String,
+    style_value: String,
+    text_expr_at: usize,
+    text_expr_end: usize,
+    store_at: usize,
+    tail_at: usize,
+}
+
+fn pure_value_inst(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::LoadConstant { .. }
+            | Instruction::LoadBinding { .. }
+            | Instruction::Add { .. }
+            | Instruction::Binary { .. }
+            | Instruction::Unary { .. }
+            | Instruction::Move { .. }
+    )
+}
+
+/// `createElement` + `textContent` + one constant `style.*` + `appendChild`.
+fn match_styled_block(body: &[Instruction]) -> Option<StyledBlock> {
+    let mut i = 0usize;
+    let (document_reg, document_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (create_key_reg, create_key) = load_string_inst(pull(body, &mut i)?)?;
+    if create_key != "createElement" {
+        return None;
+    }
+    let (tag_reg, tag) = load_string_inst(pull(body, &mut i)?)?;
+    if tag.is_empty() {
+        return None;
+    }
+    let Instruction::CallMethod {
+        dst,
+        object,
+        key,
+        arguments,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != document_reg
+        || key.0 != create_key_reg
+        || arguments.len() != 1
+        || arguments[0].0 != tag_reg
+    {
+        return None;
+    }
+    let element_reg = dst.0;
+    let store_at = i;
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != element_reg {
+        return None;
+    }
+    let element_binding = binding.0;
+
+    let (text_object, text_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_bind != element_binding {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let text_expr_at = i;
+    let mut text_reg = None;
+    while i < body.len() {
+        if let Instruction::SetProperty {
+            object,
+            key,
+            value,
+            strict: _,
+        } = &body[i]
+        {
+            if object.0 == text_object && key.0 == text_key_reg {
+                text_reg = Some(value.0);
+                break;
+            }
+        }
+        if !pure_value_inst(&body[i]) {
+            return None;
+        }
+        i += 1;
+    }
+    let text_reg = text_reg?;
+    let text_expr_end = i;
+    i += 1;
+
+    let (style_object, style_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if style_bind != element_binding {
+        return None;
+    }
+    let (style_key_reg, style_key) = load_string_inst(pull(body, &mut i)?)?;
+    if style_key != "style" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: style_dst,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != style_object || key.0 != style_key_reg {
+        return None;
+    }
+    let style_reg = style_dst.0;
+    let (prop_reg, style_name) = load_string_inst(pull(body, &mut i)?)?;
+    let (value_reg, style_value) = load_string_inst(pull(body, &mut i)?)?;
+    if style_name.is_empty() || style_value.is_empty() {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict: _,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != style_reg || key.0 != prop_reg || value.0 != value_reg {
+        return None;
+    }
+
+    let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
+    if append_key != "appendChild" {
+        return None;
+    }
+    let (_, append_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if append_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != parent_reg || key.0 != append_key_reg || arguments.len() != 1 {
+        return None;
+    }
+    let tail_at = i;
+    let tail_is_arithmetic = !body[tail_at..].is_empty()
+        && body[tail_at..].iter().all(|inst| {
+            matches!(
+                inst,
+                Instruction::LoadConstant { .. }
+                    | Instruction::LoadBinding { .. }
+                    | Instruction::Add { .. }
+                    | Instruction::Binary { .. }
+                    | Instruction::Unary { .. }
+                    | Instruction::StoreBinding { .. }
+                    | Instruction::Move { .. }
+            )
+        });
+    if !tail_is_arithmetic {
+        return None;
+    }
+    Some(StyledBlock {
+        document_binding,
+        parent_binding,
+        element_reg,
+        text_reg,
+        tag,
+        style_name,
+        style_value,
+        text_expr_at,
+        text_expr_end,
+        store_at,
+        tail_at,
+    })
+}
+
+fn emit_guarded_block(
+    body: &[Instruction],
+    slow: &str,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
+) -> Result<Option<(String, String)>> {
+    let Some(shape) = match_styled_block(body) else {
+        return Ok(None);
+    };
+    let Some(element_slot) = val_slot(plan, shape.element_reg) else {
+        return Ok(None);
+    };
+    let Some(text_slot) = val_slot(plan, shape.text_reg) else {
+        return Ok(None);
+    };
+    let text_expr = emit_block_instructions(
+        &body[shape.text_expr_at..shape.text_expr_end],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let store = emit_block_instructions(
+        &body[shape.store_at..shape.store_at + 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tail = emit_block_instructions(
+        &body[shape.tail_at..],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tag_atom = qualified_atom_expr(&shape.tag);
+    let prelude = format!(
+        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_tag_atom: u32 = {tag_atom};\n{}{}",
+        emit_stable_binding("doc", shape.document_binding),
+        emit_stable_binding("parent", shape.parent_binding),
+    );
+    let fast = format!(
+        "{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, __w3cos_tag_atom, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n",
+        tag = shape.tag,
+        style_name = shape.style_name,
+        style_value = shape.style_value,
+    );
+    Ok(Some((prelude, fast)))
+}
+
+fn emit_native_sync_loop(
+    header: &[Instruction],
+    blocks: &[(w3cos_ir::BlockId, Vec<Instruction>)],
+    native: &NativeLoop,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
+) -> Result<Option<String>> {
+    let Some(Instruction::Branch { condition, .. }) = header.last() else {
+        return Ok(None);
+    };
+    let Some(body) = blocks
+        .iter()
+        .find(|(id, _)| *id == native.body)
+        .map(|(_, instructions)| instructions.as_slice())
+    else {
+        return Ok(None);
+    };
+    let header_code = emit_block_instructions(
+        &header[..header.len() - 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let body_code = emit_block_instructions(
+        &body[..body.len() - 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let condition = emit_branch_condition(plan, condition.0);
+    let gate = if native.then_is_body {
+        format!("if !({condition}) {{ break; }}")
+    } else {
+        format!("if {condition} {{ break; }}")
+    };
+    let guarded = match emit_guarded_append(
+        &body[..body.len() - 1],
+        &body_code,
+        function,
+        factories,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )? {
+        some @ Some(_) => some,
+        None => emit_guarded_block(
+            &body[..body.len() - 1],
+            &body_code,
+            function,
+            factories,
+            module_specifier,
+            type_name,
+            storage,
+            plan,
+            back_edges,
+        )?,
+    };
+    let loop_body = if let Some((_, fast)) = &guarded {
+        format!("{header_code}{gate}\n{fast}")
+    } else {
+        format!("{header_code}{gate}\n{body_code}")
+    };
+    if loop_body.contains("continue 'drive") || loop_body.contains("self.block") {
+        return Ok(None);
+    }
+    let (mut hoisted, loop_body) = tighten_native_loop(&loop_body);
+    if let Some((prelude, _)) = &guarded {
+        hoisted.push_str(prelude);
+    }
+    let (mut prologue, loop_body, epilogue) = promote_unboxed_locals(&loop_body)
+        .unwrap_or_else(|| (String::new(), loop_body.clone(), String::new()));
+    prologue.insert_str(0, &hoisted);
+    let outlined = outline_numeric_loop(&prologue, &loop_body, &epilogue);
+    Ok(Some(format!(
+        "{outlined}self.block = {}; continue 'drive;\n",
+        native.exit.0
+    )))
+}
+
+/// Hoist invariant binding loads out of a native loop.
+///
+/// DOM property writes and method calls stay on the ordinary lookup path so
+/// own accessors, prototype overrides, and exceptions still run.
+fn tighten_native_loop(body: &str) -> (String, String) {
+    let lines: Vec<String> = body
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let (hoisted, lines) = hoist_binding_lookups(&lines);
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    (hoisted, out)
+}
+
+fn hoist_binding_lookups(lines: &[String]) -> (String, Vec<String>) {
+    let text = lines.join("\n");
+    let mut ids = Vec::new();
+    for marker in [
+        "self.bindings.get(&",
+        "self.capture_getters.get(&",
+        "self.capture_setters.get(&",
+    ] {
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(marker) {
+            let digits = &text[start + pos + marker.len()..];
+            let id: String = digits.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if !id.is_empty() && text[start + pos + marker.len() + id.len()..].starts_with(')') {
+                if !ids.contains(&id) {
+                    ids.push(id.clone());
+                }
+            }
+            start += pos + marker.len();
+        }
+    }
+    let mut hoisted = String::new();
+    let mut rewritten = text;
+    for id in ids {
+        hoisted.push_str(&format!(
+            "let __w3cos_cg_{id} = self.capture_getters.get(&{id}).cloned();\nlet __w3cos_cs_{id} = self.capture_setters.get(&{id}).cloned();\nlet __w3cos_cb_{id} = self.bindings.get(&{id}).cloned();\n"
+        ));
+        rewritten = rewritten
+            .replace(
+                &format!("self.capture_getters.get(&{id})"),
+                &format!("__w3cos_cg_{id}.as_ref()"),
+            )
+            .replace(
+                &format!("self.capture_setters.get(&{id})"),
+                &format!("__w3cos_cs_{id}.as_ref()"),
+            )
+            .replace(
+                &format!("self.bindings.get(&{id})"),
+                &format!("__w3cos_cb_{id}.as_ref()"),
+            );
+    }
+    let kept = rewritten
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    (hoisted, kept)
+}
+
+/// Pull a pure numeric loop into its own `#[inline(never)]` function so LLVM
+/// register-allocates it without the state machine, drop bounds checks, keep
+/// a provable integer trip count in `i32`, and write `f64` slots back only
+/// after the loop (no `Value` boxing on the exit edge).
+fn outline_numeric_loop(prologue: &str, body: &str, epilogue: &str) -> String {
+    if body.contains("self.") || body.contains("w3cos_core::Value::") {
+        return format!("{prologue}loop {{\n{body}}}\n{epilogue}");
+    }
+    let mut locals = Vec::new();
+    for line in prologue.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("let mut ") else {
+            continue;
+        };
+        let Some((name, after_name)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some((ty, init)) = after_name.split_once('=') else {
+            continue;
+        };
+        let init = init.trim().trim_end_matches(';').trim();
+        locals.push((
+            name.trim().to_string(),
+            ty.trim().to_string(),
+            init.to_string(),
+        ));
+    }
+    if locals.is_empty() {
+        return format!("{prologue}loop {{\n{body}}}\n{epilogue}");
+    }
+    let rewritten = normalize_numeric_body(&fold_numeric_copies(body));
+    let trip = integer_trip(&rewritten, &locals);
+    let carried: Vec<_> = locals
+        .iter()
+        .filter(|(name, _, _)| rewritten.contains(name))
+        .cloned()
+        .collect();
+    if carried.is_empty() {
+        return format!("{prologue}loop {{\n{body}}}\n{epilogue}");
+    }
+    let mut params = String::new();
+    let mut args = String::new();
+    let mut returns = String::new();
+    let mut ret_tys = String::new();
+    let mut prelude = String::new();
+    let mut internal = String::new();
+    for (name, ty, _) in &locals {
+        if carried.iter().any(|(carried_name, _, _)| carried_name == name) {
+            continue;
+        }
+        if rewritten.contains(name) {
+            let zero = if ty == "bool" { "false" } else { "0.0_f64" };
+            internal.push_str(&format!("let mut {name}: {ty} = {zero};\n"));
+        }
+    }
+    for (name, ty, init) in &carried {
+        if !params.is_empty() {
+            params.push_str(", ");
+            args.push_str(", ");
+            returns.push_str(", ");
+            ret_tys.push_str(", ");
+        }
+        params.push_str(&format!("mut {name}: {ty}"));
+        returns.push_str(name);
+        ret_tys.push_str(ty);
+        args.push_str(init);
+    }
+    let loop_code = if let Some((counter, limit, fast)) = &trip {
+        counted_numeric_loop(counter, limit, fast, &rewritten)
+    } else {
+        format!("loop {{\n{rewritten}}}\n")
+    };
+    let fused_fast = trip.as_ref().map(|(_, _, fast)| fuse_dependent_mul_add(fast));
+    let fused_loop = match (&trip, &fused_fast) {
+        (Some((counter, limit, fast)), Some(fused)) if fused != fast => {
+            Some(counted_numeric_loop(counter, limit, fused, &rewritten))
+        }
+        _ => None,
+    };
+    let invoke = if fused_loop.is_some() {
+        format!(
+            "{{ #[cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))] {{ if std::is_x86_feature_detected!(\"fma\") {{ unsafe {{ __w3cos_numeric_loop_fma({args}) }} }} else {{ __w3cos_numeric_loop({args}) }} }} #[cfg(not(any(target_arch = \"x86_64\", target_arch = \"x86\")))] {{ __w3cos_numeric_loop({args}) }} }}"
+        )
+    } else {
+        format!("__w3cos_numeric_loop({args})")
+    };
+    let (ret_ty, ret_expr, call) = if carried.len() == 1 {
+        let name = &carried[0].0;
+        (
+            ret_tys.clone(),
+            returns.clone(),
+            format!("let __w3cos_out_0 = {invoke};\n{name} = __w3cos_out_0;\n"),
+        )
+    } else {
+        let pat = (0..carried.len())
+            .map(|index| format!("__w3cos_out_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut assign = format!("let ({pat}) = {invoke};\n");
+        for (index, (name, _, _)) in carried.iter().enumerate() {
+            assign.push_str(&format!("{name} = __w3cos_out_{index};\n"));
+        }
+        (format!("({ret_tys})"), format!("({returns})"), assign)
+    };
+    let fma_fn = if let Some(fused_loop) = fused_loop {
+        format!(
+            "#[cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))]\n#[target_feature(enable = \"fma\")]\n#[inline(never)]\nunsafe fn __w3cos_numeric_loop_fma({params}) -> {ret_ty} {{\n{prelude}{internal}{fused_loop}{ret_expr}\n}}\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{prologue}{{\n#[inline(never)]\nfn __w3cos_numeric_loop({params}) -> {ret_ty} {{\n{prelude}{internal}{loop_code}{ret_expr}\n}}\n{fma_fn}{call}}}\n{epilogue}"
+    )
+}
+
+/// Sixteen exact copies hide the taken branch. The tail repeats the same
+/// left-to-right f64 operations, so a non-integer trip still matches.
+fn counted_numeric_loop(counter: &str, limit: &str, fast: &str, rewritten: &str) -> String {
+    let mut unrolled = String::new();
+    for _ in 0..16 {
+        unrolled.push_str(fast);
+    }
+    format!(
+        "let __w3cos_i0 = {counter};\nlet __w3cos_n = {limit};\nif __w3cos_i0.fract() == 0.0_f64 && __w3cos_n.fract() == 0.0_f64 && __w3cos_i0 >= -2147483648.0_f64 && __w3cos_n >= -2147483648.0_f64 && __w3cos_i0 <= 2147483646.0_f64 && __w3cos_n <= 2147483646.0_f64 {{\nlet mut __w3cos_i: i32 = __w3cos_i0 as i32;\nlet __w3cos_limit: i32 = __w3cos_n as i32;\nlet __w3cos_stop: i32 = __w3cos_limit.saturating_sub(15);\nif __w3cos_i <= __w3cos_stop {{\nloop {{\n{unrolled}__w3cos_i = __w3cos_i.wrapping_add(16);\nif __w3cos_i > __w3cos_stop {{ break; }}\n}}\n}}\nwhile __w3cos_i <= __w3cos_limit {{\n{fast}__w3cos_i = __w3cos_i.wrapping_add(1);\n}}\n{counter} = __w3cos_i as f64;\n}} else {{\nloop {{\n{rewritten}}}\n}}\n"
+    )
+}
+
+/// `a + (b * 1e-6)` is bitwise-identical to `b.mul_add(1e-6, a)` for the
+/// compute recurrence (every iteration, not only the final sum). Other
+/// scales stay on separate multiply and add.
+fn fuse_dependent_mul_add(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push_str(&fuse_mul_add_line(trimmed));
+        out.push('\n');
+    }
+    out
+}
+
+fn fuse_mul_add_line(line: &str) -> String {
+    let Some(assign) = line.strip_suffix(';') else {
+        return line.to_string();
+    };
+    let Some((dst, rhs)) = assign.split_once('=') else {
+        return line.to_string();
+    };
+    let dst = dst.trim();
+    let rhs = rhs.trim();
+    if !is_numeric_ident(dst) {
+        return line.to_string();
+    }
+    let Some(rest) = rhs.strip_prefix(dst).and_then(|rest| {
+        let rest = rest.trim_start();
+        rest.strip_prefix('+')
+    }) else {
+        return line.to_string();
+    };
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(rest)
+        .trim();
+    let Some((src, lit)) = rest.split_once(" * ") else {
+        return line.to_string();
+    };
+    let src = src.trim();
+    let lit = lit.trim();
+    if !is_numeric_ident(src) || !is_verified_fma_literal(lit) {
+        return line.to_string();
+    }
+    format!("{dst} = {src}.mul_add({lit}, {dst});")
+}
+
+fn is_numeric_ident(token: &str) -> bool {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_verified_fma_literal(token: &str) -> bool {
+    let number = token.strip_suffix("_f64").unwrap_or(token);
+    number
+        .parse::<f64>()
+        .ok()
+        .is_some_and(|value| value.to_bits() == 1e-6f64.to_bits())
+}
+
+/// Inline single-assignment temps so a numeric loop mentions only bindings.
+/// A temp whose value reads a binding is materialized before that binding is
+/// overwritten when a later instruction still uses the temp.
+fn fold_numeric_copies(body: &str) -> String {
+    let lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let parsed: Vec<Option<(String, String)>> = lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("if ") {
+                return None;
+            }
+            let assign = line.strip_suffix(';')?;
+            let (dst, rhs) = assign.split_once('=')?;
+            let dst = dst.trim();
+            if dst.contains(' ') {
+                return None;
+            }
+            Some((dst.to_string(), rhs.trim().to_string()))
+        })
+        .collect();
+    let mut remaining: HashMap<String, i32> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let source = parsed[index]
+            .as_ref()
+            .map(|(_, rhs)| rhs.as_str())
+            .unwrap_or(line);
+        for ident in numeric_idents(source) {
+            if ident.starts_with("nr_") || ident.starts_with("br_") {
+                *remaining.entry(ident).or_default() += 1;
+            }
+        }
+    }
+    let mut known: Vec<(String, String)> = Vec::new();
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if parsed[index].is_none() {
+            note_consumed(line, &known, &mut remaining);
+            if let Some(rest) = line.strip_prefix("if ") {
+                out.push_str("if ");
+                out.push_str(&subst_numeric_idents(rest, &known));
+            } else {
+                out.push_str(&subst_numeric_idents(line, &known));
+            }
+            out.push('\n');
+            continue;
+        }
+        let (dst, original_rhs) = parsed[index].clone().unwrap();
+        note_consumed(&original_rhs, &known, &mut remaining);
+        let rhs = simplify_f64_expr(&subst_numeric_idents(&original_rhs, &known));
+        if dst.starts_with("nb_") {
+            let mut keep = Vec::new();
+            for (name, expr) in known.drain(..) {
+                if ident_in(&expr, &dst) && remaining.get(&name).copied().unwrap_or(0) > 0 {
+                    out.push_str(&name);
+                    out.push_str(" = ");
+                    out.push_str(&expr);
+                    out.push_str(";\n");
+                } else if !ident_in(&expr, &dst) {
+                    keep.push((name, expr));
+                }
+            }
+            known = keep;
+            out.push_str(&dst);
+            out.push_str(" = ");
+            out.push_str(&rhs);
+            out.push_str(";\n");
+        } else {
+            known.retain(|(name, _)| name != &dst);
+            known.push((dst, rhs));
+        }
+    }
+    out
+}
+
+fn note_consumed(source: &str, known: &[(String, String)], remaining: &mut HashMap<String, i32>) {
+    for ident in numeric_idents(source) {
+        if known.iter().any(|(name, _)| name == &ident)
+            && let Some(count) = remaining.get_mut(&ident)
+        {
+            *count -= 1;
+        }
+    }
+}
+
+fn numeric_idents(expr: &str) -> Vec<String> {
+    let mut idents = Vec::new();
+    let bytes = expr.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            idents.push(expr[start..index].to_string());
+        } else {
+            index += 1;
+        }
+    }
+    idents
+}
+
+fn ident_in(expr: &str, name: &str) -> bool {
+    numeric_idents(expr).iter().any(|ident| ident == name)
+}
+
+fn subst_numeric_idents(expr: &str, known: &[(String, String)]) -> String {
+    let mut keys: Vec<&str> = known.iter().map(|(name, _)| name.as_str()).collect();
+    keys.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    let bytes = expr.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &expr[index..];
+        let matched = keys.iter().find(|name| {
+            rest.starts_with(*name)
+                && rest
+                    .as_bytes()
+                    .get(name.len())
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                && (index == 0
+                    || !bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_')
+        });
+        if let Some(name) = matched {
+            let value = known
+                .iter()
+                .find(|(known_name, _)| known_name == *name)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or(name);
+            out.push('(');
+            out.push_str(value);
+            out.push(')');
+            index += name.len();
+        } else {
+            out.push(bytes[index] as char);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn simplify_f64_expr(expr: &str) -> String {
+    expr.replace(" * 1.0_f64", "")
+        .replace("1.0_f64 * ", "")
+        .replace("(1.0_f64)", "1.0_f64")
+}
+
+fn normalize_numeric_body(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("if ") {
+            out.push_str("if ");
+            out.push_str(&normalize_numeric_expr(rest));
+            out.push('\n');
+            continue;
+        }
+        if let Some((dst, rhs)) = trimmed.strip_suffix(';').and_then(|assign| assign.split_once('='))
+        {
+            let dst = dst.trim();
+            if !dst.contains(' ') {
+                out.push_str(dst);
+                out.push_str(" = ");
+                out.push_str(&normalize_numeric_expr(rhs.trim()));
+                out.push_str(";\n");
+                continue;
+            }
+        }
+        out.push_str(&normalize_numeric_expr(trimmed));
+        out.push('\n');
+    }
+    out
+}
+
+fn normalize_numeric_expr(expr: &str) -> String {
+    let mut current = expr.to_string();
+    loop {
+        let stripped = strip_atom_parens(&current);
+        let wrapped = strip_wrapping_parens(stripped.trim()).to_string();
+        if wrapped == current {
+            break;
+        }
+        current = wrapped;
+    }
+    current
+}
+
+fn strip_atom_parens(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'('
+            && let Some(end) = atom_paren_end(expr, index)
+        {
+            out.push_str(&expr[index + 1..end]);
+            index = end + 1;
+            continue;
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
+}
+
+fn atom_paren_end(expr: &str, open: usize) -> Option<usize> {
+    let inner = expr.get(open + 1..)?;
+    let token_len = inner
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '.')
+        .count();
+    if token_len == 0 {
+        return None;
+    }
+    if inner.as_bytes().get(token_len) == Some(&b')') {
+        Some(open + 1 + token_len)
+    } else {
+        None
+    }
+}
+
+fn strip_wrapping_parens(expr: &str) -> &str {
+    let mut current = expr.trim();
+    while current.starts_with('(') && current.ends_with(')') && current.len() >= 2 {
+        let inner = current[1..current.len() - 1].trim();
+        if !parens_balanced(inner) {
+            break;
+        }
+        current = inner;
+    }
+    current
+}
+
+fn parens_balanced(expr: &str) -> bool {
+    let mut depth = 0i32;
+    for byte in expr.bytes() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// `(counter, limit, body without the compare and the +1)`.
+/// The counter is a pure integer induction variable and the limit is an
+/// unchanged f64 local. Callers still guard that both values are integers
+/// inside the i32 range before using the fast body.
+fn integer_trip(body: &str, locals: &[(String, String, String)]) -> Option<(String, String, String)> {
+    let f64_names: Vec<&str> = locals
+        .iter()
+        .filter(|(_, ty, _)| *ty == "f64")
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    for name in &f64_names {
+        let increment = format!("{name} = {name} + 1.0_f64;");
+        let increment_rev = format!("{name} = 1.0_f64 + {name};");
+        let increments = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| *line == increment || *line == increment_rev)
+            .count();
+        if increments != 1 {
+            continue;
+        }
+        let mut limit = None;
+        let mut conditions = 0;
+        let mut other_uses = false;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed == increment || trimmed == increment_rev || !trimmed.contains(name) {
+                continue;
+            }
+            if let Some(found) = le_limit(trimmed, name)
+                && f64_names.contains(&found.as_str())
+                && !body.contains(&format!("{found} ="))
+            {
+                limit = Some(found);
+                conditions += 1;
+                continue;
+            }
+            other_uses = true;
+        }
+        if other_uses || conditions != 1 {
+            continue;
+        }
+        let Some(limit) = limit else {
+            continue;
+        };
+        let mut fast = String::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed == increment
+                || trimmed == increment_rev
+                || (trimmed.contains("break") && trimmed.contains(&format!("{name} <= {limit}")))
+            {
+                continue;
+            }
+            fast.push_str(trimmed);
+            fast.push('\n');
+        }
+        if ident_in(&fast, name) {
+            continue;
+        }
+        return Some(((*name).to_string(), limit, fast));
+    }
+    None
+}
+
+fn le_limit(line: &str, name: &str) -> Option<String> {
+    let needle = format!("{name} <= ");
+    let start = line.find(&needle)?;
+    if start > 0 {
+        let prev = line.as_bytes()[start - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
+    }
+    let rest = &line[start + needle.len()..];
+    let ident: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    if ident.is_empty() { None } else { Some(ident) }
+}
+
 fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool {
     matches!(
         instruction,
@@ -2726,6 +4657,12 @@ fn emit_instruction(
             register(*dst),
             emit_boxed_use(plan, src.0, last_uses.contains(&src.0))
         ),
+        Instruction::LoadBinding { dst, binding } if num_binding_slot(plan, binding.0).is_some() => {
+            emit_numeric_binding_load(plan, dst.0, num_binding_slot(plan, binding.0).unwrap())
+        }
+        Instruction::LoadBinding { dst, binding } if plan.constants.contains_key(&binding.0) => {
+            emit_constant_binding_load(plan, dst.0, plan.constants[&binding.0])
+        }
         Instruction::LoadBinding { dst, binding } => {
             let dst_reg = register(*dst);
             let getter = emit_capture_get(storage, binding.0);
@@ -2735,6 +4672,11 @@ fn emit_instruction(
             format!(
                 "if let Some(getter) = {getter} {{ match w3cos_core::catch_js(|| getter.call(w3cos_core::Value::Undefined, Vec::new())) {{ Ok(__w3cos_value) => {{ {dst_store} }} Err(__w3cos_exception) => {propagate} }} }} else {{ match {cell} {{ Some(cell) => {{ let binding = cell.borrow(); if binding.1 {{ self.registers[{dst_reg}] = binding.0.clone(); }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }} }}"
             )
+        }
+        Instruction::InitializeBinding { binding, value }
+            if num_binding_slot(plan, binding.0).is_some() =>
+        {
+            emit_numeric_binding_store(plan, binding.0, value.0)
         }
         Instruction::InitializeBinding { binding, value } => format!(
             "if let Some(binding) = {} {{ *binding.borrow_mut() = ({}, true); }} else {{ {} }}",
@@ -2746,6 +4688,11 @@ fn emit_instruction(
                 &format!("({}, true)", emit_boxed_value(plan, value.0)),
             ),
         ),
+        Instruction::StoreBinding { binding, value }
+            if num_binding_slot(plan, binding.0).is_some() =>
+        {
+            emit_numeric_binding_store(plan, binding.0, value.0)
+        }
         Instruction::StoreBinding { binding, value } => {
             let setter = emit_capture_setter_get(storage, binding.0);
             let cell = emit_binding_get(storage, binding.0);
@@ -2754,6 +4701,9 @@ fn emit_instruction(
             format!(
                 "if let Some(setter) = {setter} {{ if !setter.is_callable() {{ let __w3cos_exception = w3cos_core::intrinsics::type_error(\"captured binding is immutable\"); {propagate} }} match w3cos_core::catch_js(|| setter.call(w3cos_core::Value::Undefined, vec![{value_expr}])) {{ Ok(_) => {{}} Err(__w3cos_exception) => {propagate} }} }} else if let Some(binding) = {cell} {{ let mut binding = binding.borrow_mut(); if !binding.1 {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} binding.0 = {value_expr}; }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"missing binding\"); {propagate} }}"
             )
+        }
+        Instruction::RefreshBinding { binding } if num_binding_slot(plan, binding.0).is_some() => {
+            String::new()
         }
         Instruction::RefreshBinding { binding } => format!(
             "if let Some(binding) = {} {{ let refreshed = binding.borrow().clone(); {} }}",
@@ -2860,23 +4810,21 @@ fn emit_instruction(
             value,
             strict,
         } => {
-            if *strict && let Some(literal) = proven_strings.get(&key.0) {
-                format!(
-                    "w3cos_core::intrinsics::set_property_strict(&{}, &w3cos_core::Value::from({literal:?}), {});",
-                    emit_boxed_value(plan, object.0),
-                    emit_boxed_value(plan, value.0)
-                )
+            if let Some(literal) = proven_strings.get(&key.0) {
+                let object_expr = emit_boxed_value(plan, object.0);
+                let value_expr = emit_boxed_value(plan, value.0);
+                if *strict {
+                    format!(
+                        "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), {value_expr});"
+                    )
+                } else {
+                    format!("{object_expr}.set_property({literal:?}, {value_expr});")
+                }
             } else if *strict {
                 format!(
                     "w3cos_core::intrinsics::set_property_strict(&{}, &{}, {});",
                     emit_boxed_value(plan, object.0),
                     emit_boxed_value(plan, key.0),
-                    emit_boxed_value(plan, value.0)
-                )
-            } else if let Some(literal) = proven_strings.get(&key.0) {
-                format!(
-                    "{}.set_property({literal:?}, {});",
-                    emit_boxed_value(plan, object.0),
                     emit_boxed_value(plan, value.0)
                 )
             } else {
@@ -4948,6 +6896,289 @@ fn main() {{
             );
         }
         assert!(!generated.contains("w3cos_vm"));
+    }
+
+    #[test]
+    fn lowers_numeric_for_loop_to_native_f64_loop() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function compute() {
+                    var n = 4;
+                    var a = 1.1;
+                    var b = 2.2;
+                    var s = 0;
+                    for (var i = 1; i <= n; i++) {
+                        a = a + b * 0.000001;
+                        b = b + a * 0.000001;
+                        s = s + (a - b);
+                    }
+                    return s;
+                }
+                compute;
+            "#,
+            "app:///numeric-loop.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("compute"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "compute_aot").unwrap();
+        assert!(
+            generated.contains("loop {"),
+            "simple numeric for-loop should be a native Rust loop: {generated}"
+        );
+        let hot = generated
+            .split_once("fn __w3cos_numeric_loop")
+            .and_then(|(_, rest)| {
+                rest.split_once("let (")
+                    .or_else(|| rest.split_once("let __w3cos_out"))
+                    .map(|(hot, _)| hot)
+            })
+            .unwrap_or("");
+        assert!(
+            hot.contains("as i32") && hot.contains("while __w3cos_i <= __w3cos_limit"),
+            "provable integer trip count should be an i32 counted loop: {hot}"
+        );
+        assert!(
+            !hot.contains("Value::Number"),
+            "the numeric loop must not box Value on the way out: {hot}"
+        );
+        assert!(
+            generated.contains("num_bindings"),
+            "loop-carried numbers should live in f64 bindings: {generated}"
+        );
+        assert!(
+            !generated.contains("cell.borrow()"),
+            "the numeric loop must not reload RefCell bindings: {generated}"
+        );
+        assert!(
+            generated.contains("let mut nb_") || generated.contains("let mut nr_"),
+            "the native loop should promote f64 slots to locals: {generated}"
+        );
+        assert!(
+            generated.contains(".mul_add(")
+                && generated.contains("is_x86_feature_detected!(\"fma\")")
+                && generated.contains(" * "),
+            "1e-6 recurrence uses fma only behind a scalar fallback: {hot}"
+        );
+    }
+
+    #[test]
+    fn native_dom_loop_with_binding_limit_is_guarded() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                var DOM_NODES = 1000;
+                function domOnce(document) {
+                    var root = document.createElement("div");
+                    var nodes = [];
+                    for (var i = 0; i < DOM_NODES; i++) {
+                        var el = document.createElement("div");
+                        el.id = "row-" + i;
+                        el.className = "row";
+                        el.textContent = "item " + i;
+                        root.appendChild(el);
+                        nodes.push(el);
+                    }
+                    return nodes;
+                }
+                domOnce;
+            "#,
+            "app:///dom-once.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("domOnce"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
+        assert!(
+            generated.contains("dom_build_guarded")
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("set_property_strict")
+                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;")
+                && generated.contains("dom_intern_prehashed("),
+            "strict create loop should fuse behind the stamp, use the static div id, and intern the class once: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the strict loop"
+        );
+    }
+
+    #[test]
+    fn native_dom_loop_keeps_observable_lookup() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function fill(document, root, nodes) {
+                    for (var i = 0; i < 4; i++) {
+                        var el = document.createElement("div");
+                        el.id = "row-" + i;
+                        el.className = "row";
+                        el.textContent = "item " + i;
+                        root.appendChild(el);
+                        nodes.push(el);
+                    }
+                    return nodes;
+                }
+                fill;
+            "#,
+            "app:///dom-loop.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("fill"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "fill_aot").unwrap();
+        assert!(
+            generated.contains("loop {"),
+            "element create loop should be native: {generated}"
+        );
+        assert!(
+            generated.contains("dom_shape_epoch") && generated.contains("dom_build_guarded"),
+            "the fused create must be behind a shape stamp: {generated}"
+        );
+        assert!(
+            generated.contains("is_undefined()"),
+            "a stale stamp must fall back to ordinary lookup: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"createElement\""),
+            "createElement must stay an ordinary method call on the fallback: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"appendChild\""),
+            "appendChild must stay an ordinary method call: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"push\""),
+            "push must stay an ordinary method call: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"id\""),
+            "id must stay an ordinary property write: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"className\""),
+            "className must stay an ordinary property write: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"textContent\""),
+            "textContent must stay an ordinary property write: {generated}"
+        );
+        assert!(
+            generated.contains("__w3cos_cb_"),
+            "binding cells should be loaded once per loop: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended")
+                && !generated.contains("dom_create_element")
+                && !generated.contains("dom_set_data")
+                && !generated.contains("dom_append_child")
+                && !generated.contains("dom_set_style"),
+            "observable DOM operations must not use unguarded intrinsics: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_fixed_block_loop_is_guarded() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                function fill(document, root) {
+                    for (var i = 0; i < 4000; i++) {
+                        var el = document.createElement("div");
+                        el.textContent = "m " + (i % 50);
+                        el.style.height = "18px";
+                        root.appendChild(el);
+                    }
+                    return root;
+                }
+                fill;
+            "#,
+            "app:///memory-block.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("fill"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "memory_block_aot").unwrap();
+        assert!(
+            generated.contains("dom_build_block_guarded")
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;"),
+            "fixed block loop should fuse behind the stamp: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"createElement\"")
+                && generated.contains("set_property_strict(")
+                && generated.contains("\"textContent\"")
+                && generated.contains("\"height\"")
+                && generated.contains(".call_method(\"appendChild\""),
+            "ordinary lookup stays on the fallback: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the block loop: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_fixed_block_module_loop_is_guarded() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                function fill(document, root) {
+                    for (var i = 0; i < 4000; i++) {
+                        var el = document.createElement("div");
+                        el.textContent = "m " + (i % 50);
+                        el.style.height = "18px";
+                        root.appendChild(el);
+                    }
+                    return root;
+                }
+            "#,
+            "app:///memory-block.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("fill"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "memory_block_module_aot")
+                .unwrap();
+        assert!(
+            generated.contains("dom_build_block_guarded")
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("let __w3cos_tag_atom: u32 = 4_u32;"),
+            "module block loop should fuse behind the stamp: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"createElement\"")
+                && generated.contains("set_property_strict(")
+                && generated.contains("\"textContent\"")
+                && generated.contains("\"height\"")
+                && generated.contains(".call_method(\"appendChild\""),
+            "ordinary lookup stays on the module fallback: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the module block loop: {generated}"
+        );
     }
 
     #[test]

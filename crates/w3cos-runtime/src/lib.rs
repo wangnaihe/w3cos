@@ -29,6 +29,7 @@ pub mod credentials_web;
 pub mod css_rules_web;
 pub mod css_typed_om_web;
 pub mod custom_elements_web;
+mod definite_layout;
 pub mod device_access_web;
 #[cfg(feature = "devtools")]
 pub mod devtools;
@@ -65,7 +66,7 @@ pub mod geometry_web;
 pub mod gpu_filter;
 #[cfg(any(target_env = "ohos", feature = "ohos-check"))]
 pub mod harmony;
-#[cfg(feature = "skia")]
+#[cfg(any(feature = "skia", feature = "cpu-render"))]
 pub mod headless;
 pub mod highlight_web;
 pub mod history;
@@ -86,6 +87,7 @@ mod ios_input;
     not(target_env = "ohos")
 ))]
 pub mod ipc;
+pub mod incremental_layout;
 pub mod jsdom;
 pub mod launch_handler_web;
 pub mod layout;

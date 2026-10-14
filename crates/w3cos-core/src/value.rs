@@ -133,6 +133,9 @@ impl Immediate {
     const TAG_OBJ: u64 = 6;
     const TAG_ARR: u64 = 7;
     const TAG_FN: u64 = 8;
+    /// DOM node id. Not a page-arena handle: the epoch slot stores the
+    /// realm generation so a reset cannot alias a recycled `NodeId`.
+    const TAG_DOM: u64 = 9;
     const TAG_MASK: u64 = 0xF;
     const HANDLE_SHIFT: u64 = 4;
     /// Bits 36..50 of a tagged handle word: page-arena epoch (15 bits).
@@ -322,6 +325,36 @@ impl Immediate {
             None
         }
     }
+
+    /// Pack a DOM node id. `generation` is masked to 15 bits, matching the
+    /// epoch field. Callers pass the bridge realm generation.
+    #[inline]
+    pub fn from_dom_node(node: u32, generation: u32) -> Self {
+        let epoch = (generation as u64) & Self::EPOCH_MASK;
+        Self(
+            Self::QNAN
+                | Self::TAG_DOM
+                | ((node as u64) << Self::HANDLE_SHIFT)
+                | (epoch << Self::EPOCH_SHIFT),
+        )
+    }
+
+    #[inline]
+    pub const fn is_dom_node(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_DOM
+    }
+
+    /// `(node id, masked generation)`.
+    #[inline]
+    pub fn dom_node_parts(self) -> Option<(u32, u32)> {
+        if self.is_dom_node() {
+            let node = (self.0 >> Self::HANDLE_SHIFT) as u32;
+            let epoch = ((self.0 >> Self::EPOCH_SHIFT) & Self::EPOCH_MASK) as u32;
+            Some((node, epoch))
+        } else {
+            None
+        }
+    }
 }
 
 impl PartialEq for Immediate {
@@ -402,13 +435,50 @@ impl Value {
     }
 
     /// Page-arena object handle or host `Rc` object.
+    ///
+    /// A DOM node immediate materializes its host wrapper here. Hot paths
+    /// that only need the node id use [`Self::live_dom_node`] instead.
     #[inline]
     pub fn as_object(&self) -> Option<JsObjectRef> {
+        if let Some(node) = self.live_dom_node() {
+            return crate::intrinsics::materialize_dom(node)
+                .and_then(|value| value.object_ref_raw());
+        }
+        self.object_ref_raw()
+    }
+
+    /// Host-object address or interned handle, without cloning an `Rc`.
+    #[inline]
+    pub fn object_identity_bits(&self) -> Option<u64> {
+        match self {
+            Value::Object(object) => Some(Rc::as_ptr(object) as u64),
+            Value::Imm(imm) => imm.object_handle().map(|handle| (handle as u64) | (1 << 63)),
+            _ => None,
+        }
+    }
+
+    /// Object storage that does not materialize a DOM immediate.
+    #[inline]
+    pub fn object_ref_raw(&self) -> Option<JsObjectRef> {
         match self {
             Value::Imm(imm) => imm.object_handle().and_then(crate::page_arena::get_object),
             Value::Object(object) => Some(JsObjectRef::from_host(Rc::clone(object))),
             _ => None,
         }
+    }
+
+    /// Live DOM node id packed in this immediate, when the realm generation matches.
+    #[inline]
+    pub fn live_dom_node(&self) -> Option<u32> {
+        let (node, generation) = self.as_immediate()?.dom_node_parts()?;
+        let current = crate::intrinsics::dom_generation()? & 0x7FFF;
+        (generation == current).then_some(node)
+    }
+
+    /// DOM node that has not yet been given a host wrapper.
+    #[inline]
+    pub fn dom_node(node: u32, generation: u32) -> Self {
+        Value::Imm(Immediate::from_dom_node(node, generation))
     }
 
     /// Packed page-arena object handle, when this value is not a host `Rc`.
@@ -531,6 +601,15 @@ impl ArrayStorage {
     pub(crate) fn push(&mut self, value: Value) {
         self.values.push(value);
         self.refresh_heap_accounting();
+    }
+
+    /// Grow once toward `min_capacity` instead of doubling through every
+    /// power of two. Create loops push thousands of handles.
+    pub(crate) fn push_reserved(&mut self, value: Value, min_capacity: usize) {
+        if self.values.len() >= 16 && self.values.capacity() < min_capacity {
+            self.values.reserve(min_capacity - self.values.capacity());
+        }
+        self.push(value);
     }
 
     pub(crate) fn pop(&mut self) -> Option<Value> {
@@ -1013,6 +1092,15 @@ impl Value {
                 .and_then(crate::page_arena::get_function)
                 .map(ValueUnpack::Function)
                 .unwrap_or(ValueUnpack::Undefined),
+            Value::Imm(imm) if imm.is_dom_node() => {
+                if let Some(value) = self
+                    .live_dom_node()
+                    .and_then(crate::intrinsics::materialize_dom)
+                {
+                    return value.unpack();
+                }
+                ValueUnpack::Undefined
+            }
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
             Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(JsArrayRef::from_host(Rc::clone(a))),
@@ -1142,6 +1230,9 @@ impl Iterator for ValueIterator {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        if let Some(same) = crate::intrinsics::dom_nodes_equal(self, other) {
+            return same;
+        }
         if let (Some(left), Some(right)) = (self.as_js_string(), other.as_js_string()) {
             return left == right;
         }
@@ -1501,6 +1592,25 @@ impl fmt::Debug for FunctionData {
 
 // ── Type coercion ──────────────────────────────────────────────────────
 
+fn dom_shape_method_key(key: &str) -> bool {
+    matches!(
+        key,
+        "appendChild"
+            | "insertBefore"
+            | "removeChild"
+            | "replaceChild"
+            | "createElement"
+            | "createElementNS"
+            | "createTextNode"
+            | "push"
+            | "__proto__"
+    )
+}
+
+fn dom_shape_data_key(key: &str) -> bool {
+    matches!(key, "id" | "className" | "textContent")
+}
+
 impl Value {
     /// Stable identity hash with ECMAScript `Object.is` semantics.
     ///
@@ -1508,6 +1618,14 @@ impl Value {
     /// This is suitable for framework hook dependency comparison.
     pub fn identity_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
+        if let Some(id) = crate::intrinsics::dom_node_id(self) {
+            9_u8.hash(&mut hasher);
+            id.hash(&mut hasher);
+            if let Some(generation) = crate::intrinsics::dom_generation() {
+                generation.hash(&mut hasher);
+            }
+            return hasher.finish();
+        }
         if let Some(value) = crate::bigint::get(self) {
             8_u8.hash(&mut hasher);
             value.to_string().hash(&mut hasher);
@@ -1535,14 +1653,23 @@ impl Value {
             ValueUnpack::Array(value) => {
                 5_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
+                if let Some(generation) = crate::intrinsics::dom_generation() {
+                    generation.hash(&mut hasher);
+                }
             }
             ValueUnpack::Object(value) => {
                 6_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
+                if let Some(generation) = crate::intrinsics::dom_generation() {
+                    generation.hash(&mut hasher);
+                }
             }
             ValueUnpack::Function(value) => {
                 7_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
+                if let Some(generation) = crate::intrinsics::dom_generation() {
+                    generation.hash(&mut hasher);
+                }
             }
         }
         hasher.finish()
@@ -1550,6 +1677,9 @@ impl Value {
 
     /// ECMAScript `typeof` operator.
     pub fn type_of(&self) -> &'static str {
+        if self.live_dom_node().is_some() {
+            return "object";
+        }
         if crate::bigint::get(self).is_some() {
             return "bigint";
         }
@@ -1568,6 +1698,9 @@ impl Value {
 
     /// ECMAScript `ToBoolean`.
     pub fn to_bool(&self) -> bool {
+        if self.live_dom_node().is_some() {
+            return true;
+        }
         if let Some(zero) = crate::bigint::is_zero(self) {
             return !zero;
         }
@@ -1582,6 +1715,9 @@ impl Value {
 
     /// ECMAScript `ToNumber`.
     pub fn to_number(&self) -> f64 {
+        if self.live_dom_node().is_some() {
+            return f64::NAN;
+        }
         if let Some(value) = crate::bigint::get(self) {
             return value.to_string().parse().unwrap_or_else(|_| {
                 if value.sign() == num_bigint::Sign::Minus {
@@ -1609,6 +1745,9 @@ impl Value {
 
     /// ECMAScript `ToString`.
     pub fn to_js_string(&self) -> String {
+        if self.live_dom_node().is_some() {
+            return "[object Object]".into();
+        }
         if let Some(value) = crate::bigint::get(self) {
             return value.to_string();
         }
@@ -1693,7 +1832,8 @@ impl Value {
         matches!(self, Value::Imm(imm) if imm.is_bool())
     }
     pub fn is_object(&self) -> bool {
-        self.as_object().is_some() && crate::bigint::get(self).is_none()
+        (self.live_dom_node().is_some() || self.object_ref_raw().is_some())
+            && crate::bigint::get(self).is_none()
     }
     pub fn is_array(&self) -> bool {
         self.as_array().is_some()
@@ -1702,9 +1842,12 @@ impl Value {
         self.as_function().is_some()
     }
     pub fn is_callable(&self) -> bool {
+        if self.live_dom_node().is_some() {
+            return false;
+        }
         self.as_function().is_some()
             || self
-                .as_object()
+                .object_ref_raw()
                 .is_some_and(|object| object.borrow().call_slot().is_some())
     }
 
@@ -1750,8 +1893,39 @@ impl Value {
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(node) = self.live_dom_node() {
+            if let Some(value) = crate::intrinsics::dom_get(node, key) {
+                return value;
+            }
+        }
         if let Some(o) = self.as_object() {
-            let value = o.borrow().get(key, self).clone();
+            // A get trap is user code and may mutate or redefine the receiver.
+            // Preserve the existing target snapshot but release the RefCell
+            // before invoking the trap. Its result (including undefined) is
+            // authoritative; a Proxy must not run an additional target getter.
+            let proxy_get = {
+                let object = o.borrow();
+                object.proxy_handler.as_ref().and_then(|handler| {
+                    handler.get.as_ref().map(|trap| {
+                        (
+                            Rc::clone(trap),
+                            handler.live_target,
+                            if handler.live_target {
+                                Value::Undefined
+                            } else {
+                                object.target_value()
+                            },
+                        )
+                    })
+                })
+            };
+            if let Some((trap, live, target)) = proxy_get {
+                if live {
+                    return trap(self, key, self);
+                }
+                return trap(&target, key, self);
+            }
+            let value = o.borrow().get_direct(key);
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
@@ -1848,6 +2022,17 @@ impl Value {
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
     pub fn try_set_property(&self, key: &str, value: Value) -> bool {
+        if dom_shape_method_key(key) {
+            crate::intrinsics::bump_dom_shape();
+        }
+        if let Some(node) = self.live_dom_node()
+            && crate::intrinsics::dom_set(node, key, value.clone())
+        {
+            return true;
+        }
+        if dom_shape_data_key(key) {
+            crate::intrinsics::bump_dom_shape();
+        }
         if let Some(o) = self.as_object() {
             let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
             let canonical_index = key
@@ -1863,10 +2048,21 @@ impl Value {
             }
             let has_own = o.borrow().properties.contains_key(key);
             if !has_own {
-                let setter = o
-                    .borrow()
-                    .get(&format!("__w3cos_setter_{key}"), self)
-                    .clone();
+                let setter_key = format!("__w3cos_setter_{key}");
+                let setter = {
+                    let object = o.borrow();
+                    if object
+                        .proxy_handler
+                        .as_ref()
+                        .is_some_and(|handler| handler.live_target)
+                    {
+                        // The setter slot is an own data property. Reading it
+                        // through the trap would clone the target and re-enter.
+                        object.get_direct(&setter_key)
+                    } else {
+                        object.get(&setter_key, self)
+                    }
+                };
                 if !setter.is_undefined() {
                     setter.call(self.clone(), vec![value]);
                     return true;
@@ -1874,17 +2070,28 @@ impl Value {
             }
             let proxy_set = {
                 let object = o.borrow();
-                object
-                    .proxy_handler
-                    .as_ref()
-                    .and_then(|handler| handler.set.as_ref())
-                    .map(|trap| (Rc::clone(trap), object.target_value()))
+                object.proxy_handler.as_ref().and_then(|handler| {
+                    handler.set.as_ref().map(|trap| {
+                        (
+                            Rc::clone(trap),
+                            handler.live_target,
+                            if handler.live_target {
+                                Value::Undefined
+                            } else {
+                                object.target_value()
+                            },
+                        )
+                    })
+                })
             };
-            if let Some((trap, target)) = proxy_set {
+            if let Some((trap, live, target)) = proxy_set {
                 // A Proxy trap is user code and can re-enter the receiver. Do
                 // not retain the RefCell borrow while it runs: DOM setters, in
                 // particular, may synchronously dispatch events or refresh a
                 // stylesheet and read another property from the same element.
+                if live {
+                    return trap(self, key, value, self);
+                }
                 return trap(&target, key, value, self);
             }
             o.borrow_mut().set_direct(key, value);
@@ -1966,6 +2173,36 @@ impl Value {
     pub fn object(props: HashMap<String, Value>) -> Self {
         let handle = crate::page_arena::alloc_object(crate::JsObject::from_map(props));
         Value::Imm(Immediate::from_object_handle(handle))
+    }
+
+    /// Arena object with a shared proxy. Own properties are written directly
+    /// so the trap can read them without re-entering.
+    pub fn proxied_object(
+        entries: &[(&str, Value)],
+        handler: crate::proxy::ProxyHandler,
+    ) -> Self {
+        let mut object = crate::JsObject::new();
+        object.proxy_handler = Some(handler);
+        for (key, value) in entries {
+            object.set_direct(key, value.clone());
+        }
+        let handle = crate::page_arena::alloc_object(object);
+        Value::Imm(Immediate::from_object_handle(handle))
+    }
+
+    /// Host `Rc` object with a shared proxy. Unlike [`Self::proxied_object`],
+    /// dropping the last handle collects the wrapper. DOM nodes that are not
+    /// pinned by a live tree use this so a weak cache can observe the drop.
+    pub fn proxied_host_object(
+        entries: &[(&str, Value)],
+        handler: crate::proxy::ProxyHandler,
+    ) -> Self {
+        let mut object = crate::JsObject::new();
+        object.proxy_handler = Some(handler);
+        for (key, value) in entries {
+            object.set_direct(key, value.clone());
+        }
+        Value::Object(Rc::new(RefCell::new(object)))
     }
 
     pub(crate) fn collectable_object(props: HashMap<String, Value>) -> Self {
@@ -3220,11 +3457,130 @@ macro_rules! js_object {
 
 // ── Arithmetic / comparison operators ──────────────────────────────────
 
+enum JsPiece {
+    Stack([u8; 48], usize),
+    Heap(String),
+}
+
+impl JsPiece {
+    fn as_str(&self) -> &str {
+        match self {
+            JsPiece::Stack(bytes, len) => std::str::from_utf8(&bytes[..*len]).unwrap_or(""),
+            JsPiece::Heap(text) => text.as_str(),
+        }
+    }
+}
+
+pub(crate) fn write_i64(value: i64, buf: &mut [u8]) -> usize {
+    if value == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let negative = value < 0;
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    while magnitude > 0 {
+        digits[count] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        count += 1;
+    }
+    let mut out = 0;
+    if negative {
+        buf[out] = b'-';
+        out += 1;
+    }
+    while count > 0 {
+        count -= 1;
+        buf[out] = digits[count];
+        out += 1;
+    }
+    out
+}
+
+fn js_primitive_text(value: &Value) -> JsPiece {
+    if value.is_null() {
+        let mut bytes = [0u8; 48];
+        bytes[..4].copy_from_slice(b"null");
+        return JsPiece::Stack(bytes, 4);
+    }
+    if value.is_undefined() {
+        let mut bytes = [0u8; 48];
+        bytes[..9].copy_from_slice(b"undefined");
+        return JsPiece::Stack(bytes, 9);
+    }
+    if let Some(flag) = value.as_bool() {
+        let mut bytes = [0u8; 48];
+        if flag {
+            bytes[..4].copy_from_slice(b"true");
+            return JsPiece::Stack(bytes, 4);
+        }
+        bytes[..5].copy_from_slice(b"false");
+        return JsPiece::Stack(bytes, 5);
+    }
+    if let Some(number) = value.as_number() {
+        if number.is_nan() {
+            let mut bytes = [0u8; 48];
+            bytes[..3].copy_from_slice(b"NaN");
+            return JsPiece::Stack(bytes, 3);
+        }
+        if number.is_infinite() {
+            let mut bytes = [0u8; 48];
+            if number > 0.0 {
+                bytes[..8].copy_from_slice(b"Infinity");
+                return JsPiece::Stack(bytes, 8);
+            }
+            bytes[..9].copy_from_slice(b"-Infinity");
+            return JsPiece::Stack(bytes, 9);
+        }
+        if number == 0.0 {
+            let mut bytes = [0u8; 48];
+            bytes[0] = b'0';
+            return JsPiece::Stack(bytes, 1);
+        }
+        if number.fract() == 0.0 && number.abs() < i64::MAX as f64 {
+            let mut bytes = [0u8; 48];
+            let len = write_i64(number as i64, &mut bytes);
+            return JsPiece::Stack(bytes, len);
+        }
+        return JsPiece::Heap(format!("{number}"));
+    }
+    JsPiece::Heap(value.to_js_string())
+}
+
+fn concat_js_values(left: &Value, right: &Value) -> Value {
+    let left_owned = left.as_js_string();
+    let right_owned = right.as_js_string();
+    let left_fallback = left_owned.is_none().then(|| js_primitive_text(left));
+    let right_fallback = right_owned.is_none().then(|| js_primitive_text(right));
+    let left_text = left_owned
+        .as_ref()
+        .map(|text| text.as_str())
+        .unwrap_or_else(|| left_fallback.as_ref().unwrap().as_str());
+    let right_text = right_owned
+        .as_ref()
+        .map(|text| text.as_str())
+        .unwrap_or_else(|| right_fallback.as_ref().unwrap().as_str());
+    let total = left_text.len().saturating_add(right_text.len());
+    if total <= 128 {
+        let mut bytes = [0u8; 128];
+        bytes[..left_text.len()].copy_from_slice(left_text.as_bytes());
+        bytes[left_text.len()..total].copy_from_slice(right_text.as_bytes());
+        let joined = std::str::from_utf8(&bytes[..total]).unwrap_or("");
+        return Value::from_js_string(JsString::intern(joined));
+    }
+    let mut owned = String::with_capacity(total);
+    owned.push_str(left_text);
+    owned.push_str(right_text);
+    Value::from_js_string(JsString::intern(&owned))
+}
+
+
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
     pub fn js_add(&self, other: &Value) -> Value {
         if self.is_string() || other.is_string() {
-            Value::from(format!("{}{}", self.to_js_string(), other.to_js_string()))
+            concat_js_values(self, other)
         } else if let Some(value) = crate::bigint::add(self, other) {
             value
         } else {
@@ -3336,6 +3692,9 @@ impl Value {
 
     /// ECMAScript `===` (strict equality).
     pub fn strict_eq(&self, other: &Value) -> bool {
+        if let Some(equal) = crate::intrinsics::dom_nodes_equal(self, other) {
+            return equal;
+        }
         if let Some(equal) = crate::bigint::equals(self, other) {
             return equal;
         }
@@ -3362,6 +3721,9 @@ impl Value {
     /// compare by reference identity (`Rc` pointer), Function keys by shared
     /// closure identity (clones of one function value are the same key).
     pub fn same_value_zero(&self, other: &Value) -> bool {
+        if let Some(equal) = crate::intrinsics::dom_nodes_equal(self, other) {
+            return equal;
+        }
         if let Some(equal) = crate::bigint::equals(self, other) {
             return equal;
         }
@@ -3383,6 +3745,9 @@ impl Value {
 
     /// ECMAScript `==` (abstract equality — simplified).
     pub fn abstract_eq(&self, other: &Value) -> bool {
+        if self.live_dom_node().is_some() || other.live_dom_node().is_some() {
+            return self.strict_eq(other);
+        }
         match (self.unpack(), other.unpack()) {
             (ValueUnpack::Undefined, ValueUnpack::Undefined)
             | (ValueUnpack::Null, ValueUnpack::Null)
@@ -3469,6 +3834,9 @@ impl fmt::Display for Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(id) = self.live_dom_node() {
+            return write!(f, "Dom({id})");
+        }
         match self.unpack() {
             ValueUnpack::Undefined => write!(f, "undefined"),
             ValueUnpack::Null => write!(f, "null"),
@@ -3856,6 +4224,68 @@ mod tests {
         ))));
 
         assert!(proxy.try_set_property("textContent", Value::string("updated")));
+    }
+
+    #[test]
+    fn proxy_get_can_redefine_the_receiver_without_a_borrow() {
+        let handler = crate::ProxyBuilder::new()
+            .get(|target, key, receiver| {
+                if key == "probe" {
+                    crate::class::define_property(
+                        receiver,
+                        "side",
+                        &crate::js_object! { "value" => Value::Number(7.0) },
+                    );
+                    return Value::Number(3.0);
+                }
+                target.get_property(key)
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        assert_eq!(proxy.get_property("probe"), Value::Number(3.0));
+        assert_eq!(proxy.get_property("side"), Value::Number(7.0));
+    }
+
+    #[test]
+    fn proxy_get_undefined_does_not_fall_through_to_target_getter() {
+        let called = Rc::new(std::cell::Cell::new(0));
+        let getter_called = Rc::clone(&called);
+        let getter = Value::function(move |_, _| {
+            getter_called.set(getter_called.get() + 1);
+            Value::Number(9.0)
+        });
+        let handler = crate::ProxyBuilder::new()
+            .get(|_, _, _| Value::Undefined)
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::from([("__w3cos_getter_probe".into(), getter)]),
+            handler,
+        ))));
+        assert!(proxy.get_property("probe").is_undefined());
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn own_accessor_shadows_an_inherited_callable() {
+        let object = Value::object(HashMap::new());
+        let prototype = crate::js_object! {
+            "probe" => Value::function(|_, _| Value::string("inherited")),
+        };
+        crate::class::set_prototype_of(&object, &prototype);
+        crate::class::define_property(
+            &object,
+            "probe",
+            &crate::js_object! {
+                "get" => Value::function(|receiver, _| {
+                    receiver.set_property("side", Value::Bool(true));
+                    Value::function(|this, _| this.get_property("side"))
+                }),
+            },
+        );
+        assert_eq!(object.call_method("probe", vec![]), Value::Bool(true));
     }
 
     #[test]

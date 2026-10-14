@@ -76,7 +76,7 @@ impl SerializedDocument {
             id: id.as_u32(),
             node_type,
             tag: node.tag.as_str(),
-            text_content: node.text_content.clone(),
+            text_content: node.text_content.as_ref().map(|text| text.to_string()),
             parent: node.parent.map(|p| p.as_u32()),
             children: children_ids.iter().map(|c| c.as_u32()).collect(),
             attributes: attrs,

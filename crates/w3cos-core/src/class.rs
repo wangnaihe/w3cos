@@ -476,8 +476,12 @@ pub fn define_field(this: &Value, key: &str, value: Value) {
 
 /// Set `obj`'s prototype link from generated code (`obj` must be an object).
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
+    crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
+        if let Some(node) = obj.live_dom_node() {
+            crate::intrinsics::pin_dom(node);
+        }
     }
 }
 
@@ -500,8 +504,30 @@ pub fn get_own_property_descriptor(obj: &Value, key: &str) -> Value {
 /// `Object.defineProperty(obj, key, descriptor)`: define `key` from a
 /// `{value}`/`{get}`/`{set}` descriptor (best-effort), returning `obj`.
 pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
+    crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
-        object.borrow_mut().define_property(key, descriptor);
+        let proxy_define = {
+            let object = object.borrow();
+            object.proxy_handler.as_ref().and_then(|handler| {
+                handler
+                    .define_property
+                    .as_ref()
+                    .map(|trap| (std::rc::Rc::clone(trap), object.target_value()))
+            })
+        };
+        if let Some((trap, target)) = proxy_define {
+            // A descriptor trap can read or redefine the proxy again.
+            if !trap(&target, key, descriptor) {
+                crate::throw_value(crate::value::type_error(
+                    "Proxy defineProperty trap rejected the definition",
+                ));
+            }
+        } else {
+            object.borrow_mut().define_property(key, descriptor);
+        }
+        if let Some(node) = obj.live_dom_node() {
+            crate::intrinsics::pin_dom(node);
+        }
     }
     obj.clone()
 }

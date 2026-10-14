@@ -547,7 +547,11 @@ impl CdpHandler {
         let tag = &node.tag;
 
         if node.node_type == 3 {
-            return node.text_content.clone().unwrap_or_default();
+            return node
+                .text_content
+                .as_ref()
+                .map(|text| text.to_string())
+                .unwrap_or_default();
         }
 
         let mut html = format!("<{tag}");

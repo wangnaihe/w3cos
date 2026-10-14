@@ -13,6 +13,7 @@ pub(super) struct RuleSet {
     universal_rules: Vec<usize>,
     has_sibling_dependencies: bool,
     has_relational_dependencies: bool,
+    has_structural_dependencies: bool,
 }
 
 enum RuleBucket<'a> {
@@ -70,6 +71,7 @@ impl RuleSet {
         self.universal_rules.clear();
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
+        self.has_structural_dependencies = false;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -91,6 +93,11 @@ impl RuleSet {
             .iter()
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_relational_dependency);
+        self.has_structural_dependencies |= self.rules[index]
+            .chain
+            .iter()
+            .flat_map(|compound| &compound.pseudo_classes)
+            .any(pseudo_has_structural_dependency);
 
         // A rule lives in one best subject bucket. Matching gathers the
         // element's buckets plus universal rules, so no per-node RuleSet scan
@@ -185,12 +192,51 @@ impl RuleSet {
     pub(super) fn has_relational_dependencies(&self) -> bool {
         self.has_relational_dependencies
     }
+
+    pub(super) fn has_structural_dependencies(&self) -> bool {
+        self.has_structural_dependencies
+    }
 }
 
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
     match pseudo {
         super::PseudoClass::Has(_) => true,
         super::PseudoClass::Not(selector) => selector.contains('+') || selector.contains('~'),
+        _ => false,
+    }
+}
+
+fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::FirstChild
+        | super::PseudoClass::LastChild
+        | super::PseudoClass::FirstOfType
+        | super::PseudoClass::LastOfType
+        | super::PseudoClass::OnlyChild
+        | super::PseudoClass::OnlyOfType
+        | super::PseudoClass::Empty
+        | super::PseudoClass::NthChild(_)
+        | super::PseudoClass::NthLastChild(_)
+        | super::PseudoClass::NthOfType(_)
+        | super::PseudoClass::NthLastOfType(_) => true,
+        super::PseudoClass::Not(selector) | super::PseudoClass::Has(selector) => {
+            let selector = selector.to_ascii_lowercase();
+            [
+                ":empty",
+                ":first-child",
+                ":last-child",
+                ":first-of-type",
+                ":last-of-type",
+                ":only-child",
+                ":only-of-type",
+                ":nth-child",
+                ":nth-last-child",
+                ":nth-of-type",
+                ":nth-last-of-type",
+            ]
+            .iter()
+            .any(|needle| selector.contains(needle))
+        }
         _ => false,
     }
 }

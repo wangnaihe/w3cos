@@ -74,7 +74,7 @@ pub fn query(doc: &Document, selector: &str) -> DomResult {
             let info = serde_json::json!({
                 "id": el.id.as_u32(),
                 "tag": node.tag,
-                "text": node.text_content,
+                "text": node.text_content.as_deref(),
                 "classes": node.class_list,
                 "attributes": node.attributes.iter()
                     .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
@@ -99,7 +99,7 @@ pub fn query_all(doc: &Document, selector: &str) -> DomResult {
             serde_json::json!({
                 "id": el.id.as_u32(),
                 "tag": node.tag,
-                "text": node.text_content,
+                "text": node.text_content.as_deref(),
                 "classes": node.class_list,
             })
         })

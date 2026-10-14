@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::layout::{self, LayoutRect};
 use crate::paint_artifact::{PaintArtifact, PaintNode};
+#[cfg(feature = "skia")]
 use crate::render_skia::SkiaRasterizer;
 
 /// One fully rasterized document frame in premultiplied RGBA byte order.
@@ -132,8 +133,6 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
                         owner.style.font_family.as_deref(), owner.baseline_shift)).collect::<Vec<_>>());
         }
     }
-    let mut rasterizer = SkiaRasterizer::new_host()
-        .ok_or_else(|| anyhow::anyhow!("host W3COS font is unavailable to Skia"))?;
     let scroll_offsets = layout_results
         .scrollable_nodes
         .iter()
@@ -156,22 +155,7 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         width as f32,
         height as f32,
     );
-    let rgba = rasterizer
-        .render_frame(
-            width,
-            height,
-            &nodes,
-            layout::layout_font(),
-            &scroll_info,
-            &HashMap::new(),
-            None,
-            artifact.canvas_background,
-            Some(&artifact),
-            None,
-            1.0,
-        )
-        .ok_or_else(|| anyhow::anyhow!("Skia failed to rasterize the headless document"))?
-        .to_vec();
+    let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact)?;
 
     Ok(HeadlessFrame {
         width,
@@ -180,7 +164,66 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
     })
 }
 
-#[cfg(test)]
+fn rasterize_prepared_frame(
+    width: u32,
+    height: u32,
+    nodes: &[(usize, LayoutRect, &w3cos_std::component::ComponentKind, &w3cos_std::style::Style)],
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    artifact: &PaintArtifact,
+) -> Result<Vec<u8>> {
+    // Skia software raster is the conformance path. Headless machines without
+    // that feature use the tiny-skia CPU renderer instead of opening a GPU
+    // window. Prefer Skia when both renderers are compiled in so existing
+    // pixel tests keep a single backend.
+    #[cfg(feature = "skia")]
+    {
+        let mut rasterizer = SkiaRasterizer::new_host()
+            .ok_or_else(|| anyhow::anyhow!("host W3COS font is unavailable to Skia"))?;
+        return rasterizer
+            .render_frame(
+                width,
+                height,
+                nodes,
+                layout::layout_font(),
+                scroll_info,
+                &HashMap::new(),
+                None,
+                artifact.canvas_background,
+                Some(artifact),
+                None,
+                1.0,
+            )
+            .map(|rgba| rgba.to_vec())
+            .ok_or_else(|| anyhow::anyhow!("Skia failed to rasterize the headless document"));
+    }
+    #[cfg(all(feature = "cpu-render", not(feature = "skia")))]
+    {
+        let _ = artifact;
+        let mut pixmap = tiny_skia::Pixmap::new(width, height)
+            .ok_or_else(|| anyhow::anyhow!("viewport is too large to rasterize on the CPU"))?;
+        let mut clips = crate::render_cpu::ClipMaskCache::default();
+        crate::render_cpu::render_frame(
+            &mut pixmap,
+            nodes,
+            layout::layout_font(),
+            scroll_info,
+            &HashMap::new(),
+            None,
+            &mut clips,
+        );
+        return Ok(pixmap.take());
+    }
+    #[cfg(not(any(
+        feature = "skia",
+        all(feature = "cpu-render", not(feature = "skia"))
+    )))]
+    {
+        let _ = (width, height, nodes, scroll_info, artifact);
+        bail!("headless rasterizer is not compiled in");
+    }
+}
+
+#[cfg(all(test, feature = "skia"))]
 mod tests {
     use super::*;
 

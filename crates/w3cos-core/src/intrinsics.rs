@@ -499,6 +499,335 @@ pub fn promise_race(arguments: Vec<Value>) -> Value {
     crate::promise::race(arguments)
 }
 
+/// Property access for a DOM node that is still a tagged immediate.
+pub struct DomImmOps {
+    pub generation: fn() -> u32,
+    pub get: fn(u32, &str) -> Value,
+    pub set: fn(u32, &str, Value) -> bool,
+    pub materialize: fn(u32) -> Value,
+    /// Keep a materialized wrapper alive after the caller drops its temporary
+    /// object borrow. Used when authored state was stored on a tagged node.
+    pub pin: fn(u32),
+    pub node_of: fn(&Value) -> Option<u32>,
+}
+
+static DOM_IMM: std::sync::OnceLock<DomImmOps> = std::sync::OnceLock::new();
+
+pub fn install_dom_imm(ops: DomImmOps) {
+    let _ = DOM_IMM.set(ops);
+}
+
+pub fn dom_generation() -> Option<u32> {
+    DOM_IMM.get().map(|ops| (ops.generation)())
+}
+
+pub fn dom_get(node: u32, key: &str) -> Option<Value> {
+    DOM_IMM.get().map(|ops| (ops.get)(node, key))
+}
+
+pub fn dom_set(node: u32, key: &str, value: Value) -> bool {
+    DOM_IMM.get().is_some_and(|ops| (ops.set)(node, key, value))
+}
+
+pub fn materialize_dom(node: u32) -> Option<Value> {
+    DOM_IMM.get().map(|ops| (ops.materialize)(node))
+}
+
+pub fn pin_dom(node: u32) {
+    if let Some(ops) = DOM_IMM.get() {
+        (ops.pin)(node);
+    }
+}
+
+pub fn dom_node_id(value: &Value) -> Option<u32> {
+    if !might_be_dom(value) {
+        return None;
+    }
+    DOM_IMM.get().and_then(|ops| (ops.node_of)(value))
+}
+
+pub fn dom_nodes_equal(left: &Value, right: &Value) -> Option<bool> {
+    if !might_be_dom(left) || !might_be_dom(right) {
+        return None;
+    }
+    let ops = DOM_IMM.get()?;
+    match ((ops.node_of)(left), (ops.node_of)(right)) {
+        (Some(a), Some(b)) => Some(a == b),
+        _ => None,
+    }
+}
+
+fn might_be_dom(value: &Value) -> bool {
+    match value {
+        Value::Object(_) => true,
+        Value::Imm(imm) => imm.is_dom_node() || imm.is_object_handle(),
+        _ => false,
+    }
+}
+
+/// Direct DOM operations installed by the native runtime. AOT emits these
+/// instead of a `call_method` / proxy round trip for the hot element path.
+pub struct DomFast {
+    pub create_element: fn(&Value, &str) -> Value,
+    pub create_text: fn(&Value, &str) -> Value,
+    pub append_child: fn(&Value, &Value) -> Value,
+    pub set_data: fn(&Value, &str, &Value) -> bool,
+    /// `name` + raw text. The bytes are not a `Value`, so a `"prefix" + i`
+    /// store can format into a stack buffer and skip the page-string intern.
+    pub set_data_str: fn(&Value, &str, &str) -> bool,
+    /// One create + id + class + text + append. The create loop uses this
+    /// instead of five document borrows and three string interns.
+    pub build_appended: fn(&Value, &Value, &str, &str, f64, &str, &str, f64) -> Value,
+    /// Fused create used only when `epoch` still matches [`dom_shape_epoch`].
+    /// Returns [`Value::Undefined`] when the stamp is stale or the fast path
+    /// refuses, so the caller runs the ordinary lookup.
+    /// `tag_atom` / `class_atom` are static or prologue-interned ids.
+    /// `u32::MAX` means the runtime resolves the name.
+    pub build_guarded: fn(&Value, &Value, &str, u32, &str, f64, &str, u32, &str, f64, u64) -> Value,
+    /// Fused create + text + one inline style + append. `Value::Undefined`
+    /// when `epoch` is stale or the runtime refuses, so the caller runs the
+    /// ordinary lookup. `tag_atom == u32::MAX` resolves the name.
+    pub build_block: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
+    pub set_style: fn(&Value, &str, &Value) -> bool,
+    pub set_element_style: fn(&Value, &str, &Value) -> bool,
+}
+
+static DOM_FAST: std::sync::OnceLock<DomFast> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// Bumped by `defineProperty`, `setPrototypeOf`, and assignments that
+    /// override the element/document/array surface the fused create path uses.
+    static DOM_SHAPE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Stamp sampled once per fused create loop. The fast path compares it on
+/// every iteration and falls back when it has moved.
+pub fn dom_shape_epoch() -> u64 {
+    DOM_SHAPE_EPOCH.with(std::cell::Cell::get)
+}
+
+pub fn bump_dom_shape() {
+    DOM_SHAPE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
+
+pub fn install_dom_fast(fast: DomFast) {
+    let _ = DOM_FAST.set(fast);
+}
+
+pub fn dom_create_element(object: &Value, tag: &str) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.create_element)(object, tag)
+    } else {
+        object.call_method("createElement", vec![Value::string(tag)])
+    }
+}
+
+pub fn dom_create_element_value(object: &Value, tag: &Value) -> Value {
+    dom_create_element(object, &tag.to_js_string())
+}
+
+pub fn dom_create_text(object: &Value, text: &str) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.create_text)(object, text)
+    } else {
+        object.call_method("createTextNode", vec![Value::string(text)])
+    }
+}
+
+pub fn dom_create_text_value(object: &Value, text: &Value) -> Value {
+    dom_create_text(object, &text.to_js_string())
+}
+
+pub fn dom_append_child(parent: &Value, child: &Value) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.append_child)(parent, child)
+    } else {
+        parent.call_method("appendChild", vec![child.clone()])
+    }
+}
+
+pub fn dom_set_data(object: &Value, name: &str, value: &Value) -> bool {
+    DOM_FAST.get().is_some_and(|fast| (fast.set_data)(object, name, value))
+}
+
+/// `object[name] = left + right` when `right` is an integer. Formats into a
+/// stack buffer so the create loop does not intern a throwaway `JsString`.
+pub fn dom_set_data_concat(object: &Value, name: &str, left: &Value, right: &Value) -> bool {
+    let Some(fast) = DOM_FAST.get() else {
+        return false;
+    };
+    let Some(prefix) = left.as_js_string() else {
+        return false;
+    };
+    let Some(number) = right.as_number() else {
+        return false;
+    };
+    if !number.is_finite() || number.fract() != 0.0 || number.abs() >= 1e15 {
+        return false;
+    }
+    let prefix = prefix.as_str();
+    let mut buf = [0u8; 96];
+    if prefix.len() + 20 > buf.len() {
+        return false;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let digits = crate::value::write_i64(number as i64, &mut buf[prefix.len()..]);
+    let text = std::str::from_utf8(&buf[..prefix.len() + digits]).unwrap_or("");
+    (fast.set_data_str)(object, name, text)
+}
+
+pub fn format_prefix_index<'a>(prefix: &str, index: f64, buf: &'a mut [u8]) -> Option<&'a str> {
+    if !index.is_finite() || index.fract() != 0.0 || index.abs() >= 1e15 {
+        return None;
+    }
+    if prefix.len() + 20 > buf.len() {
+        return None;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let digits = crate::value::write_i64(index as i64, &mut buf[prefix.len()..]);
+    std::str::from_utf8(&buf[..prefix.len() + digits]).ok()
+}
+
+/// `document.createElement(tag)` + id/class/text + `parent.appendChild` in one
+/// call. `id` and `text` are `prefix + index` with an integer index.
+pub fn dom_build_appended(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    id_prefix: &str,
+    id_index: f64,
+    class_name: &str,
+    text_prefix: &str,
+    text_index: f64,
+) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        return (fast.build_appended)(
+            document, parent, tag, id_prefix, id_index, class_name, text_prefix, text_index,
+        );
+    }
+    let element = dom_create_element(document, tag);
+    let _ = dom_set_data_concat(
+        &element,
+        "id",
+        &Value::string(id_prefix),
+        &Value::Number(id_index),
+    );
+    element.set_property("className", Value::string(class_name));
+    let _ = dom_set_data_concat(
+        &element,
+        "textContent",
+        &Value::string(text_prefix),
+        &Value::Number(text_index),
+    );
+    dom_append_child(parent, &element)
+}
+
+/// Fused create + id + class + text + append, or [`Value::Undefined`] when
+/// `epoch` is stale or the runtime refuses the fast path.
+pub fn dom_build_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    id_prefix: &str,
+    id_index: f64,
+    class_name: &str,
+    class_atom: u32,
+    text_prefix: &str,
+    text_index: f64,
+    epoch: u64,
+) -> Value {
+    if dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let Some(fast) = DOM_FAST.get() else {
+        return Value::Undefined;
+    };
+    (fast.build_guarded)(
+        document,
+        parent,
+        tag,
+        tag_atom,
+        id_prefix,
+        id_index,
+        class_name,
+        class_atom,
+        text_prefix,
+        text_index,
+        epoch,
+    )
+}
+
+/// Fused create + textContent + one inline style + appendChild, or
+/// [`Value::Undefined`] when `epoch` is stale or the runtime refuses.
+pub fn dom_build_block_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    style_name: &str,
+    style_value: &str,
+    epoch: u64,
+) -> Value {
+    if dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let Some(fast) = DOM_FAST.get() else {
+        return Value::Undefined;
+    };
+    (fast.build_block)(
+        document,
+        parent,
+        tag,
+        tag_atom,
+        text,
+        style_name,
+        style_value,
+        epoch,
+    )
+}
+
+static ATOM_PREHASH: std::sync::OnceLock<fn(&str, u64) -> u32> = std::sync::OnceLock::new();
+
+pub fn install_atom_prehash(prehash: fn(&str, u64) -> u32) {
+    let _ = ATOM_PREHASH.set(prehash);
+}
+
+/// Intern a loop-invariant name once in the prologue. `u32::MAX` if the
+/// runtime has not installed the atom table yet.
+pub fn dom_intern_prehashed(text: &str, hash: u64) -> u32 {
+    ATOM_PREHASH
+        .get()
+        .map(|prehash| prehash(text, hash))
+        .unwrap_or(u32::MAX)
+}
+
+/// `array.push(value)` without allocating an arguments `Vec`.
+pub fn array_push(array: &Value, value: &Value) -> Value {
+    if let Some(storage) = array.as_array() {
+        let mut values = storage.borrow_mut();
+        values.push_reserved(value.clone(), 1024);
+        return Value::Number(values.len() as f64);
+    }
+    array.call_method("push", vec![value.clone()])
+}
+
+pub fn dom_set_style(object: &Value, name: &str, value: &Value) -> bool {
+    DOM_FAST.get().is_some_and(|fast| (fast.set_style)(object, name, value))
+}
+
+pub fn dom_set_element_style(element: &Value, name: &str, value: &Value) -> bool {
+    if let Some(fast) = DOM_FAST.get() {
+        if (fast.set_element_style)(element, name, value) {
+            return true;
+        }
+    }
+    let style = element.get_property("style");
+    style.set_property(name, value.clone());
+    true
+}
+
 /// ECMAScript `Await(value)` begins by applying the current realm's
 /// PromiseResolve semantics. Both native AOT and W3VM call this entry point
 /// before subscribing their resumable frames.

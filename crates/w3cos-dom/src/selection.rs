@@ -110,7 +110,8 @@ impl Range {
                     new_text.extend_from_slice(&chars[..from]);
                     new_text.extend_from_slice(&chars[to..]);
                     let result: String = new_text.into_iter().collect();
-                    doc.get_node_mut(self.start_container).text_content = Some(result);
+                    doc.get_node_mut(self.start_container).text_content =
+                        Some(crate::node::CompactStr::from(result));
                     doc.mark_text_dirty(self.start_container);
                 }
             }

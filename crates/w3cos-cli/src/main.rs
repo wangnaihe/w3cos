@@ -186,7 +186,15 @@ fn main() -> Result<()> {
             target,
             devtools,
         } => {
-            let strip = if release || strip { Some(true) } else { None };
+            // Benchmark speed builds keep symbols unless the caller still asks
+            // to strip. Runtime speed is unchanged; profiles can see frames.
+            let strip = if std::env::var_os("W3COS_NO_STRIP").is_some() {
+                Some(false)
+            } else if release || strip {
+                Some(true)
+            } else {
+                None
+            };
             build(
                 &input,
                 &output,
@@ -415,7 +423,10 @@ fn build(
     }
 
     let profile = if release { "release" } else { "debug" };
-    let built_bin = build_dir.join("target").join(profile).join("w3cos-app");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| build_dir.join("target"));
+    let built_bin = target_dir.join(profile).join("w3cos-app");
 
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;

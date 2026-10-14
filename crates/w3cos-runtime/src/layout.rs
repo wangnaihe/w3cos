@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use taffy::prelude::*;
 use taffy::util::ResolveOrZero;
 use w3cos_std::component::EventAction;
@@ -19,8 +18,6 @@ use crate::text_layout;
 pub(crate) const ROOT_FONT_SIZE: f32 = 16.0;
 /// Typical mobile content width for pre-wrap intrinsic sizing.
 const DEFAULT_TEXT_WRAP_WIDTH: f32 = 360.0;
-
-static LAYOUT_FONT: OnceLock<fontdue::Font> = OnceLock::new();
 
 const TEXT_MEASURE_CACHE_CAPACITY: usize = 4096;
 
@@ -69,7 +66,9 @@ thread_local! {
 }
 
 pub(crate) fn layout_font() -> &'static fontdue::Font {
-    LAYOUT_FONT.get_or_init(|| crate::font_face::host_ui_font().font.clone())
+    // The host font is already immutable and process-static. Borrow it rather
+    // than retaining a second deep copy of its glyph vectors and lookup maps.
+    &crate::font_face::host_ui_font().font
 }
 
 pub(crate) fn inline_font_height(style: &w3cos_std::style::Style) -> f32 {
@@ -3432,6 +3431,9 @@ fn cascade_measure_width(text: &str, style: &w3cos_std::style::Style) -> f32 {
 }
 
 fn cascade_line_height(text: &str, style: &w3cos_std::style::Style) -> f32 {
+    if style.line_height_computed_px.is_some() {
+        return crate::layout::inline_style_line_height(style);
+    }
     let registry = crate::font_face::FontRegistry::global();
     registry
         .resolve_style_runs(style, text)
@@ -3490,7 +3492,7 @@ fn cascade_text_intrinsic_size(
         .map(|line| cascade_measure_width(line, style))
         .fold(0.0_f32, f32::max);
     let used_line_count = text_layout::used_text_line_count(content, style, &lines);
-    let height = if used_line_count == 1 {
+    let height = if used_line_count == 1 && style.line_height_computed_px.is_none() {
         cascade_line_height(&lines[0], style)
     } else {
         used_line_count as f32 * crate::layout::inline_style_line_height(&style)
@@ -3562,11 +3564,23 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
+/// Border-box height of one block's text, wrapped at the containing block.
+pub(crate) fn block_text_border_height(
+    content: &str,
+    containing_content_width: f32,
+    style: &w3cos_std::style::Style,
+) -> f32 {
+    if content.is_empty() || !containing_content_width.is_finite() || containing_content_width <= 0.0 {
+        return 0.0;
+    }
+    wrapped_text_height(content, containing_content_width, style)
+}
+
 pub(crate) fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Style) -> f32 {
     let registry = crate::font_face::FontRegistry::global();
-    #[cfg(not(feature = "skia"))]
-    let font_runs = registry.resolve_style_runs(style, content);
-    let key = text_measure_key(width, style, registry.cascade_cache_key(style, content));
+    // Registry revision changes when a face is registered or dropped, so a
+    // hit does not resolve runs or shape glyphs again.
+    let key = text_measure_key(width, style, registry.revision());
     if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
         cache
             .borrow()
@@ -3585,6 +3599,7 @@ pub(crate) fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::
         }
         #[cfg(not(feature = "skia"))]
         {
+            let font_runs = registry.resolve_style_runs(style, content);
             if font_runs.iter().any(|run| run.font.is_some()) {
                 cascade_text_intrinsic_size(content, style, width).1
             } else {
@@ -3918,10 +3933,39 @@ fn pre_flatten_recursive<'a>(
 // LayoutEngine — persistent TaffyTree for incremental layout
 // ---------------------------------------------------------------------------
 
+fn index_taffy_nodes(tree: &TaffyTree<usize>, root: taffy::NodeId) -> Vec<taffy::NodeId> {
+    let mut indexed: Vec<Option<taffy::NodeId>> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(&idx) = tree.get_node_context(node) {
+            if indexed.len() <= idx {
+                indexed.resize(idx + 1, None);
+            }
+            indexed[idx] = Some(node);
+        }
+        if let Ok(children) = tree.children(node) {
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    indexed
+        .into_iter()
+        .map(|node| node.unwrap_or(root))
+        .collect()
+}
+
 pub struct LayoutEngine {
     tree: TaffyTree<usize>,
     root_node: Option<taffy::NodeId>,
+    /// Taffy node for each component preorder index (`get_node_context`).
+    node_index: Vec<taffy::NodeId>,
     tree_valid: bool,
+    /// Simple flex/grid/block trees can skip the post-Taffy projection passes.
+    skip_projections: bool,
+    /// Auto-height text still needs `update_text_leaf_heights` when projections
+    /// are skipped. Definite px trees leave this false and avoid the walk.
+    measure_text: bool,
     viewport: Option<(f32, f32)>,
     /// Taffy `compute_layout` calls issued by the most recent `compute()`.
     /// 1 means text-leaf heights were already clean and the historic second
@@ -3957,10 +4001,39 @@ impl LayoutEngine {
         Self {
             tree,
             root_node: None,
+            node_index: Vec::new(),
             tree_valid: false,
+            skip_projections: false,
+            measure_text: true,
             viewport: None,
             last_compute_layout_passes: 0,
         }
+    }
+
+    pub fn set_skip_projections(&mut self, skip: bool) {
+        self.skip_projections = skip;
+    }
+
+    pub fn set_measure_text(&mut self, measure: bool) {
+        self.measure_text = measure;
+    }
+
+    /// Replace one node's Taffy style without rebuilding the tree.
+    pub fn patch_style(
+        &mut self,
+        index: usize,
+        style: &w3cos_std::style::Style,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> bool {
+        let Some(&node) = self.node_index.get(index) else {
+            return false;
+        };
+        if self.tree.get_node_context(node).copied() != Some(index) {
+            return false;
+        }
+        let taffy_style = to_taffy_style(style, viewport_w, viewport_h);
+        self.tree.set_style(node, taffy_style).is_ok()
     }
 
     pub fn invalidate(&mut self) {
@@ -3994,12 +4067,16 @@ impl LayoutEngine {
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
-            let mut layout_root = root.clone();
-            resolve_collapsed_table_layout_borders(&mut layout_root);
-            crate::table_grid::annotate(&mut layout_root);
+            let prepared = component_needs_table_prep(root).then(|| {
+                let mut layout_root = root.clone();
+                resolve_collapsed_table_layout_borders(&mut layout_root);
+                crate::table_grid::annotate(&mut layout_root);
+                layout_root
+            });
+            let layout_root = prepared.as_ref().unwrap_or(root);
             self.root_node = Some(build_taffy_tree(
                 &mut self.tree,
-                &layout_root,
+                layout_root,
                 &mut idx,
                 None,
                 None,
@@ -4019,6 +4096,9 @@ impl LayoutEngine {
                 None,
             )?);
             self.tree_valid = true;
+            if let Some(root_node) = self.root_node {
+                self.node_index = index_taffy_nodes(&self.tree, root_node);
+            }
         }
 
         let root_node = self.root_node.unwrap();
@@ -4031,9 +4111,23 @@ impl LayoutEngine {
             width: AvailableSpace::Definite(viewport_w),
             height: AvailableSpace::Definite(viewport_h),
         };
+        // A definite containing block can wrap text before the first solve.
+        // Float and table trees keep the historic post-layout measure so a
+        // predicted width cannot change their used line boxes.
+        if self.measure_text && self.skip_projections {
+            seed_text_heights_from_definite_widths(
+                &mut self.tree,
+                &self.node_index,
+                flat,
+                viewport_w,
+            )?;
+        }
         self.tree.compute_layout(root_node, space)?;
         self.last_compute_layout_passes = 1;
-        if update_text_leaf_heights(&mut self.tree, root_node, flat, None)? {
+        // Definite flex/grid/block trees already have border boxes. Measuring
+        // text leaves and solving again dominates repeated offsetHeight.
+        if self.measure_text && update_text_leaf_heights(&mut self.tree, root_node, flat, None)?
+        {
             self.tree.compute_layout(root_node, space)?;
             self.last_compute_layout_passes = 2;
         }
@@ -4081,6 +4175,16 @@ impl LayoutEngine {
             &mut clip_only,
             &mut scroll_ancestor,
         );
+
+        if self.skip_projections {
+            results.extend(fixed_results);
+            return Ok(LayoutResults {
+                layout_cache: results,
+                scrollable_nodes: scrollable,
+                clip_only_nodes: clip_only,
+                scroll_ancestor,
+            });
+        }
 
         let inline_original_rects = flat.iter().any(|node|
             matches!(node.style.display, WDisplay::TableCell | WDisplay::TableCaption))
@@ -21271,6 +21375,181 @@ fn patch_taffy_display(
     Ok(())
 }
 
+fn component_needs_table_prep(component: &Component) -> bool {
+    crate::table_grid::row_span(&component.style) != 1
+        || matches!(
+            component.style.display,
+            WDisplay::Table
+                | WDisplay::InlineTable
+                | WDisplay::TableRow
+                | WDisplay::TableRowGroup
+                | WDisplay::TableHeaderGroup
+                | WDisplay::TableFooterGroup
+                | WDisplay::TableColumn
+                | WDisplay::TableColumnGroup
+                | WDisplay::TableCell
+                | WDisplay::TableCaption
+        )
+        || component.children.iter().any(component_needs_table_prep)
+}
+
+/// Predict block containing-block widths and set text heights before the first
+/// `compute_layout`. The post-layout measure still runs and corrects a miss.
+fn seed_text_heights_from_definite_widths(
+    tree: &mut TaffyTree<usize>,
+    node_index: &[taffy::NodeId],
+    flat: &[FlatNodeInfo<'_>],
+    viewport_w: f32,
+) -> Result<(), taffy::TaffyError> {
+    if !viewport_w.is_finite() || viewport_w <= 0.0 {
+        return Ok(());
+    }
+    let widths = definite_block_content_widths(flat, viewport_w);
+    for (index, info) in flat.iter().enumerate() {
+        let ComponentKind::Text { content } = info.kind else {
+            continue;
+        };
+        if !matches!(info.style.height, WDim::Auto) {
+            continue;
+        }
+        let Some(wrap_width) = text_block_content_width(flat, index, &widths) else {
+            continue;
+        };
+        if !wrap_width.is_finite() || wrap_width <= 0.0 {
+            continue;
+        }
+        let Some(&node) = node_index.get(index) else {
+            continue;
+        };
+        if tree.get_node_context(node).copied() != Some(index) {
+            continue;
+        }
+        let parent_display = info
+            .parent
+            .and_then(|parent| flat.get(parent))
+            .map(|parent| parent.style.display);
+        apply_measured_text_height(tree, node, content, info.style, wrap_width, parent_display)?;
+    }
+    Ok(())
+}
+
+/// Content-box width for block boxes whose used width does not depend on
+/// shrink-to-fit, flex, or float placement.
+fn definite_block_content_widths(flat: &[FlatNodeInfo<'_>], viewport_w: f32) -> Vec<Option<f32>> {
+    let mut widths = vec![None; flat.len()];
+    for index in 0..flat.len() {
+        let Some(cb) = containing_content_width(flat, index, &widths, viewport_w) else {
+            continue;
+        };
+        widths[index] = used_block_content_width(flat[index].style, cb);
+    }
+    widths
+}
+
+fn containing_content_width(
+    flat: &[FlatNodeInfo<'_>],
+    index: usize,
+    widths: &[Option<f32>],
+    viewport_w: f32,
+) -> Option<f32> {
+    let mut current = flat.get(index)?.parent;
+    while let Some(parent) = current {
+        if !matches!(flat.get(parent)?.style.display, WDisplay::Inline) {
+            return widths.get(parent).copied().flatten();
+        }
+        current = flat[parent].parent;
+    }
+    Some(viewport_w)
+}
+
+fn used_block_content_width(style: &w3cos_std::style::Style, cb: f32) -> Option<f32> {
+    if style.float != WFloat::None
+        || matches!(style.position, WPos::Absolute | WPos::Fixed)
+        || style.column_count.is_some()
+        || !cb.is_finite()
+        || cb <= 0.0
+    {
+        return None;
+    }
+    let stretches = matches!(
+        style.display,
+        WDisplay::Block | WDisplay::FlowRoot | WDisplay::ListItem
+    );
+    if !stretches && style.display != WDisplay::InlineBlock {
+        return None;
+    }
+    let specified = match style.width {
+        WDim::Px(width) if width.is_finite() && width >= 0.0 => width,
+        WDim::Percent(percent) if percent.is_finite() && percent >= 0.0 => cb * percent / 100.0,
+        WDim::Auto if stretches => {
+            let margin = style.margin_lengths();
+            let padding = style.padding_lengths();
+            let border = style.border_left_width.unwrap_or(style.border_width)
+                + style.border_right_width.unwrap_or(style.border_width);
+            return Some((cb - margin.left - margin.right - padding.left - padding.right - border).max(0.0));
+        }
+        _ => return None,
+    };
+    if style.box_sizing == WBoxSizing::BorderBox {
+        let padding = style.padding_lengths();
+        let border = style.border_left_width.unwrap_or(style.border_width)
+            + style.border_right_width.unwrap_or(style.border_width);
+        Some((specified - padding.left - padding.right - border).max(0.0))
+    } else {
+        Some(specified)
+    }
+}
+
+fn text_block_content_width(
+    flat: &[FlatNodeInfo<'_>],
+    index: usize,
+    widths: &[Option<f32>],
+) -> Option<f32> {
+    let mut current = flat.get(index)?.parent;
+    while let Some(parent) = current {
+        if !matches!(flat.get(parent)?.style.display, WDisplay::Inline) {
+            return widths.get(parent).copied().flatten();
+        }
+        current = flat[parent].parent;
+    }
+    None
+}
+
+fn apply_measured_text_height(
+    tree: &mut TaffyTree<usize>,
+    node: NodeId,
+    content: &str,
+    style: &w3cos_std::style::Style,
+    wrap_width: f32,
+    parent_display: Option<WDisplay>,
+) -> Result<bool, taffy::TaffyError> {
+    let mut h = wrapped_text_height(content, wrap_width, style);
+    if let Some(browser_height) = browser_normal_cjk_height(content, style, parent_display) {
+        h = h.max(browser_height);
+    }
+    if style.box_sizing == WBoxSizing::ContentBox {
+        let padding = style.padding_lengths();
+        h = (h - padding.top - padding.bottom).max(0.0);
+    }
+    let mut taffy_style = tree.style(node)?.clone();
+    let measured_height = Dimension::length(h);
+    let measured_min_height = if matches!(style.min_height, WDim::Auto)
+        && matches!(style.max_height, WDim::Auto)
+    {
+        measured_height
+    } else {
+        taffy_style.min_size.height
+    };
+    if taffy_style.min_size.height != measured_min_height || taffy_style.size.height != measured_height
+    {
+        taffy_style.min_size.height = measured_min_height;
+        taffy_style.size.height = measured_height;
+        tree.set_style(node, taffy_style)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// After first layout pass, set Text leaf heights from wrapped line count at assigned width.
 /// Returns true when any leaf style changed and a second Taffy pass is required.
 fn update_text_leaf_heights(
@@ -21288,33 +21567,15 @@ fn update_text_leaf_heights(
             if let ComponentKind::Text { content } = flat[idx].kind {
                 let style = flat[idx].style;
                 if matches!(style.height, WDim::Auto) {
-                    let mut h = wrapped_text_height(content, node_width, style);
-                    if let Some(browser_height) =
-                        browser_normal_cjk_height(content, style, parent_display)
-                    {
-                        h = h.max(browser_height);
-                    }
-                    if style.box_sizing == WBoxSizing::ContentBox {
-                        let padding = style.padding_lengths();
-                        h = (h - padding.top - padding.bottom).max(0.0);
-                    }
-                    let mut taffy_style = tree.style(node)?.clone();
-                    let measured_height = Dimension::length(h);
-                    let measured_min_height = if matches!(style.min_height, WDim::Auto)
-                        && matches!(style.max_height, WDim::Auto)
-                    {
-                        measured_height
-                    } else {
-                        taffy_style.min_size.height
-                    };
-                    if taffy_style.min_size.height != measured_min_height
-                        || taffy_style.size.height != measured_height
-                    {
-                        taffy_style.min_size.height = measured_min_height;
-                        taffy_style.size.height = measured_height;
-                        tree.set_style(node, taffy_style)?;
-                        dirty = true;
-                    }
+                    let wrap_width = text_containing_block_width(tree, node, flat, node_width);
+                    dirty |= apply_measured_text_height(
+                        tree,
+                        node,
+                        content,
+                        style,
+                        wrap_width,
+                        parent_display,
+                    )?;
                 }
             }
         }
@@ -21329,6 +21590,45 @@ fn update_text_leaf_heights(
         dirty |= update_text_leaf_heights(tree, child, flat, current_display)?;
     }
     Ok(dirty)
+}
+
+/// Inline text wraps at the nearest block container's content box. Taffy
+/// sizes the text leaf to its max-content width, which would otherwise report
+/// a single line even when the author box is narrower.
+fn text_containing_block_width(
+    tree: &TaffyTree<usize>,
+    node: NodeId,
+    flat: &[FlatNodeInfo<'_>],
+    node_width: f32,
+) -> f32 {
+    let mut current = node;
+    while let Some(parent) = tree.parent(current) {
+        let Some(index) = tree.get_node_context(parent).copied() else {
+            break;
+        };
+        let Some(info) = flat.get(index) else {
+            break;
+        };
+        if matches!(info.style.display, WDisplay::Inline) {
+            current = parent;
+            continue;
+        }
+        let Ok(layout) = tree.layout(parent) else {
+            break;
+        };
+        let padding = info.style.padding_lengths();
+        let border = info.style.border_left_width.unwrap_or(info.style.border_width)
+            + info.style.border_right_width.unwrap_or(info.style.border_width);
+        let content = layout.size.width - padding.left - padding.right - border;
+        // A leaf only a border or subpixel wider than its container is already
+        // the wrapped line. Rewrapping those changes padding/border boxes.
+        // A max-content leaf that overflows a narrower block wraps at the block.
+        if content.is_finite() && content > 0.0 && node_width > content + 8.0 {
+            return content.max(1.0);
+        }
+        break;
+    }
+    node_width.max(1.0)
 }
 
 fn to_taffy_display(d: WDisplay) -> taffy::Display {
@@ -23086,6 +23386,13 @@ mod tests {
 
     fn s() -> Style {
         Style::default()
+    }
+
+    #[test]
+    fn layout_font_reuses_immutable_host_font() {
+        let font = layout_font();
+        assert!(std::ptr::eq(font, &crate::font_face::host_ui_font().font));
+        assert!(std::ptr::eq(font, layout_font()));
     }
 
     #[test]

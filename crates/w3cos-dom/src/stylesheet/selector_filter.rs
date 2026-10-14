@@ -2,6 +2,46 @@ use super::{
     AttributeSelector, Combinator, CompoundSelector, Document, NodeId, NodeType, SelectorContext,
 };
 
+/// Build the ancestor filter only if a surviving candidate needs ancestor
+/// features. Most simple selectors have an empty requirement, so eagerly
+/// walking and hashing the entire ancestor chain adds work without filtering
+/// anything. The cache is local to one matching operation, never a DOM snapshot.
+pub(super) struct LazyAncestorBloom<F> {
+    build: F,
+    bloom: std::cell::Cell<Option<AncestorBloom>>,
+    known_empty: bool,
+}
+
+impl<F: Fn() -> AncestorBloom> LazyAncestorBloom<F> {
+    /// `known_empty` may only be true when `build` would return the empty
+    /// filter, such as an empty ancestor slice. Builders must not reenter this
+    /// matching operation; the current builders only read ancestor features.
+    pub(super) fn new(build: F, known_empty: bool) -> Self {
+        Self {
+            build,
+            bloom: std::cell::Cell::new(None),
+            known_empty,
+        }
+    }
+
+    pub(super) fn might_contain(&self, required: AncestorBloom) -> bool {
+        if required.0 == 0 {
+            return true;
+        }
+        if self.known_empty {
+            return false;
+        }
+        let available = if let Some(available) = self.bloom.get() {
+            available
+        } else {
+            let available = (self.build)();
+            self.bloom.set(Some(available));
+            available
+        };
+        available.might_contain(required)
+    }
+}
+
 /// Compact, no-false-negative prefilter for ancestor-dependent selectors.
 /// Hash collisions only retain extra rules; the full selector matcher remains
 /// authoritative for every rule that passes.
@@ -155,4 +195,48 @@ fn attribute_local_name(name: &str) -> &str {
 fn tag_local_name(tag: &str) -> &str {
     tag.rsplit_once(['|', ':'])
         .map_or(tag, |(_, local_name)| local_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn lazy_filter_skips_empty_requirements_and_builds_only_once() {
+        let builds = Cell::new(0);
+        let lazy = LazyAncestorBloom::new(
+            || {
+                builds.set(builds.get() + 1);
+                AncestorBloom(0b101)
+            },
+            false,
+        );
+        assert!(lazy.might_contain(AncestorBloom::default()));
+        assert_eq!(builds.get(), 0);
+        assert!(lazy.might_contain(AncestorBloom(0b001)));
+        assert!(!lazy.might_contain(AncestorBloom(0b010)));
+        assert!(lazy.might_contain(AncestorBloom(0b101)));
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn lazy_filter_agrees_with_eager_filter_for_every_small_bit_pattern() {
+        for available in 0..256 {
+            let eager = AncestorBloom(available);
+            let lazy = LazyAncestorBloom::new(|| eager, false);
+            for required in 0..256 {
+                let required = AncestorBloom(required);
+                assert_eq!(lazy.might_contain(required), eager.might_contain(required));
+            }
+        }
+    }
+
+    #[test]
+    fn known_empty_filter_never_builds() {
+        let lazy =
+            LazyAncestorBloom::new(|| panic!("empty ancestor chain needs no traversal"), true);
+        assert!(lazy.might_contain(AncestorBloom::default()));
+        assert!(!lazy.might_contain(AncestorBloom(1)));
+    }
 }

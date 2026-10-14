@@ -1380,6 +1380,35 @@ mod tests {
     }
 
     #[test]
+    fn repeated_fixed_blocks_share_a_style_until_one_mutates() {
+        let mut doc = Document::new();
+        let root = doc.create_element("div");
+        doc.body().append_child(&mut doc, root);
+        let first = doc
+            .append_fixed_text_block(root.id, "div", 4, "m 1", "height", "18px")
+            .expect("simple block");
+        let second = doc
+            .append_fixed_text_block(root.id, "div", 4, "m 1", "height", "18px")
+            .expect("repeated block");
+        assert_eq!(doc.children_ids(root.id).len(), 2);
+        assert_eq!(doc.descendant_text_content(first), "m 1");
+        assert_eq!(doc.get_style(first).get_property("height"), "18px");
+        assert_eq!(doc.get_style(second).get_property("height"), "18px");
+        doc.get_style_mut(first).set_property("height", "20px");
+        assert_eq!(doc.get_style(first).get_property("height"), "20px");
+        assert_eq!(
+            doc.get_style(second).get_property("height"),
+            "18px",
+            "mutating one shared row copies its style"
+        );
+        let flex = doc.create_element("div");
+        flex.style_mut(&mut doc).set_property("display", "flex");
+        assert!(doc
+            .append_fixed_text_block(flex.id, "div", 4, "m", "height", "18px")
+            .is_none());
+    }
+
+    #[test]
     fn body_fast_path_retains_the_browser_default_margin() {
         let doc = Document::new();
         assert_eq!(
@@ -1736,7 +1765,11 @@ mod tests {
         }
         let mut text = String::new();
         collect_text(&doc.to_component_tree(), &mut text);
-        assert_eq!(text, "14950");
+        // A parent `counter-reset` already owns `item`. The middle span's
+        // reset is visible to its own `::before` (49) and does not replace
+        // the parent counter for the following sibling (2). Chrome 155 agrees;
+        // see `sibling_reset_shadows_but_does_not_replace_an_inherited_parent_counter`.
+        assert_eq!(text, "1492");
         crate::stylesheet::clear_rules();
     }
 
@@ -2277,14 +2310,9 @@ mod tests {
             w3cos_std::style::WhiteSpace::Pre
         );
         assert_eq!(anonymous_line.style.font_size, row.style.font_size);
-        assert!(
-            anonymous_line
-                .style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|properties| properties
-                    .contains_key("--w3cos-internal-inline-formatting-context"))
-        );
+        assert!(anonymous_line.style.custom_properties.as_ref().is_some_and(
+            |properties| properties.contains_key("--w3cos-internal-inline-formatting-context")
+        ));
         crate::stylesheet::clear_rules();
     }
 

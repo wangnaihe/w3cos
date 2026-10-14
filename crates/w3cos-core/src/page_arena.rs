@@ -24,7 +24,6 @@
 //! padding would not reclaim holes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -161,7 +160,10 @@ struct PageArena {
     current: Vec<u8>,
     /// 1-based intern slots; index 0 is unused so handle `0` is never valid.
     slots: Vec<PageString>,
-    intern: HashMap<u64, Vec<u32>>,
+    /// Open-addressed intern lookup. `0` is empty; otherwise a 1-based handle.
+    hash_slots: Vec<u32>,
+    hash_mask: usize,
+    hash_len: usize,
     allocated: usize,
     objects: SizeClassSlab<RefCell<crate::JsObject>>,
     arrays: SizeClassSlab<RefCell<crate::value::ArrayStorage>>,
@@ -173,15 +175,21 @@ impl PageArena {
         Self {
             epoch: 1,
             chunks: Vec::new(),
-            current: Vec::new(),
-            slots: vec![PageString {
-                handle: 0,
-                epoch: 0,
-                ptr: std::ptr::null(),
-                len: 0,
-                _thread: PhantomData,
-            }],
-            intern: HashMap::new(),
+            current: Vec::with_capacity(1 << 20),
+            slots: {
+                let mut slots = Vec::with_capacity(32768);
+                slots.push(PageString {
+                    handle: 0,
+                    epoch: 0,
+                    ptr: std::ptr::null(),
+                    len: 0,
+                    _thread: PhantomData,
+                });
+                slots
+            },
+            hash_slots: vec![0; 32768],
+            hash_mask: 32767,
+            hash_len: 0,
             allocated: 0,
             objects: SizeClassSlab::new(),
             arrays: SizeClassSlab::new(),
@@ -191,13 +199,11 @@ impl PageArena {
 
     fn intern(&mut self, s: &str) -> PageString {
         let hash = hash_str(s);
-        if let Some(handles) = self.intern.get(&hash) {
-            for &handle in handles {
-                let slot = self.slots[handle as usize];
-                if slot.len as usize == s.len() && slot.as_str() == s {
-                    return slot;
-                }
-            }
+        if let Some(existing) = self.hash_find(hash, s) {
+            return existing;
+        }
+        if self.hash_slots.is_empty() || (self.hash_len + 1) * 10 >= self.hash_slots.len() * 7 {
+            self.hash_grow();
         }
         let ptr = self.alloc_bytes(s.as_bytes());
         let handle = self.slots.len() as u32;
@@ -209,8 +215,57 @@ impl PageArena {
             _thread: PhantomData,
         };
         self.slots.push(interned);
-        self.intern.entry(hash).or_default().push(handle);
+        self.hash_insert(hash, handle);
         interned
+    }
+
+    fn hash_find(&self, hash: u64, s: &str) -> Option<PageString> {
+        if self.hash_slots.is_empty() {
+            return None;
+        }
+        let mut index = hash as usize & self.hash_mask;
+        for _ in 0..self.hash_slots.len() {
+            let handle = self.hash_slots[index];
+            if handle == 0 {
+                return None;
+            }
+            let slot = self.slots[handle as usize];
+            if slot.len as usize == s.len() && slot.as_str() == s {
+                return Some(slot);
+            }
+            index = (index + 1) & self.hash_mask;
+        }
+        None
+    }
+
+    fn hash_insert(&mut self, hash: u64, handle: u32) {
+        let mut index = hash as usize & self.hash_mask;
+        loop {
+            if self.hash_slots[index] == 0 {
+                self.hash_slots[index] = handle;
+                self.hash_len += 1;
+                return;
+            }
+            index = (index + 1) & self.hash_mask;
+        }
+    }
+
+    fn hash_grow(&mut self) {
+        let next = (self.hash_slots.len().max(1024)) * 2;
+        let old = std::mem::replace(&mut self.hash_slots, vec![0; next]);
+        self.hash_mask = next - 1;
+        self.hash_len = 0;
+        if old.is_empty() {
+            return;
+        }
+        for handle in old {
+            if handle == 0 {
+                continue;
+            }
+            let slot = self.slots[handle as usize];
+            let hash = hash_str(slot.as_str());
+            self.hash_insert(hash, handle);
+        }
     }
 
     fn alloc_bytes(&mut self, bytes: &[u8]) -> *const u8 {
@@ -254,8 +309,8 @@ impl PageArena {
             len: 0,
             _thread: PhantomData,
         });
-        self.intern.clear();
-        self.intern.shrink_to_fit();
+        self.hash_slots.fill(0);
+        self.hash_len = 0;
         self.allocated = 0;
         self.objects.clear();
         self.arrays.clear();
