@@ -65,6 +65,7 @@ pub fn reset_document() {
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
     crate::incremental_layout::invalidate();
+    crate::definite_layout::invalidate();
 }
 
 // ---------------------------------------------------------------------------

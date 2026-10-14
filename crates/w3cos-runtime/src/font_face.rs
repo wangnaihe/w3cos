@@ -29,6 +29,7 @@
 //! let data = FontRegistry::global().resolve("JetBrains Mono", FontWeight::Normal, FontFaceStyle::Normal);
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
@@ -217,6 +218,22 @@ impl Default for FontFace {
     }
 }
 
+thread_local! {
+    static FACE_HIT: RefCell<Option<(u64, LoadedFont)>> = const { RefCell::new(None) };
+}
+
+fn face_hit_key(family: &str, weight: FontWeight, style: FontFaceStyle) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    family.hash(&mut hasher);
+    weight.hash(&mut hasher);
+    style.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn clear_face_hit() {
+    FACE_HIT.with(|slot| *slot.borrow_mut() = None);
+}
+
 // ── Loaded font entry ──────────────────────────────────────────────────────
 
 /// A successfully loaded font — holds the raw bytes ready for the renderer.
@@ -260,6 +277,10 @@ impl LoadedFont {
     /// Stable identity for retained text and glyph caches.
     pub(crate) fn cache_key(&self) -> u64 {
         self.cache_key
+    }
+
+    fn covers_all_codepoints(&self) -> bool {
+        self.unicode_ranges.is_none()
     }
 
     /// Whether this face is eligible for and contains a glyph for `character`.
@@ -518,6 +539,7 @@ impl FontRegistry {
 
     /// Register a font for a lifecycle owner.
     pub fn register_for_owner(&self, owner: u64, face: FontFace) -> Result<(), String> {
+        clear_face_hit();
         let data = match &face.src {
             FontSource::Bytes(b) => normalize_font_bytes(b).map(Arc::new)?,
             FontSource::Path(p) => {
@@ -617,6 +639,7 @@ impl FontRegistry {
 
     /// Remove every font registered by one page/stylesheet lifecycle owner.
     pub fn clear_owner(&self, owner: u64) {
+        clear_face_hit();
         let mut fonts = self.fonts.lock().unwrap();
         fonts.retain(|_, entries| {
             entries.retain(|(existing_owner, _)| *existing_owner != owner);
@@ -708,12 +731,59 @@ impl FontRegistry {
             w3cos_std::style::FontStyle::Italic => FontFaceStyle::Italic,
             w3cos_std::style::FontStyle::Oblique => FontFaceStyle::Oblique,
         };
-        self.resolve_render_stack(
-            family,
-            FontWeight(style.font_weight),
-            face_style,
-            Some(character),
-        )
+        let weight = FontWeight(style.font_weight);
+        let key = face_hit_key(family, weight, face_style);
+        let cached = FACE_HIT.with(|slot| {
+            slot.borrow().as_ref().and_then(|(cached_key, font)| {
+                (*cached_key == key && font.supports_character(character)).then(|| font.clone())
+            })
+        });
+        if cached.is_some() {
+            return cached;
+        }
+        let resolved = self.resolve_render_stack(family, weight, face_style, Some(character))?;
+        if resolved.covers_all_codepoints() {
+            FACE_HIT.with(|slot| *slot.borrow_mut() = Some((key, resolved.clone())));
+        }
+        Some(resolved)
+    }
+
+    /// One unrestricted face that has a glyph for every character. Unicode-range
+    /// siblings still go through the per-character cascade.
+    fn single_covering_face(
+        &self,
+        stack: &str,
+        weight: FontWeight,
+        style: FontFaceStyle,
+        text: &str,
+    ) -> Option<LoadedFont> {
+        let key = face_hit_key(stack, weight, style);
+        if let Some(cached) = FACE_HIT.with(|slot| {
+            slot.borrow().as_ref().and_then(|(cached_key, font)| {
+                (*cached_key == key).then(|| font.clone())
+            })
+        }) {
+            if cached.covers_all_codepoints()
+                && text.chars().all(|character| {
+                    cached.supports_character(crate::text_layout::font_glyph_character(character))
+                })
+            {
+                return Some(cached);
+            }
+        }
+        let first = text.chars().next()?;
+        let glyph = crate::text_layout::font_glyph_character(first);
+        let font = self.resolve_render_stack(stack, weight, style, Some(glyph))?;
+        if !font.covers_all_codepoints() {
+            return None;
+        }
+        if text.chars().any(|character| {
+            !font.supports_character(crate::text_layout::font_glyph_character(character))
+        }) {
+            return None;
+        }
+        FACE_HIT.with(|slot| *slot.borrow_mut() = Some((key, font.clone())));
+        Some(font)
     }
 
     /// Blink's primary line strut queries U+0020 without requiring its glyph.
@@ -788,6 +858,12 @@ impl FontRegistry {
             w3cos_std::style::FontStyle::Oblique => FontFaceStyle::Oblique,
         };
         let weight = FontWeight(style.font_weight);
+        if let Some(font) = self.single_covering_face(stack, weight, face_style, text) {
+            return vec![ResolvedFontRun {
+                byte_range: 0..text.len(),
+                font: Some(font),
+            }];
+        }
         let mut runs: Vec<ResolvedFontRun> = Vec::new();
         for (offset, character) in text.char_indices() {
             let glyph_character = crate::text_layout::font_glyph_character(character);
@@ -1042,7 +1118,7 @@ fn resolve_system_font(name: &str) -> Option<Vec<u8>> {
             return Some(bytes);
         }
     }
-    if name.eq_ignore_ascii_case("Noto Sans")
+    if (name.eq_ignore_ascii_case("Noto Sans") || name.eq_ignore_ascii_case("Noto Sans Regular"))
         && let Some(bytes) = read_font_path(std::path::Path::new(
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         ))

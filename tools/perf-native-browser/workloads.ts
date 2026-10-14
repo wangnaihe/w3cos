@@ -129,7 +129,7 @@ function layoutOnce() {
 function layoutCssOnce() {
     resetPage();
     var style = document.createElement("style");
-    style.textContent = "@font-face{font-family:w3perf;src:local(\"Noto Sans\"),url(\"/NotoSans-Regular.ttf\")}.wrap{width:100%}.card{display:block;width:50%}.copy{display:block;margin:0;font-family:w3perf,sans-serif;font-size:16px;line-height:20px}";
+    style.textContent = "@font-face{font-family:w3perf;src:local(\"Noto Sans Regular\"),local(\"Noto Sans\"),url(\"/NotoSans-Regular.ttf\")}.wrap{width:100%}.card{display:block;width:50%}.copy{display:block;margin:0;font-family:w3perf,sans-serif;font-size:16px;line-height:20px}";
     document.head.appendChild(style);
     var wrap = document.createElement("div");
     wrap.className = "wrap";

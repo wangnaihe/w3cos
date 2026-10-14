@@ -3628,6 +3628,19 @@ impl Document {
         self.computed_style(id, &ancestors, inherited.as_ref())
     }
 
+    /// Cascade one element from an already-computed parent style.
+    ///
+    /// `computed_style_for` recomputes every ancestor. A tree walk that
+    /// already holds the parent style uses this so each element is cascaded
+    /// once.
+    pub fn computed_style_inherited(
+        &self,
+        id: NodeId,
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> w3cos_std::style::Style {
+        self.computed_style(id, &[], inherited)
+    }
+
     fn apply_font_size_minimums(&self, style: &mut w3cos_std::Style) {
         let specified = style.font_size;
         let absolute = style.custom_properties.as_ref()

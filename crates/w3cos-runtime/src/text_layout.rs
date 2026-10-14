@@ -738,6 +738,11 @@ pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
     }
 }
 
+thread_local! {
+    static ASCII_ADVANCE: RefCell<(usize, u32, u32, [f32; 128])> =
+        const { RefCell::new((0, 0, 0, [0.0; 128])) };
+}
+
 pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
     if is_non_rendering_format_character(ch) {
         return 0.0;
@@ -746,12 +751,37 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
     if !font.chars().contains_key(&ch) {
         return estimated_char_width(ch, font_size);
     }
+    let ascii = (ch as u32) < 128;
+    let font_id = font as *const fontdue::Font as usize;
+    let em = font.units_per_em().to_bits();
+    let size_bits = font_size.to_bits();
+    if ascii {
+        let cached = ASCII_ADVANCE.with(|slot| {
+            let slot = slot.borrow();
+            (slot.0 == font_id && slot.1 == em && slot.2 == size_bits)
+                .then(|| slot.3[ch as usize])
+                .filter(|advance| *advance > 0.0)
+        });
+        if let Some(advance) = cached {
+            return advance;
+        }
+    }
     let advance = font.metrics(ch, font_size).advance_width;
-    if advance > 0.0 {
+    let advance = if advance > 0.0 {
         advance
     } else {
         estimated_char_width(ch, font_size)
+    };
+    if ascii && advance > 0.0 {
+        ASCII_ADVANCE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.0 != font_id || slot.1 != em || slot.2 != size_bits {
+                *slot = (font_id, em, size_bits, [0.0; 128]);
+            }
+            slot.3[ch as usize] = advance;
+        });
     }
+    advance
 }
 
 pub(crate) fn font_glyph_character(character: char) -> char {

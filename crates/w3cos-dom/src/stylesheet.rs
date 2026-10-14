@@ -422,7 +422,7 @@ fn bump_generation() {
     STYLE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
 }
 
-pub(crate) fn generation() -> u64 {
+pub fn generation() -> u64 {
     STYLE_GENERATION.with(Cell::get)
 }
 
@@ -707,6 +707,13 @@ pub fn rule_count() -> usize {
 /// Whether any rules are registered — fast path for the DOM walk.
 pub fn has_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 1 != 0)
+}
+
+/// Sibling, structural, or relational selectors can give two elements with
+/// the same attributes different computed styles. Callers that reuse a
+/// cascaded style across elements must fall back while this is set.
+pub fn has_position_dependent_rules() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & (2 | 4 | 8) != 0)
 }
 
 /// Declarations of every rule matching the given element, ordered for

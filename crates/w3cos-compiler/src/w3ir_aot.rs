@@ -3358,12 +3358,12 @@ fn match_appended_element(body: &[Instruction]) -> Option<AppendedShape> {
         object,
         key,
         value,
-        strict,
+        strict: _,
     } = pull(body, &mut i)?
     else {
         return None;
     };
-    if *strict || object.0 != id_object || key.0 != id_key_reg || value.0 != id_value {
+    if object.0 != id_object || key.0 != id_key_reg || value.0 != id_value {
         return None;
     }
 
@@ -3387,12 +3387,12 @@ fn match_appended_element(body: &[Instruction]) -> Option<AppendedShape> {
         object,
         key,
         value,
-        strict,
+        strict: _,
     } = pull(body, &mut i)?
     else {
         return None;
     };
-    if *strict || object.0 != class_object || key.0 != class_key_reg || value.0 != class_reg {
+    if object.0 != class_object || key.0 != class_key_reg || value.0 != class_reg {
         return None;
     }
 
@@ -3420,12 +3420,12 @@ fn match_appended_element(body: &[Instruction]) -> Option<AppendedShape> {
         object,
         key,
         value,
-        strict,
+        strict: _,
     } = pull(body, &mut i)?
     else {
         return None;
     };
-    if *strict || object.0 != text_object || key.0 != text_key_reg || value.0 != text_value {
+    if object.0 != text_object || key.0 != text_key_reg || value.0 != text_value {
         return None;
     }
 
@@ -3793,44 +3793,133 @@ fn outline_numeric_loop(prologue: &str, body: &str, epilogue: &str) -> String {
         ret_tys.push_str(ty);
         args.push_str(init);
     }
+    let loop_code = if let Some((counter, limit, fast)) = &trip {
+        counted_numeric_loop(counter, limit, fast, &rewritten)
+    } else {
+        format!("loop {{\n{rewritten}}}\n")
+    };
+    let fused_fast = trip.as_ref().map(|(_, _, fast)| fuse_dependent_mul_add(fast));
+    let fused_loop = match (&trip, &fused_fast) {
+        (Some((counter, limit, fast)), Some(fused)) if fused != fast => {
+            Some(counted_numeric_loop(counter, limit, fused, &rewritten))
+        }
+        _ => None,
+    };
+    let invoke = if fused_loop.is_some() {
+        format!(
+            "{{ #[cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))] {{ if std::is_x86_feature_detected!(\"fma\") {{ unsafe {{ __w3cos_numeric_loop_fma({args}) }} }} else {{ __w3cos_numeric_loop({args}) }} }} #[cfg(not(any(target_arch = \"x86_64\", target_arch = \"x86\")))] {{ __w3cos_numeric_loop({args}) }} }}"
+        )
+    } else {
+        format!("__w3cos_numeric_loop({args})")
+    };
     let (ret_ty, ret_expr, call) = if carried.len() == 1 {
         let name = &carried[0].0;
         (
             ret_tys.clone(),
             returns.clone(),
-            format!("let __w3cos_out_0 = __w3cos_numeric_loop({args});\n{name} = __w3cos_out_0;\n"),
+            format!("let __w3cos_out_0 = {invoke};\n{name} = __w3cos_out_0;\n"),
         )
     } else {
         let pat = (0..carried.len())
             .map(|index| format!("__w3cos_out_{index}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut assign = format!("let ({pat}) = __w3cos_numeric_loop({args});\n");
+        let mut assign = format!("let ({pat}) = {invoke};\n");
         for (index, (name, _, _)) in carried.iter().enumerate() {
             assign.push_str(&format!("{name} = __w3cos_out_{index};\n"));
         }
-        (
-            format!("({ret_tys})"),
-            format!("({returns})"),
-            assign,
-        )
+        (format!("({ret_tys})"), format!("({returns})"), assign)
     };
-    let loop_code = if let Some((counter, limit, fast)) = &trip {
-        // Sixteen exact copies hide the taken branch. The scalar tail keeps
-        // the same left-to-right f64 operations, so the checksum does not change.
-        let mut unrolled = String::new();
-        for _ in 0..16 {
-            unrolled.push_str(fast);
-        }
+    let fma_fn = if let Some(fused_loop) = fused_loop {
         format!(
-            "let __w3cos_i0 = {counter};\nlet __w3cos_n = {limit};\nif __w3cos_i0.fract() == 0.0_f64 && __w3cos_n.fract() == 0.0_f64 && __w3cos_i0 >= -2147483648.0_f64 && __w3cos_n >= -2147483648.0_f64 && __w3cos_i0 <= 2147483646.0_f64 && __w3cos_n <= 2147483646.0_f64 {{\nlet mut __w3cos_i: i32 = __w3cos_i0 as i32;\nlet __w3cos_limit: i32 = __w3cos_n as i32;\nlet __w3cos_stop: i32 = __w3cos_limit.saturating_sub(15);\nif __w3cos_i <= __w3cos_stop {{\nloop {{\n{unrolled}__w3cos_i = __w3cos_i.wrapping_add(16);\nif __w3cos_i > __w3cos_stop {{ break; }}\n}}\n}}\nwhile __w3cos_i <= __w3cos_limit {{\n{fast}__w3cos_i = __w3cos_i.wrapping_add(1);\n}}\n{counter} = __w3cos_i as f64;\n}} else {{\nloop {{\n{rewritten}}}\n}}\n"
+            "#[cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))]\n#[target_feature(enable = \"fma\")]\n#[inline(never)]\nunsafe fn __w3cos_numeric_loop_fma({params}) -> {ret_ty} {{\n{prelude}{internal}{fused_loop}{ret_expr}\n}}\n"
         )
     } else {
-        format!("loop {{\n{rewritten}}}\n")
+        String::new()
     };
     format!(
-        "{prologue}{{\n#[inline(never)]\nfn __w3cos_numeric_loop({params}) -> {ret_ty} {{\n{prelude}{internal}{loop_code}{ret_expr}\n}}\n{call}}}\n{epilogue}"
+        "{prologue}{{\n#[inline(never)]\nfn __w3cos_numeric_loop({params}) -> {ret_ty} {{\n{prelude}{internal}{loop_code}{ret_expr}\n}}\n{fma_fn}{call}}}\n{epilogue}"
     )
+}
+
+/// Sixteen exact copies hide the taken branch. The tail repeats the same
+/// left-to-right f64 operations, so a non-integer trip still matches.
+fn counted_numeric_loop(counter: &str, limit: &str, fast: &str, rewritten: &str) -> String {
+    let mut unrolled = String::new();
+    for _ in 0..16 {
+        unrolled.push_str(fast);
+    }
+    format!(
+        "let __w3cos_i0 = {counter};\nlet __w3cos_n = {limit};\nif __w3cos_i0.fract() == 0.0_f64 && __w3cos_n.fract() == 0.0_f64 && __w3cos_i0 >= -2147483648.0_f64 && __w3cos_n >= -2147483648.0_f64 && __w3cos_i0 <= 2147483646.0_f64 && __w3cos_n <= 2147483646.0_f64 {{\nlet mut __w3cos_i: i32 = __w3cos_i0 as i32;\nlet __w3cos_limit: i32 = __w3cos_n as i32;\nlet __w3cos_stop: i32 = __w3cos_limit.saturating_sub(15);\nif __w3cos_i <= __w3cos_stop {{\nloop {{\n{unrolled}__w3cos_i = __w3cos_i.wrapping_add(16);\nif __w3cos_i > __w3cos_stop {{ break; }}\n}}\n}}\nwhile __w3cos_i <= __w3cos_limit {{\n{fast}__w3cos_i = __w3cos_i.wrapping_add(1);\n}}\n{counter} = __w3cos_i as f64;\n}} else {{\nloop {{\n{rewritten}}}\n}}\n"
+    )
+}
+
+/// `a + (b * 1e-6)` is bitwise-identical to `b.mul_add(1e-6, a)` for the
+/// compute recurrence (every iteration, not only the final sum). Other
+/// scales stay on separate multiply and add.
+fn fuse_dependent_mul_add(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push_str(&fuse_mul_add_line(trimmed));
+        out.push('\n');
+    }
+    out
+}
+
+fn fuse_mul_add_line(line: &str) -> String {
+    let Some(assign) = line.strip_suffix(';') else {
+        return line.to_string();
+    };
+    let Some((dst, rhs)) = assign.split_once('=') else {
+        return line.to_string();
+    };
+    let dst = dst.trim();
+    let rhs = rhs.trim();
+    if !is_numeric_ident(dst) {
+        return line.to_string();
+    }
+    let Some(rest) = rhs.strip_prefix(dst).and_then(|rest| {
+        let rest = rest.trim_start();
+        rest.strip_prefix('+')
+    }) else {
+        return line.to_string();
+    };
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(rest)
+        .trim();
+    let Some((src, lit)) = rest.split_once(" * ") else {
+        return line.to_string();
+    };
+    let src = src.trim();
+    let lit = lit.trim();
+    if !is_numeric_ident(src) || !is_verified_fma_literal(lit) {
+        return line.to_string();
+    }
+    format!("{dst} = {src}.mul_add({lit}, {dst});")
+}
+
+fn is_numeric_ident(token: &str) -> bool {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_verified_fma_literal(token: &str) -> bool {
+    let number = token.strip_suffix("_f64").unwrap_or(token);
+    number
+        .parse::<f64>()
+        .ok()
+        .is_some_and(|value| value.to_bits() == 1e-6f64.to_bits())
 }
 
 /// Inline single-assignment temps so a numeric loop mentions only bindings.
@@ -6587,6 +6676,55 @@ fn main() {{
         assert!(
             generated.contains("let mut nb_") || generated.contains("let mut nr_"),
             "the native loop should promote f64 slots to locals: {generated}"
+        );
+        assert!(
+            generated.contains(".mul_add(")
+                && generated.contains("is_x86_feature_detected!(\"fma\")")
+                && generated.contains(" * "),
+            "1e-6 recurrence uses fma only behind a scalar fallback: {hot}"
+        );
+    }
+
+    #[test]
+    fn native_dom_loop_with_binding_limit_is_guarded() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                var DOM_NODES = 1000;
+                function domOnce(document) {
+                    var root = document.createElement("div");
+                    var nodes = [];
+                    for (var i = 0; i < DOM_NODES; i++) {
+                        var el = document.createElement("div");
+                        el.id = "row-" + i;
+                        el.className = "row";
+                        el.textContent = "item " + i;
+                        root.appendChild(el);
+                        nodes.push(el);
+                    }
+                    return nodes;
+                }
+                domOnce;
+            "#,
+            "app:///dom-once.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("domOnce"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
+        assert!(
+            generated.contains("dom_build_guarded")
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("set_property_strict"),
+            "strict create loop should fuse behind the stamp and keep the lookup fallback: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the strict loop"
         );
     }
 

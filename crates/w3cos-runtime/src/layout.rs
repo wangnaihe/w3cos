@@ -3564,11 +3564,23 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
+/// Border-box height of one block's text, wrapped at the containing block.
+pub(crate) fn block_text_border_height(
+    content: &str,
+    containing_content_width: f32,
+    style: &w3cos_std::style::Style,
+) -> f32 {
+    if content.is_empty() || !containing_content_width.is_finite() || containing_content_width <= 0.0 {
+        return 0.0;
+    }
+    wrapped_text_height(content, containing_content_width, style)
+}
+
 pub(crate) fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Style) -> f32 {
     let registry = crate::font_face::FontRegistry::global();
-    #[cfg(not(feature = "skia"))]
-    let font_runs = registry.resolve_style_runs(style, content);
-    let key = text_measure_key(width, style, registry.cascade_cache_key(style, content));
+    // Registry revision changes when a face is registered or dropped, so a
+    // hit does not resolve runs or shape glyphs again.
+    let key = text_measure_key(width, style, registry.revision());
     if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
         cache
             .borrow()
@@ -3587,6 +3599,7 @@ pub(crate) fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::
         }
         #[cfg(not(feature = "skia"))]
         {
+            let font_runs = registry.resolve_style_runs(style, content);
             if font_runs.iter().any(|run| run.font.is_some()) {
                 cascade_text_intrinsic_size(content, style, width).1
             } else {
