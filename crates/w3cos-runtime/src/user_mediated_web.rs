@@ -44,16 +44,40 @@ fn idle_start(this: Value, args: Vec<Value>) -> Value {
     if !signal.is_undefined() && signal.get_property("aborted").to_bool() {
         return w3cos_core::promise::reject(vec![signal.get_property("reason")]);
     }
-    if !IDLE_PERMISSION.with(Cell::get) {
+    if !IDLE_PERMISSION.with(Cell::get) && !crate::capability_gate::is_granted("idle-detection") {
         warn_idle();
         return w3cos_core::promise::reject(vec![error(
             "NotAllowedError",
             "Idle detection permission is not granted",
         )]);
     }
-    this.set_property("userState", Value::string("active"));
-    this.set_property("screenState", Value::string("unlocked"));
-    w3cos_core::promise::resolve(vec![Value::Undefined])
+    this.set_property("__w3cos_started", Value::Bool(true));
+    let threshold = if threshold.is_undefined() {
+        60_000.0
+    } else {
+        threshold.to_number()
+    };
+    match crate::platform_host::sample_idle() {
+        Ok(sample) => {
+            let user_state = if sample.idle_ms as f64 >= threshold {
+                "idle"
+            } else {
+                "active"
+            };
+            let screen_state = if sample.screen_locked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            this.set_property("userState", Value::string(user_state));
+            this.set_property("screenState", Value::string(screen_state));
+            w3cos_core::promise::resolve(vec![Value::Undefined])
+        }
+        Err(message) => {
+            warn_idle();
+            w3cos_core::promise::reject(vec![error("NotSupportedError", &message)])
+        }
+    }
 }
 
 pub fn idle_detector_class() -> Value {
@@ -165,6 +189,11 @@ pub fn reset_realm() {
 
 pub fn set_idle_permission(granted: bool) {
     IDLE_PERMISSION.with(|permission| permission.set(granted));
+    if granted {
+        crate::capability_gate::grant("idle-detection");
+    } else {
+        crate::capability_gate::deny("idle-detection");
+    }
 }
 
 pub fn update_idle_state(user_state: &str, screen_state: &str) {
@@ -180,7 +209,8 @@ pub fn update_idle_state(user_state: &str, screen_state: &str) {
     };
     IDLE_DETECTORS.with(|detectors| {
         for detector in detectors.borrow().iter() {
-            if detector.get_property("userState").is_null() {
+            let started = detector.get_property("__w3cos_started").to_bool();
+            if detector.get_property("userState").is_null() && !started {
                 continue;
             }
             detector.set_property("userState", Value::string(user_state));
@@ -275,6 +305,16 @@ mod tests {
         let detector = w3cos_core::class::construct(&old_idle_class, vec![]);
         detector.call_method("start", vec![]);
         crate::jsdom::drain_microtasks();
+        let user_state = detector.get_property("userState").to_js_string();
+        let screen_state = detector.get_property("screenState").to_js_string();
+        assert!(
+            matches!(user_state.as_str(), "idle" | "active" | "null"),
+            "sampled user state: {user_state}"
+        );
+        assert!(
+            matches!(screen_state.as_str(), "locked" | "unlocked" | "null"),
+            "sampled screen state: {screen_state}"
+        );
 
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -285,12 +325,10 @@ mod tests {
         assert!(old_idle_class.call(Value::Undefined, vec![]).is_undefined());
         assert!(old_eye_class.call(Value::Undefined, vec![]).is_undefined());
         assert!(detector.call_method("start", vec![]).is_undefined());
+        let fresh = w3cos_core::class::construct(&new_idle_class, vec![]);
         update_idle_state("idle", "locked");
-        assert_eq!(detector.get_property("userState"), Value::string("active"));
-        assert_eq!(
-            detector.get_property("screenState"),
-            Value::string("unlocked")
-        );
+        assert_eq!(fresh.get_property("userState").to_js_string(), "null");
+        assert_eq!(fresh.get_property("screenState").to_js_string(), "null");
         set_idle_permission(false);
         reset_realm();
     }

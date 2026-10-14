@@ -16,6 +16,8 @@ thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    static NATIVE_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static NATIVE_QUOTA: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 const CLASS_NAMES: &[&str] = &[
@@ -321,6 +323,9 @@ fn writable_value(path: PathBuf, keep_existing: bool) -> Value {
             if let Some(parent) = write_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            if let Some(quota_error) = quota_exceeded(&write_path, write_bytes.borrow().len()) {
+                return w3cos_core::promise::reject(vec![quota_error]);
+            }
             match std::fs::write(&write_path, &*write_bytes.borrow()) {
                 Ok(()) => w3cos_core::promise::resolve(vec![Value::Undefined]),
                 Err(err) => rejected("NotAllowedError", &err.to_string()),
@@ -547,6 +552,91 @@ fn observer_value(callback: Value) -> Value {
     observer
 }
 
+fn quota_exceeded(path: &Path, len: usize) -> Option<Value> {
+    let quota = NATIVE_QUOTA.with(Cell::get)?;
+    let root = NATIVE_ROOT.with(|slot| slot.borrow().clone())?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    (len as u64 > quota).then(|| {
+        error(
+            "QuotaExceededError",
+            "the write exceeds the granted native file-system quota",
+        )
+    })
+}
+
+pub fn set_native_directory(path: Option<PathBuf>) {
+    NATIVE_ROOT.with(|slot| *slot.borrow_mut() = path);
+}
+
+pub fn set_native_quota(bytes: Option<u64>) {
+    NATIVE_QUOTA.with(|quota| quota.set(bytes));
+}
+
+fn require_native_directory() -> Result<PathBuf, Value> {
+    if let Err(error) = crate::capability_gate::require("file-system") {
+        return Err(w3cos_core::promise::reject(vec![error]));
+    }
+    NATIVE_ROOT
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| {
+            rejected(
+                "AbortError",
+                "the file picker was dismissed; no directory was chosen",
+            )
+        })
+}
+
+pub fn show_directory_picker() -> Value {
+    match require_native_directory() {
+        Ok(path) if path.is_dir() => w3cos_core::promise::resolve(vec![directory_value(path)]),
+        Ok(path) => rejected(
+            "NotFoundError",
+            &format!("{} is not a directory", path.display()),
+        ),
+        Err(rejected) => rejected,
+    }
+}
+
+pub fn show_open_file_picker() -> Value {
+    let root = match require_native_directory() {
+        Ok(path) => path,
+        Err(rejected) => return rejected,
+    };
+    let file = std::fs::read_dir(&root).ok().and_then(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+    });
+    match file {
+        Some(path) => w3cos_core::promise::resolve(vec![Value::array(vec![file_value(path)])]),
+        None => rejected(
+            "AbortError",
+            "the file picker found no files in the chosen directory",
+        ),
+    }
+}
+
+pub fn show_save_file_picker(options: Value) -> Value {
+    let root = match require_native_directory() {
+        Ok(path) => path,
+        Err(rejected) => return rejected,
+    };
+    let name = options.get_property("suggestedName").to_js_string();
+    let name = if valid_child_name(&name) {
+        name
+    } else {
+        "untitled".into()
+    };
+    let path = root.join(name);
+    if let Err(err) = std::fs::write(&path, []) {
+        return rejected("NotAllowedError", &err.to_string());
+    }
+    w3cos_core::promise::resolve(vec![file_value(path)])
+}
+
 pub fn opfs_root_value() -> Result<Value, Value> {
     warning();
     let path = opfs_root_path();
@@ -583,6 +673,8 @@ pub fn reset() {
         disconnect_realm_class(class);
     }
     WARNING_EMITTED.with(|warned| warned.set(false));
+    NATIVE_ROOT.with(|slot| *slot.borrow_mut() = None);
+    NATIVE_QUOTA.with(|quota| quota.set(None));
 }
 
 #[cfg(test)]
@@ -665,5 +757,109 @@ mod tests {
         drop(iterator);
         assert!(file_weak.upgrade().is_none());
         assert!(iterator_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn native_directory_picker_is_permissioned_and_enforces_quota() {
+        crate::capability_gate::reset();
+        let root = std::env::temp_dir().join(format!("w3cos-native-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "kept").unwrap();
+        set_native_directory(Some(root.clone()));
+        set_native_quota(Some(4));
+
+        let denied = std::rc::Rc::new(RefCell::new(String::new()));
+        let denied_for_catch = std::rc::Rc::clone(&denied);
+        show_directory_picker().call_method(
+            "catch",
+            vec![Value::function(move |_, args| {
+                *denied_for_catch.borrow_mut() = args[0].get_property("name").to_js_string();
+                Value::Undefined
+            })],
+        );
+        w3cos_core::promise::drain_microtasks();
+        assert_eq!(&*denied.borrow(), "NotAllowedError");
+
+        crate::capability_gate::grant("file-system");
+        let directory = std::rc::Rc::new(RefCell::new(Value::Undefined));
+        let directory_for_then = std::rc::Rc::clone(&directory);
+        show_directory_picker().call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *directory_for_then.borrow_mut() = args[0].clone();
+                Value::Undefined
+            })],
+        );
+        w3cos_core::promise::drain_microtasks();
+        assert_eq!(
+            directory.borrow().get_property("kind").to_js_string(),
+            "directory"
+        );
+
+        let files = std::rc::Rc::new(RefCell::new(Value::Undefined));
+        let files_for_then = std::rc::Rc::clone(&files);
+        show_open_file_picker().call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *files_for_then.borrow_mut() = args[0].clone();
+                Value::Undefined
+            })],
+        );
+        w3cos_core::promise::drain_microtasks();
+        assert_eq!(
+            files
+                .borrow()
+                .get_property("0")
+                .get_property("name")
+                .to_js_string(),
+            "note.txt"
+        );
+
+        let saved = std::rc::Rc::new(RefCell::new(Value::Undefined));
+        let saved_for_then = std::rc::Rc::clone(&saved);
+        show_save_file_picker(Value::object(HashMap::from([(
+            "suggestedName".into(),
+            Value::string("fresh.txt"),
+        )])))
+        .call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *saved_for_then.borrow_mut() = args[0].clone();
+                Value::Undefined
+            })],
+        );
+        w3cos_core::promise::drain_microtasks();
+        let writable = std::rc::Rc::new(RefCell::new(Value::Undefined));
+        let writable_for_then = std::rc::Rc::clone(&writable);
+        saved
+            .borrow()
+            .call_method("createWritable", vec![])
+            .call_method(
+                "then",
+                vec![Value::function(move |_, args| {
+                    *writable_for_then.borrow_mut() = args[0].clone();
+                    Value::Undefined
+                })],
+            );
+        w3cos_core::promise::drain_microtasks();
+        let quota = std::rc::Rc::new(RefCell::new(String::new()));
+        let quota_for_catch = std::rc::Rc::clone(&quota);
+        writable
+            .borrow()
+            .call_method("write", vec![Value::string("too-big")])
+            .call_method(
+                "catch",
+                vec![Value::function(move |_, args| {
+                    *quota_for_catch.borrow_mut() = args[0].get_property("name").to_js_string();
+                    Value::Undefined
+                })],
+            );
+        w3cos_core::promise::drain_microtasks();
+        assert_eq!(&*quota.borrow(), "QuotaExceededError");
+        set_native_directory(None);
+        set_native_quota(None);
+        crate::capability_gate::reset();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

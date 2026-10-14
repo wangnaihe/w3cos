@@ -124,6 +124,23 @@ impl AgentPermissions {
         }
         true
     }
+
+    /// Page capability names that share a bit with this agent.
+    ///
+    /// `w3cos-accessibility` is `can_read_dom`, `display-capture` is
+    /// `can_screenshot`, `w3cos-process` is `can_spawn_processes`, and
+    /// `file-system` is `can_access_files`. Other page names are not bridge
+    /// bits and return `None`. Hosts keep the page gate and these fields in
+    /// sync; the runtime does not read this struct itself.
+    pub fn grants_page_capability(&self, name: &str) -> Option<bool> {
+        match name {
+            "w3cos-accessibility" => Some(self.can_read_dom),
+            "display-capture" => Some(self.can_screenshot),
+            "w3cos-process" => Some(self.can_spawn_processes),
+            "file-system" => Some(self.can_access_files),
+            _ => None,
+        }
+    }
 }
 
 /// One bridge operation, shared by the HTTP server and the shell intent gate.
@@ -387,6 +404,29 @@ mod tests {
                 },
             ),
             Err(AuthError::WriteDom)
+        );
+    }
+
+    #[test]
+    fn page_capabilities_reuse_the_agent_bits() {
+        let observer = AgentPermissions::observer();
+        assert_eq!(
+            observer.grants_page_capability("w3cos-accessibility"),
+            Some(true)
+        );
+        assert_eq!(
+            observer.grants_page_capability("display-capture"),
+            Some(true)
+        );
+        assert_eq!(
+            observer.grants_page_capability("w3cos-process"),
+            Some(false)
+        );
+        assert_eq!(observer.grants_page_capability("file-system"), Some(false));
+        assert_eq!(observer.grants_page_capability("w3cos-tray"), None);
+        assert_eq!(
+            AgentPermissions::system().grants_page_capability("w3cos-process"),
+            Some(true)
         );
     }
 

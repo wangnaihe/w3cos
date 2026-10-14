@@ -64,6 +64,9 @@ pub fn permissions_class() -> Value {
 }
 
 fn state_for(name: &str) -> Option<String> {
+    if let Some(state) = crate::capability_gate::decision(name) {
+        return Some(state);
+    }
     match name {
         "notifications" => Some(
             crate::notification_web::notification_class()
@@ -94,7 +97,20 @@ fn state_for(name: &str) -> Option<String> {
         | "top-level-storage-access"
         | "window-management"
         | "local-fonts"
-        | "speaker-selection" => Some("prompt".into()),
+        | "speaker-selection"
+        | "direct-sockets"
+        | "webnn"
+        | "file-system"
+        | "battery"
+        | "display-capture"
+        | "w3cos-process"
+        | "w3cos-global-shortcuts"
+        | "w3cos-tray"
+        | "w3cos-window-manager"
+        | "w3cos-daemon"
+        | "w3cos-system"
+        | "w3cos-keyring"
+        | "w3cos-accessibility" => Some("prompt".into()),
         _ => None,
     }
 }

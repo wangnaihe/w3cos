@@ -2,8 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Once;
-
 use w3cos_core::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -121,14 +119,26 @@ pub fn battery_manager_value() -> Value {
 
 pub fn get_battery_value() -> Value {
     Value::function(|_, _| {
-        static WARNING: Once = Once::new();
-        WARNING.call_once(|| {
-            eprintln!(
-                "[w3cos] warning: navigator.getBattery returns a host-injectable compatibility \
-                 snapshot; live battery telemetry requires a platform power adapter"
-            );
-        });
-        w3cos_core::promise::resolve(vec![battery_manager_value()])
+        if let Some(rejected) = crate::capability_gate::reject_unless_granted("battery") {
+            return rejected;
+        }
+        match crate::platform_host::read_battery() {
+            Ok(reading) => {
+                update_battery_state(BatteryState {
+                    charging: reading.charging,
+                    charging_time: reading.charging_time,
+                    discharging_time: reading.discharging_time,
+                    level: reading.level,
+                });
+                w3cos_core::promise::resolve(vec![battery_manager_value()])
+            }
+            Err(message) => {
+                w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
+                    &message,
+                    "NotSupportedError",
+                )])
+            }
+        }
     })
 }
 
