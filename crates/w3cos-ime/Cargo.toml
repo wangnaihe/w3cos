@@ -1,0 +1,10 @@
+[package]
+name = "w3cos-ime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IME Hub message types. Routes input intents; no recognition engine yet."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

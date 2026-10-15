@@ -16,6 +16,7 @@ members = [
     "crates/w3cos-ai-bridge",
     "crates/w3cos-demo",
     "crates/w3cos-shell",
+    "crates/w3cos-ime",
     "crates/w3cos-rn-compat",
     "crates/w3cos-ffi",
     "crates/w3cos-mobile",
