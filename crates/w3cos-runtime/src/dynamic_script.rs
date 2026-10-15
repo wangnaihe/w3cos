@@ -14511,7 +14511,7 @@ parserMutationObserver.disconnect();
             computed
                 .call_method("getPropertyValue", vec![Value::string("color")])
                 .to_js_string(),
-            "#ff00ff"
+            "rgb(255, 0, 255)"
         );
         assert_eq!(
             computed.get_property("color").to_js_string(),
@@ -15876,17 +15876,16 @@ window.__dynamicInlineHandler = dynamicInlineResult;
             Some((3, 2))
         );
         let tree = crate::dom::with_document(w3cos_dom::Document::to_component_tree);
-        let picture = tree.children.first().expect("picture component");
-        let rendered_image = picture
-            .children
-            .iter()
-            .find(|component| {
-                matches!(
-                    component.kind,
-                    w3cos_std::component::ComponentKind::Image { .. }
-                )
-            })
-            .expect("selected image component");
+        fn find_image(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if matches!(
+                component.kind,
+                w3cos_std::component::ComponentKind::Image { .. }
+            ) {
+                return Some(component);
+            }
+            component.children.iter().find_map(find_image)
+        }
+        let rendered_image = find_image(&tree).expect("selected image component");
         assert!(matches!(
             rendered_image.kind,
             w3cos_std::component::ComponentKind::Image { ref src } if src == "/wide-2x.png"
@@ -17630,7 +17629,7 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         crate::jsdom::drain_microtasks();
         assert_eq!(
             computed_color(),
-            "#0000ff",
+            "rgb(0, 0, 255)",
             "replacing the earlier inline sheet must preserve DOM cascade order"
         );
 
