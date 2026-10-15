@@ -71,6 +71,8 @@ const RECEIPT_QUERY_SIGNAL: usize = 33;
 const LOCK_PASSPHRASE_SIGNAL: usize = 34;
 const LEXICON_DRAFT_SIGNAL: usize = 35;
 const CONFIRM_FOCUS_SIGNAL: usize = 36;
+const SETTINGS_MENU_SIGNAL: usize = 37;
+const PENDING_LOCALE_SIGNAL: usize = 38;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -173,6 +175,8 @@ const OP_LEXICON_SAVE: u8 = 100;
 const OP_LEXICON_DROP: u8 = 101;
 const OP_LEXICON_EXPORT: u8 = 102;
 const OP_LEXICON_CLEAR: u8 = 103;
+const OP_SETTINGS_LANGUAGE: u8 = 104;
+const OP_SETTINGS_BACK: u8 = 105;
 
 fn main() {
     shell_main();
@@ -292,6 +296,8 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_signal(1);
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -403,9 +409,26 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_CHIP_CONTEXT => apply_propose(session, "where am i", &ctx),
         OP_CHIP_TERMINAL => apply_propose(session, "打开终端", &ctx),
         OP_CHIP_SETTINGS => apply_propose(session, "打开设置", &ctx),
-        OP_CONFIRM => apply_confirm(session, &ctx),
+        OP_CONFIRM => {
+            let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+            if !pending.is_empty() && state::get_signal(PHASE_SIGNAL) != 1 {
+                apply_locale_confirm(session, &pending);
+            } else {
+                apply_confirm(session, &ctx);
+            }
+        }
         OP_CANCEL => {
-            if state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending() {
+            let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+            if !pending.is_empty()
+                && state::get_signal(PHASE_SIGNAL) != 1
+                && state::get_signal(PHASE_SIGNAL) != 3
+                && !w3cos_ai_bridge::agent_loop::has_pending()
+            {
+                state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+                sync_session(session, state::get_signal(PHASE_SIGNAL), "");
+            } else if state::get_signal(PHASE_SIGNAL) == 3
+                || w3cos_ai_bridge::agent_loop::has_pending()
+            {
                 let update = agent_host::cancel();
                 apply_host_update(session, update);
             } else {
@@ -812,6 +835,62 @@ fn run_terminal_from_button(session: &mut IntentSession) {
     };
     session.record_external(&line, "l2:run", decision, true, &outcome, IntentTier::L2);
     sync_session(session, 2, &outcome);
+}
+
+fn show_settings_pane(tab: i64) {
+    state::set_signal(SETTINGS_TAB_SIGNAL, tab);
+    state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+}
+
+fn stage_locale(tag: &str) {
+    if locale::current() == tag || state::get_signal(PHASE_SIGNAL) == 1 {
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        return;
+    }
+    state::set_text_signal(PENDING_LOCALE_SIGNAL, tag);
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "cancel");
+    if state::get_signal(UNLOCKED_SIGNAL) != 0 {
+        state::request_focus_label(&locale::t("cancel"));
+    }
+    state::mark_dirty();
+}
+
+fn locale_self_name(tag: &str) -> String {
+    if tag == "en" {
+        locale::t("locale-name-en")
+    } else {
+        locale::t("locale-name-zh")
+    }
+}
+
+fn apply_locale_confirm(session: &mut IntentSession, tag: &str) {
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("lock-first"),
+        );
+        return;
+    }
+    let name = locale_self_name(tag);
+    let utterance = locale::t_args("locale-confirm-title", &[("name", &name)]);
+    locale::set_locale(tag);
+    state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+    let applied = locale_self_name(tag);
+    let outcome = format!("Interface language is now {tag}.");
+    session.record_external(
+        &utterance,
+        "set-locale",
+        w3cos_ai_bridge::intent::Decision::Allowed,
+        true,
+        &outcome,
+        IntentTier::L0,
+    );
+    sync_session(
+        session,
+        state::get_signal(PHASE_SIGNAL),
+        &locale::t_args("locale-applied", &[("name", &applied)]),
+    );
 }
 
 fn apply_effect(effect: &ExecuteResult) {
@@ -1279,10 +1358,12 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::set_signal(LAUNCHER_SIGNAL, 1);
         }
         OP_DISMISS_TOAST => state::set_text_signal(TOAST_SIGNAL, ""),
-        OP_SETTINGS_LOCAL => state::set_signal(SETTINGS_TAB_SIGNAL, 0),
-        OP_SETTINGS_IDENTITY => state::set_signal(SETTINGS_TAB_SIGNAL, 1),
-        OP_SETTINGS_BRIDGE => state::set_signal(SETTINGS_TAB_SIGNAL, 2),
-        OP_SETTINGS_L2 => state::set_signal(SETTINGS_TAB_SIGNAL, 3),
+        OP_SETTINGS_LOCAL => show_settings_pane(0),
+        OP_SETTINGS_IDENTITY => show_settings_pane(1),
+        OP_SETTINGS_BRIDGE => show_settings_pane(2),
+        OP_SETTINGS_L2 => show_settings_pane(3),
+        OP_SETTINGS_LANGUAGE => show_settings_pane(6),
+        OP_SETTINGS_BACK => state::set_signal(SETTINGS_MENU_SIGNAL, 1),
         OP_FILES_HOME => state::set_signal(FILES_FOLDER_SIGNAL, 0),
         OP_FILES_DOCS => state::set_signal(FILES_FOLDER_SIGNAL, 1),
         OP_FILES_PICS => state::set_signal(FILES_FOLDER_SIGNAL, 2),
@@ -1301,14 +1382,8 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_FOCUS_AGENT => focus_app(4),
         OP_FOCUS_BROWSER => focus_app(5),
         OP_FOCUS_EDITOR => focus_app(6),
-        OP_LOCALE_ZH => {
-            locale::set_locale("zh-CN");
-            state::mark_dirty();
-        }
-        OP_LOCALE_EN => {
-            locale::set_locale("en");
-            state::mark_dirty();
-        }
+        OP_LOCALE_ZH => stage_locale("zh-CN"),
+        OP_LOCALE_EN => stage_locale("en"),
         OP_NOTIFY_TOGGLE => {
             let next = i64::from(state::get_signal(NOTIFY_SIGNAL) == 0);
             state::set_signal(NOTIFY_SIGNAL, next);
@@ -1322,7 +1397,7 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         }
         OP_TRAY_L2 => {
             focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+            show_settings_pane(3);
         }
         OP_RECEIPT_NEXT => {
             let pages = receipt_page_count(visible_receipts().len());
@@ -1365,11 +1440,11 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         }
         OP_SETTINGS_DEVICES => {
             focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            show_settings_pane(4);
         }
         OP_SETTINGS_LEXICON => {
             focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 5);
+            show_settings_pane(5);
         }
         OP_LEXICON_STEALTH => {
             if lexicon::unlocked() {
@@ -1578,6 +1653,16 @@ fn session_l2_on() -> bool {
     })
 }
 
+fn present_settings(tab: i64, menu: i64) {
+    focus_app(3);
+    show_settings_pane(tab);
+    state::set_signal(SETTINGS_MENU_SIGNAL, menu);
+    let (width, height) = stage_bounds();
+    if !windows::is_maximized(3) {
+        let _ = windows::toggle_maximize(3, width, height);
+    }
+}
+
 fn screenshot_shows_locked_permission() -> bool {
     std::env::var("W3COS_SCREEN").ok().as_deref() == Some("permission-locked")
 }
@@ -1594,19 +1679,15 @@ fn apply_screen_override() {
         state::set_text_signal(LAUNCHER_QUERY_SIGNAL, query.trim());
     }
     match std::env::var("W3COS_SCREEN").ok().as_deref() {
-        Some("settings") => focus_app(3),
-        Some("settings-l2") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+        Some("settings") => present_settings(0, 1),
+        Some("settings-night") => {
+            present_settings(0, 0);
+            state::set_signal(NIGHT_SIGNAL, 1);
         }
-        Some("settings-identity") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 1);
-        }
-        Some("settings-bridge") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 2);
-        }
+        Some("settings-l2") => present_settings(3, 0),
+        Some("settings-identity") => present_settings(1, 0),
+        Some("settings-bridge") | Some("settings-agent") => present_settings(2, 0),
+        Some("settings-language") => present_settings(6, 0),
         Some("files") => focus_app(1),
         Some("files-docs") => {
             focus_app(1);
@@ -1661,13 +1742,11 @@ fn apply_screen_override() {
         }
         Some("notify") => state::set_signal(NOTIFY_SIGNAL, 1),
         Some("devices") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            present_settings(4, 0);
             handoff::demo_pending();
         }
         Some("devices-sync") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            present_settings(4, 0);
             handoff::demo_pending();
             let _ = handoff::codes_match();
         }
@@ -1689,7 +1768,7 @@ fn apply_screen_override() {
         }
         Some("lexicon") => {
             focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 5);
+            show_settings_pane(5);
             lexicon::seed_demo();
         }
         Some("lexicon-rank") => {
@@ -1752,6 +1831,9 @@ fn build_shell() -> Component {
     }
     if state::get_signal(TASKS_SIGNAL) != 0 && posture() == Posture::Desktop {
         column.push(dock_right(build_task_center()));
+    }
+    if !state::get_signal_text(PENDING_LOCALE_SIGNAL).is_empty() {
+        column.push(modal_layer(build_locale_confirm()));
     }
     if state::get_signal(PHASE_SIGNAL) == 1 {
         column.push(modal_layer(build_confirm_dialog()));
@@ -3083,6 +3165,57 @@ fn focus_kind(default: &str) -> String {
     }
 }
 
+fn build_locale_confirm() -> Component {
+    let tag = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+    let name = locale_self_name(&tag);
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let mut rows = Vec::new();
+    if let Some(mark) = layer_mark("L0") {
+        rows.push(mark);
+    }
+    rows.push(Component::text(
+        locale::t_args("locale-confirm-title", &[("name", &name)]),
+        Style {
+            font_size: 22.0,
+            font_weight: 700,
+            color: ink(),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        locale::t_args("locale-confirm-impact", &[("name", &name)]),
+        Style {
+            font_size: 14.0,
+            color: muted_ink(),
+            ..Style::default()
+        },
+    ));
+    let mut cancel = sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost);
+    let accept = if unlocked {
+        sheet_button(locale::t("confirm"), OP_CONFIRM, SheetKind::Primary)
+    } else {
+        sheet_button(locale::t("lock-first"), OP_UNLOCK, SheetKind::Primary)
+    };
+    mark_initial_focus(&mut cancel);
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![cancel, accept],
+    ));
+    rows.push(Component::text(
+        locale::t("confirm-footnote"),
+        Style {
+            font_size: 12.0,
+            color: faint_token(),
+            ..Style::default()
+        },
+    ));
+    dialog_shell(rows)
+}
+
 fn build_confirm_dialog() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let tier = state::get_signal_text(TIER_SIGNAL);
@@ -3955,21 +4088,66 @@ fn file_preview_pane() -> Component {
 }
 
 fn nav_button(name: &str, active: bool, code: u8) -> Component {
-    let bg = if active { "#3d5570" } else { "#243447" };
-    let color = if active { "#f4f7fb" } else { "#d5dee8" };
-    Component::button_with_click(
+    let mut button = Component::button_with_click(
         name,
         Style {
-            font_size: 13.0,
-            color: Color::from_hex(color),
-            background: Color::from_hex(bg),
+            font_size: 14.0,
+            font_weight: if active { 700 } else { 500 },
+            color: Color::from_hex(if active { "#d7f6e8" } else { "#d5dee8" }),
+            background: Color::from_hex(if active { "#14362c" } else { "#243447" }),
+            border_width: if active { 1.0 } else { 0.0 },
+            border_color: Color::from_hex("#1c8f62"),
             border_radius: 10.0,
-            padding: Edges::xy(12.0, 12.0),
+            padding: Edges::xy(12.0, 0.0),
             min_height: Dimension::Px(48.0),
+            width: Dimension::Percent(100.0),
             ..Style::default()
         },
         invoke(code),
-    )
+    );
+    if active {
+        let props = button
+            .style
+            .custom_properties
+            .get_or_insert_with(HashMap::new);
+        props.insert("--w3cos-selected".to_string(), "1".to_string());
+    }
+    button
+}
+
+fn settings_switch(label: &str, on: bool, code: u8) -> Component {
+    let mut button = Component::button_with_click(
+        label,
+        Style {
+            font_size: 15.0,
+            font_weight: 650,
+            color: Color::from_hex(if on { "#e9fff5" } else { "#f4f7fb" }),
+            background: Color::from_hex(if on { "#0c6d4c" } else { "#31475e" }),
+            border_radius: 12.0,
+            padding: Edges::xy(14.0, 0.0),
+            min_height: Dimension::Px(48.0),
+            width: Dimension::Percent(100.0),
+            ..Style::default()
+        },
+        invoke(code),
+    );
+    let props = button
+        .style
+        .custom_properties
+        .get_or_insert_with(HashMap::new);
+    props.insert(
+        "--w3cos-switch".to_string(),
+        if on { "1" } else { "0" }.to_string(),
+    );
+    button
+}
+
+fn settings_link(label: String, code: u8) -> Component {
+    let mut button = chrome_button(label, code, "#31475e");
+    button.style.min_height = Dimension::Px(48.0);
+    button.style.height = Dimension::Px(48.0);
+    button.style.width = Dimension::Percent(100.0);
+    button
 }
 
 fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
@@ -4123,8 +4301,67 @@ fn build_terminal_app() -> Component {
 // Settings App
 // ==========================================================================
 
+fn settings_nav(tab: i64, mark_current: bool) -> Vec<Component> {
+    let on = |value: i64| mark_current && tab == value;
+    vec![
+        nav_button(&locale::t("settings-local"), on(0), OP_SETTINGS_LOCAL),
+        nav_button(&locale::t("settings-identity"), on(1), OP_SETTINGS_IDENTITY),
+        nav_button(
+            &locale::t("settings-language-nav"),
+            on(6),
+            OP_SETTINGS_LANGUAGE,
+        ),
+        nav_button(&locale::t("settings-agent"), on(2), OP_SETTINGS_BRIDGE),
+        nav_button(
+            &locale::t("settings-devices-nav"),
+            on(4),
+            OP_SETTINGS_DEVICES,
+        ),
+    ]
+}
+
 fn build_settings_app() -> Component {
     let tab = state::get_signal(SETTINGS_TAB_SIGNAL);
+    let phone = posture() == Posture::Phone;
+    let menu = state::get_signal(SETTINGS_MENU_SIGNAL) != 0;
+    if phone && menu {
+        return Component::column(
+            Style {
+                flex_grow: 1.0,
+                background: Color::from_hex("#24384a"),
+                padding: Edges::all(12.0),
+                gap: 8.0,
+                ..Style::default()
+            },
+            settings_nav(tab, false),
+        );
+    }
+    let pane = Component::column(
+        Style {
+            flex_grow: 1.0,
+            min_width: Dimension::Px(0.0),
+            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            gap: 12.0,
+            overflow: Overflow::Auto,
+            ..Style::default()
+        },
+        settings_page(tab),
+    );
+    if phone {
+        let mut back = chrome_button(locale::t("back"), OP_SETTINGS_BACK, "#31475e");
+        back.style.min_height = Dimension::Px(48.0);
+        back.style.width = Dimension::Percent(100.0);
+        return Component::column(
+            Style {
+                flex_grow: 1.0,
+                background: Color::from_hex("#24384a"),
+                padding: Edges::all(12.0),
+                gap: 12.0,
+                ..Style::default()
+            },
+            vec![back, pane],
+        );
+    }
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -4137,56 +4374,23 @@ fn build_settings_app() -> Component {
             Component::row(
                 Style {
                     flex_grow: 1.0,
+                    min_height: Dimension::Px(0.0),
                     gap: 0.0,
                     ..Style::default()
                 },
                 vec![
                     Component::column(
                         Style {
-                            width: Dimension::Px(if posture() == Posture::Phone {
-                                108.0
-                            } else {
-                                200.0
-                            }),
+                            width: Dimension::Px(200.0),
+                            flex_shrink: 0.0,
                             background: Color::from_hex("#1b2c3e"),
                             padding: Edges::all(12.0),
                             gap: 4.0,
                             ..Style::default()
                         },
-                        vec![
-                            nav_button(&locale::t("settings-local"), tab == 0, OP_SETTINGS_LOCAL),
-                            nav_button(
-                                &locale::t("settings-identity"),
-                                tab == 1,
-                                OP_SETTINGS_IDENTITY,
-                            ),
-                            nav_button(
-                                &locale::t("settings-permissions"),
-                                tab == 2,
-                                OP_SETTINGS_BRIDGE,
-                            ),
-                            nav_button(&locale::t("settings-l2"), tab == 3, OP_SETTINGS_L2),
-                            nav_button(
-                                &locale::t("settings-devices"),
-                                tab == 4,
-                                OP_SETTINGS_DEVICES,
-                            ),
-                            nav_button(
-                                &locale::t("settings-lexicon"),
-                                tab == 5,
-                                OP_SETTINGS_LEXICON,
-                            ),
-                        ],
+                        settings_nav(tab, true),
                     ),
-                    Component::column(
-                        Style {
-                            flex_grow: 1.0,
-                            padding: Edges::all(20.0),
-                            gap: 12.0,
-                            ..Style::default()
-                        },
-                        settings_page(tab),
-                    ),
+                    pane,
                 ],
             ),
         ],
@@ -4196,17 +4400,18 @@ fn build_settings_app() -> Component {
 fn settings_page(tab: i64) -> Vec<Component> {
     match tab {
         1 => settings_identity_page(),
-        2 => settings_permissions_page(),
+        2 => settings_agent_page(),
         3 => settings_l2_page(),
         4 => settings_devices_page(),
         5 => settings_lexicon_page(),
+        6 => settings_language_page(),
         _ => settings_local_page(),
     }
 }
 
 fn settings_devices_page() -> Vec<Component> {
     let mut page = settings_heading(
-        &locale::t("settings-devices-title"),
+        &locale::t("settings-devices-nav"),
         &locale::t("settings-devices-detail"),
     );
     let fingerprint = truncate_middle(&handoff::local_fingerprint(), 28);
@@ -4873,28 +5078,91 @@ fn lexicon_draft_field() -> Component {
 }
 
 fn settings_local_page() -> Vec<Component> {
-    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
-        locale::t("on")
-    } else {
-        locale::t("off")
-    };
     let mut rows = settings_heading(
         &locale::t("settings-local-title"),
         &locale::t("settings-local-detail"),
     );
-    rows.push(settings_row(&locale::t("settings-night"), &night));
-    rows.push(chrome_button(
-        locale::t("settings-night-toggle"),
+    rows.push(settings_switch(
+        &locale::t("settings-night"),
+        state::get_signal(NIGHT_SIGNAL) != 0,
         OP_CHIP_NIGHT,
-        "#3d5570",
     ));
-    rows.push(settings_row(
-        &locale::t("settings-language"),
-        &locale::current(),
+    rows.push(settings_link(
+        locale::t("settings-lexicon-open"),
+        OP_SETTINGS_LEXICON,
     ));
-    rows.push(chrome_button(locale::t("lang-zh"), OP_LOCALE_ZH, "#3d5570"));
-    rows.push(chrome_button(locale::t("lang-en"), OP_LOCALE_EN, "#3d5570"));
     rows
+}
+
+fn settings_language_page() -> Vec<Component> {
+    let mut rows = settings_heading(
+        &locale::t("settings-language-title"),
+        &locale::t("settings-language-detail"),
+    );
+    let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+    rows.push(locale_choice("zh-CN", &pending));
+    rows.push(locale_choice("en", &pending));
+    rows
+}
+
+fn locale_choice(tag: &str, pending: &str) -> Component {
+    let current = locale::current() == tag;
+    let name = locale_self_name(tag);
+    let code = if tag == "en" {
+        OP_LOCALE_EN
+    } else {
+        OP_LOCALE_ZH
+    };
+    let mut name_button = nav_button(&name, current, code);
+    name_button.style.flex_grow = 1.0;
+    name_button.style.width = Dimension::Auto;
+    let tag_label = if tag == "en" {
+        locale::t("locale-tag-en")
+    } else {
+        locale::t("locale-tag-zh")
+    };
+    let mut side = vec![Component::text(
+        tag_label,
+        Style {
+            font_size: 12.0,
+            color: muted_ink(),
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+    )];
+    if pending == tag {
+        side.push(Component::text(
+            locale::t("locale-pending"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#f0d7b4"),
+                flex_shrink: 0.0,
+                ..Style::default()
+            },
+        ));
+    }
+    Component::row(
+        Style {
+            min_height: Dimension::Px(48.0),
+            gap: 8.0,
+            align_items: AlignItems::Center,
+            width: Dimension::Percent(100.0),
+            ..Style::default()
+        },
+        vec![
+            name_button,
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+                side,
+            ),
+        ],
+    )
 }
 
 fn settings_identity_page() -> Vec<Component> {
@@ -4915,7 +5183,20 @@ fn settings_identity_page() -> Vec<Component> {
         &locale::t("settings-identity-title"),
         &locale::t("settings-identity-detail"),
     );
-    rows.push(settings_row(&locale::t("settings-subject"), &subject_label));
+    rows.push(Component::text(
+        truncate_middle(&subject_label, 28),
+        Style {
+            font_size: 16.0,
+            font_weight: 650,
+            color: Color::from_hex("#f4f7fb"),
+            ..Style::default()
+        },
+    ));
+    rows.push(chrome_button(
+        locale::t("settings-copy"),
+        OP_COPY_SUBJECT,
+        "#31475e",
+    ));
     rows.push(Component::text(
         locale::t("passkey-unregistered"),
         Style {
@@ -4952,7 +5233,7 @@ fn settings_identity_page() -> Vec<Component> {
     rows
 }
 
-fn settings_permissions_page() -> Vec<Component> {
+fn settings_agent_page() -> Vec<Component> {
     let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
     let bridge = match bridge.trim() {
         "" | "observer" => locale::t("perm-observer"),
@@ -4960,7 +5241,24 @@ fn settings_permissions_page() -> Vec<Component> {
         "system" => locale::t("perm-system"),
         _ => locale::t("perm-unknown"),
     };
-    let mut rows = settings_heading(&locale::t("perm-title"), &locale::t("perm-detail"));
+    let shared = state::get_signal(CONTEXT_SIGNAL) != 0;
+    let mut rows = settings_heading(
+        &locale::t("settings-agent-title"),
+        &locale::t("settings-agent-detail"),
+    );
+    rows.push(settings_switch(
+        &locale::t("settings-context-switch"),
+        shared,
+        if shared { OP_REVOKE } else { OP_RESTORE },
+    ));
+    rows.push(Component::text(
+        locale::t("settings-context-note"),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#d5dee8"),
+            ..Style::default()
+        },
+    ));
     rows.push(settings_row(&locale::t("perm-bridge"), &bridge));
     rows.push(settings_row(
         &locale::t("perm-shell"),
@@ -4974,6 +5272,7 @@ fn settings_permissions_page() -> Vec<Component> {
         &locale::t("perm-standing"),
         &locale::t("perm-standing-value"),
     ));
+    rows.push(settings_link(locale::t("settings-l2-open"), OP_SETTINGS_L2));
     rows
 }
 
@@ -8312,6 +8611,237 @@ mod shell_ux_tests {
         state::set_signal(PHASE_SIGNAL, 0);
         state::set_signal(PERM_SIGNAL, 0);
         state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn prop(node: &Component, key: &str) -> Option<String> {
+        node.style
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(key).cloned())
+    }
+
+    fn button_face(
+        root: &Component,
+        label: &str,
+    ) -> (Option<u8>, Option<String>, Option<String>, f32) {
+        let mut found = None;
+        walk(root, &mut |node| {
+            if found.is_some() {
+                return;
+            }
+            if let ComponentKind::Button { label: current } = &node.kind
+                && current == label
+            {
+                found = Some((
+                    invoke_code(node),
+                    prop(node, "--w3cos-selected"),
+                    prop(node, "--w3cos-switch"),
+                    match node.style.min_height {
+                        Dimension::Px(value) => value,
+                        _ => 0.0,
+                    },
+                ));
+            }
+        });
+        found.unwrap_or_else(|| panic!("missing button {label}"))
+    }
+
+    #[test]
+    fn settings_sidebar_switches_panes_and_toggles_night_and_context() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        on_shell_intent(OP_SETTINGS_LOCAL, "");
+        let desktop = build_settings_app();
+        let nav = ["本机", "身份", "语言", "代理能力", "设备与接续"];
+        for label in nav {
+            assert!(
+                button_labels(&desktop).iter().any(|item| item == label),
+                "{label} missing from {}",
+                text_blob(&desktop)
+            );
+        }
+        assert!(!button_labels(&desktop).iter().any(|item| item == "权限"));
+        assert!(!button_labels(&desktop).iter().any(|item| item == "L2 模型"));
+        let (local_code, local_selected, _, _) = button_face(&desktop, "本机");
+        assert_eq!(local_selected.as_deref(), Some("1"));
+        assert_eq!(local_code, Some(OP_SETTINGS_LOCAL));
+        let (night_code, _, night_switch, _) = button_face(&desktop, "夜间模式");
+        assert_eq!(night_switch.as_deref(), Some("0"));
+        assert_eq!(night_code, Some(OP_CHIP_NIGHT));
+        let local_blob = text_blob(&desktop);
+        assert!(!local_blob.lines().any(|line| line == "开" || line == "关"));
+
+        on_shell_intent(OP_CHIP_NIGHT, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 0);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 1);
+        on_shell_intent(OP_CHIP_NIGHT, "");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 0);
+        state::set_signal(NIGHT_SIGNAL, 1);
+        let (_, _, night_on, _) = button_face(&build_settings_app(), "夜间模式");
+        assert_eq!(night_on.as_deref(), Some("1"));
+        state::set_signal(NIGHT_SIGNAL, 0);
+
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkhaXgExampleSubjectValue");
+        on_shell_intent(OP_SETTINGS_IDENTITY, "");
+        let identity = build_settings_app();
+        let (_, identity_selected, _, _) = button_face(&identity, "身份");
+        assert_eq!(identity_selected.as_deref(), Some("1"));
+        let (_, local_selected, _, _) = button_face(&identity, "本机");
+        assert_eq!(local_selected, None);
+        let identity_blob = text_blob(&identity);
+        assert!(
+            identity_blob.contains("通行证：尚未注册"),
+            "{identity_blob}"
+        );
+        assert!(identity_blob.contains("注册本机通行证"), "{identity_blob}");
+        assert!(identity_blob.contains('…'), "{identity_blob}");
+        assert!(
+            !identity_blob.contains("did:key:z6MkhaXgExampleSubjectValue"),
+            "{identity_blob}"
+        );
+        assert!(
+            !identity_blob.contains("WebAuthn 仪式还没做"),
+            "{identity_blob}"
+        );
+        assert_eq!(codes_for(&identity, "复制"), vec![OP_COPY_SUBJECT]);
+        assert_eq!(codes_for(&identity, "注册本机通行证"), vec![OP_ENROLL]);
+
+        on_shell_intent(OP_SETTINGS_LANGUAGE, "");
+        let language = text_blob(&build_settings_app());
+        assert!(language.contains("简体中文"), "{language}");
+        assert!(language.contains("English"), "{language}");
+        assert!(language.contains("zh-CN"), "{language}");
+        assert!(language.contains("en"), "{language}");
+        on_shell_intent(OP_LOCALE_EN, "");
+        assert_eq!(locale::current(), "zh-CN");
+        assert_eq!(state::get_signal_text(PENDING_LOCALE_SIGNAL), "en");
+        let pending = text_blob(&build_settings_app());
+        assert!(pending.contains("待确认"), "{pending}");
+        let card = build_locale_confirm();
+        let card_blob = text_blob(&card);
+        assert!(card_blob.contains("L0 规则"), "{card_blob}");
+        assert!(card_blob.contains("把界面改成 English"), "{card_blob}");
+        assert!(
+            card_blob
+                .contains("只换界面上的句子。已经写下的收据保持原样，路径和时间格式跟 English。"),
+            "{card_blob}"
+        );
+        on_shell_intent(OP_CANCEL, "");
+        assert_eq!(locale::current(), "zh-CN");
+        assert!(state::get_signal_text(PENDING_LOCALE_SIGNAL).is_empty());
+        on_shell_intent(OP_LOCALE_EN, "");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(locale::current(), "en");
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("set-locale"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+        on_shell_intent(OP_LOCALE_ZH, "");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(locale::current(), "zh-CN");
+
+        on_shell_intent(OP_RESTORE, "");
+        on_shell_intent(OP_SETTINGS_BRIDGE, "");
+        let agent = build_settings_app();
+        let agent_blob = text_blob(&agent);
+        assert!(agent_blob.contains("看见当前窗口"), "{agent_blob}");
+        assert!(
+            agent_blob.contains("这和跨设备同步是两件事。"),
+            "{agent_blob}"
+        );
+        assert!(!agent_blob.contains('×'), "{agent_blob}");
+        assert!(!text_blob(&build_intent_panel()).contains('×'));
+        assert!(!text_blob(&build_floating_taskbar()).contains('×'));
+        let (share_code, _, share_on, _) = button_face(&agent, "看见当前窗口");
+        assert_eq!(share_on.as_deref(), Some("1"));
+        assert_eq!(share_code, Some(OP_REVOKE));
+        on_shell_intent(OP_REVOKE, "");
+        assert_eq!(state::get_signal(CONTEXT_SIGNAL), 0);
+        let hidden = build_settings_app();
+        let (hidden_code, _, hidden_on, _) = button_face(&hidden, "看见当前窗口");
+        assert_eq!(hidden_on.as_deref(), Some("0"));
+        assert_eq!(hidden_code, Some(OP_RESTORE));
+        on_shell_intent(OP_RESTORE, "");
+        assert_eq!(state::get_signal(CONTEXT_SIGNAL), 1);
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 1);
+        let stack = build_settings_app();
+        for label in nav {
+            let (_, _, _, height) = button_face(&stack, label);
+            assert!(height >= 48.0, "{label}");
+        }
+        let mut narrow_sidebar = false;
+        walk(&stack, &mut |node| {
+            if matches!(node.style.width, Dimension::Px(width) if (width - 108.0).abs() < 0.5) {
+                narrow_sidebar = true;
+            }
+        });
+        assert!(!narrow_sidebar);
+        on_shell_intent(OP_SETTINGS_IDENTITY, "");
+        assert_eq!(state::get_signal(SETTINGS_MENU_SIGNAL), 0);
+        let pane = build_settings_app();
+        assert!(text_blob(&pane).contains("通行证：尚未注册"));
+        assert_eq!(codes_for(&pane, "返回"), vec![OP_SETTINGS_BACK]);
+        on_shell_intent(OP_SETTINGS_BACK, "");
+        assert_eq!(state::get_signal(SETTINGS_MENU_SIGNAL), 1);
+
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(
+                !format!("{:?}", build_settings_app()).contains(hex),
+                "{hex}"
+            );
+        }
+        locale::set_locale("en");
+        assert_eq!(locale::t("settings-agent"), "Agent");
+        assert_eq!(
+            locale::t("settings-context-switch"),
+            "See the current window"
+        );
+        assert_eq!(
+            locale::t_args("locale-confirm-title", &[("name", "English")]),
+            "Change the interface to English"
+        );
+        locale::set_locale("zh-CN");
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 1);
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
         state::note_shell_viewport(1200.0, 800.0);
         drop(isolated);
     }
