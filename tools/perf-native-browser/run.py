@@ -98,6 +98,24 @@ PROFILE_SETTINGS = {
 PRIMARY_PROFILES = ("size", "speed", "max")
 PGO_TRAIN_SCALE = "0.5"
 PGO_TRAIN_SEED = "13"
+# Literal substitutions for the instrumented binary only. The measured source
+# keeps the published constants so AOT fusion still sees them.
+PGO_TRAIN_SUBSTITUTIONS = (
+    ("var DOM_NODES = 1000;", "var DOM_NODES = 500;"),
+    ("var DOM_UPDATES = 40;", "var DOM_UPDATES = 20;"),
+    ("var FLEX_ITEMS = 240;", "var FLEX_ITEMS = 120;"),
+    ("var GRID_ITEMS = 240;", "var GRID_ITEMS = 120;"),
+    ("var SCROLL_ROWS = 100;", "var SCROLL_ROWS = 50;"),
+    ("var BOXES = 80;", "var BOXES = 40;"),
+    ("var COMPUTE_N = 400000;", "var COMPUTE_N = 200000;"),
+    ("var MEMORY_NODES = 4000;", "var MEMORY_NODES = 2000;"),
+    ("var CSS_LIST_NODES = 1000;", "var CSS_LIST_NODES = 500;"),
+    ("var FLEX_LIST_NODES = 400;", "var FLEX_LIST_NODES = 200;"),
+    ("var EVENT_NODES = 400;", "var EVENT_NODES = 200;"),
+    ("var cards = 40;", "var cards = 20;"),
+    ("(k * 17)", "(k * 13)"),
+    ("(frameIndex * 17)", "(frameIndex * 13)"),
+)
 CHROME = os.environ.get("W3COS_CHROME", "/usr/bin/google-chrome")
 CHROME_ARGS = [
     "--disable-gpu",
@@ -244,9 +262,12 @@ def host_info(repo):
             "measured_scale": 1,
             "measured_seed": 17,
             "note": (
-                "The max profile is trained on half-size workloads and stride 13. "
-                "Measured runs leave W3COS_PERF_SCALE and W3COS_PERF_SEED unset, "
-                "so the published trip counts and stride 17 are not the training set."
+                "The instrumented binary is a separate compile of workloads.ts with "
+                "half the node counts and stride 13. The measured max binary is the "
+                "published source, rebuilt with that profile. Runtime crates match "
+                "across the two compiles. Application counters that do not match the "
+                "published control flow are ignored, so the measured trip counts are "
+                "not the training set."
             ),
         },
     }
@@ -373,17 +394,27 @@ def binary_identity(path):
     }
 
 
+def training_fixture(repo, dest):
+    text = (repo / "tools" / "perf-native-browser" / "workloads.ts").read_text()
+    for old, new in PGO_TRAIN_SUBSTITUTIONS:
+        count = text.count(old)
+        if count != 1:
+            raise SystemExit(f"training substitution {old!r} matched {count} times")
+        text = text.replace(old, new, 1)
+    dest.write_text(text)
+    return dest
+
+
 def train_pgo(binary, workloads, prof_dir, timeouts):
     prof_dir.mkdir(parents=True, exist_ok=True)
     for stale in prof_dir.glob("*.profraw"):
         stale.unlink()
-    extra = {
-        "W3COS_PERF_SCALE": PGO_TRAIN_SCALE,
-        "W3COS_PERF_SEED": PGO_TRAIN_SEED,
-        "LLVM_PROFILE_FILE": str(prof_dir / "train-%p.profraw"),
-    }
+    extra = {"LLVM_PROFILE_FILE": str(prof_dir / "train-%p.profraw")}
     for workload in workloads:
-        print(f"== pgo train {workload} scale={PGO_TRAIN_SCALE} seed={PGO_TRAIN_SEED}", flush=True)
+        print(
+            f"== pgo train {workload} scale={PGO_TRAIN_SCALE} seed={PGO_TRAIN_SEED}",
+            flush=True,
+        )
         result = run_native(binary, workload, timeouts[workload] / 1000.0, extra_env=extra)
         if result.get("status") != "ok":
             raise SystemExit(f"PGO training failed for {workload}: {result.get('tail') or result}")
@@ -405,6 +436,7 @@ def build_profile(repo, cli, jobs, build_root, name, workloads, timeouts):
         instr_binary = build_root / f"w3cos-bench-{name}-instrumented"
         instr_target = repo / "target" / f"perf-{name}-instrumented"
         prof_dir = build_root / f"pgo-{name}"
+        train_source = training_fixture(repo, build_root / "workloads-pgo-train.ts")
         print(f"== build {name} instrumented", flush=True)
         compile_native(
             repo,
@@ -414,7 +446,7 @@ def build_profile(repo, cli, jobs, build_root, name, workloads, timeouts):
             settings,
             instr_binary,
             instr_target,
-            fixture,
+            train_source,
             rustflags=f"-Cprofile-generate={prof_dir}",
         )
         merged = train_pgo(instr_binary, workloads, prof_dir, timeouts)
@@ -872,6 +904,15 @@ def self_check():
     assert PROFILE_SETTINGS["max"]["pgo"] is True
     assert PROFILE_SETTINGS["speed-native"]["noted_only"] is True
     assert PROFILE_SETTINGS["speed-native"]["target_cpu"] == "native"
+    assert all(old.count("\n") == 0 for old, _new in PGO_TRAIN_SUBSTITUTIONS)
+    sample = "var DOM_NODES = 1000;\nvar cards = 40;\n(k * 17)\n(frameIndex * 17)\n"
+    for old, _new in (
+        ("var DOM_NODES = 1000;", "var DOM_NODES = 500;"),
+        ("var cards = 40;", "var cards = 20;"),
+        ("(k * 17)", "(k * 13)"),
+        ("(frameIndex * 17)", "(frameIndex * 13)"),
+    ):
+        assert sample.count(old) == 1
     env = apply_profile_env({}, PROFILE_SETTINGS["max"], rustflags="-Cprofile-use=/tmp/merged.profdata")
     assert env["CARGO_PROFILE_RELEASE_PANIC"] == "unwind"
     assert env["CARGO_PROFILE_RELEASE_OPT_LEVEL"] == "3"

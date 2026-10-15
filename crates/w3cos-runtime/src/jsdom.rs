@@ -21252,22 +21252,6 @@ pub fn prepare_headless_entry() {
     if let Ok(workload) = std::env::var("W3COS_PERF_WORKLOAD") {
         window_value().set_property("W3COS_PERF_WORKLOAD", Value::string(&workload));
     }
-    // PGO training sets a different trip count and stride. Unset variables
-    // leave the published workload sizes alone.
-    if let Ok(scale) = std::env::var("W3COS_PERF_SCALE")
-        && let Ok(scale) = scale.parse::<f64>()
-        && scale.is_finite()
-        && scale > 0.0
-    {
-        window_value().set_property("W3COS_PERF_SCALE", Value::from_f64(scale));
-    }
-    if let Ok(seed) = std::env::var("W3COS_PERF_SEED")
-        && let Ok(seed) = seed.parse::<f64>()
-        && seed.is_finite()
-        && seed > 0.0
-    {
-        window_value().set_property("W3COS_PERF_SEED", Value::from_f64(seed));
-    }
 }
 
 /// Drain the headless task queue.
