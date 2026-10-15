@@ -241,6 +241,7 @@ filter-all = 全部
 filter-allowed = 允许
 filter-denied = 拒绝
 filter-cancelled = 取消
+receipt-query = 按原话筛选
 receipt-copied = 已复制主体
 receipt-filter-empty = 这一类还没有收据。
 files-preview = 预览

@@ -64,6 +64,7 @@ const NOTIFY_UNREAD_SIGNAL: usize = 29;
 const RECEIPT_FILTER_SIGNAL: usize = 30;
 const SWITCHER_SIGNAL: usize = 31;
 const FILE_PREVIEW_SIGNAL: usize = 32;
+const RECEIPT_QUERY_SIGNAL: usize = 33;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -137,6 +138,7 @@ const OP_HANDOFF_OPEN: u8 = 71;
 const OP_HANDOFF_HIDE: u8 = 72;
 const OP_SYNC_RECEIPTS: u8 = 73;
 const OP_SYNC_DRAFTS: u8 = 74;
+const OP_RECEIPT_QUERY: u8 = 75;
 
 fn main() {
     shell_main();
@@ -251,6 +253,7 @@ fn ensure_shell_signals() {
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
     });
 }
@@ -1156,6 +1159,10 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_FILTER_ALLOWED => set_receipt_filter(1),
         OP_FILTER_DENIED => set_receipt_filter(2),
         OP_FILTER_CANCELLED => set_receipt_filter(3),
+        OP_RECEIPT_QUERY => {
+            state::set_text_signal(RECEIPT_QUERY_SIGNAL, draft.trim());
+            state::set_signal(RECEIPT_PAGE_SIGNAL, 0);
+        }
         OP_COPY_SUBJECT => copy_subject(),
         OP_PREVIEW => {
             state::set_text_signal(FILE_PREVIEW_SIGNAL, draft.trim());
@@ -1296,10 +1303,10 @@ fn apply_screen_override() {
             state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
             state::set_text_signal(
                 RECEIPT_SIGNAL,
-                "#4 allowed open-files tier=L0 actor=local confirmed=true — 已切换到文件\n\
-                 #3 cancelled night tier=L1 actor=local confirmed=false — 你取消了，没有执行\n\
-                 #2 denied echo tier=L0 actor=local confirmed=true — 当时还锁着\n\
-                 #1 unrecognized summarize tier=L0 actor=local confirmed=false — 没有对应命令",
+                "#4 allowed open-files tier=L0 actor=local confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
+                 #3 cancelled night-mode tier=L1 actor=local confirmed=false ts=1760515200000 — 你取消了，没有执行 @@ 夜间模式\n\
+                 #2 denied echo tier=L0 actor=local confirmed=true ts=1760511600000 — 当时还锁着 @@ 在终端运行 echo\n\
+                 #1 unrecognized summarize tier=L0 actor=local confirmed=false ts=1760508000000 — 没有对应命令 @@ 把这段总结一下",
             );
         }
         Some("confirm") => {
@@ -1778,9 +1785,25 @@ fn copy_subject() {
 
 fn visible_receipts() -> Vec<String> {
     let filter = state::get_signal(RECEIPT_FILTER_SIGNAL);
+    let query = state::get_signal_text(RECEIPT_QUERY_SIGNAL);
+    let needle = query.trim().to_lowercase();
     receipt_entries()
         .into_iter()
-        .filter(|line| gesture::receipt_matches(filter, line))
+        .filter(|line| {
+            if !gesture::receipt_matches(filter, line) {
+                return false;
+            }
+            if needle.is_empty() {
+                return true;
+            }
+            let parts = parse_receipt(line);
+            let hay = format!(
+                "{} {} {} {}",
+                parts.command, parts.utterance, parts.detail, parts.tier
+            )
+            .to_lowercase();
+            hay.contains(&needle)
+        })
         .collect()
 }
 
@@ -1853,18 +1876,24 @@ struct ReceiptParts {
     command: String,
     tier: String,
     detail: String,
+    recorded_at: String,
+    utterance: String,
 }
 
 fn parse_receipt(line: &str) -> ReceiptParts {
-    let (head, detail) = line.split_once(" — ").unwrap_or((line, ""));
+    let (head, rest) = line.split_once(" — ").unwrap_or((line, ""));
+    let (detail, utterance) = rest.split_once(" @@ ").unwrap_or((rest, ""));
     let mut tokens = head.split_whitespace();
     let id = tokens.next().unwrap_or("#").to_string();
     let decision = tokens.next().unwrap_or("").to_string();
     let command = tokens.next().unwrap_or("").to_string();
     let mut tier = String::new();
+    let mut recorded_at = String::new();
     for token in tokens {
         if let Some(value) = token.strip_prefix("tier=") {
             tier = value.to_string();
+        } else if let Some(value) = token.strip_prefix("ts=") {
+            recorded_at = value.to_string();
         }
     }
     ReceiptParts {
@@ -1873,7 +1902,25 @@ fn parse_receipt(line: &str) -> ReceiptParts {
         command,
         tier,
         detail: detail.to_string(),
+        recorded_at,
+        utterance: utterance.to_string(),
     }
+}
+
+fn format_receipt_clock(recorded_at: &str) -> String {
+    let Ok(millis) = recorded_at.parse::<i64>() else {
+        return String::new();
+    };
+    if millis <= 0 {
+        return String::new();
+    }
+    let Some(stamp) = chrono::DateTime::from_timestamp_millis(millis) else {
+        return String::new();
+    };
+    stamp
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string()
 }
 
 fn decision_label(decision: &str) -> String {
@@ -1887,20 +1934,12 @@ fn decision_label(decision: &str) -> String {
 }
 
 fn present_receipt(line: &str) -> String {
-    let decision = line.split_whitespace().nth(1).unwrap_or("");
-    let word = match decision {
-        "allowed" => locale::t("decision-allowed"),
-        "denied" => locale::t("decision-denied"),
-        "cancelled" => locale::t("decision-cancelled"),
-        "unrecognized" => locale::t("decision-unrecognized"),
-        other => other.to_string(),
-    };
-    let id = line.split_whitespace().next().unwrap_or("#");
-    let outcome = line.split(" — ").nth(1).unwrap_or("");
-    if outcome.is_empty() {
-        format!("{id} {word}")
+    let parts = parse_receipt(line);
+    let word = decision_label(&parts.decision);
+    if parts.detail.is_empty() {
+        format!("{} {word}", parts.id)
     } else {
-        format!("{id} {word} {outcome}")
+        format!("{} {word} {}", parts.id, parts.detail)
     }
 }
 
@@ -5302,6 +5341,33 @@ fn build_toast(text: &str) -> Component {
     )
 }
 
+fn receipt_query_field() -> Component {
+    let mut style = Style {
+        font_size: 13.0,
+        color: ink_token(),
+        background: Color::rgba(244, 241, 234, 18),
+        border_radius: 10.0,
+        border_width: 1.0,
+        border_color: Color::rgba(244, 241, 234, 31),
+        padding: Edges::xy(10.0, 6.0),
+        min_height: Dimension::Px(if state::pointer_is_coarse() {
+            48.0
+        } else {
+            32.0
+        }),
+        ..Style::default()
+    };
+    style.custom_properties = Some(HashMap::from([(
+        "--w3cos-intent-submit".to_string(),
+        OP_RECEIPT_QUERY.to_string(),
+    )]));
+    Component::text_input(
+        state::get_signal_text(RECEIPT_QUERY_SIGNAL),
+        locale::t("receipt-query"),
+        style,
+    )
+}
+
 fn filter_chip(key: &str, code: u8, selected: bool) -> Component {
     let height = if state::pointer_is_coarse() {
         48.0
@@ -5339,11 +5405,23 @@ fn receipt_row(line: &str) -> Component {
         "cancelled" => (Color::rgba(226, 164, 92, 41), Color::from_hex("#ffe1b5")),
         _ => (Color::rgba(244, 241, 234, 20), muted_token()),
     };
-    let subtitle = if parts.tier.is_empty() {
+    let clock = format_receipt_clock(&parts.recorded_at);
+    let said = if parts.utterance.is_empty() {
         parts.detail.clone()
     } else {
-        format!("{} · {}", parts.tier, parts.detail)
+        parts.utterance.clone()
     };
+    let mut subtitle_bits = Vec::new();
+    if !clock.is_empty() {
+        subtitle_bits.push(clock);
+    }
+    if !parts.tier.is_empty() {
+        subtitle_bits.push(parts.tier.clone());
+    }
+    if !said.is_empty() {
+        subtitle_bits.push(said);
+    }
+    let subtitle = subtitle_bits.join(" · ");
     Component::row(
         Style {
             gap: 8.0,
@@ -5534,6 +5612,7 @@ fn build_receipts_viewer() -> Component {
             },
             invoke(OP_COPY_SUBJECT),
         ),
+        receipt_query_field(),
         Component::row(
             Style {
                 gap: 6.0,
@@ -5664,6 +5743,15 @@ mod shell_ux_tests {
         assert_eq!(parts.command, "open-files");
         assert_eq!(parts.tier, "L0");
         assert_eq!(parts.detail, "opened");
+        assert!(parts.recorded_at.is_empty());
+        assert!(parts.utterance.is_empty());
+        let stamped = parse_receipt(
+            "#4 allowed open-files tier=L0 actor=local confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件",
+        );
+        assert_eq!(stamped.recorded_at, "1760518800000");
+        assert_eq!(stamped.detail, "已切换到文件");
+        assert_eq!(stamped.utterance, "打开文件");
+        assert_eq!(format_receipt_clock("0"), "");
     }
 
     #[test]

@@ -22,7 +22,7 @@ Each pair is mockup, then the shell.
 | CPU shadow blur was a stack of expanding rects. | Runtime. | `draw_box_shadow` used to step `blur_radius / 2`. | Blur above ~0 uses a separable gaussian. σ is `blur_radius / 2`, matching the existing GPU shadow, and is capped at 24. Blur 0 stays the hard fill. `gaussian_outer_shadow_is_soft_and_backdrop_mixes_the_seam`. |
 | Dock and intent had no backdrop blur. | Runtime. | No `backdrop-filter` field. `backdrop_filter_blur_is_the_standard_deviation`. | `Style.backdrop_blur` is the CSS `blur()` standard deviation. CPU copies the border box plus the kernel pad, blurs premultiplied pixels, and writes back only inside the rounded rect. GPU crops the scene so far and runs the existing separable filter pass. Skia uses `SaveLayerRec::backdrop`. The dock uses `blur(18px)` and the intent bar `blur(16px)`, with the mock rgba kept dark enough to read. |
 | Text weight, CJK advance, and antialiasing differ from the browser mock. | Runtime. Only Inter Regular and a CJK subset are bundled. | `text_shadow_paints_beside_the_glyph`. `snapped_glyph_advance` lifts a CJK advance below 0.85 em up to one em. | Icon labels and the intent hint use `text-shadow: 0 1px 2px rgba(0,0,0,0.45)`. CPU blurs that mask. Skia blurs a text layer. GPU draws a few offset taps. Weight ≥ 600 overstrikes by about 0.6px because there is no bold face. Glyph coverage uses a mild gamma (`pow 0.85`). This is closer to the mock, not a browser text stack. |
-| Receipt timestamps and utterances. | Shell data. | `receipt_log_tail` still has no clock or utterance. | Left open. The drawer layout is unchanged. |
+| Receipt timestamps and utterances. | Shell data. | New ledger lines append `ts=` and `@@ utterance`. Older lines omit both and still parse. | The drawer shows the clock and the original utterance, and a query field filters them. |
 
 ## What was fixed in this pass
 
@@ -36,4 +36,4 @@ Animation frames do not recompute that gaussian when the pixels underneath are u
 
 ## Left open
 
-Receipt timestamps and utterances. Text is still fontdue (CPU) or the platform face (Skia/GPU) rather than Inter plus WenQuanYi in a browser. GPU text-shadow is a short tap stack; CPU and Skia use a real gaussian.
+Text is still fontdue (CPU) or the platform face (Skia/GPU) rather than Inter plus WenQuanYi in a browser. GPU text-shadow is a short tap stack; CPU and Skia use a real gaussian.
