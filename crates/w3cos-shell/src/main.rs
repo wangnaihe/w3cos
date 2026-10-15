@@ -867,6 +867,9 @@ fn build_shell() -> Component {
         Component::row(
             Style {
                 flex_grow: 1.0,
+                flex_shrink: 1.0,
+                min_height: Dimension::Px(0.0),
+                overflow: Overflow::Hidden,
                 gap: 0.0,
                 align_items: AlignItems::Stretch,
                 ..Style::default()
@@ -887,6 +890,7 @@ fn build_shell() -> Component {
         Style {
             width: Dimension::Vw(100.0),
             height: Dimension::Vh(100.0),
+            overflow: Overflow::Hidden,
             background: Color::from_hex(if night { "#15202c" } else { "#1a2836" }),
             gap: 0.0,
             ..Style::default()
@@ -918,9 +922,12 @@ fn build_desktop() -> Component {
     Component::column(
         Style {
             flex_grow: 1.0,
+            flex_shrink: 1.0,
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Hidden,
             background: Color::from_hex(if night { "#1a3048" } else { "#24506e" }),
-            padding: Edges::all(60.0),
-            gap: 40.0,
+            padding: Edges::all(28.0),
+            gap: 20.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
             ..Style::default()
@@ -1722,6 +1729,7 @@ fn build_context_header(current: i64, night: bool) -> Component {
     };
     Component::row(
         Style {
+            flex_shrink: 0.0,
             padding: Edges::xy(16.0, 8.0),
             gap: 8.0,
             background: Color::from_hex("#24384c"),
@@ -1857,6 +1865,7 @@ fn build_intent_bar() -> Component {
     }
     Component::column(
         Style {
+            flex_shrink: 0.0,
             padding: Edges::xy(16.0, 10.0),
             gap: 8.0,
             background: Color::from_hex("#1e3144"),
@@ -2113,7 +2122,10 @@ fn build_task_center() -> Component {
     }
     Component::column(
         Style {
-            width: Dimension::Px(340.0),
+            width: Dimension::Px(300.0),
+            flex_shrink: 0.0,
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
             background: Color::from_hex("#1b2c3e"),
@@ -2909,20 +2921,18 @@ fn taskbar_icon(letter: &str, color: &str, id: i64, current: i64) -> Component {
     let focused = current == id;
     let is_open = open & bit != 0;
     let is_mini = minimized & bit != 0;
-    let opacity = if focused {
+    let opacity = if focused || is_open {
         1.0
     } else if is_mini {
         0.55
-    } else if is_open {
-        1.0
     } else {
-        0.38
+        0.85
     };
     Component::button_with_click(
         letter,
         Style {
-            width: Dimension::Px(40.0),
-            height: Dimension::Px(40.0),
+            width: Dimension::Px(36.0),
+            height: Dimension::Px(36.0),
             background: Color::from_hex(color),
             border_radius: 8.0,
             font_size: 16.0,
@@ -3009,9 +3019,10 @@ fn build_taskbar(current: i64) -> Component {
     Component::row(
         Style {
             height: Dimension::Px(56.0),
+            flex_shrink: 0.0,
             background: Color::from_hex("#162433"),
-            padding: Edges::xy(16.0, 8.0),
-            gap: 12.0,
+            padding: Edges::xy(10.0, 6.0),
+            gap: 8.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::SpaceBetween,
             ..Style::default()
@@ -3063,17 +3074,13 @@ fn build_taskbar(current: i64) -> Component {
             ),
             Component::row(
                 Style {
-                    gap: 16.0,
+                    gap: 8.0,
                     align_items: AlignItems::Center,
                     ..Style::default()
                 },
                 vec![
                     chrome_button(
-                        if unlocked {
-                            "锁定 Lock"
-                        } else {
-                            "解锁 Unlock"
-                        },
+                        if unlocked { "锁定" } else { "解锁" },
                         if unlocked { OP_LOCK } else { OP_UNLOCK },
                         if unlocked { "#3d5570" } else { "#9a3412" },
                     ),
@@ -3212,6 +3219,7 @@ fn build_launcher() -> Component {
     };
     Component::column(
         Style {
+            flex_shrink: 0.0,
             background: Color::from_hex("#1b2c3e"),
             padding: Edges::all(12.0),
             gap: 8.0,
@@ -3300,6 +3308,7 @@ fn launcher_tile(app: LaunchApp) -> Component {
 fn build_toast(text: &str) -> Component {
     Component::row(
         Style {
+            flex_shrink: 0.0,
             padding: Edges::xy(16.0, 8.0),
             gap: 8.0,
             background: Color::from_hex("#1d4e89"),
@@ -3387,7 +3396,10 @@ fn build_receipts_viewer() -> Component {
     }
     Component::column(
         Style {
-            width: Dimension::Px(320.0),
+            width: Dimension::Px(300.0),
+            flex_shrink: 0.0,
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
             background: Color::from_hex("#243047"),
