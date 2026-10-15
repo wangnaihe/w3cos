@@ -1,7 +1,7 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use w3cos_dom::host_runtime;
-use w3cos_std::EventAction;
+use w3cos_std::{Component, EventAction};
 
 /// Thread-local reactive signal store.
 /// Signals hold i64 values that can be read and modified by event handlers.
@@ -198,6 +198,12 @@ pub fn clear_dirty() {
     STORE.with(|s| s.borrow_mut().dirty = false)
 }
 
+/// Mark the component tree dirty without changing a signal.
+/// The shell compositor uses this while a window is being dragged.
+pub fn mark_dirty() {
+    STORE.with(|s| s.borrow_mut().dirty = true);
+}
+
 /// All signal values in registration order (for UI tests).
 pub fn all_signal_values() -> Vec<i64> {
     STORE.with(|s| s.borrow().values.clone())
@@ -234,6 +240,138 @@ pub fn run_agent_poll_hook() {
 /// an Enter submit, not from layout or paint.
 pub fn set_invoke_hook(hook: fn(u8, &str)) {
     INVOKE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+/// `phase`: 0 press, 1 move, 2 release. `dx`/`dy` are from the press point.
+/// The hook runs on the UI thread and may mark the tree dirty.
+pub type ShellDragHook = fn(id: i64, mode: u8, dx: f32, dy: f32, phase: u8);
+
+struct DragCapture {
+    id: i64,
+    mode: u8,
+    start_x: f32,
+    start_y: f32,
+    last_dx: f32,
+    last_dy: f32,
+    moved: bool,
+}
+
+thread_local! {
+    static DRAG_HOOK: Cell<Option<ShellDragHook>> = const { Cell::new(None) };
+    static DRAG_CAPTURE: RefCell<Option<DragCapture>> = const { RefCell::new(None) };
+}
+
+pub fn set_shell_drag_hook(hook: ShellDragHook) {
+    DRAG_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+pub fn shell_drag_clear() {
+    DRAG_CAPTURE.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub fn shell_drag_begin(id: i64, mode: u8, x: f32, y: f32) {
+    DRAG_CAPTURE.with(|slot| {
+        *slot.borrow_mut() = Some(DragCapture {
+            id,
+            mode,
+            start_x: x,
+            start_y: y,
+            last_dx: 0.0,
+            last_dy: 0.0,
+            moved: false,
+        });
+    });
+    if let Some(hook) = DRAG_HOOK.with(Cell::get) {
+        hook(id, mode, 0.0, 0.0, 0);
+    }
+}
+
+pub fn shell_drag_move(x: f32, y: f32) {
+    let event = DRAG_CAPTURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let cap = slot.as_mut()?;
+        let dx = x - cap.start_x;
+        let dy = y - cap.start_y;
+        if !cap.moved && dx.abs() < 4.0 && dy.abs() < 4.0 {
+            return None;
+        }
+        cap.moved = true;
+        cap.last_dx = dx;
+        cap.last_dy = dy;
+        Some((cap.id, cap.mode, dx, dy))
+    });
+    if let Some((id, mode, dx, dy)) = event
+        && let Some(hook) = DRAG_HOOK.with(Cell::get)
+    {
+        hook(id, mode, dx, dy, 1);
+    }
+}
+
+/// Returns true when the pointer moved far enough that the click should not run.
+pub fn shell_drag_end() -> bool {
+    let finished = DRAG_CAPTURE.with(|slot| slot.borrow_mut().take());
+    let Some(cap) = finished else {
+        return false;
+    };
+    if !cap.moved {
+        return false;
+    }
+    if let Some(hook) = DRAG_HOOK.with(Cell::get) {
+        hook(cap.id, cap.mode, cap.last_dx, cap.last_dy, 2);
+    }
+    true
+}
+
+fn node_at(root: &Component, target: usize) -> Option<&Component> {
+    fn walk<'a>(comp: &'a Component, target: usize, counter: &mut usize) -> Option<&'a Component> {
+        let index = *counter;
+        *counter += 1;
+        if index == target {
+            return Some(comp);
+        }
+        for child in &comp.children {
+            if let Some(found) = walk(child, target, counter) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(root, target, &mut 0)
+}
+
+pub fn shell_win_label(root: &Component, index: usize) -> Option<String> {
+    node_at(root, index)?
+        .style
+        .custom_properties
+        .as_ref()?
+        .get("--w3cos-win")
+        .cloned()
+}
+
+pub fn with_shell_win_draft(root: &Component, index: usize, draft: String) -> String {
+    if !draft.is_empty() {
+        return draft;
+    }
+    shell_win_label(root, index).unwrap_or(draft)
+}
+
+/// Title-bar and resize-edge gesture on this node. `mode` 0 moves; 1–8 resize.
+pub fn shell_gesture_at(root: &Component, index: usize) -> Option<(i64, u8)> {
+    let props = node_at(root, index)?.style.custom_properties.as_ref()?;
+    let id = props.get("--w3cos-win")?.parse().ok()?;
+    let mode = match props.get("--w3cos-gesture")?.as_str() {
+        "move" => 0,
+        "n" => 1,
+        "s" => 2,
+        "e" => 3,
+        "w" => 4,
+        "ne" => 5,
+        "nw" => 6,
+        "se" => 7,
+        "sw" => 8,
+        _ => return None,
+    };
+    Some((id, mode))
 }
 
 /// Drop a hook installed by [`set_invoke_hook`]. Tests use this so a plugin
@@ -468,5 +606,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn shell_gesture_reads_the_hit_node_only() {
+        let mut title = Component::row(w3cos_std::Style::default(), vec![]);
+        title.style.custom_properties = Some(HashMap::from([
+            ("--w3cos-win".to_string(), "2".to_string()),
+            ("--w3cos-gesture".to_string(), "move".to_string()),
+        ]));
+        let root = Component::column(w3cos_std::Style::default(), vec![title]);
+        assert_eq!(shell_gesture_at(&root, 1), Some((2, 0)));
+        assert_eq!(shell_gesture_at(&root, 0), None);
+        assert_eq!(shell_win_label(&root, 1).as_deref(), Some("2"));
+        assert_eq!(
+            with_shell_win_draft(&root, 1, String::new()),
+            "2".to_string()
+        );
+        assert_eq!(
+            with_shell_win_draft(&root, 1, "keep".to_string()),
+            "keep".to_string()
+        );
     }
 }

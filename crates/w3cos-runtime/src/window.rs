@@ -4619,6 +4619,11 @@ impl App {
         }
         crate::uitest::set_pointer_hit(self.mouse_x, self.mouse_y, hit);
         if let Some(idx) = hit {
+            if let Some((id, mode)) = state::shell_gesture_at(&self.root, idx) {
+                state::shell_drag_begin(id, mode, self.mouse_x, self.mouse_y);
+            } else {
+                state::shell_drag_clear();
+            }
             let stable_host_id = self.native_host_chain(idx).first().copied();
             let prevented =
                 self.dispatch_native_pointer(idx, "down", pointer_id, pointer_type, 0, 1, 0.5);
@@ -4659,6 +4664,12 @@ impl App {
             );
         }
         if let Some(pressed_idx) = self.pressed_index.take() {
+            if state::shell_drag_end() {
+                self.pointer_down_default_prevented = false;
+                self.rebuild_if_dirty();
+                self.repaint_after_interaction();
+                return;
+            }
             let stable_host_id = self.native_host_chain(pressed_idx).first().copied();
             self.dispatch_native_pointer(pressed_idx, "up", pointer_id, pointer_type, 0, 0, 0.0);
             // Browser-generated click runs after pointerup/touchend listeners
@@ -5882,7 +5893,11 @@ impl App {
             }
             if kind_is_button {
                 let action = hit.on_click.clone();
-                let draft = draft_for_action(&self.root, &self.text_input_values, &action);
+                let draft = state::with_shell_win_draft(
+                    &self.root,
+                    idx,
+                    draft_for_action(&self.root, &self.text_input_values, &action),
+                );
                 // Focus dispatch can synchronously run React handlers and
                 // rebuild the lowered component tree. Preserve the DOM host
                 // chain captured by pointer-down so the subsequent click is
@@ -5929,7 +5944,11 @@ impl App {
                 return;
             }
             let action = hit.on_click.clone();
-            let draft = draft_for_action(&self.root, &self.text_input_values, &action);
+            let draft = state::with_shell_win_draft(
+                &self.root,
+                idx,
+                draft_for_action(&self.root, &self.text_input_values, &action),
+            );
             // A browser moves focus away from a text control when the user
             // activates a non-focusable surface. Do this before click
             // dispatch so a click handler can still focus another control.
@@ -8219,6 +8238,10 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 // winit gives physical pixels; convert to logical for hit testing
                 self.set_pointer_logical(position.x, position.y);
+                if self.pressed_index.is_some() {
+                    state::shell_drag_move(self.mouse_x, self.mouse_y);
+                    self.rebuild_if_dirty();
+                }
                 self.ensure_layout();
                 if let Some(idx) = self.hit_test(self.mouse_x, self.mouse_y) {
                     self.dispatch_native_pointer(

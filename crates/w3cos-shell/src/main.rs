@@ -1,13 +1,14 @@
 //! W3C OS Desktop Shell — the system-level GUI.
 //!
 //! Boot sequence: Linux kernel → init → S99w3cos → w3cos-shell (this binary)
-//! Click an app icon → the app UI replaces the desktop area.
-//! Click "W3C Apps" in taskbar → return to desktop.
+//! Click an app icon → a floating window opens over the desktop.
+//! Drag the title bar to move it; drag an edge or corner to resize.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 mod agent_host;
+mod windows;
 
 #[cfg(feature = "desktop")]
 use crate::state;
@@ -24,7 +25,7 @@ use w3cos_runtime::capability_gate;
 use w3cos_runtime::state;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
-use w3cos_std::{Component, EventAction, Style};
+use w3cos_std::{Component, ComponentKind, EventAction, Style};
 
 mod shared_launch;
 
@@ -100,6 +101,7 @@ const OP_FOCUS_SETTINGS: u8 = 44;
 const OP_FOCUS_AGENT: u8 = 45;
 const OP_FOCUS_BROWSER: u8 = 46;
 const OP_FOCUS_EDITOR: u8 = 47;
+const OP_MAXIMIZE: u8 = 48;
 
 const LAUNCHER_PLACEHOLDER: &str = "搜索应用 Search apps";
 
@@ -139,6 +141,7 @@ pub(crate) fn shell_main() {
     }
 
     state::set_invoke_hook(on_shell_intent);
+    state::set_shell_drag_hook(on_window_drag);
     state::set_agent_poll_hook(on_agent_poll);
     agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
@@ -644,10 +647,20 @@ fn focus_app(id: i64) {
     state::set_signal(OPEN_MASK_SIGNAL, open | bit);
     let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
     state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+    windows::raise(id);
+    remember_windows();
 }
 
-fn minimize_current() {
-    let id = state::get_signal(APP_SIGNAL);
+fn window_target(draft: &str) -> i64 {
+    draft
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|id| (1..=6).contains(id))
+        .unwrap_or_else(|| state::get_signal(APP_SIGNAL))
+}
+
+fn minimize_window(id: i64) {
     let bit = app_bit(id);
     if bit == 0 {
         push_toast("桌面保持显示。The desktop stays put.");
@@ -657,13 +670,15 @@ fn minimize_current() {
     state::set_signal(OPEN_MASK_SIGNAL, open | bit);
     let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
     state::set_signal(MINIMIZED_MASK_SIGNAL, minimized | bit);
-    state::set_signal(APP_SIGNAL, 0);
+    if state::get_signal(APP_SIGNAL) == id {
+        state::set_signal(APP_SIGNAL, 0);
+    }
     let name = ShellApp::from_signal(id).bilingual();
     push_toast(&format!("已最小化 {name}。Minimized {name}."));
+    remember_windows();
 }
 
-fn close_current() {
-    let id = state::get_signal(APP_SIGNAL);
+fn close_window(id: i64) {
     let bit = app_bit(id);
     if bit == 0 {
         push_toast("桌面不能关闭。The desktop has no window to close.");
@@ -673,9 +688,66 @@ fn close_current() {
     state::set_signal(OPEN_MASK_SIGNAL, open & !bit);
     let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
     state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
-    state::set_signal(APP_SIGNAL, 0);
+    if state::get_signal(APP_SIGNAL) == id {
+        state::set_signal(APP_SIGNAL, 0);
+    }
     let name = ShellApp::from_signal(id).bilingual();
     push_toast(&format!("已关闭 {name}。Closed {name}."));
+    remember_windows();
+}
+
+fn toggle_window_maximize(id: i64) {
+    let (width, height) = stage_bounds();
+    if !windows::toggle_maximize(id, width, height) {
+        push_toast("桌面不能最大化。The desktop stays put.");
+        return;
+    }
+    focus_app(id);
+    let name = ShellApp::from_signal(id).bilingual();
+    let verb = if windows::is_maximized(id) {
+        "已最大化"
+    } else {
+        "已还原"
+    };
+    push_toast(&format!("{verb} {name}。"));
+}
+
+fn stage_bounds() -> (f32, f32) {
+    let mut width: f32 = 1200.0;
+    if state::get_signal(TASKS_SIGNAL) != 0 {
+        width -= 300.0;
+    }
+    if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
+        width -= 300.0;
+    }
+    (width.max(480.0), 540.0)
+}
+
+fn remember_windows() {
+    windows::save(
+        state::get_signal(OPEN_MASK_SIGNAL),
+        state::get_signal(MINIMIZED_MASK_SIGNAL),
+        state::get_signal(APP_SIGNAL),
+    );
+}
+
+fn on_window_drag(id: i64, mode: u8, dx: f32, dy: f32, phase: u8) {
+    if phase == 1 {
+        let bit = app_bit(id);
+        if bit != 0 {
+            state::set_signal(APP_SIGNAL, id);
+            let open = state::get_signal(OPEN_MASK_SIGNAL);
+            state::set_signal(OPEN_MASK_SIGNAL, open | bit);
+            let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+            state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+        }
+        windows::raise(id);
+    }
+    let (width, height) = stage_bounds();
+    windows::on_drag(id, mode, dx, dy, phase, width, height);
+    if phase == 2 {
+        remember_windows();
+    }
 }
 
 fn cycle_windows() {
@@ -707,8 +779,9 @@ fn cycle_windows() {
 
 fn handle_chrome_op(code: u8, draft: &str) -> bool {
     match code {
-        OP_MINIMIZE => minimize_current(),
-        OP_CLOSE => close_current(),
+        OP_MINIMIZE => minimize_window(window_target(draft)),
+        OP_CLOSE => close_window(window_target(draft)),
+        OP_MAXIMIZE => toggle_window_maximize(window_target(draft)),
         OP_CYCLE => cycle_windows(),
         OP_LAUNCHER => {
             let next = i64::from(state::get_signal(LAUNCHER_SIGNAL) == 0);
@@ -837,6 +910,11 @@ fn apply_screen_override() {
 
 fn build_shell() -> Component {
     ensure_shell_signals();
+    if let Some(session) = windows::load_once() {
+        state::set_signal(OPEN_MASK_SIGNAL, session.open);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized);
+        state::set_signal(APP_SIGNAL, session.focused.clamp(0, 6));
+    }
     apply_screen_override();
     boot_session_once();
     let current = state::get_signal(APP_SIGNAL);
@@ -844,17 +922,7 @@ fn build_shell() -> Component {
     let tasks_open = state::get_signal(TASKS_SIGNAL) != 0;
     let receipts_open = state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0;
 
-    let content = match current {
-        0 => build_desktop(),
-        1 => build_files_app(),
-        2 => build_terminal_app(),
-        3 => build_settings_app(),
-        4 => build_ai_agent_app(),
-        5 => build_browser_app(),
-        6 => build_editor_app(),
-        _ => build_desktop(),
-    };
-    let mut workspace = vec![content];
+    let mut workspace = vec![build_stage()];
     if tasks_open {
         workspace.push(build_task_center());
     }
@@ -862,8 +930,8 @@ fn build_shell() -> Component {
         workspace.push(build_receipts_viewer());
     }
     let mut column = vec![
-        build_context_header(current, night),
-        build_intent_bar(),
+        chrome_layer(build_context_header(current, night)),
+        chrome_layer(build_intent_bar()),
         Component::row(
             Style {
                 flex_grow: 1.0,
@@ -879,12 +947,12 @@ fn build_shell() -> Component {
     ];
     let toast = state::get_signal_text(TOAST_SIGNAL);
     if !toast.is_empty() {
-        column.push(build_toast(&toast));
+        column.push(chrome_layer(build_toast(&toast)));
     }
     if state::get_signal(LAUNCHER_SIGNAL) != 0 {
-        column.push(build_launcher());
+        column.push(chrome_layer(build_launcher()));
     }
-    column.push(build_taskbar(current));
+    column.push(chrome_layer(build_taskbar(current)));
 
     Component::column(
         Style {
@@ -897,6 +965,174 @@ fn build_shell() -> Component {
         },
         column,
     )
+}
+
+const CHROME_Z: i32 = 1_000_000;
+
+fn chrome_layer(mut component: Component) -> Component {
+    component.style.position = Position::Relative;
+    component.style.z_index = CHROME_Z;
+    component
+}
+
+fn build_stage() -> Component {
+    let current = state::get_signal(APP_SIGNAL);
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    let mut ids: Vec<i64> = (1..=6)
+        .filter(|id| open & app_bit(*id) != 0 && minimized & app_bit(*id) == 0)
+        .collect();
+    ids.sort_by_key(|id| (windows::frame(*id).z, *id));
+    let mut children = vec![build_desktop()];
+    for id in ids {
+        children.push(build_window_frame(id, current == id));
+    }
+    Component::column(
+        Style {
+            position: Position::Relative,
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            min_width: Dimension::Px(0.0),
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Hidden,
+            ..Style::default()
+        },
+        children,
+    )
+}
+
+fn app_body(id: i64) -> Component {
+    match id {
+        1 => build_files_app(),
+        2 => build_terminal_app(),
+        3 => build_settings_app(),
+        4 => build_ai_agent_app(),
+        5 => build_browser_app(),
+        _ => build_editor_app(),
+    }
+}
+
+fn build_window_frame(id: i64, focused: bool) -> Component {
+    let frame = windows::frame(id);
+    let border = if focused { "#9eb6ff" } else { "#2a3e52" };
+    let mut window = Component::column(
+        Style {
+            position: Position::Absolute,
+            left: Dimension::Px(frame.x),
+            top: Dimension::Px(frame.y),
+            width: Dimension::Px(frame.w),
+            height: Dimension::Px(frame.h),
+            z_index: frame.z,
+            overflow: Overflow::Hidden,
+            box_sizing: BoxSizing::BorderBox,
+            border_width: 1.0,
+            border_color: Color::from_hex(border),
+            background: Color::from_hex("#0f0f1a"),
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+        vec![
+            resize_handle(id, "n", Dimension::Percent(100.0), Dimension::Px(6.0)),
+            Component::row(
+                Style {
+                    flex_grow: 1.0,
+                    min_height: Dimension::Px(0.0),
+                    overflow: Overflow::Hidden,
+                    gap: 0.0,
+                    ..Style::default()
+                },
+                vec![
+                    resize_handle(id, "w", Dimension::Px(6.0), Dimension::Percent(100.0)),
+                    Component::column(
+                        Style {
+                            flex_grow: 1.0,
+                            min_width: Dimension::Px(0.0),
+                            min_height: Dimension::Px(0.0),
+                            overflow: Overflow::Auto,
+                            ..Style::default()
+                        },
+                        vec![app_body(id)],
+                    ),
+                    resize_handle(id, "e", Dimension::Px(6.0), Dimension::Percent(100.0)),
+                ],
+            ),
+            resize_handle(id, "s", Dimension::Percent(100.0), Dimension::Px(6.0)),
+            resize_corner(id, "nw", true, true),
+            resize_corner(id, "sw", false, true),
+            resize_corner(id, "se", false, false),
+        ],
+    );
+    window.kind = ComponentKind::Button {
+        label: String::new(),
+    };
+    window.on_click = invoke(focus_code(id));
+    window.style.custom_properties = Some(win_props(id, None));
+    window
+}
+
+fn win_props(id: i64, gesture: Option<&str>) -> HashMap<String, String> {
+    let mut props = HashMap::from([("--w3cos-win".to_string(), id.to_string())]);
+    if let Some(gesture) = gesture {
+        props.insert("--w3cos-gesture".to_string(), gesture.to_string());
+    }
+    props
+}
+
+fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) -> Component {
+    let mut handle = Component::button_with_click(
+        " ",
+        Style {
+            width,
+            height,
+            flex_shrink: 0.0,
+            padding: Edges::ZERO,
+            font_size: 1.0,
+            background: Color::from_hex("#2a3e52"),
+            ..Style::default()
+        },
+        invoke(focus_code(id)),
+    );
+    handle.style.custom_properties = Some(win_props(id, Some(gesture)));
+    handle
+}
+
+fn resize_corner(id: i64, gesture: &str, top: bool, left: bool) -> Component {
+    let mut corner = Component::button_with_click(
+        " ",
+        Style {
+            position: Position::Absolute,
+            width: Dimension::Px(16.0),
+            height: Dimension::Px(16.0),
+            top: if top {
+                Dimension::Px(0.0)
+            } else {
+                Dimension::Auto
+            },
+            bottom: if top {
+                Dimension::Auto
+            } else {
+                Dimension::Px(0.0)
+            },
+            left: if left {
+                Dimension::Px(0.0)
+            } else {
+                Dimension::Auto
+            },
+            right: if left {
+                Dimension::Auto
+            } else {
+                Dimension::Px(0.0)
+            },
+            padding: Edges::ZERO,
+            font_size: 1.0,
+            background: Color::from_hex("#d5dee8"),
+            border_radius: 2.0,
+            ..Style::default()
+        },
+        invoke(focus_code(id)),
+    );
+    corner.style.custom_properties = Some(win_props(id, Some(gesture)));
+    corner
 }
 
 // ==========================================================================
@@ -1163,7 +1399,7 @@ fn build_files_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar(title, "#3498db"),
+            app_titlebar(title, "#3498db", 1),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -1358,7 +1594,7 @@ fn build_terminal_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("终端 Terminal", "#1c8f62"),
+            app_titlebar("终端 Terminal", "#1c8f62", 2),
             Component::column(
                 Style {
                     flex_grow: 1.0,
@@ -1459,7 +1695,7 @@ fn build_settings_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("设置 Settings", "#5b4fe0"),
+            app_titlebar("设置 Settings", "#5b4fe0", 3),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -2189,7 +2425,7 @@ fn build_ai_agent_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("助手 Agent", "#e07a5f"),
+            app_titlebar("助手 Agent", "#e07a5f", 4),
             Component::column(
                 Style {
                     flex_grow: 1.0,
@@ -2242,7 +2478,7 @@ fn build_browser_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Browser", "#f39c12"),
+            app_titlebar("Browser", "#f39c12", 5),
             // URL bar
             Component::row(
                 Style {
@@ -2475,7 +2711,7 @@ fn build_editor_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Editor", "#1abc9c"),
+            app_titlebar("Editor", "#1abc9c", 6),
             // Editor toolbar
             Component::row(
                 Style {
@@ -2899,8 +3135,8 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // Shared: title bar + taskbar
 // ==========================================================================
 
-fn window_button(label: &str, code: u8, color: &str) -> Component {
-    Component::button_with_click(
+fn window_button(label: &str, code: u8, color: &str, app_id: i64) -> Component {
+    let mut button = Component::button_with_click(
         label,
         Style {
             font_size: 12.0,
@@ -2911,7 +3147,9 @@ fn window_button(label: &str, code: u8, color: &str) -> Component {
             ..Style::default()
         },
         invoke(code),
-    )
+    );
+    button.style.custom_properties = Some(win_props(app_id, None));
+    button
 }
 
 fn taskbar_icon(letter: &str, color: &str, id: i64, current: i64) -> Component {
@@ -2953,10 +3191,16 @@ fn taskbar_icon(letter: &str, color: &str, id: i64, current: i64) -> Component {
     )
 }
 
-fn app_titlebar(title: &str, accent: &str) -> Component {
-    Component::row(
+fn app_titlebar(title: &str, accent: &str, app_id: i64) -> Component {
+    let max_label = if windows::is_maximized(app_id) {
+        "回"
+    } else {
+        "[]"
+    };
+    let mut bar = Component::row(
         Style {
             height: Dimension::Px(40.0),
+            flex_shrink: 0.0,
             background: Color::from_hex("#2a3e52"),
             padding: Edges::xy(16.0, 8.0),
             align_items: AlignItems::Center,
@@ -2998,13 +3242,19 @@ fn app_titlebar(title: &str, accent: &str) -> Component {
                     ..Style::default()
                 },
                 vec![
-                    window_button("--", OP_MINIMIZE, "#808090"),
-                    window_button("[]", OP_CYCLE, "#808090"),
-                    window_button("X", OP_CLOSE, "#e94560"),
+                    window_button("--", OP_MINIMIZE, "#808090", app_id),
+                    window_button(max_label, OP_MAXIMIZE, "#808090", app_id),
+                    window_button("X", OP_CLOSE, "#e94560", app_id),
                 ],
             ),
         ],
-    )
+    );
+    bar.kind = ComponentKind::Button {
+        label: String::new(),
+    };
+    bar.on_click = invoke(focus_code(app_id));
+    bar.style.custom_properties = Some(win_props(app_id, Some("move")));
+    bar
 }
 
 fn build_taskbar(current: i64) -> Component {
