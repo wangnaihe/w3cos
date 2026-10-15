@@ -1292,7 +1292,32 @@ fn apply_screen_override() {
         }
         Some("terminal") => focus_app(2),
         Some("launcher") => state::set_signal(LAUNCHER_SIGNAL, 1),
-        Some("receipts") => state::set_signal(RECEIPTS_OPEN_SIGNAL, 1),
+        Some("receipts") => {
+            state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+            state::set_text_signal(
+                RECEIPT_SIGNAL,
+                "#4 allowed open-files tier=L0 actor=local confirmed=true — 已切换到文件\n\
+                 #3 cancelled night tier=L1 actor=local confirmed=false — 你取消了，没有执行\n\
+                 #2 denied echo tier=L0 actor=local confirmed=true — 当时还锁着\n\
+                 #1 unrecognized summarize tier=L0 actor=local confirmed=false — 没有对应命令",
+            );
+        }
+        Some("confirm") => {
+            focus_app(1);
+            state::set_signal(PHASE_SIGNAL, 1);
+            state::set_text_signal(TIER_SIGNAL, "L0");
+            state::set_text_signal(SUMMARY_SIGNAL, "打开文件");
+            state::set_text_signal(
+                IMPACT_SIGNAL,
+                "切换到文件窗口。不读取、不修改磁盘上的内容。",
+            );
+        }
+        Some("permission") => {
+            focus_app(2);
+            state::set_text_signal(TERMINAL_SIGNAL, "echo");
+            state::set_signal(PERM_SIGNAL, 1);
+        }
+        Some("lock") => state::set_signal(UNLOCKED_SIGNAL, 0),
         Some("switcher") => {
             focus_app(1);
             state::set_signal(SWITCHER_SIGNAL, 1);
@@ -1329,8 +1354,8 @@ fn build_shell() -> Component {
         state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized);
         state::set_signal(APP_SIGNAL, session.focused.clamp(0, 6));
     }
-    apply_screen_override();
     boot_session_once();
+    apply_screen_override();
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut column = match posture() {
@@ -1360,7 +1385,12 @@ fn build_shell() -> Component {
         column.push(chrome_layer(build_notify_panel()));
     }
     if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
-        column.push(dock_right(build_receipts_viewer()));
+        let viewer = build_receipts_viewer();
+        column.push(if posture() == Posture::Phone {
+            dock_right(viewer)
+        } else {
+            place_receipts(viewer)
+        });
     }
     if state::get_signal(LAUNCHER_SIGNAL) != 0 && posture() != Posture::Phone {
         column.push(chrome_layer(build_launcher()));
@@ -1370,7 +1400,7 @@ fn build_shell() -> Component {
         column.push(chrome_layer(build_toast(&toast)));
     }
     if !unlocked {
-        column.push(place_modal(build_lock_screen(), true));
+        column.push(place_overlay(build_lock_screen()));
     }
 
     Component::column(
@@ -1394,6 +1424,11 @@ fn modal_layer(card: Component) -> Component {
 
 fn place_modal(mut card: Component, fill: bool) -> Component {
     let (width, height) = state::shell_viewport();
+    let scrim_h = if fill || posture() == Posture::Phone {
+        height
+    } else {
+        (height - 68.0).max(0.0)
+    };
     let scrim = Component::button_with_click(
         "",
         Style {
@@ -1401,8 +1436,8 @@ fn place_modal(mut card: Component, fill: bool) -> Component {
             left: Dimension::Px(0.0),
             top: Dimension::Px(0.0),
             width: Dimension::Px(width),
-            height: Dimension::Px(height),
-            background: Color::rgba(12, 18, 24, 160),
+            height: Dimension::Px(scrim_h),
+            background: Color::rgba(6, 10, 14, 117),
             z_index: CHROME_Z + 2,
             ..Style::default()
         },
@@ -1439,6 +1474,29 @@ fn place_modal(mut card: Component, fill: bool) -> Component {
         },
         vec![scrim, card],
     )
+}
+
+fn place_overlay(mut node: Component) -> Component {
+    let (width, height) = state::shell_viewport();
+    node.style.position = Position::Absolute;
+    node.style.left = Dimension::Px(0.0);
+    node.style.top = Dimension::Px(0.0);
+    node.style.width = Dimension::Px(width);
+    node.style.height = Dimension::Px(height);
+    node.style.z_index = CHROME_Z + 4;
+    node
+}
+
+fn place_receipts(mut panel: Component) -> Component {
+    let (width, height) = state::shell_viewport();
+    let panel_w = 400.0_f32.min((width - 48.0).max(280.0));
+    panel.style.position = Position::Absolute;
+    panel.style.left = Dimension::Px((width - panel_w - 24.0).max(8.0));
+    panel.style.top = Dimension::Px(24.0);
+    panel.style.width = Dimension::Px(panel_w);
+    panel.style.height = Dimension::Px((height - 132.0).max(240.0));
+    panel.style.z_index = CHROME_Z + 1;
+    panel
 }
 
 fn dock_right(panel: Component) -> Component {
@@ -1504,32 +1562,88 @@ fn resident(id: i64) -> bool {
     RESIDENT_APPS.iter().any(|app| app.id == id)
 }
 
-fn glyph_svg(name: &str) -> &'static str {
-    match name {
+const WALLPAPER: &str = "radial-gradient(980px 560px at 12% -8%, rgba(120, 168, 186, 0.22), transparent 62%), radial-gradient(820px 520px at 100% 110%, rgba(20, 90, 72, 0.28), transparent 58%), linear-gradient(180deg, #1b3344 0%, #13202c 48%, #101820 100%)";
+
+fn touch_min() -> f32 {
+    if state::pointer_is_coarse() {
+        48.0
+    } else {
+        36.0
+    }
+}
+
+fn line_strong() -> Color {
+    Color::rgba(244, 241, 234, 56)
+}
+
+fn ink_token() -> Color {
+    Color::from_hex("#f4f1ea")
+}
+
+fn muted_token() -> Color {
+    Color::from_hex("#c5d0d8")
+}
+
+fn faint_token() -> Color {
+    Color::from_hex("#aebbc6")
+}
+
+fn shadow_sm() -> BoxShadow {
+    BoxShadow::new(0.0, 8.0, 24.0, 0.0, Color::rgba(0, 0, 0, 82))
+}
+
+fn shadow_lg() -> BoxShadow {
+    BoxShadow::new(0.0, 24.0, 60.0, 0.0, Color::rgba(0, 0, 0, 115))
+}
+
+fn sheet_fill() -> Color {
+    Color::rgba(22, 30, 39, 245)
+}
+
+fn glyph_svg(name: &str, stroke: &str) -> String {
+    let body = match name {
         "files" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="white" d="M3 6.5A1.5 1.5 0 0 1 4.5 5h5.2l1.8 2H19.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z"/></svg>"#
+            r#"<path d="M4 8.2A2 2 0 0 1 6 6.2h3.1L11 8.2h7a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8.2Z"/>"#
         }
         "terminal" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="white" d="M5 7l6 5-6 5V7zm8 9h7v2h-7v-2z"/></svg>"#
+            r#"<rect x="4" y="5.5" width="16" height="13" rx="2"/><path d="M7.5 9.5 10 12l-2.5 2.5M12 14.5h4.5"/>"#
         }
         "settings" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="white" stroke-width="2"/><path fill="none" stroke="white" stroke-width="2" stroke-linecap="round" d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>"#
+            r#"<path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.2"/><circle cx="15" cy="16" r="2.2"/>"#
         }
         "browser" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="none" stroke="white" stroke-width="2"/><path fill="none" stroke="white" stroke-width="2" d="M4 12h16M12 4c2.4 2.6 2.4 13.4 0 16M12 4c-2.4 2.6-2.4 13.4 0 16"/></svg>"#
+            r#"<circle cx="12" cy="12" r="7.5"/><path d="m14.6 9.4-1.6 3.6-3.6 1.6 1.6-3.6 3.6-1.6Z"/>"#
         }
         "editor" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="white" d="M14.2 4.2l5.6 5.6L8.5 21H3v-5.5z"/></svg>"#
+            r#"<path d="M4.5 19.5h4L19 9a2.1 2.1 0 0 0-3-3L5.5 16.5v3Z"/><path d="M13.5 7.5l3 3"/>"#
         }
         "lock" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><rect x="6" y="11" width="12" height="9" rx="1.5" fill="white"/><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="white" stroke-width="2"/></svg>"#
+            r#"<rect x="6" y="10.5" width="12" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>"#
         }
         "bell" => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="white" d="M12 3a1 1 0 0 1 1 1v1.1A6 6 0 0 1 18 11v3l1.6 2.4H4.4L6 14v-3a6 6 0 0 1 5-5.9V4a1 1 0 0 1 1-1zm-2.2 16a2.2 2.2 0 0 0 4.4 0z"/></svg>"#
+            r#"<path d="M6 16.5h12l-1.2-2V10.2a4.8 4.8 0 0 0-9.6 0v4.3L6 16.5Z"/><path d="M10 16.5a2 2 0 0 0 4 0"/>"#
+        }
+        "devices" => {
+            r#"<rect x="3" y="6" width="12" height="8" rx="1.4"/><path d="M7 17.5h6M10 14v3.5"/><rect x="16" y="8" width="5" height="9" rx="1.2"/>"#
+        }
+        "arrow" => {
+            r#"<path d="M19 7v5.2A2.8 2.8 0 0 1 16.2 15H6"/><path d="M9.5 11.5 6 15l3.5 3.5"/>"#
         }
         _ => {
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.2" fill="white"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.2" fill="white"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.2" fill="white"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.2" fill="white"/></svg>"#
+            r#"<rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/>"#
         }
+    };
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{stroke}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{body}</svg>"#
+    )
+}
+
+fn squircle_tone(glyph: &str) -> (Color, &'static str) {
+    match glyph {
+        "files" => (Color::rgba(20, 150, 106, 46), "#d9ffe9"),
+        "settings" => (Color::rgba(226, 164, 92, 41), "#ffe6c2"),
+        "browser" => (Color::rgba(130, 170, 200, 41), "#e5f3ff"),
+        _ => (Color::rgba(244, 241, 234, 20), "#f4f1ea"),
     }
 }
 
@@ -1540,31 +1654,85 @@ fn icon_button(
     background: &str,
     size: f32,
 ) -> Component {
-    let glyph_px = (size * 0.56).round().clamp(18.0, 36.0);
+    glyph_face(
+        glyph,
+        name,
+        code,
+        Color::from_hex(background),
+        "white",
+        size,
+        12.0,
+        false,
+    )
+}
+
+fn dock_icon(
+    glyph: &str,
+    name: impl Into<String>,
+    code: u8,
+    fill: Color,
+    active: bool,
+) -> Component {
+    let size = if state::pointer_is_coarse() {
+        48.0
+    } else {
+        40.0
+    };
+    glyph_face(glyph, name, code, fill, "#f4f1ea", size, 12.0, active)
+}
+
+fn glyph_face(
+    glyph: &str,
+    name: impl Into<String>,
+    code: u8,
+    fill: Color,
+    stroke: &str,
+    size: f32,
+    radius: f32,
+    active: bool,
+) -> Component {
+    let glyph_px = (size * 0.5).round().clamp(16.0, 28.0);
+    let mut children = vec![Component::svg_document(
+        glyph_svg(glyph, stroke),
+        24,
+        24,
+        Style {
+            width: Dimension::Px(glyph_px),
+            height: Dimension::Px(glyph_px),
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+    )];
+    if active {
+        children.push(Component::column(
+            Style {
+                position: Position::Absolute,
+                left: Dimension::Px((size - 12.0) / 2.0),
+                top: Dimension::Px(size - 6.0),
+                width: Dimension::Px(12.0),
+                height: Dimension::Px(3.0),
+                background: Color::from_hex("#14966a"),
+                border_radius: 99.0,
+                ..Style::default()
+            },
+            vec![],
+        ));
+    }
     let mut button = Component::column(
         Style {
+            position: Position::Relative,
             width: Dimension::Px(size),
             height: Dimension::Px(size),
             min_width: Dimension::Px(size),
             min_height: Dimension::Px(size),
             flex_shrink: 0.0,
-            background: Color::from_hex(background),
-            border_radius: 12.0,
+            background: fill,
+            border_radius: radius,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
             ..Style::default()
         },
-        vec![Component::svg_document(
-            glyph_svg(glyph),
-            24,
-            24,
-            Style {
-                width: Dimension::Px(glyph_px),
-                height: Dimension::Px(glyph_px),
-                flex_shrink: 0.0,
-                ..Style::default()
-            },
-        )],
+        children,
     );
     button.kind = ComponentKind::Button { label: name.into() };
     button.on_click = invoke(code);
@@ -1572,7 +1740,7 @@ fn icon_button(
 }
 
 fn live_clock() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
+    chrono::Local::now().format("%H:%M").to_string()
 }
 
 fn set_receipt_filter(kind: i64) {
@@ -1666,6 +1834,45 @@ fn receipt_page_count(len: usize) -> i64 {
     pages.max(1)
 }
 
+struct ReceiptParts {
+    id: String,
+    decision: String,
+    command: String,
+    tier: String,
+    detail: String,
+}
+
+fn parse_receipt(line: &str) -> ReceiptParts {
+    let (head, detail) = line.split_once(" — ").unwrap_or((line, ""));
+    let mut tokens = head.split_whitespace();
+    let id = tokens.next().unwrap_or("#").to_string();
+    let decision = tokens.next().unwrap_or("").to_string();
+    let command = tokens.next().unwrap_or("").to_string();
+    let mut tier = String::new();
+    for token in tokens {
+        if let Some(value) = token.strip_prefix("tier=") {
+            tier = value.to_string();
+        }
+    }
+    ReceiptParts {
+        id,
+        decision,
+        command,
+        tier,
+        detail: detail.to_string(),
+    }
+}
+
+fn decision_label(decision: &str) -> String {
+    match decision {
+        "allowed" => locale::t("decision-allowed"),
+        "denied" => locale::t("decision-denied"),
+        "cancelled" => locale::t("decision-cancelled"),
+        "unrecognized" => locale::t("decision-unrecognized"),
+        other => other.to_string(),
+    }
+}
+
 fn present_receipt(line: &str) -> String {
     let decision = line.split_whitespace().nth(1).unwrap_or("");
     let word = match decision {
@@ -1685,37 +1892,68 @@ fn present_receipt(line: &str) -> String {
 }
 
 fn build_intent_panel() -> Component {
+    let go = if state::pointer_is_coarse() {
+        44.0
+    } else {
+        36.0
+    };
     let mut input_style = Style {
         flex_grow: 1.0,
-        font_size: 15.0,
-        color: Color::from_hex("#1a2836"),
-        background: Color::from_hex("#f4f7fb"),
-        border_radius: 8.0,
-        padding: Edges::xy(12.0, 8.0),
-        min_height: Dimension::Px(if posture() == Posture::Desktop {
-            36.0
-        } else {
-            48.0
-        }),
+        font_size: 16.0,
+        color: ink_token(),
+        background: Color::TRANSPARENT,
+        padding: Edges::ZERO,
+        min_height: Dimension::Px(go),
         ..Style::default()
     };
     input_style.custom_properties = Some(HashMap::from([(
         "--w3cos-intent-submit".to_string(),
         OP_PROPOSE.to_string(),
     )]));
+    let mut go_button = glyph_face(
+        "arrow",
+        locale::t("propose"),
+        OP_PROPOSE,
+        Color::from_hex("#0c6d4c"),
+        "#e9fff5",
+        go,
+        10.0,
+        false,
+    );
+    go_button.on_click = EventAction::Invoke {
+        code: OP_PROPOSE,
+        input_placeholder: locale::t("intent-placeholder"),
+    };
     let mut rows = vec![
         Component::text(
             locale::t("intent-hint"),
             Style {
                 font_size: 12.0,
-                color: Color::from_hex("#d5dee8"),
+                color: muted_token(),
+                text_align: TextAlign::Center,
                 ..Style::default()
             },
         ),
         Component::row(
             Style {
+                height: Dimension::Px(if state::pointer_is_coarse() {
+                    56.0
+                } else {
+                    52.0
+                }),
+                padding: Edges {
+                    top: Spacing::Px(0.0),
+                    right: Spacing::Px(8.0),
+                    bottom: Spacing::Px(0.0),
+                    left: Spacing::Px(16.0),
+                },
                 gap: 8.0,
                 align_items: AlignItems::Center,
+                background: Color::rgba(16, 22, 29, 235),
+                border_width: 1.0,
+                border_color: line_strong(),
+                border_radius: 16.0,
+                box_shadow: Some(shadow_sm()),
                 ..Style::default()
             },
             vec![
@@ -1724,7 +1962,7 @@ fn build_intent_panel() -> Component {
                     locale::t("intent-placeholder"),
                     input_style,
                 ),
-                chrome_button(locale::t("propose"), OP_PROPOSE, "#5b4fe0"),
+                go_button,
             ],
         ),
     ];
@@ -1733,7 +1971,8 @@ fn build_intent_panel() -> Component {
             locale::t("planning"),
             Style {
                 font_size: 13.0,
-                color: Color::from_hex("#9eb6ff"),
+                color: Color::from_hex("#b7c0ff"),
+                text_align: TextAlign::Center,
                 ..Style::default()
             },
         ));
@@ -1741,10 +1980,8 @@ fn build_intent_panel() -> Component {
     Component::column(
         Style {
             flex_shrink: 0.0,
-            padding: Edges::xy(16.0, 10.0),
             gap: 8.0,
-            background: Color::from_hex("#1e3144"),
-            border_radius: 16.0,
+            background: Color::TRANSPARENT,
             ..Style::default()
         },
         rows,
@@ -1758,68 +1995,40 @@ fn floating_intent() -> Component {
     bar.style.position = Position::Absolute;
     bar.style.width = Dimension::Px(bar_w);
     bar.style.left = Dimension::Px(((width - bar_w) / 2.0).max(8.0));
-    bar.style.top = Dimension::Px((height - 192.0).max(8.0));
+    bar.style.top = Dimension::Px((height - 84.0 - 78.0).max(8.0));
     bar.style.z_index = CHROME_Z;
     bar
 }
 
 fn taskbar_app(id: i64, current: i64) -> Component {
     let focused = current == id;
-    let app = RESIDENT_APPS.iter().find(|app| app.id == id);
-    let (glyph, color) = app
-        .map(|app| (app.glyph, app.color))
-        .unwrap_or(("grid", "#3d5570"));
-    let name = app_label(id);
-    let caption = if focused {
-        format!("{name} · {}", locale::t("using-now"))
-    } else {
-        name
-    };
-    Component::column(
-        Style {
-            align_items: AlignItems::Center,
-            gap: 2.0,
-            flex_shrink: 0.0,
-            ..Style::default()
-        },
-        vec![
-            icon_button(glyph, String::new(), focus_code(id), color, 40.0),
-            Component::text(
-                caption,
-                Style {
-                    font_size: 11.0,
-                    color: Color::from_hex(if focused { "#f4f7fb" } else { "#d5dee8" }),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
+    let glyph = RESIDENT_APPS
+        .iter()
+        .find(|app| app.id == id)
+        .map(|app| app.glyph)
+        .unwrap_or("grid");
+    let (fill, _) = squircle_tone(glyph);
+    dock_icon(glyph, app_label(id), focus_code(id), fill, focused)
 }
 
 fn build_floating_taskbar() -> Component {
     let current = state::get_signal(APP_SIGNAL);
     let open = state::get_signal(OPEN_MASK_SIGNAL);
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
-    let mut leading = vec![icon_button(
+    let mut leading = vec![dock_icon(
         "grid",
-        String::new(),
+        locale::t("launcher-all"),
         OP_LAUNCHER,
-        "#5b4fe0",
-        40.0,
+        Color::TRANSPARENT,
+        false,
     )];
     for app in RESIDENT_APPS {
         if open & app_bit(app.id) != 0 {
             leading.push(taskbar_app(app.id, current));
         }
     }
-    let unread = state::get_signal(NOTIFY_UNREAD_SIGNAL);
-    let notify = if unread > 0 {
-        format!("{} {unread}", locale::t("tray-notify"))
-    } else {
-        locale::t("tray-notify")
-    };
     let mut tray = vec![
-        icon_button(
+        dock_icon(
             "lock",
             if unlocked {
                 locale::t("lock")
@@ -1827,11 +2036,40 @@ fn build_floating_taskbar() -> Component {
                 locale::t("unlock")
             },
             if unlocked { OP_LOCK } else { OP_UNLOCK },
-            if unlocked { "#3d5570" } else { "#9a3412" },
-            40.0,
+            Color::TRANSPARENT,
+            false,
         ),
-        chrome_button(notify, OP_NOTIFY_TOGGLE, "#3d5570"),
-        chrome_button(l2_badge(), OP_TRAY_L2, "#1d4e89"),
+        dock_icon(
+            "devices",
+            locale::t("settings-devices"),
+            OP_SETTINGS_DEVICES,
+            Color::TRANSPARENT,
+            false,
+        ),
+        dock_icon(
+            "bell",
+            locale::t("tray-notify"),
+            OP_NOTIFY_TOGGLE,
+            Color::TRANSPARENT,
+            false,
+        ),
+        Component::button_with_click(
+            l2_badge(),
+            Style {
+                background: Color::TRANSPARENT,
+                color: faint_token(),
+                font_size: 12.0,
+                padding: Edges::xy(8.0, 0.0),
+                min_height: Dimension::Px(if state::pointer_is_coarse() {
+                    48.0
+                } else {
+                    32.0
+                }),
+                border_radius: 8.0,
+                ..Style::default()
+            },
+            invoke(OP_TRAY_L2),
+        ),
     ];
     if let Some(battery) = live_battery() {
         tray.push(Component::text(
@@ -1846,20 +2084,30 @@ fn build_floating_taskbar() -> Component {
     tray.push(Component::text(
         live_clock(),
         Style {
-            font_size: 14.0,
-            font_weight: 700,
-            color: Color::from_hex("#f4f7fb"),
+            font_size: 13.0,
+            font_weight: 600,
+            color: ink_token(),
+            padding: Edges::xy(10.0, 0.0),
             ..Style::default()
         },
     ));
+    let bar_h = if state::pointer_is_coarse() {
+        64.0
+    } else {
+        56.0
+    };
     Component::row(
         Style {
-            height: Dimension::Px(64.0),
-            padding: Edges::xy(12.0, 6.0),
-            gap: 10.0,
+            height: Dimension::Px(bar_h),
+            padding: Edges::xy(10.0, 0.0),
+            gap: 8.0,
             align_items: AlignItems::Center,
             background: Color::rgba(12, 18, 24, 224),
+            border_width: 1.0,
+            border_color: Color::rgba(244, 241, 234, 31),
             border_radius: 16.0,
+            box_shadow: Some(shadow_sm()),
+            box_sizing: BoxSizing::BorderBox,
             ..Style::default()
         },
         vec![
@@ -1898,15 +2146,70 @@ fn floating_taskbar() -> Component {
     let mut bar = build_floating_taskbar();
     bar.style.position = Position::Absolute;
     bar.style.left = Dimension::Px(16.0);
-    bar.style.top = Dimension::Px((height - 80.0).max(8.0));
+    let bar_h = if state::pointer_is_coarse() {
+        64.0
+    } else {
+        56.0
+    };
+    bar.style.top = Dimension::Px((height - 12.0 - bar_h).max(8.0));
     bar.style.width = Dimension::Px((width - 32.0).max(280.0));
-    bar.style.height = Dimension::Px(64.0);
+    bar.style.height = Dimension::Px(bar_h);
     bar.style.z_index = CHROME_Z;
     bar
 }
 
 fn build_phone_home() -> Component {
-    let mut children = vec![build_desktop_icons()];
+    let mut status_right = vec![Component::svg_document(
+        glyph_svg("lock", "#f4f1ea"),
+        24,
+        24,
+        Style {
+            width: Dimension::Px(14.0),
+            height: Dimension::Px(14.0),
+            ..Style::default()
+        },
+    )];
+    if let Some(battery) = live_battery() {
+        status_right.push(Component::text(
+            battery,
+            Style {
+                font_size: 12.0,
+                color: ink_token(),
+                ..Style::default()
+            },
+        ));
+    }
+    let mut children = vec![
+        Component::row(
+            Style {
+                height: Dimension::Px(36.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                padding: Edges::xy(6.0, 0.0),
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    live_clock(),
+                    Style {
+                        font_size: 14.0,
+                        font_weight: 650,
+                        color: ink_token(),
+                        ..Style::default()
+                    },
+                ),
+                Component::row(
+                    Style {
+                        gap: 6.0,
+                        align_items: AlignItems::Center,
+                        ..Style::default()
+                    },
+                    status_right,
+                ),
+            ],
+        ),
+        build_desktop_icons(),
+    ];
     if std::env::var_os("W3COS_SHARED_LAUNCHER").is_some() {
         children.push(build_shared_launcher());
     }
@@ -1915,9 +2218,15 @@ fn build_phone_home() -> Component {
             flex_grow: 1.0,
             min_height: Dimension::Px(0.0),
             overflow: Overflow::Auto,
-            padding: Edges::all(20.0),
-            gap: 16.0,
-            background: Color::from_hex("#24506e"),
+            padding: Edges {
+                top: Spacing::Px(16.0),
+                right: Spacing::Px(16.0),
+                bottom: Spacing::Px(8.0),
+                left: Spacing::Px(16.0),
+            },
+            gap: 8.0,
+            background: Color::from_hex("#121b24"),
+            background_image: Some(WALLPAPER.to_string()),
             ..Style::default()
         },
         children,
@@ -1971,7 +2280,33 @@ fn build_phone_stack() -> Component {
     } else {
         children.push(build_phone_home());
     }
-    children.push(build_intent_panel());
+    children.push(Component::column(
+        Style {
+            flex_shrink: 0.0,
+            padding: Edges::xy(12.0, 0.0),
+            ..Style::default()
+        },
+        vec![build_intent_panel()],
+    ));
+    children.push(Component::row(
+        Style {
+            height: Dimension::Px(20.0),
+            flex_shrink: 0.0,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            ..Style::default()
+        },
+        vec![Component::column(
+            Style {
+                width: Dimension::Px(128.0),
+                height: Dimension::Px(5.0),
+                border_radius: 99.0,
+                background: Color::rgba(244, 241, 234, 140),
+                ..Style::default()
+            },
+            vec![],
+        )],
+    ));
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -2068,26 +2403,31 @@ fn build_tablet_row() -> Component {
 }
 
 fn dialog_shell(children: Vec<Component>) -> Component {
+    let phone = posture() == Posture::Phone;
     Component::column(
         Style {
             gap: 10.0,
-            padding: Edges::all(18.0),
-            background: Color::from_hex("#1b2c3e"),
-            border_radius: if posture() == Posture::Phone {
-                16.0
+            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            background: if phone {
+                Color::from_hex("#1c2631")
             } else {
-                14.0
+                sheet_fill()
             },
+            border_width: if phone { 0.0 } else { 1.0 },
+            border_color: line_strong(),
+            border_radius: if phone { 22.0 } else { 16.0 },
+            box_shadow: Some(shadow_lg()),
             ..Style::default()
         },
         children,
     )
 }
 
-fn sheet_button(label: impl Into<String>, code: u8, background: &str) -> Component {
-    let mut button = chrome_button(label, code, background);
+fn sheet_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Component {
+    let mut button = action_button(label, code, kind);
     if posture() != Posture::Desktop {
         button.style.height = Dimension::Px(48.0);
+        button.style.min_height = Dimension::Px(48.0);
         button.style.flex_grow = 1.0;
     }
     button
@@ -2097,20 +2437,35 @@ fn build_confirm_dialog() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let tier = state::get_signal_text(TIER_SIGNAL);
     let mut rows = Vec::new();
-    if tier == "L1" || tier == "L2" {
+    if tier == "L0" || tier == "L1" || tier == "L2" {
+        let (label, bg, fg) = if tier == "L2" {
+            (
+                locale::t("tier-l2"),
+                Color::from_hex("#2a315c"),
+                Color::from_hex("#b7c0ff"),
+            )
+        } else if tier == "L1" {
+            (
+                locale::t("tier-l1"),
+                Color::from_hex("#f0d7b4"),
+                Color::from_hex("#2a1c0c"),
+            )
+        } else {
+            (
+                locale::t("tier-l0"),
+                Color::rgba(244, 241, 234, 20),
+                ink_token(),
+            )
+        };
         rows.push(Component::text(
-            if tier == "L2" {
-                locale::t("tier-l2")
-            } else {
-                locale::t("tier-l1")
-            },
+            label,
             Style {
                 font_size: 12.0,
-                font_weight: 700,
-                color: Color::WHITE,
-                background: Color::from_hex(if tier == "L2" { "#1d4e89" } else { "#9a3412" }),
-                border_radius: 6.0,
-                padding: Edges::xy(8.0, 4.0),
+                font_weight: 650,
+                color: fg,
+                background: bg,
+                border_radius: 999.0,
+                padding: Edges::xy(8.0, 2.0),
                 align_self: AlignSelf::FlexStart,
                 ..Style::default()
             },
@@ -2133,28 +2488,29 @@ fn build_confirm_dialog() -> Component {
             ..Style::default()
         },
     ));
-    rows.push(Component::text(
-        locale::t("confirm-footnote"),
-        Style {
-            font_size: 12.0,
-            color: Color::from_hex("#ffe08a"),
-            ..Style::default()
-        },
-    ));
     let accept = if unlocked {
-        sheet_button(locale::t("confirm"), OP_CONFIRM, "#1c8f62")
+        sheet_button(locale::t("confirm"), OP_CONFIRM, SheetKind::Primary)
     } else {
-        sheet_button(locale::t("lock-first"), OP_UNLOCK, "#9a3412")
+        sheet_button(locale::t("lock-first"), OP_UNLOCK, SheetKind::Primary)
     };
     rows.push(Component::row(
         Style {
             gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
             ..Style::default()
         },
         vec![
-            sheet_button(locale::t("cancel"), OP_CANCEL, "#3d5570"),
+            sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost),
             accept,
         ],
+    ));
+    rows.push(Component::text(
+        locale::t("confirm-footnote"),
+        Style {
+            font_size: 12.0,
+            color: faint_token(),
+            ..Style::default()
+        },
     ));
     dialog_shell(rows)
 }
@@ -2180,22 +2536,64 @@ fn build_permission_sheet() -> Component {
                 ..Style::default()
             },
         ));
-        rows.push(Component::text(
-            locale::t("perm-sheet-scope"),
+        rows.push(Component::row(
             Style {
-                font_size: 13.0,
-                color: ink(),
+                gap: 12.0,
+                padding: Edges::all(12.0),
+                border_radius: 12.0,
+                border_width: 1.0,
+                border_color: Color::rgba(244, 241, 234, 31),
+                background: Color::rgba(244, 241, 234, 10),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
                 ..Style::default()
             },
+            vec![
+                Component::column(
+                    Style {
+                        gap: 4.0,
+                        flex_grow: 1.0,
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::text(
+                            locale::t("perm-cap-title"),
+                            Style {
+                                font_size: 13.0,
+                                font_weight: 650,
+                                color: ink_token(),
+                                ..Style::default()
+                            },
+                        ),
+                        Component::text(
+                            locale::t("perm-sheet-scope"),
+                            Style {
+                                font_size: 12.0,
+                                color: faint_token(),
+                                ..Style::default()
+                            },
+                        ),
+                    ],
+                ),
+                Component::text(
+                    locale::t("perm-cap-id"),
+                    Style {
+                        font_size: 12.0,
+                        color: faint_token(),
+                        ..Style::default()
+                    },
+                ),
+            ],
         ));
         rows.push(Component::row(
             Style {
                 gap: 8.0,
+                justify_content: JustifyContent::FlexEnd,
                 ..Style::default()
             },
             vec![
-                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, "#3d5570"),
-                sheet_button(locale::t("perm-once"), OP_PERM_ONCE, "#1c8f62"),
+                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
+                sheet_button(locale::t("perm-once"), OP_PERM_ONCE, SheetKind::Primary),
             ],
         ));
     } else {
@@ -2214,8 +2612,8 @@ fn build_permission_sheet() -> Component {
                 ..Style::default()
             },
             vec![
-                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, "#3d5570"),
-                sheet_button(locale::t("lock-action"), OP_UNLOCK, "#9a3412"),
+                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
+                sheet_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary),
             ],
         ));
     }
@@ -2223,54 +2621,104 @@ fn build_permission_sheet() -> Component {
 }
 
 fn build_lock_screen() -> Component {
-    let subject = truncate_middle(&current_subject(), 22);
+    let subject = truncate_middle(&current_subject(), 28);
+    let (width, _) = state::shell_viewport();
+    let card_w = 420.0_f32.min((width - 32.0).max(280.0));
+    let mut unlock = action_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary);
+    unlock.style.width = Dimension::Px(card_w - 56.0);
+    unlock.style.height = Dimension::Px(if state::pointer_is_coarse() {
+        48.0
+    } else {
+        44.0
+    });
+    unlock.style.border_radius = 12.0;
     Component::column(
         Style {
             width: Dimension::Vw(100.0),
             height: Dimension::Vh(100.0),
             background: Color::from_hex("#101820"),
+            background_image: Some(WALLPAPER.to_string()),
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
-            gap: 14.0,
-            padding: Edges::all(28.0),
             ..Style::default()
         },
-        vec![
-            Component::text(
-                locale::t("locked"),
-                Style {
-                    font_size: 32.0,
-                    font_weight: 700,
-                    color: Color::from_hex("#f4f7fb"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                subject,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d5dee8"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                locale::t("lock-body"),
-                Style {
-                    font_size: 15.0,
-                    color: Color::from_hex("#f4f7fb"),
-                    ..Style::default()
-                },
-            ),
-            chrome_button(locale::t("lock-action"), OP_UNLOCK, "#9a3412"),
-            Component::text(
-                locale::t("lock-footnote"),
-                Style {
-                    font_size: 12.0,
-                    color: Color::from_hex("#9eb0c2"),
-                    ..Style::default()
-                },
-            ),
-        ],
+        vec![Component::column(
+            Style {
+                width: Dimension::Px(card_w),
+                padding: Edges::all(28.0),
+                gap: 8.0,
+                align_items: AlignItems::Center,
+                background: sheet_fill(),
+                border_width: 1.0,
+                border_color: line_strong(),
+                border_radius: 16.0,
+                box_shadow: Some(shadow_lg()),
+                ..Style::default()
+            },
+            vec![
+                Component::column(
+                    Style {
+                        width: Dimension::Px(64.0),
+                        height: Dimension::Px(64.0),
+                        border_radius: 20.0,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        background: Color::rgba(224, 122, 120, 31),
+                        border_width: 1.0,
+                        border_color: Color::rgba(224, 122, 120, 71),
+                        ..Style::default()
+                    },
+                    vec![Component::svg_document(
+                        glyph_svg("lock", "#ffd5d4"),
+                        24,
+                        24,
+                        Style {
+                            width: Dimension::Px(28.0),
+                            height: Dimension::Px(28.0),
+                            ..Style::default()
+                        },
+                    )],
+                ),
+                Component::text(
+                    locale::t("locked"),
+                    Style {
+                        font_size: 32.0,
+                        font_weight: 650,
+                        color: ink_token(),
+                        text_align: TextAlign::Center,
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    subject,
+                    Style {
+                        font_size: 12.0,
+                        color: muted_token(),
+                        text_align: TextAlign::Center,
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    locale::t("lock-body"),
+                    Style {
+                        font_size: 13.0,
+                        color: muted_token(),
+                        text_align: TextAlign::Center,
+                        ..Style::default()
+                    },
+                ),
+                unlock,
+                Component::text(
+                    locale::t("lock-footnote"),
+                    Style {
+                        font_size: 12.0,
+                        color: faint_token(),
+                        text_align: TextAlign::Center,
+                        ..Style::default()
+                    },
+                ),
+            ],
+        )],
     )
 }
 
@@ -2367,9 +2815,8 @@ fn app_body(id: i64) -> Component {
     }
 }
 
-fn build_window_frame(id: i64, focused: bool) -> Component {
+fn build_window_frame(id: i64, _focused: bool) -> Component {
     let frame = windows::frame(id);
-    let border = if focused { "#9eb6ff" } else { "#2a3e52" };
     let mut window = Component::column(
         Style {
             position: Position::Absolute,
@@ -2381,8 +2828,10 @@ fn build_window_frame(id: i64, focused: bool) -> Component {
             overflow: Overflow::Hidden,
             box_sizing: BoxSizing::BorderBox,
             border_width: 1.0,
-            border_color: Color::from_hex(border),
-            background: Color::from_hex("#0f0f1a"),
+            border_color: line_strong(),
+            border_radius: 14.0,
+            box_shadow: Some(shadow_lg()),
+            background: Color::from_hex("#1a242f"),
             flex_shrink: 0.0,
             ..Style::default()
         },
@@ -2495,7 +2944,8 @@ fn build_desktop() -> Component {
             min_height: Dimension::Px(0.0),
             min_width: Dimension::Px(0.0),
             overflow: Overflow::Hidden,
-            background: Color::from_hex(if night { "#1a3048" } else { "#24506e" }),
+            background: Color::from_hex(if night { "#101820" } else { "#13202c" }),
+            background_image: Some(WALLPAPER.to_string()),
             padding: Edges::all(28.0),
             align_items: AlignItems::FlexStart,
             justify_content: JustifyContent::FlexStart,
@@ -2505,27 +2955,37 @@ fn build_desktop() -> Component {
     )
 }
 
-fn desktop_icon(app: ResidentApp) -> Component {
+fn desktop_tile(glyph: &str, label: String, code: u8) -> Component {
+    let (fill, stroke) = squircle_tone(glyph);
+    let mut face = glyph_face(glyph, label.clone(), code, fill, stroke, 64.0, 18.0, false);
+    face.style.border_width = 1.0;
+    face.style.border_color = Color::rgba(244, 241, 234, 36);
+    face.style.box_shadow = Some(BoxShadow::new(
+        0.0,
+        10.0,
+        20.0,
+        0.0,
+        Color::rgba(0, 0, 0, 46),
+    ));
     Component::column(
         Style {
-            width: Dimension::Px(104.0),
+            width: Dimension::Px(if posture() == Posture::Phone {
+                96.0
+            } else {
+                104.0
+            }),
             align_items: AlignItems::Center,
             gap: 8.0,
             ..Style::default()
         },
         vec![
-            icon_button(
-                app.glyph,
-                String::new(),
-                focus_code(app.id),
-                app.color,
-                64.0,
-            ),
+            face,
             Component::text(
-                app_label(app.id),
+                label,
                 Style {
-                    font_size: 14.0,
-                    color: Color::from_hex("#e7eef6"),
+                    font_size: 13.0,
+                    color: ink_token(),
+                    text_align: TextAlign::Center,
                     ..Style::default()
                 },
             ),
@@ -2533,16 +2993,30 @@ fn desktop_icon(app: ResidentApp) -> Component {
     )
 }
 
+fn desktop_icon(app: ResidentApp) -> Component {
+    desktop_tile(app.glyph, app_label(app.id), focus_code(app.id))
+}
+
 fn build_desktop_icons() -> Component {
+    let phone = posture() == Posture::Phone;
+    let mut tiles: Vec<Component> = RESIDENT_APPS.iter().copied().map(desktop_icon).collect();
+    if phone {
+        tiles.push(desktop_tile(
+            "devices",
+            locale::t("settings-devices"),
+            OP_SETTINGS_DEVICES,
+        ));
+    }
+    let columns = if phone { 3 } else { 2 };
     let mut rows = Vec::new();
-    for pair in RESIDENT_APPS.chunks(2) {
+    for pair in tiles.chunks(columns) {
         rows.push(Component::row(
             Style {
-                gap: 28.0,
+                gap: 8.0,
                 align_items: AlignItems::FlexStart,
                 ..Style::default()
             },
-            pair.iter().copied().map(desktop_icon).collect(),
+            pair.to_vec(),
         ));
     }
     Component::column(
@@ -3624,7 +4098,7 @@ fn build_task_center() -> Component {
     } else {
         for line in log.lines().take(8) {
             body.push(Component::text(
-                line,
+                present_receipt(line),
                 Style {
                     font_size: 12.0,
                     color: ink(),
@@ -3668,6 +4142,44 @@ fn planner_subtitle() -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SheetKind {
+    Ghost,
+    Primary,
+    Danger,
+}
+
+fn action_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Component {
+    let (background, color, border) = match kind {
+        SheetKind::Ghost => (Color::TRANSPARENT, ink_token(), Some(line_strong())),
+        SheetKind::Primary => (Color::from_hex("#0c6d4c"), Color::from_hex("#e9fff5"), None),
+        SheetKind::Danger => (
+            Color::TRANSPARENT,
+            Color::from_hex("#ffd5d4"),
+            Some(Color::rgba(224, 122, 120, 115)),
+        ),
+    };
+    let height = touch_min();
+    Component::button_with_click(
+        label,
+        Style {
+            background,
+            color,
+            border_width: if border.is_some() { 1.0 } else { 0.0 },
+            border_color: border.unwrap_or(Color::TRANSPARENT),
+            border_radius: 10.0,
+            font_size: 14.0,
+            font_weight: 600,
+            padding: Edges::xy(14.0, 0.0),
+            height: Dimension::Px(height),
+            min_height: Dimension::Px(height),
+            box_sizing: BoxSizing::BorderBox,
+            ..Style::default()
+        },
+        invoke(code),
+    )
+}
+
 fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Component {
     let action = if code == OP_PROPOSE {
         EventAction::Invoke {
@@ -3677,16 +4189,19 @@ fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Compon
     } else {
         invoke(code)
     };
+    let height = touch_min();
     Component::button_with_click(
         label,
         Style {
             background: Color::from_hex(background),
-            border_radius: 8.0,
+            border_radius: 10.0,
             font_size: 13.0,
-            font_weight: 700,
+            font_weight: 650,
             color: Color::WHITE,
-            padding: Edges::xy(12.0, 12.0),
-            min_height: Dimension::Px(48.0),
+            padding: Edges::xy(12.0, 0.0),
+            height: Dimension::Px(height),
+            min_height: Dimension::Px(height),
+            box_sizing: BoxSizing::BorderBox,
             ..Style::default()
         },
         action,
@@ -4697,7 +5212,7 @@ fn launcher_tile(app: LaunchApp) -> Component {
         },
         vec![
             Component::svg_document(
-                glyph_svg(app.glyph),
+                glyph_svg(app.glyph, "white"),
                 24,
                 24,
                 Style {
@@ -4767,10 +5282,108 @@ fn build_toast(text: &str) -> Component {
 }
 
 fn filter_chip(key: &str, code: u8, selected: bool) -> Component {
-    chrome_button(
+    let height = if state::pointer_is_coarse() {
+        48.0
+    } else {
+        28.0
+    };
+    Component::button_with_click(
         locale::t(key),
-        code,
-        if selected { "#0c6d4c" } else { "#3d5570" },
+        Style {
+            height: Dimension::Px(height),
+            min_height: Dimension::Px(height),
+            box_sizing: BoxSizing::BorderBox,
+            padding: Edges::xy(10.0, 0.0),
+            border_radius: 999.0,
+            border_width: if selected { 0.0 } else { 1.0 },
+            border_color: Color::rgba(244, 241, 234, 31),
+            background: if selected {
+                Color::rgba(244, 241, 234, 26)
+            } else {
+                Color::TRANSPARENT
+            },
+            color: if selected { ink_token() } else { muted_token() },
+            font_size: 12.0,
+            ..Style::default()
+        },
+        invoke(code),
+    )
+}
+
+fn receipt_row(line: &str) -> Component {
+    let parts = parse_receipt(line);
+    let (pill_bg, pill_fg) = match parts.decision.as_str() {
+        "allowed" => (Color::rgba(20, 150, 106, 46), Color::from_hex("#c9ffe4")),
+        "denied" => (Color::rgba(224, 122, 120, 41), Color::from_hex("#ffd0cf")),
+        "cancelled" => (Color::rgba(226, 164, 92, 41), Color::from_hex("#ffe1b5")),
+        _ => (Color::rgba(244, 241, 234, 20), muted_token()),
+    };
+    let subtitle = if parts.tier.is_empty() {
+        parts.detail.clone()
+    } else {
+        format!("{} · {}", parts.tier, parts.detail)
+    };
+    Component::row(
+        Style {
+            gap: 8.0,
+            align_items: AlignItems::Center,
+            padding: Edges::xy(8.0, 10.0),
+            border_width: 0.0,
+            border_color: Color::rgba(244, 241, 234, 31),
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                parts.id,
+                Style {
+                    width: Dimension::Px(52.0),
+                    font_size: 12.0,
+                    color: faint_token(),
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+            ),
+            Component::column(
+                Style {
+                    flex_grow: 1.0,
+                    min_width: Dimension::Px(0.0),
+                    gap: 2.0,
+                    ..Style::default()
+                },
+                vec![
+                    Component::text(
+                        parts.command,
+                        Style {
+                            font_size: 13.0,
+                            font_weight: 650,
+                            color: ink_token(),
+                            ..Style::default()
+                        },
+                    ),
+                    Component::text(
+                        subtitle,
+                        Style {
+                            font_size: 12.0,
+                            color: faint_token(),
+                            ..Style::default()
+                        },
+                    ),
+                ],
+            ),
+            Component::text(
+                decision_label(&parts.decision),
+                Style {
+                    font_size: 12.0,
+                    font_weight: 650,
+                    color: pill_fg,
+                    background: pill_bg,
+                    border_radius: 999.0,
+                    padding: Edges::xy(8.0, 2.0),
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+            ),
+        ],
     )
 }
 
@@ -4856,24 +5469,53 @@ fn build_receipts_viewer() -> Component {
     let page_label = (page + 1).to_string();
     let pages_label = pages.to_string();
     let filter = state::get_signal(RECEIPT_FILTER_SIGNAL);
+    let mut close = action_button(locale::t("close"), OP_TOGGLE_RECEIPTS, SheetKind::Ghost);
+    close.style.height = Dimension::Px(if state::pointer_is_coarse() {
+        48.0
+    } else {
+        32.0
+    });
+    close.style.min_height = close.style.height;
     let mut body = vec![
-        Component::text(
-            locale::t("ledger"),
+        Component::row(
             Style {
-                font_size: 16.0,
-                font_weight: 700,
-                color: ink(),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                gap: 8.0,
                 ..Style::default()
             },
+            vec![
+                Component::text(
+                    locale::t("receipts"),
+                    Style {
+                        font_size: 18.0,
+                        font_weight: 650,
+                        color: ink_token(),
+                        ..Style::default()
+                    },
+                ),
+                close,
+            ],
         ),
-        chrome_button(
+        Component::button_with_click(
             format!("{subject_label} · {storage_label}"),
-            OP_COPY_SUBJECT,
-            "#243447",
+            Style {
+                background: Color::TRANSPARENT,
+                color: muted_token(),
+                font_size: 12.0,
+                padding: Edges::ZERO,
+                min_height: Dimension::Px(if state::pointer_is_coarse() {
+                    48.0
+                } else {
+                    28.0
+                }),
+                ..Style::default()
+            },
+            invoke(OP_COPY_SUBJECT),
         ),
         Component::row(
             Style {
-                gap: 8.0,
+                gap: 6.0,
                 align_items: AlignItems::Center,
                 flex_wrap: FlexWrap::Wrap,
                 ..Style::default()
@@ -4885,7 +5527,6 @@ fn build_receipts_viewer() -> Component {
                 filter_chip("filter-cancelled", OP_FILTER_CANCELLED, filter == 3),
             ],
         ),
-        chrome_button(locale::t("close"), OP_TOGGLE_RECEIPTS, "#3d5570"),
         Component::row(
             Style {
                 gap: 8.0,
@@ -4893,7 +5534,7 @@ fn build_receipts_viewer() -> Component {
                 ..Style::default()
             },
             vec![
-                chrome_button(locale::t("receipt-prev"), OP_RECEIPT_PREV, "#3d5570"),
+                action_button(locale::t("receipt-prev"), OP_RECEIPT_PREV, SheetKind::Ghost),
                 Component::text(
                     locale::t_args(
                         "receipt-page",
@@ -4901,11 +5542,11 @@ fn build_receipts_viewer() -> Component {
                     ),
                     Style {
                         font_size: 12.0,
-                        color: muted_ink(),
+                        color: muted_token(),
                         ..Style::default()
                     },
                 ),
-                chrome_button(locale::t("receipt-next"), OP_RECEIPT_NEXT, "#3d5570"),
+                action_button(locale::t("receipt-next"), OP_RECEIPT_NEXT, SheetKind::Ghost),
             ],
         ),
     ];
@@ -4925,25 +5566,22 @@ fn build_receipts_viewer() -> Component {
         ));
     } else {
         for line in &entries[start..end] {
-            body.push(Component::text(
-                present_receipt(line),
-                Style {
-                    font_size: 12.0,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ));
+            body.push(receipt_row(line));
         }
     }
     Component::column(
         Style {
-            width: Dimension::Px(360.0),
+            width: Dimension::Px(400.0),
             flex_shrink: 0.0,
             min_height: Dimension::Px(0.0),
             overflow: Overflow::Auto,
-            padding: Edges::all(14.0),
-            gap: 8.0,
-            background: Color::from_hex("#243047"),
+            padding: Edges::all(16.0),
+            gap: 10.0,
+            background: sheet_fill(),
+            border_width: 1.0,
+            border_color: line_strong(),
+            border_radius: 16.0,
+            box_shadow: Some(shadow_lg()),
             ..Style::default()
         },
         body,
@@ -4994,6 +5632,16 @@ mod shell_ux_tests {
         assert_eq!(receipt_page_count(6), 1);
         assert_eq!(receipt_page_count(7), 2);
         assert_eq!(receipt_page_count(48), 8);
+    }
+
+    #[test]
+    fn parse_receipt_keeps_id_tier_and_outcome() {
+        let parts = parse_receipt("#3 allowed open-files tier=L0 actor=me confirmed=true — opened");
+        assert_eq!(parts.id, "#3");
+        assert_eq!(parts.decision, "allowed");
+        assert_eq!(parts.command, "open-files");
+        assert_eq!(parts.tier, "L0");
+        assert_eq!(parts.detail, "opened");
     }
 
     #[test]
