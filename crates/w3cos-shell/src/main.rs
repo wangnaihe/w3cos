@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 mod agent_host;
+mod locale;
 mod windows;
 
 #[cfg(feature = "desktop")]
@@ -15,8 +16,7 @@ use crate::state;
 use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, INTENT_INPUT_PLACEHOLDER, IntentSession, IntentTier, ProposeResult, ShellApp,
-    ShellContext,
+    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
 };
 use w3cos_ai_bridge::permissions::{AgentPermissions, BridgeOp};
 use w3cos_ai_bridge::shell_tools::{self, ShellView};
@@ -102,8 +102,8 @@ const OP_FOCUS_AGENT: u8 = 45;
 const OP_FOCUS_BROWSER: u8 = 46;
 const OP_FOCUS_EDITOR: u8 = 47;
 const OP_MAXIMIZE: u8 = 48;
-
-const LAUNCHER_PLACEHOLDER: &str = "搜索应用 Search apps";
+const OP_LOCALE_ZH: u8 = 49;
+const OP_LOCALE_EN: u8 = 50;
 
 fn main() {
     shell_main();
@@ -113,6 +113,7 @@ pub(crate) fn shell_main() {
     if shared_launch::launch_from_args() {
         return;
     }
+    locale::apply_startup();
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
 
     let mut ai_port = None;
@@ -279,7 +280,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                "上下文已隐藏。Context hidden.",
+                &locale::t("toast-context-hidden"),
             );
         }
         OP_RESTORE => {
@@ -287,7 +288,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                "上下文已恢复。Context shared.",
+                &locale::t("toast-context-shared"),
             );
         }
         OP_LOCK => {
@@ -295,7 +296,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                "身份已锁定。Identity locked.",
+                &locale::t("toast-identity-locked"),
             );
         }
         OP_UNLOCK => {
@@ -303,17 +304,17 @@ fn on_shell_intent(code: u8, draft: &str) {
                 sync_session(
                     session,
                     state::get_signal(PHASE_SIGNAL),
-                    "已解锁（不是 passkey）。Unlocked stub.",
+                    &locale::t("toast-unlocked-stub"),
                 );
             }
         }
         OP_ENROLL => {
             let notice = if session.begin_passkey_enrollment().is_some() {
-                "已生成注册挑战。还没有验证断言。Challenge ready."
+                locale::t("toast-enroll-ok")
             } else {
-                "挑战没有生成。Challenge was not created."
+                locale::t("toast-enroll-fail")
             };
-            sync_session(session, state::get_signal(PHASE_SIGNAL), notice);
+            sync_session(session, state::get_signal(PHASE_SIGNAL), &notice);
         }
         OP_SHARED_APP => {
             shared_launch::spawn_detached(
@@ -323,10 +324,7 @@ fn on_shell_intent(code: u8, draft: &str) {
                     "/usr/share/w3cos/apps/shared-hello/shared-hello.w3app",
                 ),
             );
-            state::set_text_signal(
-                NOTICE_SIGNAL,
-                "已启动共享运行时应用。Launched the shared-runtime app.",
-            );
+            state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-app"));
         }
         OP_SHARED_PAGE => {
             shared_launch::spawn_detached(
@@ -336,10 +334,7 @@ fn on_shell_intent(code: u8, draft: &str) {
                     "/usr/share/w3cos/apps/shared-hello/page.html",
                 ),
             );
-            state::set_text_signal(
-                NOTICE_SIGNAL,
-                "已把网页载入页面 worker。Loaded the page in the page worker.",
-            );
+            state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-page"));
         }
         OP_RUN_TERMINAL => run_terminal_from_button(session),
         OP_L2_TOGGLE => toggle_l2(session),
@@ -351,10 +346,7 @@ fn on_shell_intent(code: u8, draft: &str) {
                     "/usr/share/w3cos/apps/shared-counter/libshared_counter.so",
                 ),
             );
-            state::set_text_signal(
-                NOTICE_SIGNAL,
-                "已启动 C 插件应用。Launched the C plugin app.",
-            );
+            state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-plugin"));
         }
         _ => {}
     });
@@ -610,6 +602,27 @@ fn invoke(code: u8) -> EventAction {
     }
 }
 
+fn app_key(id: i64) -> &'static str {
+    match id {
+        1 => "app-files",
+        2 => "app-terminal",
+        3 => "app-settings",
+        4 => "app-agent",
+        5 => "app-browser",
+        6 => "app-editor",
+        _ => "app-desktop",
+    }
+}
+
+fn app_label(id: i64) -> String {
+    locale::t(app_key(id))
+}
+
+fn toast_named(key: &str, id: i64) -> String {
+    let name = app_label(id);
+    locale::t_args(key, &[("name", &name)])
+}
+
 fn app_bit(id: i64) -> i64 {
     if (1..=6).contains(&id) {
         1_i64 << id
@@ -663,7 +676,7 @@ fn window_target(draft: &str) -> i64 {
 fn minimize_window(id: i64) {
     let bit = app_bit(id);
     if bit == 0 {
-        push_toast("桌面保持显示。The desktop stays put.");
+        push_toast(&locale::t("toast-desktop-stays"));
         return;
     }
     let open = state::get_signal(OPEN_MASK_SIGNAL);
@@ -673,15 +686,14 @@ fn minimize_window(id: i64) {
     if state::get_signal(APP_SIGNAL) == id {
         state::set_signal(APP_SIGNAL, 0);
     }
-    let name = ShellApp::from_signal(id).bilingual();
-    push_toast(&format!("已最小化 {name}。Minimized {name}."));
+    push_toast(&toast_named("toast-minimized", id));
     remember_windows();
 }
 
 fn close_window(id: i64) {
     let bit = app_bit(id);
     if bit == 0 {
-        push_toast("桌面不能关闭。The desktop has no window to close.");
+        push_toast(&locale::t("toast-no-close"));
         return;
     }
     let open = state::get_signal(OPEN_MASK_SIGNAL);
@@ -691,25 +703,23 @@ fn close_window(id: i64) {
     if state::get_signal(APP_SIGNAL) == id {
         state::set_signal(APP_SIGNAL, 0);
     }
-    let name = ShellApp::from_signal(id).bilingual();
-    push_toast(&format!("已关闭 {name}。Closed {name}."));
+    push_toast(&toast_named("toast-closed", id));
     remember_windows();
 }
 
 fn toggle_window_maximize(id: i64) {
     let (width, height) = stage_bounds();
     if !windows::toggle_maximize(id, width, height) {
-        push_toast("桌面不能最大化。The desktop stays put.");
+        push_toast(&locale::t("toast-no-max"));
         return;
     }
     focus_app(id);
-    let name = ShellApp::from_signal(id).bilingual();
-    let verb = if windows::is_maximized(id) {
-        "已最大化"
+    let key = if windows::is_maximized(id) {
+        "toast-max"
     } else {
-        "已还原"
+        "toast-restore"
     };
-    push_toast(&format!("{verb} {name}。"));
+    push_toast(&toast_named(key, id));
 }
 
 fn stage_bounds() -> (f32, f32) {
@@ -769,11 +779,10 @@ fn cycle_windows() {
     match found {
         Some(id) if id != current => {
             focus_app(id);
-            let name = ShellApp::from_signal(id).bilingual();
-            push_toast(&format!("切换到 {name}。Switched to {name}."));
+            push_toast(&toast_named("toast-switched", id));
         }
-        Some(_) => push_toast("没有其他打开的窗口。No other open window."),
-        None => push_toast("没有打开的窗口。No open window."),
+        Some(_) => push_toast(&locale::t("toast-no-other")),
+        None => push_toast(&locale::t("toast-none")),
     }
 }
 
@@ -814,6 +823,14 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_FOCUS_AGENT => focus_app(4),
         OP_FOCUS_BROWSER => focus_app(5),
         OP_FOCUS_EDITOR => focus_app(6),
+        OP_LOCALE_ZH => {
+            locale::set_locale("zh-CN");
+            state::mark_dirty();
+        }
+        OP_LOCALE_EN => {
+            locale::set_locale("en");
+            state::mark_dirty();
+        }
         _ => return false,
     }
     true
@@ -836,7 +853,7 @@ fn toggle_l2(session: &mut IntentSession) {
         sync_session(
             session,
             state::get_signal(PHASE_SIGNAL),
-            "L2 已关闭。没有启动模型。L2 is off. No model was started.",
+            &locale::t("toast-l2-off"),
         );
         return;
     }
@@ -845,14 +862,14 @@ fn toggle_l2(session: &mut IntentSession) {
         sync_session(
             session,
             state::get_signal(PHASE_SIGNAL),
-            "L2 已打开。改动仍要先确认。L2 is on. Confirm still gates every change.",
+            &locale::t("toast-l2-on"),
         );
         return;
     }
     sync_session(
         session,
         state::get_signal(PHASE_SIGNAL),
-        "L2 保持关闭。先设置 W3COS_L2，这个开关不会启动推理。L2 stays off until W3COS_L2 is set.",
+        &locale::t("toast-l2-blocked"),
     );
 }
 
@@ -901,7 +918,7 @@ fn apply_screen_override() {
             state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
             state::set_signal(MINIMIZED_MASK_SIGNAL, app_bit(5));
             focus_app(1);
-            push_toast("浏览器已最小化。Browser is minimized.");
+            push_toast(&locale::t("toast-browser-min"));
         }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
         _ => {}
@@ -961,6 +978,7 @@ fn build_shell() -> Component {
             overflow: Overflow::Hidden,
             background: Color::from_hex(if night { "#15202c" } else { "#1a2836" }),
             gap: 0.0,
+            direction: locale::text_direction(),
             ..Style::default()
         },
         column,
@@ -1139,7 +1157,7 @@ fn build_desktop() -> Component {
     }
     if night {
         children.push(Component::text(
-            "Night mode is on",
+            locale::t("desktop-night"),
             Style {
                 font_size: 14.0,
                 color: Color::from_hex("#a29bfe"),
@@ -1166,16 +1184,17 @@ fn build_desktop() -> Component {
 
 fn build_desktop_icons() -> Component {
     let apps = [
-        ("F", "Files", "#3498db", 1),
-        ("T", "Terminal", "#2ecc71", 2),
-        ("S", "Settings", "#9b59b6", 3),
-        ("A", "AI Agent", "#e74c3c", 4),
-        ("B", "Browser", "#f39c12", 5),
-        ("E", "Editor", "#1abc9c", 6),
+        ("F", "#3498db", 1),
+        ("T", "#2ecc71", 2),
+        ("S", "#9b59b6", 3),
+        ("A", "#e74c3c", 4),
+        ("B", "#f39c12", 5),
+        ("E", "#1abc9c", 6),
     ];
     let icons: Vec<Component> = apps
         .iter()
-        .map(|(l, label, c, id)| {
+        .map(|(l, c, id)| {
+            let label = app_label(*id);
             Component::column(
                 Style {
                     align_items: AlignItems::Center,
@@ -1198,7 +1217,7 @@ fn build_desktop_icons() -> Component {
                         invoke(focus_code(*id)),
                     ),
                     Component::text(
-                        *label,
+                        label,
                         Style {
                             font_size: 14.0,
                             color: Color::from_hex("#c0c0d0"),
@@ -1229,7 +1248,7 @@ fn build_shared_launcher() -> Component {
         },
         vec![
             Component::button_with_click(
-                "Shared Hello",
+                locale::t("shared-hello"),
                 Style {
                     background: Color::from_hex("#2bb0ed"),
                     color: Color::from_hex("#041422"),
@@ -1241,7 +1260,7 @@ fn build_shared_launcher() -> Component {
                 invoke(OP_SHARED_APP),
             ),
             Component::button_with_click(
-                "Web VM",
+                locale::t("shared-web"),
                 Style {
                     background: Color::from_hex("#1b4332"),
                     color: Color::from_hex("#d8f3dc"),
@@ -1253,7 +1272,7 @@ fn build_shared_launcher() -> Component {
                 invoke(OP_SHARED_PAGE),
             ),
             Component::button_with_click(
-                "Counter",
+                locale::t("shared-counter"),
                 Style {
                     background: Color::from_hex("#9b2226"),
                     color: Color::from_hex("#fff1f0"),
@@ -1277,10 +1296,10 @@ fn build_system_info() -> Component {
             ..Style::default()
         },
         vec![
-            info_card("CPU", "23%", "#00b894"),
-            info_card("Memory", "5.4 / 8 GB", "#fdcb6e"),
-            info_card("Storage", "205 / 512 GB", "#74b9ff"),
-            info_card("Network", "84 Mbps", "#a29bfe"),
+            info_card(&locale::t("info-cpu"), "23%", "#00b894"),
+            info_card(&locale::t("info-memory"), "5.4 / 8 GB", "#fdcb6e"),
+            info_card(&locale::t("info-storage"), "205 / 512 GB", "#74b9ff"),
+            info_card(&locale::t("info-network"), "84 Mbps", "#a29bfe"),
         ],
     )
 }
@@ -1355,7 +1374,7 @@ fn build_branding() -> Component {
                 },
             ),
             Component::text(
-                "Native Desktop Shell - TypeScript compiled to native binary",
+                locale::t("brand-tagline"),
                 Style {
                     font_size: 13.0,
                     color: Color::from_hex("#808090"),
@@ -1408,11 +1427,11 @@ fn build_files_app() -> Component {
                             ..Style::default()
                         },
                         vec![
-                            nav_button("主文件夹 Home", folder == 0, OP_FILES_HOME),
-                            nav_button("文档 Documents", folder == 1, OP_FILES_DOCS),
-                            nav_button("图片 Pictures", folder == 2, OP_FILES_PICS),
-                            nav_button("下载 Downloads", folder == 3, OP_FILES_DOWN),
-                            nav_button("音乐 Music", folder == 4, OP_FILES_MUSIC),
+                            nav_button(&locale::t("files-home"), folder == 0, OP_FILES_HOME),
+                            nav_button(&locale::t("files-docs"), folder == 1, OP_FILES_DOCS),
+                            nav_button(&locale::t("files-pics"), folder == 2, OP_FILES_PICS),
+                            nav_button(&locale::t("files-down"), folder == 3, OP_FILES_DOWN),
+                            nav_button(&locale::t("files-music"), folder == 4, OP_FILES_MUSIC),
                         ],
                     ),
                     Component::column(
@@ -1442,43 +1461,47 @@ fn build_files_app() -> Component {
     )
 }
 
-fn folder_title(folder: i64) -> (&'static str, &'static str) {
+fn folder_title(folder: i64) -> (String, String) {
     match folder {
-        1 => ("文档 Documents", "主文件夹 / 文档"),
-        2 => ("图片 Pictures", "主文件夹 / 图片"),
-        3 => ("下载 Downloads", "主文件夹 / 下载"),
-        4 => ("音乐 Music", "主文件夹 / 音乐"),
-        5 => ("projects", "主文件夹 / projects"),
-        6 => ("w3cos", "主文件夹 / w3cos"),
-        _ => ("文件 Files", "主文件夹 Home"),
+        1 => (locale::t("files-docs"), locale::t("files-crumb-docs")),
+        2 => (locale::t("files-pics"), locale::t("files-crumb-pics")),
+        3 => (locale::t("files-down"), locale::t("files-crumb-down")),
+        4 => (locale::t("files-music"), locale::t("files-crumb-music")),
+        5 => ("projects".to_string(), locale::t("files-crumb-projects")),
+        6 => ("w3cos".to_string(), locale::t("files-crumb-w3cos")),
+        _ => (locale::t("app-files"), locale::t("files-crumb-home")),
     }
 }
 
-fn folder_summary(folder: i64) -> &'static str {
-    match folder {
-        1 => "2 items",
-        2 => "2 items",
-        3 => "1 item",
-        4 => "0 items",
-        5 => "2 items",
-        6 => "2 items",
-        _ => "6 items",
-    }
+fn folder_summary(folder: i64) -> String {
+    let count = match folder {
+        1 | 2 | 5 | 6 => 2,
+        3 => 1,
+        4 => 0,
+        _ => 6,
+    };
+    let count = count.to_string();
+    locale::t_args("files-count", &[("count", &count)])
 }
 
 fn folder_rows(folder: i64) -> Vec<Component> {
     match folder {
         1 => vec![
-            file_row("notes.txt", "Text", "1.2 KB", None),
-            file_row("design.md", "Markdown", "8.4 KB", None),
+            file_row("notes.txt", &locale::t("file-text"), "1.2 KB", None),
+            file_row("design.md", &locale::t("file-markdown"), "8.4 KB", None),
         ],
         2 => vec![
-            file_row("screenshot.png", "PNG Image", "245 KB", None),
-            file_row("wallpaper.png", "PNG Image", "1.1 MB", None),
+            file_row("screenshot.png", &locale::t("file-png"), "245 KB", None),
+            file_row("wallpaper.png", &locale::t("file-png"), "1.1 MB", None),
         ],
-        3 => vec![file_row("fetch-l2-models.sh", "Script", "2.0 KB", None)],
+        3 => vec![file_row(
+            "fetch-l2-models.sh",
+            &locale::t("file-script"),
+            "2.0 KB",
+            None,
+        )],
         4 => vec![Component::text(
-            "这个文件夹是空的。This folder is empty.",
+            locale::t("files-empty"),
             Style {
                 font_size: 14.0,
                 color: Color::from_hex("#d5dee8"),
@@ -1487,20 +1510,30 @@ fn folder_rows(folder: i64) -> Vec<Component> {
             },
         )],
         5 => vec![
-            file_row("README.md", "Markdown", "4.2 KB", None),
-            file_row("Cargo.toml", "TOML", "1.1 KB", None),
+            file_row("README.md", &locale::t("file-markdown"), "4.2 KB", None),
+            file_row("Cargo.toml", &locale::t("file-toml"), "1.1 KB", None),
         ],
         6 => vec![
-            file_row("app.tsx", "TypeScript", "2.8 KB", None),
-            file_row("shell.rs", "Rust", "18 KB", None),
+            file_row("app.tsx", &locale::t("file-typescript"), "2.8 KB", None),
+            file_row("shell.rs", &locale::t("file-rust"), "18 KB", None),
         ],
         _ => vec![
-            file_row("projects", "Folder", "--", Some(OP_FILES_PROJECTS)),
-            file_row("w3cos", "Folder", "--", Some(OP_FILES_W3COS)),
-            file_row("README.md", "Markdown", "4.2 KB", None),
-            file_row("Cargo.toml", "TOML", "1.1 KB", None),
-            file_row("app.tsx", "TypeScript", "2.8 KB", None),
-            file_row("screenshot.png", "PNG Image", "245 KB", None),
+            file_row(
+                "projects",
+                &locale::t("file-folder"),
+                "--",
+                Some(OP_FILES_PROJECTS),
+            ),
+            file_row(
+                "w3cos",
+                &locale::t("file-folder"),
+                "--",
+                Some(OP_FILES_W3COS),
+            ),
+            file_row("README.md", &locale::t("file-markdown"), "4.2 KB", None),
+            file_row("Cargo.toml", &locale::t("file-toml"), "1.1 KB", None),
+            file_row("app.tsx", &locale::t("file-typescript"), "2.8 KB", None),
+            file_row("screenshot.png", &locale::t("file-png"), "245 KB", None),
         ],
     }
 }
@@ -1586,7 +1619,7 @@ fn build_terminal_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("终端 Terminal", "#1c8f62", 2),
+            app_titlebar(locale::t("app-terminal"), "#1c8f62", 2),
             Component::column(
                 Style {
                     flex_grow: 1.0,
@@ -1596,7 +1629,7 @@ fn build_terminal_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "允许 echo、pwd、help。运行时申请一次性的 w3cos-process。",
+                        locale::t("terminal-allow"),
                         Style {
                             font_size: 16.0,
                             font_weight: 700,
@@ -1605,15 +1638,7 @@ fn build_terminal_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Allowlist: echo, pwd, help. Run asks for a one-shot w3cos-process grant.",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#d5dee8"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "w3cos shell ready",
+                        locale::t("terminal-ready"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#b7f0d8"),
@@ -1649,14 +1674,14 @@ fn build_terminal_app() -> Component {
                                     ..Style::default()
                                 },
                             ),
-                            chrome_button("运行 Run", OP_RUN_TERMINAL, "#1c8f62"),
+                            chrome_button(locale::t("terminal-run"), OP_RUN_TERMINAL, "#1c8f62"),
                         ],
                     ),
                     Component::text(
                         {
                             let output = state::get_signal_text(TERM_OUT_SIGNAL);
                             if output.is_empty() {
-                                "允许 echo、pwd、help。需要一次性的 w3cos-process。".to_string()
+                                locale::t("terminal-hint")
                             } else {
                                 output
                             }
@@ -1687,7 +1712,7 @@ fn build_settings_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("设置 Settings", "#5b4fe0", 3),
+            app_titlebar(locale::t("app-settings"), "#5b4fe0", 3),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -1704,10 +1729,18 @@ fn build_settings_app() -> Component {
                             ..Style::default()
                         },
                         vec![
-                            nav_button("本机 Local", tab == 0, OP_SETTINGS_LOCAL),
-                            nav_button("身份 Identity", tab == 1, OP_SETTINGS_IDENTITY),
-                            nav_button("权限 Permissions", tab == 2, OP_SETTINGS_BRIDGE),
-                            nav_button("L2 模型", tab == 3, OP_SETTINGS_L2),
+                            nav_button(&locale::t("settings-local"), tab == 0, OP_SETTINGS_LOCAL),
+                            nav_button(
+                                &locale::t("settings-identity"),
+                                tab == 1,
+                                OP_SETTINGS_IDENTITY,
+                            ),
+                            nav_button(
+                                &locale::t("settings-permissions"),
+                                tab == 2,
+                                OP_SETTINGS_BRIDGE,
+                            ),
+                            nav_button(&locale::t("settings-l2"), tab == 3, OP_SETTINGS_L2),
                         ],
                     ),
                     Component::column(
@@ -1758,20 +1791,26 @@ fn settings_heading(title: &str, detail: &str) -> Vec<Component> {
 
 fn settings_local_page() -> Vec<Component> {
     let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
-        "开 On"
+        locale::t("on")
     } else {
-        "关 Off"
+        locale::t("off")
     };
     let mut rows = settings_heading(
-        "本机设置 · Local preferences",
-        "没有账号，也没有链。夜间模式仍走提议和确认。",
+        &locale::t("settings-local-title"),
+        &locale::t("settings-local-detail"),
     );
-    rows.push(settings_row("夜间模式 Night", night));
+    rows.push(settings_row(&locale::t("settings-night"), &night));
     rows.push(chrome_button(
-        "切换夜间 Toggle night",
+        locale::t("settings-night-toggle"),
         OP_CHIP_NIGHT,
         "#3d5570",
     ));
+    rows.push(settings_row(
+        &locale::t("settings-language"),
+        &locale::current(),
+    ));
+    rows.push(chrome_button(locale::t("lang-zh"), OP_LOCALE_ZH, "#3d5570"));
+    rows.push(chrome_button(locale::t("lang-en"), OP_LOCALE_EN, "#3d5570"));
     rows
 }
 
@@ -1790,16 +1829,16 @@ fn settings_identity_page() -> Vec<Component> {
     };
     let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
     let enroll_label = if enroll_owned.is_empty() {
-        "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。".to_string()
+        locale::t("enroll-fallback")
     } else {
         enroll_owned
     };
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut rows = settings_heading(
-        "身份 Identity",
-        "口令经 KDF 保存，还不是 passkey。锁定后不能确认改动。",
+        &locale::t("settings-identity-title"),
+        &locale::t("settings-identity-detail"),
     );
-    rows.push(settings_row("主体 Subject", &subject_label));
+    rows.push(settings_row(&locale::t("settings-subject"), &subject_label));
     rows.push(Component::text(
         enroll_label,
         Style {
@@ -1809,31 +1848,32 @@ fn settings_identity_page() -> Vec<Component> {
         },
     ));
     rows.push(chrome_button(
-        "生成注册挑战 Challenge",
+        locale::t("enroll-challenge"),
         OP_ENROLL,
         "#3d5570",
     ));
-    rows.push(settings_row("身份 Identity", "PBKDF2 · not a passkey"));
     rows.push(settings_row(
-        "状态 Status",
-        if unlocked {
-            "已解锁 Unlocked"
-        } else {
-            "已锁定 Locked"
-        },
+        &locale::t("settings-identity-title"),
+        &locale::t("settings-not-passkey"),
     ));
+    let status = if unlocked {
+        locale::t("unlocked")
+    } else {
+        locale::t("locked")
+    };
+    rows.push(settings_row(&locale::t("settings-status"), &status));
     rows.push(chrome_button(
         if unlocked {
-            "锁定 Lock"
+            locale::t("lock")
         } else {
-            "解锁 Unlock"
+            locale::t("unlock")
         },
         if unlocked { OP_LOCK } else { OP_UNLOCK },
         if unlocked { "#3d5570" } else { "#9a3412" },
     ));
-    rows.push(settings_row("收据存储 Receipts", &storage_label));
+    rows.push(settings_row(&locale::t("settings-storage"), &storage_label));
     rows.push(chrome_button(
-        "打开收据本 Ledger",
+        locale::t("open-ledger"),
         OP_TOGGLE_RECEIPTS,
         "#3d5570",
     ));
@@ -1843,59 +1883,63 @@ fn settings_identity_page() -> Vec<Component> {
 fn settings_permissions_page() -> Vec<Component> {
     let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
     let bridge = match bridge.trim() {
-        "" | "observer" => "observer（HTTP 默认，本页不能调高）",
-        "interactive" => "interactive（来自环境变量）",
-        "system" => "system（来自环境变量）",
-        _ => "observer（无法识别的值已忽略）",
+        "" | "observer" => locale::t("perm-observer"),
+        "interactive" => locale::t("perm-interactive"),
+        "system" => locale::t("perm-system"),
+        _ => locale::t("perm-unknown"),
     };
-    let mut rows = settings_heading(
-        "权限 Permissions",
-        "HTTP 桥的权限只看 W3COS_AI_PERMISSIONS。这个页面不会把它调高。",
-    );
-    rows.push(settings_row("HTTP 桥 Bridge", bridge));
+    let mut rows = settings_heading(&locale::t("perm-title"), &locale::t("perm-detail"));
+    rows.push(settings_row(&locale::t("perm-bridge"), &bridge));
     rows.push(settings_row(
-        "本机会话 Shell",
-        "interactive · 确认后才授予一次性 act / process",
+        &locale::t("perm-shell"),
+        &locale::t("perm-shell-value"),
     ));
     rows.push(settings_row(
-        "启动时授予 Boot grants",
-        "w3cos-accessibility · display-capture",
+        &locale::t("perm-boot"),
+        &locale::t("perm-boot-value"),
     ));
     rows.push(settings_row(
-        "不会常驻 Not standing",
-        "w3cos-agent-act · w3cos-process",
+        &locale::t("perm-standing"),
+        &locale::t("perm-standing-value"),
     ));
     rows
 }
 
 fn settings_l2_page() -> Vec<Component> {
-    let env_flag = std::env::var("W3COS_L2").unwrap_or_else(|_| "未设置".into());
+    let env_flag = std::env::var("W3COS_L2").unwrap_or_default();
     let env_flag = if env_flag.trim().is_empty() {
-        "未设置".to_string()
+        locale::t("l2-unset")
     } else {
         env_flag
     };
-    let model = std::env::var("W3COS_L2_MODEL").unwrap_or_else(|_| {
-        "未设置。打开 L2 时默认 models/qwen2.5-1.5b-instruct-q4_k_m.gguf".into()
-    });
-    let endpoint = std::env::var("W3COS_L2_URL").unwrap_or_else(|_| "未设置，不连接".into());
+    let model = std::env::var("W3COS_L2_MODEL").unwrap_or_default();
+    let model = if model.trim().is_empty() {
+        locale::t("l2-model-default")
+    } else {
+        model
+    };
+    let endpoint = std::env::var("W3COS_L2_URL").unwrap_or_default();
+    let endpoint = if endpoint.trim().is_empty() {
+        locale::t("l2-endpoint-default")
+    } else {
+        endpoint
+    };
     let on = session_l2_on();
-    let mut rows = settings_heading(
-        "L2 模型",
-        "默认关闭。开关只改本会话，不会启动 llama-server，也不会下载权重。",
-    );
-    rows.push(settings_row(
-        "当前 Current",
-        if on { "开 On" } else { "关 Off" },
-    ));
-    rows.push(settings_row("环境 W3COS_L2", &env_flag));
-    rows.push(settings_row("模型路径 Model", &model));
-    rows.push(settings_row("端点 Endpoint", &endpoint));
+    let current = if on {
+        locale::t("on")
+    } else {
+        locale::t("off")
+    };
+    let mut rows = settings_heading(&locale::t("l2-title"), &locale::t("l2-detail"));
+    rows.push(settings_row(&locale::t("l2-current"), &current));
+    rows.push(settings_row(&locale::t("l2-env"), &env_flag));
+    rows.push(settings_row(&locale::t("l2-model"), &model));
+    rows.push(settings_row(&locale::t("l2-endpoint"), &endpoint));
     rows.push(chrome_button(
         if on {
-            "关闭 L2 Turn L2 off"
+            locale::t("l2-turn-off")
         } else {
-            "打开 L2 Turn L2 on"
+            locale::t("l2-turn-on")
         },
         OP_L2_TOGGLE,
         if on { "#3d5570" } else { "#1d4e89" },
@@ -1950,10 +1994,11 @@ fn muted_ink() -> Color {
 fn build_context_header(current: i64, night: bool) -> Component {
     let shared = state::get_signal(CONTEXT_SIGNAL) != 0;
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
-    let app = if shared {
-        ShellApp::from_signal(current).bilingual()
+    let app_name = app_label(current);
+    let chip = if shared {
+        locale::t_args("context-chip", &[("app", &app_name)])
     } else {
-        "已隐藏 Hidden"
+        locale::t("context-restore")
     };
     Component::row(
         Style {
@@ -1966,7 +2011,7 @@ fn build_context_header(current: i64, night: bool) -> Component {
         },
         vec![
             Component::text(
-                "上下文 Context",
+                locale::t("context-title"),
                 Style {
                     font_size: 13.0,
                     font_weight: 700,
@@ -1974,20 +2019,12 @@ fn build_context_header(current: i64, night: bool) -> Component {
                     ..Style::default()
                 },
             ),
-            chrome_button(
-                if shared {
-                    format!("{app}  ×")
-                } else {
-                    "恢复上下文 Restore".to_string()
-                },
-                if shared { OP_REVOKE } else { OP_RESTORE },
-                "#3d5570",
-            ),
+            chrome_button(chip, if shared { OP_REVOKE } else { OP_RESTORE }, "#3d5570"),
             Component::text(
                 if night {
-                    "夜间 开 Night on"
+                    locale::t("night-on")
                 } else {
-                    "夜间 关 Night off"
+                    locale::t("night-off")
                 },
                 Style {
                     font_size: 12.0,
@@ -2000,9 +2037,9 @@ fn build_context_header(current: i64, night: bool) -> Component {
             ),
             Component::text(
                 if unlocked {
-                    "已解锁 Unlocked"
+                    locale::t("unlocked")
                 } else {
-                    "已锁定 Locked"
+                    locale::t("locked")
                 },
                 Style {
                     font_size: 12.0,
@@ -2015,15 +2052,15 @@ fn build_context_header(current: i64, night: bool) -> Component {
             ),
             chrome_button(
                 if state::get_signal(TASKS_SIGNAL) != 0 {
-                    "收起任务 Hide"
+                    locale::t("tasks-hide")
                 } else {
-                    "任务 Tasks"
+                    locale::t("tasks")
                 },
                 OP_TOGGLE_TASKS,
                 "#3d5570",
             ),
             Component::text(
-                "实时 Live",
+                locale::t("live"),
                 Style {
                     font_size: 12.0,
                     color: Color::from_hex("#b7f0d8"),
@@ -2059,10 +2096,10 @@ fn build_intent_bar() -> Component {
             vec![
                 Component::text_input(
                     state::get_signal_text(DRAFT_SIGNAL),
-                    INTENT_INPUT_PLACEHOLDER,
+                    locale::t("intent-placeholder"),
                     input_style,
                 ),
-                chrome_button("提议 Propose", OP_PROPOSE, "#5b4fe0"),
+                chrome_button(locale::t("propose"), OP_PROPOSE, "#5b4fe0"),
             ],
         ),
         Component::row(
@@ -2072,19 +2109,19 @@ fn build_intent_bar() -> Component {
                 ..Style::default()
             },
             vec![
-                chrome_button("打开文件 Files", OP_CHIP_FILES, "#3d5570"),
-                chrome_button("打开终端 Terminal", OP_CHIP_TERMINAL, "#3d5570"),
-                chrome_button("打开设置 Settings", OP_CHIP_SETTINGS, "#3d5570"),
-                chrome_button("夜间模式 Night", OP_CHIP_NIGHT, "#3d5570"),
-                chrome_button("应用列表 Apps", OP_CHIP_APPS, "#3d5570"),
-                chrome_button("我在哪 Where", OP_CHIP_CONTEXT, "#3d5570"),
+                chrome_button(locale::t("chip-files"), OP_CHIP_FILES, "#3d5570"),
+                chrome_button(locale::t("chip-terminal"), OP_CHIP_TERMINAL, "#3d5570"),
+                chrome_button(locale::t("chip-settings"), OP_CHIP_SETTINGS, "#3d5570"),
+                chrome_button(locale::t("chip-night"), OP_CHIP_NIGHT, "#3d5570"),
+                chrome_button(locale::t("chip-apps"), OP_CHIP_APPS, "#3d5570"),
+                chrome_button(locale::t("chip-where"), OP_CHIP_CONTEXT, "#3d5570"),
             ],
         ),
     ];
     if phase == 1 {
         rows.push(confirm_card());
     } else if phase == 3 {
-        rows.push(result_card("规划中 Planning · 模型在后台线程"));
+        rows.push(result_card(&locale::t("planning")));
     } else if phase == 2 {
         let notice = state::get_signal_text(NOTICE_SIGNAL);
         if !notice.is_empty() {
@@ -2117,9 +2154,9 @@ fn confirm_card() -> Component {
             },
             vec![Component::text(
                 if tier == "L2" {
-                    "L2 规划 Planner"
+                    locale::t("tier-l2")
                 } else {
-                    "L1 本地 Local"
+                    locale::t("tier-l1")
                 },
                 Style {
                     font_size: 12.0,
@@ -2131,7 +2168,7 @@ fn confirm_card() -> Component {
         ));
     }
     rows.push(Component::text(
-        "确认后才会执行 · Confirm to run",
+        locale::t("confirm-hint"),
         Style {
             font_size: 12.0,
             font_weight: 700,
@@ -2162,8 +2199,8 @@ fn confirm_card() -> Component {
             ..Style::default()
         },
         vec![
-            chrome_button("确认 Confirm", OP_CONFIRM, "#1c8f62"),
-            chrome_button("取消 Cancel", OP_CANCEL, "#3d5570"),
+            chrome_button(locale::t("confirm"), OP_CONFIRM, "#1c8f62"),
+            chrome_button(locale::t("cancel"), OP_CANCEL, "#3d5570"),
         ],
     ));
     Component::column(
@@ -2191,7 +2228,7 @@ fn result_card(notice: &str) -> Component {
         },
         vec![
             Component::text(
-                format!("结果 Result · {notice}"),
+                locale::t_args("result", &[("notice", notice)]),
                 Style {
                     font_size: 13.0,
                     color: ink(),
@@ -2199,7 +2236,7 @@ fn result_card(notice: &str) -> Component {
                     ..Style::default()
                 },
             ),
-            chrome_button("关闭 Close", OP_CANCEL, "#3d5570"),
+            chrome_button(locale::t("close"), OP_CANCEL, "#3d5570"),
         ],
     )
 }
@@ -2208,14 +2245,14 @@ fn build_task_center() -> Component {
     let phase = state::get_signal(PHASE_SIGNAL);
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let (status, status_color) = match phase {
-        1 => ("等待确认 Awaiting confirm", "#ffe08a"),
-        2 => ("已完成 Done", "#b7f0d8"),
-        3 => ("规划中 Planning", "#9eb6ff"),
-        _ => ("空闲 Idle", "#d5dee8"),
+        1 => (locale::t("phase-confirm"), "#ffe08a"),
+        2 => (locale::t("phase-done"), "#b7f0d8"),
+        3 => (locale::t("phase-planning"), "#9eb6ff"),
+        _ => (locale::t("phase-idle"), "#d5dee8"),
     };
     let mut body = vec![
         Component::text(
-            "任务中心 Tasks",
+            locale::t("tasks-title"),
             Style {
                 font_size: 16.0,
                 font_weight: 700,
@@ -2248,10 +2285,17 @@ fn build_task_center() -> Component {
                 } else {
                     subject_owned
                 };
-                format!(
-                    "{subject_label} · {} · 口令经 KDF 保存，还不是 passkey",
-                    if unlocked { "stub unlocked" } else { "locked" }
-                )
+                {
+                    let state_label = if unlocked {
+                        locale::t("state-stub-unlocked")
+                    } else {
+                        locale::t("state-locked")
+                    };
+                    locale::t_args(
+                        "identity-line",
+                        &[("subject", &subject_label), ("state", &state_label)],
+                    )
+                }
             },
             Style {
                 font_size: 12.0,
@@ -2262,7 +2306,7 @@ fn build_task_center() -> Component {
     ];
     if !unlocked {
         body.push(Component::text(
-            "已锁定。确认前请先解锁。Locked — unlock before confirm.",
+            locale::t("locked-hint"),
             Style {
                 font_size: 13.0,
                 font_weight: 700,
@@ -2273,9 +2317,9 @@ fn build_task_center() -> Component {
     }
     body.push(chrome_button(
         if unlocked {
-            "锁定 Lock"
+            locale::t("lock")
         } else {
-            "解锁才能执行 Unlock to run"
+            locale::t("unlock-to-run")
         },
         if unlocked { OP_LOCK } else { OP_UNLOCK },
         if unlocked { "#3d5570" } else { "#9a3412" },
@@ -2283,7 +2327,7 @@ fn build_task_center() -> Component {
     let steps = state::get_signal_text(STEPS_SIGNAL);
     if !steps.is_empty() {
         body.push(Component::text(
-            "步骤 Steps",
+            locale::t("steps"),
             Style {
                 font_size: 14.0,
                 font_weight: 700,
@@ -2310,7 +2354,7 @@ fn build_task_center() -> Component {
         }
     }
     body.push(Component::text(
-        "收据 Receipts",
+        locale::t("receipts"),
         Style {
             font_size: 14.0,
             font_weight: 700,
@@ -2319,14 +2363,14 @@ fn build_task_center() -> Component {
         },
     ));
     body.push(chrome_button(
-        "收据本 Ledger",
+        locale::t("ledger"),
         OP_TOGGLE_RECEIPTS,
         "#3d5570",
     ));
     let log = state::get_signal_text(RECEIPT_SIGNAL);
     if log.is_empty() || log == "No receipts yet." {
         body.push(Component::text(
-            "还没有收据。No receipts yet.",
+            locale::t("no-receipts"),
             Style {
                 font_size: 12.0,
                 color: muted_ink(),
@@ -2346,7 +2390,7 @@ fn build_task_center() -> Component {
         }
     }
     if phase == 1 || phase == 3 {
-        body.push(chrome_button("停止 Stop", OP_CANCEL, "#a33b45"));
+        body.push(chrome_button(locale::t("stop"), OP_CANCEL, "#a33b45"));
     }
     Component::column(
         Style {
@@ -2365,16 +2409,16 @@ fn build_task_center() -> Component {
 
 fn planner_subtitle() -> String {
     match std::env::var("W3COS_L2").ok().as_deref().map(str::trim) {
-        Some("script") => "L2 脚本夹具 · 无权重 · 后台线程".to_string(),
+        Some("script") => locale::t("planner-script"),
         Some("1") | Some("true") => {
             let model = std::env::var("W3COS_L2_MODEL").unwrap_or_else(|_| "local".into());
-            format!("L2 {model} · 后台线程 · 确认后执行")
+            locale::t_args("planner-model", &[("model", &model)])
         }
         _ => {
             if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
-                "本地 L0/L1 · 无模型 · 加密文件".to_string()
+                locale::t("planner-encrypted")
             } else {
-                "本地 L0/L1 · 无模型 · 仅内存".to_string()
+                locale::t("planner-memory")
             }
         }
     }
@@ -2384,7 +2428,7 @@ fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Compon
     let action = if code == OP_PROPOSE {
         EventAction::Invoke {
             code,
-            input_placeholder: INTENT_INPUT_PLACEHOLDER.to_string(),
+            input_placeholder: locale::t("intent-placeholder"),
         }
     } else {
         invoke(code)
@@ -2417,7 +2461,7 @@ fn build_ai_agent_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("助手 Agent", "#e07a5f", 4),
+            app_titlebar(locale::t("app-agent"), "#e07a5f", 4),
             Component::column(
                 Style {
                     flex_grow: 1.0,
@@ -2427,19 +2471,11 @@ fn build_ai_agent_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "会话在右侧任务中心。这个窗口只是同一条收据的阅读页。",
+                        locale::t("agent-body"),
                         Style {
                             font_size: 16.0,
                             font_weight: 700,
                             color: ink(),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "The live session stays in the task center beside this window.",
-                        Style {
-                            font_size: 14.0,
-                            color: muted_ink(),
                             ..Style::default()
                         },
                     ),
@@ -2470,7 +2506,7 @@ fn build_browser_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Browser", "#f39c12", 5),
+            app_titlebar(locale::t("app-browser"), "#f39c12", 5),
             // URL bar
             Component::row(
                 Style {
@@ -2559,7 +2595,7 @@ fn build_browser_app() -> Component {
                 },
                 vec![
                     browser_tab("W3C OS", true),
-                    browser_tab("Docs", false),
+                    browser_tab(&locale::t("browser-tab-docs"), false),
                     browser_tab("GitHub", false),
                 ],
             ),
@@ -2585,7 +2621,7 @@ fn build_browser_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "The AI-Native Operating System",
+                        locale::t("browser-tagline"),
                         Style {
                             font_size: 18.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -2603,7 +2639,7 @@ fn build_browser_app() -> Component {
                         },
                         vec![
                             Component::text(
-                                "Welcome to the W3C OS Browser",
+                                locale::t("browser-welcome"),
                                 Style {
                                     font_size: 16.0,
                                     color: Color::from_hex("#f0f0ff"),
@@ -2612,7 +2648,7 @@ fn build_browser_app() -> Component {
                                 },
                             ),
                             Component::text(
-                                "Applications are rendered natively using the W3C DOM model — no Chromium, no V8. TypeScript is compiled to native Rust binaries.",
+                                locale::t("browser-body"),
                                 Style {
                                     font_size: 13.0,
                                     color: Color::from_hex("#808090"),
@@ -2626,7 +2662,7 @@ fn build_browser_app() -> Component {
                                 },
                                 vec![
                                     Component::button(
-                                        "Get Started",
+                                        locale::t("browser-start"),
                                         Style {
                                             background: Color::from_hex("#6c5ce7"),
                                             border_radius: 8.0,
@@ -2637,7 +2673,7 @@ fn build_browser_app() -> Component {
                                         },
                                     ),
                                     Component::button(
-                                        "Documentation",
+                                        locale::t("browser-docs"),
                                         Style {
                                             background: Color::from_hex("#1e1e38"),
                                             border_radius: 8.0,
@@ -2703,7 +2739,7 @@ fn build_editor_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Editor", "#1abc9c", 6),
+            app_titlebar(locale::t("app-editor"), "#1abc9c", 6),
             // Editor toolbar
             Component::row(
                 Style {
@@ -2716,7 +2752,7 @@ fn build_editor_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "File",
+                        locale::t("editor-file"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -2724,7 +2760,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Edit",
+                        locale::t("editor-edit"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -2732,7 +2768,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "View",
+                        locale::t("editor-view"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -2740,7 +2776,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Terminal",
+                        locale::t("app-terminal"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -2748,7 +2784,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Help",
+                        locale::t("editor-help"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -2791,7 +2827,7 @@ fn build_editor_app() -> Component {
                         },
                         vec![
                             Component::text(
-                                "EXPLORER",
+                                locale::t("editor-explorer"),
                                 Style {
                                     font_size: 11.0,
                                     color: Color::from_hex("#505070"),
@@ -3127,7 +3163,7 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // Shared: title bar + taskbar
 // ==========================================================================
 
-fn window_button(label: &str, code: u8, color: &str, app_id: i64) -> Component {
+fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -> Component {
     let mut button = Component::button_with_click(
         label,
         Style {
@@ -3183,11 +3219,12 @@ fn taskbar_icon(letter: &str, color: &str, id: i64, current: i64) -> Component {
     )
 }
 
-fn app_titlebar(title: &str, accent: &str, app_id: i64) -> Component {
+fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Component {
+    let title = title.into();
     let max_label = if windows::is_maximized(app_id) {
-        "回"
+        locale::t("win-restore")
     } else {
-        "[]"
+        locale::t("win-maximize")
     };
     let mut bar = Component::row(
         Style {
@@ -3252,10 +3289,9 @@ fn app_titlebar(title: &str, accent: &str, app_id: i64) -> Component {
 fn build_taskbar(current: i64) -> Component {
     let open = state::get_signal(OPEN_MASK_SIGNAL);
     let open_count = (1..=6).filter(|id| open & app_bit(*id) != 0).count();
-    let center_text = format!(
-        "{} · {open_count} open",
-        ShellApp::from_signal(current).bilingual()
-    );
+    let open_count = open_count.to_string();
+    let open_label = locale::t_args("open-count", &[("count", &open_count)]);
+    let center_text = format!("{} · {open_label}", app_label(current));
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let launcher_open = state::get_signal(LAUNCHER_SIGNAL) != 0;
     Component::row(
@@ -3279,9 +3315,9 @@ fn build_taskbar(current: i64) -> Component {
                 vec![
                     Component::button_with_click(
                         if launcher_open {
-                            "关闭启动器"
+                            locale::t("launcher-close")
                         } else {
-                            "W3C Apps"
+                            locale::t("launcher-apps")
                         },
                         Style {
                             background: Color::from_hex(if launcher_open {
@@ -3322,21 +3358,25 @@ fn build_taskbar(current: i64) -> Component {
                 },
                 vec![
                     chrome_button(
-                        if unlocked { "锁定" } else { "解锁" },
+                        if unlocked {
+                            locale::t("lock")
+                        } else {
+                            locale::t("unlock")
+                        },
                         if unlocked { OP_LOCK } else { OP_UNLOCK },
                         if unlocked { "#3d5570" } else { "#9a3412" },
                     ),
                     chrome_button(
                         if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
-                            "收起收据"
+                            locale::t("taskbar-receipts-hide")
                         } else {
-                            "收据"
+                            locale::t("receipts")
                         },
                         OP_TOGGLE_RECEIPTS,
                         "#3d5570",
                     ),
                     Component::text(
-                        "Online",
+                        locale::t("online"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#00b894"),
@@ -3363,8 +3403,6 @@ fn build_taskbar(current: i64) -> Component {
 struct LaunchApp {
     id: i64,
     letter: &'static str,
-    zh: &'static str,
-    en: &'static str,
     color: &'static str,
 }
 
@@ -3372,50 +3410,36 @@ const LAUNCH_APPS: [LaunchApp; 7] = [
     LaunchApp {
         id: 0,
         letter: "D",
-        zh: "桌面",
-        en: "Desktop",
         color: "#6c5ce7",
     },
     LaunchApp {
         id: 1,
         letter: "F",
-        zh: "文件",
-        en: "Files",
         color: "#3498db",
     },
     LaunchApp {
         id: 2,
         letter: "T",
-        zh: "终端",
-        en: "Terminal",
         color: "#2ecc71",
     },
     LaunchApp {
         id: 3,
         letter: "S",
-        zh: "设置",
-        en: "Settings",
         color: "#9b59b6",
     },
     LaunchApp {
         id: 4,
         letter: "A",
-        zh: "助手",
-        en: "Agent",
         color: "#e74c3c",
     },
     LaunchApp {
         id: 5,
         letter: "B",
-        zh: "浏览器",
-        en: "Browser",
         color: "#f39c12",
     },
     LaunchApp {
         id: 6,
         letter: "E",
-        zh: "编辑器",
-        en: "Editor",
         color: "#1abc9c",
     },
 ];
@@ -3438,7 +3462,13 @@ fn build_launcher() -> Component {
     let needle = query.trim().to_lowercase();
     let mut tiles = Vec::new();
     for app in LAUNCH_APPS {
-        let hay = format!("{} {} {}", app.zh, app.en, app.letter).to_lowercase();
+        let hay = format!(
+            "{} {} {}",
+            locale::t_in("zh-CN", app_key(app.id)),
+            locale::t_in("en", app_key(app.id)),
+            app.letter
+        )
+        .to_lowercase();
         if !needle.is_empty() && !hay.contains(&needle) {
             continue;
         }
@@ -3446,7 +3476,7 @@ fn build_launcher() -> Component {
     }
     if tiles.is_empty() {
         tiles.push(Component::text(
-            "没有匹配的应用。No matching app.",
+            locale::t("launcher-empty"),
             Style {
                 font_size: 13.0,
                 color: Color::from_hex("#d5dee8"),
@@ -3455,9 +3485,10 @@ fn build_launcher() -> Component {
         ));
     }
     let query_label = if query.trim().is_empty() {
-        "全部应用".to_string()
+        locale::t("launcher-all")
     } else {
-        format!("搜索：{}", query.trim())
+        let shown = query.trim();
+        locale::t_args("launcher-query", &[("query", shown)])
     };
     Component::column(
         Style {
@@ -3475,9 +3506,13 @@ fn build_launcher() -> Component {
                     ..Style::default()
                 },
                 vec![
-                    Component::text_input(query.clone(), LAUNCHER_PLACEHOLDER, search_style),
+                    Component::text_input(
+                        query.clone(),
+                        locale::t("launcher-placeholder"),
+                        search_style,
+                    ),
                     Component::button_with_click(
-                        "搜索 Search",
+                        locale::t("launcher-search"),
                         Style {
                             background: Color::from_hex("#5b4fe0"),
                             border_radius: 8.0,
@@ -3489,7 +3524,7 @@ fn build_launcher() -> Component {
                         },
                         EventAction::Invoke {
                             code: OP_LAUNCHER_SEARCH,
-                            input_placeholder: LAUNCHER_PLACEHOLDER.to_string(),
+                            input_placeholder: locale::t("launcher-placeholder"),
                         },
                     ),
                 ],
@@ -3519,18 +3554,19 @@ fn launcher_tile(app: LaunchApp) -> Component {
     let open = state::get_signal(OPEN_MASK_SIGNAL) & app_bit(app.id) != 0;
     let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL) & app_bit(app.id) != 0;
     let status = if current {
-        "在前台"
+        locale::t("launcher-front")
     } else if minimized {
-        "最小化"
+        locale::t("launcher-min")
     } else if open {
-        "已打开"
+        locale::t("launcher-open")
     } else {
-        ""
+        String::new()
     };
+    let name = app_label(app.id);
     let label = if status.is_empty() {
-        format!("{}  {} {}", app.letter, app.zh, app.en)
+        format!("{}  {name}", app.letter)
     } else {
-        format!("{}  {} {} · {status}", app.letter, app.zh, app.en)
+        format!("{}  {name} · {status}", app.letter)
     };
     Component::button_with_click(
         label,
@@ -3559,7 +3595,7 @@ fn build_toast(text: &str) -> Component {
         },
         vec![
             Component::text(
-                "通知",
+                locale::t("toast-title"),
                 Style {
                     font_size: 13.0,
                     font_weight: 700,
@@ -3576,7 +3612,7 @@ fn build_toast(text: &str) -> Component {
                     ..Style::default()
                 },
             ),
-            chrome_button("知道了", OP_DISMISS_TOAST, "#3d5570"),
+            chrome_button(locale::t("toast-dismiss"), OP_DISMISS_TOAST, "#3d5570"),
         ],
     )
 }
@@ -3597,7 +3633,7 @@ fn build_receipts_viewer() -> Component {
     let log = state::get_signal_text(RECEIPT_SIGNAL);
     let mut body = vec![
         Component::text(
-            "收据本 Receipts",
+            locale::t("ledger"),
             Style {
                 font_size: 16.0,
                 font_weight: 700,
@@ -3613,11 +3649,11 @@ fn build_receipts_viewer() -> Component {
                 ..Style::default()
             },
         ),
-        chrome_button("关闭 Close", OP_TOGGLE_RECEIPTS, "#3d5570"),
+        chrome_button(locale::t("close"), OP_TOGGLE_RECEIPTS, "#3d5570"),
     ];
     if log.is_empty() || log == "No receipts yet." {
         body.push(Component::text(
-            "还没有收据。No receipts yet.",
+            locale::t("no-receipts"),
             Style {
                 font_size: 12.0,
                 color: muted_ink(),
