@@ -189,6 +189,9 @@ pub struct ActionReceipt {
     /// Missing on receipts written before the L0/L1 log existed.
     #[serde(default)]
     pub tier: IntentTier,
+    /// Unix milliseconds. `0` on receipts written before the clock was stored.
+    #[serde(default)]
+    pub recorded_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,16 +577,7 @@ impl IntentSession {
             lines.push(format!("… {skip} earlier"));
         }
         for receipt in &self.receipts[skip..] {
-            lines.push(format!(
-                "#{} {} {} tier={} actor={} confirmed={} — {}",
-                receipt.operation_id,
-                receipt.decision.as_str(),
-                receipt.command,
-                tier_label(receipt.tier),
-                receipt.actor,
-                receipt.confirmed,
-                receipt.outcome
-            ));
+            lines.push(format_receipt_line(receipt));
         }
         lines.join("\n")
     }
@@ -652,6 +646,7 @@ impl IntentSession {
             confirmed,
             outcome: outcome.to_string(),
             tier,
+            recorded_at_ms: unix_millis(),
         };
         self.next_id += 1;
         self.receipts.push(receipt.clone());
@@ -679,6 +674,39 @@ impl IntentSession {
             eprintln!("[intent] receipt ledger write failed: {err}");
         }
     }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Text form of one receipt. `ts=` and `@@ utterance` are appended so older
+/// lines, which have neither, still parse. The utterance is the original
+/// text, not the normalized command name.
+pub fn format_receipt_line(receipt: &ActionReceipt) -> String {
+    let mut line = format!(
+        "#{} {} {} tier={} actor={} confirmed={}",
+        receipt.operation_id,
+        receipt.decision.as_str(),
+        receipt.command,
+        tier_label(receipt.tier),
+        receipt.actor,
+        receipt.confirmed
+    );
+    if receipt.recorded_at_ms > 0 {
+        line.push_str(" ts=");
+        line.push_str(&receipt.recorded_at_ms.to_string());
+    }
+    line.push_str(" — ");
+    line.push_str(&receipt.outcome);
+    if !receipt.utterance.is_empty() {
+        line.push_str(" @@ ");
+        line.push_str(&receipt.utterance);
+    }
+    line
 }
 
 fn bridge_op(command: &ShellCommand) -> BridgeOp {
@@ -1152,6 +1180,25 @@ mod tests {
             ProposeResult::Plan { .. } => panic!("smuggled selector reached the planner"),
         }
         assert!(session.confirm(&ctx(), 1_000).is_none());
+    }
+
+    #[test]
+    fn older_receipt_json_omits_the_clock_and_new_lines_keep_the_utterance() {
+        let old = r#"{"operation_id":1,"actor":"did:key:stub","utterance":"open files","command":"open-files","decision":"Allowed","confirmed":true,"outcome":"opened"}"#;
+        let receipt: ActionReceipt = serde_json::from_str(old).expect("old receipt");
+        assert_eq!(receipt.recorded_at_ms, 0);
+        assert_eq!(receipt.utterance, "open files");
+        let line = format_receipt_line(&receipt);
+        assert!(line.contains("@@ open files"), "{line}");
+        assert!(!line.contains("ts="), "{line}");
+        assert!(line.contains(" — opened"), "{line}");
+        let stamped = ActionReceipt {
+            recorded_at_ms: 1_760_518_800_000,
+            ..receipt
+        };
+        let stamped_line = format_receipt_line(&stamped);
+        assert!(stamped_line.contains("ts=1760518800000"), "{stamped_line}");
+        assert!(stamped_line.contains("@@ open files"), "{stamped_line}");
     }
 
     #[test]

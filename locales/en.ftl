@@ -242,6 +242,7 @@ filter-all = All
 filter-allowed = Allowed
 filter-denied = Refused
 filter-cancelled = Cancelled
+receipt-query = Filter by utterance
 receipt-copied = Subject copied
 receipt-filter-empty = Nothing in this filter yet.
 files-preview = Preview
