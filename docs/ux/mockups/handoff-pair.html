@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <title>配对</title>
+  <link rel="stylesheet" href="system.css?v=3" />
+  <style>html,body{width:1440px;height:900px;overflow:hidden;}</style>
+</head>
+<body>
+<div class="os">
+      <div style="position:absolute;inset:36px 40px 96px;display:flex;align-items:center;justify-content:space-between;gap:28px">
+        
+    <section class="window" style="position:relative;width:640px;height:640px">
+      <div class="titlebar"><i class="mark"></i><h2>设备</h2><div class="win-btns"><button class="win-btn" aria-label="最小化"><svg class="ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h12"/></svg></button><button class="win-btn" aria-label="最大化"><svg class="ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg></button><button class="win-btn close" aria-label="关闭"><svg class="ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7l10 10M17 7 7 17"/></svg></button></div></div>
+      <div style="padding:18px 18px 0">
+        <h3 style="margin:0 0 4px;font-size:20px">同一把身份下的设备</h3>
+        <p class="who">did:key:z6MkhaXg…ta2doK</p>
+        <div class="list-dev">
+          <div class="dev"><svg class="ico" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="11" rx="1.6"/><path d="M8 19.5h8M12 16v3.5"/></svg><div><b>书桌</b><span>本机 · 已解锁这台</span></div><span class="pill ok">本机</span></div>
+          <div class="dev" style="outline:1px solid rgba(20,150,106,.5)"><svg class="ico" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="18" rx="2"/><path d="M11 18.5h2"/></svg><div><b>手机</b><span>局域网发现 · 尚未信任</span></div><span class="pill stop">待核对</span></div>
+        </div>
+        <p style="margin:16px 0 0">两边都要看到同一个短码。没有账号服务器。</p>
+        <div class="code">481 926</div>
+        <div class="actions" style="display:flex;gap:8px">
+          <button class="btn danger">数字不同</button>
+          <button class="btn primary">数字一致，信任这台</button>
+        </div>
+      </div>
+    </section>
+        
+    <div class="device" aria-hidden="false">
+      <div class="screen">
+        <div class="status" style="padding:8px 4px 0"><span>9:41</span><span>手机</span></div>
+        <div style="margin-top:36px;text-align:center">
+          <div class="lock-seal" style="background:rgba(20,150,106,.16);color:#d9ffe9;border-color:rgba(20,150,106,.3)"><svg class="ico" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12H7.5a3.5 3.5 0 0 1 0-7H10"/><path d="M15 12h1.5a3.5 3.5 0 0 0 0-7H14"/><path d="M8 12h8"/></svg></div>
+          <h3 style="margin:14px 0 0;font-size:18px">配对书桌</h3>
+          <p>核对数字是否一致</p>
+          <div class="code">481 926</div>
+          <p class="fine">90 秒后失效。不一致就停，不要猜。</p>
+        </div>
+      </div>
+    </div>
+      </div>
+      
+    <footer class="dock">
+      <button class="dock-btn" aria-label="启动器"><svg class="ico" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/></svg></button>
+      
+      <div class="spacer"></div>
+      <div class="tray">
+        <button class="dock-btn" aria-label="已锁定"><svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="10.5" width="12" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg></button>
+        <button class="dock-btn" aria-label="设备"><svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="12" height="8" rx="1.4"/><path d="M7 17.5h6M10 14v3.5"/><rect x="16" y="8" width="5" height="9" rx="1.2"/></svg></button>
+        <button class="dock-btn" aria-label="通知"><svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 16.5h12l-1.2-2V10.2a4.8 4.8 0 0 0-9.6 0v4.3L6 16.5Z"/><path d="M10 16.5a2 2 0 0 0 4 0"/></svg></button>
+        <span class="l2flag">L2 关</span>
+        <span class="clock">14:32</span>
+      </div>
+    </footer>
+    </div>
+</body>
+</html>
