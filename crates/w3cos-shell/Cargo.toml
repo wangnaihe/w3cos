@@ -16,6 +16,7 @@ cpu-render = ["w3cos-runtime/cpu-render"]
 ai-bridge = ["w3cos-runtime/ai-bridge"]
 
 [dependencies]
+chrono = { workspace = true, features = ["clock"] }
 w3cos-ai-bridge = { workspace = true, features = ["l1"] }
 w3cos-runtime = { workspace = true, default-features = false }
 w3cos-std = { workspace = true }

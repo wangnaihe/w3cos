@@ -28,7 +28,8 @@ use winit::window::{Window, WindowAttributes, WindowId};
 /// fullscreen bounds; forcing a reference-device size clips other devices.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn default_logical_size() -> LogicalSize<f64> {
-    LogicalSize::new(1200.0, 800.0)
+    let (width, height) = state::shell_viewport();
+    LogicalSize::new(width as f64, height as f64)
 }
 
 /// `_NET_ACTIVE_WINDOW` is a no-op without a window manager. Xvfb is that
@@ -2790,6 +2791,9 @@ impl App {
             inset_top,
             ViewportLayout::ime_open_for_app(self),
         );
+        if state::note_shell_viewport(viewport.layout_w, viewport.layout_h) {
+            state::mark_dirty();
+        }
         #[cfg(target_os = "ios")]
         let input_window_offset = window
             .outer_position()

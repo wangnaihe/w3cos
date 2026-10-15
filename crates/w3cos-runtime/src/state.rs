@@ -204,6 +204,56 @@ pub fn mark_dirty() {
     STORE.with(|s| s.borrow_mut().dirty = true);
 }
 
+thread_local! {
+    static SHELL_VIEWPORT: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+fn configured_viewport() -> (f32, f32) {
+    if let Ok(raw) = std::env::var("W3COS_VIEW") {
+        let mut parts = raw.split(['x', 'X', ',']);
+        if let (Some(width), Some(height)) = (parts.next(), parts.next())
+            && let (Ok(width), Ok(height)) =
+                (width.trim().parse::<f32>(), height.trim().parse::<f32>())
+            && width >= 200.0
+            && height >= 200.0
+        {
+            return (width, height);
+        }
+    }
+    (1200.0, 800.0)
+}
+
+/// Logical window size the shell should lay out against.
+/// `W3COS_VIEW=390x760` overrides the 1200×800 desktop default.
+pub fn shell_viewport() -> (f32, f32) {
+    SHELL_VIEWPORT.with(|slot| {
+        let current = slot.get();
+        if current.0 < 1.0 {
+            let initial = configured_viewport();
+            slot.set(initial);
+            initial
+        } else {
+            current
+        }
+    })
+}
+
+/// Remember the platform viewport. Returns true when the size changed so the
+/// shell can rebuild its desktop, tablet, or phone posture.
+pub fn note_shell_viewport(width: f32, height: f32) -> bool {
+    let width = width.round();
+    let height = height.round();
+    if width < 1.0 || height < 1.0 {
+        return false;
+    }
+    let (current_w, current_h) = shell_viewport();
+    if (current_w - width).abs() < 0.5 && (current_h - height).abs() < 0.5 {
+        return false;
+    }
+    SHELL_VIEWPORT.with(|slot| slot.set((width, height)));
+    true
+}
+
 /// All signal values in registration order (for UI tests).
 pub fn all_signal_values() -> Vec<i64> {
     STORE.with(|s| s.borrow().values.clone())
