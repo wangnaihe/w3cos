@@ -14569,16 +14569,21 @@ parserMutationObserver.disconnect();
             .map(|(rect, _)| *rect)
             .expect("target layout");
         assert_eq!((target_layout.width, target_layout.height), (96.0, 96.0));
-        let frame = crate::headless::render_document_rgba(800, 600).unwrap();
-        let black_pixels = frame
-            .rgba
-            .chunks_exact(4)
-            .filter(|pixel| *pixel == [0, 0, 0, 255])
-            .count();
-        assert!(
-            black_pixels >= 96 * 96,
-            "painted black pixels: {black_pixels}"
-        );
+        // The dynamic-js CI slice builds this crate without a renderer.
+        // The pixel check still runs whenever skia or the CPU renderer is on.
+        #[cfg(any(feature = "skia", feature = "cpu-render"))]
+        {
+            let frame = crate::headless::render_document_rgba(800, 600).unwrap();
+            let black_pixels = frame
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| *pixel == [0, 0, 0, 255])
+                .count();
+            assert!(
+                black_pixels >= 96 * 96,
+                "painted black pixels: {black_pixels}"
+            );
+        }
     }
 
     #[test]
