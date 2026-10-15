@@ -305,7 +305,7 @@ impl LoadedFont {
     pub(crate) fn skia_typeface(&self) -> Option<skia_safe::Typeface> {
         self.skia_typeface
             .get_or_init(|| {
-                skia_safe::FontMgr::default().new_from_data(
+                pinned_font_mgr().new_from_data(
                     self.data.as_slice(),
                     self.collection_index.map(|index| index as usize),
                 )
@@ -439,6 +439,13 @@ static HOST_UI_FONT: OnceLock<HostUiFont> = OnceLock::new();
 pub(crate) fn parsed_fallback(character: char) -> Option<Arc<fontdue::Font>> {
     let character = crate::text_layout::font_glyph_character(character);
     system_fonts::fallback_for_character(character)?.parsed()
+}
+
+/// Fontconfig-backed manager. Tests pin bundled faces before the first init.
+#[cfg(feature = "skia")]
+pub(crate) fn pinned_font_mgr() -> skia_safe::FontMgr {
+    system_fonts::pin_test_fontconfig();
+    skia_safe::FontMgr::default()
 }
 
 pub(crate) fn host_ui_font() -> &'static HostUiFont {

@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn trailing_forced_break_keeps_the_last_word_in_shared_shaping() {
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Arial", FontStyle::normal())
             .unwrap();
         let style = Style {
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn generated_border_pieces_share_glyph_positions_without_losing_edges() {
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Arial", FontStyle::normal())
             .unwrap();
         let style = Style {
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn quote_word_wrapper_keeps_the_adjacent_text_source_shaped_together() {
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", FontStyle::normal())
             .unwrap();
         let text_style = Style {
@@ -925,7 +925,7 @@ mod tests {
             )])),
             ..Style::default()
         };
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", FontStyle::normal())
             .unwrap();
         let parent = Style {
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn authored_glyph_view_starts_at_its_used_inline_origin() {
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", FontStyle::normal())
             .unwrap();
         let texts = [
@@ -1164,7 +1164,7 @@ mod tests {
             .collect::<Vec<_>>();
         let layouts = crate::layout::compute(&root, 800.0, 600.0).unwrap();
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", FontStyle::normal())
             .unwrap();
         let fragments = build(&artifact, 0..artifact.nodes.len(), &face);
@@ -1225,7 +1225,7 @@ mod tests {
             .collect::<Vec<_>>();
         let layouts = crate::layout::compute(&root, 800.0, 600.0).unwrap();
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", FontStyle::normal())
             .unwrap();
         let fragments = build(&artifact, 0..artifact.nodes.len(), &face);
@@ -1273,7 +1273,7 @@ mod tests {
 
     #[test]
     fn shared_glyph_slices_match_the_whole_fallback_font_run() {
-        let face = FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", FontStyle::normal())
             .unwrap();
         for kerning in [true, false] {

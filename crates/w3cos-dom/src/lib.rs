@@ -2035,8 +2035,18 @@ mod tests {
         let principal = &tree.children[0];
         assert_eq!(
             principal.style.display,
-            w3cos_std::style::Display::Flex,
-            "a block containing inline mixed content needs one anonymous line row"
+            w3cos_std::style::Display::Block,
+            "an authored block keeps its principal display"
+        );
+        assert!(
+            principal
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                }),
+            "a block containing inline mixed content needs one anonymous line"
         );
         let generated = &principal.children[0];
         assert_eq!(
@@ -2120,7 +2130,15 @@ mod tests {
 
         let tree = doc.to_component_tree();
         let host = &tree.children[0];
-        assert_eq!(host.style.display, w3cos_std::style::Display::Flex);
+        assert_eq!(host.style.display, w3cos_std::style::Display::Block);
+        assert!(
+            host.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         // The inline packet does not turn an authored atomic table into
         // flex. Keep its principal display so the runtime exports the first
         // row's baseline, as Chrome does beside Before/After text.
@@ -2156,7 +2174,15 @@ mod tests {
 
         let tree = doc.to_component_tree();
         let host = &tree.children[0];
-        assert_eq!(host.style.display, w3cos_std::style::Display::Flex);
+        assert_eq!(host.style.display, w3cos_std::style::Display::Block);
+        assert!(
+            host.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         assert_eq!(
             host.children[1].style.position,
             w3cos_std::style::Position::Relative

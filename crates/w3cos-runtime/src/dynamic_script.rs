@@ -29,6 +29,25 @@ use crate::html_parser_state::{
 use crate::html_parser_state::{MATHML_NAMESPACE, SVG_NAMESPACE};
 use crate::xml_tree_builder::StreamingXmlDocumentParser;
 
+/// One CSS rule parsed by the dynamic runtime. Callers outside this module
+/// must not name the compiler crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedStyleRule {
+    pub selector: String,
+    pub declarations: Vec<(String, String)>,
+}
+
+pub(crate) fn parse_inline_style_rules(css: &str, source_url: &str) -> Vec<ParsedStyleRule> {
+    w3cos_compiler::esm_css::parse_css_source(css, source_url)
+        .rules
+        .into_iter()
+        .map(|rule| ParsedStyleRule {
+            selector: rule.selector,
+            declarations: rule.declarations,
+        })
+        .collect()
+}
+
 thread_local! {
     static ACTIVE_DOCUMENT_LOADER: RefCell<Option<(ScriptLoader, String)>> =
         const { RefCell::new(None) };
@@ -801,6 +820,12 @@ impl NavigationDocumentParser {
             Self::Xml(parser) => parser.is_blocked(),
         }
     }
+
+    fn note_confident_document_encoding(&mut self) {
+        if let Self::Html(parser) = self {
+            parser.note_confident_document_encoding();
+        }
+    }
 }
 
 pub struct DocumentLoader {
@@ -1118,6 +1143,13 @@ impl DocumentLoader {
                 &crate::jsdom::document_value(),
                 decoder.encoding_name(),
             );
+            // A BOM or Content-Type charset is confident and must survive a
+            // later `<meta charset>`. The windows-1252 default stays tentative.
+            if content_type_charset(&self.content_type).is_some() || bom_bytes > 0 {
+                if let Some(parser) = self.parser.as_mut() {
+                    parser.note_confident_document_encoding();
+                }
+            }
             self.decoder = Some(decoder);
             decoded
         };
@@ -1724,11 +1756,7 @@ impl ScriptLoader {
                 (import.local, binding)
             })
             .collect();
-        let result = Vm::new(module, self.inner.policy.limits)
-            .map_err(|error| anyhow!(error.to_string()))?
-            .run_with_cells(bindings)
-            .map_err(|error| anyhow!(error.to_string()))?;
-        Ok(result)
+        self.run_lowered_classic(module, bindings)
     }
 
     fn execute_classic_source_in_realm(
@@ -1760,6 +1788,14 @@ impl ScriptLoader {
                 (import.local, binding)
             })
             .collect();
+        self.run_lowered_classic(module, bindings)
+    }
+
+    fn run_lowered_classic(
+        &self,
+        module: w3cos_ir::Module,
+        bindings: BindingCells,
+    ) -> Result<Value> {
         Vm::new(module, self.inner.policy.limits)
             .map_err(|error| anyhow!(error.to_string()))?
             .run_with_cells(bindings)
@@ -6207,15 +6243,12 @@ impl ScriptLoader {
 
         for index in 0..length {
             let element = scripts.call_method("item", vec![Value::Number(f64::from(index))]);
-            if let Some(only_node) = only_node {
-                let only_element = crate::jsdom::element_value(only_node);
-                let is_only_node = match (element.as_object(), only_element.as_object()) {
-                    (Some(element), Some(only_element)) => element.ptr_eq(&only_element),
-                    _ => false,
-                };
-                if !is_only_node {
-                    continue;
-                }
+            if let Some(only_node) = only_node
+                && crate::jsdom::node_id_of(&element) != Some(only_node)
+            {
+                // Query results may be DOM immediates while the mutation path
+                // holds the memoized wrapper. Node id is the element identity.
+                continue;
             }
             // A DOM property setter can synchronously report children-changed
             // steps while its proxy target is still mutably borrowed. The
@@ -9203,6 +9236,7 @@ pub(crate) fn notify_node_inserted(node: u32) {
         // or link is observable before any script post-insertion step runs.
         loader.prepare_pending_stylesheets(&document_url);
     }
+    let mut ran_dynamic_inline_classic = false;
     if (has_scripts || !frames.is_empty() || !default_style_metas.is_empty())
         && let Some((loader, document_url)) =
             ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
@@ -9222,15 +9256,37 @@ pub(crate) fn notify_node_inserted(node: u32) {
             {
                 loader.apply_default_style_meta(inserted_node);
             } else if tag.eq_ignore_ascii_case("script") {
-                // Dynamically inserted classic scripts prepare synchronously.
-                // Inline sources run before the DOM insertion method returns;
-                // external sources only start their fetch here.
-                let _ = loader
-                    .execute_pending_document_scripts_for_node(&document_url, Some(inserted_node));
+                // Inline modules stay unprepared here. `execute_pending`
+                // counts them, and evaluation waits for microtask settlement
+                // so removing the element before that checkpoint cancels it.
+                if script_node_is_module(inserted_node) {
+                    continue;
+                }
+                // Classic scripts prepare synchronously. Inline sources run
+                // before the DOM insertion method returns; external sources
+                // only start their fetch here.
+                let inline = crate::dom::get_attribute(inserted_node, "src")
+                    .is_none_or(|src| src.trim().is_empty());
+                let prepared = loader
+                    .execute_pending_document_scripts_for_node(&document_url, Some(inserted_node))
+                    .unwrap_or(0);
+                if inline && prepared > 0 {
+                    ran_dynamic_inline_classic = true;
+                }
             }
         }
     }
-    schedule_document_script_pump();
+    if ran_dynamic_inline_classic {
+        // The insertion record is already queued. Checkpoint after the
+        // classic script returns so the mutations it made share that delivery.
+        // Queue the document-script pump only after this checkpoint, and only
+        // for a connected root: a detached fragment must not leave a pump
+        // that would run a later sibling before its own post-insertion step.
+        crate::jsdom::drain_microtasks();
+    }
+    if crate::dom::is_connected(node) {
+        schedule_document_script_pump();
+    }
 }
 
 pub(crate) fn prepare_inserted_stylesheets(nodes: &[u32]) {
@@ -9503,6 +9559,11 @@ pub(crate) fn notify_node_removed(node: u32) {
     }
 }
 
+fn script_node_is_module(node: u32) -> bool {
+    crate::dom::get_attribute(node, "type")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("module"))
+}
+
 fn collect_script_nodes(node: u32, scripts: &mut HashSet<u32>) {
     if crate::dom::tag_name(node).eq_ignore_ascii_case("script") {
         scripts.insert(node);
@@ -9516,11 +9577,17 @@ fn script_element_source(element: &Value) -> String {
     let Some(node) = crate::jsdom::node_id_of(element) else {
         return element.get_property("textContent").to_js_string();
     };
-    crate::dom::children(node)
+    let from_children: String = crate::dom::children(node)
         .into_iter()
         .filter(|child| matches!(crate::dom::node_type(*child), 3 | 4))
         .filter_map(crate::dom::get_text_content)
-        .collect()
+        .collect();
+    if !from_children.is_empty() {
+        return from_children;
+    }
+    // `HTMLScriptElement.text` can land on the element itself when the setter
+    // does not allocate a child text node. That text is still the script source.
+    crate::dom::get_text_content(node).unwrap_or_default()
 }
 
 fn collect_stylesheet_nodes(node: u32, stylesheets: &mut HashSet<u32>) {
@@ -14508,7 +14575,7 @@ parserMutationObserver.disconnect();
             computed
                 .call_method("getPropertyValue", vec![Value::string("color")])
                 .to_js_string(),
-            "#ff00ff"
+            "rgb(255, 0, 255)"
         );
         assert_eq!(
             computed.get_property("color").to_js_string(),
@@ -14569,16 +14636,21 @@ parserMutationObserver.disconnect();
             .map(|(rect, _)| *rect)
             .expect("target layout");
         assert_eq!((target_layout.width, target_layout.height), (96.0, 96.0));
-        let frame = crate::headless::render_document_rgba(800, 600).unwrap();
-        let black_pixels = frame
-            .rgba
-            .chunks_exact(4)
-            .filter(|pixel| *pixel == [0, 0, 0, 255])
-            .count();
-        assert!(
-            black_pixels >= 96 * 96,
-            "painted black pixels: {black_pixels}"
-        );
+        // The dynamic-js CI slice builds this crate without a renderer.
+        // The pixel check still runs whenever skia or the CPU renderer is on.
+        #[cfg(any(feature = "skia", feature = "cpu-render"))]
+        {
+            let frame = crate::headless::render_document_rgba(800, 600).unwrap();
+            let black_pixels = frame
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| *pixel == [0, 0, 0, 255])
+                .count();
+            assert!(
+                black_pixels >= 96 * 96,
+                "painted black pixels: {black_pixels}"
+            );
+        }
     }
 
     #[test]
@@ -15868,17 +15940,16 @@ window.__dynamicInlineHandler = dynamicInlineResult;
             Some((3, 2))
         );
         let tree = crate::dom::with_document(w3cos_dom::Document::to_component_tree);
-        let picture = tree.children.first().expect("picture component");
-        let rendered_image = picture
-            .children
-            .iter()
-            .find(|component| {
-                matches!(
-                    component.kind,
-                    w3cos_std::component::ComponentKind::Image { .. }
-                )
-            })
-            .expect("selected image component");
+        fn find_image(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if matches!(
+                component.kind,
+                w3cos_std::component::ComponentKind::Image { .. }
+            ) {
+                return Some(component);
+            }
+            component.children.iter().find_map(find_image)
+        }
+        let rendered_image = find_image(&tree).expect("selected image component");
         assert!(matches!(
             rendered_image.kind,
             w3cos_std::component::ComponentKind::Image { ref src } if src == "/wide-2x.png"
@@ -17622,7 +17693,7 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         crate::jsdom::drain_microtasks();
         assert_eq!(
             computed_color(),
-            "#0000ff",
+            "rgb(0, 0, 255)",
             "replacing the earlier inline sheet must preserve DOM cascade order"
         );
 

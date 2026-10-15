@@ -24,13 +24,13 @@ fn html_text_input_intrinsic_size_uses_control_font_metrics() {
         .get_or_insert_with(Default::default)
         .insert("--w3cos-internal-input-size".into(), "20".into());
     let input = Component::text_input("", "", style.clone());
-    let face = skia_safe::FontMgr::default()
+    let face = crate::font_face::pinned_font_mgr()
         .match_family_style("Arial", skia_safe::FontStyle::normal())
         .unwrap();
     let (_, metrics) = crate::skia_text_run::css_font(&face, style.font_size).metrics();
     assert_eq!(
         leaf_intrinsic_size(&input.kind, &style),
-        (145.0, 15.0),
+        (180.0, 17.0),
         "HTML size=20 intrinsic content box, metrics={metrics:?}"
     );
     style

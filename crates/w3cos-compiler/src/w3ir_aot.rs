@@ -7851,7 +7851,7 @@ fn main() {{
         let generated =
             generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
         assert!(
-            generated.contains(".call_method(\"createElement\"")
+            generated.contains(".call_method_slice(\"createElement\"")
                 && generated.contains("set_property_strict")
                 && !generated.contains("dom_build_guarded")
                 && !generated.contains("dom_shape_epoch"),

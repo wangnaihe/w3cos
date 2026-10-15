@@ -662,6 +662,9 @@ impl StreamingDocumentParser {
         if namespace == HTML_NAMESPACE && name == "template" {
             crate::jsdom::ensure_template_content(element);
         }
+        if namespace == HTML_NAMESPACE && name == "meta" {
+            self.note_meta_charset(&attributes);
+        }
         let formatting_attributes = attributes.clone();
         for (attribute, value) in &attributes {
             if self.sanitize && is_unsafe_fragment_attribute(attribute, value) {
@@ -943,19 +946,30 @@ impl StreamingDocumentParser {
         document_url: &str,
     ) -> Result<Self> {
         let document = crate::jsdom::document_value();
-        let (html, head, body) =
-            if document.get_property("contentType").to_js_string() == "application/xhtml+xml" {
-                crate::jsdom::parser_document_shell_ids()
-            } else {
-                (
-                    crate::jsdom::node_id_of(&document.get_property("documentElement"))
-                        .ok_or_else(|| anyhow!("live document has no documentElement"))?,
-                    crate::jsdom::node_id_of(&document.get_property("head"))
-                        .ok_or_else(|| anyhow!("live document has no head"))?,
-                    crate::jsdom::node_id_of(&document.get_property("body"))
-                        .ok_or_else(|| anyhow!("live document has no body"))?,
-                )
-            };
+        let content_type = document.get_property("contentType").to_js_string();
+        // `text/html` getters synthesize html/head/body. Other HTML-parser
+        // documents (plain text, and XHTML before its own elements exist)
+        // must still receive that shell: the plain-text navigation algorithm
+        // builds html/head/body and then a `<pre>` of the escaped payload.
+        let (html, head, body) = if content_type == "text/html" {
+            (
+                crate::jsdom::node_id_of(&document.get_property("documentElement"))
+                    .ok_or_else(|| anyhow!("live document has no documentElement"))?,
+                crate::jsdom::node_id_of(&document.get_property("head"))
+                    .ok_or_else(|| anyhow!("live document has no head"))?,
+                crate::jsdom::node_id_of(&document.get_property("body"))
+                    .ok_or_else(|| anyhow!("live document has no body"))?,
+            )
+        } else {
+            crate::jsdom::parser_document_shell_ids()
+        };
+        let xml_document =
+            content_type == "application/xhtml+xml" || content_type == "image/svg+xml";
+        if !xml_document {
+            // HTML without a BOM, transport charset, or meta charset uses
+            // windows-1252. A later confident decoder may replace this.
+            crate::jsdom::set_document_encoding(&document, encoding_rs::WINDOWS_1252.name());
+        }
         Ok(Self {
             script_host,
             document_url: document_url.to_string(),
@@ -978,7 +992,57 @@ impl StreamingDocumentParser {
             paused: false,
             eof_received: false,
             complete: false,
+            encoding_certain: xml_document,
         })
+    }
+
+    /// A BOM or transport `charset` already chose the document encoding.
+    pub(crate) fn note_confident_document_encoding(&mut self) {
+        self.encoding_certain = true;
+    }
+
+    /// Honor a `<meta charset>` or `http-equiv=content-type` while the
+    /// document encoding is still the tentative HTML default.
+    fn note_meta_charset(&mut self, attributes: &[(String, String)]) {
+        if self.encoding_certain || self.fragment_root.is_some() {
+            return;
+        }
+        let charset = attributes
+            .iter()
+            .find_map(|(name, value)| (name == "charset").then(|| value.trim().to_string()));
+        let charset = charset.or_else(|| {
+            let http_equiv = attributes.iter().any(|(name, value)| {
+                name == "http-equiv" && value.trim().eq_ignore_ascii_case("content-type")
+            });
+            if !http_equiv {
+                return None;
+            }
+            let content = attributes
+                .iter()
+                .find(|(name, _)| name == "content")
+                .map(|(_, value)| value.as_str())?;
+            content.split(';').skip(1).find_map(|parameter| {
+                let (name, value) = parameter.split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("charset")
+                    .then(|| value.trim().trim_matches(['\'', '"']).to_ascii_lowercase())
+            })
+        });
+        let Some(label) = charset.filter(|label| !label.is_empty()) else {
+            return;
+        };
+        let Some(encoding) = encoding_rs::Encoding::for_label(label.as_bytes()) else {
+            return;
+        };
+        let encoding = if matches!(encoding.name(), "UTF-16LE" | "UTF-16BE") {
+            encoding_rs::UTF_8
+        } else if encoding.name() == "x-user-defined" {
+            encoding_rs::WINDOWS_1252
+        } else {
+            encoding
+        };
+        crate::jsdom::set_document_encoding(&crate::jsdom::document_value(), encoding.name());
+        self.encoding_certain = true;
     }
 
     pub(crate) fn for_fragment(parent: u32, sanitize: bool) -> Self {
@@ -1004,6 +1068,7 @@ impl StreamingDocumentParser {
             paused: false,
             eof_received: false,
             complete: false,
+            encoding_certain: true,
         }
     }
 

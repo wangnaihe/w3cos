@@ -253,11 +253,21 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
 
 pub fn set_attribute(node: u32, name: &str, value: &str) {
     if crate::observers_web::mutation_observers_empty() {
+        // Mutation records can be skipped, but a script, image, or stylesheet
+        // still has to observe src/href/type changes when no observer is registered.
+        #[cfg(feature = "dynamic-js")]
+        let previous = dynamic_resource_attribute(name).then(|| get_attribute(node, name));
         with_document_mut(|doc| {
             let el = w3cos_dom::Element::new(NodeId::from_u32(node));
             el.set_attribute(doc, name, value);
         });
         mark_dom_dirty();
+        #[cfg(feature = "dynamic-js")]
+        if let Some(old) = previous
+            && old.as_deref() != Some(value)
+        {
+            crate::dynamic_script::notify_script_mutated(node);
+        }
         return;
     }
     let old_value = get_attribute(node, name);
@@ -365,6 +375,10 @@ pub fn set_text_content(node: u32, text: &str) {
     }
     let new_children = children(node);
     if old_children.is_empty() && new_children.is_empty() {
+        // Inline text storage does not produce a child list record, but a
+        // connected script or style still prepares from that text.
+        #[cfg(feature = "dynamic-js")]
+        crate::dynamic_script::notify_script_mutated(node);
         return;
     }
     crate::observers_web::notify_child_list(node, &new_children, &old_children, None, None);
@@ -770,6 +784,25 @@ pub fn outer_html(node: u32) -> String {
 // Small additive wrappers used by `crate::jsdom` (Value-level DOM bridge).
 // They follow the same conventions as the wrappers above: u32 node ids and
 // DOM_DIRTY marking for mutations.
+
+#[cfg(feature = "dynamic-js")]
+fn dynamic_resource_attribute(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "src"
+            | "data"
+            | "href"
+            | "rel"
+            | "type"
+            | "media"
+            | "disabled"
+            | "integrity"
+            | "referrerpolicy"
+            | "crossorigin"
+            | "srcset"
+            | "sizes"
+    )
+}
 
 /// Force the DOM dirty flag on. Used by the jsdom bridge when it mutates the
 /// document through `with_document_mut` on paths that have no wrapper here.

@@ -14,7 +14,10 @@ const CACHE_CAPACITY: usize = 2048;
 pub(super) fn database() -> MutexGuard<'static, fontdb::Database> {
     DATABASE
         .get_or_init(|| {
+            pin_test_fontconfig();
             let mut database = fontdb::Database::new();
+            #[cfg(test)]
+            database.load_fonts_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test-fonts"));
             database.load_system_fonts();
             #[cfg(any(target_os = "android", target_env = "ohos"))]
             database.load_fonts_dir("/system/fonts");
@@ -109,6 +112,7 @@ fn load_by_id(id: fontdb::ID) -> Option<LoadedFont> {
     style.hash(&mut hasher);
     #[cfg(feature = "skia")]
     let skia_typeface = {
+        pin_test_fontconfig();
         use skia_safe::{FontMgr, FontStyle, font_style};
         let face = FontMgr::default()
             .match_family_style(
@@ -151,6 +155,74 @@ fn load_by_id(id: fontdb::ID) -> Option<LoadedFont> {
 
 static FALLBACK_CACHE: OnceLock<Mutex<HashMap<char, Option<LoadedFont>>>> = OnceLock::new();
 
+/// Point fontconfig at the bundled test faces before the first `FcInit`.
+///
+/// Layout expectations were measured against Noto Sans / Noto Serif / Arimo /
+/// Tinos / Cousine. A GitHub runner's DejaVu fallback changes those metrics.
+pub(super) fn pin_test_fontconfig() {
+    #[cfg(test)]
+    {
+        use std::sync::Once;
+        static PIN: Once = Once::new();
+        PIN.call_once(|| {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test-fonts");
+            let cjk = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test-fonts-cjk");
+            let conf_path = std::env::temp_dir().join("w3cos-test-fonts.conf");
+            let conf = format!(
+                r#"<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <dir>{dir}</dir>
+  <dir>{cjk}</dir>
+  <alias><family>sans-serif</family><prefer><family>Noto Sans</family></prefer></alias>
+  <alias><family>serif</family><prefer><family>Noto Serif</family></prefer></alias>
+  <alias><family>monospace</family><prefer><family>Cousine</family></prefer></alias>
+  <alias><family>Arial</family><prefer><family>Arimo</family></prefer></alias>
+  <alias><family>Helvetica</family><prefer><family>Arimo</family></prefer></alias>
+  <alias><family>Times</family><prefer><family>Tinos</family></prefer></alias>
+  <alias><family>Times New Roman</family><prefer><family>Tinos</family></prefer></alias>
+  <alias><family>Courier</family><prefer><family>Cousine</family></prefer></alias>
+  <alias><family>Courier New</family><prefer><family>Cousine</family></prefer></alias>
+</fontconfig>
+"#
+            );
+            std::fs::write(&conf_path, conf).expect("pinned test fontconfig");
+            // The first FontMgr::default() call initializes fontconfig for the
+            // process. The variable has to be in place before that call.
+            unsafe { std::env::set_var("FONTCONFIG_FILE", &conf_path) };
+        });
+    }
+}
+
+/// Test builds ship a CJK subset so layout checks do not depend on the host.
+/// Release linkage probes stay inside the AOT size budget, so production
+/// fallback keeps using installed faces.
+#[cfg(test)]
+fn bundled_cjk_face() -> Option<LoadedFont> {
+    static FACE: OnceLock<Option<LoadedFont>> = OnceLock::new();
+    FACE.get_or_init(|| {
+        let data = Arc::new(include_bytes!("../assets/CJK-Subset.ttf").to_vec());
+        let parsed =
+            fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default()).ok()?;
+        let mut hasher = DefaultHasher::new();
+        data.hash(&mut hasher);
+        Some(LoadedFont {
+            family: "W3COS CJK Subset".into(),
+            weight: FontWeight::NORMAL,
+            style: FontFaceStyle::Normal,
+            data,
+            is_monospace: false,
+            parsed: Some(Arc::new(parsed)),
+            unicode_ranges: None,
+            cache_key: hasher.finish(),
+            collection_index: Some(0),
+            #[cfg(feature = "skia")]
+            skia_typeface: Arc::new(OnceLock::new()),
+        })
+    })
+    .clone()
+}
+
 /// Face to use when the primary font has no glyph for `character`.
 ///
 /// Order: fontconfig's charset match (when `libfontconfig` is installed),
@@ -173,6 +245,13 @@ pub(super) fn fallback_for_character(character: char) -> Option<LoadedFont> {
 
 fn lookup_fallback(character: char) -> Option<LoadedFont> {
     if let Some(font) = fontconfig_fallback(character)
+        && inks(&font, character)
+    {
+        return Some(font);
+    }
+    #[cfg(test)]
+    if is_cjk(character)
+        && let Some(font) = bundled_cjk_face()
         && inks(&font, character)
     {
         return Some(font);
@@ -389,6 +468,7 @@ fn fontconfig_match(character: char) -> Option<(std::path::PathBuf, u32)> {
         }
     }
 
+    pin_test_fontconfig();
     let fc = library()?;
     unsafe {
         if (fc.init)().is_null() {

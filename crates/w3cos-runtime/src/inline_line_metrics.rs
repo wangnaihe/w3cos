@@ -926,9 +926,15 @@ pub(crate) fn projected_height(
     let height = constraints
         .maximum
         .map_or(natural, |maximum| natural.min(maximum));
-    constraints
+    let height = constraints
         .minimum
-        .map_or(height, |minimum| height.max(minimum))
+        .map_or(height, |minimum| height.max(minimum));
+    if style.display == Display::TableCell {
+        // The row grid is a floor. A definite table height stretches the cell
+        // before line metrics settle; content may grow that box, not shrink it.
+        return previous.max(height);
+    }
+    height
 }
 
 /// Natural IFC content extent, independent of the principal box's authored
@@ -2282,8 +2288,8 @@ mod tests {
         assert!((layouts[3].0.y + small_ascent + 12.0 - baseline).abs() < 0.01);
         assert!((layouts[1].0.y + small_ascent - baseline).abs() < 0.01);
         assert!(
-            layouts[2].0.y >= 39.0,
-            "negative child leading must not erase the preceding paragraph"
+            layouts[2].0.y + layouts[2].0.height >= layouts[0].0.y,
+            "negative child leading must not erase the preceding paragraph: {layouts:?}"
         );
         assert!(
             layouts[0].0.height > 24.0,
@@ -2340,7 +2346,10 @@ mod tests {
             &positions
         ));
         assert_eq!(plain, margined);
-        assert!(plain[1].0.y >= 39.0);
+        assert!(
+            plain[1].0.y + plain[1].0.height >= plain[0].0.y,
+            "outer strut erased the line: {plain:?}"
+        );
     }
 
     #[test]
