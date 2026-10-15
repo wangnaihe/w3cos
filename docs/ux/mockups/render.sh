@@ -12,6 +12,7 @@ shot() {
   h=$3
   timeout 20s google-chrome --headless=new --no-sandbox --disable-gpu \
     --disable-dev-shm-usage --hide-scrollbars --force-device-scale-factor=1 \
+    --user-data-dir="/tmp/w3cos-ux-chrome-${name}" \
     --window-size="${w},${h}" \
     --screenshot="$out/${name}.png" \
     "file://$(pwd)/${name}.html" >/dev/null 2>&1 || true
@@ -35,3 +36,6 @@ shot tablet-home 1194 834
 shot handoff-pair 1440 900
 shot handoff-desktop 1440 900
 shot handoff-phone 390 844
+shot desktop-en 1440 900
+shot phone-ar 390 844
+shot desktop-language 1440 900

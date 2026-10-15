@@ -24,7 +24,7 @@
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
   --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.32);
   --radius: 12px;
-  --sans: Inter, "WenQuanYi Micro Hei", "Droid Sans Fallback", sans-serif;
+  --sans: Inter, "Noto Sans Arabic", "Noto Sans Hebrew", "WenQuanYi Micro Hei", "Droid Sans Fallback", sans-serif;
   --mono: "JetBrains Mono", "WenQuanYi Micro Hei Mono", monospace;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
@@ -285,6 +285,12 @@ h1, h2, h3, p { margin: 0; }
   font-size: 16px;
   line-height: 1.5;
   outline: none;
+  text-align: start;
+}
+html[dir="rtl"] .go .ico { transform: scaleX(-1); }
+html[dir="rtl"] body {
+  font-family: "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans Hebrew", Inter, "WenQuanYi Micro Hei", sans-serif;
+  line-height: 1.7;
 }
 .intent input::placeholder { color: var(--faint); }
 .go, .btn {
@@ -872,6 +878,38 @@ h1, h2, h3, p { margin: 0; }
   line-height: 1.45;
 }
 .choice button small { display: block; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+
+.lang-list { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.lang-row {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 52px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(244, 241, 234, 0.04);
+  text-align: start;
+}
+.lang-row b { display: block; font-size: 15px; font-weight: 650; line-height: 1.4; }
+.lang-row span { display: block; color: var(--faint); font-size: 12px; line-height: 1.45; margin-top: 2px; }
+.lang-row.pending { border-color: rgba(226, 164, 92, 0.7); }
+.radio {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--muted);
+  display: grid;
+  place-items: center;
+}
+.radio.on { border-color: #8ee0bf; }
+.radio.on i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8ee0bf;
+}
 
 .empty {
   margin: auto;

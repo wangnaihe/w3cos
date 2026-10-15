@@ -59,31 +59,53 @@ def titlebar(title: str, mark: str = "") -> str:
     )
 
 
-def dock(running: str = "", notes: int = 0, l2: str = "L2 关") -> str:
+def dock(
+    running: str = "",
+    notes: int = 0,
+    l2: str = "L2 关",
+    clock: str = "14:32",
+    labels: dict | None = None,
+) -> str:
+    names = {
+        "files": "文件",
+        "term": "终端",
+        "launcher": "启动器",
+        "lock": "已锁定",
+        "devices": "设备",
+        "notes": "通知",
+    }
+    if labels:
+        names.update(labels)
     files_on = " on" if running in {"files", "both"} else ""
     term_on = " on" if running == "term" else ""
     apps = ""
     if running in {"files", "both"}:
-        apps += f'<div class="running{files_on}" aria-label="文件">{ico("folder", 20)}</div>'
+        apps += f'<div class="running{files_on}" aria-label="{names["files"]}">{ico("folder", 20)}</div>'
     if running in {"term", "both"}:
-        apps += f'<div class="running term{term_on}" aria-label="终端">{ico("term", 20)}</div>'
+        apps += f'<div class="running term{term_on}" aria-label="{names["term"]}">{ico("term", 20)}</div>'
     badge = f'<i class="badge">{notes}</i>' if notes else ""
     return f'''
     <footer class="dock">
-      <button class="dock-btn" aria-label="启动器">{ico("grid", 20)}</button>
+      <button class="dock-btn" aria-label="{names["launcher"]}">{ico("grid", 20)}</button>
       {apps}
       <div class="spacer"></div>
       <div class="tray">
-        <button class="dock-btn" aria-label="已锁定">{ico("lock", 18)}</button>
-        <button class="dock-btn" aria-label="设备">{ico("devices", 18)}</button>
-        <button class="dock-btn" aria-label="通知">{ico("bell", 18)}{badge}</button>
+        <button class="dock-btn" aria-label="{names["lock"]}">{ico("lock", 18)}</button>
+        <button class="dock-btn" aria-label="{names["devices"]}">{ico("devices", 18)}</button>
+        <button class="dock-btn" aria-label="{names["notes"]}">{ico("bell", 18)}{badge}</button>
         <span class="l2flag">{l2}</span>
-        <span class="clock">14:32</span>
+        <span class="clock">{clock}</span>
       </div>
     </footer>'''
 
 
-def intent(value: str, placeholder: str, card: str = "", go_label: str = "提议") -> str:
+def intent(
+    value: str,
+    placeholder: str,
+    card: str = "",
+    go_label: str = "提议",
+    field_label: str = "意图",
+) -> str:
     shown = value or ""
     ph = "" if value else f' placeholder="{placeholder}"'
     val = f' value="{shown}"' if shown else ""
@@ -91,7 +113,7 @@ def intent(value: str, placeholder: str, card: str = "", go_label: str = "提议
     <div class="intent-wrap">
       {card}
       <div class="intent">
-        <input aria-label="意图"{ph}{val} />
+        <input aria-label="{field_label}"{ph}{val} />
         <button class="go" aria-label="{go_label}">{ico("enter", 18)}</button>
       </div>
     </div>'''
@@ -134,13 +156,13 @@ def files_body() -> str:
     return f'<div class="body-row"><nav class="side">{side}</nav><div class="main">{"".join(lines)}</div></div>'
 
 
-def page(title: str, width: int, height: int, body: str) -> str:
+def page(title: str, width: int, height: int, body: str, lang: str = "zh-CN", direction: str = "ltr") -> str:
     return f'''<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="{lang}" dir="{direction}">
 <head>
   <meta charset="utf-8" />
   <title>{title}</title>
-  <link rel="stylesheet" href="system.css" />
+  <link rel="stylesheet" href="system.css?v=3" />
   <style>html,body{{width:{width}px;height:{height}px;overflow:hidden;}}</style>
 </head>
 <body>
@@ -619,6 +641,145 @@ def handoff_desktop() -> str:
     return page("在手机上继续", 1440, 900, body)
 
 
+def desktop_en() -> str:
+    card = '''
+      <section class="card" role="dialog" aria-label="Confirm intent">
+        <span class="tier">L0 Rule</span>
+        <h3>Open Files</h3>
+        <p>Switch to the Files window. Nothing on disk is read or changed.</p>
+        <div class="actions">
+          <button class="btn ghost">Cancel</button>
+          <button class="btn primary">Confirm</button>
+        </div>
+        <p class="fine">Nothing runs until you confirm, and a receipt is written. Press Esc to cancel.</p>
+      </section>'''
+    side = "".join(
+        f'<button class="{"active" if i == 0 else ""}">{name}</button>'
+        for i, name in enumerate(["Home", "Documents", "Downloads", "Pictures"])
+    )
+    rows = [
+        ("folder", "w3cos", "Folder", "", True),
+        ("receipt", "Receipts", "Folder", "", False),
+        ("file", "README.md", "Markdown", "4 KB", False),
+        ("image", "screenshot.png", "PNG", "245 KB", False),
+    ]
+    lines = []
+    for icon, name, kind, size, sel in rows:
+        cls = "file sel" if sel else "file"
+        lines.append(
+            f'<div class="{cls}">{ico(icon, 18)}<span>{name}</span><small>{kind}</small><small>{size}</small></div>'
+        )
+    win = f'''<div class="window" style="left:390px;top:78px;width:760px;height:500px">
+      {titlebar("Files")}
+      <div class="body-row"><nav class="side">{side}</nav><div class="main">{"".join(lines)}</div></div>
+    </div>'''
+    icons = [
+        ("folder", "jade", "Files"),
+        ("term", "", "Terminal"),
+        ("sliders", "amber", "Settings"),
+        ("compass", "blue", "Browser"),
+        ("pen", "", "Editor"),
+    ]
+    bits = []
+    for name, tone, label in icons:
+        cls = f"squircle {tone}".strip()
+        bits.append(
+            f'<button class="dicon"><span class="{cls}">{ico(name, 28)}</span><span>{label}</span></button>'
+        )
+    body = f'''<div class="os">
+      <div class="dicons">{"".join(bits)}</div>
+      <div class="stage">{win}</div>
+      {intent("open files", "", card, "Propose", "Intent")}
+      {dock("files", l2="L2 off", clock="2:32 PM", labels={"files": "Files", "launcher": "Launcher", "lock": "Locked", "devices": "Devices", "notes": "Notifications"})}
+    </div>'''
+    return page("English desktop", 1440, 900, body, lang="en")
+
+
+def phone_ar() -> str:
+    items = [
+        ("folder", "jade", "الملفات"),
+        ("term", "", "الطرفية"),
+        ("sliders", "amber", "الإعدادات"),
+        ("compass", "blue", "المتصفح"),
+        ("pen", "", "المحرّر"),
+        ("devices", "", "الأجهزة"),
+    ]
+    cells = []
+    for name, tone, label in items:
+        cls = f"squircle {tone}".strip()
+        cells.append(
+            f'<button class="dicon"><span class="{cls}">{ico(name, 26)}</span><span>{label}</span></button>'
+        )
+    body = f'''<div class="phone">
+      <div class="status"><span>٢:٣٢ م</span><span class="right">{ico("lock", 14)} <span>١٠٠٪</span></span></div>
+      <div class="phone-icons">{"".join(cells)}</div>
+      <div class="bottom-intent">
+        <p class="hint">افتح الملفات، أو الوضع الليلي، أو جملة كاملة</p>
+        <div class="intent" dir="ltr">
+          <button class="go" style="order: -1" aria-label="اقتراح">{ico("enter", 18)}</button>
+          <input dir="rtl" style="text-align: right" aria-label="النية" placeholder="ماذا تريد أن تفعل؟" />
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>'''
+    return page("Arabic phone", 390, 844, body, lang="ar", direction="rtl")
+
+
+def desktop_language() -> str:
+    def row(name: str, meta: str, on: bool = False, pending: bool = False, pill: str = "") -> str:
+        cls = "lang-row"
+        if on:
+            cls += " on"
+        if pending:
+            cls += " pending"
+        radio = '<span class="radio on"><i></i></span>' if on else '<span class="radio"></span>'
+        badge = f'<span class="pill stop">{pill}</span>' if pill else ""
+        return f'<div class="{cls}">{radio}<div><b>{name}</b><span>{meta}</span></div>{badge}</div>'
+
+    rows = "".join(
+        [
+            row("跟随系统", "现在解析为简体中文", on=True),
+            row("简体中文", "zh-CN · 内置"),
+            row("English", "en · 内置", pending=True, pill="待确认"),
+            row("العربية", "ar · 从右到左"),
+            row("עברית", "he · 从右到左"),
+        ]
+    )
+    win = f'''<div class="window" style="left:340px;top:48px;width:760px;height:560px">
+      {titlebar("设置")}
+      <div class="body-row">
+        <nav class="side">
+          <button>本机</button>
+          <button>身份</button>
+          <button class="active">语言</button>
+          <button>设备</button>
+        </nav>
+        <div class="main" style="padding:16px 18px">
+          <h3 style="font-size:20px">语言</h3>
+          <p style="margin-top:6px">界面只用一种语言。收据里的原句不翻译。</p>
+          <div class="lang-list">{rows}</div>
+          <p class="fine">系统语言是简体中文。改成 English 要先确认。语言包放在本机，可以再加。</p>
+        </div>
+      </div>
+    </div>'''
+    card = '''
+      <section class="card" role="dialog" aria-label="确认切换语言">
+        <span class="tier">L0 规则</span>
+        <h3>把界面改成 English</h3>
+        <p>只换界面上的句子。已经写下的收据保持原样，路径和时间格式跟 English。</p>
+        <div class="actions">
+          <button class="btn ghost">取消</button>
+          <button class="btn primary">确认</button>
+        </div>
+      </section>'''
+    body = f'''<div class="os">
+      <div class="stage">{win}</div>
+      {intent("把界面改成 English", "", card)}
+      {dock()}
+    </div>'''
+    return page("语言设置", 1440, 900, body)
+
+
 def handoff_phone() -> str:
     body = f'''<div class="phone">
       {phone_status()}
@@ -666,6 +827,9 @@ PAGES = {
     "handoff-pair": handoff_pair,
     "handoff-desktop": handoff_desktop,
     "handoff-phone": handoff_phone,
+    "desktop-en": desktop_en,
+    "phone-ar": phone_ar,
+    "desktop-language": desktop_language,
 }
 
 
