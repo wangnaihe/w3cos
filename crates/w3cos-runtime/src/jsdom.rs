@@ -4249,11 +4249,12 @@ fn remove_indexed_table_row(rows: Vec<u32>, requested_index: Value) {
     let Some(parent) = dom::parent_node(row) else {
         return;
     };
-    let value = element_value(row);
     let was_connected = dom::is_connected(row);
+    let notify_disconnected = was_connected && disconnected_lifecycle_may_be_observable(row);
+    let value = notify_disconnected.then(|| element_value(row));
     dom::remove_child(parent, row);
     release_element_subtree(row);
-    if was_connected {
+    if let Some(value) = value {
         crate::custom_elements_web::disconnected_subtree(&value);
     }
 }
@@ -4371,6 +4372,16 @@ fn subtree_has_element_memo(root: u32) -> bool {
         }
     });
     found
+}
+
+/// Custom-element definitions make lifecycle callbacks observable for any
+/// matching node. With an empty registry, an authored/materialized wrapper is
+/// still observable: it may carry the upgraded marker and an authored
+/// disconnectedCallback on its prototype. Fresh immediate-only subtrees have
+/// neither, so removal can avoid materializing every node just to discover
+/// that there is no callback to run.
+fn disconnected_lifecycle_may_be_observable(root: u32) -> bool {
+    crate::custom_elements_web::has_definitions() || subtree_has_element_memo(root)
 }
 
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
@@ -9910,9 +9921,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 dom_exception("The node is not a child of this parent", "NotFoundError");
             }
             let was_connected = dom::is_connected(cid);
+            let notify_disconnected =
+                was_connected && disconnected_lifecycle_may_be_observable(cid);
             dom::remove_child(node, cid);
             release_element_subtree(cid);
-            if was_connected {
+            if notify_disconnected {
                 crate::custom_elements_web::disconnected_subtree(&child);
             }
             child
@@ -10084,9 +10097,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             };
             ensure_tree_child_type_and_adopt(node, inserted_node);
             let old_was_connected = dom::is_connected(old_node);
+            let notify_disconnected =
+                old_was_connected && disconnected_lifecycle_may_be_observable(old_node);
             replace_child_or_fragment(node, inserted_node, old_node);
             release_element_subtree(old_node);
-            if old_was_connected {
+            if notify_disconnected {
                 crate::custom_elements_web::disconnected_subtree(&old_child);
             }
             if dom::node_type(inserted_node) != 11 && dom::is_connected(inserted_node) {
@@ -10102,11 +10117,13 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "remove" => func(move |_, _| {
             if let Some(parent) = dom::parent_node(node) {
-                let element = element_value(node);
                 let was_connected = dom::is_connected(node);
+                let notify_disconnected =
+                    was_connected && disconnected_lifecycle_may_be_observable(node);
+                let element = notify_disconnected.then(|| element_value(node));
                 dom::remove_child(parent, node);
                 release_element_subtree(node);
-                if was_connected {
+                if let Some(element) = element {
                     crate::custom_elements_web::disconnected_subtree(&element);
                 }
             } else if let Some(parent_document) = get_expando(node, "parentNode")
@@ -21863,6 +21880,57 @@ mod tests {
         );
         assert_eq!(el.get_property("ready").to_js_string(), "yes");
         assert_eq!(calls.get(), 1, "disconnectedCallback should run");
+    }
+
+    #[test]
+    fn empty_custom_element_registry_removes_fresh_immediate_without_materializing() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        let node = node_id_of(&element).expect("fresh DOM immediate");
+        assert!(memoized_element(node).is_none());
+
+        body.call_method("appendChild", vec![element.clone()]);
+        body.call_method("removeChild", vec![element]);
+
+        assert!(
+            memoized_element(node).is_none(),
+            "an empty registry must not materialize a fresh removed node"
+        );
+    }
+
+    #[test]
+    fn empty_registry_keeps_materialized_descendant_disconnected_callback() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let doc = document_value();
+        let parent = doc.call_method("createElement", vec![Value::string("div")]);
+        let child = doc.call_method("createElement", vec![Value::string("span")]);
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        w3cos_core::class::set_prototype_of(&child, &prototype);
+        child.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        parent.call_method("appendChild", vec![child]);
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![parent.clone()]);
+
+        body.call_method("removeChild", vec![parent]);
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a materialized descendant callback must survive the empty-registry fast path"
+        );
     }
 
     #[test]
