@@ -192,9 +192,9 @@ scheduling around the callback. Those two rows are not a ratio.
 
 DOM create is a code loss on every profile. Size is 9.237 ms
 (9.196–9.739), speed is 7.197 ms (7.139–7.253), and max is 3.693 ms
-(3.655–3.754). Chromium is 0.800 ms (0.700–1.400). Max is about 2.5× the
-size profile and about 1.9× the speed profile, and its fastest sample,
-3.655 ms, is still above Chromium's slowest, 1.400 ms. The 0.375 ms create
+(3.655–3.754). Chromium is 0.800 ms (0.700–1.400). Size create is 2.50× max and speed
+create is 1.95× max. Max's fastest sample, 3.655 ms, is still above
+Chromium's slowest, 1.400 ms. The 0.375 ms create
 in the `d9bc7fe` section below is that commit, not this tree. DOM wall
 follows create: 9.480 / 7.392 / 3.794 ms against 0.800 ms (0.700–1.400),
 also a loss on every profile.
