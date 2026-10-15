@@ -93,7 +93,8 @@ fn primitive_rectangles(source: &str) -> Option<String> {
 
 pub(crate) fn rasterize(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<DecodedImage> {
     let source = primitive_rectangles(&tree.to_string(&resvg::usvg::WriteOptions::default()))?;
-    let mut dom = skia_safe::svg::Dom::from_str(&source, FontMgr::default()).ok()?;
+    let mut dom =
+        skia_safe::svg::Dom::from_str(&source, crate::font_face::pinned_font_mgr()).ok()?;
     let size = tree.size();
     dom.set_container_size((size.width(), size.height()));
     // Keep the temporary surface and returned pixels within the decoder's

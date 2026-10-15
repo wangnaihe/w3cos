@@ -1,0 +1,7 @@
+Pinned faces for layout and glyph tests. Runtime tests load this directory
+and point fontconfig at it so metrics do not follow the host font set.
+
+Arimo, Tinos, Cousine, Noto Sans, and Noto Serif are
+Copyright 2010–2020 Google Inc. / Google LLC.
+Licensed under the SIL Open Font License, Version 1.1.
+See LICENSE-OFL.txt.

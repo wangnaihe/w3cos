@@ -1,0 +1,7 @@
+These files are excerpts from the Web Platform Tests
+(https://github.com/web-platform-tests/wpt) at commit
+fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0, the revision this
+repository's CI checks out. They are included so layout tests can
+run without a separate WPT checkout.
+
+Upstream license: BSD 3-Clause and W3C Test Suite License.

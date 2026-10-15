@@ -142,7 +142,7 @@ impl HarmonyRuntime {
         let direct_context = direct_contexts::make_gl(interface, None)
             .ok_or_else(|| "Skia could not create an OHOS Ganesh context".to_string())?;
         let font = crate::font_face::host_ui_font();
-        let typeface = FontMgr::default()
+        let typeface = crate::font_face::pinned_font_mgr()
             .new_from_data(font.data.as_slice(), Some(font.index as usize))
             .ok_or_else(|| "Host system font is invalid".to_string())?;
 

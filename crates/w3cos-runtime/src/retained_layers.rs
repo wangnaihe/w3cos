@@ -898,7 +898,7 @@ mod tests {
             fontdue::FontSettings::default(),
         )
         .unwrap();
-        let typeface = skia_safe::FontMgr::default()
+        let typeface = crate::font_face::pinned_font_mgr()
             .new_from_data(include_bytes!("../assets/Inter-Regular.ttf"), None)
             .expect("test typeface");
         let mut cache = crate::render_skia::RetainedSkiaCache::default();

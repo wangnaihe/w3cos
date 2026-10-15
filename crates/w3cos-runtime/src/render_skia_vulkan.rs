@@ -77,7 +77,7 @@ impl SkiaVulkanPresenter {
         font_bytes: &[u8],
         font_index: Option<usize>,
     ) -> Result<Self, String> {
-        let typeface = FontMgr::default()
+        let typeface = crate::font_face::pinned_font_mgr()
             .new_from_data(font_bytes, font_index)
             .ok_or_else(|| "host font is not a valid Skia typeface".to_string())?;
         let entry = ash::Entry::load().map_err(|error| format!("load Vulkan: {error}"))?;

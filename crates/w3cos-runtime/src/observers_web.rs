@@ -2091,7 +2091,7 @@ fn performance_entry_value(entry: &PerformanceEntry) -> Value {
         ("detail".to_string(), entry.detail.clone()),
     ]));
     if let Some(class_name) = performance_class_for_entry_type(&entry.entry_type) {
-        if let Value::Object(detail) = &entry.detail {
+        if let Some(detail) = entry.detail.as_object() {
             for key in detail.borrow().keys() {
                 value.set_property(&key, entry.detail.get_property(&key));
             }

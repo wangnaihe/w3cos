@@ -643,7 +643,7 @@ mod precision_tests {
     #[test]
     fn synthetic_small_caps_keep_css_size_and_original_source_clusters() {
         use w3cos_std::style::FontVariant;
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", skia_safe::FontStyle::normal())
             .unwrap();
         let style = Style {
@@ -685,7 +685,7 @@ mod precision_tests {
     #[test]
     fn synthetic_small_caps_expansions_and_combining_marks_keep_source_spacing() {
         use w3cos_std::style::FontVariant;
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", skia_safe::FontStyle::normal())
             .unwrap();
         let style = Style {
@@ -721,7 +721,7 @@ mod precision_tests {
 
     #[test]
     fn browser_justified_pingfang_character_origin_uses_layout_range() {
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("PingFang SC", skia_safe::FontStyle::normal())
             .unwrap();
         let text = "decreased): its sides should be approximately equidistant from the";
@@ -751,7 +751,7 @@ mod precision_tests {
 
     #[test]
     fn justified_full_line_preserves_contextual_glyphs_and_space_advances() {
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", skia_safe::FontStyle::normal())
             .unwrap();
         let text = "Some words justified";
@@ -782,7 +782,7 @@ mod precision_tests {
 
     #[test]
     fn effective_platform_font_size_preserves_computed_css_size() {
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Courier", skia_safe::FontStyle::normal())
             .unwrap();
         for (computed, effective) in [
@@ -829,7 +829,7 @@ mod precision_tests {
 
     #[test]
     fn synthetic_italic_only_shears_upright_faces_and_preserves_advance() {
-        let manager = skia_safe::FontMgr::default();
+        let manager = crate::font_face::pinned_font_mgr();
         for face_style in [
             skia_safe::FontStyle::normal(),
             skia_safe::FontStyle::italic(),
@@ -873,7 +873,7 @@ mod precision_tests {
 
     #[test]
     fn macos_untracked_font_advance_matches_skia_fixed_point_callback() {
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", skia_safe::FontStyle::normal())
             .unwrap();
         let tags = face.read_table_tags().unwrap();
@@ -922,7 +922,7 @@ mod precision_tests {
 
     #[test]
     fn fractional_cluster_advance_does_not_depend_on_prefix_length() {
-        let face = skia_safe::FontMgr::default()
+        let face = crate::font_face::pinned_font_mgr()
             .match_family_style("Times", skia_safe::FontStyle::normal())
             .unwrap();
         let style = Style {

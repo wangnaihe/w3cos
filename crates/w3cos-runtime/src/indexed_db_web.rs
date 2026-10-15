@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::rc::Weak;
 
 use serde_json::Value as JsonValue;
-use w3cos_core::JsObject;
 use w3cos_core::Value;
+use w3cos_core::WeakJsObject;
 
 use crate::indexed_db::{self, Database, IndexedDbError, KeyRange, Transaction, TransactionMode};
 use crate::jsdom::queue_microtask_value;
@@ -48,7 +48,7 @@ struct WebTransaction {
     commit_requested: Cell<bool>,
     error: RefCell<Value>,
     listeners: ListenerMap,
-    target: RefCell<Option<Weak<RefCell<JsObject>>>>,
+    target: RefCell<Option<WeakJsObject>>,
 }
 
 struct DatabaseConnection {
@@ -56,7 +56,7 @@ struct DatabaseConnection {
     version: u32,
     closed: Cell<bool>,
     listeners: ListenerMap,
-    target: RefCell<Option<Weak<RefCell<JsObject>>>>,
+    target: RefCell<Option<WeakJsObject>>,
 }
 
 impl DatabaseConnection {
@@ -64,8 +64,7 @@ impl DatabaseConnection {
         self.target
             .borrow()
             .as_ref()
-            .and_then(Weak::upgrade)
-            .map(Value::Object)
+            .and_then(WeakJsObject::upgrade_value)
     }
 }
 
@@ -121,8 +120,7 @@ impl WebTransaction {
         self.target
             .borrow()
             .as_ref()
-            .and_then(Weak::upgrade)
-            .map(Value::Object)
+            .and_then(WeakJsObject::upgrade_value)
     }
 }
 
@@ -1462,8 +1460,8 @@ fn database_web_value(
     );
     let value = Value::object(properties);
     set_interface_prototype(&value, "IDBDatabase");
-    if let Value::Object(object) = &value {
-        *connection.target.borrow_mut() = Some(Rc::downgrade(object));
+    if let Some(object) = value.as_object() {
+        *connection.target.borrow_mut() = Some(object.downgrade());
     }
     (value, connection)
 }
@@ -1668,8 +1666,8 @@ fn transaction_web_value(
     );
     let value = Value::object(properties);
     set_interface_prototype(&value, "IDBTransaction");
-    if let Value::Object(object) = &value {
-        *transaction.target.borrow_mut() = Some(Rc::downgrade(object));
+    if let Some(object) = value.as_object() {
+        *transaction.target.borrow_mut() = Some(object.downgrade());
     }
     queue_transaction_finalize(transaction);
     value

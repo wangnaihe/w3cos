@@ -8634,8 +8634,13 @@ impl Document {
                             });
                         style.display = match style.display {
                             w3cos_std::style::Display::Block
-                                if floated_inline_image || relative_inline_fragment =>
+                                if floated_inline_image
+                                    || relative_inline_fragment
+                                    || anonymous_inline_formatting_context =>
                             {
+                                // The anonymous line is an internal flex model.
+                                // An authored block keeps its principal display
+                                // so its font strut still owns the line.
                                 style.display
                             }
                             w3cos_std::style::Display::Inline
@@ -12573,6 +12578,8 @@ fn normalize_single_inline_text_indent(component: &mut w3cos_std::Component) {
             | Display::InlineBlock
             | Display::TableCell
             | Display::TableCaption
+    ) && !component.style.custom_properties.as_ref().is_some_and(
+        |properties| properties.contains_key("--w3cos-internal-inline-formatting-context"),
     );
     if !is_block_like
         || component.children.len() != 1
@@ -13331,16 +13338,18 @@ fn split_collapsible_space_after_nonbreaking_run(component: &mut w3cos_std::Comp
     for child in &mut component.children {
         split_collapsible_space_after_nonbreaking_run(child);
     }
-    if component.style.display != Display::Flex
-        || component.style.flex_wrap == FlexWrap::NoWrap
-        || !component
+    // An authored block keeps its principal display and records the anonymous
+    // line with the inline-formatting marker. The trailing collapsible space
+    // is still a separate break opportunity on that line.
+    let inline_line = matches!(component.style.display, Display::Flex | Display::Block)
+        && component
             .style
             .custom_properties
             .as_ref()
             .is_some_and(|properties| {
                 properties.contains_key("--w3cos-internal-inline-formatting-context")
-            })
-    {
+            });
+    if !inline_line || component.style.flex_wrap == FlexWrap::NoWrap {
         return;
     }
 
@@ -18044,8 +18053,17 @@ mod image_component_tests {
         let host = fuchsia_host(&tree).expect("the fuchsia container must survive lowering");
         assert_eq!(
             host.style.display,
-            Display::Flex,
-            "a self-painting inline box still needs its own flex item"
+            Display::Block,
+            "an authored block keeps its principal display"
+        );
+        assert!(
+            host.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                }),
+            "a self-painting inline box still needs its own line item"
         );
         assert_eq!(
             host.children.len(),
@@ -18495,7 +18513,15 @@ mod image_component_tests {
         document.body().append_child(&mut document, script);
 
         let tree = document.to_component_tree();
-        assert_eq!(tree.style.display, Display::Flex);
+        assert_eq!(tree.style.display, Display::Block);
+        assert!(
+            tree.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
 
         crate::stylesheet::clear_rules();
     }
@@ -19046,7 +19072,16 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let line_box = tree.children.first().expect("line box");
-        assert_eq!(line_box.style.display, Display::Flex);
+        assert_eq!(line_box.style.display, Display::Block);
+        assert!(
+            line_box
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         assert_eq!(line_box.style.line_height, 6.0);
         assert_eq!(line_box.style.min_height, Dimension::Px(96.0));
         crate::stylesheet::clear_rules();
@@ -19076,7 +19111,16 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let line_box = tree.children.first().expect("line box");
-        assert_eq!(line_box.style.display, Display::Flex);
+        assert_eq!(line_box.style.display, Display::Block);
+        assert!(
+            line_box
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         assert_eq!(line_box.style.height, Dimension::Px(16.0));
         assert_eq!(line_box.style.min_height, Dimension::Auto);
         crate::stylesheet::clear_rules();
@@ -22643,7 +22687,15 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let line = &tree.children[0];
-        assert_eq!(line.style.display, Display::Flex);
+        assert_eq!(line.style.display, Display::Block);
+        assert!(
+            line.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         assert_eq!(line.children[0].style.width, Dimension::Percent(100.0));
         assert_eq!(line.children[0].style.min_width, Dimension::Px(0.0));
         crate::stylesheet::clear_rules();
@@ -22743,7 +22795,15 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let line = &tree.children[0];
 
-        assert_eq!(line.style.display, Display::Flex);
+        assert_eq!(line.style.display, Display::Block);
+        assert!(
+            line.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         assert_eq!(
             line.style.justify_content,
             w3cos_std::style::JustifyContent::FlexEnd
@@ -22763,7 +22823,15 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let line = &tree.children[0];
-        assert_eq!(line.style.display, Display::Flex);
+        assert_eq!(line.style.display, Display::Block);
+        assert!(
+            line.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })
+        );
         assert_eq!(
             line.children[0].style.width,
             w3cos_std::style::Dimension::Percent(100.0)

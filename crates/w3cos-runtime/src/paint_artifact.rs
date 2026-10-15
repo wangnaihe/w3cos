@@ -3319,7 +3319,7 @@ mod tests {
         let context = artifact
             .inline_line_context(1)
             .expect("float lines need shared metrics");
-        assert_eq!(context.line_advance, Some(24.0));
+        assert_eq!(context.line_advance, Some(25.0));
     }
 
     #[test]
