@@ -6207,15 +6207,12 @@ impl ScriptLoader {
 
         for index in 0..length {
             let element = scripts.call_method("item", vec![Value::Number(f64::from(index))]);
-            if let Some(only_node) = only_node {
-                let only_element = crate::jsdom::element_value(only_node);
-                let is_only_node = match (element.as_object(), only_element.as_object()) {
-                    (Some(element), Some(only_element)) => element.ptr_eq(&only_element),
-                    _ => false,
-                };
-                if !is_only_node {
-                    continue;
-                }
+            if let Some(only_node) = only_node
+                && crate::jsdom::node_id_of(&element) != Some(only_node)
+            {
+                // Query results may be DOM immediates while the mutation path
+                // holds the memoized wrapper. Node id is the element identity.
+                continue;
             }
             // A DOM property setter can synchronously report children-changed
             // steps while its proxy target is still mutably borrowed. The
@@ -9516,11 +9513,17 @@ fn script_element_source(element: &Value) -> String {
     let Some(node) = crate::jsdom::node_id_of(element) else {
         return element.get_property("textContent").to_js_string();
     };
-    crate::dom::children(node)
+    let from_children: String = crate::dom::children(node)
         .into_iter()
         .filter(|child| matches!(crate::dom::node_type(*child), 3 | 4))
         .filter_map(crate::dom::get_text_content)
-        .collect()
+        .collect();
+    if !from_children.is_empty() {
+        return from_children;
+    }
+    // `HTMLScriptElement.text` can land on the element itself when the setter
+    // does not allocate a child text node. That text is still the script source.
+    crate::dom::get_text_content(node).unwrap_or_default()
 }
 
 fn collect_stylesheet_nodes(node: u32, stylesheets: &mut HashSet<u32>) {

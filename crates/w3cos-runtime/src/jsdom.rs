@@ -11011,6 +11011,10 @@ fn apply_text_content(node: u32, text: &str) {
         if is_style {
             sync_style_element(node);
         }
+        // The observer-free text path replaces the child without append_child,
+        // so a connected script or style would otherwise miss its mutation.
+        #[cfg(feature = "dynamic-js")]
+        crate::dynamic_script::notify_script_mutated(node);
         return;
     }
     replace_all_children(node, || {
