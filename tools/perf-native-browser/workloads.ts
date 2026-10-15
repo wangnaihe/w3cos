@@ -16,8 +16,31 @@ var MEMORY_NODES = 4000;
 var CSS_LIST_NODES = 1000;
 var FLEX_LIST_NODES = 400;
 var EVENT_NODES = 400;
+var LAYOUT_CSS_CARDS = 40;
 var WARMUP = 2;
 var SAMPLES = 5;
+var UPDATE_STRIDE = 17;
+
+function trainingCount(base) {
+    var scale = globalThis.W3COS_PERF_SCALE;
+    if (typeof scale !== "number" || !(scale > 0) || scale === 1) return base;
+    var value = (base * scale + 0.5) | 0;
+    return value < 1 ? 1 : value;
+}
+DOM_NODES = trainingCount(DOM_NODES);
+DOM_UPDATES = trainingCount(DOM_UPDATES);
+FLEX_ITEMS = trainingCount(FLEX_ITEMS);
+GRID_ITEMS = trainingCount(GRID_ITEMS);
+SCROLL_ROWS = trainingCount(SCROLL_ROWS);
+BOXES = trainingCount(BOXES);
+COMPUTE_N = trainingCount(COMPUTE_N);
+MEMORY_NODES = trainingCount(MEMORY_NODES);
+CSS_LIST_NODES = trainingCount(CSS_LIST_NODES);
+FLEX_LIST_NODES = trainingCount(FLEX_LIST_NODES);
+EVENT_NODES = trainingCount(EVENT_NODES);
+LAYOUT_CSS_CARDS = trainingCount(LAYOUT_CSS_CARDS);
+var stride = globalThis.W3COS_PERF_SEED;
+if (typeof stride === "number" && stride > 0) UPDATE_STRIDE = stride | 0;
 
 function check(ok, message) {
     if (!ok) throw new Error(message || "correctness check failed");
@@ -68,7 +91,7 @@ function domOnce() {
     var t1 = performance.now();
     var textSum = 0;
     for (var k = 0; k < DOM_UPDATES; k++) {
-        var index = (k * 17) % DOM_NODES;
+        var index = (k * UPDATE_STRIDE) % DOM_NODES;
         nodes[index].textContent = "upd " + k;
         root.appendChild(nodes[index]);
         textSum = textSum + nodes[index].textContent.length;
@@ -137,7 +160,7 @@ function layoutCssOnce() {
     var wrap = document.createElement("div");
     wrap.className = "wrap";
     document.body.appendChild(wrap);
-    var cards = 40;
+    var cards = LAYOUT_CSS_CARDS;
     for (var i = 0; i < cards; i++) {
         var card = document.createElement("div");
         card.className = "card";
@@ -238,7 +261,7 @@ function runFrames() {
         var gap = lastTs === 0 ? 0 : ts - lastTs;
         lastTs = ts;
         var t0 = performance.now();
-        scroller.scrollTop = (frameIndex * 17) % 2000;
+        scroller.scrollTop = (frameIndex * UPDATE_STRIDE) % 2000;
         for (var n = 0; n < BOXES; n++) {
             boxes[n].style.top = ((frameIndex * 3 + n) % 180) + "px";
         }

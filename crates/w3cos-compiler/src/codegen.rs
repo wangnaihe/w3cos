@@ -265,7 +265,8 @@ w3cos-std = {{ path = "{std_}" }}
 "#,
         runtime = runtime_path.display(),
         std_ = std_path.display(),
-        release_profile = GENERATED_RELEASE_PROFILE,
+        release_profile =
+            crate::release_profile_toml(std::env::var("W3COS_RELEASE_PROFILE").ok().as_deref(),),
     ))
 }
 

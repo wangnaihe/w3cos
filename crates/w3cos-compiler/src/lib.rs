@@ -835,11 +835,9 @@ edition = "2024"
     if flags.needs_std {
         toml.push_str(&dependency("w3cos-std"));
     }
-    if std::env::var("W3COS_RELEASE_PROFILE").ok().as_deref() == Some("speed") {
-        toml.push_str(SPEED_RELEASE_PROFILE);
-    } else {
-        toml.push_str(codegen::GENERATED_RELEASE_PROFILE);
-    }
+    toml.push_str(release_profile_toml(
+        std::env::var("W3COS_RELEASE_PROFILE").ok().as_deref(),
+    ));
     toml
 }
 
@@ -854,6 +852,32 @@ lto = "off"
 codegen-units = 16
 panic = "unwind"
 "#;
+
+const MAX_RELEASE_PROFILE: &str = r#"
+# Selected only by W3COS_RELEASE_PROFILE=max. This is the speed opt-level with
+# the production LTO shape. panic=abort is not selected: JavaScript exceptions
+# and host callbacks unwind through catch_unwind, and abort would turn those
+# into a process abort. PGO is applied by the benchmark runner with rustc
+# profile-generate/profile-use, not by this manifest.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+"#;
+
+/// Cargo release profile embedded in a generated application.
+///
+/// `size` (and any unset or unknown name) is the profile production
+/// `w3cos build --release` ships. `speed` and `max` exist for measurement.
+pub(crate) fn release_profile_toml(name: Option<&str>) -> &'static str {
+    match name {
+        Some("speed") => SPEED_RELEASE_PROFILE,
+        Some("max") => MAX_RELEASE_PROFILE,
+        _ => codegen::GENERATED_RELEASE_PROFILE,
+    }
+}
 
 fn uses_advanced_web_graphics(generated_rust: &str) -> bool {
     const EXACT_GLOBALS: &[&str] = &[
@@ -1164,6 +1188,29 @@ console.log("Done!");
         assert!(toml.contains("opt-level = \"z\""), "{toml}");
         assert!(toml.contains("lto = \"fat\""), "{toml}");
         assert!(toml.contains("panic = \"unwind\""), "{toml}");
+    }
+
+    #[test]
+    fn release_profile_toml_keeps_size_speed_and_max_distinct() {
+        let size = release_profile_toml(None);
+        let explicit_size = release_profile_toml(Some("size"));
+        let speed = release_profile_toml(Some("speed"));
+        let max = release_profile_toml(Some("max"));
+        assert_eq!(size, explicit_size);
+        assert!(size.contains("opt-level = \"z\""));
+        assert!(size.contains("lto = \"fat\""));
+        assert!(size.contains("codegen-units = 1"));
+        assert!(size.contains("panic = \"unwind\""));
+        assert!(speed.contains("opt-level = 3"));
+        assert!(speed.contains("lto = \"off\""));
+        assert!(speed.contains("codegen-units = 16"));
+        assert!(speed.contains("panic = \"unwind\""));
+        assert!(max.contains("opt-level = 3"));
+        assert!(max.contains("lto = \"fat\""));
+        assert!(max.contains("codegen-units = 1"));
+        assert!(max.contains("panic = \"unwind\""));
+        assert!(!max.contains("panic = \"abort\""));
+        assert!(!speed.contains("lto = \"fat\""));
     }
 
     #[test]

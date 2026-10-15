@@ -12,6 +12,7 @@ set because this host has no DRM/GPU node; the native side uses tiny-skia for
 the same reason.
 """
 import argparse
+import hashlib
 import http.server
 import json
 import math
@@ -51,6 +52,52 @@ TIMEOUTS_MS = {
     "flex-list": 240000,
     "events": 180000,
 }
+# Production `w3cos build --release` embeds the size profile. speed and max
+# are measurement-only. panic stays unwind in every profile: JS exceptions
+# use catch_unwind, so panic=abort is not a compatible application setting.
+# PGO for max is rustc profile-generate/profile-use, trained on a different
+# trip count and stride than the measured run.
+PROFILE_SETTINGS = {
+    "size": {
+        "release_profile": "size",
+        "opt_level": "z",
+        "lto": "fat",
+        "codegen_units": "1",
+        "pgo": False,
+        "target_cpu": None,
+        "noted_only": False,
+    },
+    "speed": {
+        "release_profile": "speed",
+        "opt_level": "3",
+        "lto": "off",
+        "codegen_units": "16",
+        "pgo": False,
+        "target_cpu": None,
+        "noted_only": False,
+    },
+    "max": {
+        "release_profile": "max",
+        "opt_level": "3",
+        "lto": "fat",
+        "codegen_units": "1",
+        "pgo": True,
+        "target_cpu": None,
+        "noted_only": False,
+    },
+    "speed-native": {
+        "release_profile": "speed",
+        "opt_level": "3",
+        "lto": "off",
+        "codegen_units": "16",
+        "pgo": False,
+        "target_cpu": "native",
+        "noted_only": True,
+    },
+}
+PRIMARY_PROFILES = ("size", "speed", "max")
+PGO_TRAIN_SCALE = "0.5"
+PGO_TRAIN_SEED = "13"
 CHROME = os.environ.get("W3COS_CHROME", "/usr/bin/google-chrome")
 CHROME_ARGS = [
     "--disable-gpu",
@@ -189,7 +236,19 @@ def host_info(repo):
         "git": revision,
         "viewport": VIEWPORT,
         "chrome_args": CHROME_ARGS,
-        "native_profile": "opt-level=3 lto=off codegen-units=16 cpu-render",
+        "panic": "unwind",
+        "panic_abort": "incompatible: JavaScript exceptions use catch_unwind",
+        "pgo_training": {
+            "scale": PGO_TRAIN_SCALE,
+            "seed": PGO_TRAIN_SEED,
+            "measured_scale": 1,
+            "measured_seed": 17,
+            "note": (
+                "The max profile is trained on half-size workloads and stride 13. "
+                "Measured runs leave W3COS_PERF_SCALE and W3COS_PERF_SEED unset, "
+                "so the published trip counts and stride 17 are not the training set."
+            ),
+        },
     }
 
 
@@ -252,27 +311,143 @@ def build_cli(repo, jobs):
     return repo / "target" / "release" / "w3cos"
 
 
-def build_native(repo, cli, jobs, build_root):
+def llvm_profdata():
+    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+    host = subprocess.check_output(["rustc", "-vV"], text=True)
+    target = ""
+    for line in host.splitlines():
+        if line.startswith("host:"):
+            target = line.split(":", 1)[1].strip()
+    path = Path(sysroot) / "lib" / "rustlib" / target / "bin" / "llvm-profdata"
+    if not path.is_file():
+        raise SystemExit(
+            f"llvm-profdata is not installed at {path}. "
+            "Install it with: rustup component add llvm-tools"
+        )
+    return path
+
+
+def apply_profile_env(env, settings, rustflags=None):
+    env["W3COS_RUNTIME_FEATURES"] = "cpu-render"
+    env["W3COS_RELEASE_PROFILE"] = settings["release_profile"]
+    env["CARGO_PROFILE_RELEASE_OPT_LEVEL"] = settings["opt_level"]
+    env["CARGO_PROFILE_RELEASE_LTO"] = settings["lto"]
+    env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = settings["codegen_units"]
+    env["CARGO_PROFILE_RELEASE_PANIC"] = "unwind"
+    env["CARGO_INCREMENTAL"] = "0"
+    env.pop("W3COS_NO_STRIP", None)
+    env.pop("W3COS_AOT_WINDOW", None)
+    flags = []
+    if settings.get("target_cpu"):
+        flags.append(f"-Ctarget-cpu={settings['target_cpu']}")
+    if rustflags:
+        flags.append(rustflags)
+    if flags:
+        env["RUSTFLAGS"] = " ".join(flags)
+    else:
+        env.pop("RUSTFLAGS", None)
+    return env
+
+
+def compile_native(repo, cli, jobs, build_root, settings, binary, target_dir, fixture, rustflags=None):
     build_root.mkdir(parents=True, exist_ok=True)
-    binary = build_root / "w3cos-native-browser-bench"
-    env = os.environ.copy()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    env = apply_profile_env(os.environ.copy(), settings, rustflags)
     env["CARGO_BUILD_JOBS"] = str(jobs)
     env["TMPDIR"] = str(build_root)
-    env["CARGO_TARGET_DIR"] = str(repo / "target")
-    env["CARGO_PROFILE_RELEASE_LTO"] = "off"
-    env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "16"
-    env["CARGO_PROFILE_RELEASE_OPT_LEVEL"] = "3"
-    env["W3COS_RUNTIME_FEATURES"] = "cpu-render"
-    env["W3COS_RELEASE_PROFILE"] = "speed"
-    env["W3COS_NO_STRIP"] = "1"
-    env.pop("W3COS_AOT_WINDOW", None)
-    fixture = repo / "tools" / "perf-native-browser" / "workloads.ts"
+    env["CARGO_TARGET_DIR"] = str(target_dir)
     subprocess.check_call(
         [str(cli), "build", str(fixture), "--release", "--output", str(binary)],
         cwd=repo,
         env=env,
     )
     return binary
+
+
+def binary_identity(path):
+    data = Path(path).read_bytes()
+    return {
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def train_pgo(binary, workloads, prof_dir, timeouts):
+    prof_dir.mkdir(parents=True, exist_ok=True)
+    for stale in prof_dir.glob("*.profraw"):
+        stale.unlink()
+    extra = {
+        "W3COS_PERF_SCALE": PGO_TRAIN_SCALE,
+        "W3COS_PERF_SEED": PGO_TRAIN_SEED,
+        "LLVM_PROFILE_FILE": str(prof_dir / "train-%p.profraw"),
+    }
+    for workload in workloads:
+        print(f"== pgo train {workload} scale={PGO_TRAIN_SCALE} seed={PGO_TRAIN_SEED}", flush=True)
+        result = run_native(binary, workload, timeouts[workload] / 1000.0, extra_env=extra)
+        if result.get("status") != "ok":
+            raise SystemExit(f"PGO training failed for {workload}: {result.get('tail') or result}")
+    raw = list(prof_dir.glob("*.profraw"))
+    if not raw:
+        raise SystemExit(f"PGO training produced no .profraw files in {prof_dir}")
+    merged = prof_dir / "merged.profdata"
+    subprocess.check_call([str(llvm_profdata()), "merge", "-o", str(merged), *map(str, raw)])
+    return merged
+
+
+def build_profile(repo, cli, jobs, build_root, name, workloads, timeouts):
+    settings = PROFILE_SETTINGS[name]
+    fixture = repo / "tools" / "perf-native-browser" / "workloads.ts"
+    final_binary = build_root / f"w3cos-bench-{name}"
+    final_target = repo / "target" / f"perf-{name}"
+    pgo = None
+    if settings["pgo"]:
+        instr_binary = build_root / f"w3cos-bench-{name}-instrumented"
+        instr_target = repo / "target" / f"perf-{name}-instrumented"
+        prof_dir = build_root / f"pgo-{name}"
+        print(f"== build {name} instrumented", flush=True)
+        compile_native(
+            repo,
+            cli,
+            jobs,
+            build_root,
+            settings,
+            instr_binary,
+            instr_target,
+            fixture,
+            rustflags=f"-Cprofile-generate={prof_dir}",
+        )
+        merged = train_pgo(instr_binary, workloads, prof_dir, timeouts)
+        print(f"== build {name} profile-use", flush=True)
+        compile_native(
+            repo,
+            cli,
+            jobs,
+            build_root,
+            settings,
+            final_binary,
+            final_target,
+            fixture,
+            rustflags=f"-Cprofile-use={merged}",
+        )
+        pgo = {
+            "merged_profdata": str(merged),
+            "profdata_bytes": merged.stat().st_size,
+            "training_scale": PGO_TRAIN_SCALE,
+            "training_seed": PGO_TRAIN_SEED,
+            "instrumented": binary_identity(instr_binary),
+        }
+    else:
+        print(f"== build {name}", flush=True)
+        compile_native(repo, cli, jobs, build_root, settings, final_binary, final_target, fixture)
+    identity = binary_identity(final_binary)
+    identity.update({
+        "profile": name,
+        "settings": settings,
+        "pgo": pgo,
+        "stripped": True,
+    })
+    return final_binary, identity
 
 
 def parse_result_line(text):
@@ -286,7 +461,7 @@ def parse_result_line(text):
         return None
 
 
-def run_native(binary, workload, timeout):
+def run_native(binary, workload, timeout, extra_env=None):
     env = os.environ.copy()
     env["W3COS_JS_CONSOLE"] = "1"
     env["W3COS_HEADLESS_PUMP"] = "1"
@@ -294,6 +469,10 @@ def run_native(binary, workload, timeout):
     env["W3COS_VIEWPORT_W"] = str(VIEWPORT["width"])
     env["W3COS_VIEWPORT_H"] = str(VIEWPORT["height"])
     env.pop("W3COS_AOT_WINDOW", None)
+    env.pop("W3COS_PERF_SCALE", None)
+    env.pop("W3COS_PERF_SEED", None)
+    if extra_env:
+        env.update(extra_env)
     started = time.perf_counter()
     proc = subprocess.Popen(
         [str(binary)],
@@ -605,12 +784,31 @@ def summarize_runs(workload, native_runs, browser_runs):
             [run["peak_rss_kb"] for run in ok_browser if run.get("peak_rss_kb")])
         add("steady_rss_kb", [run["steady_rss_kb"] for run in ok_native if run.get("steady_rss_kb")],
             [run["steady_rss_kb"] for run in ok_browser if run.get("steady_rss_kb")])
+        add(
+            "checksum",
+            [value for run in ok_native if (value := numeric_checksum(run)) is not None],
+            [value for run in ok_browser if (value := numeric_checksum(run)) is not None],
+            lower_is_better=False,
+        )
     return {"agreement": agreement, "rows": rows, "native_runs": native_runs, "browser_runs": browser_runs}
 
 
-def format_stat(stat):
+def numeric_checksum(run):
+    value = checksum_of(run.get("result"))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def format_stat(stat, metric=""):
     if not stat or stat.get("median") is None:
         return "n/a"
+    if "rss" in metric:
+        def mb(value):
+            return value / 1024.0
+        return f"{mb(stat['median']):.1f} MB ({mb(stat['min']):.1f}–{mb(stat['max']):.1f}, n={stat['n']})"
+    if metric == "checksum":
+        return f"{stat['median']:.6g} ({stat['min']:.6g}–{stat['max']:.6g}, n={stat['n']})"
     return f"{stat['median']:.3f} ({stat['min']:.3f}–{stat['max']:.3f}, n={stat['n']})"
 
 
@@ -624,8 +822,35 @@ def format_table(summaries):
             ratio = row["ratio_w3cos_over_chromium"]
             ratio_text = "n/a" if ratio is None else f"{ratio:.3f}"
             lines.append(
-                f"| {row['workload']} | {row['metric']} | {format_stat(row['w3cos'])} | {format_stat(row['chromium'])} | {ratio_text} | {row['comparable']} |"
+                f"| {row['workload']} | {row['metric']} | {format_stat(row['w3cos'], row['metric'])} | {format_stat(row['chromium'], row['metric'])} | {ratio_text} | {row['comparable']} |"
             )
+    return "\n".join(lines)
+
+
+def format_profile_comparison(order, by_profile):
+    """One Chromium column beside every native profile. Noted profiles stay in the table."""
+    if not order:
+        return ""
+    first = by_profile[order[0]]
+    header = ["workload", "metric", *[name for name in order], "Chromium", "comparable"]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---", "---", *["---:" for _ in order], "---:", "---"]) + " |",
+    ]
+    for index, summary in enumerate(first):
+        metrics = [row["metric"] for row in summary["rows"]]
+        for metric in metrics:
+            workload = summary["rows"][0]["workload"]
+            cells = [workload, metric]
+            chromium = "n/a"
+            comparable = True
+            for name in order:
+                row = next(item for item in by_profile[name][index]["rows"] if item["metric"] == metric)
+                cells.append(format_stat(row["w3cos"], metric))
+                chromium = format_stat(row["chromium"], metric)
+                comparable = comparable and row["comparable"]
+            cells.extend([chromium, str(comparable)])
+            lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -638,6 +863,25 @@ def self_check():
     assert numbers_close(1.0, 1.01, rel=0.02, abs_tol=0)
     assert not numbers_close(1.0, 2.0, rel=0.02, abs_tol=0)
     assert set(TIMEOUTS_MS) == set(WORKLOADS)
+    assert set(PRIMARY_PROFILES) <= set(PROFILE_SETTINGS)
+    assert PROFILE_SETTINGS["size"]["opt_level"] == "z"
+    assert PROFILE_SETTINGS["size"]["lto"] == "fat"
+    assert PROFILE_SETTINGS["speed"]["lto"] == "off"
+    assert PROFILE_SETTINGS["speed"]["codegen_units"] == "16"
+    assert PROFILE_SETTINGS["max"]["lto"] == "fat"
+    assert PROFILE_SETTINGS["max"]["pgo"] is True
+    assert PROFILE_SETTINGS["speed-native"]["noted_only"] is True
+    assert PROFILE_SETTINGS["speed-native"]["target_cpu"] == "native"
+    env = apply_profile_env({}, PROFILE_SETTINGS["max"], rustflags="-Cprofile-use=/tmp/merged.profdata")
+    assert env["CARGO_PROFILE_RELEASE_PANIC"] == "unwind"
+    assert env["CARGO_PROFILE_RELEASE_OPT_LEVEL"] == "3"
+    assert "target-cpu" not in env["RUSTFLAGS"]
+    assert "-Cprofile-use=" in env["RUSTFLAGS"]
+    native_env = apply_profile_env({}, PROFILE_SETTINGS["speed-native"])
+    assert native_env["RUSTFLAGS"] == "-Ctarget-cpu=native"
+    assert "W3COS_NO_STRIP" not in env
+    fake = spread([1.0, 2.0, 3.0])
+    assert format_stat(fake, "steady_rss_kb").startswith("0.0 MB")
     print("self-check ok")
 
 
@@ -646,6 +890,12 @@ def main():
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--jobs", type=int, default=int(os.environ.get("CARGO_BUILD_JOBS", "2")))
     parser.add_argument("--workloads", default=",".join(WORKLOADS))
+    parser.add_argument("--profiles", default=",".join(PRIMARY_PROFILES))
+    parser.add_argument(
+        "--target-cpu-native",
+        action="store_true",
+        help="Add a speed profile built with -Ctarget-cpu=native. Reported as its own column, not as a shipped profile.",
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--native-binary", type=Path)
     parser.add_argument("--build-root", type=Path, default=Path("/tmp/w3cos-native-browser-build"))
@@ -662,43 +912,75 @@ def main():
     unknown = [item for item in workloads if item not in WORKLOADS]
     if unknown:
         raise SystemExit(f"unknown workloads: {unknown}")
+    profiles = [item.strip() for item in args.profiles.split(",") if item.strip()]
+    if args.target_cpu_native and "speed-native" not in profiles:
+        profiles.append("speed-native")
+    unknown_profiles = [item for item in profiles if item not in PROFILE_SETTINGS]
+    if unknown_profiles:
+        raise SystemExit(f"unknown profiles: {unknown_profiles}")
+    if args.native_binary and len(profiles) != 1:
+        raise SystemExit("--native-binary requires exactly one --profiles value")
     repo = args.repo_root.resolve()
     source = (repo / "tools" / "perf-native-browser" / "workloads.ts").read_text()
+    timeouts = TIMEOUTS_MS
+    binaries = {}
+    identities = {}
     if args.native_binary:
-        binary = args.native_binary
+        binaries[profiles[0]] = args.native_binary
+        identities[profiles[0]] = binary_identity(args.native_binary)
     elif args.skip_build:
-        binary = args.build_root / "w3cos-native-browser-bench"
+        for name in profiles:
+            path = args.build_root / f"w3cos-bench-{name}"
+            if not path.is_file():
+                raise SystemExit(f"missing built binary {path}")
+            binaries[name] = path
+            identities[name] = binary_identity(path)
     else:
         cli = build_cli(repo, args.jobs)
-        binary = build_native(repo, cli, args.jobs, args.build_root)
+        for name in profiles:
+            binaries[name], identities[name] = build_profile(
+                repo, cli, args.jobs, args.build_root, name, workloads, timeouts
+            )
     info = host_info(repo)
+    info["profiles"] = identities
     from playwright.sync_api import sync_playwright
     server = WorkloadServer(source)
     server.start()
-    timeouts = TIMEOUTS_MS
-    summaries = []
+    by_profile = {name: [] for name in profiles}
     try:
         with sync_playwright() as playwright:
             for workload in workloads:
-                native_runs = []
+                native_runs = {name: [] for name in profiles}
                 browser_runs = []
                 for index in range(args.runs):
-                    print(f"== {workload} run {index + 1}/{args.runs} native", flush=True)
-                    native_runs.append(run_native(binary, workload, timeouts[workload] / 1000.0))
+                    for name in profiles:
+                        print(f"== {workload} run {index + 1}/{args.runs} {name}", flush=True)
+                        native_runs[name].append(
+                            run_native(binaries[name], workload, timeouts[workload] / 1000.0)
+                        )
                     print(f"== {workload} run {index + 1}/{args.runs} chromium", flush=True)
                     try:
                         browser_runs.append(run_browser(playwright, server, workload, timeouts[workload]))
                     except Exception as error:
                         browser_runs.append({"status": "error", "error": str(error)})
-                summaries.append(summarize_runs(workload, native_runs, browser_runs))
-                print(format_table([summaries[-1]]), flush=True)
+                for name in profiles:
+                    by_profile[name].append(summarize_runs(workload, native_runs[name], browser_runs))
+                print(format_profile_comparison(profiles, {name: by_profile[name][-1:] for name in profiles}), flush=True)
     finally:
         server.close()
-    payload = {"host": info, "runs": args.runs, "source_sha256": __import__("hashlib").sha256(source.encode()).hexdigest(), "summaries": summaries}
+    payload = {
+        "host": info,
+        "runs": args.runs,
+        "profiles": profiles,
+        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "summaries": by_profile,
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
-    table = format_table(summaries)
+    table = format_profile_comparison(profiles, by_profile)
     print(table)
+    for name, identity in identities.items():
+        print(f"binary {name}: {identity['bytes']} bytes sha256={identity['sha256']}")
     print(f"wrote {args.output}")
     return 0
 
