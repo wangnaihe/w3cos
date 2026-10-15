@@ -278,3 +278,7 @@ handoff-l2-still-off = L2 在这台设备上仍然关闭。要做的话在这里
 handoff-open = 打开文件
 handoff-opened = 已打开文件。草稿还在，需要的话在这里重新提议。
 handoff-incoming = 另一台想把文件交过来。
+ime-mode-pinyin = 拼
+ime-mode-direct = EN
+ime-preedit = { $spelling }
+ime-candidate = { $n } { $text }

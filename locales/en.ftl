@@ -279,3 +279,7 @@ handoff-l2-still-off = L2 stays off on this device. Propose again here if you wa
 handoff-open = Open file
 handoff-opened = Opened the file. The draft is still here if you want to propose it again.
 handoff-incoming = Another device wants to hand off a file.
+ime-mode-pinyin = 拼
+ime-mode-direct = EN
+ime-preedit = { $spelling }
+ime-candidate = { $n } { $text }

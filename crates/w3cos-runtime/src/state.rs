@@ -254,12 +254,28 @@ pub fn note_shell_viewport(width: f32, height: f32) -> bool {
     true
 }
 
+/// Focused text field the shell IME may edit. The runtime notes it before
+/// forwarding a key. `role` is the `--w3cos-ime` marker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImeFieldNote {
+    pub index: usize,
+    pub value: String,
+    pub role: String,
+    pub secure: bool,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 thread_local! {
     static POINTER_COARSE: Cell<Option<bool>> = const { Cell::new(None) };
     static PRESS_ORIGIN: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
     static SWIPE_HOOK: Cell<Option<fn(f32, f32, f32, f32) -> bool>> = const { Cell::new(None) };
     static KEY_HOOK: Cell<Option<fn(&str) -> bool>> = const { Cell::new(None) };
     static FOCUS_PLACEHOLDER: RefCell<Option<String>> = const { RefCell::new(None) };
+    static IME_FIELD: RefCell<Option<ImeFieldNote>> = const { RefCell::new(None) };
+    static IME_REPLACEMENTS: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `W3COS_POINTER=coarse` or `fine` overrides the last pointer sample.
@@ -311,6 +327,29 @@ pub fn set_shell_key_hook(hook: fn(&str) -> bool) {
 
 pub fn shell_key(name: &str) -> bool {
     KEY_HOOK.with(|slot| slot.get().is_some_and(|hook| hook(name)))
+}
+
+pub fn note_ime_field(note: ImeFieldNote) {
+    IME_FIELD.with(|slot| *slot.borrow_mut() = Some(note));
+}
+
+pub fn current_ime_field() -> Option<ImeFieldNote> {
+    IME_FIELD.with(|slot| slot.borrow().clone())
+}
+
+pub fn clear_ime_field() {
+    IME_FIELD.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Queue a full replacement for a text-input flat index. The window applies
+/// every queued edit after the shell key hook or a candidate click.
+pub fn queue_ime_replacement(index: usize, text: impl Into<String>) {
+    let text = text.into();
+    IME_REPLACEMENTS.with(|slot| slot.borrow_mut().push((index, text)));
+}
+
+pub fn take_ime_replacements() -> Vec<(usize, String)> {
+    IME_REPLACEMENTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 pub fn request_focus_placeholder(placeholder: &str) {

@@ -11,6 +11,7 @@ mod agent_host;
 mod gesture;
 mod handoff;
 mod hpke;
+mod ime_bar;
 mod locale;
 mod windows;
 
@@ -142,6 +143,16 @@ const OP_SYNC_RECEIPTS: u8 = 73;
 const OP_SYNC_DRAFTS: u8 = 74;
 const OP_RECEIPT_QUERY: u8 = 75;
 const OP_SYNC_CLIPBOARD: u8 = 76;
+const OP_IME_1: u8 = 77;
+const OP_IME_2: u8 = 78;
+const OP_IME_3: u8 = 79;
+const OP_IME_4: u8 = 80;
+const OP_IME_5: u8 = 81;
+const OP_IME_6: u8 = 82;
+const OP_IME_7: u8 = 83;
+const OP_IME_8: u8 = 84;
+const OP_IME_9: u8 = 85;
+const OP_IME_MODE: u8 = 86;
 
 fn main() {
     shell_main();
@@ -302,11 +313,41 @@ fn boot_session_once() {
     });
 }
 
+fn ime_role_for_submit(code: u8) -> Option<&'static str> {
+    match code {
+        OP_PROPOSE => Some("intent"),
+        OP_RUN_TERMINAL => Some("terminal"),
+        OP_LAUNCHER_SEARCH => Some("launcher"),
+        OP_RECEIPT_QUERY => Some("text"),
+        _ => None,
+    }
+}
+
+fn apply_ime_field() {
+    for update in ime_bar::take_field_updates() {
+        match update.role.as_str() {
+            "intent" => state::set_text_signal(DRAFT_SIGNAL, update.text),
+            "terminal" => state::set_text_signal(TERMINAL_SIGNAL, update.text),
+            "launcher" => state::set_text_signal(LAUNCHER_QUERY_SIGNAL, update.text),
+            "text" => state::set_text_signal(RECEIPT_QUERY_SIGNAL, update.text),
+            _ => {}
+        }
+    }
+}
+
 fn on_shell_intent(code: u8, draft: &str) {
     if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
         eprintln!("[W3C OS][INTENT] code={code} draft={draft:?}");
     }
     ensure_shell_signals();
+    let mut draft_owned = draft.to_string();
+    if let Some(role) = ime_role_for_submit(code)
+        && let Some(text) = ime_bar::commit_active(role)
+    {
+        apply_ime_field();
+        draft_owned = text;
+    }
+    let draft = draft_owned.as_str();
     if code == OP_TOGGLE_TASKS {
         let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);
         state::set_signal(TASKS_SIGNAL, next);
@@ -932,6 +973,10 @@ fn ensure_clock_timer() {
 
 fn on_shell_key(name: &str) -> bool {
     ensure_shell_signals();
+    if ime_bar::on_key(name) {
+        apply_ime_field();
+        return true;
+    }
     match name {
         "Escape" => dismiss_top_layer(),
         "Mod+K" => {
@@ -1245,6 +1290,15 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::mark_dirty();
         }
         OP_SCRIM => {}
+        OP_IME_1 | OP_IME_2 | OP_IME_3 | OP_IME_4 | OP_IME_5 | OP_IME_6 | OP_IME_7 | OP_IME_8
+        | OP_IME_9 => {
+            ime_bar::commit_candidate((code - OP_IME_1) as usize);
+            apply_ime_field();
+        }
+        OP_IME_MODE => {
+            ime_bar::toggle_mode();
+            apply_ime_field();
+        }
         _ => return false,
     }
     true
@@ -1434,6 +1488,9 @@ fn build_shell() -> Component {
     let toast = state::get_signal_text(TOAST_SIGNAL);
     if !toast.is_empty() && state::get_signal(NOTIFY_SIGNAL) == 0 {
         column.push(chrome_layer(build_toast(&toast)));
+    }
+    if let Some(bar) = ime_bar::candidate_layer() {
+        column.push(bar);
     }
     if !unlocked {
         column.push(place_overlay(build_lock_screen()));
@@ -2032,10 +2089,10 @@ fn build_intent_panel() -> Component {
         min_height: Dimension::Px(go),
         ..Style::default()
     };
-    input_style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_PROPOSE.to_string(),
-    )]));
+    input_style.custom_properties = Some(HashMap::from([
+        ("--w3cos-intent-submit".to_string(), OP_PROPOSE.to_string()),
+        ("--w3cos-ime".to_string(), "intent".to_string()),
+    ]));
     let mut go_button = glyph_face(
         "arrow",
         locale::t("propose"),
@@ -2771,10 +2828,10 @@ fn build_lock_screen() -> Component {
         padding: Edges::xy(12.0, 10.0),
         ..Style::default()
     };
-    field_style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_UNLOCK.to_string(),
-    )]));
+    field_style.custom_properties = Some(HashMap::from([
+        ("--w3cos-intent-submit".to_string(), OP_UNLOCK.to_string()),
+        ("--w3cos-ime".to_string(), "secure".to_string()),
+    ]));
     let passphrase = Component::secure_text_input(
         state::get_signal_text(LOCK_PASSPHRASE_SIGNAL),
         locale::t("lock-passphrase"),
@@ -3567,17 +3624,24 @@ fn build_terminal_app() -> Component {
                                     ..Style::default()
                                 },
                             ),
-                            Component::text_input(
-                                state::get_signal_text(TERMINAL_SIGNAL),
-                                "help",
-                                Style {
+                            {
+                                let mut term_style = Style {
                                     font_size: 14.0,
                                     color: Color::from_hex("#f4f7fb"),
                                     background: Color::from_hex("#1b2c3e"),
                                     flex_grow: 1.0,
                                     ..Style::default()
-                                },
-                            ),
+                                };
+                                term_style.custom_properties = Some(HashMap::from([(
+                                    "--w3cos-ime".to_string(),
+                                    "terminal".to_string(),
+                                )]));
+                                Component::text_input(
+                                    state::get_signal_text(TERMINAL_SIGNAL),
+                                    "help",
+                                    term_style,
+                                )
+                            },
                             chrome_button(locale::t("terminal-run"), OP_RUN_TERMINAL, "#1c8f62"),
                         ],
                     ),
@@ -5249,10 +5313,13 @@ fn build_launcher() -> Component {
         padding: Edges::xy(12.0, 8.0),
         ..Style::default()
     };
-    search_style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_LAUNCHER_SEARCH.to_string(),
-    )]));
+    search_style.custom_properties = Some(HashMap::from([
+        (
+            "--w3cos-intent-submit".to_string(),
+            OP_LAUNCHER_SEARCH.to_string(),
+        ),
+        ("--w3cos-ime".to_string(), "launcher".to_string()),
+    ]));
     let needle = query.trim().to_lowercase();
     let mut tiles = Vec::new();
     for app in LAUNCH_APPS {
@@ -5472,10 +5539,13 @@ fn receipt_query_field() -> Component {
         }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_RECEIPT_QUERY.to_string(),
-    )]));
+    style.custom_properties = Some(HashMap::from([
+        (
+            "--w3cos-intent-submit".to_string(),
+            OP_RECEIPT_QUERY.to_string(),
+        ),
+        ("--w3cos-ime".to_string(), "text".to_string()),
+    ]));
     Component::text_input(
         state::get_signal_text(RECEIPT_QUERY_SIGNAL),
         locale::t("receipt-query"),
@@ -6106,5 +6176,39 @@ mod shell_ux_tests {
         assert_eq!(grants, 1, "{texts:?}");
         assert!(texts.iter().any(|text| text.contains("终端已就绪")));
         locale::set_locale("en");
+    }
+
+    fn ime_role(root: &Component, role: &str) -> bool {
+        let mut found = false;
+        walk(root, &mut |node| {
+            let marked =
+                node.style.custom_properties.as_ref().is_some_and(|props| {
+                    props.get("--w3cos-ime").is_some_and(|value| value == role)
+                });
+            if marked {
+                found = true;
+            }
+        });
+        found
+    }
+
+    #[test]
+    fn text_fields_declare_an_ime_role() {
+        ensure_shell_signals();
+        assert!(ime_role(&build_intent_panel(), "intent"));
+        assert!(ime_role(&build_terminal_app(), "terminal"));
+        assert!(ime_role(&build_launcher(), "launcher"));
+        assert!(ime_role(&build_lock_screen(), "secure"));
+        assert!(ime_role(&receipt_query_field(), "text"));
+        let lock = build_lock_screen();
+        let mut secure = false;
+        walk(&lock, &mut |node| {
+            if let ComponentKind::TextInput { secure: hidden, .. } = &node.kind
+                && *hidden
+            {
+                secure = true;
+            }
+        });
+        assert!(secure);
     }
 }
