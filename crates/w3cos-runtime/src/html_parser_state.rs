@@ -77,6 +77,9 @@ pub struct StreamingDocumentParser {
     pub(crate) paused: bool,
     pub(crate) eof_received: bool,
     pub(crate) complete: bool,
+    /// Transport charset and a BOM are confident. The windows-1252 HTML
+    /// default stays tentative so a parser-seen meta charset can replace it.
+    pub(crate) encoding_certain: bool,
 }
 
 struct ParserInsertionGuard;

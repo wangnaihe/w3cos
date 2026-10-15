@@ -801,6 +801,12 @@ impl NavigationDocumentParser {
             Self::Xml(parser) => parser.is_blocked(),
         }
     }
+
+    fn note_confident_document_encoding(&mut self) {
+        if let Self::Html(parser) = self {
+            parser.note_confident_document_encoding();
+        }
+    }
 }
 
 pub struct DocumentLoader {
@@ -1118,6 +1124,13 @@ impl DocumentLoader {
                 &crate::jsdom::document_value(),
                 decoder.encoding_name(),
             );
+            // A BOM or Content-Type charset is confident and must survive a
+            // later `<meta charset>`. The windows-1252 default stays tentative.
+            if content_type_charset(&self.content_type).is_some() || bom_bytes > 0 {
+                if let Some(parser) = self.parser.as_mut() {
+                    parser.note_confident_document_encoding();
+                }
+            }
             self.decoder = Some(decoder);
             decoded
         };
@@ -9200,6 +9213,7 @@ pub(crate) fn notify_node_inserted(node: u32) {
         // or link is observable before any script post-insertion step runs.
         loader.prepare_pending_stylesheets(&document_url);
     }
+    let mut ran_dynamic_inline_classic = false;
     if (has_scripts || !frames.is_empty() || !default_style_metas.is_empty())
         && let Some((loader, document_url)) =
             ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
@@ -9219,15 +9233,37 @@ pub(crate) fn notify_node_inserted(node: u32) {
             {
                 loader.apply_default_style_meta(inserted_node);
             } else if tag.eq_ignore_ascii_case("script") {
-                // Dynamically inserted classic scripts prepare synchronously.
-                // Inline sources run before the DOM insertion method returns;
-                // external sources only start their fetch here.
-                let _ = loader
-                    .execute_pending_document_scripts_for_node(&document_url, Some(inserted_node));
+                // Inline modules stay unprepared here. `execute_pending`
+                // counts them, and evaluation waits for microtask settlement
+                // so removing the element before that checkpoint cancels it.
+                if script_node_is_module(inserted_node) {
+                    continue;
+                }
+                // Classic scripts prepare synchronously. Inline sources run
+                // before the DOM insertion method returns; external sources
+                // only start their fetch here.
+                let inline = crate::dom::get_attribute(inserted_node, "src")
+                    .is_none_or(|src| src.trim().is_empty());
+                let prepared = loader
+                    .execute_pending_document_scripts_for_node(&document_url, Some(inserted_node))
+                    .unwrap_or(0);
+                if inline && prepared > 0 {
+                    ran_dynamic_inline_classic = true;
+                }
             }
         }
     }
-    schedule_document_script_pump();
+    if ran_dynamic_inline_classic {
+        // The insertion record is already queued. Checkpoint after the
+        // classic script returns so the mutations it made share that delivery.
+        // Queue the document-script pump only after this checkpoint, and only
+        // for a connected root: a detached fragment must not leave a pump
+        // that would run a later sibling before its own post-insertion step.
+        crate::jsdom::drain_microtasks();
+    }
+    if crate::dom::is_connected(node) {
+        schedule_document_script_pump();
+    }
 }
 
 pub(crate) fn prepare_inserted_stylesheets(nodes: &[u32]) {
@@ -9498,6 +9534,11 @@ pub(crate) fn notify_node_removed(node: u32) {
         loader.invalidate_image_nodes(&images, true);
         loader.invalidate_frame_nodes(&frames);
     }
+}
+
+fn script_node_is_module(node: u32) -> bool {
+    crate::dom::get_attribute(node, "type")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("module"))
 }
 
 fn collect_script_nodes(node: u32, scripts: &mut HashSet<u32>) {
