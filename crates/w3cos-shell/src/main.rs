@@ -428,13 +428,33 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
         }
         OP_LOCK => {
+            let keep_card = state::get_signal(PHASE_SIGNAL) == 1;
+            let summary = state::get_signal_text(SUMMARY_SIGNAL);
+            let impact = state::get_signal_text(IMPACT_SIGNAL);
+            let tier = state::get_signal_text(TIER_SIGNAL);
+            let planning =
+                state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending();
             session.lock_identity();
             lexicon::lock();
-            sync_session(
-                session,
-                state::get_signal(PHASE_SIGNAL),
-                &locale::t("toast-identity-locked"),
-            );
+            if planning {
+                let update = agent_host::cancel();
+                apply_host_update(session, update);
+            }
+            if session.proposal().is_some() {
+                session.cancel();
+            }
+            if keep_card {
+                state::set_text_signal(SUMMARY_SIGNAL, &summary);
+                state::set_text_signal(IMPACT_SIGNAL, &impact);
+                state::set_text_signal(TIER_SIGNAL, &tier);
+                sync_session(session, 1, &locale::t("toast-identity-locked"));
+            } else {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("toast-identity-locked"),
+                );
+            }
         }
         OP_UNLOCK => {
             let passphrase = draft.trim();
@@ -548,6 +568,14 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
 }
 
 fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("locked-hint"),
+        );
+        return;
+    }
     if w3cos_ai_bridge::agent_loop::has_pending() {
         confirm_agent_step(session);
         return;
@@ -1927,6 +1955,9 @@ fn glyph_svg(name: &str, stroke: &str) -> String {
         "lock" => {
             r#"<rect x="6" y="10.5" width="12" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>"#
         }
+        "lock-open" => {
+            r#"<rect x="6" y="10.5" width="12" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 6.4-1.9"/>"#
+        }
         "bell" => {
             r#"<path d="M6 16.5h12l-1.2-2V10.2a4.8 4.8 0 0 0-9.6 0v4.3L6 16.5Z"/><path d="M10 16.5a2 2 0 0 0 4 0"/>"#
         }
@@ -2515,13 +2546,13 @@ fn build_floating_taskbar() -> Component {
     }
     let mut tray = vec![
         dock_icon(
-            "lock",
+            if unlocked { "lock-open" } else { "lock" },
             if unlocked {
-                locale::t("lock")
+                locale::t("unlocked")
             } else {
-                locale::t("unlock")
+                locale::t("locked")
             },
-            if unlocked { OP_LOCK } else { OP_UNLOCK },
+            OP_LOCK,
             Color::TRANSPARENT,
             false,
         ),
@@ -2637,15 +2668,20 @@ fn floating_taskbar() -> Component {
 }
 
 fn build_phone_home() -> Component {
-    let mut status_right = vec![Component::svg_document(
-        glyph_svg("lock", "#f4f1ea"),
-        24,
-        24,
-        Style {
-            width: Dimension::Px(14.0),
-            height: Dimension::Px(14.0),
-            ..Style::default()
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let mut status_right = vec![glyph_face(
+        if unlocked { "lock-open" } else { "lock" },
+        if unlocked {
+            locale::t("unlocked")
+        } else {
+            locale::t("locked")
         },
+        OP_LOCK,
+        Color::TRANSPARENT,
+        "#f4f1ea",
+        28.0,
+        8.0,
+        false,
     )];
     if let Some(battery) = live_battery() {
         status_right.push(Component::text(
@@ -4766,12 +4802,6 @@ fn settings_identity_page() -> Vec<Component> {
     } else {
         subject_owned
     };
-    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
-    let enroll_label = if enroll_owned.is_empty() {
-        locale::t("enroll-fallback")
-    } else {
-        enroll_owned
-    };
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut rows = settings_heading(
         &locale::t("settings-identity-title"),
@@ -4779,15 +4809,16 @@ fn settings_identity_page() -> Vec<Component> {
     );
     rows.push(settings_row(&locale::t("settings-subject"), &subject_label));
     rows.push(Component::text(
-        enroll_label,
+        locale::t("passkey-unregistered"),
         Style {
-            font_size: 13.0,
-            color: Color::from_hex("#d5dee8"),
+            font_size: 14.0,
+            font_weight: 650,
+            color: Color::from_hex("#ffe08a"),
             ..Style::default()
         },
     ));
     rows.push(chrome_button(
-        locale::t("enroll-challenge"),
+        locale::t("passkey-enroll"),
         OP_ENROLL,
         "#3d5570",
     ));
@@ -4801,15 +4832,9 @@ fn settings_identity_page() -> Vec<Component> {
         locale::t("locked")
     };
     rows.push(settings_row(&locale::t("settings-status"), &status));
-    rows.push(chrome_button(
-        if unlocked {
-            locale::t("lock")
-        } else {
-            locale::t("unlock")
-        },
-        if unlocked { OP_LOCK } else { OP_UNLOCK },
-        if unlocked { "#3d5570" } else { "#9a3412" },
-    ));
+    if unlocked {
+        rows.push(chrome_button(locale::t("lock"), OP_LOCK, "#3d5570"));
+    }
     rows.push(settings_row(&locale::t("settings-storage"), &storage_label));
     rows.push(chrome_button(
         locale::t("open-ledger"),
@@ -4976,9 +5001,9 @@ fn build_task_center() -> Component {
                 };
                 {
                     let state_label = if unlocked {
-                        locale::t("state-stub-unlocked")
+                        locale::t("unlocked")
                     } else {
-                        locale::t("state-locked")
+                        locale::t("locked")
                     };
                     locale::t_args(
                         "identity-line",
@@ -5004,15 +5029,9 @@ fn build_task_center() -> Component {
             },
         ));
     }
-    body.push(chrome_button(
-        if unlocked {
-            locale::t("lock")
-        } else {
-            locale::t("unlock-to-run")
-        },
-        if unlocked { OP_LOCK } else { OP_UNLOCK },
-        if unlocked { "#3d5570" } else { "#9a3412" },
-    ));
+    if unlocked {
+        body.push(chrome_button(locale::t("lock"), OP_LOCK, "#3d5570"));
+    }
     let steps = state::get_signal_text(STEPS_SIGNAL);
     if !steps.is_empty() {
         body.push(Component::text(
@@ -7674,5 +7693,279 @@ mod shell_ux_tests {
         );
         locale::set_locale("en");
         state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    fn invoke_code(node: &Component) -> Option<u8> {
+        match &node.on_click {
+            EventAction::Invoke { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    fn codes_for(root: &Component, label: &str) -> Vec<u8> {
+        let mut codes = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label: button } = &node.kind
+                && button == label
+                && let Some(code) = invoke_code(node)
+            {
+                codes.push(code);
+            }
+        });
+        codes
+    }
+
+    #[test]
+    fn lock_screen_covers_the_shell_and_the_open_lock_locks() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkhaXgExampleSubjectValue");
+        let screen = build_lock_screen();
+        let blob = text_blob(&screen);
+        assert!(blob.contains("已锁定"), "{blob}");
+        assert!(
+            blob.contains("没有账号，也不走链。钥匙留在这台设备上。"),
+            "{blob}"
+        );
+        assert!(blob.contains("用本机口令解锁"), "{blob}");
+        assert!(
+            blob.contains("解锁只影响这台设备。口令经 PBKDF2 校验后留在本机。"),
+            "{blob}"
+        );
+        assert!(blob.contains('…'), "subject should be truncated: {blob}");
+        assert!(
+            !blob.contains("did:key:z6MkhaXgExampleSubjectValue"),
+            "{blob}"
+        );
+        let mut placeholder = String::new();
+        walk(&screen, &mut |node| {
+            if let ComponentKind::TextInput {
+                placeholder: hint,
+                secure,
+                ..
+            } = &node.kind
+            {
+                assert!(*secure);
+                placeholder = hint.clone();
+            }
+        });
+        assert_eq!(placeholder, "本机口令");
+        assert_eq!(codes_for(&screen, "用本机口令解锁"), vec![OP_UNLOCK]);
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{screen:?}").contains(hex), "{hex}");
+        }
+
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let bar = build_floating_taskbar();
+        let icons = icon_buttons(&bar);
+        let open = icons
+            .iter()
+            .find(|icon| icon.label == "已解锁")
+            .expect("unlocked tray control");
+        assert!(
+            open.svg.contains("6.4-1.9"),
+            "tray should show an open lock: {}",
+            open.svg
+        );
+        assert_eq!(codes_for(&bar, "已解锁"), vec![OP_LOCK]);
+        assert!(icons.iter().all(|icon| icon.label != "解锁"));
+        assert!(!text_blob(&bar).contains("占位已解锁"));
+
+        state::note_shell_viewport(390.0, 760.0);
+        let phone = build_phone_home();
+        assert!(
+            icon_buttons(&phone)
+                .iter()
+                .any(|icon| icon.label == "已解锁" && icon.svg.contains("6.4-1.9"))
+        );
+        assert_eq!(codes_for(&phone, "已解锁"), vec![OP_LOCK]);
+
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        let locked_bar = build_floating_taskbar();
+        assert_eq!(codes_for(&locked_bar, "已锁定"), vec![OP_LOCK]);
+        assert!(codes_for(&locked_bar, "解锁").is_empty());
+
+        let identity = Component::column(Style::default(), settings_identity_page());
+        let identity_blob = text_blob(&identity);
+        assert!(
+            identity_blob.contains("通行证：尚未注册"),
+            "{identity_blob}"
+        );
+        assert!(identity_blob.contains("注册本机通行证"), "{identity_blob}");
+        assert!(identity_blob.contains("还不是 passkey"), "{identity_blob}");
+        assert!(
+            !identity_blob.contains("WebAuthn 仪式还没做"),
+            "{identity_blob}"
+        );
+        assert!(!identity_blob.contains("占位已解锁"), "{identity_blob}");
+        assert_eq!(codes_for(&identity, "注册本机通行证"), vec![OP_ENROLL]);
+        assert!(codes_for(&identity, "解锁").is_empty());
+
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let unlocked_identity = Component::column(Style::default(), settings_identity_page());
+        assert_eq!(codes_for(&unlocked_identity, "锁定"), vec![OP_LOCK]);
+        assert!(text_blob(&unlocked_identity).contains("通行证：尚未注册"));
+        let tasks = text_blob(&build_task_center());
+        assert!(tasks.contains("已解锁"), "{tasks}");
+        assert!(!tasks.contains("占位已解锁"), "{tasks}");
+        assert!(!tasks.contains("解锁才能执行"), "{tasks}");
+
+        let _ = build_shell();
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        let root = build_shell();
+        let mut covered = false;
+        walk(&root, &mut |node| {
+            if node.style.z_index == CHROME_Z + 4
+                && px(node.style.width) == 1200.0
+                && px(node.style.height) == 800.0
+            {
+                covered = true;
+            }
+        });
+        assert!(covered, "lock screen should cover the viewport");
+        assert!(text_blob(&root).contains("已锁定"));
+
+        locale::set_locale("en");
+        assert_eq!(locale::t("passkey-unregistered"), "Passkey: not registered");
+        assert_eq!(locale::t("passkey-enroll"), "Register a device passkey");
+        assert_eq!(
+            locale::t("lock-body"),
+            "No account and no chain. The key stays on this device."
+        );
+        assert_eq!(
+            locale::t("lock-footnote"),
+            "Unlock only affects this device. The passphrase is checked with PBKDF2 and stays on this device."
+        );
+        assert_eq!(locale::t("lock-first"), "Unlock first");
+        assert_eq!(locale::t("unlocked"), "Unlocked");
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    struct IsolatedSession {
+        session: Option<IntentSession>,
+        booted: bool,
+        receipt_dir: Option<std::ffi::OsString>,
+        lexicon_path: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for IsolatedSession {
+        fn drop(&mut self) {
+            SESSION.with(|slot| {
+                *slot.borrow_mut() = self.session.take();
+            });
+            let booted = self.booted;
+            SESSION_BOOTED.with(|flag| flag.set(booted));
+            restore_env("W3COS_RECEIPT_DIR", self.receipt_dir.take());
+            restore_env("W3COS_LEXICON_PATH", self.lexicon_path.take());
+            let _ = std::fs::remove_dir_all(&self.dir);
+            lexicon::lock();
+        }
+    }
+
+    fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn passphrase_refuses_empty_and_wrong_and_lock_blocks_confirm() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+
+        on_shell_intent(OP_UNLOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        assert!(
+            state::get_signal_text(TOAST_SIGNAL).contains("口令为空或不匹配"),
+            "{}",
+            state::get_signal_text(TOAST_SIGNAL)
+        );
+        on_shell_intent(OP_UNLOCK, "   ");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+        on_shell_intent(OP_LOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "wrong-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        assert!(
+            state::get_signal_text(TOAST_SIGNAL).contains("口令为空或不匹配"),
+            "{}",
+            state::get_signal_text(TOAST_SIGNAL)
+        );
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        on_shell_intent(OP_PROPOSE, "打开文件");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        let app_before = state::get_signal(APP_SIGNAL);
+        let summary = state::get_signal_text(SUMMARY_SIGNAL);
+        assert!(!summary.is_empty(), "confirm card keeps its summary");
+        on_shell_intent(OP_LOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), summary);
+        let dialog = build_confirm_dialog();
+        let labels = button_labels(&dialog);
+        assert!(labels.iter().any(|label| label == "先解锁"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "确认"), "{labels:?}");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), app_before);
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 0);
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(
+            state::get_signal(APP_SIGNAL),
+            app_before,
+            "a voided proposal does not run after unlock"
+        );
+
+        locale::set_locale("en");
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
     }
 }
