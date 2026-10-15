@@ -751,16 +751,16 @@ mod tests {
         let mut parser = StreamingXmlDocumentParser::from_started_navigation(loader, url);
         parser.write("<html xmlns='http://www.w3.org/1999/xhtml'><head></head><body>\n<p>instruction</p>\n<div>SSAP SSAP</div>\n</body></html>").unwrap();
         assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
-        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+        let rules = crate::dynamic_script::parse_inline_style_rules(
             "div { direction: rtl; display: inline; unicode-bidi: bidi-override; }",
             "inline <style>",
         );
-        assert!(stylesheet.rules.iter().any(|rule| {
+        assert!(rules.iter().any(|rule| {
             rule.declarations
                 .iter()
                 .any(|(property, value)| property == "unicode-bidi" && value == "bidi-override")
         }));
-        for rule in stylesheet.rules {
+        for rule in &rules {
             let declarations = rule
                 .declarations
                 .iter()
@@ -886,21 +886,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
-        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+        let rules = crate::dynamic_script::parse_inline_style_rules(
             "div { position: relative; color: red; } span { position: absolute; top: 0; left: 0; } .test:before { content: 'TEST &#x46;&#x41;&#x49;&#x4c;'; }",
             "inline <style>",
         );
         assert!(
-            stylesheet.rules.iter().any(|rule| {
+            rules.iter().any(|rule| {
                 rule.selector == ".test:before"
                     && rule.declarations.iter().any(|(property, value)| {
                         property == "content" && value == "'TEST &#x46;&#x41;&#x49;&#x4c;'"
                     })
             }),
             "compiled CSS must retain the XHTML entity spelling: {:#?}",
-            stylesheet.rules
+            rules
         );
-        for rule in stylesheet.rules {
+        for rule in &rules {
             let declarations = rule
                 .declarations
                 .iter()
@@ -965,12 +965,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
-        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+        let rules = crate::dynamic_script::parse_inline_style_rules(
             ".test div { display: inline; padding: 0 1em 0 0; background: navy; color: navy; }\
              .test div:after { content: '  \\A'; white-space: pre; }",
             "inline <style>",
         );
-        for rule in stylesheet.rules {
+        for rule in &rules {
             let declarations = rule
                 .declarations
                 .iter()
@@ -1059,11 +1059,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
-        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+        let rules = crate::dynamic_script::parse_inline_style_rules(
             "div { display: inline; padding-right: 1em; background: navy; color: navy; }",
             "inline reference <style>",
         );
-        for rule in stylesheet.rules {
+        for rule in &rules {
             let declarations = rule
                 .declarations
                 .iter()

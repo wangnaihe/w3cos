@@ -9659,7 +9659,7 @@ mod tests {
         // fixture, without altering its CSS or switching to an HTML parser.
         for node in crate::dom::get_elements_by_tag_name("style") {
             let css = crate::dom::inner_text(node);
-            for rule in w3cos_compiler::esm_css::parse_css_source(&css, "inline <style>").rules {
+            for rule in crate::dynamic_script::parse_inline_style_rules(&css, "inline <style>") {
                 let declarations: Vec<_> = rule
                     .declarations
                     .iter()

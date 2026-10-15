@@ -29,6 +29,25 @@ use crate::html_parser_state::{
 use crate::html_parser_state::{MATHML_NAMESPACE, SVG_NAMESPACE};
 use crate::xml_tree_builder::StreamingXmlDocumentParser;
 
+/// One CSS rule parsed by the dynamic runtime. Callers outside this module
+/// must not name the compiler crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedStyleRule {
+    pub selector: String,
+    pub declarations: Vec<(String, String)>,
+}
+
+pub(crate) fn parse_inline_style_rules(css: &str, source_url: &str) -> Vec<ParsedStyleRule> {
+    w3cos_compiler::esm_css::parse_css_source(css, source_url)
+        .rules
+        .into_iter()
+        .map(|rule| ParsedStyleRule {
+            selector: rule.selector,
+            declarations: rule.declarations,
+        })
+        .collect()
+}
+
 thread_local! {
     static ACTIVE_DOCUMENT_LOADER: RefCell<Option<(ScriptLoader, String)>> =
         const { RefCell::new(None) };
@@ -1737,11 +1756,7 @@ impl ScriptLoader {
                 (import.local, binding)
             })
             .collect();
-        let result = Vm::new(module, self.inner.policy.limits)
-            .map_err(|error| anyhow!(error.to_string()))?
-            .run_with_cells(bindings)
-            .map_err(|error| anyhow!(error.to_string()))?;
-        Ok(result)
+        self.run_lowered_classic(module, bindings)
     }
 
     fn execute_classic_source_in_realm(
@@ -1773,6 +1788,14 @@ impl ScriptLoader {
                 (import.local, binding)
             })
             .collect();
+        self.run_lowered_classic(module, bindings)
+    }
+
+    fn run_lowered_classic(
+        &self,
+        module: w3cos_ir::Module,
+        bindings: BindingCells,
+    ) -> Result<Value> {
         Vm::new(module, self.inner.policy.limits)
             .map_err(|error| anyhow!(error.to_string()))?
             .run_with_cells(bindings)
