@@ -46,6 +46,14 @@ const TIER_SIGNAL: usize = 14;
 const STEPS_SIGNAL: usize = 15;
 const TERMINAL_SIGNAL: usize = 16;
 const TERM_OUT_SIGNAL: usize = 17;
+const OPEN_MASK_SIGNAL: usize = 18;
+const MINIMIZED_MASK_SIGNAL: usize = 19;
+const LAUNCHER_SIGNAL: usize = 20;
+const LAUNCHER_QUERY_SIGNAL: usize = 21;
+const SETTINGS_TAB_SIGNAL: usize = 22;
+const FILES_FOLDER_SIGNAL: usize = 23;
+const TOAST_SIGNAL: usize = 24;
+const RECEIPTS_OPEN_SIGNAL: usize = 25;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -66,6 +74,34 @@ const OP_SHARED_APP: u8 = 18;
 const OP_SHARED_PAGE: u8 = 19;
 const OP_SHARED_PLUGIN: u8 = 20;
 const OP_RUN_TERMINAL: u8 = 21;
+const OP_MINIMIZE: u8 = 22;
+const OP_CLOSE: u8 = 23;
+const OP_CYCLE: u8 = 24;
+const OP_LAUNCHER: u8 = 25;
+const OP_LAUNCHER_SEARCH: u8 = 26;
+const OP_DISMISS_TOAST: u8 = 27;
+const OP_SETTINGS_LOCAL: u8 = 28;
+const OP_SETTINGS_IDENTITY: u8 = 29;
+const OP_SETTINGS_BRIDGE: u8 = 30;
+const OP_SETTINGS_L2: u8 = 31;
+const OP_L2_TOGGLE: u8 = 32;
+const OP_FILES_HOME: u8 = 33;
+const OP_FILES_DOCS: u8 = 34;
+const OP_FILES_PICS: u8 = 35;
+const OP_FILES_DOWN: u8 = 36;
+const OP_FILES_MUSIC: u8 = 37;
+const OP_FILES_PROJECTS: u8 = 38;
+const OP_FILES_W3COS: u8 = 39;
+const OP_TOGGLE_RECEIPTS: u8 = 40;
+const OP_FOCUS_DESKTOP: u8 = 41;
+const OP_FOCUS_FILES: u8 = 42;
+const OP_FOCUS_TERMINAL: u8 = 43;
+const OP_FOCUS_SETTINGS: u8 = 44;
+const OP_FOCUS_AGENT: u8 = 45;
+const OP_FOCUS_BROWSER: u8 = 46;
+const OP_FOCUS_EDITOR: u8 = 47;
+
+const LAUNCHER_PLACEHOLDER: &str = "搜索应用 Search apps";
 
 fn main() {
     shell_main();
@@ -156,6 +192,14 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
     });
 }
 
@@ -200,6 +244,9 @@ fn on_shell_intent(code: u8, draft: &str) {
     if code == OP_TOGGLE_TASKS {
         let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);
         state::set_signal(TASKS_SIGNAL, next);
+        return;
+    }
+    if handle_chrome_op(code, draft) {
         return;
     }
     let ctx = ShellContext {
@@ -292,6 +339,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
         }
         OP_RUN_TERMINAL => run_terminal_from_button(session),
+        OP_L2_TOGGLE => toggle_l2(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
                 "plugin",
@@ -437,7 +485,7 @@ fn apply_host_update(session: &mut IntentSession, update: agent_host::HostUpdate
     for effect in &update.effects {
         match effect {
             shell_tools::ShellEffect::Navigate(app) => {
-                state::set_signal(APP_SIGNAL, app.signal_value());
+                focus_app(app.signal_value());
             }
             shell_tools::ShellEffect::SetNight(night) => {
                 state::set_signal(NIGHT_SIGNAL, i64::from(*night));
@@ -524,7 +572,7 @@ fn run_terminal_from_button(session: &mut IntentSession) {
 
 fn apply_effect(effect: &ExecuteResult) {
     if let Some(app) = effect.navigate {
-        state::set_signal(APP_SIGNAL, app.signal_value());
+        focus_app(app.signal_value());
     }
     if let Some(night) = effect.night {
         state::set_signal(NIGHT_SIGNAL, i64::from(night));
@@ -536,6 +584,9 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
     state::set_signal(CONTEXT_SIGNAL, i64::from(session.context_shared()));
     state::set_signal(UNLOCKED_SIGNAL, i64::from(session.identity_unlocked()));
     state::set_text_signal(NOTICE_SIGNAL, notice);
+    if !notice.is_empty() {
+        state::set_text_signal(TOAST_SIGNAL, notice);
+    }
     state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(12));
     state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
     state::set_text_signal(SUBJECT_SIGNAL, session.actor());
@@ -556,6 +607,190 @@ fn invoke(code: u8) -> EventAction {
     }
 }
 
+fn app_bit(id: i64) -> i64 {
+    if (1..=6).contains(&id) {
+        1_i64 << id
+    } else {
+        0
+    }
+}
+
+fn focus_code(id: i64) -> u8 {
+    match id {
+        0 => OP_FOCUS_DESKTOP,
+        1 => OP_FOCUS_FILES,
+        2 => OP_FOCUS_TERMINAL,
+        3 => OP_FOCUS_SETTINGS,
+        4 => OP_FOCUS_AGENT,
+        5 => OP_FOCUS_BROWSER,
+        _ => OP_FOCUS_EDITOR,
+    }
+}
+
+fn push_toast(text: &str) {
+    state::set_text_signal(TOAST_SIGNAL, text);
+}
+
+fn focus_app(id: i64) {
+    ensure_shell_signals();
+    let id = id.clamp(0, 6);
+    state::set_signal(APP_SIGNAL, id);
+    state::set_signal(LAUNCHER_SIGNAL, 0);
+    let bit = app_bit(id);
+    if bit == 0 {
+        return;
+    }
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    state::set_signal(OPEN_MASK_SIGNAL, open | bit);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+}
+
+fn minimize_current() {
+    let id = state::get_signal(APP_SIGNAL);
+    let bit = app_bit(id);
+    if bit == 0 {
+        push_toast("桌面保持显示。The desktop stays put.");
+        return;
+    }
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    state::set_signal(OPEN_MASK_SIGNAL, open | bit);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    state::set_signal(MINIMIZED_MASK_SIGNAL, minimized | bit);
+    state::set_signal(APP_SIGNAL, 0);
+    let name = ShellApp::from_signal(id).bilingual();
+    push_toast(&format!("已最小化 {name}。Minimized {name}."));
+}
+
+fn close_current() {
+    let id = state::get_signal(APP_SIGNAL);
+    let bit = app_bit(id);
+    if bit == 0 {
+        push_toast("桌面不能关闭。The desktop has no window to close.");
+        return;
+    }
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    state::set_signal(OPEN_MASK_SIGNAL, open & !bit);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+    state::set_signal(APP_SIGNAL, 0);
+    let name = ShellApp::from_signal(id).bilingual();
+    push_toast(&format!("已关闭 {name}。Closed {name}."));
+}
+
+fn cycle_windows() {
+    let current = state::get_signal(APP_SIGNAL);
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let start = if (1..=6).contains(&current) {
+        current
+    } else {
+        0
+    };
+    let mut found = None;
+    for step in 1..=6 {
+        let id = (start + step - 1) % 6 + 1;
+        if open & app_bit(id) != 0 {
+            found = Some(id);
+            break;
+        }
+    }
+    match found {
+        Some(id) if id != current => {
+            focus_app(id);
+            let name = ShellApp::from_signal(id).bilingual();
+            push_toast(&format!("切换到 {name}。Switched to {name}."));
+        }
+        Some(_) => push_toast("没有其他打开的窗口。No other open window."),
+        None => push_toast("没有打开的窗口。No open window."),
+    }
+}
+
+fn handle_chrome_op(code: u8, draft: &str) -> bool {
+    match code {
+        OP_MINIMIZE => minimize_current(),
+        OP_CLOSE => close_current(),
+        OP_CYCLE => cycle_windows(),
+        OP_LAUNCHER => {
+            let next = i64::from(state::get_signal(LAUNCHER_SIGNAL) == 0);
+            state::set_signal(LAUNCHER_SIGNAL, next);
+        }
+        OP_LAUNCHER_SEARCH => {
+            state::set_text_signal(LAUNCHER_QUERY_SIGNAL, draft.trim());
+            state::set_signal(LAUNCHER_SIGNAL, 1);
+        }
+        OP_DISMISS_TOAST => state::set_text_signal(TOAST_SIGNAL, ""),
+        OP_SETTINGS_LOCAL => state::set_signal(SETTINGS_TAB_SIGNAL, 0),
+        OP_SETTINGS_IDENTITY => state::set_signal(SETTINGS_TAB_SIGNAL, 1),
+        OP_SETTINGS_BRIDGE => state::set_signal(SETTINGS_TAB_SIGNAL, 2),
+        OP_SETTINGS_L2 => state::set_signal(SETTINGS_TAB_SIGNAL, 3),
+        OP_FILES_HOME => state::set_signal(FILES_FOLDER_SIGNAL, 0),
+        OP_FILES_DOCS => state::set_signal(FILES_FOLDER_SIGNAL, 1),
+        OP_FILES_PICS => state::set_signal(FILES_FOLDER_SIGNAL, 2),
+        OP_FILES_DOWN => state::set_signal(FILES_FOLDER_SIGNAL, 3),
+        OP_FILES_MUSIC => state::set_signal(FILES_FOLDER_SIGNAL, 4),
+        OP_FILES_PROJECTS => state::set_signal(FILES_FOLDER_SIGNAL, 5),
+        OP_FILES_W3COS => state::set_signal(FILES_FOLDER_SIGNAL, 6),
+        OP_TOGGLE_RECEIPTS => {
+            let next = i64::from(state::get_signal(RECEIPTS_OPEN_SIGNAL) == 0);
+            state::set_signal(RECEIPTS_OPEN_SIGNAL, next);
+        }
+        OP_FOCUS_DESKTOP => focus_app(0),
+        OP_FOCUS_FILES => focus_app(1),
+        OP_FOCUS_TERMINAL => focus_app(2),
+        OP_FOCUS_SETTINGS => focus_app(3),
+        OP_FOCUS_AGENT => focus_app(4),
+        OP_FOCUS_BROWSER => focus_app(5),
+        OP_FOCUS_EDITOR => focus_app(6),
+        _ => return false,
+    }
+    true
+}
+
+fn l2_env_configured() -> bool {
+    matches!(
+        std::env::var("W3COS_L2").unwrap_or_default().trim(),
+        "1" | "true" | "script"
+    )
+}
+
+fn toggle_l2(session: &mut IntentSession) {
+    if session.l2_enabled() {
+        session.set_l2_enabled(false);
+        if state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending() {
+            let update = agent_host::cancel();
+            apply_host_update(session, update);
+        }
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            "L2 已关闭。没有启动模型。L2 is off. No model was started.",
+        );
+        return;
+    }
+    if l2_env_configured() {
+        session.set_l2_enabled(true);
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            "L2 已打开。改动仍要先确认。L2 is on. Confirm still gates every change.",
+        );
+        return;
+    }
+    sync_session(
+        session,
+        state::get_signal(PHASE_SIGNAL),
+        "L2 保持关闭。先设置 W3COS_L2，这个开关不会启动推理。L2 stays off until W3COS_L2 is set.",
+    );
+}
+
+fn session_l2_on() -> bool {
+    SESSION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|session| session.l2_enabled())
+    })
+}
+
 fn apply_screen_override() {
     // Screenshot hook. Set once so a later click can still change the screen.
     thread_local! {
@@ -564,8 +799,37 @@ fn apply_screen_override() {
     if APPLIED.with(|applied| applied.replace(true)) {
         return;
     }
+    if let Ok(query) = std::env::var("W3COS_LAUNCHER_QUERY") {
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, query.trim());
+    }
     match std::env::var("W3COS_SCREEN").ok().as_deref() {
-        Some("settings") => state::set_signal(APP_SIGNAL, 3),
+        Some("settings") => focus_app(3),
+        Some("settings-l2") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+        }
+        Some("settings-identity") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 1);
+        }
+        Some("settings-bridge") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 2);
+        }
+        Some("files") => focus_app(1),
+        Some("files-docs") => {
+            focus_app(1);
+            state::set_signal(FILES_FOLDER_SIGNAL, 1);
+        }
+        Some("terminal") => focus_app(2),
+        Some("launcher") => state::set_signal(LAUNCHER_SIGNAL, 1),
+        Some("receipts") => state::set_signal(RECEIPTS_OPEN_SIGNAL, 1),
+        Some("windows") => {
+            state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
+            state::set_signal(MINIMIZED_MASK_SIGNAL, app_bit(5));
+            focus_app(1);
+            push_toast("浏览器已最小化。Browser is minimized.");
+        }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
         _ => {}
     }
@@ -578,6 +842,7 @@ fn build_shell() -> Component {
     let current = state::get_signal(APP_SIGNAL);
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
     let tasks_open = state::get_signal(TASKS_SIGNAL) != 0;
+    let receipts_open = state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0;
 
     let content = match current {
         0 => build_desktop(),
@@ -589,6 +854,34 @@ fn build_shell() -> Component {
         6 => build_editor_app(),
         _ => build_desktop(),
     };
+    let mut workspace = vec![content];
+    if tasks_open {
+        workspace.push(build_task_center());
+    }
+    if receipts_open {
+        workspace.push(build_receipts_viewer());
+    }
+    let mut column = vec![
+        build_context_header(current, night),
+        build_intent_bar(),
+        Component::row(
+            Style {
+                flex_grow: 1.0,
+                gap: 0.0,
+                align_items: AlignItems::Stretch,
+                ..Style::default()
+            },
+            workspace,
+        ),
+    ];
+    let toast = state::get_signal_text(TOAST_SIGNAL);
+    if !toast.is_empty() {
+        column.push(build_toast(&toast));
+    }
+    if state::get_signal(LAUNCHER_SIGNAL) != 0 {
+        column.push(build_launcher());
+    }
+    column.push(build_taskbar(current));
 
     Component::column(
         Style {
@@ -598,24 +891,7 @@ fn build_shell() -> Component {
             gap: 0.0,
             ..Style::default()
         },
-        vec![
-            build_context_header(current, night),
-            build_intent_bar(),
-            Component::row(
-                Style {
-                    flex_grow: 1.0,
-                    gap: 0.0,
-                    align_items: AlignItems::Stretch,
-                    ..Style::default()
-                },
-                if tasks_open {
-                    vec![content, build_task_center()]
-                } else {
-                    vec![content]
-                },
-            ),
-            build_taskbar(current),
-        ],
+        column,
     )
 }
 
@@ -684,7 +960,7 @@ fn build_desktop_icons() -> Component {
                             color: Color::WHITE,
                             ..Style::default()
                         },
-                        EventAction::Set(APP_SIGNAL, *id),
+                        invoke(focus_code(*id)),
                     ),
                     Component::text(
                         *label,
@@ -860,6 +1136,18 @@ fn build_branding() -> Component {
 // ==========================================================================
 
 fn build_files_app() -> Component {
+    let folder = state::get_signal(FILES_FOLDER_SIGNAL);
+    let (title, crumbs) = folder_title(folder);
+    let mut listing = folder_rows(folder);
+    listing.push(Component::text(
+        folder_summary(folder),
+        Style {
+            font_size: 11.0,
+            color: Color::from_hex("#606080"),
+            padding: Edges::all(8.0),
+            ..Style::default()
+        },
+    ));
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -868,7 +1156,7 @@ fn build_files_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Files", "#3498db"),
+            app_titlebar(title, "#3498db"),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -876,7 +1164,6 @@ fn build_files_app() -> Component {
                     ..Style::default()
                 },
                 vec![
-                    // Sidebar
                     Component::column(
                         Style {
                             width: Dimension::Px(200.0),
@@ -886,14 +1173,13 @@ fn build_files_app() -> Component {
                             ..Style::default()
                         },
                         vec![
-                            sidebar_item("Home", true),
-                            sidebar_item("Documents", false),
-                            sidebar_item("Pictures", false),
-                            sidebar_item("Downloads", false),
-                            sidebar_item("Music", false),
+                            nav_button("主文件夹 Home", folder == 0, OP_FILES_HOME),
+                            nav_button("文档 Documents", folder == 1, OP_FILES_DOCS),
+                            nav_button("图片 Pictures", folder == 2, OP_FILES_PICS),
+                            nav_button("下载 Downloads", folder == 3, OP_FILES_DOWN),
+                            nav_button("音乐 Music", folder == 4, OP_FILES_MUSIC),
                         ],
                     ),
-                    // File list
                     Component::column(
                         Style {
                             flex_grow: 1.0,
@@ -901,23 +1187,19 @@ fn build_files_app() -> Component {
                             gap: 4.0,
                             ..Style::default()
                         },
-                        vec![
-                            file_row("projects", "Folder", "--", true),
-                            file_row("w3cos", "Folder", "--", true),
-                            file_row("README.md", "Markdown", "4.2 KB", false),
-                            file_row("Cargo.toml", "TOML", "1.1 KB", false),
-                            file_row("app.tsx", "TypeScript", "2.8 KB", false),
-                            file_row("screenshot.png", "PNG Image", "245 KB", false),
-                            Component::text(
-                                "6 items, 253 KB",
+                        {
+                            let mut rows = vec![Component::text(
+                                crumbs,
                                 Style {
-                                    font_size: 11.0,
-                                    color: Color::from_hex("#606080"),
-                                    padding: Edges::all(8.0),
+                                    font_size: 13.0,
+                                    color: Color::from_hex("#d5dee8"),
+                                    padding: Edges::xy(8.0, 4.0),
                                     ..Style::default()
                                 },
-                            ),
-                        ],
+                            )];
+                            rows.append(&mut listing);
+                            rows
+                        },
                     ),
                 ],
             ),
@@ -925,10 +1207,73 @@ fn build_files_app() -> Component {
     )
 }
 
-fn sidebar_item(name: &str, active: bool) -> Component {
+fn folder_title(folder: i64) -> (&'static str, &'static str) {
+    match folder {
+        1 => ("文档 Documents", "主文件夹 / 文档"),
+        2 => ("图片 Pictures", "主文件夹 / 图片"),
+        3 => ("下载 Downloads", "主文件夹 / 下载"),
+        4 => ("音乐 Music", "主文件夹 / 音乐"),
+        5 => ("projects", "主文件夹 / projects"),
+        6 => ("w3cos", "主文件夹 / w3cos"),
+        _ => ("文件 Files", "主文件夹 Home"),
+    }
+}
+
+fn folder_summary(folder: i64) -> &'static str {
+    match folder {
+        1 => "2 items",
+        2 => "2 items",
+        3 => "1 item",
+        4 => "0 items",
+        5 => "2 items",
+        6 => "2 items",
+        _ => "6 items",
+    }
+}
+
+fn folder_rows(folder: i64) -> Vec<Component> {
+    match folder {
+        1 => vec![
+            file_row("notes.txt", "Text", "1.2 KB", None),
+            file_row("design.md", "Markdown", "8.4 KB", None),
+        ],
+        2 => vec![
+            file_row("screenshot.png", "PNG Image", "245 KB", None),
+            file_row("wallpaper.png", "PNG Image", "1.1 MB", None),
+        ],
+        3 => vec![file_row("fetch-l2-models.sh", "Script", "2.0 KB", None)],
+        4 => vec![Component::text(
+            "这个文件夹是空的。This folder is empty.",
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#d5dee8"),
+                padding: Edges::all(12.0),
+                ..Style::default()
+            },
+        )],
+        5 => vec![
+            file_row("README.md", "Markdown", "4.2 KB", None),
+            file_row("Cargo.toml", "TOML", "1.1 KB", None),
+        ],
+        6 => vec![
+            file_row("app.tsx", "TypeScript", "2.8 KB", None),
+            file_row("shell.rs", "Rust", "18 KB", None),
+        ],
+        _ => vec![
+            file_row("projects", "Folder", "--", Some(OP_FILES_PROJECTS)),
+            file_row("w3cos", "Folder", "--", Some(OP_FILES_W3COS)),
+            file_row("README.md", "Markdown", "4.2 KB", None),
+            file_row("Cargo.toml", "TOML", "1.1 KB", None),
+            file_row("app.tsx", "TypeScript", "2.8 KB", None),
+            file_row("screenshot.png", "PNG Image", "245 KB", None),
+        ],
+    }
+}
+
+fn nav_button(name: &str, active: bool, code: u8) -> Component {
     let bg = if active { "#3d5570" } else { "#243447" };
     let color = if active { "#f4f7fb" } else { "#d5dee8" };
-    Component::text(
+    Component::button_with_click(
         name,
         Style {
             font_size: 13.0,
@@ -938,11 +1283,23 @@ fn sidebar_item(name: &str, active: bool) -> Component {
             padding: Edges::xy(10.0, 8.0),
             ..Style::default()
         },
+        invoke(code),
     )
 }
 
-fn file_row(name: &str, kind: &str, size: &str, is_dir: bool) -> Component {
-    let icon = if is_dir { "[DIR]" } else { "    " };
+fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
+    let icon = if open.is_some() { "[DIR]" } else { "    " };
+    let name_style = Style {
+        font_size: 13.0,
+        color: Color::from_hex(if open.is_some() { "#9eb6ff" } else { "#d0d0e0" }),
+        flex_grow: 1.0,
+        ..Style::default()
+    };
+    let name_node = if let Some(code) = open {
+        Component::button_with_click(name, name_style, invoke(code))
+    } else {
+        Component::text(name, name_style)
+    };
     Component::row(
         Style {
             padding: Edges::xy(8.0, 10.0),
@@ -960,15 +1317,7 @@ fn file_row(name: &str, kind: &str, size: &str, is_dir: bool) -> Component {
                     ..Style::default()
                 },
             ),
-            Component::text(
-                name,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    flex_grow: 1.0,
-                    ..Style::default()
-                },
-            ),
+            name_node,
             Component::text(
                 size,
                 Style {
@@ -1012,7 +1361,7 @@ fn build_terminal_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "本机终端占位。命令还不会执行。",
+                        "允许 echo、pwd、help。运行时申请一次性的 w3cos-process。",
                         Style {
                             font_size: 16.0,
                             font_weight: 700,
@@ -1021,7 +1370,7 @@ fn build_terminal_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Local terminal placeholder. Typed commands stay on this page.",
+                        "Allowlist: echo, pwd, help. Run asks for a one-shot w3cos-process grant.",
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#d5dee8"),
@@ -1094,37 +1443,7 @@ fn build_terminal_app() -> Component {
 // ==========================================================================
 
 fn build_settings_app() -> Component {
-    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
-        "开 On"
-    } else {
-        "关 Off"
-    };
-    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
-    let storage_label = if storage_owned.is_empty() {
-        "memory".to_string()
-    } else {
-        storage_owned
-    };
-    let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
-    let bridge = match bridge.trim() {
-        "" | "observer" => "observer",
-        "interactive" => "interactive",
-        "system" => "system",
-        _ => "observer",
-    };
-    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
-    let subject_label = if subject_owned.is_empty() {
-        LocalIdentityStub::SUBJECT.to_string()
-    } else {
-        subject_owned
-    };
-    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
-    let enroll_label = if enroll_owned.is_empty() {
-        "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
-            .to_string()
-    } else {
-        enroll_owned
-    };
+    let tab = state::get_signal(SETTINGS_TAB_SIGNAL);
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -1150,9 +1469,10 @@ fn build_settings_app() -> Component {
                             ..Style::default()
                         },
                         vec![
-                            sidebar_item("本机 Local", true),
-                            sidebar_item("身份 Identity", false),
-                            sidebar_item("桥接 Bridge", false),
+                            nav_button("本机 Local", tab == 0, OP_SETTINGS_LOCAL),
+                            nav_button("身份 Identity", tab == 1, OP_SETTINGS_IDENTITY),
+                            nav_button("权限 Permissions", tab == 2, OP_SETTINGS_BRIDGE),
+                            nav_button("L2 模型", tab == 3, OP_SETTINGS_L2),
                         ],
                     ),
                     Component::column(
@@ -1162,44 +1482,190 @@ fn build_settings_app() -> Component {
                             gap: 12.0,
                             ..Style::default()
                         },
-                        vec![
-                            Component::text(
-                                "本机设置 · Local preferences",
-                                Style {
-                                    font_size: 18.0,
-                                    color: Color::from_hex("#f4f7fb"),
-                                    font_weight: 700,
-                                    ..Style::default()
-                                },
-                            ),
-                            Component::text(
-                                "没有账号，也没有链。WebAuthn 仪式还没做。",
-                                Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#d5dee8"),
-                                    ..Style::default()
-                                },
-                            ),
-                            settings_row("主体 Subject", &subject_label),
-                            Component::text(
-                                enroll_label,
-                                Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#d5dee8"),
-                                    ..Style::default()
-                                },
-                            ),
-                            chrome_button("生成注册挑战 Challenge", OP_ENROLL, "#3d5570"),
-                            settings_row("身份 Identity", "PBKDF2 · not a passkey"),
-                            settings_row("夜间模式 Night", night),
-                            settings_row("AI 权限 Bridge", bridge),
-                            settings_row("收据 Receipts", &storage_label),
-                        ],
+                        settings_page(tab),
                     ),
                 ],
             ),
         ],
     )
+}
+
+fn settings_page(tab: i64) -> Vec<Component> {
+    match tab {
+        1 => settings_identity_page(),
+        2 => settings_permissions_page(),
+        3 => settings_l2_page(),
+        _ => settings_local_page(),
+    }
+}
+
+fn settings_heading(title: &str, detail: &str) -> Vec<Component> {
+    vec![
+        Component::text(
+            title,
+            Style {
+                font_size: 18.0,
+                color: Color::from_hex("#f4f7fb"),
+                font_weight: 700,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            detail,
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        ),
+    ]
+}
+
+fn settings_local_page() -> Vec<Component> {
+    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
+        "开 On"
+    } else {
+        "关 Off"
+    };
+    let mut rows = settings_heading(
+        "本机设置 · Local preferences",
+        "没有账号，也没有链。夜间模式仍走提议和确认。",
+    );
+    rows.push(settings_row("夜间模式 Night", night));
+    rows.push(chrome_button(
+        "切换夜间 Toggle night",
+        OP_CHIP_NIGHT,
+        "#3d5570",
+    ));
+    rows
+}
+
+fn settings_identity_page() -> Vec<Component> {
+    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
+    let storage_label = if storage_owned.is_empty() {
+        "memory".to_string()
+    } else {
+        storage_owned
+    };
+    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+    let subject_label = if subject_owned.is_empty() {
+        LocalIdentityStub::SUBJECT.to_string()
+    } else {
+        subject_owned
+    };
+    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
+    let enroll_label = if enroll_owned.is_empty() {
+        "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。".to_string()
+    } else {
+        enroll_owned
+    };
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let mut rows = settings_heading(
+        "身份 Identity",
+        "口令经 KDF 保存，还不是 passkey。锁定后不能确认改动。",
+    );
+    rows.push(settings_row("主体 Subject", &subject_label));
+    rows.push(Component::text(
+        enroll_label,
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#d5dee8"),
+            ..Style::default()
+        },
+    ));
+    rows.push(chrome_button(
+        "生成注册挑战 Challenge",
+        OP_ENROLL,
+        "#3d5570",
+    ));
+    rows.push(settings_row("身份 Identity", "PBKDF2 · not a passkey"));
+    rows.push(settings_row(
+        "状态 Status",
+        if unlocked {
+            "已解锁 Unlocked"
+        } else {
+            "已锁定 Locked"
+        },
+    ));
+    rows.push(chrome_button(
+        if unlocked {
+            "锁定 Lock"
+        } else {
+            "解锁 Unlock"
+        },
+        if unlocked { OP_LOCK } else { OP_UNLOCK },
+        if unlocked { "#3d5570" } else { "#9a3412" },
+    ));
+    rows.push(settings_row("收据存储 Receipts", &storage_label));
+    rows.push(chrome_button(
+        "打开收据本 Ledger",
+        OP_TOGGLE_RECEIPTS,
+        "#3d5570",
+    ));
+    rows
+}
+
+fn settings_permissions_page() -> Vec<Component> {
+    let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
+    let bridge = match bridge.trim() {
+        "" | "observer" => "observer（HTTP 默认，本页不能调高）",
+        "interactive" => "interactive（来自环境变量）",
+        "system" => "system（来自环境变量）",
+        _ => "observer（无法识别的值已忽略）",
+    };
+    let mut rows = settings_heading(
+        "权限 Permissions",
+        "HTTP 桥的权限只看 W3COS_AI_PERMISSIONS。这个页面不会把它调高。",
+    );
+    rows.push(settings_row("HTTP 桥 Bridge", bridge));
+    rows.push(settings_row(
+        "本机会话 Shell",
+        "interactive · 确认后才授予一次性 act / process",
+    ));
+    rows.push(settings_row(
+        "启动时授予 Boot grants",
+        "w3cos-accessibility · display-capture",
+    ));
+    rows.push(settings_row(
+        "不会常驻 Not standing",
+        "w3cos-agent-act · w3cos-process",
+    ));
+    rows
+}
+
+fn settings_l2_page() -> Vec<Component> {
+    let env_flag = std::env::var("W3COS_L2").unwrap_or_else(|_| "未设置".into());
+    let env_flag = if env_flag.trim().is_empty() {
+        "未设置".to_string()
+    } else {
+        env_flag
+    };
+    let model = std::env::var("W3COS_L2_MODEL").unwrap_or_else(|_| {
+        "未设置。打开 L2 时默认 models/qwen2.5-1.5b-instruct-q4_k_m.gguf".into()
+    });
+    let endpoint = std::env::var("W3COS_L2_URL").unwrap_or_else(|_| "未设置，不连接".into());
+    let on = session_l2_on();
+    let mut rows = settings_heading(
+        "L2 模型",
+        "默认关闭。开关只改本会话，不会启动 llama-server，也不会下载权重。",
+    );
+    rows.push(settings_row(
+        "当前 Current",
+        if on { "开 On" } else { "关 Off" },
+    ));
+    rows.push(settings_row("环境 W3COS_L2", &env_flag));
+    rows.push(settings_row("模型路径 Model", &model));
+    rows.push(settings_row("端点 Endpoint", &endpoint));
+    rows.push(chrome_button(
+        if on {
+            "关闭 L2 Turn L2 off"
+        } else {
+            "打开 L2 Turn L2 on"
+        },
+        OP_L2_TOGGLE,
+        if on { "#3d5570" } else { "#1d4e89" },
+    ));
+    rows
 }
 
 fn settings_row(label: &str, value: &str) -> Component {
@@ -1614,6 +2080,11 @@ fn build_task_center() -> Component {
             color: ink(),
             ..Style::default()
         },
+    ));
+    body.push(chrome_button(
+        "收据本 Ledger",
+        OP_TOGGLE_RECEIPTS,
+        "#3d5570",
     ));
     let log = state::get_signal_text(RECEIPT_SIGNAL);
     if log.is_empty() || log == "No receipts yet." {
@@ -2416,7 +2887,37 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // Shared: title bar + taskbar
 // ==========================================================================
 
-fn taskbar_icon(letter: &str, color: &str, id: i64) -> Component {
+fn window_button(label: &str, code: u8, color: &str) -> Component {
+    Component::button_with_click(
+        label,
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex(color),
+            background: Color::from_hex("#2a2a3e"),
+            border_radius: 4.0,
+            padding: Edges::xy(8.0, 4.0),
+            ..Style::default()
+        },
+        invoke(code),
+    )
+}
+
+fn taskbar_icon(letter: &str, color: &str, id: i64, current: i64) -> Component {
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    let bit = app_bit(id);
+    let focused = current == id;
+    let is_open = open & bit != 0;
+    let is_mini = minimized & bit != 0;
+    let opacity = if focused {
+        1.0
+    } else if is_mini {
+        0.55
+    } else if is_open {
+        1.0
+    } else {
+        0.38
+    };
     Component::button_with_click(
         letter,
         Style {
@@ -2427,9 +2928,18 @@ fn taskbar_icon(letter: &str, color: &str, id: i64) -> Component {
             font_size: 16.0,
             font_weight: 700,
             color: Color::WHITE,
+            opacity,
+            border_bottom_width: Some(if focused {
+                3.0
+            } else if is_open {
+                2.0
+            } else {
+                0.0
+            }),
+            border_bottom_color: Some(Color::from_hex(if focused { "#f4f7fb" } else { "#d5dee8" })),
             ..Style::default()
         },
-        EventAction::Set(APP_SIGNAL, id),
+        invoke(focus_code(id)),
     )
 }
 
@@ -2478,36 +2988,9 @@ fn app_titlebar(title: &str, accent: &str) -> Component {
                     ..Style::default()
                 },
                 vec![
-                    Component::button(
-                        "--",
-                        Style {
-                            font_size: 12.0,
-                            color: Color::from_hex("#808090"),
-                            background: Color::from_hex("#2a2a3e"),
-                            border_radius: 4.0,
-                            ..Style::default()
-                        },
-                    ),
-                    Component::button(
-                        "[]",
-                        Style {
-                            font_size: 12.0,
-                            color: Color::from_hex("#808090"),
-                            background: Color::from_hex("#2a2a3e"),
-                            border_radius: 4.0,
-                            ..Style::default()
-                        },
-                    ),
-                    Component::button(
-                        "X",
-                        Style {
-                            font_size: 12.0,
-                            color: Color::from_hex("#e94560"),
-                            background: Color::from_hex("#2a2a3e"),
-                            border_radius: 4.0,
-                            ..Style::default()
-                        },
-                    ),
+                    window_button("--", OP_MINIMIZE, "#808090"),
+                    window_button("[]", OP_CYCLE, "#808090"),
+                    window_button("X", OP_CLOSE, "#e94560"),
                 ],
             ),
         ],
@@ -2515,16 +2998,14 @@ fn app_titlebar(title: &str, accent: &str) -> Component {
 }
 
 fn build_taskbar(current: i64) -> Component {
-    let center_text = match current {
-        0 => "W3C OS Desktop",
-        1 => "Files",
-        2 => "Terminal",
-        3 => "Settings",
-        4 => "AI Agent",
-        5 => "Browser",
-        6 => "Editor",
-        _ => "W3C OS",
-    };
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let open_count = (1..=6).filter(|id| open & app_bit(*id) != 0).count();
+    let center_text = format!(
+        "{} · {open_count} open",
+        ShellApp::from_signal(current).bilingual()
+    );
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let launcher_open = state::get_signal(LAUNCHER_SIGNAL) != 0;
     Component::row(
         Style {
             height: Dimension::Px(56.0),
@@ -2544,9 +3025,17 @@ fn build_taskbar(current: i64) -> Component {
                 },
                 vec![
                     Component::button_with_click(
-                        "W3C Apps",
+                        if launcher_open {
+                            "关闭启动器"
+                        } else {
+                            "W3C Apps"
+                        },
                         Style {
-                            background: Color::from_hex("#6c5ce7"),
+                            background: Color::from_hex(if launcher_open {
+                                "#3d5570"
+                            } else {
+                                "#6c5ce7"
+                            }),
                             border_radius: 8.0,
                             font_size: 14.0,
                             font_weight: 600,
@@ -2554,12 +3043,14 @@ fn build_taskbar(current: i64) -> Component {
                             padding: Edges::xy(14.0, 8.0),
                             ..Style::default()
                         },
-                        EventAction::Set(APP_SIGNAL, 0),
+                        invoke(OP_LAUNCHER),
                     ),
-                    taskbar_icon("F", "#3498db", 1),
-                    taskbar_icon("T", "#2ecc71", 2),
-                    taskbar_icon("S", "#9b59b6", 3),
-                    taskbar_icon("A", "#e74c3c", 4),
+                    taskbar_icon("F", "#3498db", 1, current),
+                    taskbar_icon("T", "#2ecc71", 2, current),
+                    taskbar_icon("S", "#9b59b6", 3, current),
+                    taskbar_icon("A", "#e74c3c", 4, current),
+                    taskbar_icon("B", "#f39c12", 5, current),
+                    taskbar_icon("E", "#1abc9c", 6, current),
                 ],
             ),
             Component::text(
@@ -2577,19 +3068,29 @@ fn build_taskbar(current: i64) -> Component {
                     ..Style::default()
                 },
                 vec![
+                    chrome_button(
+                        if unlocked {
+                            "锁定 Lock"
+                        } else {
+                            "解锁 Unlock"
+                        },
+                        if unlocked { OP_LOCK } else { OP_UNLOCK },
+                        if unlocked { "#3d5570" } else { "#9a3412" },
+                    ),
+                    chrome_button(
+                        if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
+                            "收起收据"
+                        } else {
+                            "收据"
+                        },
+                        OP_TOGGLE_RECEIPTS,
+                        "#3d5570",
+                    ),
                     Component::text(
                         "Online",
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#00b894"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "92%",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
                             ..Style::default()
                         },
                     ),
@@ -2607,5 +3108,291 @@ fn build_taskbar(current: i64) -> Component {
                 ],
             ),
         ],
+    )
+}
+
+struct LaunchApp {
+    id: i64,
+    letter: &'static str,
+    zh: &'static str,
+    en: &'static str,
+    color: &'static str,
+}
+
+const LAUNCH_APPS: [LaunchApp; 7] = [
+    LaunchApp {
+        id: 0,
+        letter: "D",
+        zh: "桌面",
+        en: "Desktop",
+        color: "#6c5ce7",
+    },
+    LaunchApp {
+        id: 1,
+        letter: "F",
+        zh: "文件",
+        en: "Files",
+        color: "#3498db",
+    },
+    LaunchApp {
+        id: 2,
+        letter: "T",
+        zh: "终端",
+        en: "Terminal",
+        color: "#2ecc71",
+    },
+    LaunchApp {
+        id: 3,
+        letter: "S",
+        zh: "设置",
+        en: "Settings",
+        color: "#9b59b6",
+    },
+    LaunchApp {
+        id: 4,
+        letter: "A",
+        zh: "助手",
+        en: "Agent",
+        color: "#e74c3c",
+    },
+    LaunchApp {
+        id: 5,
+        letter: "B",
+        zh: "浏览器",
+        en: "Browser",
+        color: "#f39c12",
+    },
+    LaunchApp {
+        id: 6,
+        letter: "E",
+        zh: "编辑器",
+        en: "Editor",
+        color: "#1abc9c",
+    },
+];
+
+fn build_launcher() -> Component {
+    let query = state::get_signal_text(LAUNCHER_QUERY_SIGNAL);
+    let mut search_style = Style {
+        flex_grow: 1.0,
+        font_size: 14.0,
+        color: Color::from_hex("#1a2836"),
+        background: Color::from_hex("#f4f7fb"),
+        border_radius: 8.0,
+        padding: Edges::xy(12.0, 8.0),
+        ..Style::default()
+    };
+    search_style.custom_properties = Some(HashMap::from([(
+        "--w3cos-intent-submit".to_string(),
+        OP_LAUNCHER_SEARCH.to_string(),
+    )]));
+    let needle = query.trim().to_lowercase();
+    let mut tiles = Vec::new();
+    for app in LAUNCH_APPS {
+        let hay = format!("{} {} {}", app.zh, app.en, app.letter).to_lowercase();
+        if !needle.is_empty() && !hay.contains(&needle) {
+            continue;
+        }
+        tiles.push(launcher_tile(app));
+    }
+    if tiles.is_empty() {
+        tiles.push(Component::text(
+            "没有匹配的应用。No matching app.",
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        ));
+    }
+    let query_label = if query.trim().is_empty() {
+        "全部应用".to_string()
+    } else {
+        format!("搜索：{}", query.trim())
+    };
+    Component::column(
+        Style {
+            background: Color::from_hex("#1b2c3e"),
+            padding: Edges::all(12.0),
+            gap: 8.0,
+            ..Style::default()
+        },
+        vec![
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    ..Style::default()
+                },
+                vec![
+                    Component::text_input(query.clone(), LAUNCHER_PLACEHOLDER, search_style),
+                    Component::button_with_click(
+                        "搜索 Search",
+                        Style {
+                            background: Color::from_hex("#5b4fe0"),
+                            border_radius: 8.0,
+                            font_size: 13.0,
+                            font_weight: 700,
+                            color: Color::WHITE,
+                            padding: Edges::xy(12.0, 8.0),
+                            ..Style::default()
+                        },
+                        EventAction::Invoke {
+                            code: OP_LAUNCHER_SEARCH,
+                            input_placeholder: LAUNCHER_PLACEHOLDER.to_string(),
+                        },
+                    ),
+                ],
+            ),
+            Component::text(
+                query_label,
+                Style {
+                    font_size: 12.0,
+                    color: Color::from_hex("#d5dee8"),
+                    ..Style::default()
+                },
+            ),
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    flex_wrap: FlexWrap::Wrap,
+                    ..Style::default()
+                },
+                tiles,
+            ),
+        ],
+    )
+}
+
+fn launcher_tile(app: LaunchApp) -> Component {
+    let current = state::get_signal(APP_SIGNAL) == app.id;
+    let open = state::get_signal(OPEN_MASK_SIGNAL) & app_bit(app.id) != 0;
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL) & app_bit(app.id) != 0;
+    let status = if current {
+        "在前台"
+    } else if minimized {
+        "最小化"
+    } else if open {
+        "已打开"
+    } else {
+        ""
+    };
+    let label = if status.is_empty() {
+        format!("{}  {} {}", app.letter, app.zh, app.en)
+    } else {
+        format!("{}  {} {} · {status}", app.letter, app.zh, app.en)
+    };
+    Component::button_with_click(
+        label,
+        Style {
+            background: Color::from_hex(app.color),
+            border_radius: 8.0,
+            font_size: 13.0,
+            font_weight: 700,
+            color: Color::WHITE,
+            padding: Edges::xy(12.0, 8.0),
+            ..Style::default()
+        },
+        invoke(focus_code(app.id)),
+    )
+}
+
+fn build_toast(text: &str) -> Component {
+    Component::row(
+        Style {
+            padding: Edges::xy(16.0, 8.0),
+            gap: 8.0,
+            background: Color::from_hex("#1d4e89"),
+            align_items: AlignItems::Center,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                "通知",
+                Style {
+                    font_size: 13.0,
+                    font_weight: 700,
+                    color: Color::WHITE,
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                text,
+                Style {
+                    font_size: 13.0,
+                    color: Color::from_hex("#f4f7fb"),
+                    flex_grow: 1.0,
+                    ..Style::default()
+                },
+            ),
+            chrome_button("知道了", OP_DISMISS_TOAST, "#3d5570"),
+        ],
+    )
+}
+
+fn build_receipts_viewer() -> Component {
+    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
+    let storage_label = if storage_owned.is_empty() {
+        "memory".to_string()
+    } else {
+        storage_owned
+    };
+    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+    let subject_label = if subject_owned.is_empty() {
+        LocalIdentityStub::SUBJECT.to_string()
+    } else {
+        subject_owned
+    };
+    let log = state::get_signal_text(RECEIPT_SIGNAL);
+    let mut body = vec![
+        Component::text(
+            "收据本 Receipts",
+            Style {
+                font_size: 16.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            format!("{subject_label} · {storage_label}"),
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        chrome_button("关闭 Close", OP_TOGGLE_RECEIPTS, "#3d5570"),
+    ];
+    if log.is_empty() || log == "No receipts yet." {
+        body.push(Component::text(
+            "还没有收据。No receipts yet.",
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+    } else {
+        for line in log.lines() {
+            body.push(Component::text(
+                line,
+                Style {
+                    font_size: 12.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
+    }
+    Component::column(
+        Style {
+            width: Dimension::Px(320.0),
+            padding: Edges::all(14.0),
+            gap: 8.0,
+            background: Color::from_hex("#243047"),
+            ..Style::default()
+        },
+        body,
     )
 }

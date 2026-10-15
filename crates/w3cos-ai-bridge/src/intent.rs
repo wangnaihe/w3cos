@@ -302,6 +302,12 @@ impl IntentSession {
         self.l2_enabled
     }
 
+    /// Session switch for the settings page. Does not start a model process.
+    /// The shell keeps this off unless `W3COS_L2` was already set.
+    pub fn set_l2_enabled(&mut self, enabled: bool) {
+        self.l2_enabled = enabled;
+    }
+
     /// Shell entry point. Loads the machine-local ledger when a directory is
     /// available. Tests keep using [`new`](Self::new), which stays in memory.
     pub fn open_local(permissions: AgentPermissions, identity: LocalIdentityStub) -> Self {
