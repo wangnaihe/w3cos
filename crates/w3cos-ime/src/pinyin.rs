@@ -17,7 +17,7 @@ const CANDIDATE_CAP: usize = 9;
 
 struct Dict {
     syllables: BTreeMap<String, String>,
-    phrases: BTreeMap<String, Vec<String>>,
+    phrases: BTreeMap<String, Vec<(String, u32)>>,
 }
 
 fn dict() -> &'static Dict {
@@ -33,12 +33,25 @@ fn dict() -> &'static Dict {
             if let Some(body) = line.strip_prefix('=') {
                 let mut parts = body.split_whitespace();
                 let Some(key) = parts.next() else { continue };
-                let phrase: String = parts.collect::<String>();
+                let mut tokens: Vec<&str> = parts.collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+                let freq = tokens
+                    .last()
+                    .filter(|token| token.bytes().all(|byte| byte.is_ascii_digit()))
+                    .and_then(|token| token.parse::<u32>().ok())
+                    .map(|freq| {
+                        tokens.pop();
+                        freq
+                    })
+                    .unwrap_or_else(|| phrase_frequency(key, phrases.len()));
+                let phrase: String = tokens.concat();
                 if !phrase.is_empty() {
                     phrases
                         .entry(key.to_string())
                         .or_insert_with(Vec::new)
-                        .push(phrase);
+                        .push((phrase, freq));
                 }
                 continue;
             }
@@ -51,6 +64,38 @@ fn dict() -> &'static Dict {
         }
         Dict { syllables, phrases }
     })
+}
+
+/// Common words outrank file order. Anything else keeps the dictionary order.
+fn phrase_frequency(key: &str, order: usize) -> u32 {
+    let known = match key {
+        "women" => 90_000,
+        "shenme" => 86_000,
+        "yige" => 84_000,
+        "keyi" => 82_000,
+        "meiyou" => 80_000,
+        "xiexie" => 76_000,
+        "jintian" => 74_000,
+        "mingtian" => 72_000,
+        "woaini" => 68_000,
+        "zhidao" => 66_000,
+        "xianzai" => 62_000,
+        "pengyou" => 60_000,
+        "dakai" => 58_000,
+        "meiguanxi" => 56_000,
+        "duibuqi" => 54_000,
+        "zaijian" => 52_000,
+        _ => return 30_000u32.saturating_sub(order as u32),
+    };
+    known
+}
+
+fn char_weight(index: usize) -> u32 {
+    match index {
+        0 => 100,
+        1 => 10,
+        _ => 1,
+    }
 }
 
 fn normalize(raw: &str) -> String {
@@ -149,28 +194,69 @@ fn primary(sylls: &[&str], dict: &Dict) -> String {
         .collect()
 }
 
-fn compose(sylls: &[&str], dict: &Dict, out: &mut Vec<String>) {
-    if sylls.is_empty() {
+fn push_scored(out: &mut Vec<(u32, String)>, score: u32, text: String) {
+    if text.is_empty() {
         return;
     }
-    push_unique(out, primary(sylls, dict));
-    let lists: Vec<&str> = sylls
-        .iter()
-        .map(|syll| dict.syllables.get(*syll).map(String::as_str).unwrap_or(""))
-        .collect();
-    if lists.len() == 1 {
-        for ch in lists[0].chars().skip(1) {
-            push_unique(out, ch.to_string());
+    if let Some(existing) = out.iter_mut().find(|(_, found)| found == &text) {
+        if score > existing.0 {
+            existing.0 = score;
         }
         return;
     }
-    let prefix: String = lists[..lists.len() - 1]
+    out.push((score, text));
+}
+
+fn syllable_lists<'a>(sylls: &[&str], dict: &'a Dict) -> Option<Vec<Vec<char>>> {
+    let lists: Vec<Vec<char>> = sylls
         .iter()
-        .filter_map(|chars| chars.chars().next())
+        .map(|syll| {
+            dict.syllables
+                .get(*syll)
+                .map(|chars| chars.chars().collect())
+                .unwrap_or_default()
+        })
         .collect();
-    if let Some(last) = lists.last() {
-        for ch in last.chars().skip(1) {
-            push_unique(out, format!("{prefix}{ch}"));
+    if lists.iter().any(Vec::is_empty) {
+        None
+    } else {
+        Some(lists)
+    }
+}
+
+/// Character combinations. A multi-syllable guess has to stay near the best
+/// pairing, so a rare second character (你号, 你豪) does not crowd out words.
+fn add_syllable_candidates(sylls: &[&str], dict: &Dict, out: &mut Vec<(u32, String)>) {
+    let Some(lists) = syllable_lists(sylls, dict) else {
+        return;
+    };
+    let primary_score = lists
+        .iter()
+        .fold(1u32, |score, _| score.saturating_mul(100));
+    push_scored(out, primary_score, primary(sylls, dict));
+    if lists.len() == 1 {
+        for (index, ch) in lists[0].iter().enumerate().skip(1) {
+            push_scored(out, char_weight(index), ch.to_string());
+        }
+        return;
+    }
+    for (pos, chars) in lists.iter().enumerate() {
+        for (index, ch) in chars.iter().enumerate().take(3).skip(1) {
+            let mut text = String::new();
+            let mut score = 1u32;
+            for (other, list) in lists.iter().enumerate() {
+                let (weight_index, chosen) = if other == pos {
+                    (index, *ch)
+                } else {
+                    (0, list[0])
+                };
+                text.push(chosen);
+                score = score.saturating_mul(char_weight(weight_index));
+            }
+            // 40% of the all-common pairing. 100×10 is only 10%, so it drops.
+            if score.saturating_mul(5) >= primary_score.saturating_mul(2) {
+                push_scored(out, score, text);
+            }
         }
     }
 }
@@ -183,45 +269,72 @@ pub fn candidates(spelling: &str) -> Vec<String> {
         return Vec::new();
     }
     let dict = dict();
-    let mut out = Vec::new();
+    let mut scored = Vec::new();
     if let Some(phrases) = dict.phrases.get(&spelling) {
-        for phrase in phrases {
-            push_unique(&mut out, phrase.clone());
+        for (phrase, freq) in phrases {
+            push_scored(&mut scored, *freq, phrase.clone());
         }
     }
-    match split(&spelling, dict) {
-        Split::Full(sylls) => compose(&sylls, dict, &mut out),
-        Split::Partial { done, tail } => {
-            let mut hits: Vec<&str> = dict
-                .phrases
-                .keys()
-                .filter(|key| key.starts_with(&spelling) && key.as_str() != spelling)
-                .map(String::as_str)
-                .collect();
-            hits.sort_by_key(|key| (key.len(), *key));
-            for key in hits {
-                if let Some(phrases) = dict.phrases.get(key) {
-                    for phrase in phrases {
-                        push_unique(&mut out, phrase.clone());
-                    }
-                }
+    let mut longer = Vec::new();
+    for (key, phrases) in &dict.phrases {
+        if key.starts_with(&spelling) && key != &spelling {
+            for (phrase, freq) in phrases {
+                longer.push((*freq, phrase.clone()));
             }
+        }
+    }
+    longer.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (freq, phrase) in longer {
+        push_scored(&mut scored, freq, phrase);
+    }
+    let phrase_hit = !scored.is_empty();
+    match split(&spelling, dict) {
+        Split::Full(sylls) => {
+            if !phrase_hit {
+                add_syllable_candidates(&sylls, dict, &mut scored);
+            }
+        }
+        Split::Partial { done, tail } => {
             for (syll, _) in dict.syllables.range(tail.to_string()..) {
                 if !syll.starts_with(tail) {
                     break;
                 }
                 let mut full = done.clone();
                 full.push(syll.as_str());
-                push_unique(&mut out, primary(&full, dict));
+                // Stay under phrase scores so 你好 ranks ahead of a bare 你还.
+                push_scored(&mut scored, 9_000, primary(&full, dict));
             }
         }
-        Split::Failed => push_unique(&mut out, spelling.clone()),
+        Split::Failed => push_scored(&mut scored, 1, spelling.clone()),
     }
-    if out.is_empty() {
-        out.push(spelling);
+    if scored.is_empty() {
+        return vec![spelling];
     }
-    out.truncate(CANDIDATE_CAP);
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut out = Vec::new();
+    for (_, text) in scored {
+        push_unique(&mut out, text);
+    }
     out
+}
+
+/// Spaced syllables for the composition display. `nihao` is `ni hao`.
+pub fn preedit_display(spelling: &str) -> String {
+    let spelling = normalize(spelling);
+    if spelling.is_empty() {
+        return String::new();
+    }
+    match split(&spelling, dict()) {
+        Split::Full(sylls) => sylls.join(" "),
+        Split::Partial { done, tail } => {
+            if done.is_empty() {
+                tail.to_string()
+            } else {
+                format!("{} {tail}", done.join(" "))
+            }
+        }
+        Split::Failed => spelling,
+    }
 }
 
 /// Full syllable split, used by tests. Incomplete or illegal tails return none.
@@ -266,9 +379,10 @@ impl InputEngine for PinyinEngine {
         if spelling.is_empty() {
             return Vec::new();
         }
+        let shown = preedit_display(&spelling);
         let mut out = vec![Proposal::Preedit {
-            text: spelling.clone(),
-            cursor: spelling.chars().count(),
+            text: shown.clone(),
+            cursor: shown.chars().count(),
         }];
         for (index, text) in candidates(&spelling).into_iter().enumerate() {
             out.push(Proposal::candidate(
@@ -292,7 +406,24 @@ mod tests {
         let found = candidates("nihao");
         assert_eq!(found.first().map(String::as_str), Some("你好"));
         assert!(found.len() <= CANDIDATE_CAP);
-        assert!(found.contains(&"你号".to_string()) || found.len() > 1);
+        assert!(found.iter().any(|item| item == "你好吗"));
+        assert!(found.iter().any(|item| item == "您好"));
+        assert!(
+            !found
+                .iter()
+                .take(3)
+                .any(|item| item == "你号" || item == "你豪")
+        );
+    }
+
+    #[test]
+    fn preedit_shows_the_syllable_split() {
+        assert_eq!(preedit_display("nihao"), "ni hao");
+        assert_eq!(preedit_display("NiHao"), "ni hao");
+        assert_eq!(preedit_display("nih"), "ni h");
+        assert_eq!(preedit_display("zhongguo"), "zhong guo");
+        assert_eq!(preedit_display("nihaoqx"), "nihaoqx");
+        assert_eq!(preedit_display(""), "");
     }
 
     #[test]
@@ -343,7 +474,7 @@ mod tests {
         let proposals = hub.handle_intent(&session, &intent, &mut [&mut engine]);
         assert!(proposals.iter().any(|proposal| matches!(
             proposal,
-            Proposal::Preedit { text, .. } if text == "nihao"
+            Proposal::Preedit { text, .. } if text == "ni hao"
         )));
         assert!(proposals.iter().any(|proposal| matches!(
             proposal,

@@ -1,5 +1,6 @@
 # Bundled L0 pinyin dictionary. Syllable lines are `pinyin hanzi` (common first).
-# Phrase lines are `=pinyin phrase`. No tones, no spaces in the key. `v` stands for ü.
+# Phrase lines are `=pinyin phrase [frequency]`. A trailing integer is the word
+# frequency (higher is more common). No tones, no spaces in the key. `v` stands for ü.
 # librime is not linked; this table is the on-device engine.
 
 a 啊阿
@@ -394,12 +395,13 @@ zui 最
 zun 尊
 zuo 做作左
 
-=nihao 你好
-=nihaoma 你好吗
-=zhongguo 中国
-=zhongwen 中文
+=nihao 你好 92000
+=nihao 您好 51000
+=nihaoma 你好吗 70000
+=zhongguo 中国 88000
+=zhongwen 中文 64000
 =zhongguoren 中国人
-=women 我们
+=women 我们 90000
 =woshi 我是
 =nishi 你是
 =shenme 什么

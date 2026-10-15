@@ -1194,6 +1194,18 @@ fn render_node(
                 style,
                 clip_mask,
             );
+            if !secure && !display_value.is_empty() {
+                draw_ime_preedit_underline(
+                    pixmap,
+                    text_x,
+                    text_y + ink.height.max(style.font_size * 0.85) + 1.0,
+                    display_text,
+                    style,
+                    font,
+                    tc,
+                    clip_mask,
+                );
+            }
             if is_focused {
                 draw_blinking_cursor(
                     pixmap,
@@ -1688,6 +1700,54 @@ fn push_round_rect(builder: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, ra
     builder.line_to(x, y + radius);
     builder.quad_to(x, y, x + radius, y);
     builder.close();
+}
+
+fn draw_ime_preedit_underline(
+    pixmap: &mut Pixmap,
+    text_x: f32,
+    underline_y: f32,
+    display_text: &str,
+    style: &Style,
+    font: &fontdue::Font,
+    color: Color,
+    clip_mask: Option<&Mask>,
+) {
+    let Some(suffix) = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get("--w3cos-ime-preedit"))
+        .map(String::as_str)
+        .filter(|suffix| !suffix.is_empty())
+    else {
+        return;
+    };
+    let Some((prefix, suffix)) = text_layout::split_preedit_suffix(display_text, suffix) else {
+        return;
+    };
+    let registry = crate::font_face::FontRegistry::global();
+    let prefix_w: f32 = prefix
+        .chars()
+        .map(|ch| registry.style_char_advance(style, ch, style.font_size, font))
+        .sum();
+    let suffix_w: f32 = suffix
+        .chars()
+        .map(|ch| registry.style_char_advance(style, ch, style.font_size, font))
+        .sum();
+    if suffix_w <= 0.0 {
+        return;
+    }
+    draw_rect(
+        pixmap,
+        crate::layout::LayoutRect {
+            x: text_x + prefix_w,
+            y: underline_y,
+            width: suffix_w,
+            height: 1.5,
+        },
+        color,
+        0.0,
+        clip_mask,
+    );
 }
 
 fn draw_rect(
