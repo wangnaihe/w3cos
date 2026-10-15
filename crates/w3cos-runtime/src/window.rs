@@ -3255,6 +3255,10 @@ impl App {
             self.request_repaint();
         }
         self.layout_generation += 1;
+        // The flatten borrow of `self.root` ends with the last use of `flat`.
+        // Apply a one-shot label focus only on this final pass so a virtual-list
+        // remeasure does not consume the request against a stale tree.
+        self.apply_requested_focus();
         self.ensure_focused_input_visible();
     }
 
@@ -6369,6 +6373,21 @@ impl App {
         };
         if let Some(pos) = next_pos {
             self.set_focused_index(Some(self.focusable_indices[pos]));
+        }
+    }
+
+    fn apply_requested_focus(&mut self) {
+        let Some(label) = state::take_focus_label() else {
+            return;
+        };
+        let found = self.focusable_indices.iter().copied().find(|index| {
+            matches!(
+                self.get_kind_at(*index),
+                Some(ComponentKind::Button { label: current }) if current == &label
+            )
+        });
+        if let Some(index) = found {
+            self.set_focused_index(Some(index));
         }
     }
 

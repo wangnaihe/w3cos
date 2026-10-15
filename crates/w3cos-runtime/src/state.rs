@@ -360,6 +360,21 @@ pub fn take_focus_placeholder() -> Option<String> {
     FOCUS_PLACEHOLDER.with(|slot| slot.borrow_mut().take())
 }
 
+thread_local! {
+    static FOCUS_LABEL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Ask the next layout pass to focus the button with this label. One-shot:
+/// a later rebuild does not pull focus back.
+pub fn request_focus_label(label: &str) {
+    let label = label.to_string();
+    FOCUS_LABEL.with(|slot| *slot.borrow_mut() = Some(label));
+}
+
+pub fn take_focus_label() -> Option<String> {
+    FOCUS_LABEL.with(|slot| slot.borrow_mut().take())
+}
+
 /// All signal values in registration order (for UI tests).
 pub fn all_signal_values() -> Vec<i64> {
     STORE.with(|s| s.borrow().values.clone())
