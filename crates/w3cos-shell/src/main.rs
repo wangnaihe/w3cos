@@ -157,6 +157,12 @@ const OP_SOFTKEY: u8 = 87;
 const OP_IME_PAGE_PREV: u8 = 88;
 const OP_IME_PAGE_NEXT: u8 = 89;
 const OP_IME_ACTION: u8 = 90;
+const OP_SYNC_ALLOW: u8 = 91;
+const OP_SYNC_SKIP: u8 = 92;
+const OP_HANDOFF_CANCEL: u8 = 93;
+const OP_HANDOFF_REVEAL: u8 = 94;
+const OP_CLIP_MINE: u8 = 95;
+const OP_CLIP_THEIRS: u8 = 96;
 
 fn main() {
     shell_main();
@@ -1219,6 +1225,9 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::set_signal(RECEIPT_PAGE_SIGNAL, page);
         }
         OP_CLOCK => {
+            if handoff::note_clock() {
+                state::mark_dirty();
+            }
             let now = live_clock();
             let changed = LAST_CLOCK.with(|slot| {
                 let mut shown = slot.borrow_mut();
@@ -1274,25 +1283,49 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             push_toast(&locale::t("toast-clipboard-sync"));
             state::mark_dirty();
         }
+        OP_SYNC_ALLOW => {
+            let gating = handoff::scene_gate_open();
+            handoff::allow_current();
+            if gating {
+                send_handoff();
+            }
+            state::mark_dirty();
+        }
+        OP_SYNC_SKIP => {
+            let gating = handoff::scene_gate_open();
+            handoff::skip_current();
+            if gating {
+                send_handoff();
+            }
+            state::mark_dirty();
+        }
         OP_HANDOFF_LATER => {
             handoff::hide_banner();
             state::mark_dirty();
         }
         OP_HANDOFF_GO => {
-            let clipboard = if handoff::clipboard_sync_enabled() {
-                read_clipboard()
-            } else {
-                None
-            };
-            let sealed = handoff::begin_send(
-                receipt_entries(),
-                &state::get_signal_text(DRAFT_SIGNAL),
-                &state::get_signal_text(FILE_PREVIEW_SIGNAL),
-                false,
-                clipboard.as_deref(),
-            );
-            if sealed.is_none() {
-                push_toast(&locale::t("handoff-no-peer"));
+            if handoff::request_continue() {
+                send_handoff();
+            }
+            state::mark_dirty();
+        }
+        OP_HANDOFF_CANCEL => {
+            handoff::cancel_send();
+            state::mark_dirty();
+        }
+        OP_HANDOFF_REVEAL => {
+            handoff::reveal_incoming();
+            state::mark_dirty();
+        }
+        OP_CLIP_MINE => {
+            if let Some(text) = handoff::choose_clipboard(false) {
+                handoff::publish_clipboard(&text);
+            }
+            state::mark_dirty();
+        }
+        OP_CLIP_THEIRS => {
+            if let Some(text) = handoff::choose_clipboard(true) {
+                handoff::publish_clipboard(&text);
             }
             state::mark_dirty();
         }
@@ -1465,6 +1498,14 @@ fn apply_screen_override() {
             focus_app(1);
             handoff::demo_banner();
         }
+        Some("handoff-sending") => {
+            focus_app(1);
+            handoff::demo_sending();
+        }
+        Some("handoff-no-answer") => {
+            focus_app(1);
+            handoff::demo_no_answer();
+        }
         Some("handoff-phone") => {
             focus_app(0);
             handoff::demo_incoming();
@@ -1500,11 +1541,17 @@ fn build_shell() -> Component {
     if state::get_signal(SWITCHER_SIGNAL) != 0 && matches!(posture(), Posture::Phone) {
         column.push(chrome_layer(build_switcher()));
     }
-    if handoff::show_banner() && matches!(posture(), Posture::Desktop | Posture::WideTablet) {
+    if handoff::show_banner() && posture() != Posture::Phone {
         column.push(chrome_layer(build_handoff_banner()));
     }
     if handoff::incoming().is_some() {
         column.push(chrome_layer(build_handoff_incoming()));
+    }
+    if handoff::sync_prompt().is_some() {
+        column.push(modal_layer(build_sync_sheet()));
+    }
+    if handoff::clip_conflict().is_some() && !clip_sheet_inside_incoming() {
+        column.push(chrome_layer(build_clip_dock()));
     }
     if state::get_signal(TASKS_SIGNAL) != 0 && posture() == Posture::Desktop {
         column.push(dock_right(build_task_center()));
@@ -1967,6 +2014,52 @@ fn note_preedit(style: &mut Style, role: &str) {
 fn set_receipt_filter(kind: i64) {
     state::set_signal(RECEIPT_FILTER_SIGNAL, kind);
     state::set_signal(RECEIPT_PAGE_SIGNAL, 0);
+}
+
+fn send_handoff() {
+    let clipboard = if handoff::clipboard_sync_enabled() {
+        read_clipboard()
+    } else {
+        None
+    };
+    let sealed = handoff::begin_send(
+        receipt_entries(),
+        &state::get_signal_text(DRAFT_SIGNAL),
+        &state::get_signal_text(FILE_PREVIEW_SIGNAL),
+        false,
+        clipboard.as_deref(),
+    );
+    if sealed.is_none() {
+        push_toast(&locale::t("handoff-no-peer"));
+    }
+}
+
+fn handoff_notice_text(id: &str) -> String {
+    match id {
+        "handoff-no-answer" => locale::t_args(
+            "handoff-no-answer",
+            &[
+                ("peer", &handoff::handoff_target_name()),
+                ("here", &handoff::local_name()),
+            ],
+        ),
+        "handoff-incoming" => {
+            let from = handoff::incoming()
+                .map(|(name, _, _)| name)
+                .unwrap_or_default();
+            locale::t_args("handoff-incoming", &[("name", &from)])
+        }
+        other => locale::t(other),
+    }
+}
+
+fn clip_clock(unix: u64) -> String {
+    let day = unix % 86_400;
+    format!("{:02}:{:02}", day / 3600, (day % 3600) / 60)
+}
+
+fn clip_sheet_inside_incoming() -> bool {
+    handoff::incoming().is_some() && (handoff::incoming_revealed() || posture() != Posture::Phone)
 }
 
 fn read_clipboard() -> Option<String> {
@@ -3892,30 +3985,6 @@ fn settings_devices_page() -> Vec<Component> {
             OP_PAIR_YES,
             "#0c6d4c",
         ));
-    } else if handoff::choosing_sync() {
-        page.push(Component::text(
-            locale::t("pair-trusted"),
-            Style {
-                font_size: 14.0,
-                color: ink(),
-                ..Style::default()
-            },
-        ));
-        page.push(chrome_button(
-            locale::t("sync-receipts"),
-            OP_SYNC_RECEIPTS,
-            "#0c6d4c",
-        ));
-        page.push(chrome_button(
-            locale::t("sync-drafts"),
-            OP_SYNC_DRAFTS,
-            "#0c6d4c",
-        ));
-        page.push(chrome_button(
-            locale::t("sync-clipboard"),
-            OP_SYNC_CLIPBOARD,
-            "#0c6d4c",
-        ));
     } else if handoff::peers().is_empty() {
         page.push(Component::text(
             locale::t("devices-empty"),
@@ -3928,7 +3997,7 @@ fn settings_devices_page() -> Vec<Component> {
     } else {
         for peer in handoff::peers() {
             let state = if peer.trusted {
-                locale::t("pair-trusted")
+                locale::t("pair-trusted-short")
             } else {
                 locale::t("pair-pending")
             };
@@ -3942,20 +4011,27 @@ fn settings_devices_page() -> Vec<Component> {
             ));
         }
     }
-    if handoff::sending() {
-        page.push(Component::text(
-            locale::t("handoff-sending"),
-            Style {
-                font_size: 14.0,
-                color: ink(),
-                ..Style::default()
-            },
-        ));
+    if let Some(kind) = handoff::banner_kind() {
+        let copy = match kind {
+            handoff::BannerKind::Sending => locale::t("handoff-sending"),
+            handoff::BannerKind::NoAnswer => handoff_notice_text("handoff-no-answer"),
+            handoff::BannerKind::Offer => String::new(),
+        };
+        if !copy.is_empty() {
+            page.push(Component::text(
+                copy,
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
     }
     let notice = handoff::notice();
-    if !notice.is_empty() {
+    if !notice.is_empty() && notice != "handoff-sending" && notice != "handoff-no-answer" {
         page.push(Component::text(
-            locale::t(&notice),
+            handoff_notice_text(&notice),
             Style {
                 font_size: 13.0,
                 color: muted_ink(),
@@ -3966,101 +4042,396 @@ fn settings_devices_page() -> Vec<Component> {
     page
 }
 
+fn banner_anchor() -> (f32, f32, f32) {
+    let (width, _) = state::shell_viewport();
+    let title_h = if state::pointer_is_coarse() {
+        56.0
+    } else {
+        40.0
+    };
+    if posture() == Posture::Desktop {
+        let id = state::get_signal(APP_SIGNAL).clamp(1, 6);
+        let frame = windows::frame(id);
+        let top = frame.y + 6.0 + title_h;
+        let banner_w = (frame.w - 12.0).max(280.0);
+        (frame.x + 6.0, top, banner_w)
+    } else {
+        let left = 80.0;
+        ((left), title_h, (width - left - 16.0).max(280.0))
+    }
+}
+
+fn handoff_strip(children: Vec<Component>, width: f32) -> Component {
+    Component::row(
+        Style {
+            width: Dimension::Px(width),
+            padding: Edges::xy(14.0, 10.0),
+            gap: 12.0,
+            align_items: AlignItems::Center,
+            background: Color::from_hex("#1c2631"),
+            border_radius: 12.0,
+            border_width: 1.0,
+            border_color: Color::rgba(244, 241, 234, 31),
+            ..Style::default()
+        },
+        children,
+    )
+}
+
 fn build_handoff_banner() -> Component {
+    let (left, top, width) = banner_anchor();
+    let kind = handoff::banner_kind().unwrap_or(handoff::BannerKind::Offer);
+    let (copy, buttons) = match kind {
+        handoff::BannerKind::Offer => (
+            vec![
+                Component::text(
+                    locale::t("handoff-title"),
+                    Style {
+                        font_size: 15.0,
+                        font_weight: 700,
+                        color: ink(),
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    locale::t("handoff-detail"),
+                    Style {
+                        font_size: 12.0,
+                        color: muted_ink(),
+                        ..Style::default()
+                    },
+                ),
+            ],
+            vec![
+                chrome_button(locale::t("handoff-later"), OP_HANDOFF_LATER, "#3d5570"),
+                chrome_button(locale::t("handoff-go"), OP_HANDOFF_GO, "#0c6d4c"),
+            ],
+        ),
+        handoff::BannerKind::Sending => (
+            vec![Component::text(
+                locale::t("handoff-sending"),
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            )],
+            vec![chrome_button(
+                locale::t("handoff-cancel"),
+                OP_HANDOFF_CANCEL,
+                "#9a3412",
+            )],
+        ),
+        handoff::BannerKind::NoAnswer => (
+            vec![Component::text(
+                handoff_notice_text("handoff-no-answer"),
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            )],
+            vec![chrome_button(
+                locale::t("handoff-later"),
+                OP_HANDOFF_LATER,
+                "#3d5570",
+            )],
+        ),
+    };
+    let mut strip = handoff_strip(
+        vec![
+            Component::column(
+                Style {
+                    flex_grow: 1.0,
+                    gap: 2.0,
+                    min_width: Dimension::Px(0.0),
+                    ..Style::default()
+                },
+                copy,
+            ),
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    flex_shrink: 0.0,
+                    align_items: AlignItems::Center,
+                    ..Style::default()
+                },
+                buttons,
+            ),
+        ],
+        width,
+    );
+    strip.style.position = Position::Absolute;
+    strip.style.left = Dimension::Px(left);
+    strip.style.top = Dimension::Px(top);
+    strip.style.z_index = CHROME_Z + 1;
+    strip
+}
+
+fn build_sync_sheet() -> Component {
+    let surface = handoff::sync_prompt().unwrap_or(handoff::SyncSurface::Receipts);
+    let (title, detail) = match surface {
+        handoff::SyncSurface::Receipts => ("sync-receipts-title", "sync-receipts-detail"),
+        handoff::SyncSurface::Drafts => ("sync-drafts-title", "sync-drafts-detail"),
+        handoff::SyncSurface::Scene => ("sync-scene-title", "sync-scene-detail"),
+        handoff::SyncSurface::Clipboard => ("sync-clipboard-title", "sync-clipboard-detail"),
+    };
+    dialog_shell(vec![
+        Component::text(
+            locale::t(title),
+            Style {
+                font_size: 18.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t(detail),
+            Style {
+                font_size: 13.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                justify_content: JustifyContent::FlexEnd,
+                ..Style::default()
+            },
+            vec![
+                sheet_button(locale::t("sync-ask-skip"), OP_SYNC_SKIP, SheetKind::Danger),
+                sheet_button(
+                    locale::t("sync-ask-allow"),
+                    OP_SYNC_ALLOW,
+                    SheetKind::Primary,
+                ),
+            ],
+        ),
+    ])
+}
+
+fn clip_sheet_rows() -> Vec<Component> {
+    let Some((local, remote)) = handoff::clip_conflict() else {
+        return Vec::new();
+    };
+    let row = |side: &handoff::ClipSide, code: u8| {
+        Component::column(
+            Style {
+                gap: 4.0,
+                padding: Edges::all(10.0),
+                border_radius: 12.0,
+                background: Color::rgba(244, 241, 234, 10),
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    locale::t_args(
+                        "clip-conflict-row",
+                        &[("device", &side.device), ("when", &clip_clock(side.unix))],
+                    ),
+                    Style {
+                        font_size: 13.0,
+                        font_weight: 650,
+                        color: ink(),
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    side.text.clone(),
+                    Style {
+                        font_size: 13.0,
+                        color: muted_ink(),
+                        ..Style::default()
+                    },
+                ),
+                chrome_button(locale::t("clip-use"), code, "#0c6d4c"),
+            ],
+        )
+    };
+    vec![
+        Component::text(
+            locale::t("clip-conflict-title"),
+            Style {
+                font_size: 16.0,
+                font_weight: 700,
+                color: Color::from_hex("#f0d7b4"),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t("clip-conflict-detail"),
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        row(&local, OP_CLIP_MINE),
+        row(&remote, OP_CLIP_THEIRS),
+    ]
+}
+
+fn build_clip_dock() -> Component {
+    let (width, height) = state::shell_viewport();
+    let dock_w = 420.0_f32.min((width - 24.0).max(280.0));
     let mut card = Component::column(
         Style {
-            width: Dimension::Px(420.0),
-            padding: Edges::all(16.0),
+            width: Dimension::Px(dock_w),
+            padding: Edges::all(14.0),
             gap: 8.0,
             background: Color::from_hex("#1c2631"),
             border_radius: 16.0,
+            border_width: 1.0,
+            border_color: Color::rgba(244, 241, 234, 31),
+            ..Style::default()
+        },
+        clip_sheet_rows(),
+    );
+    card.style.position = Position::Absolute;
+    card.style.left = Dimension::Px(((width - dock_w) / 2.0).max(12.0));
+    card.style.bottom = Dimension::Px(24.0);
+    card.style.top = Dimension::Auto;
+    card.style.z_index = CHROME_Z + 1;
+    card.style.max_height = Dimension::Px((height * 0.42).max(160.0));
+    card
+}
+
+fn build_handoff_notice() -> Component {
+    let (from, _, _) = handoff::incoming().unwrap_or_default();
+    let (width, _) = state::shell_viewport();
+    let card_w = 420.0_f32.min((width - 24.0).max(240.0));
+    let mut card = Component::row(
+        Style {
+            width: Dimension::Px(card_w),
+            padding: Edges::xy(14.0, 12.0),
+            gap: 12.0,
+            align_items: AlignItems::Center,
+            background: Color::from_hex("#1c2631"),
+            border_radius: 16.0,
+            border_width: 1.0,
+            border_color: Color::rgba(240, 215, 180, 90),
             ..Style::default()
         },
         vec![
             Component::text(
-                locale::t("handoff-title"),
+                locale::t_args("handoff-incoming", &[("name", &from)]),
                 Style {
-                    font_size: 16.0,
-                    font_weight: 700,
+                    flex_grow: 1.0,
+                    font_size: 14.0,
+                    font_weight: 650,
                     color: ink(),
                     ..Style::default()
                 },
             ),
-            Component::text(
-                locale::t("handoff-detail"),
-                Style {
-                    font_size: 13.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            chrome_button(locale::t("handoff-later"), OP_HANDOFF_LATER, "#3d5570"),
-            chrome_button(locale::t("handoff-go"), OP_HANDOFF_GO, "#0c6d4c"),
+            chrome_button(locale::t("handoff-reveal"), OP_HANDOFF_REVEAL, "#0c6d4c"),
         ],
     );
-    let (width, _) = state::shell_viewport();
     card.style.position = Position::Absolute;
-    card.style.left = Dimension::Px(((width - 420.0) / 2.0).max(16.0));
-    card.style.top = Dimension::Px(24.0);
+    card.style.left = Dimension::Px(12.0);
+    card.style.top = Dimension::Px(12.0);
     card.style.z_index = CHROME_Z + 1;
     card
 }
 
+fn handoff_page_body(from: &str, path: &str, draft: &str) -> Vec<Component> {
+    let mut rows = vec![
+        Component::text(
+            locale::t_args("handoff-from", &[("name", from)]),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            path.to_string(),
+            Style {
+                font_size: 14.0,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            draft.to_string(),
+            Style {
+                font_size: 14.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t_args(
+                "handoff-l2-still-off",
+                &[("here", &handoff::local_name()), ("there", from)],
+            ),
+            Style {
+                font_size: 13.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                ..Style::default()
+            },
+            vec![
+                chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
+                chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
+            ],
+        ),
+    ];
+    if handoff::clip_conflict().is_some() {
+        rows.push(Component::column(
+            Style {
+                gap: 8.0,
+                margin: Edges {
+                    top: Spacing::Px(8.0),
+                    ..Edges::ZERO
+                },
+                ..Style::default()
+            },
+            clip_sheet_rows(),
+        ));
+    }
+    rows
+}
+
 fn build_handoff_incoming() -> Component {
+    if posture() == Posture::Phone && !handoff::incoming_revealed() {
+        return build_handoff_notice();
+    }
     let (from, path, draft) = handoff::incoming().unwrap_or_default();
     let (width, height) = state::shell_viewport();
+    let phone = posture() == Posture::Phone;
     let mut card = Component::column(
         Style {
-            padding: Edges::all(20.0),
+            padding: Edges::all(if phone { 20.0 } else { 16.0 }),
             gap: 12.0,
             background: Color::from_hex("#1c2631"),
-            border_radius: 22.0,
+            border_radius: if phone { 0.0 } else { 16.0 },
+            overflow: Overflow::Auto,
             ..Style::default()
         },
-        vec![
-            Component::text(
-                locale::t_args("handoff-from", &[("name", &from)]),
-                Style {
-                    font_size: 20.0,
-                    font_weight: 700,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                path,
-                Style {
-                    font_size: 14.0,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                draft,
-                Style {
-                    font_size: 14.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                locale::t("handoff-l2-still-off"),
-                Style {
-                    font_size: 13.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
-            chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
-        ],
+        handoff_page_body(&from, &path, &draft),
     );
     card.style.position = Position::Absolute;
-    card.style.left = Dimension::Px(16.0);
-    card.style.top = Dimension::Px(24.0);
-    card.style.width = Dimension::Px((width - 32.0).max(200.0));
-    card.style.max_height = Dimension::Px((height - 120.0).max(240.0));
     card.style.z_index = CHROME_Z + 1;
+    if phone {
+        card.style.left = Dimension::Px(0.0);
+        card.style.top = Dimension::Px(0.0);
+        card.style.width = Dimension::Px(width);
+        card.style.height = Dimension::Px(height);
+    } else {
+        let card_w = 440.0_f32.min((width - 32.0).max(280.0));
+        card.style.left = Dimension::Px(((width - card_w) / 2.0).max(16.0));
+        card.style.top = Dimension::Px(72.0);
+        card.style.width = Dimension::Px(card_w);
+        card.style.max_height = Dimension::Px((height - 120.0).max(280.0));
+    }
     card
 }
 
@@ -6592,5 +6963,187 @@ mod shell_ux_tests {
         ime_bar::reset_for_tests();
         state::clear_ime_field();
         locale::set_locale("en");
+    }
+
+    fn button_labels(root: &Component) -> Vec<String> {
+        let mut labels = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label } = &node.kind
+                && !label.is_empty()
+            {
+                labels.push(label.clone());
+            }
+        });
+        labels
+    }
+
+    fn text_blob(root: &Component) -> String {
+        let mut parts = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind {
+                parts.push(content.clone());
+            }
+            if let ComponentKind::Button { label } = &node.kind {
+                parts.push(label.clone());
+            }
+        });
+        parts.join("\n")
+    }
+
+    #[test]
+    fn strangers_show_a_grouped_code_and_are_not_connected() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        handoff::demo_pending();
+        let page = Component::column(Style::default(), settings_devices_page());
+        let blob = text_blob(&page);
+        assert!(blob.contains("待核对"), "{blob}");
+        assert!(!blob.contains("已连接"), "{blob}");
+        assert!(blob.contains("数字不同"));
+        assert!(blob.contains("数字一致，信任这台"));
+        assert!(
+            blob.contains(' ') && blob.chars().filter(|ch| ch.is_ascii_digit()).count() >= 6,
+            "{blob}"
+        );
+        let peer = handoff::pending_peer().expect("pending");
+        let (grouped, _) = handoff::short_code(
+            &handoff::local_fingerprint(),
+            &peer.fingerprint,
+            &peer.nonce,
+        );
+        assert!(blob.contains(&grouped), "{grouped} missing from {blob}");
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn sync_sheet_asks_one_surface_and_does_not_enable_the_rest() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        handoff::demo_pending();
+        assert!(handoff::codes_match());
+        let sheet = build_sync_sheet();
+        let blob = text_blob(&sheet);
+        assert!(blob.contains("同步收据？"), "{blob}");
+        assert!(blob.contains("不允许"));
+        assert!(blob.contains("允许这一面"));
+        assert!(!blob.contains("同步场景？"));
+        assert!(!handoff::sync_receipts_enabled());
+        assert!(!handoff::sync_scene_enabled());
+        assert!(!handoff::clipboard_sync_enabled());
+        on_shell_intent(OP_SYNC_SKIP, "");
+        let next = text_blob(&build_sync_sheet());
+        assert!(next.contains("同步未执行的草稿？"), "{next}");
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn continue_banner_sits_under_the_title_bar_and_is_not_a_scrim() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        ensure_shell_signals();
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 1);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        handoff::demo_banner();
+        let banner = build_handoff_banner();
+        let frame = windows::frame(1);
+        let title_h = if state::pointer_is_coarse() {
+            56.0
+        } else {
+            40.0
+        };
+        assert_eq!(px(banner.style.top), frame.y + 6.0 + title_h);
+        assert!(px(banner.style.width) < 1200.0 - 40.0);
+        assert_eq!(banner.kind, ComponentKind::Row);
+        let labels = button_labels(&banner);
+        assert!(labels.iter().any(|label| label == "不是现在"));
+        assert!(labels.iter().any(|label| label == "继续"));
+        let blob = text_blob(&banner);
+        assert!(blob.contains("在手机上继续"), "{blob}");
+        assert!(!blob.contains("已连接"));
+        let shell = format!("{:?}", build_shell());
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!shell.contains(hex), "{hex}");
+        }
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn phone_receive_page_opens_the_file_without_confirming() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _name = EnvFlag::set("W3COS_DEVICE_NAME", "手机");
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        ensure_shell_signals();
+        state::note_shell_viewport(390.0, 760.0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_text_signal(DRAFT_SIGNAL, "把这段改成夜间模式");
+        handoff::demo_incoming();
+        let hidden = build_handoff_incoming();
+        assert_eq!(px(hidden.style.height), 760.0);
+        let labels = button_labels(&hidden);
+        let open_at = labels
+            .iter()
+            .position(|label| label == "打开文件")
+            .expect("open");
+        let clip_at = labels
+            .iter()
+            .position(|label| label == "用这份")
+            .expect("clip");
+        assert!(open_at < clip_at, "{labels:?}");
+        let blob = text_blob(&hidden);
+        assert!(blob.contains("从书桌继续"), "{blob}");
+        assert!(blob.contains("/docs/notes.txt"));
+        assert!(blob.contains("把这段改成夜间模式"));
+        assert!(blob.contains("L2 在这台手机上仍然关闭"));
+        assert!(blob.contains("书桌上的确认不会自动生效"));
+        assert!(blob.contains("剪贴板有两份"));
+        on_shell_intent(OP_HANDOFF_OPEN, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+        assert_eq!(state::get_signal_text(DRAFT_SIGNAL), "把这段改成夜间模式");
+        assert_eq!(state::get_signal(APP_SIGNAL), 1);
+        assert!(handoff::incoming().is_none());
+        assert!(handoff::clip_conflict().is_some());
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn an_unrevealed_phone_handoff_is_a_notification() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        ensure_shell_signals();
+        state::note_shell_viewport(390.0, 760.0);
+        let peer = handoff::DeviceKey::from_seed([8; 32]);
+        let payload = handoff::SyncPayload {
+            receipts: Vec::new(),
+            draft: "把这段改成夜间模式".to_string(),
+            path: "/docs/notes.txt".to_string(),
+            clipboard: None,
+        };
+        let sealed = handoff::seal(&peer, &handoff::local_public(), &payload).unwrap();
+        assert!(handoff::receive_sealed(
+            &peer.public_bytes(),
+            "书桌",
+            &sealed,
+            None,
+        ));
+        let notice = build_handoff_incoming();
+        let blob = text_blob(&notice);
+        assert!(blob.contains("书桌想把文件交过来。"), "{blob}");
+        assert!(blob.contains("查看"));
+        assert!(!blob.contains("打开文件"), "{blob}");
+        on_shell_intent(OP_HANDOFF_REVEAL, "");
+        let page = text_blob(&build_handoff_incoming());
+        assert!(page.contains("打开文件"), "{page}");
+        assert!(page.contains("从书桌继续"));
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
     }
 }
