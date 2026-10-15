@@ -1522,11 +1522,15 @@ fn apply_screen_override() {
             state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
             state::set_text_signal(
                 RECEIPT_SIGNAL,
-                "#4 allowed open-files tier=L0 actor=local confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
-                 #3 cancelled night-mode tier=L1 actor=local confirmed=false ts=1760515200000 — 你取消了，没有执行 @@ 夜间模式\n\
-                 #2 denied echo tier=L0 actor=local confirmed=true ts=1760511600000 — 当时还锁着 @@ 在终端运行 echo\n\
-                 #1 unrecognized summarize tier=L0 actor=local confirmed=false ts=1760508000000 — 没有对应命令 @@ 把这段总结一下",
+                "#4 allowed open-files tier=L0 actor=did:key:z6MkhaXgExample confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
+                 #3 unrecognized summarize tier=L2 actor=did:key:z6MkOLD confirmed=false ts=1760515200000 — 没有对应命令 @@ 把这段总结一下\n\
+                 #2 cancelled night-mode tier=L1 actor=did:key:z6MkhaXgExample confirmed=false ts=1760511600000 — 你取消了，没有执行 @@ 夜间模式\n\
+                 #1 denied echo tier=L0 actor=did:key:z6MkhaXgExample confirmed=true ts=1760508000000 — 当时还锁着 @@ 在终端运行 echo",
             );
+        }
+        Some("receipts-empty") => {
+            state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+            state::set_text_signal(RECEIPT_SIGNAL, "");
         }
         Some("confirm") => {
             focus_app(1);
@@ -1763,24 +1767,29 @@ fn intent_block_top(height: f32) -> f32 {
 
 fn place_receipts(mut panel: Component) -> Component {
     let (width, height) = state::shell_viewport();
-    let phone = posture() == Posture::Phone;
-    let panel_w = if phone {
-        340.0_f32.min(width)
-    } else {
-        400.0_f32.min((width - 48.0).max(280.0))
-    };
-    let top = if phone { 0.0 } else { 24.0 };
-    let bottom = (intent_block_top(height) - 12.0).max(top);
     panel.style.position = Position::Absolute;
-    panel.style.left = Dimension::Px(if phone {
-        (width - panel_w).max(0.0)
-    } else {
-        (width - panel_w - 24.0).max(8.0)
-    });
+    panel.style.z_index = CHROME_Z + 1;
+    if posture() == Posture::Phone {
+        let top = 56.0_f32.min((height * 0.22).max(48.0));
+        panel.style.left = Dimension::Px(0.0);
+        panel.style.top = Dimension::Px(top);
+        panel.style.width = Dimension::Px(width);
+        panel.style.height = Dimension::Px((height - top).max(240.0));
+        panel.style.border_radius = 22.0;
+        panel.style.border_top_left_radius = Some(22.0);
+        panel.style.border_top_right_radius = Some(22.0);
+        panel.style.border_bottom_left_radius = Some(0.0);
+        panel.style.border_bottom_right_radius = Some(0.0);
+        return panel;
+    }
+    let panel_w = 400.0_f32.min((width - 48.0).max(280.0));
+    let top = 24.0;
+    let bottom = (intent_block_top(height) - 12.0).max(top);
+    panel.style.left = Dimension::Px((width - panel_w - 24.0).max(8.0));
     panel.style.top = Dimension::Px(top);
     panel.style.width = Dimension::Px(panel_w);
     panel.style.height = Dimension::Px(bottom - top);
-    panel.style.z_index = CHROME_Z + 1;
+    panel.style.border_radius = 16.0;
     panel
 }
 
@@ -2272,6 +2281,7 @@ struct ReceiptParts {
     decision: String,
     command: String,
     tier: String,
+    actor: String,
     detail: String,
     recorded_at: String,
     utterance: String,
@@ -2285,10 +2295,13 @@ fn parse_receipt(line: &str) -> ReceiptParts {
     let decision = tokens.next().unwrap_or("").to_string();
     let command = tokens.next().unwrap_or("").to_string();
     let mut tier = String::new();
+    let mut actor = String::new();
     let mut recorded_at = String::new();
     for token in tokens {
         if let Some(value) = token.strip_prefix("tier=") {
             tier = value.to_string();
+        } else if let Some(value) = token.strip_prefix("actor=") {
+            actor = value.to_string();
         } else if let Some(value) = token.strip_prefix("ts=") {
             recorded_at = value.to_string();
         }
@@ -2298,6 +2311,7 @@ fn parse_receipt(line: &str) -> ReceiptParts {
         decision,
         command,
         tier,
+        actor,
         detail: detail.to_string(),
         recorded_at,
         utterance: utterance.to_string(),
@@ -2326,6 +2340,26 @@ fn decision_label(decision: &str) -> String {
         "denied" => locale::t("decision-denied"),
         "cancelled" => locale::t("decision-cancelled"),
         "unrecognized" => locale::t("decision-unrecognized"),
+        other => other.to_string(),
+    }
+}
+
+fn decision_colors(decision: &str) -> (Color, Color) {
+    match decision {
+        "allowed" => (Color::from_hex("#0c6d4c"), Color::from_hex("#e9fff5")),
+        "denied" => (Color::from_hex("#9a3412"), Color::from_hex("#ffe8e4")),
+        "cancelled" => (Color::from_hex("#b45309"), Color::from_hex("#fff4d6")),
+        "unrecognized" => (Color::from_hex("#1d4e89"), Color::from_hex("#e7f1ff")),
+        _ => (Color::from_hex("#31475e"), Color::from_hex("#f4f7fb")),
+    }
+}
+
+fn layer_label(tier: &str) -> String {
+    match tier {
+        "L0" => locale::t("layer-l0"),
+        "L1" => locale::t("layer-l1"),
+        "L2" => locale::t("layer-l2"),
+        "" => String::new(),
         other => other.to_string(),
     }
 }
@@ -6290,90 +6324,106 @@ fn filter_chip(key: &str, code: u8, selected: bool) -> Component {
 
 fn receipt_row(line: &str) -> Component {
     let parts = parse_receipt(line);
-    let (pill_bg, pill_fg) = match parts.decision.as_str() {
-        "allowed" => (Color::rgba(20, 150, 106, 46), Color::from_hex("#c9ffe4")),
-        "denied" => (Color::rgba(224, 122, 120, 41), Color::from_hex("#ffd0cf")),
-        "cancelled" => (Color::rgba(226, 164, 92, 41), Color::from_hex("#ffe1b5")),
-        _ => (Color::rgba(244, 241, 234, 20), muted_token()),
-    };
+    let (pill_bg, pill_fg) = decision_colors(&parts.decision);
     let clock = format_receipt_clock(&parts.recorded_at);
-    let said = if parts.utterance.is_empty() {
+    let clock = if clock.is_empty() {
+        "—".to_string()
+    } else {
+        clock
+    };
+    let summary = if !parts.utterance.is_empty() {
+        parts.utterance.clone()
+    } else if !parts.detail.is_empty() {
         parts.detail.clone()
     } else {
-        parts.utterance.clone()
+        parts.command.clone()
     };
-    let mut subtitle_bits = Vec::new();
-    if !clock.is_empty() {
-        subtitle_bits.push(clock);
+    let layer = layer_label(&parts.tier);
+    let actor = if parts.actor.is_empty() {
+        String::new()
+    } else {
+        truncate_middle(&parts.actor, 22)
+    };
+    let meta = if actor.is_empty() {
+        locale::t_args("receipt-meta", &[("layer", &layer), ("id", &parts.id)])
+    } else {
+        locale::t_args(
+            "receipt-meta-actor",
+            &[("layer", &layer), ("id", &parts.id), ("actor", &actor)],
+        )
+    };
+    let show_result = !parts.detail.is_empty() && parts.detail != summary;
+    let mut lines = vec![
+        Component::row(
+            Style {
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                gap: 8.0,
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    clock,
+                    Style {
+                        font_size: 12.0,
+                        color: faint_token(),
+                        flex_shrink: 0.0,
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    decision_label(&parts.decision),
+                    Style {
+                        font_size: 12.0,
+                        font_weight: 650,
+                        color: pill_fg,
+                        background: pill_bg,
+                        border_radius: 999.0,
+                        padding: Edges::xy(8.0, 2.0),
+                        flex_shrink: 0.0,
+                        ..Style::default()
+                    },
+                ),
+            ],
+        ),
+        Component::text(
+            summary,
+            Style {
+                font_size: 14.0,
+                font_weight: 650,
+                color: ink_token(),
+                ..Style::default()
+            },
+        ),
+    ];
+    if show_result {
+        lines.push(Component::text(
+            locale::t_args("receipt-result", &[("text", &parts.detail)]),
+            Style {
+                font_size: 12.0,
+                color: muted_token(),
+                ..Style::default()
+            },
+        ));
     }
-    if !parts.tier.is_empty() {
-        subtitle_bits.push(parts.tier.clone());
-    }
-    if !said.is_empty() {
-        subtitle_bits.push(said);
-    }
-    let subtitle = subtitle_bits.join(" · ");
-    Component::row(
+    lines.push(Component::text(
+        meta,
         Style {
-            gap: 8.0,
-            align_items: AlignItems::Center,
-            padding: Edges::xy(8.0, 10.0),
-            border_width: 0.0,
-            border_color: Color::rgba(244, 241, 234, 31),
+            font_size: 12.0,
+            color: faint_token(),
+            font_family: Some("ui-monospace, monospace".to_string()),
             ..Style::default()
         },
-        vec![
-            Component::text(
-                parts.id,
-                Style {
-                    width: Dimension::Px(52.0),
-                    font_size: 12.0,
-                    color: faint_token(),
-                    flex_shrink: 0.0,
-                    ..Style::default()
-                },
-            ),
-            Component::column(
-                Style {
-                    flex_grow: 1.0,
-                    min_width: Dimension::Px(0.0),
-                    gap: 2.0,
-                    ..Style::default()
-                },
-                vec![
-                    Component::text(
-                        parts.command,
-                        Style {
-                            font_size: 13.0,
-                            font_weight: 650,
-                            color: ink_token(),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        subtitle,
-                        Style {
-                            font_size: 12.0,
-                            color: faint_token(),
-                            ..Style::default()
-                        },
-                    ),
-                ],
-            ),
-            Component::text(
-                decision_label(&parts.decision),
-                Style {
-                    font_size: 12.0,
-                    font_weight: 650,
-                    color: pill_fg,
-                    background: pill_bg,
-                    border_radius: 999.0,
-                    padding: Edges::xy(8.0, 2.0),
-                    flex_shrink: 0.0,
-                    ..Style::default()
-                },
-            ),
-        ],
+    ));
+    Component::column(
+        Style {
+            gap: 4.0,
+            padding: Edges::xy(10.0, 10.0),
+            background: Color::rgba(244, 241, 234, 10),
+            border_radius: 12.0,
+            ..Style::default()
+        },
+        lines,
     )
 }
 
@@ -6450,13 +6500,7 @@ fn build_switcher() -> Component {
 }
 
 fn build_receipts_viewer() -> Component {
-    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
-    let storage_label = if storage_owned.is_empty() {
-        "memory".to_string()
-    } else {
-        storage_owned
-    };
-    let subject_label = truncate_middle(&current_subject(), 22);
+    let subject_label = truncate_middle(&current_subject(), 24);
     let entries = visible_receipts();
     let pages = receipt_page_count(entries.len());
     let page = state::get_signal(RECEIPT_PAGE_SIGNAL).clamp(0, pages - 1);
@@ -6494,7 +6538,7 @@ fn build_receipts_viewer() -> Component {
             ],
         ),
         Component::button_with_click(
-            format!("{subject_label} · {storage_label}"),
+            subject_label,
             Style {
                 background: Color::TRANSPARENT,
                 color: muted_token(),
@@ -6524,7 +6568,9 @@ fn build_receipts_viewer() -> Component {
                 filter_chip("filter-cancelled", OP_FILTER_CANCELLED, filter == 3),
             ],
         ),
-        Component::row(
+    ];
+    if pages > 1 {
+        body.push(Component::row(
             Style {
                 gap: 8.0,
                 align_items: AlignItems::Center,
@@ -6545,8 +6591,8 @@ fn build_receipts_viewer() -> Component {
                 ),
                 action_button(locale::t("receipt-next"), OP_RECEIPT_NEXT, SheetKind::Ghost),
             ],
-        ),
-    ];
+        ));
+    }
     if entries.is_empty() {
         let empty_key = if filter == 0 {
             "receipt-empty-long"
@@ -6640,6 +6686,7 @@ mod shell_ux_tests {
         assert_eq!(parts.command, "open-files");
         assert_eq!(parts.tier, "L0");
         assert_eq!(parts.detail, "opened");
+        assert_eq!(parts.actor, "me");
         assert!(parts.recorded_at.is_empty());
         assert!(parts.utterance.is_empty());
         let stamped = parse_receipt(
@@ -6822,16 +6869,30 @@ mod shell_ux_tests {
     #[test]
     fn receipts_drawer_stops_above_the_intent_bar() {
         let _guard = POSTURE_LOCK.lock().unwrap();
-        for (width, height) in [(1200.0, 800.0), (390.0, 760.0)] {
-            state::note_shell_viewport(width, height);
-            let panel = place_receipts(Component::column(Style::default(), vec![]));
-            let bottom = px(panel.style.top) + px(panel.style.height);
-            let intent_top = px(floating_intent().style.top);
-            assert!(
-                bottom <= intent_top - 8.0,
-                "{width}x{height}: drawer ends at {bottom}, intent starts at {intent_top}"
-            );
-        }
+        state::note_shell_viewport(1200.0, 800.0);
+        let panel = place_receipts(Component::column(Style::default(), vec![]));
+        let bottom = px(panel.style.top) + px(panel.style.height);
+        let intent_top = px(floating_intent().style.top);
+        assert!(
+            bottom <= intent_top - 8.0,
+            "drawer ends at {bottom}, intent starts at {intent_top}"
+        );
+        assert!(
+            px(panel.style.left) > 400.0,
+            "desktop drawer stays on the right"
+        );
+        assert!(px(panel.style.width) <= 420.0);
+        state::note_shell_viewport(390.0, 760.0);
+        let sheet = place_receipts(Component::column(Style::default(), vec![]));
+        assert_eq!(px(sheet.style.left), 0.0);
+        assert!(
+            px(sheet.style.top) >= 48.0,
+            "phone sheet leaves the status area"
+        );
+        assert_eq!(px(sheet.style.width), 390.0);
+        assert_eq!(sheet.style.border_top_left_radius, Some(22.0));
+        assert_eq!(sheet.style.border_bottom_left_radius, Some(0.0));
+        state::note_shell_viewport(1200.0, 800.0);
     }
 
     #[test]
@@ -7502,5 +7563,116 @@ mod shell_ux_tests {
         ime_bar::reset_for_tests();
         state::clear_ime_field();
         locale::set_locale("en");
+    }
+
+    fn decision_face(decision: &str) -> (Color, Color) {
+        let line = format!(
+            "#9 {decision} open-files tier=L0 actor=did:key:z6MkOLD confirmed=true ts=1760518800000 — 已记下 @@ 打开文件"
+        );
+        let row = receipt_row(&line);
+        let word = decision_label(decision);
+        let mut found = None;
+        walk(&row, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind
+                && content == &word
+            {
+                found = Some((node.style.background, node.style.color));
+            }
+        });
+        found.expect("decision pill")
+    }
+
+    #[test]
+    fn receipts_show_four_decisions_and_keep_the_written_subject() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+        state::set_signal(RECEIPT_FILTER_SIGNAL, 0);
+        state::set_text_signal(RECEIPT_QUERY_SIGNAL, "");
+        state::set_text_signal(
+            RECEIPT_SIGNAL,
+            "#4 allowed open-files tier=L0 actor=did:key:z6MkOLD confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
+             #3 cancelled night-mode tier=L1 actor=did:key:z6MkOLD confirmed=false ts=1760515200000 — 你取消了，没有执行 @@ 夜间模式\n\
+             #2 denied echo tier=L0 actor=did:key:z6MkOLD confirmed=true ts=1760511600000 — 当时还锁着 @@ 在终端运行 echo\n\
+             #1 unrecognized summarize tier=L2 actor=did:key:z6MkOLD confirmed=false ts=1760508000000 — 没有对应命令 @@ 把这段总结一下",
+        );
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkNEWCURRENTSUBJECT");
+        let viewer = build_receipts_viewer();
+        let blob = text_blob(&viewer);
+        for word in [
+            "允许",
+            "拒绝",
+            "取消",
+            "未识别",
+            "打开文件",
+            "夜间模式",
+            "在终端运行 echo",
+            "把这段总结一下",
+        ] {
+            assert!(blob.contains(word), "{word} missing from {blob}");
+        }
+        assert!(blob.contains("L0 规则"), "{blob}");
+        assert!(blob.contains("L1 同义"), "{blob}");
+        assert!(blob.contains("L2 规划"), "{blob}");
+        assert!(blob.contains("结果 · 已切换到文件"), "{blob}");
+        assert!(blob.contains("did:key:z6MkOLD"), "{blob}");
+        assert!(blob.contains(':'));
+        let labels = button_labels(&viewer);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("did:key:z6Mk") && label.contains("SUBJECT")),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|label| label.contains("z6MkOLD")));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("删除") || label == "Delete")
+        );
+        assert_eq!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("did:key:z6MkOLD"),
+            true
+        );
+        copy_subject();
+        let copied = COPIED_SUBJECT.with(|slot| slot.borrow().clone());
+        assert_eq!(copied, "did:key:z6MkNEWCURRENTSUBJECT");
+
+        let allowed = decision_face("allowed");
+        let denied = decision_face("denied");
+        let cancelled = decision_face("cancelled");
+        let unrecognized = decision_face("unrecognized");
+        let faces = [allowed, denied, cancelled, unrecognized];
+        for (index, face) in faces.iter().enumerate() {
+            assert!(faces.iter().skip(index + 1).all(|other| other.0 != face.0));
+            assert!(face.0.g > 20 || face.0.r > 20 || face.0.b > 20);
+        }
+        assert!(allowed.0.g > allowed.0.r);
+        assert!(denied.0.r > denied.0.g);
+        assert!(cancelled.0.r > cancelled.0.b);
+        assert!(unrecognized.0.b > unrecognized.0.r);
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{viewer:?}").contains(hex), "{hex}");
+        }
+
+        on_shell_intent(OP_FILTER_DENIED, "");
+        let filtered = text_blob(&build_receipts_viewer());
+        assert!(filtered.contains("当时还锁着"), "{filtered}");
+        assert!(filtered.contains("拒绝"), "{filtered}");
+        assert!(!filtered.contains("打开文件"), "{filtered}");
+        assert!(!filtered.contains("未识别"), "{filtered}");
+
+        state::set_text_signal(RECEIPT_SIGNAL, "");
+        state::set_signal(RECEIPT_FILTER_SIGNAL, 0);
+        let empty = text_blob(&build_receipts_viewer());
+        assert!(
+            empty
+                .contains("还没有收据。你确认并执行之后，每一条会出现在这里。取消和拒绝也会留下。"),
+            "{empty}"
+        );
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
     }
 }
