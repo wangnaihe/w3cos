@@ -12146,7 +12146,9 @@ fn principal_box_can_merge_generated_inline_text(style: &w3cos_std::style::Style
             .background_image
             .as_deref()
             .is_none_or(|image| image.eq_ignore_ascii_case("none"))
-        && style.box_shadow.is_none()
+        && !style.has_box_shadow()
+        && style.backdrop_blur.is_none()
+        && style.text_shadows.is_empty()
         && style.filter.is_none()
         && style.opacity == 1.0
         && style.transform == Transform2D::default()

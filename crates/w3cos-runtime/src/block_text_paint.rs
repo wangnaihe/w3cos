@@ -32,6 +32,8 @@ pub(crate) fn replay<'a>(
             text.background = w3cos_std::Color::TRANSPARENT;
             text.background_image = None;
             text.box_shadow = None;
+            text.box_shadows.clear();
+            text.backdrop_blur = None;
             // Widths remain: text inset and background origin use the box.
             text.border_color = w3cos_std::Color::TRANSPARENT;
             text.border_top_color = Some(w3cos_std::Color::TRANSPARENT);

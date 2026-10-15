@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skrifa::MetadataProvider;
-use vello::kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
+use vello::kurbo::{Affine, BezPath, Rect, RoundedRect, Shape, Stroke};
 use vello::peniko::{
     Blob, Color, Fill, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
 };
@@ -41,6 +41,7 @@ thread_local! {
     static IMAGE_BRUSHES: RefCell<HashMap<usize, ImageBrush>> = RefCell::new(HashMap::new());
     static GPU_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
     static GPU_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
+    static GPU_FRAME_SCALE: Cell<f32> = const { Cell::new(1.0) };
 }
 
 pub(crate) fn gpu_image_upload_count() -> u64 {
@@ -326,7 +327,9 @@ fn display_chunk_key(kind: &ComponentKind, style: &Style, width: f32, height: f3
         kind,
         ComponentKind::Text { .. } | ComponentKind::Button { .. }
     ) || style.filter.is_some()
-        || style.box_shadow.is_some()
+        || style.has_box_shadow()
+        || style.backdrop_blur.is_some()
+        || !style.text_shadows.is_empty()
         || style.transform != w3cos_std::style::Transform2D::IDENTITY
     {
         return None;
@@ -457,6 +460,7 @@ pub fn render_frame(
     let vh = height as f32 / scale_factor;
 
     let dpi = Affine::scale(scale_factor as f64);
+    GPU_FRAME_SCALE.with(|scale| scale.set(scale_factor));
 
     for &(idx, rect, kind, style) in nodes {
         let (offset_rect, clip) = match scroll_info.get(idx) {
@@ -610,9 +614,8 @@ fn render_node(
                 if let Some(shadow) = chain.drop_shadow() {
                     draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
                 }
-                if let Some(ref shadow) = style.box_shadow {
-                    draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
-                }
+                draw_outer_shadows(scene, rect, style, dpi);
+                draw_backdrop_blur(scene, ctx, rect, style, dpi);
                 render_node_gpu_layer(
                     scene,
                     ctx,
@@ -644,8 +647,10 @@ fn render_node(
                 draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
             }
         }
-        if let Some(ref shadow) = style.box_shadow {
-            draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+        draw_outer_shadows(scene, rect, style, dpi);
+        #[cfg(feature = "gpu")]
+        if let Some(ctx) = gpu_filter.as_deref_mut() {
+            draw_backdrop_blur(scene, ctx, rect, style, dpi);
         }
     }
 
@@ -705,6 +710,10 @@ fn render_node(
             }
             scene.pop_layer();
         }
+    }
+
+    if !in_layer {
+        draw_inset_shadows(scene, rect, style, dpi);
     }
 
     if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
@@ -1016,6 +1025,26 @@ fn svg_bez_path(rect: LayoutRect, commands: &[SvgPathCommand]) -> BezPath {
     path
 }
 
+fn draw_outer_shadows(scene: &mut Scene, rect: LayoutRect, style: &Style, dpi: Affine) {
+    let shadows = style
+        .box_shadow_layers()
+        .filter(|shadow| !shadow.inset)
+        .collect::<Vec<_>>();
+    for shadow in shadows.into_iter().rev() {
+        draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+    }
+}
+
+fn draw_inset_shadows(scene: &mut Scene, rect: LayoutRect, style: &Style, dpi: Affine) {
+    let shadows = style
+        .box_shadow_layers()
+        .filter(|shadow| shadow.inset)
+        .collect::<Vec<_>>();
+    for shadow in shadows.into_iter().rev() {
+        draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+    }
+}
+
 fn draw_box_shadow(
     scene: &mut Scene,
     rect: LayoutRect,
@@ -1023,10 +1052,8 @@ fn draw_box_shadow(
     radius: f32,
     dpi: Affine,
 ) {
-    // Inset shadows are clipped to the padding box. Painting them as a drop
-    // shadow puts the blur outside the control. CPU renders the inset; this
-    // path still has no clip-to-self for an inner blur.
     if shadow.inset {
+        draw_inset_box_shadow(scene, rect, shadow, radius, dpi);
         return;
     }
     let spread = shadow.spread_radius;
@@ -1040,6 +1067,113 @@ fn draw_box_shadow(
     let r = (radius + spread) as f64;
     let std_dev = (shadow.blur_radius / 2.0) as f64;
     scene.draw_blurred_rounded_rect(dpi, shadow_rect, color, r, std_dev);
+}
+
+fn draw_inset_box_shadow(
+    scene: &mut Scene,
+    rect: LayoutRect,
+    shadow: &w3cos_std::style::BoxShadow,
+    radius: f32,
+    dpi: Affine,
+) {
+    // A blurred inset is the gaussian of the ring, clipped to the element so
+    // the kernel cannot leak outside the border box.
+    if shadow.blur_radius > 0.5
+        && let Some(sprite) = crate::blur::raster_box_shadow(rect, radius, shadow)
+    {
+        let clip = rounded_clip(rect, radius);
+        scene.push_clip_layer(Fill::NonZero, dpi, &clip);
+        draw_premul_sprite(scene, &sprite, dpi);
+        scene.pop_layer();
+        return;
+    }
+    let clip = rounded_clip(rect, radius);
+    scene.push_clip_layer(Fill::NonZero, dpi, &clip);
+    let mut path = BezPath::new();
+    path.extend(clip.path_elements(0.1));
+    let shrink = shadow.spread_radius;
+    let hole = LayoutRect {
+        x: rect.x + shadow.offset_x + shrink,
+        y: rect.y + shadow.offset_y + shrink,
+        width: (rect.width - shrink * 2.0).max(0.0),
+        height: (rect.height - shrink * 2.0).max(0.0),
+    };
+    if hole.width > 0.5 && hole.height > 0.5 {
+        let inner = rounded_clip(hole, (radius - shrink).max(0.0));
+        path.extend(inner.path_elements(0.1));
+    }
+    scene.fill(
+        Fill::EvenOdd,
+        dpi,
+        color_to_vello(shadow.color),
+        None,
+        &path,
+    );
+    scene.pop_layer();
+}
+
+fn rounded_clip(rect: LayoutRect, radius: f32) -> RoundedRect {
+    RoundedRect::new(
+        rect.x as f64,
+        rect.y as f64,
+        (rect.x + rect.width) as f64,
+        (rect.y + rect.height) as f64,
+        radius as f64,
+    )
+}
+
+fn draw_premul_sprite(scene: &mut Scene, sprite: &crate::blur::PremulSprite, dpi: Affine) {
+    let image = ImageData {
+        data: Blob::new(Arc::new(sprite.pixels.clone())),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::AlphaPremultiplied,
+        width: sprite.width,
+        height: sprite.height,
+    };
+    let transform = dpi * Affine::translate((sprite.origin_x as f64, sprite.origin_y as f64));
+    scene.draw_image(&ImageBrush::new(image), transform);
+}
+
+#[cfg(feature = "gpu")]
+fn draw_backdrop_blur(
+    scene: &mut Scene,
+    filter_ctx: &mut GpuFilterCtx<'_>,
+    rect: LayoutRect,
+    style: &Style,
+    dpi: Affine,
+) {
+    let Some(sigma) = style.backdrop_blur.filter(|sigma| *sigma > 0.15) else {
+        return;
+    };
+    let sigma = sigma.min(crate::blur::MAX_SIGMA);
+    let scale = GPU_FRAME_SCALE.with(Cell::get).max(0.1);
+    let pad = crate::blur::kernel_radius(sigma) as f32 * scale;
+    let device_x = rect.x * scale - pad;
+    let device_y = rect.y * scale - pad;
+    let device_w = (rect.width * scale + pad * 2.0).ceil().max(1.0);
+    let device_h = (rect.height * scale + pad * 2.0).ceil().max(1.0);
+    if device_w > 4096.0 || device_h > 4096.0 {
+        return;
+    }
+    let mut crop = Scene::new();
+    crop.append(
+        scene,
+        Some(Affine::translate((-device_x as f64, -device_y as f64))),
+    );
+    let chain = crate::filter::FilterChain {
+        ops: vec![crate::filter::FilterOp::Blur(sigma * 2.0)],
+    };
+    let Some(layer) =
+        filter_ctx.rasterize_filtered_layer(&crop, device_w as u32, device_h as u32, &chain)
+    else {
+        return;
+    };
+    let clip = rounded_clip(rect, style.border_radius);
+    scene.push_clip_layer(Fill::NonZero, dpi, &clip);
+    // The crop is already in device pixels, matching the dpi baked into `scene`.
+    let transform = Affine::translate((device_x as f64, device_y as f64));
+    scene.draw_image(&ImageBrush::new(layer.image), transform);
+    scene.pop_layer();
 }
 
 fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32, dpi: Affine) {
@@ -1091,9 +1225,28 @@ fn draw_gradient(
             let (center, (radius_x, radius_y)) = crate::background_image::radial_gradient_axes(
                 rect, *center_x, *center_y, *shape, *radius,
             );
-            // Vello's radial gradient is a circle. An ellipse uses the longer axis.
-            let radius = radius_x.max(radius_y);
-            Gradient::new_radial(center, radius).with_stops(stops.as_slice())
+            let shape = Rect::new(
+                rect.x as f64,
+                rect.y as f64,
+                (rect.x + rect.width) as f64,
+                (rect.y + rect.height) as f64,
+            );
+            if (radius_x - radius_y).abs() <= 0.5 {
+                let gradient = Gradient::new_radial(center, radius_x)
+                    .with_stops(stops.as_slice())
+                    .multiply_alpha(opacity.clamp(0.0, 1.0));
+                scene.fill(Fill::NonZero, dpi, &gradient, None, &shape);
+            } else {
+                // Unit circle, stretched by (rx, ry). The brush transform is
+                // in CSS pixels; `dpi` maps that into device pixels.
+                let gradient = Gradient::new_radial((0.0_f32, 0.0_f32), 1.0)
+                    .with_stops(stops.as_slice())
+                    .multiply_alpha(opacity.clamp(0.0, 1.0));
+                let brush = Affine::translate((center.0 as f64, center.1 as f64))
+                    * Affine::scale_non_uniform(radius_x as f64, radius_y as f64);
+                scene.fill(Fill::NonZero, dpi, &gradient, Some(brush), &shape);
+            }
+            return;
         }
     }
     .multiply_alpha(opacity.clamp(0.0, 1.0));
@@ -1191,6 +1344,93 @@ fn draw_text(
         return;
     }
 
+    for shadow in style.text_shadows.iter().rev() {
+        let mut shadow_color = shadow.color;
+        if shadow.blur_radius > 0.5 {
+            let taps = [
+                (shadow.offset_x, shadow.offset_y),
+                (shadow.offset_x + shadow.blur_radius * 0.25, shadow.offset_y),
+                (shadow.offset_x - shadow.blur_radius * 0.25, shadow.offset_y),
+                (shadow.offset_x, shadow.offset_y + shadow.blur_radius * 0.25),
+                (shadow.offset_x, shadow.offset_y - shadow.blur_radius * 0.25),
+            ];
+            shadow_color.a = (f32::from(shadow_color.a) / taps.len() as f32).round() as u8;
+            for (dx, dy) in taps {
+                draw_text_runs(
+                    scene,
+                    x + dx,
+                    y + dy,
+                    text,
+                    font_size,
+                    shadow_color,
+                    font_data,
+                    fontdue_font,
+                    style,
+                    glyph_cache,
+                    dpi,
+                );
+            }
+        } else {
+            draw_text_runs(
+                scene,
+                x + shadow.offset_x,
+                y + shadow.offset_y,
+                text,
+                font_size,
+                shadow_color,
+                font_data,
+                fontdue_font,
+                style,
+                glyph_cache,
+                dpi,
+            );
+        }
+    }
+
+    draw_text_runs(
+        scene,
+        x,
+        y,
+        text,
+        font_size,
+        color,
+        font_data,
+        fontdue_font,
+        style,
+        glyph_cache,
+        dpi,
+    );
+    if style.font_weight >= 600 {
+        draw_text_runs(
+            scene,
+            x + 0.6,
+            y,
+            text,
+            font_size,
+            color,
+            font_data,
+            fontdue_font,
+            style,
+            glyph_cache,
+            dpi,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_runs(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    text: &str,
+    font_size: f32,
+    color: AppColor,
+    font_data: &FontData,
+    fontdue_font: &fontdue::Font,
+    style: &Style,
+    glyph_cache: &mut GlyphCache,
+    dpi: Affine,
+) {
     let runs = crate::font_face::FontRegistry::global().resolve_style_runs(style, text);
     let mut cursor_x = x;
     for run in runs {

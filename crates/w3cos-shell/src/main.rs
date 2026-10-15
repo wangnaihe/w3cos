@@ -1596,6 +1596,19 @@ fn shadow_lg() -> BoxShadow {
     BoxShadow::new(0.0, 24.0, 60.0, 0.0, Color::rgba(0, 0, 0, 115))
 }
 
+fn inset_highlight(alpha: u8) -> BoxShadow {
+    BoxShadow::inset(0.0, 1.0, 0.0, 0.0, Color::rgba(255, 255, 255, alpha))
+}
+
+fn label_shadow() -> Vec<TextShadow> {
+    vec![TextShadow {
+        offset_x: 0.0,
+        offset_y: 1.0,
+        blur_radius: 2.0,
+        color: Color::rgba(0, 0, 0, 115),
+    }]
+}
+
 fn sheet_fill() -> Color {
     Color::rgba(22, 30, 39, 245)
 }
@@ -1931,6 +1944,7 @@ fn build_intent_panel() -> Component {
                 font_size: 12.0,
                 color: muted_token(),
                 text_align: TextAlign::Center,
+                text_shadows: label_shadow(),
                 ..Style::default()
             },
         ),
@@ -1949,11 +1963,12 @@ fn build_intent_panel() -> Component {
                 },
                 gap: 8.0,
                 align_items: AlignItems::Center,
-                background: Color::rgba(16, 22, 29, 235),
+                background: Color::rgba(16, 22, 29, 210),
                 border_width: 1.0,
                 border_color: line_strong(),
                 border_radius: 16.0,
                 box_shadow: Some(shadow_sm()),
+                backdrop_blur: Some(16.0),
                 ..Style::default()
             },
             vec![
@@ -2102,11 +2117,12 @@ fn build_floating_taskbar() -> Component {
             padding: Edges::xy(10.0, 0.0),
             gap: 8.0,
             align_items: AlignItems::Center,
-            background: Color::rgba(12, 18, 24, 224),
+            background: Color::rgba(12, 18, 24, 190),
             border_width: 1.0,
             border_color: Color::rgba(244, 241, 234, 31),
             border_radius: 16.0,
             box_shadow: Some(shadow_sm()),
+            backdrop_blur: Some(18.0),
             box_sizing: BoxSizing::BorderBox,
             ..Style::default()
         },
@@ -2417,6 +2433,7 @@ fn dialog_shell(children: Vec<Component>) -> Component {
             border_color: line_strong(),
             border_radius: if phone { 22.0 } else { 16.0 },
             box_shadow: Some(shadow_lg()),
+            box_shadows: vec![inset_highlight(15)],
             ..Style::default()
         },
         children,
@@ -2653,6 +2670,7 @@ fn build_lock_screen() -> Component {
                 border_color: line_strong(),
                 border_radius: 16.0,
                 box_shadow: Some(shadow_lg()),
+                box_shadows: vec![inset_highlight(15)],
                 ..Style::default()
             },
             vec![
@@ -2831,6 +2849,7 @@ fn build_window_frame(id: i64, _focused: bool) -> Component {
             border_color: line_strong(),
             border_radius: 14.0,
             box_shadow: Some(shadow_lg()),
+            box_shadows: vec![inset_highlight(15)],
             background: Color::from_hex("#1a242f"),
             flex_shrink: 0.0,
             ..Style::default()
@@ -2967,6 +2986,7 @@ fn desktop_tile(glyph: &str, label: String, code: u8) -> Component {
         0.0,
         Color::rgba(0, 0, 0, 46),
     ));
+    face.style.box_shadows = vec![inset_highlight(41)];
     Component::column(
         Style {
             width: Dimension::Px(if posture() == Posture::Phone {
@@ -2986,6 +3006,7 @@ fn desktop_tile(glyph: &str, label: String, code: u8) -> Component {
                     font_size: 13.0,
                     color: ink_token(),
                     text_align: TextAlign::Center,
+                    text_shadows: label_shadow(),
                     ..Style::default()
                 },
             ),
@@ -5582,6 +5603,7 @@ fn build_receipts_viewer() -> Component {
             border_color: line_strong(),
             border_radius: 16.0,
             box_shadow: Some(shadow_lg()),
+            box_shadows: vec![inset_highlight(15)],
             ..Style::default()
         },
         body,

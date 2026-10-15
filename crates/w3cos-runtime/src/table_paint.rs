@@ -79,6 +79,8 @@ fn clear_background(style: &mut Style) {
     style.background = Color::TRANSPARENT;
     style.background_image = None;
     style.box_shadow = None;
+    style.box_shadows.clear();
+    style.backdrop_blur = None;
 }
 
 pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> Vec<ReplayNode<'a>> {

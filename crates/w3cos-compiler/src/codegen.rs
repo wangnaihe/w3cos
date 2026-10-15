@@ -1,5 +1,5 @@
 use crate::css_parser::{MatchContext, PseudoState, Stylesheet};
-use crate::css_values::{self, parse_animation, parse_box_shadow, parse_transform};
+use crate::css_values::{self, parse_animation, parse_box_shadow_list, parse_transform};
 use crate::parser::{AppTree, Node, NodeKind, SignalDecl, StyleDecl};
 use crate::style_matcher::{self, ResolveViewport};
 #[allow(unused_imports)]
@@ -1349,11 +1349,33 @@ fn gen_transform_rust(value: &str) -> String {
 }
 
 fn gen_box_shadow_rust(value: &str) -> Option<String> {
-    let s = parse_box_shadow(value)?;
-    Some(format!(
-        "box_shadow: Some(BoxShadow::new({}_f32, {}_f32, {}_f32, {}_f32, Color::from_css({:?}).unwrap_or(Color::TRANSPARENT)))",
-        s.offset_x, s.offset_y, s.blur, s.spread, s.color
-    ))
+    let shadows = parse_box_shadow_list(value);
+    let first = shadows.first()?;
+    let mut code = format!("box_shadow: Some({})", box_shadow_expr(first));
+    if shadows.len() > 1 {
+        let rest = shadows
+            .iter()
+            .skip(1)
+            .map(box_shadow_expr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        code.push_str(&format!(", box_shadows: vec![{rest}]"));
+    }
+    Some(code)
+}
+
+fn box_shadow_expr(shadow: &crate::css_values::ParsedBoxShadow) -> String {
+    if shadow.inset {
+        format!(
+            "BoxShadow::inset({}_f32, {}_f32, {}_f32, {}_f32, Color::from_css({:?}).unwrap_or(Color::TRANSPARENT))",
+            shadow.offset_x, shadow.offset_y, shadow.blur, shadow.spread, shadow.color
+        )
+    } else {
+        format!(
+            "BoxShadow::new({}_f32, {}_f32, {}_f32, {}_f32, Color::from_css({:?}).unwrap_or(Color::TRANSPARENT))",
+            shadow.offset_x, shadow.offset_y, shadow.blur, shadow.spread, shadow.color
+        )
+    }
 }
 
 fn gen_animation_rust(value: &str) -> Option<String> {

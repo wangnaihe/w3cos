@@ -27,7 +27,9 @@ fn eligible(kind: &ComponentKind, style: &Style) -> bool {
         && style.float == w3cos_std::style::Float::None
         && style.opacity == 1.0
         && style.transform.is_identity()
-        && style.box_shadow.is_none()
+        && !style.has_box_shadow()
+        && style.backdrop_blur.is_none()
+        && style.text_shadows.is_empty()
         && style
             .filter
             .as_deref()

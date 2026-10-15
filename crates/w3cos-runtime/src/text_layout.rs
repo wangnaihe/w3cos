@@ -746,7 +746,7 @@ fn wrap_greedy_with_line_width(
     lines
 }
 
-fn is_cjk_line_break_character(character: char) -> bool {
+pub(crate) fn is_cjk_line_break_character(character: char) -> bool {
     matches!(
         character,
         '\u{2e80}'..='\u{2fff}'
@@ -758,6 +758,16 @@ fn is_cjk_line_break_character(character: char) -> bool {
             | '\u{ac00}'..='\u{d7af}'
             | '\u{f900}'..='\u{faff}'
     )
+}
+
+/// Ideographs in the bundled subset sometimes report a near-zero advance.
+/// A full em matches the browser's CJK cell better than that missing width.
+pub fn snapped_glyph_advance(ch: char, advance: f32, font_size: f32) -> f32 {
+    if is_cjk_line_break_character(ch) && advance < font_size * 0.85 {
+        font_size
+    } else {
+        advance
+    }
 }
 
 pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
@@ -814,6 +824,7 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
     } else {
         estimated_char_width(ch, font_size)
     };
+    let advance = snapped_glyph_advance(ch, advance, font_size);
     if ascii && advance > 0.0 {
         ASCII_ADVANCE.with(|slot| {
             let mut slot = slot.borrow_mut();
