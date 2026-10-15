@@ -249,20 +249,55 @@ pub struct ParsedBoxShadow {
     pub blur: f32,
     pub spread: f32,
     pub color: String,
+    pub inset: bool,
 }
 
 pub fn parse_box_shadow(value: &str) -> Option<ParsedBoxShadow> {
-    let parts = split_css_whitespace(value);
-    if parts.len() < 3 {
+    parse_box_shadow_list(value).into_iter().next()
+}
+
+pub fn parse_box_shadow_list(value: &str) -> Vec<ParsedBoxShadow> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    split_top_level_commas(value)
+        .into_iter()
+        .filter_map(|layer| parse_one_box_shadow(layer))
+        .collect()
+}
+
+fn parse_one_box_shadow(value: &str) -> Option<ParsedBoxShadow> {
+    let mut parts = split_css_whitespace(value);
+    let mut inset = false;
+    parts.retain(|part| {
+        if part.eq_ignore_ascii_case("inset") {
+            inset = true;
+            false
+        } else {
+            true
+        }
+    });
+    if parts.len() < 2 {
         return None;
     }
     let ox = parse_plain_px(&parts[0])?;
     let oy = parse_plain_px(&parts[1])?;
-    let blur = parse_plain_px(&parts[2])?;
-    let (spread, color_index) = parts
-        .get(3)
+    let blur = parts
+        .get(2)
         .and_then(|part| parse_plain_px(part))
-        .map_or((0.0, 3), |spread| (spread, 4));
+        .unwrap_or(0.0);
+    let (spread, color_index) = if parts
+        .get(2)
+        .is_some_and(|part| parse_plain_px(part).is_some())
+    {
+        parts
+            .get(3)
+            .and_then(|part| parse_plain_px(part))
+            .map_or((0.0, 3), |spread| (spread, 4))
+    } else {
+        (0.0, 2)
+    };
     let color = parts
         .get(color_index)
         .cloned()
@@ -273,7 +308,33 @@ pub fn parse_box_shadow(value: &str) -> Option<ParsedBoxShadow> {
         blur,
         spread,
         color,
+        inset,
     })
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut layers = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let layer = value[start..index].trim();
+                if !layer.is_empty() {
+                    layers.push(layer);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = value[start..].trim();
+    if !tail.is_empty() {
+        layers.push(tail);
+    }
+    layers
 }
 
 fn split_css_whitespace(value: &str) -> Vec<String> {

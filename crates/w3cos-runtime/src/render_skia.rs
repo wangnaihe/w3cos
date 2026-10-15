@@ -2476,7 +2476,11 @@ fn render_node_with_applied_decorations(
         );
     }
 
-    if let Some(shadow) = style.box_shadow.filter(|shadow| !shadow.inset) {
+    let outer_shadows = style
+        .box_shadow_layers()
+        .filter(|shadow| !shadow.inset)
+        .collect::<Vec<_>>();
+    for shadow in outer_shadows.into_iter().rev() {
         let spread = shadow.spread_radius;
         let shadow_rect = LayoutRect {
             x: rect.x + shadow.offset_x - spread,
@@ -2498,6 +2502,9 @@ fn render_node_with_applied_decorations(
             style.border_corner_radii().map(|radius| radius + spread),
             &paint,
         );
+    }
+    if let Some(sigma) = style.backdrop_blur.filter(|sigma| *sigma > 0.15) {
+        draw_skia_backdrop(canvas, rect, style.border_radius, sigma);
     }
 
     let themed_control = paint_html_auto_control(canvas, rect, kind, style, multisample);
@@ -2597,6 +2604,13 @@ fn render_node_with_applied_decorations(
                 &color_paint(bg, style.opacity),
             );
         }
+    }
+    let inset_shadows = style
+        .box_shadow_layers()
+        .filter(|shadow| shadow.inset)
+        .collect::<Vec<_>>();
+    for shadow in inset_shadows.into_iter().rev() {
+        draw_skia_inset_shadow(canvas, rect, style, shadow);
     }
     if !themed_control
         && !(style.display == Display::Inline && matches!(kind, ComponentKind::Text { .. }))
@@ -3478,7 +3492,8 @@ fn small_blur_input_bounds(frame: &ReplayFrame<'_>, bake: bool) -> HashMap<usize
             // are derived in the same coordinate system as the filter input.
             if frame.scale_factor != 1.0
                 || style.transform != Transform2D::IDENTITY
-                || style.box_shadow.is_some()
+                || style.has_box_shadow()
+                || style.backdrop_blur.is_some()
                 || style.outline_width > 0.0
                 || path[position + 1..]
                     .iter()
@@ -4689,9 +4704,57 @@ pub(crate) fn draw_text_line(
     typeface: &Typeface,
     style: &Style,
 ) -> f32 {
+    for shadow in style.text_shadows.iter().rev() {
+        let sigma = crate::blur::box_shadow_sigma(shadow.blur_radius);
+        let filter = (sigma > 0.15)
+            .then(|| image_filters::blur((sigma, sigma), None, None, None))
+            .flatten();
+        if let Some(filter) = filter {
+            let mut layer = Paint::default();
+            layer.set_image_filter(filter);
+            canvas.save_layer(&SaveLayerRec::default().paint(&layer));
+            draw_text_glyph_line(
+                canvas,
+                x + shadow.offset_x,
+                top + shadow.offset_y,
+                text,
+                font_size,
+                shadow.color,
+                opacity,
+                typeface,
+                style,
+            );
+            canvas.restore();
+        } else {
+            draw_text_glyph_line(
+                canvas,
+                x + shadow.offset_x,
+                top + shadow.offset_y,
+                text,
+                font_size,
+                shadow.color,
+                opacity,
+                typeface,
+                style,
+            );
+        }
+    }
     let advance = draw_text_glyph_line(
         canvas, x, top, text, font_size, color, opacity, typeface, style,
     );
+    if style.font_weight >= 600 {
+        draw_text_glyph_line(
+            canvas,
+            x + 0.6,
+            top,
+            text,
+            font_size,
+            color,
+            opacity,
+            typeface,
+            style,
+        );
+    }
     text_decoration::paint(
         canvas, x, top, text, advance, font_size, color, opacity, typeface, style,
     );
@@ -6483,16 +6546,32 @@ fn gradient_shader_for_layer(
             let (center, (radius_x, radius_y)) = crate::background_image::radial_gradient_axes(
                 rect, *center_x, *center_y, *shape, *explicit,
             );
-            let radius = radius_x.max(radius_y);
-            gradient_shader::radial(
-                center,
-                radius,
-                colors.as_slice(),
-                positions.as_slice(),
-                TileMode::Clamp,
-                None,
-                None,
-            )
+            if (radius_x - radius_y).abs() <= 0.5 {
+                gradient_shader::radial(
+                    center,
+                    radius_x,
+                    colors.as_slice(),
+                    positions.as_slice(),
+                    TileMode::Clamp,
+                    None,
+                    None,
+                )
+            } else {
+                let coeffs =
+                    crate::blur::radial_local_coeffs(center.0, center.1, radius_x, radius_y);
+                let local = Matrix::new_all(
+                    coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5], 0.0, 0.0, 1.0,
+                );
+                gradient_shader::radial(
+                    (0.0, 0.0),
+                    1.0,
+                    colors.as_slice(),
+                    positions.as_slice(),
+                    TileMode::Clamp,
+                    None,
+                    Some(&local),
+                )
+            }
         }
     }
 }
@@ -6530,6 +6609,67 @@ fn draw_rounded_rect(canvas: &Canvas, rect: LayoutRect, radii: [f32; 4], paint: 
     {
         canvas.draw_rrect(rounded, paint);
     }
+}
+
+fn draw_skia_backdrop(canvas: &Canvas, rect: LayoutRect, radius: f32, sigma: f32) {
+    let Some(filter) = image_filters::blur((sigma, sigma), Some(TileMode::Clamp), None, None)
+    else {
+        return;
+    };
+    let bounds = to_rect(rect);
+    let save = canvas.save();
+    if radius > 0.0 {
+        canvas.clip_rrect(RRect::new_rect_xy(bounds, radius, radius), None, Some(true));
+    } else {
+        canvas.clip_rect(bounds, None, Some(false));
+    }
+    canvas.save_layer(&SaveLayerRec::default().backdrop(&filter).bounds(&bounds));
+    canvas.restore();
+    canvas.restore_to_count(save);
+}
+
+fn draw_skia_inset_shadow(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    style: &Style,
+    shadow: &w3cos_std::style::BoxShadow,
+) {
+    let radius = style.border_radius.max(0.0);
+    let bounds = to_rect(rect);
+    let save = canvas.save();
+    if radius > 0.0 {
+        canvas.clip_rrect(RRect::new_rect_xy(bounds, radius, radius), None, Some(true));
+    } else {
+        canvas.clip_rect(bounds, None, Some(false));
+    }
+    let mut path = PathBuilder::new();
+    path.add_rrect(RRect::new_rect_xy(bounds, radius, radius), None, None);
+    let shrink = shadow.spread_radius;
+    let hole = LayoutRect {
+        x: rect.x + shadow.offset_x + shrink,
+        y: rect.y + shadow.offset_y + shrink,
+        width: (rect.width - shrink * 2.0).max(0.0),
+        height: (rect.height - shrink * 2.0).max(0.0),
+    };
+    if hole.width > 0.5 && hole.height > 0.5 {
+        let hole_radius = (radius - shrink).max(0.0);
+        path.add_rrect(
+            RRect::new_rect_xy(to_rect(hole), hole_radius, hole_radius),
+            None,
+            None,
+        );
+    }
+    path.set_fill_type(skia_safe::PathFillType::EvenOdd);
+    let mut paint = color_paint(shadow.color, style.opacity);
+    if shadow.blur_radius > 0.0 {
+        paint.set_mask_filter(MaskFilter::blur(
+            BlurStyle::Normal,
+            shadow.blur_radius * 0.5,
+            false,
+        ));
+    }
+    canvas.draw_path(&path.detach(), &paint);
+    canvas.restore_to_count(save);
 }
 
 fn to_rect(rect: LayoutRect) -> Rect {

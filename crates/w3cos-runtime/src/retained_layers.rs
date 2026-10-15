@@ -410,7 +410,9 @@ fn hash_paint_style(style: &Style, hasher: &mut impl Hasher) {
         }
         None => 0u8.hash(hasher),
     }
-    style.box_shadow.is_some().hash(hasher);
+    style.has_box_shadow().hash(hasher);
+    style.backdrop_blur.is_some().hash(hasher);
+    style.text_shadows.len().hash(hasher);
     style.will_change.transform.hash(hasher);
     style.will_change.opacity.hash(hasher);
     style.will_change.filter.hash(hasher);

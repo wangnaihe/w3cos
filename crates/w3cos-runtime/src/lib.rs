@@ -6,6 +6,7 @@ pub mod barcode_detection_web;
 pub mod battery_web;
 mod bidi_paint;
 pub mod bluetooth_web;
+mod blur;
 mod border_paint;
 #[cfg(feature = "dynamic-js")]
 pub mod browser_controller;

@@ -501,7 +501,9 @@ fn scroll_raster_copy_safe(style: &Style) -> bool {
         && style.opacity >= 0.999
         && style.border_width <= 0.001
         && style.border_radius <= 0.001
-        && style.box_shadow.is_none()
+        && !style.has_box_shadow()
+        && style.backdrop_blur.is_none()
+        && style.text_shadows.is_empty()
         && style.filter.is_none()
         && style.transform.translate_x.abs() <= 0.001
         && style.transform.translate_y.abs() <= 0.001
@@ -761,7 +763,11 @@ fn render_node(
                 );
             }
         }
-        if let Some(ref shadow) = style.box_shadow.filter(|shadow| !shadow.inset) {
+        let outer_shadows = style
+            .box_shadow_layers()
+            .filter(|shadow| !shadow.inset)
+            .collect::<Vec<_>>();
+        for shadow in outer_shadows.into_iter().rev() {
             draw_box_shadow(
                 pixmap,
                 rect,
@@ -770,6 +776,9 @@ fn render_node(
                 style.opacity,
                 clip_mask,
             );
+        }
+        if let Some(sigma) = style.backdrop_blur.filter(|sigma| *sigma > 0.0) {
+            draw_backdrop_blur(pixmap, rect, style.border_radius, sigma, clip_mask);
         }
 
         if css_filter.as_ref().is_some_and(|c| c.has_blur()) {
@@ -845,7 +854,11 @@ fn render_node(
         }
     }
 
-    if let Some(ref shadow) = style.box_shadow.filter(|shadow| shadow.inset) {
+    let inset_shadows = style
+        .box_shadow_layers()
+        .filter(|shadow| shadow.inset)
+        .collect::<Vec<_>>();
+    for shadow in inset_shadows.into_iter().rev() {
         draw_box_shadow(
             pixmap,
             rect,
@@ -1245,6 +1258,136 @@ fn resolved_color(c: Color, opacity: f32, filter: Option<&CssFilter>) -> Color {
     node_color(c, opacity, filter)
 }
 
+fn draw_backdrop_blur(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    radius: f32,
+    sigma: f32,
+    clip_mask: Option<&Mask>,
+) {
+    let sigma = sigma.min(crate::blur::MAX_SIGMA);
+    let pad = crate::blur::kernel_radius(sigma);
+    if pad == 0 {
+        return;
+    }
+    let src_w = pixmap.width() as i32;
+    let src_h = pixmap.height() as i32;
+    let x0 = (rect.x.floor() as i32 - pad).clamp(0, src_w);
+    let y0 = (rect.y.floor() as i32 - pad).clamp(0, src_h);
+    let x1 = ((rect.x + rect.width).ceil() as i32 + pad).clamp(0, src_w);
+    let y1 = ((rect.y + rect.height).ceil() as i32 + pad).clamp(0, src_h);
+    let width = (x1 - x0) as u32;
+    let height = (y1 - y0) as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let mut region = vec![0_u8; (width as usize) * (height as usize) * 4];
+    {
+        let data = pixmap.data();
+        let row_bytes = src_w as usize * 4;
+        for row in 0..height as usize {
+            let src = (y0 as usize + row) * row_bytes + x0 as usize * 4;
+            let dst = row * width as usize * 4;
+            region[dst..dst + width as usize * 4]
+                .copy_from_slice(&data[src..src + width as usize * 4]);
+        }
+    }
+    crate::blur::blur_premultiplied(
+        &mut region,
+        width,
+        height,
+        sigma,
+        crate::blur::BlurEdge::Clamp,
+    );
+    let row_bytes = pixmap.width() as usize * 4;
+    let data = pixmap.data_mut();
+    for row in 0..height {
+        for col in 0..width {
+            let px = x0 + col as i32;
+            let py = y0 + row as i32;
+            let cover =
+                crate::blur::round_rect_coverage(px as f32 + 0.5, py as f32 + 0.5, rect, radius);
+            if cover <= 0.0 {
+                continue;
+            }
+            if let Some(mask) = clip_mask {
+                let index = (py as u32 * mask.width() + px as u32) as usize;
+                if mask.data().get(index).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+            }
+            let src = ((row * width + col) * 4) as usize;
+            let dst = (py as usize) * row_bytes + px as usize * 4;
+            if cover >= 0.99 {
+                data[dst..dst + 4].copy_from_slice(&region[src..src + 4]);
+            } else {
+                for channel in 0..4 {
+                    let blurred = f32::from(region[src + channel]);
+                    let original = f32::from(data[dst + channel]);
+                    data[dst + channel] =
+                        (blurred * cover + original * (1.0 - cover)).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+fn blit_premul_sprite(
+    pixmap: &mut Pixmap,
+    sprite: &crate::blur::PremulSprite,
+    opacity: f32,
+    clip_mask: Option<&Mask>,
+) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return;
+    }
+    let dst_w = pixmap.width() as i32;
+    let dst_h = pixmap.height() as i32;
+    let origin_x = sprite.origin_x as i32;
+    let origin_y = sprite.origin_y as i32;
+    let data = pixmap.data_mut();
+    let row_bytes = dst_w as usize * 4;
+    for row in 0..sprite.height {
+        for col in 0..sprite.width {
+            let px = origin_x + col as i32;
+            let py = origin_y + row as i32;
+            if px < 0 || py < 0 || px >= dst_w || py >= dst_h {
+                continue;
+            }
+            if let Some(mask) = clip_mask {
+                let index = (py as u32 * mask.width() + px as u32) as usize;
+                if mask.data().get(index).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+            }
+            let src = ((row * sprite.width + col) * 4) as usize;
+            let src_a = sprite.pixels[src + 3];
+            if src_a == 0 {
+                continue;
+            }
+            let sa = (f32::from(src_a) * opacity).round() as u8;
+            if sa == 0 {
+                continue;
+            }
+            let scale = u16::from(sa);
+            let base = u16::from(src_a).max(1);
+            let premul = [
+                (u16::from(sprite.pixels[src]) * scale / base) as u8,
+                (u16::from(sprite.pixels[src + 1]) * scale / base) as u8,
+                (u16::from(sprite.pixels[src + 2]) * scale / base) as u8,
+                sa,
+            ];
+            let dst = py as usize * row_bytes + px as usize * 4;
+            let inv = 255 - u16::from(sa);
+            for channel in 0..4 {
+                let mixed = u16::from(premul[channel]) + u16::from(data[dst + channel]) * inv / 255;
+                data[dst + channel] = mixed.min(255) as u8;
+            }
+        }
+    }
+}
+
 fn draw_box_shadow(
     pixmap: &mut Pixmap,
     rect: LayoutRect,
@@ -1253,6 +1396,10 @@ fn draw_box_shadow(
     opacity: f32,
     clip_mask: Option<&Mask>,
 ) {
+    if let Some(sprite) = crate::blur::raster_box_shadow(rect, radius, shadow) {
+        blit_premul_sprite(pixmap, &sprite, opacity, clip_mask);
+        return;
+    }
     if shadow.inset {
         draw_inset_box_shadow(pixmap, rect, shadow, radius, opacity, clip_mask);
         return;
@@ -1730,6 +1877,10 @@ fn draw_text_line(
         }
     };
 
+    if !style.text_shadows.is_empty() {
+        paint_text_shadows(pixmap, x, y, text, font_size, font, style, clip_mask);
+    }
+
     GLYPH_RASTER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let render_text = text_layout::font_render_text_for_style(text, style);
@@ -1754,6 +1905,7 @@ fn draw_text_line(
             } else {
                 text_layout::estimated_char_width(ch, font_size)
             };
+            let advance = text_layout::snapped_glyph_advance(ch, advance, font_size);
             if metrics.width == 0 || metrics.height == 0 {
                 cursor_x += advance;
                 continue;
@@ -1772,6 +1924,21 @@ fn draw_text_line(
                 px_h,
                 &in_clip,
             );
+            // The bundled face is Regular. A small overstrike stands in for
+            // the missing bold/semibold outlines.
+            if style.font_weight >= 600 {
+                paint_glyph_bitmap(
+                    pixmap,
+                    gx + 1,
+                    gy,
+                    metrics,
+                    &glyph.bitmap,
+                    color,
+                    px_w,
+                    px_h,
+                    &in_clip,
+                );
+            }
 
             cursor_x += advance;
         }
@@ -1804,6 +1971,7 @@ fn paint_glyph_bitmap(
             if alpha == 0 {
                 continue;
             }
+            let alpha = coverage_lut()[alpha as usize];
             let idx = (py * px_w + px) as usize;
             let a = (alpha as u16 * color.a as u16 / 255) as u8;
             let dst = pixels[idx];
@@ -1811,6 +1979,142 @@ fn paint_glyph_bitmap(
             pixels[idx] = blended;
         }
     }
+}
+
+fn coverage_lut() -> &'static [u8; 256] {
+    static LUT: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [0_u8; 256];
+        for (index, slot) in lut.iter_mut().enumerate() {
+            let coverage = (index as f32 / 255.0).powf(0.85);
+            *slot = (coverage * 255.0).round() as u8;
+        }
+        lut
+    })
+}
+
+fn paint_text_shadows(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    text: &str,
+    font_size: f32,
+    font: &fontdue::Font,
+    style: &Style,
+    clip_mask: Option<&Mask>,
+) {
+    let render_text = text_layout::font_render_text_for_style(text, style);
+    if render_text.is_empty() {
+        return;
+    }
+    GLYPH_RASTER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let mut cursor_x = x;
+        let cursor_y = y + font_size;
+        let mut stamps = Vec::new();
+        for ch in render_text.chars() {
+            let registered = crate::font_face::FontRegistry::global()
+                .resolve_style_for_character(style, ch)
+                .and_then(|font| font.parsed());
+            let system = if registered
+                .as_ref()
+                .is_some_and(|font| font.chars().contains_key(&ch))
+                || font.chars().contains_key(&ch)
+            {
+                None
+            } else {
+                crate::font_face::parsed_fallback(ch)
+            };
+            let glyph_font = registered.as_deref().or(system.as_deref()).unwrap_or(font);
+            let glyph = cache.get_or_rasterize(glyph_font, ch, font_size);
+            let metrics = &glyph.metrics;
+            let advance = if metrics.advance_width > 0.0 {
+                metrics.advance_width
+            } else {
+                text_layout::estimated_char_width(ch, font_size)
+            };
+            let advance = text_layout::snapped_glyph_advance(ch, advance, font_size);
+            if metrics.width > 0 && metrics.height > 0 {
+                let (gx, gy) = text_layout::glyph_pixel_origin(cursor_x, cursor_y, metrics);
+                stamps.push((gx, gy, metrics.width, metrics.height, glyph.bitmap.clone()));
+            }
+            cursor_x += advance;
+        }
+        drop(cache);
+        for shadow in style.text_shadows.iter().rev() {
+            if stamps.is_empty() {
+                break;
+            }
+            let sigma = crate::blur::box_shadow_sigma(shadow.blur_radius);
+            let pad = crate::blur::kernel_radius(sigma).max(0) as i32;
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            for (gx, gy, width, height, _) in &stamps {
+                min_x = min_x.min(*gx);
+                min_y = min_y.min(*gy);
+                max_x = max_x.max(*gx + *width as i32);
+                max_y = max_y.max(*gy + *height as i32);
+            }
+            let origin_x = min_x + shadow.offset_x.round() as i32 - pad;
+            let origin_y = min_y + shadow.offset_y.round() as i32 - pad;
+            let width =
+                (max_x - min_x + pad * 2 + shadow.offset_x.abs().ceil() as i32 + 2).max(1) as u32;
+            let height =
+                (max_y - min_y + pad * 2 + shadow.offset_y.abs().ceil() as i32 + 2).max(1) as u32;
+            if width > 2048 || height > 512 {
+                continue;
+            }
+            let mut alpha = vec![0_u8; (width * height) as usize];
+            for (gx, gy, gw, gh, bitmap) in &stamps {
+                let dest_x = *gx + shadow.offset_x.round() as i32 - origin_x;
+                let dest_y = *gy + shadow.offset_y.round() as i32 - origin_y;
+                for row in 0..*gh {
+                    for col in 0..*gw {
+                        let coverage = bitmap[row * *gw + col];
+                        if coverage == 0 {
+                            continue;
+                        }
+                        let px = dest_x + col as i32;
+                        let py = dest_y + row as i32;
+                        if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                            continue;
+                        }
+                        let index = (py as u32 * width + px as u32) as usize;
+                        alpha[index] = alpha[index].max(coverage);
+                    }
+                }
+            }
+            if sigma >= 0.15 {
+                crate::blur::blur_alpha(
+                    &mut alpha,
+                    width,
+                    height,
+                    sigma,
+                    crate::blur::BlurEdge::Zero,
+                );
+            }
+            let sprite = crate::blur::PremulSprite {
+                origin_x: origin_x as f32,
+                origin_y: origin_y as f32,
+                width,
+                height,
+                pixels: {
+                    let mut pixels = Vec::with_capacity(alpha.len() * 4);
+                    for coverage in &alpha {
+                        let a = (u16::from(*coverage) * u16::from(shadow.color.a) / 255) as u8;
+                        pixels.push((u16::from(shadow.color.r) * u16::from(a) / 255) as u8);
+                        pixels.push((u16::from(shadow.color.g) * u16::from(a) / 255) as u8);
+                        pixels.push((u16::from(shadow.color.b) * u16::from(a) / 255) as u8);
+                        pixels.push(a);
+                    }
+                    pixels
+                },
+            };
+            blit_premul_sprite(pixmap, &sprite, style.opacity, clip_mask);
+        }
+    });
 }
 
 fn draw_blinking_cursor(
@@ -2257,6 +2561,93 @@ mod font_cjk_tests {
             None,
         );
         assert!(outer.pixel(20, 32).unwrap().blue() > 0);
+    }
+
+    #[test]
+    fn gaussian_outer_shadow_is_soft_and_backdrop_mixes_the_seam() {
+        let rect = LayoutRect {
+            x: 16.0,
+            y: 16.0,
+            width: 28.0,
+            height: 20.0,
+        };
+        let mut pixmap = Pixmap::new(64, 56).unwrap();
+        draw_box_shadow(
+            &mut pixmap,
+            rect,
+            &w3cos_std::style::BoxShadow::new(0.0, 0.0, 8.0, 0.0, Color::rgb(0, 0, 255)),
+            0.0,
+            1.0,
+            None,
+        );
+        let edge = pixmap.pixel(45, 26).unwrap().alpha();
+        let further = pixmap.pixel(50, 26).unwrap().alpha();
+        assert!(edge > further);
+        assert!(further > 0);
+        assert!(edge < 250);
+
+        let mut backdrop = Pixmap::new(40, 20).unwrap();
+        backdrop.fill(tiny_skia::Color::from_rgba8(220, 20, 20, 255));
+        for x in 20..40 {
+            for y in 0..20 {
+                if let Some(pixel) = backdrop.pixels_mut().get_mut((y * 40 + x) as usize) {
+                    *pixel = tiny_skia::PremultipliedColorU8::from_rgba(20, 20, 220, 255)
+                        .unwrap_or(*pixel);
+                }
+            }
+        }
+        let before = backdrop.pixel(4, 10).unwrap().red();
+        draw_backdrop_blur(
+            &mut backdrop,
+            LayoutRect {
+                x: 8.0,
+                y: 2.0,
+                width: 24.0,
+                height: 16.0,
+            },
+            0.0,
+            4.0,
+            None,
+        );
+        let mixed = backdrop.pixel(20, 10).unwrap();
+        assert!(mixed.red() > 40 && mixed.blue() > 40);
+        assert_eq!(backdrop.pixel(4, 10).unwrap().red(), before);
+    }
+
+    #[test]
+    fn text_shadow_paints_beside_the_glyph() {
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let mut style = Style::default();
+        style.font_size = 18.0;
+        style.color = Color::rgb(255, 255, 255);
+        style.text_shadows = vec![w3cos_std::style::TextShadow {
+            offset_x: 3.0,
+            offset_y: 0.0,
+            blur_radius: 0.0,
+            color: Color::rgb(255, 0, 0),
+        }];
+        let mut pixmap = Pixmap::new(48, 32).unwrap();
+        draw_text_line(
+            &mut pixmap,
+            4.0,
+            4.0,
+            "A",
+            18.0,
+            Color::rgb(255, 255, 255),
+            &font,
+            &style,
+            None,
+        );
+        assert!(
+            pixmap
+                .pixels()
+                .iter()
+                .any(|pixel| pixel.red() > pixel.blue().saturating_add(40) && pixel.alpha() > 0)
+        );
     }
 
     #[test]

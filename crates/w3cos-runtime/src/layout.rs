@@ -22516,7 +22516,9 @@ fn build_taffy_tree(
                     && c.style.margin.right == WSpacing::Px(0.0)
                     && c.style.background.a == 0
                     && c.style.background_image.is_none()
-                    && c.style.box_shadow.is_none()
+                    && !c.style.has_box_shadow()
+                    && c.style.backdrop_blur.is_none()
+                    && c.style.text_shadows.is_empty()
                     && c.style.border_left_width.unwrap_or(c.style.border_width) == 0.0
                     && c.style.border_right_width.unwrap_or(c.style.border_width) == 0.0
                     && (c.style.display == WDisplay::Inline

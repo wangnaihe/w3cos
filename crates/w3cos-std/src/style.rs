@@ -306,8 +306,17 @@ pub struct Style {
     /// CSS `filter` — stored raw; non-none values promote compositor layers.
     pub filter: Option<String>,
 
-    // Box Shadow
+    // Box Shadow. `box_shadow` is the first layer so existing callers stay
+    // valid. Further comma-separated layers live in `box_shadows`.
     pub box_shadow: Option<BoxShadow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub box_shadows: Vec<BoxShadow>,
+    /// CSS `backdrop-filter: blur()` standard deviation, in CSS pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backdrop_blur: Option<f32>,
+    /// CSS `text-shadow` layers, first painted on top.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_shadows: Vec<TextShadow>,
 
     // Transform
     pub transform: Transform2D,
@@ -448,6 +457,9 @@ impl Default for Style {
             will_change: WillChange::default(),
             filter: None,
             box_shadow: None,
+            box_shadows: Vec::new(),
+            backdrop_blur: None,
+            text_shadows: Vec::new(),
             transform: Transform2D::IDENTITY,
             transition: None,
             animation: None,
@@ -471,6 +483,16 @@ impl Default for Style {
 }
 
 impl Style {
+    pub fn has_box_shadow(&self) -> bool {
+        self.box_shadow.is_some() || !self.box_shadows.is_empty()
+    }
+
+    /// First declared shadow, then the rest. Painters that need CSS order
+    /// (first on top) reverse this after splitting inset from outer.
+    pub fn box_shadow_layers(&self) -> impl Iterator<Item = &BoxShadow> {
+        self.box_shadow.iter().chain(self.box_shadows.iter())
+    }
+
     /// Resolve only an owned layout/paint snapshot. The source computed style
     /// must retain its lengths so explicit inheritance can copy them.
     pub fn resolve_used_border_widths(&mut self) {
@@ -607,6 +629,9 @@ impl Style {
             will_change,
             filter,
             box_shadow,
+            box_shadows,
+            backdrop_blur,
+            text_shadows,
             transform,
             transition,
             animation,
@@ -726,6 +751,9 @@ impl Style {
             will_change: will_change_b,
             filter: filter_b,
             box_shadow: box_shadow_b,
+            box_shadows: box_shadows_b,
+            backdrop_blur: backdrop_blur_b,
+            text_shadows: text_shadows_b,
             transform: transform_b,
             transition: transition_b,
             animation: animation_b,
@@ -843,6 +871,9 @@ impl Style {
             && will_change == will_change_b
             && filter == filter_b
             && box_shadow == box_shadow_b
+            && box_shadows == box_shadows_b
+            && backdrop_blur == backdrop_blur_b
+            && text_shadows == text_shadows_b
             && transform == transform_b
             && transition == transition_b
             && animation == animation_b
@@ -1672,6 +1703,22 @@ impl BoxShadow {
             inset: false,
         }
     }
+
+    pub fn inset(ox: f32, oy: f32, blur: f32, spread: f32, color: Color) -> Self {
+        Self {
+            inset: true,
+            ..Self::new(ox, oy, blur, spread, color)
+        }
+    }
+}
+
+/// CSS `text-shadow` (no spread, no inset).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub color: Color,
 }
 
 // --- Transform ---

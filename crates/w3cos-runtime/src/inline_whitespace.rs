@@ -41,7 +41,9 @@ fn passive(node: &Component, parent: &Style) -> bool {
         && s.opacity == 1.0
         && s.transform.is_identity()
         && s.filter.is_none()
-        && s.box_shadow.is_none()
+        && !s.has_box_shadow()
+        && s.backdrop_blur.is_none()
+        && s.text_shadows.is_empty()
         && matches!(
             node.kind,
             ComponentKind::Text { .. } | ComponentKind::Row | ComponentKind::Box

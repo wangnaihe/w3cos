@@ -3216,7 +3216,9 @@ fn unadorned_block_text(node: &PaintNode) -> bool {
         ]
         .into_iter()
         .all(|width| width.unwrap_or(0.0) == 0.0)
-        && node.style.box_shadow.is_none()
+        && !node.style.has_box_shadow()
+        && node.style.backdrop_blur.is_none()
+        && node.style.text_shadows.is_empty()
 }
 
 fn is_positioned(style: &Style) -> bool {

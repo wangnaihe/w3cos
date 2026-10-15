@@ -818,9 +818,17 @@ impl CSSStyleDeclaration {
                 }
             }
 
-            // Box shadow: "offsetX offsetY blur spread color"
+            // Box shadow: "offsetX offsetY blur spread color", comma-separated.
             "box-shadow" | "boxShadow" => {
-                self.inner.box_shadow = parse_box_shadow(value);
+                let shadows = parse_box_shadow_list(value);
+                self.inner.box_shadow = shadows.first().copied();
+                self.inner.box_shadows = shadows.get(1..).unwrap_or(&[]).to_vec();
+            }
+            "backdrop-filter" | "backdropFilter" => {
+                self.inner.backdrop_blur = parse_backdrop_blur(value);
+            }
+            "text-shadow" | "textShadow" => {
+                self.inner.text_shadows = parse_text_shadow_list(value);
             }
 
             // Transform
@@ -2310,25 +2318,129 @@ fn parse_min_percent_and_fixed(value: &str) -> Option<(Dimension, Dimension)> {
 }
 
 fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
+    parse_box_shadow_list(value).into_iter().next()
+}
+
+fn parse_box_shadow_list(value: &str) -> Vec<w3cos_std::style::BoxShadow> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    split_top_level_commas(value)
+        .into_iter()
+        .filter_map(|layer| parse_one_box_shadow(layer))
+        .collect()
+}
+
+fn parse_one_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
     // CSS allows the spread radius to be omitted: `x y blur color`.
-    let parts = split_css_whitespace(value);
-    if parts.len() < 3 {
+    // `inset` may sit at either end.
+    let mut parts = split_css_whitespace(value);
+    let mut inset = false;
+    parts.retain(|part| {
+        if part.eq_ignore_ascii_case("inset") {
+            inset = true;
+            false
+        } else {
+            true
+        }
+    });
+    if parts.len() < 2 {
         return None;
     }
     let ox = parse_px(&parts[0])?;
     let oy = parse_px(&parts[1])?;
-    let blur = parse_px(&parts[2])?;
-    let (spread, color_index) = parts
-        .get(3)
-        .and_then(|part| parse_px(part))
-        .map_or((0.0, 3), |spread| (spread, 4));
+    let blur = parts.get(2).and_then(|part| parse_px(part)).unwrap_or(0.0);
+    let (spread, color_index) = if parts.get(2).is_some_and(|part| parse_px(part).is_some()) {
+        parts
+            .get(3)
+            .and_then(|part| parse_px(part))
+            .map_or((0.0, 3), |spread| (spread, 4))
+    } else {
+        (0.0, 2)
+    };
     let color = parts
         .get(color_index)
         .and_then(|color| Color::from_css(color))
         .unwrap_or(Color::rgba(0, 0, 0, 80));
-    Some(w3cos_std::style::BoxShadow::new(
-        ox, oy, blur, spread, color,
-    ))
+    let mut shadow = w3cos_std::style::BoxShadow::new(ox, oy, blur, spread, color);
+    shadow.inset = inset;
+    Some(shadow)
+}
+
+fn parse_backdrop_blur(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("blur(")?;
+    let rest = &value[start + 5..];
+    let end = rest.find(')')?;
+    let argument = rest[..end].trim();
+    let px = parse_px(argument).or_else(|| argument.parse().ok())?;
+    (px > 0.0).then_some(px)
+}
+
+fn parse_text_shadow_list(value: &str) -> Vec<w3cos_std::style::TextShadow> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    split_top_level_commas(value)
+        .into_iter()
+        .filter_map(|layer| parse_one_text_shadow(layer))
+        .collect()
+}
+
+fn parse_one_text_shadow(value: &str) -> Option<w3cos_std::style::TextShadow> {
+    let parts = split_css_whitespace(value);
+    if parts.len() < 2 {
+        return None;
+    }
+    let ox = parse_px(&parts[0])?;
+    let oy = parse_px(&parts[1])?;
+    let blur = parts.get(2).and_then(|part| parse_px(part)).unwrap_or(0.0);
+    let color_index = if parts.get(2).is_some_and(|part| parse_px(part).is_some()) {
+        3
+    } else {
+        2
+    };
+    let color = parts
+        .get(color_index)
+        .and_then(|color| Color::from_css(color))
+        .unwrap_or(Color::rgba(0, 0, 0, 80));
+    Some(w3cos_std::style::TextShadow {
+        offset_x: ox,
+        offset_y: oy,
+        blur_radius: blur,
+        color,
+    })
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut layers = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let layer = value[start..index].trim();
+                if !layer.is_empty() {
+                    layers.push(layer);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = value[start..].trim();
+    if !tail.is_empty() {
+        layers.push(tail);
+    }
+    layers
 }
 
 pub(crate) fn list_style_marker_properties(value: &str) -> Option<(String, String)> {
@@ -5130,6 +5242,43 @@ mod tests {
         let shadow = declaration.inner.box_shadow.expect("parsed shadow");
         assert_eq!(shadow.spread_radius, 0.0);
         assert_eq!(shadow.color, Color::rgba(28, 55, 90, 31));
+        assert!(declaration.inner.box_shadows.is_empty());
+    }
+
+    #[test]
+    fn box_shadow_list_keeps_inset_and_outer_layers() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property(
+            "box-shadow",
+            "inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 10px 20px rgba(0, 0, 0, 0.18)",
+        );
+        let first = declaration.inner.box_shadow.expect("inset");
+        assert!(first.inset);
+        assert_eq!(first.offset_y, 1.0);
+        assert_eq!(first.blur_radius, 0.0);
+        let outer = &declaration.inner.box_shadows[0];
+        assert!(!outer.inset);
+        assert_eq!(outer.blur_radius, 20.0);
+        assert_eq!(outer.offset_y, 10.0);
+    }
+
+    #[test]
+    fn backdrop_filter_blur_is_the_standard_deviation() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("backdrop-filter", "blur(16px)");
+        assert_eq!(declaration.inner.backdrop_blur, Some(16.0));
+        declaration.set_property("backdropFilter", "none");
+        assert_eq!(declaration.inner.backdrop_blur, None);
+    }
+
+    #[test]
+    fn text_shadow_list_parses_blur_and_color() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("text-shadow", "0 1px 2px rgba(0, 0, 0, 0.45)");
+        let shadow = &declaration.inner.text_shadows[0];
+        assert_eq!(shadow.offset_y, 1.0);
+        assert_eq!(shadow.blur_radius, 2.0);
+        assert_eq!(shadow.color.a, 115);
     }
 
     #[test]
