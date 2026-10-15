@@ -1,25 +1,31 @@
 //! W3C OS Desktop Shell — the system-level GUI.
 //!
 //! Boot sequence: Linux kernel → init → S99w3cos → w3cos-shell (this binary)
-//! Click an app icon → the app UI replaces the desktop area.
-//! Click "W3C Apps" in taskbar → return to desktop.
+//! Click an app icon → a floating window opens over the desktop.
+//! Drag the title bar to move it; drag an edge or corner to resize.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+mod agent_host;
+mod locale;
+mod windows;
+
 #[cfg(feature = "desktop")]
 use crate::state;
+use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, INTENT_INPUT_PLACEHOLDER, IntentSession, IntentTier, ProposeResult, ShellApp,
-    ShellContext,
+    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
 };
-use w3cos_ai_bridge::permissions::AgentPermissions;
+use w3cos_ai_bridge::permissions::{AgentPermissions, BridgeOp};
+use w3cos_ai_bridge::shell_tools::{self, ShellView};
+use w3cos_runtime::capability_gate;
 #[cfg(not(feature = "desktop"))]
 use w3cos_runtime::state;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
-use w3cos_std::{Component, EventAction, Style};
+use w3cos_std::{Component, ComponentKind, EventAction, Style};
 
 mod shared_launch;
 
@@ -38,6 +44,17 @@ const STORAGE_SIGNAL: usize = 11;
 const SUBJECT_SIGNAL: usize = 12;
 const ENROLL_SIGNAL: usize = 13;
 const TIER_SIGNAL: usize = 14;
+const STEPS_SIGNAL: usize = 15;
+const TERMINAL_SIGNAL: usize = 16;
+const TERM_OUT_SIGNAL: usize = 17;
+const OPEN_MASK_SIGNAL: usize = 18;
+const MINIMIZED_MASK_SIGNAL: usize = 19;
+const LAUNCHER_SIGNAL: usize = 20;
+const LAUNCHER_QUERY_SIGNAL: usize = 21;
+const SETTINGS_TAB_SIGNAL: usize = 22;
+const FILES_FOLDER_SIGNAL: usize = 23;
+const TOAST_SIGNAL: usize = 24;
+const RECEIPTS_OPEN_SIGNAL: usize = 25;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -57,6 +74,36 @@ const OP_ENROLL: u8 = 17;
 const OP_SHARED_APP: u8 = 18;
 const OP_SHARED_PAGE: u8 = 19;
 const OP_SHARED_PLUGIN: u8 = 20;
+const OP_RUN_TERMINAL: u8 = 21;
+const OP_MINIMIZE: u8 = 22;
+const OP_CLOSE: u8 = 23;
+const OP_CYCLE: u8 = 24;
+const OP_LAUNCHER: u8 = 25;
+const OP_LAUNCHER_SEARCH: u8 = 26;
+const OP_DISMISS_TOAST: u8 = 27;
+const OP_SETTINGS_LOCAL: u8 = 28;
+const OP_SETTINGS_IDENTITY: u8 = 29;
+const OP_SETTINGS_BRIDGE: u8 = 30;
+const OP_SETTINGS_L2: u8 = 31;
+const OP_L2_TOGGLE: u8 = 32;
+const OP_FILES_HOME: u8 = 33;
+const OP_FILES_DOCS: u8 = 34;
+const OP_FILES_PICS: u8 = 35;
+const OP_FILES_DOWN: u8 = 36;
+const OP_FILES_MUSIC: u8 = 37;
+const OP_FILES_PROJECTS: u8 = 38;
+const OP_FILES_W3COS: u8 = 39;
+const OP_TOGGLE_RECEIPTS: u8 = 40;
+const OP_FOCUS_DESKTOP: u8 = 41;
+const OP_FOCUS_FILES: u8 = 42;
+const OP_FOCUS_TERMINAL: u8 = 43;
+const OP_FOCUS_SETTINGS: u8 = 44;
+const OP_FOCUS_AGENT: u8 = 45;
+const OP_FOCUS_BROWSER: u8 = 46;
+const OP_FOCUS_EDITOR: u8 = 47;
+const OP_MAXIMIZE: u8 = 48;
+const OP_LOCALE_ZH: u8 = 49;
+const OP_LOCALE_EN: u8 = 50;
 
 fn main() {
     shell_main();
@@ -66,6 +113,7 @@ pub(crate) fn shell_main() {
     if shared_launch::launch_from_args() {
         return;
     }
+    locale::apply_startup();
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
 
     let mut ai_port = None;
@@ -94,6 +142,9 @@ pub(crate) fn shell_main() {
     }
 
     state::set_invoke_hook(on_shell_intent);
+    state::set_shell_drag_hook(on_window_drag);
+    state::set_agent_poll_hook(on_agent_poll);
+    agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     #[cfg(feature = "desktop")]
     let launched = crate::run_app(build_shell);
@@ -142,6 +193,17 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
     });
 }
 
@@ -167,7 +229,15 @@ fn boot_session_once() {
     if already {
         return;
     }
-    with_session(|session| sync_session(session, 0, ""));
+    with_session(|session| {
+        if session.authorize_bridge(&BridgeOp::ReadDom).is_ok() {
+            capability_gate::grant(shell_tools::CAP_A11Y);
+        }
+        if session.authorize_bridge(&BridgeOp::Screenshot).is_ok() {
+            capability_gate::grant(shell_tools::CAP_CAPTURE);
+        }
+        sync_session(session, 0, "");
+    });
 }
 
 fn on_shell_intent(code: u8, draft: &str) {
@@ -178,6 +248,9 @@ fn on_shell_intent(code: u8, draft: &str) {
     if code == OP_TOGGLE_TASKS {
         let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);
         state::set_signal(TASKS_SIGNAL, next);
+        return;
+    }
+    if handle_chrome_op(code, draft) {
         return;
     }
     let ctx = ShellContext {
@@ -194,15 +267,20 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_CHIP_SETTINGS => apply_propose(session, "打开设置", &ctx),
         OP_CONFIRM => apply_confirm(session, &ctx),
         OP_CANCEL => {
-            session.cancel();
-            sync_session(session, 0, "");
+            if state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending() {
+                let update = agent_host::cancel();
+                apply_host_update(session, update);
+            } else {
+                session.cancel();
+                sync_session(session, 0, "");
+            }
         }
         OP_REVOKE => {
             session.revoke_context();
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                "上下文已隐藏。Context hidden.",
+                &locale::t("toast-context-hidden"),
             );
         }
         OP_RESTORE => {
@@ -210,7 +288,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                "上下文已恢复。Context shared.",
+                &locale::t("toast-context-shared"),
             );
         }
         OP_LOCK => {
@@ -218,7 +296,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                "身份已锁定。Identity locked.",
+                &locale::t("toast-identity-locked"),
             );
         }
         OP_UNLOCK => {
@@ -226,17 +304,17 @@ fn on_shell_intent(code: u8, draft: &str) {
                 sync_session(
                     session,
                     state::get_signal(PHASE_SIGNAL),
-                    "已解锁（不是 passkey）。Unlocked stub.",
+                    &locale::t("toast-unlocked-stub"),
                 );
             }
         }
         OP_ENROLL => {
             let notice = if session.begin_passkey_enrollment().is_some() {
-                "已生成注册挑战。还没有验证断言。Challenge ready."
+                locale::t("toast-enroll-ok")
             } else {
-                "挑战没有生成。Challenge was not created."
+                locale::t("toast-enroll-fail")
             };
-            sync_session(session, state::get_signal(PHASE_SIGNAL), notice);
+            sync_session(session, state::get_signal(PHASE_SIGNAL), &notice);
         }
         OP_SHARED_APP => {
             shared_launch::spawn_detached(
@@ -246,10 +324,7 @@ fn on_shell_intent(code: u8, draft: &str) {
                     "/usr/share/w3cos/apps/shared-hello/shared-hello.w3app",
                 ),
             );
-            state::set_text_signal(
-                NOTICE_SIGNAL,
-                "已启动共享运行时应用。Launched the shared-runtime app.",
-            );
+            state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-app"));
         }
         OP_SHARED_PAGE => {
             shared_launch::spawn_detached(
@@ -259,11 +334,10 @@ fn on_shell_intent(code: u8, draft: &str) {
                     "/usr/share/w3cos/apps/shared-hello/page.html",
                 ),
             );
-            state::set_text_signal(
-                NOTICE_SIGNAL,
-                "已把网页载入页面 worker。Loaded the page in the page worker.",
-            );
+            state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-page"));
         }
+        OP_RUN_TERMINAL => run_terminal_from_button(session),
+        OP_L2_TOGGLE => toggle_l2(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
                 "plugin",
@@ -272,10 +346,7 @@ fn on_shell_intent(code: u8, draft: &str) {
                     "/usr/share/w3cos/apps/shared-counter/libshared_counter.so",
                 ),
             );
-            state::set_text_signal(
-                NOTICE_SIGNAL,
-                "已启动 C 插件应用。Launched the C plugin app.",
-            );
+            state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-plugin"));
         }
         _ => {}
     });
@@ -290,6 +361,23 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
             state::set_text_signal(TIER_SIGNAL, tier_name(proposal.tier));
             sync_session(session, 1, "");
         }
+        ProposeResult::Plan { utterance } => match agent_host::begin(&utterance) {
+            Ok(update) => apply_host_update(session, update),
+            Err(err) => {
+                let receipt = session.record_external(
+                    &utterance,
+                    "l2",
+                    w3cos_ai_bridge::intent::Decision::Unrecognized,
+                    false,
+                    &err,
+                    IntentTier::L2,
+                );
+                state::set_text_signal(SUMMARY_SIGNAL, "");
+                state::set_text_signal(IMPACT_SIGNAL, "");
+                state::set_text_signal(TIER_SIGNAL, "L2");
+                sync_session(session, 2, &receipt.outcome);
+            }
+        },
         ProposeResult::Unrecognized { receipt } => {
             state::set_text_signal(SUMMARY_SIGNAL, "");
             state::set_text_signal(IMPACT_SIGNAL, "");
@@ -300,6 +388,10 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
 }
 
 fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
+    if w3cos_ai_bridge::agent_loop::has_pending() {
+        confirm_agent_step(session);
+        return;
+    }
     let Some(effect) = session.confirm(ctx, now_ms()) else {
         sync_session(session, 0, "");
         return;
@@ -310,15 +402,172 @@ fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
 
 fn tier_name(tier: IntentTier) -> &'static str {
     match tier {
+        IntentTier::L2 => "L2",
         IntentTier::L1 => "L1",
         IntentTier::L0 => "L0",
         IntentTier::Unspecified => "",
     }
 }
 
+fn on_agent_poll() {
+    ensure_shell_signals();
+    let (can_read, can_shot) = session_read_flags();
+    let mut view = current_shell_view();
+    let Some(update) = agent_host::poll(&mut view, &|name| match name {
+        shell_tools::CAP_A11Y => can_read,
+        shell_tools::CAP_CAPTURE => can_shot,
+        _ => false,
+    }) else {
+        return;
+    };
+    with_session(|session| apply_host_update(session, update));
+}
+
+fn confirm_agent_step(session: &mut IntentSession) {
+    let name = w3cos_ai_bridge::agent_loop::pending_capability();
+    let tool_name = if name == shell_tools::CAP_PROCESS {
+        "click"
+    } else {
+        "act"
+    };
+    if let Err(reason) = session.gate_mutation(now_ms()) {
+        apply_host_update(session, agent_host::reject(reason));
+        return;
+    }
+    let op = BridgeOp::Mutate {
+        action: ActionType::Click,
+        selector: format!("shell:l2:{tool_name}"),
+    };
+    if let Err(reason) = session.authorize_bridge(&op) {
+        apply_host_update(session, agent_host::reject(&reason));
+        return;
+    }
+    capability_gate::grant(shell_tools::CAP_ACT);
+    if name == shell_tools::CAP_PROCESS {
+        capability_gate::grant(shell_tools::CAP_PROCESS);
+    }
+    let mut view = current_shell_view();
+    let update = agent_host::confirm(&mut view, &|capability| {
+        capability_gate::is_granted(capability)
+    });
+    capability_gate::deny(shell_tools::CAP_ACT);
+    capability_gate::deny(shell_tools::CAP_PROCESS);
+    apply_host_update(session, update);
+}
+
+fn session_read_flags() -> (bool, bool) {
+    let mut can_read = false;
+    let mut can_shot = false;
+    with_session(|session| {
+        can_read = session.authorize_bridge(&BridgeOp::ReadDom).is_ok()
+            && capability_gate::is_granted(shell_tools::CAP_A11Y);
+        can_shot = session.authorize_bridge(&BridgeOp::Screenshot).is_ok()
+            && capability_gate::is_granted(shell_tools::CAP_CAPTURE);
+    });
+    (can_read, can_shot)
+}
+
+fn current_shell_view() -> ShellView {
+    ShellView {
+        app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
+        night: state::get_signal(NIGHT_SIGNAL) != 0,
+        terminal_line: state::get_signal_text(TERMINAL_SIGNAL),
+        terminal_output: state::get_signal_text(TERM_OUT_SIGNAL),
+    }
+}
+
+fn apply_host_update(session: &mut IntentSession, update: agent_host::HostUpdate) {
+    for effect in &update.effects {
+        match effect {
+            shell_tools::ShellEffect::Navigate(app) => {
+                focus_app(app.signal_value());
+            }
+            shell_tools::ShellEffect::SetNight(night) => {
+                state::set_signal(NIGHT_SIGNAL, i64::from(*night));
+            }
+            shell_tools::ShellEffect::SetTerminalLine(line) => {
+                state::set_text_signal(TERMINAL_SIGNAL, line);
+            }
+            shell_tools::ShellEffect::SetTerminalOutput(output) => {
+                state::set_text_signal(TERM_OUT_SIGNAL, output);
+            }
+        }
+    }
+    for receipt in &update.receipts {
+        session.record_external(
+            &update.utterance,
+            &receipt.command,
+            receipt.decision,
+            receipt.confirmed,
+            &receipt.outcome,
+            receipt.tier,
+        );
+    }
+    if update.open_tasks {
+        state::set_signal(TASKS_SIGNAL, 1);
+    }
+    state::set_text_signal(SUMMARY_SIGNAL, update.summary);
+    state::set_text_signal(IMPACT_SIGNAL, update.impact);
+    state::set_text_signal(TIER_SIGNAL, update.tier);
+    state::set_text_signal(STEPS_SIGNAL, update.steps);
+    sync_session(session, update.phase, &update.notice);
+    if let Ok(path) = std::env::var("W3COS_AGENT_TRACE") {
+        let line = format!(
+            "phase={} {}\n",
+            update.phase,
+            update.notice.replace('\n', " ")
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(line.as_bytes())
+            });
+    }
+}
+
+fn run_terminal_from_button(session: &mut IntentSession) {
+    let line = state::get_signal_text(TERMINAL_SIGNAL);
+    if let Err(reason) = session.gate_mutation(now_ms()) {
+        sync_session(session, state::get_signal(PHASE_SIGNAL), reason);
+        return;
+    }
+    let op = BridgeOp::Mutate {
+        action: ActionType::Click,
+        selector: "shell:l2:run".into(),
+    };
+    if let Err(reason) = session.authorize_bridge(&op) {
+        sync_session(session, state::get_signal(PHASE_SIGNAL), &reason);
+        return;
+    }
+    capability_gate::grant(shell_tools::CAP_PROCESS);
+    let granted = capability_gate::is_granted(shell_tools::CAP_PROCESS);
+    let outcome = if !granted {
+        "Denied: w3cos-process is not granted. Nothing was changed.".to_string()
+    } else {
+        match shell_tools::run_allowlisted(&line) {
+            Ok(output) => {
+                state::set_text_signal(TERM_OUT_SIGNAL, &output);
+                output
+            }
+            Err(err) => format!("Denied: {err}. Nothing was changed."),
+        }
+    };
+    capability_gate::deny(shell_tools::CAP_PROCESS);
+    let decision = if outcome.starts_with("Denied") {
+        w3cos_ai_bridge::intent::Decision::Denied
+    } else {
+        w3cos_ai_bridge::intent::Decision::Allowed
+    };
+    session.record_external(&line, "l2:run", decision, true, &outcome, IntentTier::L2);
+    sync_session(session, 2, &outcome);
+}
+
 fn apply_effect(effect: &ExecuteResult) {
     if let Some(app) = effect.navigate {
-        state::set_signal(APP_SIGNAL, app.signal_value());
+        focus_app(app.signal_value());
     }
     if let Some(night) = effect.night {
         state::set_signal(NIGHT_SIGNAL, i64::from(night));
@@ -330,6 +579,9 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
     state::set_signal(CONTEXT_SIGNAL, i64::from(session.context_shared()));
     state::set_signal(UNLOCKED_SIGNAL, i64::from(session.identity_unlocked()));
     state::set_text_signal(NOTICE_SIGNAL, notice);
+    if !notice.is_empty() {
+        state::set_text_signal(TOAST_SIGNAL, notice);
+    }
     state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(12));
     state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
     state::set_text_signal(SUBJECT_SIGNAL, session.actor());
@@ -350,6 +602,285 @@ fn invoke(code: u8) -> EventAction {
     }
 }
 
+fn app_key(id: i64) -> &'static str {
+    match id {
+        1 => "app-files",
+        2 => "app-terminal",
+        3 => "app-settings",
+        4 => "app-agent",
+        5 => "app-browser",
+        6 => "app-editor",
+        _ => "app-desktop",
+    }
+}
+
+fn app_label(id: i64) -> String {
+    locale::t(app_key(id))
+}
+
+fn toast_named(key: &str, id: i64) -> String {
+    let name = app_label(id);
+    locale::t_args(key, &[("name", &name)])
+}
+
+fn app_bit(id: i64) -> i64 {
+    if (1..=6).contains(&id) {
+        1_i64 << id
+    } else {
+        0
+    }
+}
+
+fn focus_code(id: i64) -> u8 {
+    match id {
+        0 => OP_FOCUS_DESKTOP,
+        1 => OP_FOCUS_FILES,
+        2 => OP_FOCUS_TERMINAL,
+        3 => OP_FOCUS_SETTINGS,
+        4 => OP_FOCUS_AGENT,
+        5 => OP_FOCUS_BROWSER,
+        _ => OP_FOCUS_EDITOR,
+    }
+}
+
+fn push_toast(text: &str) {
+    state::set_text_signal(TOAST_SIGNAL, text);
+}
+
+fn focus_app(id: i64) {
+    ensure_shell_signals();
+    let id = id.clamp(0, 6);
+    state::set_signal(APP_SIGNAL, id);
+    state::set_signal(LAUNCHER_SIGNAL, 0);
+    let bit = app_bit(id);
+    if bit == 0 {
+        return;
+    }
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    state::set_signal(OPEN_MASK_SIGNAL, open | bit);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+    windows::raise(id);
+    remember_windows();
+}
+
+fn window_target(draft: &str) -> i64 {
+    draft
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|id| (1..=6).contains(id))
+        .unwrap_or_else(|| state::get_signal(APP_SIGNAL))
+}
+
+fn minimize_window(id: i64) {
+    let bit = app_bit(id);
+    if bit == 0 {
+        push_toast(&locale::t("toast-desktop-stays"));
+        return;
+    }
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    state::set_signal(OPEN_MASK_SIGNAL, open | bit);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    state::set_signal(MINIMIZED_MASK_SIGNAL, minimized | bit);
+    if state::get_signal(APP_SIGNAL) == id {
+        state::set_signal(APP_SIGNAL, 0);
+    }
+    push_toast(&toast_named("toast-minimized", id));
+    remember_windows();
+}
+
+fn close_window(id: i64) {
+    let bit = app_bit(id);
+    if bit == 0 {
+        push_toast(&locale::t("toast-no-close"));
+        return;
+    }
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    state::set_signal(OPEN_MASK_SIGNAL, open & !bit);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+    if state::get_signal(APP_SIGNAL) == id {
+        state::set_signal(APP_SIGNAL, 0);
+    }
+    push_toast(&toast_named("toast-closed", id));
+    remember_windows();
+}
+
+fn toggle_window_maximize(id: i64) {
+    let (width, height) = stage_bounds();
+    if !windows::toggle_maximize(id, width, height) {
+        push_toast(&locale::t("toast-no-max"));
+        return;
+    }
+    focus_app(id);
+    let key = if windows::is_maximized(id) {
+        "toast-max"
+    } else {
+        "toast-restore"
+    };
+    push_toast(&toast_named(key, id));
+}
+
+fn stage_bounds() -> (f32, f32) {
+    let mut width: f32 = 1200.0;
+    if state::get_signal(TASKS_SIGNAL) != 0 {
+        width -= 300.0;
+    }
+    if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
+        width -= 300.0;
+    }
+    (width.max(480.0), 540.0)
+}
+
+fn remember_windows() {
+    windows::save(
+        state::get_signal(OPEN_MASK_SIGNAL),
+        state::get_signal(MINIMIZED_MASK_SIGNAL),
+        state::get_signal(APP_SIGNAL),
+    );
+}
+
+fn on_window_drag(id: i64, mode: u8, dx: f32, dy: f32, phase: u8) {
+    if phase == 1 {
+        let bit = app_bit(id);
+        if bit != 0 {
+            state::set_signal(APP_SIGNAL, id);
+            let open = state::get_signal(OPEN_MASK_SIGNAL);
+            state::set_signal(OPEN_MASK_SIGNAL, open | bit);
+            let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+            state::set_signal(MINIMIZED_MASK_SIGNAL, minimized & !bit);
+        }
+        windows::raise(id);
+    }
+    let (width, height) = stage_bounds();
+    windows::on_drag(id, mode, dx, dy, phase, width, height);
+    if phase == 2 {
+        remember_windows();
+    }
+}
+
+fn cycle_windows() {
+    let current = state::get_signal(APP_SIGNAL);
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let start = if (1..=6).contains(&current) {
+        current
+    } else {
+        0
+    };
+    let mut found = None;
+    for step in 1..=6 {
+        let id = (start + step - 1) % 6 + 1;
+        if open & app_bit(id) != 0 {
+            found = Some(id);
+            break;
+        }
+    }
+    match found {
+        Some(id) if id != current => {
+            focus_app(id);
+            push_toast(&toast_named("toast-switched", id));
+        }
+        Some(_) => push_toast(&locale::t("toast-no-other")),
+        None => push_toast(&locale::t("toast-none")),
+    }
+}
+
+fn handle_chrome_op(code: u8, draft: &str) -> bool {
+    match code {
+        OP_MINIMIZE => minimize_window(window_target(draft)),
+        OP_CLOSE => close_window(window_target(draft)),
+        OP_MAXIMIZE => toggle_window_maximize(window_target(draft)),
+        OP_CYCLE => cycle_windows(),
+        OP_LAUNCHER => {
+            let next = i64::from(state::get_signal(LAUNCHER_SIGNAL) == 0);
+            state::set_signal(LAUNCHER_SIGNAL, next);
+        }
+        OP_LAUNCHER_SEARCH => {
+            state::set_text_signal(LAUNCHER_QUERY_SIGNAL, draft.trim());
+            state::set_signal(LAUNCHER_SIGNAL, 1);
+        }
+        OP_DISMISS_TOAST => state::set_text_signal(TOAST_SIGNAL, ""),
+        OP_SETTINGS_LOCAL => state::set_signal(SETTINGS_TAB_SIGNAL, 0),
+        OP_SETTINGS_IDENTITY => state::set_signal(SETTINGS_TAB_SIGNAL, 1),
+        OP_SETTINGS_BRIDGE => state::set_signal(SETTINGS_TAB_SIGNAL, 2),
+        OP_SETTINGS_L2 => state::set_signal(SETTINGS_TAB_SIGNAL, 3),
+        OP_FILES_HOME => state::set_signal(FILES_FOLDER_SIGNAL, 0),
+        OP_FILES_DOCS => state::set_signal(FILES_FOLDER_SIGNAL, 1),
+        OP_FILES_PICS => state::set_signal(FILES_FOLDER_SIGNAL, 2),
+        OP_FILES_DOWN => state::set_signal(FILES_FOLDER_SIGNAL, 3),
+        OP_FILES_MUSIC => state::set_signal(FILES_FOLDER_SIGNAL, 4),
+        OP_FILES_PROJECTS => state::set_signal(FILES_FOLDER_SIGNAL, 5),
+        OP_FILES_W3COS => state::set_signal(FILES_FOLDER_SIGNAL, 6),
+        OP_TOGGLE_RECEIPTS => {
+            let next = i64::from(state::get_signal(RECEIPTS_OPEN_SIGNAL) == 0);
+            state::set_signal(RECEIPTS_OPEN_SIGNAL, next);
+        }
+        OP_FOCUS_DESKTOP => focus_app(0),
+        OP_FOCUS_FILES => focus_app(1),
+        OP_FOCUS_TERMINAL => focus_app(2),
+        OP_FOCUS_SETTINGS => focus_app(3),
+        OP_FOCUS_AGENT => focus_app(4),
+        OP_FOCUS_BROWSER => focus_app(5),
+        OP_FOCUS_EDITOR => focus_app(6),
+        OP_LOCALE_ZH => {
+            locale::set_locale("zh-CN");
+            state::mark_dirty();
+        }
+        OP_LOCALE_EN => {
+            locale::set_locale("en");
+            state::mark_dirty();
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn l2_env_configured() -> bool {
+    matches!(
+        std::env::var("W3COS_L2").unwrap_or_default().trim(),
+        "1" | "true" | "script"
+    )
+}
+
+fn toggle_l2(session: &mut IntentSession) {
+    if session.l2_enabled() {
+        session.set_l2_enabled(false);
+        if state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending() {
+            let update = agent_host::cancel();
+            apply_host_update(session, update);
+        }
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("toast-l2-off"),
+        );
+        return;
+    }
+    if l2_env_configured() {
+        session.set_l2_enabled(true);
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("toast-l2-on"),
+        );
+        return;
+    }
+    sync_session(
+        session,
+        state::get_signal(PHASE_SIGNAL),
+        &locale::t("toast-l2-blocked"),
+    );
+}
+
+fn session_l2_on() -> bool {
+    SESSION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|session| session.l2_enabled())
+    })
+}
+
 fn apply_screen_override() {
     // Screenshot hook. Set once so a later click can still change the screen.
     thread_local! {
@@ -358,8 +889,37 @@ fn apply_screen_override() {
     if APPLIED.with(|applied| applied.replace(true)) {
         return;
     }
+    if let Ok(query) = std::env::var("W3COS_LAUNCHER_QUERY") {
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, query.trim());
+    }
     match std::env::var("W3COS_SCREEN").ok().as_deref() {
-        Some("settings") => state::set_signal(APP_SIGNAL, 3),
+        Some("settings") => focus_app(3),
+        Some("settings-l2") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+        }
+        Some("settings-identity") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 1);
+        }
+        Some("settings-bridge") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 2);
+        }
+        Some("files") => focus_app(1),
+        Some("files-docs") => {
+            focus_app(1);
+            state::set_signal(FILES_FOLDER_SIGNAL, 1);
+        }
+        Some("terminal") => focus_app(2),
+        Some("launcher") => state::set_signal(LAUNCHER_SIGNAL, 1),
+        Some("receipts") => state::set_signal(RECEIPTS_OPEN_SIGNAL, 1),
+        Some("windows") => {
+            state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
+            state::set_signal(MINIMIZED_MASK_SIGNAL, app_bit(5));
+            focus_app(1);
+            push_toast(&locale::t("toast-browser-min"));
+        }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
         _ => {}
     }
@@ -367,50 +927,222 @@ fn apply_screen_override() {
 
 fn build_shell() -> Component {
     ensure_shell_signals();
+    if let Some(session) = windows::load_once() {
+        state::set_signal(OPEN_MASK_SIGNAL, session.open);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized);
+        state::set_signal(APP_SIGNAL, session.focused.clamp(0, 6));
+    }
     apply_screen_override();
     boot_session_once();
     let current = state::get_signal(APP_SIGNAL);
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
     let tasks_open = state::get_signal(TASKS_SIGNAL) != 0;
+    let receipts_open = state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0;
 
-    let content = match current {
-        0 => build_desktop(),
-        1 => build_files_app(),
-        2 => build_terminal_app(),
-        3 => build_settings_app(),
-        4 => build_ai_agent_app(),
-        5 => build_browser_app(),
-        6 => build_editor_app(),
-        _ => build_desktop(),
-    };
+    let mut workspace = vec![build_stage()];
+    if tasks_open {
+        workspace.push(build_task_center());
+    }
+    if receipts_open {
+        workspace.push(build_receipts_viewer());
+    }
+    let mut column = vec![
+        chrome_layer(build_context_header(current, night)),
+        chrome_layer(build_intent_bar()),
+        Component::row(
+            Style {
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                min_height: Dimension::Px(0.0),
+                overflow: Overflow::Hidden,
+                gap: 0.0,
+                align_items: AlignItems::Stretch,
+                ..Style::default()
+            },
+            workspace,
+        ),
+    ];
+    let toast = state::get_signal_text(TOAST_SIGNAL);
+    if !toast.is_empty() {
+        column.push(chrome_layer(build_toast(&toast)));
+    }
+    if state::get_signal(LAUNCHER_SIGNAL) != 0 {
+        column.push(chrome_layer(build_launcher()));
+    }
+    column.push(chrome_layer(build_taskbar(current)));
 
     Component::column(
         Style {
             width: Dimension::Vw(100.0),
             height: Dimension::Vh(100.0),
+            overflow: Overflow::Hidden,
             background: Color::from_hex(if night { "#15202c" } else { "#1a2836" }),
             gap: 0.0,
+            direction: locale::text_direction(),
+            ..Style::default()
+        },
+        column,
+    )
+}
+
+const CHROME_Z: i32 = 1_000_000;
+
+fn chrome_layer(mut component: Component) -> Component {
+    component.style.position = Position::Relative;
+    component.style.z_index = CHROME_Z;
+    component
+}
+
+fn build_stage() -> Component {
+    let current = state::get_signal(APP_SIGNAL);
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    let mut ids: Vec<i64> = (1..=6)
+        .filter(|id| open & app_bit(*id) != 0 && minimized & app_bit(*id) == 0)
+        .collect();
+    ids.sort_by_key(|id| (windows::frame(*id).z, *id));
+    let mut children = vec![build_desktop()];
+    for id in ids {
+        children.push(build_window_frame(id, current == id));
+    }
+    Component::column(
+        Style {
+            position: Position::Relative,
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            min_width: Dimension::Px(0.0),
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Hidden,
+            ..Style::default()
+        },
+        children,
+    )
+}
+
+fn app_body(id: i64) -> Component {
+    match id {
+        1 => build_files_app(),
+        2 => build_terminal_app(),
+        3 => build_settings_app(),
+        4 => build_ai_agent_app(),
+        5 => build_browser_app(),
+        _ => build_editor_app(),
+    }
+}
+
+fn build_window_frame(id: i64, focused: bool) -> Component {
+    let frame = windows::frame(id);
+    let border = if focused { "#9eb6ff" } else { "#2a3e52" };
+    let mut window = Component::column(
+        Style {
+            position: Position::Absolute,
+            left: Dimension::Px(frame.x),
+            top: Dimension::Px(frame.y),
+            width: Dimension::Px(frame.w),
+            height: Dimension::Px(frame.h),
+            z_index: frame.z,
+            overflow: Overflow::Hidden,
+            box_sizing: BoxSizing::BorderBox,
+            border_width: 1.0,
+            border_color: Color::from_hex(border),
+            background: Color::from_hex("#0f0f1a"),
+            flex_shrink: 0.0,
             ..Style::default()
         },
         vec![
-            build_context_header(current, night),
-            build_intent_bar(),
+            resize_handle(id, "n", Dimension::Percent(100.0), Dimension::Px(6.0)),
             Component::row(
                 Style {
                     flex_grow: 1.0,
+                    min_height: Dimension::Px(0.0),
+                    overflow: Overflow::Hidden,
                     gap: 0.0,
-                    align_items: AlignItems::Stretch,
                     ..Style::default()
                 },
-                if tasks_open {
-                    vec![content, build_task_center()]
-                } else {
-                    vec![content]
-                },
+                vec![
+                    resize_handle(id, "w", Dimension::Px(6.0), Dimension::Percent(100.0)),
+                    Component::column(
+                        Style {
+                            flex_grow: 1.0,
+                            min_width: Dimension::Px(0.0),
+                            min_height: Dimension::Px(0.0),
+                            overflow: Overflow::Auto,
+                            ..Style::default()
+                        },
+                        vec![app_body(id)],
+                    ),
+                    Component::column(
+                        Style {
+                            width: Dimension::Px(16.0),
+                            flex_shrink: 0.0,
+                            gap: 0.0,
+                            ..Style::default()
+                        },
+                        vec![
+                            {
+                                let mut east =
+                                    resize_handle(id, "e", Dimension::Px(16.0), Dimension::Auto);
+                                east.style.flex_grow = 1.0;
+                                east
+                            },
+                            resize_corner(id),
+                        ],
+                    ),
+                ],
             ),
-            build_taskbar(current),
+            resize_handle(id, "s", Dimension::Percent(100.0), Dimension::Px(6.0)),
         ],
-    )
+    );
+    window.kind = ComponentKind::Button {
+        label: String::new(),
+    };
+    window.on_click = invoke(focus_code(id));
+    window.style.custom_properties = Some(win_props(id, None));
+    window
+}
+
+fn win_props(id: i64, gesture: Option<&str>) -> HashMap<String, String> {
+    let mut props = HashMap::from([("--w3cos-win".to_string(), id.to_string())]);
+    if let Some(gesture) = gesture {
+        props.insert("--w3cos-gesture".to_string(), gesture.to_string());
+    }
+    props
+}
+
+fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) -> Component {
+    let mut handle = Component::button_with_click(
+        " ",
+        Style {
+            width,
+            height,
+            flex_shrink: 0.0,
+            padding: Edges::ZERO,
+            font_size: 1.0,
+            background: Color::from_hex("#2a3e52"),
+            ..Style::default()
+        },
+        invoke(focus_code(id)),
+    );
+    handle.style.custom_properties = Some(win_props(id, Some(gesture)));
+    handle
+}
+
+fn resize_corner(id: i64) -> Component {
+    let mut corner = Component::button_with_click(
+        " ",
+        Style {
+            width: Dimension::Px(16.0),
+            height: Dimension::Px(16.0),
+            flex_shrink: 0.0,
+            padding: Edges::ZERO,
+            font_size: 1.0,
+            background: Color::from_hex("#d5dee8"),
+            ..Style::default()
+        },
+        invoke(focus_code(id)),
+    );
+    corner.style.custom_properties = Some(win_props(id, Some("se")));
+    corner
 }
 
 // ==========================================================================
@@ -425,7 +1157,7 @@ fn build_desktop() -> Component {
     }
     if night {
         children.push(Component::text(
-            "Night mode is on",
+            locale::t("desktop-night"),
             Style {
                 font_size: 14.0,
                 color: Color::from_hex("#a29bfe"),
@@ -436,9 +1168,12 @@ fn build_desktop() -> Component {
     Component::column(
         Style {
             flex_grow: 1.0,
+            flex_shrink: 1.0,
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Hidden,
             background: Color::from_hex(if night { "#1a3048" } else { "#24506e" }),
-            padding: Edges::all(60.0),
-            gap: 40.0,
+            padding: Edges::all(28.0),
+            gap: 20.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
             ..Style::default()
@@ -449,16 +1184,17 @@ fn build_desktop() -> Component {
 
 fn build_desktop_icons() -> Component {
     let apps = [
-        ("F", "Files", "#3498db", 1),
-        ("T", "Terminal", "#2ecc71", 2),
-        ("S", "Settings", "#9b59b6", 3),
-        ("A", "AI Agent", "#e74c3c", 4),
-        ("B", "Browser", "#f39c12", 5),
-        ("E", "Editor", "#1abc9c", 6),
+        ("F", "#3498db", 1),
+        ("T", "#2ecc71", 2),
+        ("S", "#9b59b6", 3),
+        ("A", "#e74c3c", 4),
+        ("B", "#f39c12", 5),
+        ("E", "#1abc9c", 6),
     ];
     let icons: Vec<Component> = apps
         .iter()
-        .map(|(l, label, c, id)| {
+        .map(|(l, c, id)| {
+            let label = app_label(*id);
             Component::column(
                 Style {
                     align_items: AlignItems::Center,
@@ -478,10 +1214,10 @@ fn build_desktop_icons() -> Component {
                             color: Color::WHITE,
                             ..Style::default()
                         },
-                        EventAction::Set(APP_SIGNAL, *id),
+                        invoke(focus_code(*id)),
                     ),
                     Component::text(
-                        *label,
+                        label,
                         Style {
                             font_size: 14.0,
                             color: Color::from_hex("#c0c0d0"),
@@ -512,7 +1248,7 @@ fn build_shared_launcher() -> Component {
         },
         vec![
             Component::button_with_click(
-                "Shared Hello",
+                locale::t("shared-hello"),
                 Style {
                     background: Color::from_hex("#2bb0ed"),
                     color: Color::from_hex("#041422"),
@@ -524,7 +1260,7 @@ fn build_shared_launcher() -> Component {
                 invoke(OP_SHARED_APP),
             ),
             Component::button_with_click(
-                "Web VM",
+                locale::t("shared-web"),
                 Style {
                     background: Color::from_hex("#1b4332"),
                     color: Color::from_hex("#d8f3dc"),
@@ -536,7 +1272,7 @@ fn build_shared_launcher() -> Component {
                 invoke(OP_SHARED_PAGE),
             ),
             Component::button_with_click(
-                "Counter",
+                locale::t("shared-counter"),
                 Style {
                     background: Color::from_hex("#9b2226"),
                     color: Color::from_hex("#fff1f0"),
@@ -560,10 +1296,10 @@ fn build_system_info() -> Component {
             ..Style::default()
         },
         vec![
-            info_card("CPU", "23%", "#00b894"),
-            info_card("Memory", "5.4 / 8 GB", "#fdcb6e"),
-            info_card("Storage", "205 / 512 GB", "#74b9ff"),
-            info_card("Network", "84 Mbps", "#a29bfe"),
+            info_card(&locale::t("info-cpu"), "23%", "#00b894"),
+            info_card(&locale::t("info-memory"), "5.4 / 8 GB", "#fdcb6e"),
+            info_card(&locale::t("info-storage"), "205 / 512 GB", "#74b9ff"),
+            info_card(&locale::t("info-network"), "84 Mbps", "#a29bfe"),
         ],
     )
 }
@@ -638,7 +1374,7 @@ fn build_branding() -> Component {
                 },
             ),
             Component::text(
-                "Native Desktop Shell - TypeScript compiled to native binary",
+                locale::t("brand-tagline"),
                 Style {
                     font_size: 13.0,
                     color: Color::from_hex("#808090"),
@@ -654,6 +1390,18 @@ fn build_branding() -> Component {
 // ==========================================================================
 
 fn build_files_app() -> Component {
+    let folder = state::get_signal(FILES_FOLDER_SIGNAL);
+    let (title, crumbs) = folder_title(folder);
+    let mut listing = folder_rows(folder);
+    listing.push(Component::text(
+        folder_summary(folder),
+        Style {
+            font_size: 11.0,
+            color: Color::from_hex("#606080"),
+            padding: Edges::all(8.0),
+            ..Style::default()
+        },
+    ));
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -662,7 +1410,7 @@ fn build_files_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Files", "#3498db"),
+            app_titlebar(title, "#3498db", 1),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -670,7 +1418,6 @@ fn build_files_app() -> Component {
                     ..Style::default()
                 },
                 vec![
-                    // Sidebar
                     Component::column(
                         Style {
                             width: Dimension::Px(200.0),
@@ -680,14 +1427,13 @@ fn build_files_app() -> Component {
                             ..Style::default()
                         },
                         vec![
-                            sidebar_item("Home", true),
-                            sidebar_item("Documents", false),
-                            sidebar_item("Pictures", false),
-                            sidebar_item("Downloads", false),
-                            sidebar_item("Music", false),
+                            nav_button(&locale::t("files-home"), folder == 0, OP_FILES_HOME),
+                            nav_button(&locale::t("files-docs"), folder == 1, OP_FILES_DOCS),
+                            nav_button(&locale::t("files-pics"), folder == 2, OP_FILES_PICS),
+                            nav_button(&locale::t("files-down"), folder == 3, OP_FILES_DOWN),
+                            nav_button(&locale::t("files-music"), folder == 4, OP_FILES_MUSIC),
                         ],
                     ),
-                    // File list
                     Component::column(
                         Style {
                             flex_grow: 1.0,
@@ -695,23 +1441,19 @@ fn build_files_app() -> Component {
                             gap: 4.0,
                             ..Style::default()
                         },
-                        vec![
-                            file_row("projects", "Folder", "--", true),
-                            file_row("w3cos", "Folder", "--", true),
-                            file_row("README.md", "Markdown", "4.2 KB", false),
-                            file_row("Cargo.toml", "TOML", "1.1 KB", false),
-                            file_row("app.tsx", "TypeScript", "2.8 KB", false),
-                            file_row("screenshot.png", "PNG Image", "245 KB", false),
-                            Component::text(
-                                "6 items, 253 KB",
+                        {
+                            let mut rows = vec![Component::text(
+                                crumbs,
                                 Style {
-                                    font_size: 11.0,
-                                    color: Color::from_hex("#606080"),
-                                    padding: Edges::all(8.0),
+                                    font_size: 13.0,
+                                    color: Color::from_hex("#d5dee8"),
+                                    padding: Edges::xy(8.0, 4.0),
                                     ..Style::default()
                                 },
-                            ),
-                        ],
+                            )];
+                            rows.append(&mut listing);
+                            rows
+                        },
                     ),
                 ],
             ),
@@ -719,10 +1461,87 @@ fn build_files_app() -> Component {
     )
 }
 
-fn sidebar_item(name: &str, active: bool) -> Component {
+fn folder_title(folder: i64) -> (String, String) {
+    match folder {
+        1 => (locale::t("files-docs"), locale::t("files-crumb-docs")),
+        2 => (locale::t("files-pics"), locale::t("files-crumb-pics")),
+        3 => (locale::t("files-down"), locale::t("files-crumb-down")),
+        4 => (locale::t("files-music"), locale::t("files-crumb-music")),
+        5 => ("projects".to_string(), locale::t("files-crumb-projects")),
+        6 => ("w3cos".to_string(), locale::t("files-crumb-w3cos")),
+        _ => (locale::t("app-files"), locale::t("files-crumb-home")),
+    }
+}
+
+fn folder_summary(folder: i64) -> String {
+    let count = match folder {
+        1 | 2 | 5 | 6 => 2,
+        3 => 1,
+        4 => 0,
+        _ => 6,
+    };
+    let count = count.to_string();
+    locale::t_args("files-count", &[("count", &count)])
+}
+
+fn folder_rows(folder: i64) -> Vec<Component> {
+    match folder {
+        1 => vec![
+            file_row("notes.txt", &locale::t("file-text"), "1.2 KB", None),
+            file_row("design.md", &locale::t("file-markdown"), "8.4 KB", None),
+        ],
+        2 => vec![
+            file_row("screenshot.png", &locale::t("file-png"), "245 KB", None),
+            file_row("wallpaper.png", &locale::t("file-png"), "1.1 MB", None),
+        ],
+        3 => vec![file_row(
+            "fetch-l2-models.sh",
+            &locale::t("file-script"),
+            "2.0 KB",
+            None,
+        )],
+        4 => vec![Component::text(
+            locale::t("files-empty"),
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#d5dee8"),
+                padding: Edges::all(12.0),
+                ..Style::default()
+            },
+        )],
+        5 => vec![
+            file_row("README.md", &locale::t("file-markdown"), "4.2 KB", None),
+            file_row("Cargo.toml", &locale::t("file-toml"), "1.1 KB", None),
+        ],
+        6 => vec![
+            file_row("app.tsx", &locale::t("file-typescript"), "2.8 KB", None),
+            file_row("shell.rs", &locale::t("file-rust"), "18 KB", None),
+        ],
+        _ => vec![
+            file_row(
+                "projects",
+                &locale::t("file-folder"),
+                "--",
+                Some(OP_FILES_PROJECTS),
+            ),
+            file_row(
+                "w3cos",
+                &locale::t("file-folder"),
+                "--",
+                Some(OP_FILES_W3COS),
+            ),
+            file_row("README.md", &locale::t("file-markdown"), "4.2 KB", None),
+            file_row("Cargo.toml", &locale::t("file-toml"), "1.1 KB", None),
+            file_row("app.tsx", &locale::t("file-typescript"), "2.8 KB", None),
+            file_row("screenshot.png", &locale::t("file-png"), "245 KB", None),
+        ],
+    }
+}
+
+fn nav_button(name: &str, active: bool, code: u8) -> Component {
     let bg = if active { "#3d5570" } else { "#243447" };
     let color = if active { "#f4f7fb" } else { "#d5dee8" };
-    Component::text(
+    Component::button_with_click(
         name,
         Style {
             font_size: 13.0,
@@ -732,11 +1551,23 @@ fn sidebar_item(name: &str, active: bool) -> Component {
             padding: Edges::xy(10.0, 8.0),
             ..Style::default()
         },
+        invoke(code),
     )
 }
 
-fn file_row(name: &str, kind: &str, size: &str, is_dir: bool) -> Component {
-    let icon = if is_dir { "[DIR]" } else { "    " };
+fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
+    let icon = if open.is_some() { "[DIR]" } else { "    " };
+    let name_style = Style {
+        font_size: 13.0,
+        color: Color::from_hex(if open.is_some() { "#9eb6ff" } else { "#d0d0e0" }),
+        flex_grow: 1.0,
+        ..Style::default()
+    };
+    let name_node = if let Some(code) = open {
+        Component::button_with_click(name, name_style, invoke(code))
+    } else {
+        Component::text(name, name_style)
+    };
     Component::row(
         Style {
             padding: Edges::xy(8.0, 10.0),
@@ -754,15 +1585,7 @@ fn file_row(name: &str, kind: &str, size: &str, is_dir: bool) -> Component {
                     ..Style::default()
                 },
             ),
-            Component::text(
-                name,
-                Style {
-                    font_size: 13.0,
-                    color: Color::from_hex("#d0d0e0"),
-                    flex_grow: 1.0,
-                    ..Style::default()
-                },
-            ),
+            name_node,
             Component::text(
                 size,
                 Style {
@@ -796,7 +1619,7 @@ fn build_terminal_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("终端 Terminal", "#1c8f62"),
+            app_titlebar(locale::t("app-terminal"), "#1c8f62", 2),
             Component::column(
                 Style {
                     flex_grow: 1.0,
@@ -806,7 +1629,7 @@ fn build_terminal_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "本机终端占位。命令还不会执行。",
+                        locale::t("terminal-allow"),
                         Style {
                             font_size: 16.0,
                             font_weight: 700,
@@ -815,15 +1638,7 @@ fn build_terminal_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Local terminal placeholder. Typed commands stay on this page.",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#d5dee8"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "w3cos shell ready",
+                        locale::t("terminal-ready"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#b7f0d8"),
@@ -849,7 +1664,7 @@ fn build_terminal_app() -> Component {
                                 },
                             ),
                             Component::text_input(
-                                "",
+                                state::get_signal_text(TERMINAL_SIGNAL),
                                 "help",
                                 Style {
                                     font_size: 14.0,
@@ -859,7 +1674,23 @@ fn build_terminal_app() -> Component {
                                     ..Style::default()
                                 },
                             ),
+                            chrome_button(locale::t("terminal-run"), OP_RUN_TERMINAL, "#1c8f62"),
                         ],
+                    ),
+                    Component::text(
+                        {
+                            let output = state::get_signal_text(TERM_OUT_SIGNAL);
+                            if output.is_empty() {
+                                locale::t("terminal-hint")
+                            } else {
+                                output
+                            }
+                        },
+                        Style {
+                            font_size: 13.0,
+                            color: Color::from_hex("#b7f0d8"),
+                            ..Style::default()
+                        },
                     ),
                 ],
             ),
@@ -872,37 +1703,7 @@ fn build_terminal_app() -> Component {
 // ==========================================================================
 
 fn build_settings_app() -> Component {
-    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
-        "开 On"
-    } else {
-        "关 Off"
-    };
-    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
-    let storage_label = if storage_owned.is_empty() {
-        "memory".to_string()
-    } else {
-        storage_owned
-    };
-    let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
-    let bridge = match bridge.trim() {
-        "" | "observer" => "observer",
-        "interactive" => "interactive",
-        "system" => "system",
-        _ => "observer",
-    };
-    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
-    let subject_label = if subject_owned.is_empty() {
-        LocalIdentityStub::SUBJECT.to_string()
-    } else {
-        subject_owned
-    };
-    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
-    let enroll_label = if enroll_owned.is_empty() {
-        "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
-            .to_string()
-    } else {
-        enroll_owned
-    };
+    let tab = state::get_signal(SETTINGS_TAB_SIGNAL);
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -911,7 +1712,7 @@ fn build_settings_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("设置 Settings", "#5b4fe0"),
+            app_titlebar(locale::t("app-settings"), "#5b4fe0", 3),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -928,9 +1729,18 @@ fn build_settings_app() -> Component {
                             ..Style::default()
                         },
                         vec![
-                            sidebar_item("本机 Local", true),
-                            sidebar_item("身份 Identity", false),
-                            sidebar_item("桥接 Bridge", false),
+                            nav_button(&locale::t("settings-local"), tab == 0, OP_SETTINGS_LOCAL),
+                            nav_button(
+                                &locale::t("settings-identity"),
+                                tab == 1,
+                                OP_SETTINGS_IDENTITY,
+                            ),
+                            nav_button(
+                                &locale::t("settings-permissions"),
+                                tab == 2,
+                                OP_SETTINGS_BRIDGE,
+                            ),
+                            nav_button(&locale::t("settings-l2"), tab == 3, OP_SETTINGS_L2),
                         ],
                     ),
                     Component::column(
@@ -940,44 +1750,201 @@ fn build_settings_app() -> Component {
                             gap: 12.0,
                             ..Style::default()
                         },
-                        vec![
-                            Component::text(
-                                "本机设置 · Local preferences",
-                                Style {
-                                    font_size: 18.0,
-                                    color: Color::from_hex("#f4f7fb"),
-                                    font_weight: 700,
-                                    ..Style::default()
-                                },
-                            ),
-                            Component::text(
-                                "没有账号，也没有链。WebAuthn 仪式还没做。",
-                                Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#d5dee8"),
-                                    ..Style::default()
-                                },
-                            ),
-                            settings_row("主体 Subject", &subject_label),
-                            Component::text(
-                                enroll_label,
-                                Style {
-                                    font_size: 13.0,
-                                    color: Color::from_hex("#d5dee8"),
-                                    ..Style::default()
-                                },
-                            ),
-                            chrome_button("生成注册挑战 Challenge", OP_ENROLL, "#3d5570"),
-                            settings_row("身份 Identity", "PBKDF2 · not a passkey"),
-                            settings_row("夜间模式 Night", night),
-                            settings_row("AI 权限 Bridge", bridge),
-                            settings_row("收据 Receipts", &storage_label),
-                        ],
+                        settings_page(tab),
                     ),
                 ],
             ),
         ],
     )
+}
+
+fn settings_page(tab: i64) -> Vec<Component> {
+    match tab {
+        1 => settings_identity_page(),
+        2 => settings_permissions_page(),
+        3 => settings_l2_page(),
+        _ => settings_local_page(),
+    }
+}
+
+fn settings_heading(title: &str, detail: &str) -> Vec<Component> {
+    vec![
+        Component::text(
+            title,
+            Style {
+                font_size: 18.0,
+                color: Color::from_hex("#f4f7fb"),
+                font_weight: 700,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            detail,
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        ),
+    ]
+}
+
+fn settings_local_page() -> Vec<Component> {
+    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
+        locale::t("on")
+    } else {
+        locale::t("off")
+    };
+    let mut rows = settings_heading(
+        &locale::t("settings-local-title"),
+        &locale::t("settings-local-detail"),
+    );
+    rows.push(settings_row(&locale::t("settings-night"), &night));
+    rows.push(chrome_button(
+        locale::t("settings-night-toggle"),
+        OP_CHIP_NIGHT,
+        "#3d5570",
+    ));
+    rows.push(settings_row(
+        &locale::t("settings-language"),
+        &locale::current(),
+    ));
+    rows.push(chrome_button(locale::t("lang-zh"), OP_LOCALE_ZH, "#3d5570"));
+    rows.push(chrome_button(locale::t("lang-en"), OP_LOCALE_EN, "#3d5570"));
+    rows
+}
+
+fn settings_identity_page() -> Vec<Component> {
+    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
+    let storage_label = if storage_owned.is_empty() {
+        "memory".to_string()
+    } else {
+        storage_owned
+    };
+    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+    let subject_label = if subject_owned.is_empty() {
+        LocalIdentityStub::SUBJECT.to_string()
+    } else {
+        subject_owned
+    };
+    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
+    let enroll_label = if enroll_owned.is_empty() {
+        locale::t("enroll-fallback")
+    } else {
+        enroll_owned
+    };
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let mut rows = settings_heading(
+        &locale::t("settings-identity-title"),
+        &locale::t("settings-identity-detail"),
+    );
+    rows.push(settings_row(&locale::t("settings-subject"), &subject_label));
+    rows.push(Component::text(
+        enroll_label,
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#d5dee8"),
+            ..Style::default()
+        },
+    ));
+    rows.push(chrome_button(
+        locale::t("enroll-challenge"),
+        OP_ENROLL,
+        "#3d5570",
+    ));
+    rows.push(settings_row(
+        &locale::t("settings-identity-title"),
+        &locale::t("settings-not-passkey"),
+    ));
+    let status = if unlocked {
+        locale::t("unlocked")
+    } else {
+        locale::t("locked")
+    };
+    rows.push(settings_row(&locale::t("settings-status"), &status));
+    rows.push(chrome_button(
+        if unlocked {
+            locale::t("lock")
+        } else {
+            locale::t("unlock")
+        },
+        if unlocked { OP_LOCK } else { OP_UNLOCK },
+        if unlocked { "#3d5570" } else { "#9a3412" },
+    ));
+    rows.push(settings_row(&locale::t("settings-storage"), &storage_label));
+    rows.push(chrome_button(
+        locale::t("open-ledger"),
+        OP_TOGGLE_RECEIPTS,
+        "#3d5570",
+    ));
+    rows
+}
+
+fn settings_permissions_page() -> Vec<Component> {
+    let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
+    let bridge = match bridge.trim() {
+        "" | "observer" => locale::t("perm-observer"),
+        "interactive" => locale::t("perm-interactive"),
+        "system" => locale::t("perm-system"),
+        _ => locale::t("perm-unknown"),
+    };
+    let mut rows = settings_heading(&locale::t("perm-title"), &locale::t("perm-detail"));
+    rows.push(settings_row(&locale::t("perm-bridge"), &bridge));
+    rows.push(settings_row(
+        &locale::t("perm-shell"),
+        &locale::t("perm-shell-value"),
+    ));
+    rows.push(settings_row(
+        &locale::t("perm-boot"),
+        &locale::t("perm-boot-value"),
+    ));
+    rows.push(settings_row(
+        &locale::t("perm-standing"),
+        &locale::t("perm-standing-value"),
+    ));
+    rows
+}
+
+fn settings_l2_page() -> Vec<Component> {
+    let env_flag = std::env::var("W3COS_L2").unwrap_or_default();
+    let env_flag = if env_flag.trim().is_empty() {
+        locale::t("l2-unset")
+    } else {
+        env_flag
+    };
+    let model = std::env::var("W3COS_L2_MODEL").unwrap_or_default();
+    let model = if model.trim().is_empty() {
+        locale::t("l2-model-default")
+    } else {
+        model
+    };
+    let endpoint = std::env::var("W3COS_L2_URL").unwrap_or_default();
+    let endpoint = if endpoint.trim().is_empty() {
+        locale::t("l2-endpoint-default")
+    } else {
+        endpoint
+    };
+    let on = session_l2_on();
+    let current = if on {
+        locale::t("on")
+    } else {
+        locale::t("off")
+    };
+    let mut rows = settings_heading(&locale::t("l2-title"), &locale::t("l2-detail"));
+    rows.push(settings_row(&locale::t("l2-current"), &current));
+    rows.push(settings_row(&locale::t("l2-env"), &env_flag));
+    rows.push(settings_row(&locale::t("l2-model"), &model));
+    rows.push(settings_row(&locale::t("l2-endpoint"), &endpoint));
+    rows.push(chrome_button(
+        if on {
+            locale::t("l2-turn-off")
+        } else {
+            locale::t("l2-turn-on")
+        },
+        OP_L2_TOGGLE,
+        if on { "#3d5570" } else { "#1d4e89" },
+    ));
+    rows
 }
 
 fn settings_row(label: &str, value: &str) -> Component {
@@ -1027,13 +1994,15 @@ fn muted_ink() -> Color {
 fn build_context_header(current: i64, night: bool) -> Component {
     let shared = state::get_signal(CONTEXT_SIGNAL) != 0;
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
-    let app = if shared {
-        ShellApp::from_signal(current).bilingual()
+    let app_name = app_label(current);
+    let chip = if shared {
+        locale::t_args("context-chip", &[("app", &app_name)])
     } else {
-        "已隐藏 Hidden"
+        locale::t("context-restore")
     };
     Component::row(
         Style {
+            flex_shrink: 0.0,
             padding: Edges::xy(16.0, 8.0),
             gap: 8.0,
             background: Color::from_hex("#24384c"),
@@ -1042,7 +2011,7 @@ fn build_context_header(current: i64, night: bool) -> Component {
         },
         vec![
             Component::text(
-                "上下文 Context",
+                locale::t("context-title"),
                 Style {
                     font_size: 13.0,
                     font_weight: 700,
@@ -1050,20 +2019,12 @@ fn build_context_header(current: i64, night: bool) -> Component {
                     ..Style::default()
                 },
             ),
-            chrome_button(
-                if shared {
-                    format!("{app}  ×")
-                } else {
-                    "恢复上下文 Restore".to_string()
-                },
-                if shared { OP_REVOKE } else { OP_RESTORE },
-                "#3d5570",
-            ),
+            chrome_button(chip, if shared { OP_REVOKE } else { OP_RESTORE }, "#3d5570"),
             Component::text(
                 if night {
-                    "夜间 开 Night on"
+                    locale::t("night-on")
                 } else {
-                    "夜间 关 Night off"
+                    locale::t("night-off")
                 },
                 Style {
                     font_size: 12.0,
@@ -1076,9 +2037,9 @@ fn build_context_header(current: i64, night: bool) -> Component {
             ),
             Component::text(
                 if unlocked {
-                    "已解锁 Unlocked"
+                    locale::t("unlocked")
                 } else {
-                    "已锁定 Locked"
+                    locale::t("locked")
                 },
                 Style {
                     font_size: 12.0,
@@ -1091,15 +2052,15 @@ fn build_context_header(current: i64, night: bool) -> Component {
             ),
             chrome_button(
                 if state::get_signal(TASKS_SIGNAL) != 0 {
-                    "收起任务 Hide"
+                    locale::t("tasks-hide")
                 } else {
-                    "任务 Tasks"
+                    locale::t("tasks")
                 },
                 OP_TOGGLE_TASKS,
                 "#3d5570",
             ),
             Component::text(
-                "实时 Live",
+                locale::t("live"),
                 Style {
                     font_size: 12.0,
                     color: Color::from_hex("#b7f0d8"),
@@ -1135,10 +2096,10 @@ fn build_intent_bar() -> Component {
             vec![
                 Component::text_input(
                     state::get_signal_text(DRAFT_SIGNAL),
-                    INTENT_INPUT_PLACEHOLDER,
+                    locale::t("intent-placeholder"),
                     input_style,
                 ),
-                chrome_button("提议 Propose", OP_PROPOSE, "#5b4fe0"),
+                chrome_button(locale::t("propose"), OP_PROPOSE, "#5b4fe0"),
             ],
         ),
         Component::row(
@@ -1148,17 +2109,19 @@ fn build_intent_bar() -> Component {
                 ..Style::default()
             },
             vec![
-                chrome_button("打开文件 Files", OP_CHIP_FILES, "#3d5570"),
-                chrome_button("打开终端 Terminal", OP_CHIP_TERMINAL, "#3d5570"),
-                chrome_button("打开设置 Settings", OP_CHIP_SETTINGS, "#3d5570"),
-                chrome_button("夜间模式 Night", OP_CHIP_NIGHT, "#3d5570"),
-                chrome_button("应用列表 Apps", OP_CHIP_APPS, "#3d5570"),
-                chrome_button("我在哪 Where", OP_CHIP_CONTEXT, "#3d5570"),
+                chrome_button(locale::t("chip-files"), OP_CHIP_FILES, "#3d5570"),
+                chrome_button(locale::t("chip-terminal"), OP_CHIP_TERMINAL, "#3d5570"),
+                chrome_button(locale::t("chip-settings"), OP_CHIP_SETTINGS, "#3d5570"),
+                chrome_button(locale::t("chip-night"), OP_CHIP_NIGHT, "#3d5570"),
+                chrome_button(locale::t("chip-apps"), OP_CHIP_APPS, "#3d5570"),
+                chrome_button(locale::t("chip-where"), OP_CHIP_CONTEXT, "#3d5570"),
             ],
         ),
     ];
     if phase == 1 {
         rows.push(confirm_card());
+    } else if phase == 3 {
+        rows.push(result_card(&locale::t("planning")));
     } else if phase == 2 {
         let notice = state::get_signal_text(NOTICE_SIGNAL);
         if !notice.is_empty() {
@@ -1167,6 +2130,7 @@ fn build_intent_bar() -> Component {
     }
     Component::column(
         Style {
+            flex_shrink: 0.0,
             padding: Edges::xy(16.0, 10.0),
             gap: 8.0,
             background: Color::from_hex("#1e3144"),
@@ -1178,17 +2142,22 @@ fn build_intent_bar() -> Component {
 
 fn confirm_card() -> Component {
     let mut rows = Vec::new();
-    if state::get_signal_text(TIER_SIGNAL) == "L1" {
+    let tier = state::get_signal_text(TIER_SIGNAL);
+    if tier == "L1" || tier == "L2" {
         rows.push(Component::row(
             Style {
                 padding: Edges::xy(8.0, 4.0),
-                background: Color::from_hex("#9a3412"),
+                background: Color::from_hex(if tier == "L2" { "#1d4e89" } else { "#9a3412" }),
                 border_radius: 6.0,
                 align_self: AlignSelf::FlexStart,
                 ..Style::default()
             },
             vec![Component::text(
-                "L1 本地 Local",
+                if tier == "L2" {
+                    locale::t("tier-l2")
+                } else {
+                    locale::t("tier-l1")
+                },
                 Style {
                     font_size: 12.0,
                     font_weight: 700,
@@ -1199,7 +2168,7 @@ fn confirm_card() -> Component {
         ));
     }
     rows.push(Component::text(
-        "确认后才会执行 · Confirm to run",
+        locale::t("confirm-hint"),
         Style {
             font_size: 12.0,
             font_weight: 700,
@@ -1230,8 +2199,8 @@ fn confirm_card() -> Component {
             ..Style::default()
         },
         vec![
-            chrome_button("确认 Confirm", OP_CONFIRM, "#1c8f62"),
-            chrome_button("取消 Cancel", OP_CANCEL, "#3d5570"),
+            chrome_button(locale::t("confirm"), OP_CONFIRM, "#1c8f62"),
+            chrome_button(locale::t("cancel"), OP_CANCEL, "#3d5570"),
         ],
     ));
     Component::column(
@@ -1259,7 +2228,7 @@ fn result_card(notice: &str) -> Component {
         },
         vec![
             Component::text(
-                format!("结果 Result · {notice}"),
+                locale::t_args("result", &[("notice", notice)]),
                 Style {
                     font_size: 13.0,
                     color: ink(),
@@ -1267,7 +2236,7 @@ fn result_card(notice: &str) -> Component {
                     ..Style::default()
                 },
             ),
-            chrome_button("关闭 Close", OP_CANCEL, "#3d5570"),
+            chrome_button(locale::t("close"), OP_CANCEL, "#3d5570"),
         ],
     )
 }
@@ -1276,13 +2245,14 @@ fn build_task_center() -> Component {
     let phase = state::get_signal(PHASE_SIGNAL);
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let (status, status_color) = match phase {
-        1 => ("等待确认 Awaiting confirm", "#ffe08a"),
-        2 => ("已完成 Done", "#b7f0d8"),
-        _ => ("空闲 Idle", "#d5dee8"),
+        1 => (locale::t("phase-confirm"), "#ffe08a"),
+        2 => (locale::t("phase-done"), "#b7f0d8"),
+        3 => (locale::t("phase-planning"), "#9eb6ff"),
+        _ => (locale::t("phase-idle"), "#d5dee8"),
     };
     let mut body = vec![
         Component::text(
-            "任务中心 Tasks",
+            locale::t("tasks-title"),
             Style {
                 font_size: 16.0,
                 font_weight: 700,
@@ -1291,11 +2261,7 @@ fn build_task_center() -> Component {
             },
         ),
         Component::text(
-            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
-                "本地 L0/L1 · 无模型 · 加密文件"
-            } else {
-                "本地 L0/L1 · 无模型 · 仅内存"
-            },
+            planner_subtitle(),
             Style {
                 font_size: 12.0,
                 color: muted_ink(),
@@ -1319,10 +2285,17 @@ fn build_task_center() -> Component {
                 } else {
                     subject_owned
                 };
-                format!(
-                    "{subject_label} · {} · 口令经 KDF 保存，还不是 passkey",
-                    if unlocked { "stub unlocked" } else { "locked" }
-                )
+                {
+                    let state_label = if unlocked {
+                        locale::t("state-stub-unlocked")
+                    } else {
+                        locale::t("state-locked")
+                    };
+                    locale::t_args(
+                        "identity-line",
+                        &[("subject", &subject_label), ("state", &state_label)],
+                    )
+                }
             },
             Style {
                 font_size: 12.0,
@@ -1333,7 +2306,7 @@ fn build_task_center() -> Component {
     ];
     if !unlocked {
         body.push(Component::text(
-            "已锁定。确认前请先解锁。Locked — unlock before confirm.",
+            locale::t("locked-hint"),
             Style {
                 font_size: 13.0,
                 font_weight: 700,
@@ -1344,15 +2317,44 @@ fn build_task_center() -> Component {
     }
     body.push(chrome_button(
         if unlocked {
-            "锁定 Lock"
+            locale::t("lock")
         } else {
-            "解锁才能执行 Unlock to run"
+            locale::t("unlock-to-run")
         },
         if unlocked { OP_LOCK } else { OP_UNLOCK },
         if unlocked { "#3d5570" } else { "#9a3412" },
     ));
+    let steps = state::get_signal_text(STEPS_SIGNAL);
+    if !steps.is_empty() {
+        body.push(Component::text(
+            locale::t("steps"),
+            Style {
+                font_size: 14.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ));
+        for line in steps
+            .lines()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            body.push(Component::text(
+                line,
+                Style {
+                    font_size: 12.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
+    }
     body.push(Component::text(
-        "收据 Receipts",
+        locale::t("receipts"),
         Style {
             font_size: 14.0,
             font_weight: 700,
@@ -1360,10 +2362,15 @@ fn build_task_center() -> Component {
             ..Style::default()
         },
     ));
+    body.push(chrome_button(
+        locale::t("ledger"),
+        OP_TOGGLE_RECEIPTS,
+        "#3d5570",
+    ));
     let log = state::get_signal_text(RECEIPT_SIGNAL);
     if log.is_empty() || log == "No receipts yet." {
         body.push(Component::text(
-            "还没有收据。No receipts yet.",
+            locale::t("no-receipts"),
             Style {
                 font_size: 12.0,
                 color: muted_ink(),
@@ -1382,12 +2389,15 @@ fn build_task_center() -> Component {
             ));
         }
     }
-    if phase == 1 {
-        body.push(chrome_button("停止 Stop", OP_CANCEL, "#a33b45"));
+    if phase == 1 || phase == 3 {
+        body.push(chrome_button(locale::t("stop"), OP_CANCEL, "#a33b45"));
     }
     Component::column(
         Style {
             width: Dimension::Px(300.0),
+            flex_shrink: 0.0,
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
             background: Color::from_hex("#1b2c3e"),
@@ -1397,11 +2407,28 @@ fn build_task_center() -> Component {
     )
 }
 
+fn planner_subtitle() -> String {
+    match std::env::var("W3COS_L2").ok().as_deref().map(str::trim) {
+        Some("script") => locale::t("planner-script"),
+        Some("1") | Some("true") => {
+            let model = std::env::var("W3COS_L2_MODEL").unwrap_or_else(|_| "local".into());
+            locale::t_args("planner-model", &[("model", &model)])
+        }
+        _ => {
+            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
+                locale::t("planner-encrypted")
+            } else {
+                locale::t("planner-memory")
+            }
+        }
+    }
+}
+
 fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Component {
     let action = if code == OP_PROPOSE {
         EventAction::Invoke {
             code,
-            input_placeholder: INTENT_INPUT_PLACEHOLDER.to_string(),
+            input_placeholder: locale::t("intent-placeholder"),
         }
     } else {
         invoke(code)
@@ -1434,7 +2461,7 @@ fn build_ai_agent_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("助手 Agent", "#e07a5f"),
+            app_titlebar(locale::t("app-agent"), "#e07a5f", 4),
             Component::column(
                 Style {
                     flex_grow: 1.0,
@@ -1444,19 +2471,11 @@ fn build_ai_agent_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "会话在右侧任务中心。这个窗口只是同一条收据的阅读页。",
+                        locale::t("agent-body"),
                         Style {
                             font_size: 16.0,
                             font_weight: 700,
                             color: ink(),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "The live session stays in the task center beside this window.",
-                        Style {
-                            font_size: 14.0,
-                            color: muted_ink(),
                             ..Style::default()
                         },
                     ),
@@ -1487,7 +2506,7 @@ fn build_browser_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Browser", "#f39c12"),
+            app_titlebar(locale::t("app-browser"), "#f39c12", 5),
             // URL bar
             Component::row(
                 Style {
@@ -1576,7 +2595,7 @@ fn build_browser_app() -> Component {
                 },
                 vec![
                     browser_tab("W3C OS", true),
-                    browser_tab("Docs", false),
+                    browser_tab(&locale::t("browser-tab-docs"), false),
                     browser_tab("GitHub", false),
                 ],
             ),
@@ -1602,7 +2621,7 @@ fn build_browser_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "The AI-Native Operating System",
+                        locale::t("browser-tagline"),
                         Style {
                             font_size: 18.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -1620,7 +2639,7 @@ fn build_browser_app() -> Component {
                         },
                         vec![
                             Component::text(
-                                "Welcome to the W3C OS Browser",
+                                locale::t("browser-welcome"),
                                 Style {
                                     font_size: 16.0,
                                     color: Color::from_hex("#f0f0ff"),
@@ -1629,7 +2648,7 @@ fn build_browser_app() -> Component {
                                 },
                             ),
                             Component::text(
-                                "Applications are rendered natively using the W3C DOM model — no Chromium, no V8. TypeScript is compiled to native Rust binaries.",
+                                locale::t("browser-body"),
                                 Style {
                                     font_size: 13.0,
                                     color: Color::from_hex("#808090"),
@@ -1643,7 +2662,7 @@ fn build_browser_app() -> Component {
                                 },
                                 vec![
                                     Component::button(
-                                        "Get Started",
+                                        locale::t("browser-start"),
                                         Style {
                                             background: Color::from_hex("#6c5ce7"),
                                             border_radius: 8.0,
@@ -1654,7 +2673,7 @@ fn build_browser_app() -> Component {
                                         },
                                     ),
                                     Component::button(
-                                        "Documentation",
+                                        locale::t("browser-docs"),
                                         Style {
                                             background: Color::from_hex("#1e1e38"),
                                             border_radius: 8.0,
@@ -1720,7 +2739,7 @@ fn build_editor_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar("Editor", "#1abc9c"),
+            app_titlebar(locale::t("app-editor"), "#1abc9c", 6),
             // Editor toolbar
             Component::row(
                 Style {
@@ -1733,7 +2752,7 @@ fn build_editor_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        "File",
+                        locale::t("editor-file"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -1741,7 +2760,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Edit",
+                        locale::t("editor-edit"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -1749,7 +2768,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "View",
+                        locale::t("editor-view"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -1757,7 +2776,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Terminal",
+                        locale::t("app-terminal"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -1765,7 +2784,7 @@ fn build_editor_app() -> Component {
                         },
                     ),
                     Component::text(
-                        "Help",
+                        locale::t("editor-help"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#a0a0c0"),
@@ -1808,7 +2827,7 @@ fn build_editor_app() -> Component {
                         },
                         vec![
                             Component::text(
-                                "EXPLORER",
+                                locale::t("editor-explorer"),
                                 Style {
                                     font_size: 11.0,
                                     color: Color::from_hex("#505070"),
@@ -2144,27 +3163,73 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // Shared: title bar + taskbar
 // ==========================================================================
 
-fn taskbar_icon(letter: &str, color: &str, id: i64) -> Component {
+fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -> Component {
+    let mut button = Component::button_with_click(
+        label,
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex(color),
+            background: Color::from_hex("#2a2a3e"),
+            border_radius: 4.0,
+            padding: Edges::xy(8.0, 4.0),
+            ..Style::default()
+        },
+        invoke(code),
+    );
+    button.style.custom_properties = Some(win_props(app_id, None));
+    button
+}
+
+fn taskbar_icon(letter: &str, color: &str, id: i64, current: i64) -> Component {
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL);
+    let bit = app_bit(id);
+    let focused = current == id;
+    let is_open = open & bit != 0;
+    let is_mini = minimized & bit != 0;
+    let opacity = if focused || is_open {
+        1.0
+    } else if is_mini {
+        0.55
+    } else {
+        0.85
+    };
     Component::button_with_click(
         letter,
         Style {
-            width: Dimension::Px(40.0),
-            height: Dimension::Px(40.0),
+            width: Dimension::Px(36.0),
+            height: Dimension::Px(36.0),
             background: Color::from_hex(color),
             border_radius: 8.0,
             font_size: 16.0,
             font_weight: 700,
             color: Color::WHITE,
+            opacity,
+            border_bottom_width: Some(if focused {
+                3.0
+            } else if is_open {
+                2.0
+            } else {
+                0.0
+            }),
+            border_bottom_color: Some(Color::from_hex(if focused { "#f4f7fb" } else { "#d5dee8" })),
             ..Style::default()
         },
-        EventAction::Set(APP_SIGNAL, id),
+        invoke(focus_code(id)),
     )
 }
 
-fn app_titlebar(title: &str, accent: &str) -> Component {
-    Component::row(
+fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Component {
+    let title = title.into();
+    let max_label = if windows::is_maximized(app_id) {
+        locale::t("win-restore")
+    } else {
+        locale::t("win-maximize")
+    };
+    let mut bar = Component::row(
         Style {
             height: Dimension::Px(40.0),
+            flex_shrink: 0.0,
             background: Color::from_hex("#2a3e52"),
             padding: Edges::xy(16.0, 8.0),
             align_items: AlignItems::Center,
@@ -2206,59 +3271,36 @@ fn app_titlebar(title: &str, accent: &str) -> Component {
                     ..Style::default()
                 },
                 vec![
-                    Component::button(
-                        "--",
-                        Style {
-                            font_size: 12.0,
-                            color: Color::from_hex("#808090"),
-                            background: Color::from_hex("#2a2a3e"),
-                            border_radius: 4.0,
-                            ..Style::default()
-                        },
-                    ),
-                    Component::button(
-                        "[]",
-                        Style {
-                            font_size: 12.0,
-                            color: Color::from_hex("#808090"),
-                            background: Color::from_hex("#2a2a3e"),
-                            border_radius: 4.0,
-                            ..Style::default()
-                        },
-                    ),
-                    Component::button(
-                        "X",
-                        Style {
-                            font_size: 12.0,
-                            color: Color::from_hex("#e94560"),
-                            background: Color::from_hex("#2a2a3e"),
-                            border_radius: 4.0,
-                            ..Style::default()
-                        },
-                    ),
+                    window_button("--", OP_MINIMIZE, "#808090", app_id),
+                    window_button(max_label, OP_MAXIMIZE, "#808090", app_id),
+                    window_button("X", OP_CLOSE, "#e94560", app_id),
                 ],
             ),
         ],
-    )
+    );
+    bar.kind = ComponentKind::Button {
+        label: String::new(),
+    };
+    bar.on_click = invoke(focus_code(app_id));
+    bar.style.custom_properties = Some(win_props(app_id, Some("move")));
+    bar
 }
 
 fn build_taskbar(current: i64) -> Component {
-    let center_text = match current {
-        0 => "W3C OS Desktop",
-        1 => "Files",
-        2 => "Terminal",
-        3 => "Settings",
-        4 => "AI Agent",
-        5 => "Browser",
-        6 => "Editor",
-        _ => "W3C OS",
-    };
+    let open = state::get_signal(OPEN_MASK_SIGNAL);
+    let open_count = (1..=6).filter(|id| open & app_bit(*id) != 0).count();
+    let open_count = open_count.to_string();
+    let open_label = locale::t_args("open-count", &[("count", &open_count)]);
+    let center_text = format!("{} · {open_label}", app_label(current));
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let launcher_open = state::get_signal(LAUNCHER_SIGNAL) != 0;
     Component::row(
         Style {
             height: Dimension::Px(56.0),
+            flex_shrink: 0.0,
             background: Color::from_hex("#162433"),
-            padding: Edges::xy(16.0, 8.0),
-            gap: 12.0,
+            padding: Edges::xy(10.0, 6.0),
+            gap: 8.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::SpaceBetween,
             ..Style::default()
@@ -2272,9 +3314,17 @@ fn build_taskbar(current: i64) -> Component {
                 },
                 vec![
                     Component::button_with_click(
-                        "W3C Apps",
+                        if launcher_open {
+                            locale::t("launcher-close")
+                        } else {
+                            locale::t("launcher-apps")
+                        },
                         Style {
-                            background: Color::from_hex("#6c5ce7"),
+                            background: Color::from_hex(if launcher_open {
+                                "#3d5570"
+                            } else {
+                                "#6c5ce7"
+                            }),
                             border_radius: 8.0,
                             font_size: 14.0,
                             font_weight: 600,
@@ -2282,12 +3332,14 @@ fn build_taskbar(current: i64) -> Component {
                             padding: Edges::xy(14.0, 8.0),
                             ..Style::default()
                         },
-                        EventAction::Set(APP_SIGNAL, 0),
+                        invoke(OP_LAUNCHER),
                     ),
-                    taskbar_icon("F", "#3498db", 1),
-                    taskbar_icon("T", "#2ecc71", 2),
-                    taskbar_icon("S", "#9b59b6", 3),
-                    taskbar_icon("A", "#e74c3c", 4),
+                    taskbar_icon("F", "#3498db", 1, current),
+                    taskbar_icon("T", "#2ecc71", 2, current),
+                    taskbar_icon("S", "#9b59b6", 3, current),
+                    taskbar_icon("A", "#e74c3c", 4, current),
+                    taskbar_icon("B", "#f39c12", 5, current),
+                    taskbar_icon("E", "#1abc9c", 6, current),
                 ],
             ),
             Component::text(
@@ -2300,24 +3352,34 @@ fn build_taskbar(current: i64) -> Component {
             ),
             Component::row(
                 Style {
-                    gap: 16.0,
+                    gap: 8.0,
                     align_items: AlignItems::Center,
                     ..Style::default()
                 },
                 vec![
+                    chrome_button(
+                        if unlocked {
+                            locale::t("lock")
+                        } else {
+                            locale::t("unlock")
+                        },
+                        if unlocked { OP_LOCK } else { OP_UNLOCK },
+                        if unlocked { "#3d5570" } else { "#9a3412" },
+                    ),
+                    chrome_button(
+                        if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
+                            locale::t("taskbar-receipts-hide")
+                        } else {
+                            locale::t("receipts")
+                        },
+                        OP_TOGGLE_RECEIPTS,
+                        "#3d5570",
+                    ),
                     Component::text(
-                        "Online",
+                        locale::t("online"),
                         Style {
                             font_size: 13.0,
                             color: Color::from_hex("#00b894"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        "92%",
-                        Style {
-                            font_size: 13.0,
-                            color: Color::from_hex("#a0a0c0"),
                             ..Style::default()
                         },
                     ),
@@ -2335,5 +3397,292 @@ fn build_taskbar(current: i64) -> Component {
                 ],
             ),
         ],
+    )
+}
+
+struct LaunchApp {
+    id: i64,
+    letter: &'static str,
+    color: &'static str,
+}
+
+const LAUNCH_APPS: [LaunchApp; 7] = [
+    LaunchApp {
+        id: 0,
+        letter: "D",
+        color: "#6c5ce7",
+    },
+    LaunchApp {
+        id: 1,
+        letter: "F",
+        color: "#3498db",
+    },
+    LaunchApp {
+        id: 2,
+        letter: "T",
+        color: "#2ecc71",
+    },
+    LaunchApp {
+        id: 3,
+        letter: "S",
+        color: "#9b59b6",
+    },
+    LaunchApp {
+        id: 4,
+        letter: "A",
+        color: "#e74c3c",
+    },
+    LaunchApp {
+        id: 5,
+        letter: "B",
+        color: "#f39c12",
+    },
+    LaunchApp {
+        id: 6,
+        letter: "E",
+        color: "#1abc9c",
+    },
+];
+
+fn build_launcher() -> Component {
+    let query = state::get_signal_text(LAUNCHER_QUERY_SIGNAL);
+    let mut search_style = Style {
+        flex_grow: 1.0,
+        font_size: 14.0,
+        color: Color::from_hex("#1a2836"),
+        background: Color::from_hex("#f4f7fb"),
+        border_radius: 8.0,
+        padding: Edges::xy(12.0, 8.0),
+        ..Style::default()
+    };
+    search_style.custom_properties = Some(HashMap::from([(
+        "--w3cos-intent-submit".to_string(),
+        OP_LAUNCHER_SEARCH.to_string(),
+    )]));
+    let needle = query.trim().to_lowercase();
+    let mut tiles = Vec::new();
+    for app in LAUNCH_APPS {
+        let hay = format!(
+            "{} {} {}",
+            locale::t_in("zh-CN", app_key(app.id)),
+            locale::t_in("en", app_key(app.id)),
+            app.letter
+        )
+        .to_lowercase();
+        if !needle.is_empty() && !hay.contains(&needle) {
+            continue;
+        }
+        tiles.push(launcher_tile(app));
+    }
+    if tiles.is_empty() {
+        tiles.push(Component::text(
+            locale::t("launcher-empty"),
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        ));
+    }
+    let query_label = if query.trim().is_empty() {
+        locale::t("launcher-all")
+    } else {
+        let shown = query.trim();
+        locale::t_args("launcher-query", &[("query", shown)])
+    };
+    Component::column(
+        Style {
+            flex_shrink: 0.0,
+            background: Color::from_hex("#1b2c3e"),
+            padding: Edges::all(12.0),
+            gap: 8.0,
+            ..Style::default()
+        },
+        vec![
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    ..Style::default()
+                },
+                vec![
+                    Component::text_input(
+                        query.clone(),
+                        locale::t("launcher-placeholder"),
+                        search_style,
+                    ),
+                    Component::button_with_click(
+                        locale::t("launcher-search"),
+                        Style {
+                            background: Color::from_hex("#5b4fe0"),
+                            border_radius: 8.0,
+                            font_size: 13.0,
+                            font_weight: 700,
+                            color: Color::WHITE,
+                            padding: Edges::xy(12.0, 8.0),
+                            ..Style::default()
+                        },
+                        EventAction::Invoke {
+                            code: OP_LAUNCHER_SEARCH,
+                            input_placeholder: locale::t("launcher-placeholder"),
+                        },
+                    ),
+                ],
+            ),
+            Component::text(
+                query_label,
+                Style {
+                    font_size: 12.0,
+                    color: Color::from_hex("#d5dee8"),
+                    ..Style::default()
+                },
+            ),
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    flex_wrap: FlexWrap::Wrap,
+                    ..Style::default()
+                },
+                tiles,
+            ),
+        ],
+    )
+}
+
+fn launcher_tile(app: LaunchApp) -> Component {
+    let current = state::get_signal(APP_SIGNAL) == app.id;
+    let open = state::get_signal(OPEN_MASK_SIGNAL) & app_bit(app.id) != 0;
+    let minimized = state::get_signal(MINIMIZED_MASK_SIGNAL) & app_bit(app.id) != 0;
+    let status = if current {
+        locale::t("launcher-front")
+    } else if minimized {
+        locale::t("launcher-min")
+    } else if open {
+        locale::t("launcher-open")
+    } else {
+        String::new()
+    };
+    let name = app_label(app.id);
+    let label = if status.is_empty() {
+        format!("{}  {name}", app.letter)
+    } else {
+        format!("{}  {name} · {status}", app.letter)
+    };
+    Component::button_with_click(
+        label,
+        Style {
+            background: Color::from_hex(app.color),
+            border_radius: 8.0,
+            font_size: 13.0,
+            font_weight: 700,
+            color: Color::WHITE,
+            padding: Edges::xy(12.0, 8.0),
+            ..Style::default()
+        },
+        invoke(focus_code(app.id)),
+    )
+}
+
+fn build_toast(text: &str) -> Component {
+    Component::row(
+        Style {
+            flex_shrink: 0.0,
+            padding: Edges::xy(16.0, 8.0),
+            gap: 8.0,
+            background: Color::from_hex("#1d4e89"),
+            align_items: AlignItems::Center,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                locale::t("toast-title"),
+                Style {
+                    font_size: 13.0,
+                    font_weight: 700,
+                    color: Color::WHITE,
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                text,
+                Style {
+                    font_size: 13.0,
+                    color: Color::from_hex("#f4f7fb"),
+                    flex_grow: 1.0,
+                    ..Style::default()
+                },
+            ),
+            chrome_button(locale::t("toast-dismiss"), OP_DISMISS_TOAST, "#3d5570"),
+        ],
+    )
+}
+
+fn build_receipts_viewer() -> Component {
+    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
+    let storage_label = if storage_owned.is_empty() {
+        "memory".to_string()
+    } else {
+        storage_owned
+    };
+    let subject_owned = state::get_signal_text(SUBJECT_SIGNAL);
+    let subject_label = if subject_owned.is_empty() {
+        LocalIdentityStub::SUBJECT.to_string()
+    } else {
+        subject_owned
+    };
+    let log = state::get_signal_text(RECEIPT_SIGNAL);
+    let mut body = vec![
+        Component::text(
+            locale::t("ledger"),
+            Style {
+                font_size: 16.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            format!("{subject_label} · {storage_label}"),
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        chrome_button(locale::t("close"), OP_TOGGLE_RECEIPTS, "#3d5570"),
+    ];
+    if log.is_empty() || log == "No receipts yet." {
+        body.push(Component::text(
+            locale::t("no-receipts"),
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+    } else {
+        for line in log.lines() {
+            body.push(Component::text(
+                line,
+                Style {
+                    font_size: 12.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
+    }
+    Component::column(
+        Style {
+            width: Dimension::Px(300.0),
+            flex_shrink: 0.0,
+            min_height: Dimension::Px(0.0),
+            overflow: Overflow::Auto,
+            padding: Edges::all(14.0),
+            gap: 8.0,
+            background: Color::from_hex("#243047"),
+            ..Style::default()
+        },
+        body,
     )
 }

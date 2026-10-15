@@ -122,6 +122,8 @@ pub enum IntentTier {
     L0,
     /// Synonym / typo resolver, still not a model.
     L1,
+    /// Planner model. Tool calls still stop for confirm.
+    L2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +203,14 @@ pub struct Proposal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposeResult {
     Confirm(Proposal),
-    Unrecognized { receipt: ActionReceipt },
+    /// L0 and L1 missed, or the utterance is more than one clause.
+    /// The shell plans this off the UI thread. Nothing has run.
+    Plan {
+        utterance: String,
+    },
+    Unrecognized {
+        receipt: ActionReceipt,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +249,7 @@ pub struct IntentSession {
     next_id: u64,
     ledger: Option<ReceiptLedger>,
     l1_enabled: bool,
+    l2_enabled: bool,
 }
 
 impl IntentSession {
@@ -254,6 +264,7 @@ impl IntentSession {
             next_id: 1,
             ledger: None,
             l1_enabled: false,
+            l2_enabled: false,
         }
     }
 
@@ -274,18 +285,44 @@ impl IntentSession {
         }
     }
 
+    /// Enable the L2 planner path. `W3COS_L2=1` or `W3COS_L2=script`.
+    /// The model call itself still waits for [`crate::planner::mode_from_env`].
+    pub fn with_l2_from_env(mut self) -> Self {
+        let flag = std::env::var("W3COS_L2").unwrap_or_default();
+        self.l2_enabled = matches!(flag.trim(), "1" | "true" | "script");
+        self
+    }
+
+    pub fn with_l2(mut self) -> Self {
+        self.l2_enabled = true;
+        self
+    }
+
+    pub fn l2_enabled(&self) -> bool {
+        self.l2_enabled
+    }
+
+    /// Session switch for the settings page. Does not start a model process.
+    /// The shell keeps this off unless `W3COS_L2` was already set.
+    pub fn set_l2_enabled(&mut self, enabled: bool) {
+        self.l2_enabled = enabled;
+    }
+
     /// Shell entry point. Loads the machine-local ledger when a directory is
     /// available. Tests keep using [`new`](Self::new), which stays in memory.
     pub fn open_local(permissions: AgentPermissions, identity: LocalIdentityStub) -> Self {
         match ReceiptLedger::open_default() {
             Ok(ledger) => Self::new(permissions, identity)
                 .with_l1()
+                .with_l2_from_env()
                 .with_ledger(ledger),
             Err(err) => {
                 eprintln!(
                     "[intent] receipt ledger unavailable ({err}); keeping receipts in memory"
                 );
-                Self::new(permissions, identity).with_l1()
+                Self::new(permissions, identity)
+                    .with_l1()
+                    .with_l2_from_env()
             }
         }
     }
@@ -432,6 +469,11 @@ impl IntentSession {
 
     pub fn propose(&mut self, utterance: &str, ctx: &ShellContext) -> ProposeResult {
         let utterance = normalize(utterance);
+        if self.l2_enabled && utterance_needs_l2(&utterance, self.l1_enabled) {
+            eprintln!("[intent] tier=L2 utterance={utterance:?}");
+            self.proposal = None;
+            return ProposeResult::Plan { utterance };
+        }
         let Some(resolved) = resolve_intent(&utterance, self.l1_enabled) else {
             eprintln!("[intent] tier=none utterance={utterance:?}");
             let receipt = self.push(
@@ -562,6 +604,36 @@ impl IntentSession {
         }
     }
 
+    pub fn record_external(
+        &mut self,
+        utterance: &str,
+        command: &str,
+        decision: Decision,
+        confirmed: bool,
+        outcome: &str,
+        tier: IntentTier,
+    ) -> ActionReceipt {
+        self.push(utterance, command, decision, confirmed, outcome, tier)
+    }
+
+    pub fn authorize_bridge(&self, op: &crate::permissions::BridgeOp) -> Result<(), String> {
+        authorize(&self.permissions, op).map_err(|err| err.message("shell"))
+    }
+
+    /// Identity and rate checks shared with L0 confirm. Does not perform work.
+    pub fn gate_mutation(&mut self, now_ms: u64) -> Result<(), &'static str> {
+        if !self.identity.unlocked() {
+            return Err("local identity is locked");
+        }
+        if !self
+            .rate
+            .try_acquire(now_ms, self.permissions.max_actions_per_second)
+        {
+            return Err("rate limit exceeded");
+        }
+        Ok(())
+    }
+
     fn push(
         &mut self,
         utterance: &str,
@@ -683,8 +755,48 @@ fn tier_label(tier: IntentTier) -> &'static str {
     match tier {
         IntentTier::L0 => "L0",
         IntentTier::L1 => "L1",
+        IntentTier::L2 => "L2",
         IntentTier::Unspecified => "none",
     }
+}
+
+/// Free-form or multi-clause text that should go to the planner.
+/// A `#` selector never does: that stays on the L0 smuggle rule.
+pub fn utterance_needs_l2(normalized: &str, l1_enabled: bool) -> bool {
+    if normalized.is_empty() || normalized.contains('#') {
+        return false;
+    }
+    if is_multi_clause(normalized) {
+        return true;
+    }
+    resolve_intent(normalized, l1_enabled).is_none()
+}
+
+fn is_multi_clause(normalized: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        " and ",
+        " then ",
+        " then,",
+        ";",
+        "然后",
+        "并且",
+        "接着",
+        "再把",
+        "然后再",
+        "之后",
+    ];
+    MARKERS.iter().any(|marker| normalized.contains(marker))
+}
+
+pub fn resolve_l0_command(utterance: &str) -> Option<ShellCommand> {
+    match_command(&normalize(utterance))
+}
+
+pub fn command_effect(
+    command: &ShellCommand,
+    ctx: &ShellContext,
+) -> (String, Option<ShellApp>, Option<bool>) {
+    execute(command, ctx)
 }
 
 fn resolve_intent(normalized: &str, l1_enabled: bool) -> Option<ResolvedIntent> {
@@ -722,7 +834,8 @@ fn impact_for(command: &ShellCommand, shared: bool, tier: IntentTier) -> String 
     };
     match tier {
         IntentTier::L1 => format!("L1 本地同义词，没有模型。Local synonyms, no model. {body}"),
-        _ => body,
+        IntentTier::L2 => format!("L2 规划模型。Planner model. {body}"),
+        IntentTier::L0 | IntentTier::Unspecified => body,
     }
 }
 
@@ -993,6 +1106,33 @@ mod tests {
     }
 
     #[test]
+    fn l2_plans_free_form_and_keeps_exact_commands_on_l0() {
+        let mut session = session(AgentPermissions::interactive()).with_l2();
+        match session.propose("please open the files application", &ctx()) {
+            ProposeResult::Plan { utterance } => {
+                assert!(utterance.contains("files"), "{utterance}")
+            }
+            other => panic!("free-form did not plan: {other:?}"),
+        }
+        match session.propose("open files", &ctx()) {
+            ProposeResult::Confirm(proposal) => assert_eq!(proposal.tier, IntentTier::L0),
+            other => panic!("exact command left L0: {other:?}"),
+        }
+        match session.propose("open the terminal and run echo hello", &ctx()) {
+            ProposeResult::Plan { .. } => {}
+            other => panic!("multi-step stayed on L0: {other:?}"),
+        }
+        match session.propose("click #secret", &ctx()) {
+            ProposeResult::Unrecognized { .. } => {}
+            other => panic!("selector smuggling reached the planner: {other:?}"),
+        }
+        assert!(
+            !IntentSession::new(AgentPermissions::observer(), LocalIdentityStub::new())
+                .l2_enabled()
+        );
+    }
+
+    #[test]
     fn help_says_no_model_is_used() {
         let mut session = session(AgentPermissions::observer());
         session.propose("帮助", &ctx());
@@ -1009,6 +1149,7 @@ mod tests {
                 assert_eq!(receipt.decision, Decision::Unrecognized);
             }
             ProposeResult::Confirm(_) => panic!("smuggled selector became a proposal"),
+            ProposeResult::Plan { .. } => panic!("smuggled selector reached the planner"),
         }
         assert!(session.confirm(&ctx(), 1_000).is_none());
     }
@@ -1095,6 +1236,7 @@ mod tests {
                 assert_eq!(receipt.tier, IntentTier::Unspecified);
             }
             ProposeResult::Confirm(_) => panic!("memory session resolved an L1 phrase"),
+            ProposeResult::Plan { .. } => panic!("memory session planned an L1 phrase"),
         }
         session.propose("open files", &ctx());
         let proposal = session.proposal().expect("l0 proposal");
@@ -1118,6 +1260,7 @@ mod tests {
                 );
             }
             ProposeResult::Unrecognized { receipt } => panic!("{}", receipt.outcome),
+            ProposeResult::Plan { .. } => panic!("L1 phrase was sent to the planner"),
         }
         match session.propose("dark theme", &ctx()) {
             ProposeResult::Confirm(proposal) => {
@@ -1125,14 +1268,17 @@ mod tests {
                 assert_eq!(proposal.tier, IntentTier::L1);
             }
             ProposeResult::Unrecognized { receipt } => panic!("{}", receipt.outcome),
+            ProposeResult::Plan { .. } => panic!("L1 phrase was sent to the planner"),
         }
         match session.propose("make me a sandwich", &ctx()) {
             ProposeResult::Unrecognized { .. } => {}
             ProposeResult::Confirm(_) => panic!("unrelated text became a command"),
+            ProposeResult::Plan { .. } => panic!("unrelated text reached the planner"),
         }
         match session.propose("click #secret", &ctx()) {
             ProposeResult::Unrecognized { .. } => {}
             ProposeResult::Confirm(_) => panic!("selector smuggling became a command"),
+            ProposeResult::Plan { .. } => panic!("selector smuggling reached the planner"),
         }
         session.propose("help me", &ctx());
         let effect = session.confirm(&ctx(), 1_000).unwrap();
