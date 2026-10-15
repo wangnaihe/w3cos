@@ -773,6 +773,12 @@ def summarize_runs(workload, native_runs, browser_runs):
                 "comparable": False,
                 "note": "Included in native cold start. Chromium's cold start stops at the rAF signal and does not PNG-encode the frame.",
             })
+        add("cpu_ms", [run["cpu_ms"] for run in ok_native if run.get("cpu_ms") is not None],
+            [run["cpu_ms"] for run in ok_browser if run.get("cpu_ms") is not None])
+        add("peak_rss_kb", [run["peak_rss_kb"] for run in ok_native if run.get("peak_rss_kb")],
+            [run["peak_rss_kb"] for run in ok_browser if run.get("peak_rss_kb")])
+        add("steady_rss_kb", [run["steady_rss_kb"] for run in ok_native if run.get("steady_rss_kb")],
+            [run["steady_rss_kb"] for run in ok_browser if run.get("steady_rss_kb")])
     else:
         if workload != "frames":
             add("wall_ms", [run_median(run.get("result")) for run in ok_native if run_median(run.get("result")) is not None],
