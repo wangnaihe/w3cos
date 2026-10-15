@@ -208,25 +208,31 @@ impl LocalIdentityStub {
         migrated
     }
 
-    /// Returns false when `assertion` is empty or does not match the verifier.
-    /// The first non-empty value is stretched and stored. Nothing here is
-    /// checked against an authenticator. Passkey / `did:key` is still next.
-    pub fn unlock_with_passkey_stub(&mut self, assertion: &str) -> bool {
-        if assertion.is_empty() {
+    /// Returns false when `passphrase` is empty or does not match the verifier.
+    /// The first non-empty value is stretched with PBKDF2-HMAC-SHA256 and only
+    /// the verifier is stored. Nothing here is checked against an authenticator.
+    /// Passkey / `did:key` is still next.
+    pub fn unlock_with_passphrase(&mut self, passphrase: &str) -> bool {
+        if passphrase.is_empty() {
             return false;
         }
         if let Some(stored) = &self.verifier {
-            if !verify_pin(assertion, stored) {
+            if !verify_pin(passphrase, stored) {
                 return false;
             }
         } else {
-            let Some(verifier) = seal_pin(assertion) else {
+            let Some(verifier) = seal_pin(passphrase) else {
                 return false;
             };
             self.verifier = Some(verifier);
         }
         self.unlocked = true;
         true
+    }
+
+    /// Older name for [`unlock_with_passphrase`](Self::unlock_with_passphrase).
+    pub fn unlock_with_passkey_stub(&mut self, assertion: &str) -> bool {
+        self.unlock_with_passphrase(assertion)
     }
 }
 
@@ -414,6 +420,7 @@ mod tests {
         id.lock();
         assert!(!id.unlocked());
         assert!(!id.unlock_with_passkey_stub(""));
+        assert!(!id.unlock_with_passphrase(""));
         assert!(!id.unlocked());
         assert!(id.unlock_with_passkey_stub("not-a-real-passkey"));
         assert!(id.unlocked());

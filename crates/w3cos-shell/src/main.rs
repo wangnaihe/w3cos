@@ -10,6 +10,7 @@ use std::collections::HashMap;
 mod agent_host;
 mod gesture;
 mod handoff;
+mod hpke;
 mod locale;
 mod windows;
 
@@ -65,6 +66,7 @@ const RECEIPT_FILTER_SIGNAL: usize = 30;
 const SWITCHER_SIGNAL: usize = 31;
 const FILE_PREVIEW_SIGNAL: usize = 32;
 const RECEIPT_QUERY_SIGNAL: usize = 33;
+const LOCK_PASSPHRASE_SIGNAL: usize = 34;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -139,6 +141,7 @@ const OP_HANDOFF_HIDE: u8 = 72;
 const OP_SYNC_RECEIPTS: u8 = 73;
 const OP_SYNC_DRAFTS: u8 = 74;
 const OP_RECEIPT_QUERY: u8 = 75;
+const OP_SYNC_CLIPBOARD: u8 = 76;
 
 fn main() {
     shell_main();
@@ -255,6 +258,7 @@ fn ensure_shell_signals() {
         let _ = state::create_signal(0);
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -288,7 +292,11 @@ fn boot_session_once() {
             capability_gate::grant(shell_tools::CAP_CAPTURE);
         }
         if std::env::var("W3COS_UNLOCK").ok().as_deref() == Some("1") {
-            session.unlock_identity_stub("stub-passkey");
+            let passphrase = std::env::var("W3COS_UNLOCK_PASSPHRASE")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "w3cos-local".to_string());
+            session.unlock_with_passphrase(&passphrase);
         }
         sync_session(session, 0, "");
     });
@@ -354,11 +362,20 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
         }
         OP_UNLOCK => {
-            if session.unlock_identity_stub("stub-passkey") {
+            let passphrase = draft.trim();
+            if session.unlock_with_passphrase(passphrase) {
+                state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, "");
                 sync_session(
                     session,
                     state::get_signal(PHASE_SIGNAL),
                     &locale::t("toast-unlocked-stub"),
+                );
+            } else {
+                state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, passphrase);
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("toast-unlock-fail"),
                 );
             }
         }
@@ -1191,16 +1208,27 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             handoff::allow_draft_sync();
             state::mark_dirty();
         }
+        OP_SYNC_CLIPBOARD => {
+            handoff::allow_clipboard_sync();
+            push_toast(&locale::t("toast-clipboard-sync"));
+            state::mark_dirty();
+        }
         OP_HANDOFF_LATER => {
             handoff::hide_banner();
             state::mark_dirty();
         }
         OP_HANDOFF_GO => {
+            let clipboard = if handoff::clipboard_sync_enabled() {
+                read_clipboard()
+            } else {
+                None
+            };
             let sealed = handoff::begin_send(
                 receipt_entries(),
                 &state::get_signal_text(DRAFT_SIGNAL),
                 &state::get_signal_text(FILE_PREVIEW_SIGNAL),
                 false,
+                clipboard.as_deref(),
             );
             if sealed.is_none() {
                 push_toast(&locale::t("handoff-no-peer"));
@@ -1334,6 +1362,12 @@ fn apply_screen_override() {
             focus_app(3);
             state::set_signal(SETTINGS_TAB_SIGNAL, 4);
             handoff::demo_pending();
+        }
+        Some("devices-sync") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            handoff::demo_pending();
+            let _ = handoff::codes_match();
         }
         Some("handoff") => {
             focus_app(1);
@@ -1766,6 +1800,23 @@ fn live_clock() -> String {
 fn set_receipt_filter(kind: i64) {
     state::set_signal(RECEIPT_FILTER_SIGNAL, kind);
     state::set_signal(RECEIPT_PAGE_SIGNAL, 0);
+}
+
+fn read_clipboard() -> Option<String> {
+    let output = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-o"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn copy_subject() {
@@ -2669,7 +2720,15 @@ fn build_permission_sheet() -> Component {
             },
             vec![
                 sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
-                sheet_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary),
+                {
+                    let mut unlock =
+                        sheet_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary);
+                    unlock.on_click = EventAction::Invoke {
+                        code: OP_UNLOCK,
+                        input_placeholder: locale::t("lock-passphrase"),
+                    };
+                    unlock
+                },
             ],
         ));
     }
@@ -2680,7 +2739,29 @@ fn build_lock_screen() -> Component {
     let subject = truncate_middle(&current_subject(), 28);
     let (width, _) = state::shell_viewport();
     let card_w = 420.0_f32.min((width - 32.0).max(280.0));
+    let mut field_style = Style {
+        width: Dimension::Px(card_w - 56.0),
+        font_size: 15.0,
+        color: Color::from_hex("#1a2836"),
+        background: Color::from_hex("#f4f7fb"),
+        border_radius: 10.0,
+        padding: Edges::xy(12.0, 10.0),
+        ..Style::default()
+    };
+    field_style.custom_properties = Some(HashMap::from([(
+        "--w3cos-intent-submit".to_string(),
+        OP_UNLOCK.to_string(),
+    )]));
+    let passphrase = Component::secure_text_input(
+        state::get_signal_text(LOCK_PASSPHRASE_SIGNAL),
+        locale::t("lock-passphrase"),
+        field_style,
+    );
     let mut unlock = action_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary);
+    unlock.on_click = EventAction::Invoke {
+        code: OP_UNLOCK,
+        input_placeholder: locale::t("lock-passphrase"),
+    };
     unlock.style.width = Dimension::Px(card_w - 56.0);
     unlock.style.height = Dimension::Px(if state::pointer_is_coarse() {
         48.0
@@ -2764,6 +2845,7 @@ fn build_lock_screen() -> Component {
                         ..Style::default()
                     },
                 ),
+                passphrase,
                 unlock,
                 Component::text(
                     locale::t("lock-footnote"),
@@ -3645,6 +3727,11 @@ fn settings_devices_page() -> Vec<Component> {
         page.push(chrome_button(
             locale::t("sync-drafts"),
             OP_SYNC_DRAFTS,
+            "#0c6d4c",
+        ));
+        page.push(chrome_button(
+            locale::t("sync-clipboard"),
+            OP_SYNC_CLIPBOARD,
             "#0c6d4c",
         ));
     } else if handoff::peers().is_empty() {
