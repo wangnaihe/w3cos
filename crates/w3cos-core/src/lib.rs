@@ -24,7 +24,7 @@ pub mod web;
 pub use builtins::{
     Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, Set, array_value,
     console, dispatch_resize_observers, dispatch_resize_observers_bounded, document, error_class,
-    error_instance, json_value, math_value, object_value, parseFloat, parseInt,
+    error_instance, json_value, math_value, object_value, parseFloat, parseInt, reset_constructors,
 };
 pub use js_string::JsString;
 pub use object::JsObject;

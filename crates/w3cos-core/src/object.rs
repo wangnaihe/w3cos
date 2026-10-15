@@ -427,6 +427,24 @@ impl JsObject {
         true
     }
 
+    /// Prototype link when no `getPrototypeOf` trap would run.
+    ///
+    /// `None` means a trap is installed. Callers that must not invoke user
+    /// code use this instead of [`Self::get_prototype_of`].
+    pub fn untrapped_prototype(&self) -> Option<Value> {
+        if self
+            .proxy_handler
+            .as_ref()
+            .is_some_and(|handler| handler.get_prototype_of.is_some())
+        {
+            return None;
+        }
+        Some(match &self.prototype {
+            Some(proto) if proto.is_live() => proto.as_value(),
+            _ => Value::Null,
+        })
+    }
+
     /// `[[GetPrototypeOf]]`.
     pub fn get_prototype_of(&self) -> Value {
         if let Some(ref handler) = self.proxy_handler {

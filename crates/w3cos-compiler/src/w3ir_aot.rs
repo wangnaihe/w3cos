@@ -4037,8 +4037,10 @@ fn fusion_latch_prelude(suffix: &str, atoms: &str, names: &[&str]) -> String {
 }
 
 /// Load the fused receivers only once the loop body is known to run, then
-/// accept the fast path only while the sealed builtin epoch is unchanged.
-fn fusion_latch_open(suffix: &str, names: &[(&str, u32)]) -> String {
+/// accept the fast path only when those receivers still expose the sealed
+/// builtins. The epoch is sampled after that proof so a later override falls
+/// back without treating an earlier `style` prototype install as a mismatch.
+fn fusion_latch_open(suffix: &str, names: &[(&str, u32)], surface: &str) -> String {
     let mut out =
         format!("if !__w3cos_fuse_latched_{suffix} {{\n__w3cos_fuse_latched_{suffix} = true;\n");
     for (name, id) in names {
@@ -4048,9 +4050,20 @@ fn fusion_latch_open(suffix: &str, names: &[(&str, u32)]) -> String {
         ));
     }
     out.push_str(&format!(
-        "if w3cos_core::intrinsics::dom_shape_is_pristine() {{\n__w3cos_dom_epoch_{suffix} = w3cos_core::intrinsics::dom_shape_epoch();\n__w3cos_fuse_fast_{suffix} = true;\n}}\n}}\nif __w3cos_fuse_fast_{suffix} {{\n"
+        "if {surface} {{\n__w3cos_dom_epoch_{suffix} = w3cos_core::intrinsics::dom_shape_epoch();\n__w3cos_fuse_fast_{suffix} = true;\n}}\n}}\nif __w3cos_fuse_fast_{suffix} {{\n"
     ));
     out
+}
+
+fn fusion_surface_expr(suffix: &str, nodes: bool, tag: &str) -> String {
+    let nodes = if nodes {
+        format!("Some(&__w3cos_nodes_{suffix})")
+    } else {
+        "None".to_string()
+    };
+    format!(
+        "w3cos_core::intrinsics::dom_fusion_surface_ok(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {nodes}, {tag:?})"
+    )
 }
 
 /// Stamp-guarded fused create. The else branch is the ordinary lookup body.
@@ -4118,6 +4131,7 @@ fn emit_guarded_append(
             ("parent", shape.parent_binding),
             ("nodes", shape.nodes_binding),
         ],
+        &fusion_surface_expr(&suffix, true, &shape.tag),
     );
     let fast = format!(
         "{open}let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, __w3cos_class_atom_{suffix}, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch_{suffix});\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes_{suffix}, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
@@ -4385,6 +4399,7 @@ fn emit_guarded_block(
             ("doc", shape.document_binding),
             ("parent", shape.parent_binding),
         ],
+        &fusion_surface_expr(&suffix, false, &shape.tag),
     );
     let fast = format!(
         "{open}{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch_{suffix});\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
@@ -4447,9 +4462,10 @@ fn emit_native_sync_loop(
     } else {
         format!("if {condition} {{ break; }}")
     };
-    // Fuse only behind a pristine baseline sampled after the gate. Binding
-    // reads stay in the body so a zero-trip loop does not observe them.
-    // A stale stamp or a bumped epoch falls through to `body_code`.
+    // Fuse only after the loop gate, and only when the loaded receivers still
+    // match the sealed builtins. Binding reads stay in the body so a zero-trip
+    // loop does not observe them. A failed surface check or a bumped epoch
+    // falls through to `body_code`.
     let guarded = match emit_guarded_append(
         &body[..body.len() - 1],
         &body_code,
@@ -7912,11 +7928,11 @@ fn main() {{
             .find("break;")
             .unwrap_or_else(|| panic!("loop gate missing: {generated}"));
         let proof_at = generated
-            .find("dom_shape_is_pristine")
-            .unwrap_or_else(|| panic!("pristine proof missing: {generated}"));
+            .find("dom_fusion_surface_ok")
+            .unwrap_or_else(|| panic!("surface proof missing: {generated}"));
         assert!(
             loop_at + break_at < proof_at,
-            "the pristine proof must follow the loop gate so a zero-trip body is not observed: {generated}"
+            "the surface proof must follow the loop gate so a zero-trip body is not observed: {generated}"
         );
         assert!(
             generated.contains(intrinsic)

@@ -628,9 +628,10 @@ pub fn bump_dom_shape() {
 
 /// Record the epoch once builtins exist and before user script runs.
 ///
-/// A sample taken at the loop would match an already-overridden surface,
-/// because the epoch only moves. Fusion is allowed only while the epoch is
-/// still this baseline.
+/// This stamp is not the fusion proof. Unrelated `setPrototypeOf` calls, such
+/// as the first `element.style` access, move the epoch before the timed loop.
+/// Fusion uses [`dom_fusion_surface_ok`] and then samples the epoch so a later
+/// override still falls back.
 pub fn note_dom_shape_baseline() {
     let epoch = dom_shape_epoch();
     DOM_SHAPE_BASELINE.with(|cell| cell.set(epoch));
@@ -647,6 +648,30 @@ pub fn dom_shape_is_pristine() -> bool {
 
 pub fn install_dom_fast(fast: DomFast) {
     let _ = DOM_FAST.set(fast);
+}
+
+static DOM_FUSION_SURFACE: std::sync::OnceLock<fn(&Value, &Value, Option<&Value>, &str) -> bool> =
+    std::sync::OnceLock::new();
+
+pub fn install_dom_fusion_surface(check: fn(&Value, &Value, Option<&Value>, &str) -> bool) {
+    let _ = DOM_FUSION_SURFACE.set(check);
+}
+
+/// True when the fused create surface is still the builtins recorded at seal.
+///
+/// `nodes` is `Some` for create + id/class/text + append + push, and `None`
+/// for a styled block. The check does not invoke getters or proxy get traps.
+/// Callers that see `true` sample [`dom_shape_epoch`] for [`dom_build_guarded`].
+/// An unset checker stays false so fusion cannot run before the runtime installs it.
+pub fn dom_fusion_surface_ok(
+    document: &Value,
+    parent: &Value,
+    nodes: Option<&Value>,
+    tag: &str,
+) -> bool {
+    DOM_FUSION_SURFACE
+        .get()
+        .is_some_and(|check| check(document, parent, nodes, tag))
 }
 
 pub fn dom_create_element(object: &Value, tag: &str) -> Value {

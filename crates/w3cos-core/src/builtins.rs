@@ -11,6 +11,16 @@ thread_local! {
     static ARRAY_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
+/// Drop cached constructors before the page arena reset.
+///
+/// Their property names are interned strings. Keeping the objects across
+/// `page_arena::reset` makes the next realm observe empty keys.
+pub fn reset_constructors() {
+    OBJECT_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    ARRAY_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    ERROR_CLASSES.with(|slot| slot.borrow_mut().take());
+}
+
 #[derive(Clone, Copy)]
 enum BuiltinKind {
     Math,
