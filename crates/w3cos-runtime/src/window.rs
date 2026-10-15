@@ -7696,11 +7696,44 @@ mod cpu_present_swizzle_tests {
         .unwrap();
         assert_eq!(px, [0, 10, 16, 6]);
     }
+
+    #[test]
+    fn hover_outline_is_jade_not_indigo() {
+        let mut pixmap = tiny_skia::Pixmap::new(64, 64).unwrap();
+        super::draw_hover_outline_cpu(
+            &mut pixmap,
+            LayoutRect {
+                x: 8.0,
+                y: 8.0,
+                width: 48.0,
+                height: 48.0,
+            },
+        );
+        let mut jade = 0;
+        let mut indigo = 0;
+        for pixel in pixmap.pixels() {
+            if pixel.alpha() < 8 {
+                continue;
+            }
+            let r = pixel.red();
+            let g = pixel.green();
+            let b = pixel.blue();
+            if b > r.saturating_add(30) && b > g.saturating_add(30) {
+                indigo += 1;
+            }
+            if g > r.saturating_add(15) && g.saturating_add(8) >= b {
+                jade += 1;
+            }
+        }
+        assert_eq!(indigo, 0, "hover outline still paints indigo");
+        assert!(jade > 20, "expected a jade hover ring, saw {jade} pixels");
+    }
 }
 
 #[cfg(feature = "cpu-render")]
 fn draw_hover_outline_cpu(pixmap: &mut Pixmap, rect: LayoutRect) {
-    let color = tiny_skia::Color::from_rgba8(108, 92, 231, 100);
+    let [r, g, b, a] = crate::HOVER_OUTLINE_RGBA;
+    let color = tiny_skia::Color::from_rgba8(r, g, b, a);
     let mut paint = tiny_skia::Paint::default();
     paint.set_color(color);
     paint.anti_alias = true;

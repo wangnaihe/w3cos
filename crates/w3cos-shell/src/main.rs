@@ -1426,12 +1426,7 @@ fn build_shell() -> Component {
         column.push(chrome_layer(build_notify_panel()));
     }
     if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
-        let viewer = build_receipts_viewer();
-        column.push(if posture() == Posture::Phone {
-            dock_right(viewer)
-        } else {
-            place_receipts(viewer)
-        });
+        column.push(place_receipts(build_receipts_viewer()));
     }
     if state::get_signal(LAUNCHER_SIGNAL) != 0 && posture() != Posture::Phone {
         column.push(chrome_layer(build_launcher()));
@@ -1528,14 +1523,31 @@ fn place_overlay(mut node: Component) -> Component {
     node
 }
 
+/// Top of the floating intent block. Drawers stop above this so they leave the
+/// submit control uncovered.
+fn intent_block_top(height: f32) -> f32 {
+    (height - 84.0 - 78.0).max(8.0)
+}
+
 fn place_receipts(mut panel: Component) -> Component {
     let (width, height) = state::shell_viewport();
-    let panel_w = 400.0_f32.min((width - 48.0).max(280.0));
+    let phone = posture() == Posture::Phone;
+    let panel_w = if phone {
+        340.0_f32.min(width)
+    } else {
+        400.0_f32.min((width - 48.0).max(280.0))
+    };
+    let top = if phone { 0.0 } else { 24.0 };
+    let bottom = (intent_block_top(height) - 12.0).max(top);
     panel.style.position = Position::Absolute;
-    panel.style.left = Dimension::Px((width - panel_w - 24.0).max(8.0));
-    panel.style.top = Dimension::Px(24.0);
+    panel.style.left = Dimension::Px(if phone {
+        (width - panel_w).max(0.0)
+    } else {
+        (width - panel_w - 24.0).max(8.0)
+    });
+    panel.style.top = Dimension::Px(top);
     panel.style.width = Dimension::Px(panel_w);
-    panel.style.height = Dimension::Px((height - 132.0).max(240.0));
+    panel.style.height = Dimension::Px(bottom - top);
     panel.style.z_index = CHROME_Z + 1;
     panel
 }
@@ -1683,6 +1695,12 @@ fn glyph_svg(name: &str, stroke: &str) -> String {
         "arrow" => {
             r#"<path d="M19 7v5.2A2.8 2.8 0 0 1 16.2 15H6"/><path d="M9.5 11.5 6 15l3.5 3.5"/>"#
         }
+        "minus" => r#"<path d="M6 12h12"/>"#,
+        "maximize" => r#"<rect x="6" y="6" width="12" height="12" rx="1.4"/>"#,
+        "restore" => {
+            r#"<rect x="8" y="5" width="10" height="10" rx="1.2"/><path d="M6 9.5V17.5A1.5 1.5 0 0 0 7.5 19H15"/>"#
+        }
+        "close" => r#"<path d="M7 7l10 10M17 7 7 17"/>"#,
         _ => {
             r#"<rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/>"#
         }
@@ -1784,6 +1802,11 @@ fn glyph_face(
             border_radius: radius,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
+            // The name stays on the button for accessibility. Icon buttons must
+            // not paint it: a CJK label is wider than the 40px face and draws
+            // across the neighboring dock icons.
+            color: Color::TRANSPARENT,
+            overflow: Overflow::Hidden,
             ..Style::default()
         },
         children,
@@ -2100,7 +2123,7 @@ fn floating_intent() -> Component {
     bar.style.position = Position::Absolute;
     bar.style.width = Dimension::Px(bar_w);
     bar.style.left = Dimension::Px(((width - bar_w) / 2.0).max(8.0));
-    bar.style.top = Dimension::Px((height - 84.0 - 78.0).max(8.0));
+    bar.style.top = Dimension::Px(intent_block_top(height));
     bar.style.z_index = CHROME_Z;
     bar
 }
@@ -2898,13 +2921,15 @@ fn build_notify_panel() -> Component {
             ));
         }
     }
+    let bottom = intent_block_top(height) - 12.0;
+    let top = (bottom - 240.0).max(16.0);
     Component::column(
         Style {
             position: Position::Absolute,
             left: Dimension::Px((width - panel_w - 16.0).max(8.0)),
-            top: Dimension::Px((height - 80.0 - 16.0 - 260.0).max(16.0)),
+            top: Dimension::Px(top),
             width: Dimension::Px(panel_w),
-            max_height: Dimension::Px(280.0),
+            max_height: Dimension::Px((bottom - top).max(0.0)),
             overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
@@ -2954,7 +2979,7 @@ fn app_body(id: i64) -> Component {
     }
 }
 
-fn build_window_frame(id: i64, _focused: bool) -> Component {
+fn build_window_frame(id: i64, focused: bool) -> Component {
     let frame = windows::frame(id);
     let mut window = Component::column(
         Style {
@@ -2967,7 +2992,11 @@ fn build_window_frame(id: i64, _focused: bool) -> Component {
             overflow: Overflow::Hidden,
             box_sizing: BoxSizing::BorderBox,
             border_width: 1.0,
-            border_color: line_strong(),
+            border_color: if focused {
+                Color::rgba(20, 150, 106, 210)
+            } else {
+                line_strong()
+            },
             border_radius: 14.0,
             box_shadow: Some(shadow_lg()),
             box_shadows: vec![inset_highlight(15)],
@@ -3044,7 +3073,8 @@ fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) ->
             flex_shrink: 0.0,
             padding: Edges::ZERO,
             font_size: 1.0,
-            background: Color::from_hex("#2a3e52"),
+            color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
             ..Style::default()
         },
         invoke(focus_code(id)),
@@ -3062,7 +3092,8 @@ fn resize_corner(id: i64) -> Component {
             flex_shrink: 0.0,
             padding: Edges::ZERO,
             font_size: 1.0,
-            background: Color::from_hex("#d5dee8"),
+            color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
             ..Style::default()
         },
         invoke(focus_code(id)),
@@ -3510,15 +3541,6 @@ fn build_terminal_app() -> Component {
                     ..Style::default()
                 },
                 vec![
-                    Component::text(
-                        locale::t("terminal-allow"),
-                        Style {
-                            font_size: 16.0,
-                            font_weight: 700,
-                            color: Color::from_hex("#f4f7fb"),
-                            ..Style::default()
-                        },
-                    ),
                     Component::text(
                         locale::t("terminal-ready"),
                         Style {
@@ -5070,23 +5092,23 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // Shared: title bar + taskbar
 // ==========================================================================
 
-fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -> Component {
+fn window_button(
+    glyph: &str,
+    name: impl Into<String>,
+    code: u8,
+    stroke: &str,
+    app_id: i64,
+) -> Component {
     let side = gesture::coarse_target(state::pointer_is_coarse());
-    let mut button = Component::button_with_click(
-        label,
-        Style {
-            font_size: 12.0,
-            color: Color::from_hex(color),
-            background: Color::from_hex("#2a2a3e"),
-            border_radius: 10.0,
-            padding: Edges::all(4.0),
-            width: Dimension::Px(side),
-            height: Dimension::Px(side),
-            min_width: Dimension::Px(side),
-            min_height: Dimension::Px(side),
-            ..Style::default()
-        },
-        invoke(code),
+    let mut button = glyph_face(
+        glyph,
+        name,
+        code,
+        Color::TRANSPARENT,
+        stroke,
+        side,
+        8.0,
+        false,
     );
     button.style.custom_properties = Some(win_props(app_id, None));
     button
@@ -5094,10 +5116,10 @@ fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -
 
 fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Component {
     let title = title.into();
-    let max_label = if windows::is_maximized(app_id) {
-        locale::t("win-restore")
+    let (max_glyph, max_label) = if windows::is_maximized(app_id) {
+        ("restore", locale::t("win-restore"))
     } else {
-        locale::t("win-maximize")
+        ("maximize", locale::t("win-maximize"))
     };
     let bar_height = if state::pointer_is_coarse() {
         56.0
@@ -5149,9 +5171,15 @@ fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Componen
                     ..Style::default()
                 },
                 vec![
-                    window_button("--", OP_MINIMIZE, "#808090", app_id),
-                    window_button(max_label, OP_MAXIMIZE, "#808090", app_id),
-                    window_button("X", OP_CLOSE, "#e94560", app_id),
+                    window_button(
+                        "minus",
+                        locale::t("win-minimize"),
+                        OP_MINIMIZE,
+                        "#c5d0d8",
+                        app_id,
+                    ),
+                    window_button(max_glyph, max_label, OP_MAXIMIZE, "#c5d0d8", app_id),
+                    window_button("close", locale::t("win-close"), OP_CLOSE, "#e94560", app_id),
                 ],
             ),
         ],
@@ -5613,7 +5641,13 @@ fn build_switcher() -> Component {
                 },
                 vec![
                     chrome_button(app_label(id), focus_code(id), app_accent(id)),
-                    window_button(locale::t("switcher-close"), OP_CLOSE, "#e07a78", id),
+                    window_button(
+                        "close",
+                        locale::t("switcher-close"),
+                        OP_CLOSE,
+                        "#e07a78",
+                        id,
+                    ),
                 ],
             ));
         }
@@ -5895,5 +5929,182 @@ mod shell_ux_tests {
         copy_subject();
         let copied = COPIED_SUBJECT.with(|slot| slot.borrow().clone());
         assert_eq!(copied, "did:key:z6MkhaXgexample");
+    }
+
+    fn px(dim: Dimension) -> f32 {
+        match dim {
+            Dimension::Px(value) => value,
+            other => panic!("expected px, got {other:?}"),
+        }
+    }
+
+    fn walk(node: &Component, visit: &mut dyn FnMut(&Component)) {
+        visit(node);
+        for child in &node.children {
+            walk(child, visit);
+        }
+    }
+
+    struct IconFace {
+        label: String,
+        color_a: u8,
+        background: Color,
+        overflow: Overflow,
+        width: f32,
+        svg: String,
+    }
+
+    fn icon_buttons(root: &Component) -> Vec<IconFace> {
+        let mut found = Vec::new();
+        walk(root, &mut |node| {
+            let ComponentKind::Button { label } = &node.kind else {
+                return;
+            };
+            if label.is_empty() {
+                return;
+            }
+            let Some(svg) = node.children.iter().find_map(|child| match &child.kind {
+                ComponentKind::SvgDocument { source, .. } => Some(source.clone()),
+                _ => None,
+            }) else {
+                return;
+            };
+            found.push(IconFace {
+                label: label.clone(),
+                color_a: node.style.color.a,
+                background: node.style.background,
+                overflow: node.style.overflow,
+                width: px(node.style.width),
+                svg,
+            });
+        });
+        found
+    }
+
+    #[test]
+    fn dock_icons_keep_names_without_painting_them() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2));
+        let bar = build_floating_taskbar();
+        let icons = icon_buttons(&bar);
+        assert!(icons.len() >= 5, "expected launcher, apps, and tray icons");
+        for icon in &icons {
+            assert_eq!(icon.color_a, 0, "{} paints across the dock", icon.label);
+            assert_eq!(icon.overflow, Overflow::Hidden);
+            assert!(
+                icon.width <= 48.0,
+                "{} is {}px wide",
+                icon.label,
+                icon.width
+            );
+        }
+        assert!(bar.style.gap >= 8.0);
+    }
+
+    #[test]
+    fn window_controls_are_icons_not_a_missing_glyph() {
+        locale::set_locale("zh-CN");
+        assert_ne!(locale::t("win-maximize"), "[]");
+        assert_eq!(locale::t("win-minimize"), "最小化");
+        assert_eq!(locale::t("win-maximize"), "最大化");
+        assert_eq!(locale::t("win-restore"), "还原");
+        assert_eq!(locale::t("win-close"), "关闭");
+        locale::set_locale("en");
+        assert_eq!(locale::t("win-maximize"), "Maximize");
+        assert_ne!(locale::t("win-maximize"), "[]");
+        locale::set_locale("zh-CN");
+        let bar = app_titlebar("终端", "#1c8f62", 2);
+        let icons = icon_buttons(&bar);
+        let labels: Vec<&str> = icons.iter().map(|icon| icon.label.as_str()).collect();
+        assert_eq!(labels, ["最小化", "最大化", "关闭"]);
+        for icon in &icons {
+            assert_eq!(icon.color_a, 0, "{}", icon.label);
+            assert_eq!(icon.background.a, 0, "{} still fills a square", icon.label);
+            assert_ne!(icon.background, Color::from_hex("#2a2a3e"));
+            assert!(
+                !icon.svg.contains('['),
+                "{} still uses a tofu glyph",
+                icon.label
+            );
+        }
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn resize_grip_is_not_a_white_square() {
+        let corner = resize_corner(2);
+        assert_eq!(corner.style.background.a, 0);
+        assert_ne!(corner.style.background, Color::from_hex("#d5dee8"));
+        let edge = resize_handle(2, "e", Dimension::Px(16.0), Dimension::Auto);
+        assert_eq!(edge.style.background.a, 0);
+        assert_ne!(edge.style.background, Color::from_hex("#2a3e52"));
+    }
+
+    #[test]
+    fn receipts_drawer_stops_above_the_intent_bar() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        for (width, height) in [(1200.0, 800.0), (390.0, 760.0)] {
+            state::note_shell_viewport(width, height);
+            let panel = place_receipts(Component::column(Style::default(), vec![]));
+            let bottom = px(panel.style.top) + px(panel.style.height);
+            let intent_top = px(floating_intent().style.top);
+            assert!(
+                bottom <= intent_top - 8.0,
+                "{width}x{height}: drawer ends at {bottom}, intent starts at {intent_top}"
+            );
+        }
+    }
+
+    #[test]
+    fn notify_panel_stops_above_the_intent_bar() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        state::note_shell_viewport(1200.0, 800.0);
+        let panel = build_notify_panel();
+        let bottom = px(panel.style.top) + px(panel.style.max_height);
+        let intent_top = px(floating_intent().style.top);
+        assert!(
+            bottom <= intent_top - 8.0,
+            "notify ends at {bottom}, intent starts at {intent_top}"
+        );
+    }
+
+    #[test]
+    fn focused_window_border_is_jade() {
+        let frame = build_window_frame(2, true);
+        assert!(frame.style.border_color.g > frame.style.border_color.r + 40);
+        assert!(frame.style.border_color.b < 180);
+        assert_ne!(
+            (
+                frame.style.border_color.r,
+                frame.style.border_color.g,
+                frame.style.border_color.b
+            ),
+            (108, 92, 231)
+        );
+    }
+
+    #[test]
+    fn terminal_states_the_process_grant_once() {
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        let app = build_terminal_app();
+        let mut texts = Vec::new();
+        walk(&app, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind {
+                texts.push(content.clone());
+            }
+        });
+        let grants = texts
+            .iter()
+            .filter(|text| text.contains("echo") || text.contains("w3cos-process"))
+            .count();
+        assert_eq!(grants, 1, "{texts:?}");
+        assert!(texts.iter().any(|text| text.contains("终端已就绪")));
+        locale::set_locale("en");
     }
 }

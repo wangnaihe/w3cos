@@ -800,18 +800,20 @@ fn render_node(
             );
         }
         ComponentKind::Button { label } => {
-            draw_text_centered_in_rect(
-                scene,
-                rect,
-                label,
-                style.font_size,
-                text_color,
-                font_data,
-                font,
-                style,
-                glyph_cache,
-                dpi,
-            );
+            if text_color.a > 0 {
+                draw_text_centered_in_rect(
+                    scene,
+                    rect,
+                    label,
+                    style.font_size,
+                    text_color,
+                    font_data,
+                    font,
+                    style,
+                    glyph_cache,
+                    dpi,
+                );
+            }
         }
         ComponentKind::Image { src } => {
             if crate::image_loader::get_or_load(src).is_some() {
@@ -1714,7 +1716,13 @@ fn draw_blinking_cursor(
 
 pub fn draw_hover_outline(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
     let dpi = Affine::scale(scale_factor as f64);
-    let color = Color::new([108.0 / 255.0, 92.0 / 255.0, 231.0 / 255.0, 100.0 / 255.0]);
+    let [r, g, b, a] = crate::HOVER_OUTLINE_RGBA;
+    let color = Color::new([
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ]);
     let stroke = Stroke::new(2.0);
     let r = Rect::new(
         rect.x as f64,
@@ -1847,6 +1855,17 @@ pub fn composite_retained_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_outline_color_is_jade() {
+        let [r, g, b, a] = crate::HOVER_OUTLINE_RGBA;
+        assert!(a > 0);
+        assert!(
+            g > r + 40 && g > b,
+            "hover outline should be jade, got {r},{g},{b}"
+        );
+        assert!(r < 80 && b < 160, "indigo hover leaked back: {r},{g},{b}");
+    }
 
     #[test]
     fn gpu_font_lookup_uses_the_selected_collection_face() {

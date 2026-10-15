@@ -1096,7 +1096,9 @@ fn render_node(
             draw_text_in_rect(pixmap, rect, content, style, text_color, font, clip_mask);
         }
         ComponentKind::Button { label } => {
-            draw_text_centered_in_rect(pixmap, rect, label, style, text_color, font, clip_mask);
+            if text_color.a > 0 {
+                draw_text_centered_in_rect(pixmap, rect, label, style, text_color, font, clip_mask);
+            }
         }
         ComponentKind::Image { src } => {
             let content_rect = text_content_box(rect, style);
@@ -2004,6 +2006,26 @@ fn draw_text_centered_in_rect(
     font: &fontdue::Font,
     clip_mask: Option<&Mask>,
 ) {
+    let clips_own_overflow = matches!(
+        style.resolved_overflow_x(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    ) || matches!(
+        style.resolved_overflow_y(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    );
+    let mut own_clip_mask = clips_own_overflow
+        .then(|| make_clip_mask(pixmap, rect))
+        .flatten();
+    if let (Some(own), Some(ancestor)) = (own_clip_mask.as_mut(), clip_mask) {
+        for (own_alpha, ancestor_alpha) in own.data_mut().iter_mut().zip(ancestor.data()) {
+            *own_alpha = (*own_alpha).min(*ancestor_alpha);
+        }
+    }
+    let effective_clip = own_clip_mask.as_ref().or(clip_mask);
     draw_text_ink_in_box(
         pixmap,
         text_paint_box(rect, style),
@@ -2013,7 +2035,7 @@ fn draw_text_centered_in_rect(
         font,
         style,
         TextAlign::Center,
-        clip_mask,
+        effective_clip,
     );
 }
 
@@ -2668,6 +2690,137 @@ mod font_cjk_tests {
         assert!(m.width > 0 && !bmp.is_empty());
         let (m2, _) = font.rasterize('A', 16.0);
         assert!(m2.advance_width > 0.0);
+    }
+
+    fn button_label(
+        label: &str,
+        overflow: w3cos_std::style::Overflow,
+        color: Color,
+    ) -> (ComponentKind, Style) {
+        let mut style = Style::default();
+        style.color = color;
+        style.overflow = overflow;
+        style.font_size = 16.0;
+        (
+            ComponentKind::Button {
+                label: label.to_string(),
+            },
+            style,
+        )
+    }
+
+    fn inside(rect: LayoutRect, x: u32, y: u32) -> bool {
+        x as f32 >= rect.x
+            && y as f32 >= rect.y
+            && (x as f32) < rect.x + rect.width
+            && (y as f32) < rect.y + rect.height
+    }
+
+    fn bright_where(pixmap: &Pixmap, pred: impl Fn(u32, u32) -> bool) -> usize {
+        pixmap
+            .pixels()
+            .iter()
+            .enumerate()
+            .filter(|(index, pixel)| {
+                let x = (*index as u32) % pixmap.width();
+                let y = (*index as u32) / pixmap.width();
+                pred(x, y) && pixel.red() > 180 && pixel.green() > 180 && pixel.blue() > 180
+            })
+            .count()
+    }
+
+    #[test]
+    fn overflowing_button_labels_do_not_paint_into_a_neighbor() {
+        let data = include_bytes!("../assets/CJK-Subset.ttf");
+        let font =
+            fontdue::Font::from_bytes(data as &[u8], fontdue::FontSettings::default()).unwrap();
+        let left = LayoutRect {
+            x: 8.0,
+            y: 4.0,
+            width: 40.0,
+            height: 32.0,
+        };
+        let right = LayoutRect {
+            x: 56.0,
+            y: 4.0,
+            width: 40.0,
+            height: 32.0,
+        };
+        let mut clipped = Pixmap::new(104, 40).unwrap();
+        clipped.fill(SkColor::from_rgba8(16, 22, 29, 255));
+        for (rect, label) in [(left, "Applications"), (right, "Notifications")] {
+            let (kind, style) =
+                button_label(label, w3cos_std::style::Overflow::Hidden, Color::WHITE);
+            render_node(
+                &mut clipped,
+                rect,
+                &kind,
+                &style,
+                &font,
+                None,
+                None,
+                false,
+                false,
+                None,
+            );
+        }
+        assert_eq!(
+            bright_where(&clipped, |x, y| !inside(left, x, y) && !inside(right, x, y)),
+            0,
+            "clipped labels crossed the gap"
+        );
+        assert!(bright_where(&clipped, |x, y| inside(left, x, y)) > 0);
+
+        let mut visible = Pixmap::new(104, 40).unwrap();
+        visible.fill(SkColor::from_rgba8(16, 22, 29, 255));
+        let (kind, style) = button_label(
+            "Applications",
+            w3cos_std::style::Overflow::Visible,
+            Color::WHITE,
+        );
+        render_node(
+            &mut visible,
+            left,
+            &kind,
+            &style,
+            &font,
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            bright_where(&visible, |x, y| !inside(left, x, y)) > 0,
+            "a visible label wider than its icon must be able to spill, otherwise the clip assertion is vacuous"
+        );
+
+        let mut hidden = Pixmap::new(104, 40).unwrap();
+        hidden.fill(SkColor::from_rgba8(16, 22, 29, 255));
+        let (kind, style) = button_label(
+            "Applications",
+            w3cos_std::style::Overflow::Hidden,
+            Color::TRANSPARENT,
+        );
+        render_node(
+            &mut hidden,
+            left,
+            &kind,
+            &style,
+            &font,
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            hidden
+                .pixels()
+                .iter()
+                .all(|pixel| pixel.red() < 40 && pixel.green() < 50),
+            "an icon button's accessible name must not paint"
+        );
     }
 
     #[test]
