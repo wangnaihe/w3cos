@@ -282,3 +282,6 @@ ime-mode-pinyin = 拼
 ime-mode-direct = EN
 ime-preedit = { $spelling }
 ime-candidate = { $n } { $text }
+kbd-space = 空格
+kbd-backspace = 删除
+kbd-enter = 完成

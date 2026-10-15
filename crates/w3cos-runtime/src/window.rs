@@ -5943,6 +5943,32 @@ impl App {
         });
     }
 
+    fn style_property(&self, idx: usize, name: &str) -> Option<String> {
+        let flat = layout::pre_flatten(&self.root);
+        flat.get(idx)?
+            .style
+            .custom_properties
+            .as_ref()?
+            .get(name)
+            .cloned()
+    }
+
+    /// Remember a text field for the shell keyboard, and keep that note while
+    /// the pointer is on an IME key so the key can still edit the field.
+    fn sync_ime_note(&self, next: Option<usize>) {
+        let had = state::current_ime_field().is_some();
+        match next {
+            Some(idx) if matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. })) => {
+                self.note_ime_target(idx);
+            }
+            Some(idx) if self.style_property(idx, "--w3cos-ime-keep").is_some() => {}
+            _ => state::clear_ime_field(),
+        }
+        if had != state::current_ime_field().is_some() {
+            state::mark_dirty();
+        }
+    }
+
     fn apply_queued_ime_text(&mut self) {
         let queued = state::take_ime_replacements();
         if queued.is_empty() {
@@ -6038,11 +6064,14 @@ impl App {
             }
             if kind_is_button {
                 let action = hit.on_click.clone();
-                let draft = state::with_shell_win_draft(
+                let mut draft = state::with_shell_win_draft(
                     &self.root,
                     idx,
                     draft_for_action(&self.root, &self.text_input_values, &action),
                 );
+                if let Some(key) = self.style_property(idx, "--w3cos-softkey") {
+                    draft = key;
+                }
                 // Focus dispatch can synchronously run React handlers and
                 // rebuild the lowered component tree. Preserve the DOM host
                 // chain captured by pointer-down so the subsequent click is
@@ -6248,6 +6277,7 @@ impl App {
             }
         }
         self.focused_index = next;
+        self.sync_ime_note(next);
         crate::uitest::set_focused_index(next);
         #[cfg(target_os = "ios")]
         if let Some(current) = next {

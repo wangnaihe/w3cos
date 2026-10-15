@@ -5,6 +5,7 @@
 //! engine. L2 is not consulted: the lookup hub is constructed with L2 off.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use w3cos_ime::{ImeHub, InputIntent, Modality, PinyinEngine, Proposal, Purpose};
 use w3cos_runtime::state::{self, ImeFieldNote};
@@ -12,13 +13,19 @@ use w3cos_std::Component;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
 
-use super::{CHROME_Z, OP_IME_1, OP_IME_MODE, ink_token, invoke, line_strong, touch_min};
+use super::{
+    CHROME_Z, OP_IME_1, OP_IME_MODE, OP_SOFTKEY, ink_token, invoke, line_strong, touch_min,
+};
 use crate::locale;
 
 /// Room left above the bottom edge for the phone keyboard that sits under
 /// the candidate bar.
 pub const PHONE_KEYBOARD_RESERVE: f32 = 240.0;
+/// Key rows plus padding. The phone stack leaves this much room above the
+/// home indicator so the absolute keyboard does not cover the intent field.
+pub const KEYBOARD_HEIGHT: f32 = 218.0;
 const BAR_BLOCK: f32 = 120.0;
+const KEY_ROW: f32 = 48.0;
 
 struct Caret {
     x: f32,
@@ -78,7 +85,7 @@ fn with_session<R>(body: impl FnOnce(&mut Session) -> R) -> R {
     SESSION.with(|slot| body(&mut slot.borrow_mut()))
 }
 
-fn pinyin_mode(session: &Session) -> bool {
+fn pinyin_mode(session: &mut Session) -> bool {
     session
         .override_pinyin
         .unwrap_or_else(|| locale::current().starts_with("zh"))
@@ -316,18 +323,74 @@ fn place(width: f32, height: f32, caret: &Caret) -> (f32, f32) {
     (x, y)
 }
 
-pub(crate) fn candidate_layer() -> Option<Component> {
-    let visible = with_session(|session| {
-        pinyin_mode(session) && !session.secure && !session.spelling.is_empty()
-    });
-    if !visible {
-        return None;
+/// Drop an uncommitted spelling when focus has left every text field.
+pub(crate) fn sync_field_presence() {
+    if state::current_ime_field().is_some() {
+        return;
     }
+    with_session(|session| {
+        session.spelling.clear();
+        session.candidates.clear();
+        session.has_field = false;
+    });
+}
+
+pub(crate) fn keyboard_open() -> bool {
+    let (width, _) = state::shell_viewport();
+    width < 600.0 && state::current_ime_field().is_some()
+}
+
+pub(crate) enum SoftOutcome {
+    None,
+    Edit,
+    Submit { role: String, text: String },
+}
+
+/// A phone-keyboard key. Letters in direct or secure mode are inserted here
+/// because there is no runtime key event to fall back on.
+pub(crate) fn on_soft_key(name: &str) -> SoftOutcome {
+    if on_key(name) {
+        return SoftOutcome::Edit;
+    }
+    with_session(|session| {
+        if !session.has_field {
+            return SoftOutcome::None;
+        }
+        match name {
+            "Backspace" => {
+                let mut chars: Vec<char> = session.base.chars().collect();
+                if chars.pop().is_some() {
+                    session.base = chars.into_iter().collect();
+                    queue(session, session.base.clone());
+                }
+                SoftOutcome::Edit
+            }
+            "Enter" => SoftOutcome::Submit {
+                role: session.role.clone(),
+                text: session.base.clone(),
+            },
+            "Space" => {
+                session.base.push(' ');
+                queue(session, session.base.clone());
+                SoftOutcome::Edit
+            }
+            other if other.chars().count() == 1 && !other.chars().any(|ch| ch.is_control()) => {
+                session.base.push_str(other);
+                queue(session, session.base.clone());
+                SoftOutcome::Edit
+            }
+            _ => SoftOutcome::None,
+        }
+    })
+}
+
+fn candidates_visible(session: &mut Session) -> bool {
+    pinyin_mode(session) && !session.secure && !session.spelling.is_empty()
+}
+
+fn candidate_children() -> Vec<Component> {
     let (spelling, candidates) =
         with_session(|session| (session.spelling.clone(), session.candidates.clone()));
-    let (width, height) = state::shell_viewport();
-    let (x, y) = candidate_origin(width, height);
-    let bar_w = (width - 16.0).clamp(160.0, 640.0);
     let mut children = vec![
         mode_button(),
         Component::text(
@@ -345,6 +408,21 @@ pub(crate) fn candidate_layer() -> Option<Component> {
         let label = locale::t_args("ime-candidate", &[("n", &n), ("text", text)]);
         children.push(candidate_button(label, OP_IME_1 + index as u8));
     }
+    children
+}
+
+pub(crate) fn candidate_layer() -> Option<Component> {
+    let (width, _) = state::shell_viewport();
+    if width < 600.0 {
+        return None;
+    }
+    let visible = with_session(candidates_visible);
+    if !visible {
+        return None;
+    }
+    let (width, height) = state::shell_viewport();
+    let (x, y) = candidate_origin(width, height);
+    let bar_w = (width - 16.0).clamp(160.0, 640.0);
     let mut bar = Component::row(
         Style {
             position: Position::Absolute,
@@ -362,48 +440,187 @@ pub(crate) fn candidate_layer() -> Option<Component> {
             z_index: CHROME_Z + 5,
             ..Style::default()
         },
-        children,
+        candidate_children(),
     );
     bar.style.z_index = CHROME_Z + 5;
     Some(bar)
 }
 
-fn mode_button() -> Component {
-    Component::button_with_click(
-        locale::t("ime-mode-pinyin"),
+/// In-flow candidate row for the phone stack, just above the keyboard.
+pub(crate) fn phone_candidate_strip() -> Option<Component> {
+    if !keyboard_open() || !with_session(candidates_visible) {
+        return None;
+    }
+    Some(Component::row(
         Style {
-            background: Color::from_hex("#24384a"),
-            border_radius: 8.0,
-            font_size: 13.0,
-            font_weight: 700,
-            color: Color::WHITE,
-            padding: Edges::xy(10.0, 0.0),
-            height: Dimension::Px(touch_min()),
-            min_height: Dimension::Px(touch_min()),
-            box_sizing: BoxSizing::BorderBox,
+            flex_shrink: 0.0,
+            gap: 6.0,
+            margin: Edges::xy(8.0, 4.0),
+            padding: Edges::all(8.0),
+            flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Center,
+            background: Color::from_hex("#162433"),
+            border_width: 1.0,
+            border_color: line_strong(),
+            border_radius: 12.0,
             ..Style::default()
         },
-        invoke(OP_IME_MODE),
+        candidate_children(),
+    ))
+}
+
+fn keep_ime(style: &mut Style) {
+    let mut props = style.custom_properties.take().unwrap_or_default();
+    props.insert("--w3cos-ime-keep".to_string(), "1".to_string());
+    style.custom_properties = Some(props);
+}
+
+fn soft_key(label: String, key: &str, grow: f32, special: bool) -> Component {
+    let mut style = Style {
+        flex_grow: grow,
+        flex_shrink: 1.0,
+        height: Dimension::Px(KEY_ROW),
+        min_height: Dimension::Px(KEY_ROW),
+        background: Color::from_hex(if special { "#1b2c3e" } else { "#24384a" }),
+        border_radius: 8.0,
+        font_size: 16.0,
+        font_weight: 650,
+        color: Color::from_hex("#f4f7fb"),
+        padding: Edges::ZERO,
+        box_sizing: BoxSizing::BorderBox,
+        ..Style::default()
+    };
+    style.custom_properties = Some(HashMap::from([
+        ("--w3cos-softkey".to_string(), key.to_string()),
+        ("--w3cos-ime-keep".to_string(), "1".to_string()),
+    ]));
+    Component::button_with_click(label, style, invoke(OP_SOFTKEY))
+}
+
+fn letter_row(letters: &[&str]) -> Component {
+    Component::row(
+        Style {
+            height: Dimension::Px(KEY_ROW),
+            gap: 4.0,
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+        letters
+            .iter()
+            .map(|letter| soft_key((*letter).to_string(), letter, 1.0, false))
+            .collect(),
     )
 }
 
-fn candidate_button(label: String, code: u8) -> Component {
-    Component::button_with_click(
-        label,
+/// Basic QWERTY keyboard for the 390×760 phone posture, including the pinyin toggle.
+pub(crate) fn phone_keyboard() -> Option<Component> {
+    if !keyboard_open() {
+        return None;
+    }
+    let (width, height) = state::shell_viewport();
+    let mut board = Component::column(
         Style {
-            background: Color::from_hex("#1c8f62"),
-            border_radius: 8.0,
-            font_size: 14.0,
-            font_weight: 650,
-            color: Color::WHITE,
-            padding: Edges::xy(8.0, 0.0),
-            height: Dimension::Px(touch_min()),
-            min_height: Dimension::Px(touch_min()),
-            box_sizing: BoxSizing::BorderBox,
+            position: Position::Absolute,
+            left: Dimension::Px(0.0),
+            top: Dimension::Px((height - KEYBOARD_HEIGHT).max(0.0)),
+            width: Dimension::Px(width),
+            height: Dimension::Px(KEYBOARD_HEIGHT),
+            padding: Edges::xy(4.0, 4.0),
+            gap: 6.0,
+            justify_content: JustifyContent::Center,
+            background: Color::from_hex("#10161d"),
+            border_width: 1.0,
+            border_color: line_strong(),
+            z_index: CHROME_Z + 6,
+            flex_shrink: 0.0,
             ..Style::default()
         },
-        invoke(code),
-    )
+        vec![
+            letter_row(&["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]),
+            letter_row(&["a", "s", "d", "f", "g", "h", "j", "k", "l"]),
+            Component::row(
+                Style {
+                    height: Dimension::Px(KEY_ROW),
+                    gap: 4.0,
+                    align_items: AlignItems::Center,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+                vec![
+                    {
+                        let mut key = mode_button();
+                        key.style.flex_grow = 1.4;
+                        key.style.height = Dimension::Px(KEY_ROW);
+                        key.style.min_height = Dimension::Px(KEY_ROW);
+                        key
+                    },
+                    soft_key("z".into(), "z", 1.0, false),
+                    soft_key("x".into(), "x", 1.0, false),
+                    soft_key("c".into(), "c", 1.0, false),
+                    soft_key("v".into(), "v", 1.0, false),
+                    soft_key("b".into(), "b", 1.0, false),
+                    soft_key("n".into(), "n", 1.0, false),
+                    soft_key("m".into(), "m", 1.0, false),
+                    soft_key(locale::t("kbd-backspace"), "Backspace", 1.4, true),
+                ],
+            ),
+            Component::row(
+                Style {
+                    height: Dimension::Px(KEY_ROW),
+                    gap: 4.0,
+                    align_items: AlignItems::Center,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+                vec![
+                    soft_key(locale::t("kbd-space"), "Space", 4.0, true),
+                    soft_key(locale::t("kbd-enter"), "Enter", 1.6, true),
+                ],
+            ),
+        ],
+    );
+    board.style.z_index = CHROME_Z + 6;
+    Some(board)
+}
+
+fn mode_button() -> Component {
+    let label = if with_session(pinyin_mode) {
+        locale::t("ime-mode-pinyin")
+    } else {
+        locale::t("ime-mode-direct")
+    };
+    let mut style = Style {
+        background: Color::from_hex("#24384a"),
+        border_radius: 8.0,
+        font_size: 13.0,
+        font_weight: 700,
+        color: Color::WHITE,
+        padding: Edges::xy(10.0, 0.0),
+        height: Dimension::Px(touch_min()),
+        min_height: Dimension::Px(touch_min()),
+        box_sizing: BoxSizing::BorderBox,
+        ..Style::default()
+    };
+    keep_ime(&mut style);
+    Component::button_with_click(label, style, invoke(OP_IME_MODE))
+}
+
+fn candidate_button(label: String, code: u8) -> Component {
+    let mut style = Style {
+        background: Color::from_hex("#1c8f62"),
+        border_radius: 8.0,
+        font_size: 14.0,
+        font_weight: 650,
+        color: Color::WHITE,
+        padding: Edges::xy(8.0, 0.0),
+        height: Dimension::Px(touch_min()),
+        min_height: Dimension::Px(touch_min()),
+        box_sizing: BoxSizing::BorderBox,
+        ..Style::default()
+    };
+    keep_ime(&mut style);
+    Component::button_with_click(label, style, invoke(code))
 }
 
 #[cfg(test)]
@@ -514,5 +731,54 @@ mod tests {
         assert!(on_key("h"));
         let (_, above) = candidate_origin(1200.0, 800.0);
         assert!(above < 740.0);
+    }
+
+    #[test]
+    fn phone_keyboard_covers_pinyin_direct_and_secure_entry() {
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        note("intent", "", false, 4, 640.0);
+        assert!(matches!(on_soft_key("n"), SoftOutcome::Edit));
+        assert!(matches!(on_soft_key("i"), SoftOutcome::Edit));
+        assert!(matches!(on_soft_key("h"), SoftOutcome::Edit));
+        assert!(matches!(on_soft_key("a"), SoftOutcome::Edit));
+        assert!(matches!(on_soft_key("o"), SoftOutcome::Edit));
+        let board = phone_keyboard().expect("phone keyboard");
+        let dumped = format!("{board:?}");
+        assert!(dumped.contains("--w3cos-softkey"), "{dumped}");
+        assert!(dumped.contains("Backspace"));
+        assert!(dumped.contains(&locale::t("kbd-space")));
+        assert!(KEYBOARD_HEIGHT <= PHONE_KEYBOARD_RESERVE);
+        let strip = phone_candidate_strip().expect("candidate strip");
+        assert!(format!("{strip:?}").contains("你好"));
+        assert!(matches!(on_soft_key("Enter"), SoftOutcome::Edit));
+        assert_eq!(composed_text(), "你好");
+        assert!(matches!(
+            on_soft_key("Enter"),
+            SoftOutcome::Submit { role, .. } if role == "intent"
+        ));
+
+        reset_for_tests();
+        locale::set_locale("en");
+        state::note_shell_viewport(390.0, 760.0);
+        note("intent", "hi", false, 4, 640.0);
+        assert!(matches!(on_soft_key("x"), SoftOutcome::Edit));
+        assert_eq!(composed_text(), "hix");
+        assert!(phone_candidate_strip().is_none());
+        state::note_shell_viewport(1200.0, 800.0);
+        assert!(phone_keyboard().is_none());
+
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        note("secure", "", true, 2, 400.0);
+        assert!(matches!(on_soft_key("a"), SoftOutcome::Edit));
+        assert_eq!(composed_text(), "a");
+        assert!(phone_candidate_strip().is_none());
+        assert!(phone_keyboard().is_some());
+        state::clear_ime_field();
+        sync_field_presence();
+        assert!(phone_keyboard().is_none());
     }
 }
