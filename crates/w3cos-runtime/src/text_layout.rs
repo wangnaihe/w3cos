@@ -1148,6 +1148,18 @@ pub fn single_line_content_height(
     visual.max(font_size * line_height)
 }
 
+/// Split a field value into the committed prefix and the IME composition suffix.
+pub fn split_preedit_suffix<'a>(display: &'a str, suffix: &str) -> Option<(&'a str, &'a str)> {
+    if suffix.is_empty() || !display.ends_with(suffix) {
+        return None;
+    }
+    let split_at = display.len() - suffix.len();
+    if !display.is_char_boundary(split_at) {
+        return None;
+    }
+    Some(display.split_at(split_at))
+}
+
 pub fn measure_text_width_font(text: &str, font_size: f32, font: &fontdue::Font) -> f32 {
     text.chars()
         .map(|ch| char_advance(ch, font_size, font))

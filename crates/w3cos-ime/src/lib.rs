@@ -19,4 +19,6 @@ pub use hub::{ImeHub, l2_from_value};
 pub use intent::{
     InputIntent, IntentHint, IntentPayload, Modality, Proposal, Purpose, Scope, Session,
 };
-pub use pinyin::{PinyinEngine, candidates as pinyin_candidates, segment as pinyin_segment};
+pub use pinyin::{
+    PinyinEngine, candidates as pinyin_candidates, preedit_display, segment as pinyin_segment,
+};

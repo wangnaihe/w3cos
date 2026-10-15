@@ -154,6 +154,8 @@ const OP_IME_8: u8 = 84;
 const OP_IME_9: u8 = 85;
 const OP_IME_MODE: u8 = 86;
 const OP_SOFTKEY: u8 = 87;
+const OP_IME_PAGE_PREV: u8 = 88;
+const OP_IME_PAGE_NEXT: u8 = 89;
 
 fn main() {
     shell_main();
@@ -1301,6 +1303,12 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             ime_bar::toggle_mode();
             apply_ime_field();
         }
+        OP_IME_PAGE_PREV => {
+            ime_bar::page_by(-1);
+        }
+        OP_IME_PAGE_NEXT => {
+            ime_bar::page_by(1);
+        }
         OP_SOFTKEY => match ime_bar::on_soft_key(draft) {
             ime_bar::SoftOutcome::Edit => apply_ime_field(),
             ime_bar::SoftOutcome::Submit { role, text } => {
@@ -1899,6 +1907,51 @@ fn live_clock() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
+/// One fixed cell per character so digits stay evenly spaced and the colon
+/// does not pick up proportional side bearings.
+fn tabular_clock(font_size: f32, weight: u16, color: Color) -> Component {
+    let digit_w = (font_size * 0.62).round();
+    let colon_w = (font_size * 0.36).round();
+    let cells = live_clock()
+        .chars()
+        .map(|ch| {
+            let width = if ch == ':' { colon_w } else { digit_w };
+            Component::text(
+                ch.to_string(),
+                Style {
+                    width: Dimension::Px(width),
+                    min_width: Dimension::Px(width),
+                    font_size,
+                    font_weight: weight,
+                    font_kerning: false,
+                    text_align: TextAlign::Center,
+                    color,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+            )
+        })
+        .collect();
+    Component::row(
+        Style {
+            gap: 0.0,
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+        cells,
+    )
+}
+
+fn note_preedit(style: &mut Style, role: &str) {
+    let Some(suffix) = ime_bar::preedit_suffix(role) else {
+        return;
+    };
+    let mut props = style.custom_properties.take().unwrap_or_default();
+    props.insert("--w3cos-ime-preedit".to_string(), suffix);
+    style.custom_properties = Some(props);
+}
+
 fn set_receipt_filter(kind: i64) {
     state::set_signal(RECEIPT_FILTER_SIGNAL, kind);
     state::set_signal(RECEIPT_PAGE_SIGNAL, 0);
@@ -2115,6 +2168,7 @@ fn build_intent_panel() -> Component {
         ("--w3cos-intent-submit".to_string(), OP_PROPOSE.to_string()),
         ("--w3cos-ime".to_string(), "intent".to_string()),
     ]));
+    note_preedit(&mut input_style, "intent");
     let mut go_button = glyph_face(
         "arrow",
         locale::t("propose"),
@@ -2288,16 +2342,7 @@ fn build_floating_taskbar() -> Component {
             },
         ));
     }
-    tray.push(Component::text(
-        live_clock(),
-        Style {
-            font_size: 13.0,
-            font_weight: 600,
-            color: ink_token(),
-            padding: Edges::xy(10.0, 0.0),
-            ..Style::default()
-        },
-    ));
+    tray.push(tabular_clock(13.0, 600, ink_token()));
     let bar_h = if state::pointer_is_coarse() {
         64.0
     } else {
@@ -2397,15 +2442,7 @@ fn build_phone_home() -> Component {
                 ..Style::default()
             },
             vec![
-                Component::text(
-                    live_clock(),
-                    Style {
-                        font_size: 14.0,
-                        font_weight: 650,
-                        color: ink_token(),
-                        ..Style::default()
-                    },
-                ),
+                tabular_clock(14.0, 650, ink_token()),
                 Component::row(
                     Style {
                         gap: 6.0,
@@ -3682,6 +3719,7 @@ fn build_terminal_app() -> Component {
                                     "--w3cos-ime".to_string(),
                                     "terminal".to_string(),
                                 )]));
+                                note_preedit(&mut term_style, "terminal");
                                 Component::text_input(
                                     state::get_signal_text(TERMINAL_SIGNAL),
                                     "help",
@@ -5366,6 +5404,7 @@ fn build_launcher() -> Component {
         ),
         ("--w3cos-ime".to_string(), "launcher".to_string()),
     ]));
+    note_preedit(&mut search_style, "launcher");
     let needle = query.trim().to_lowercase();
     let mut tiles = Vec::new();
     for app in LAUNCH_APPS {
@@ -5592,6 +5631,7 @@ fn receipt_query_field() -> Component {
         ),
         ("--w3cos-ime".to_string(), "text".to_string()),
     ]));
+    note_preedit(&mut style, "text");
     Component::text_input(
         state::get_signal_text(RECEIPT_QUERY_SIGNAL),
         locale::t("receipt-query"),
@@ -6323,5 +6363,183 @@ mod shell_ux_tests {
             }
         });
         assert!(secure);
+    }
+
+    fn absolute_boxes_fit(
+        node: &Component,
+        cb_x: f32,
+        cb_y: f32,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) {
+        let left = match node.style.left {
+            Dimension::Px(value) => value,
+            _ => 0.0,
+        };
+        let top = match node.style.top {
+            Dimension::Px(value) => value,
+            _ => 0.0,
+        };
+        let width = match node.style.width {
+            Dimension::Px(value) => Some(value),
+            _ => None,
+        };
+        let height = match node.style.height {
+            Dimension::Px(value) if value > 0.0 => Some(value),
+            _ => None,
+        };
+        let (x, y) = if node.style.position == Position::Absolute {
+            (cb_x + left, cb_y + top)
+        } else {
+            (cb_x, cb_y)
+        };
+        if node.style.position == Position::Absolute {
+            if let Some(w) = width {
+                assert!(
+                    x >= -0.5 && x + w <= viewport_w + 0.5,
+                    "x={x} w={w} viewport={viewport_w} kind={:?}",
+                    node.kind
+                );
+            }
+            if let Some(h) = height {
+                assert!(
+                    y >= -0.5 && y + h <= viewport_h + 0.5,
+                    "y={y} h={h} viewport={viewport_h} kind={:?}",
+                    node.kind
+                );
+            }
+        }
+        let positioned = matches!(node.style.position, Position::Absolute | Position::Relative);
+        let (next_x, next_y) = if positioned { (x, y) } else { (cb_x, cb_y) };
+        for child in &node.children {
+            absolute_boxes_fit(child, next_x, next_y, viewport_w, viewport_h);
+        }
+    }
+
+    fn candidate_bar(node: &Component) -> Option<&Component> {
+        if node.style.position == Position::Absolute && node.style.z_index == CHROME_Z + 5 {
+            return Some(node);
+        }
+        for child in &node.children {
+            if let Some(found) = candidate_bar(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn chrome_stays_inside_the_viewport_and_candidates_clear_the_intent() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        // The first build restores saved windows. Later builds keep the mask.
+        let _ = build_shell();
+        for (width, height) in [(1200.0, 800.0), (768.0, 1024.0), (390.0, 760.0)] {
+            state::set_signal(OPEN_MASK_SIGNAL, 0);
+            state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+            state::set_signal(APP_SIGNAL, 0);
+            state::note_shell_viewport(width, height);
+            ime_bar::reset_for_tests();
+            state::note_ime_field(state::ImeFieldNote {
+                index: 4,
+                value: String::new(),
+                role: "intent".into(),
+                secure: false,
+                x: 24.0,
+                y: intent_block_top(height) + 28.0,
+                width: 280.0,
+                height: 36.0,
+            });
+            for ch in "nihao".chars() {
+                assert!(ime_bar::on_key(&ch.to_string()));
+            }
+            apply_ime_field();
+            let root = build_shell();
+            absolute_boxes_fit(&root, 0.0, 0.0, width, height);
+            if width >= 1024.0 || width < 600.0 {
+                let shown = live_clock();
+                let mut digit_widths = Vec::new();
+                let mut colon_width = None;
+                walk(&root, &mut |node| {
+                    if node.children.len() != shown.chars().count() {
+                        return;
+                    }
+                    let matches_clock =
+                        node.children.iter().zip(shown.chars()).all(|(child, ch)| {
+                            matches!(&child.kind, ComponentKind::Text { content } if content.chars().next() == Some(ch))
+                                && !child.style.font_kerning
+                        });
+                    if !matches_clock {
+                        return;
+                    }
+                    digit_widths = node
+                        .children
+                        .iter()
+                        .filter(|child| {
+                            matches!(&child.kind, ComponentKind::Text { content } if content != ":")
+                        })
+                        .map(|child| px(child.style.width))
+                        .collect();
+                    colon_width = node.children.iter().find_map(|child| match &child.kind {
+                        ComponentKind::Text { content } if content == ":" => {
+                            Some(px(child.style.width))
+                        }
+                        _ => None,
+                    });
+                });
+                assert!(digit_widths.len() >= 4, "{digit_widths:?}");
+                assert!(
+                    digit_widths
+                        .windows(2)
+                        .all(|pair| (pair[0] - pair[1]).abs() < 0.1)
+                );
+                let colon_width = colon_width.expect("colon");
+                assert!(colon_width < digit_widths[0]);
+            }
+            let preedit = {
+                let mut found = None;
+                walk(&root, &mut |node| {
+                    if let ComponentKind::TextInput { value, secure, .. } = &node.kind
+                        && !*secure
+                        && let Some(props) = &node.style.custom_properties
+                        && let Some(suffix) = props.get("--w3cos-ime-preedit")
+                    {
+                        found = Some((value.clone(), suffix.clone()));
+                    }
+                });
+                found
+            };
+            let (value, suffix) = preedit.expect("underlined preedit");
+            assert_eq!(suffix, "ni hao");
+            assert!(value.ends_with("ni hao"), "{value}");
+            assert!(!value.ends_with("nihao"));
+            if width >= 600.0 {
+                let bar = candidate_bar(&root).expect("candidate bar");
+                let bar_top = px(bar.style.top);
+                let bar_h = px(bar.style.height);
+                let bar_left = px(bar.style.left);
+                let bar_w = px(bar.style.width);
+                let intent_top = intent_block_top(height);
+                assert!(
+                    bar_top + bar_h <= intent_top - 8.0 + 0.5,
+                    "bar {bar_top}+{bar_h} intersects intent {intent_top}"
+                );
+                assert!(bar_left >= -0.5 && bar_left + bar_w <= width + 0.5);
+                assert_eq!(bar.style.flex_wrap, FlexWrap::NoWrap);
+            } else {
+                assert!(candidate_bar(&root).is_none());
+            }
+        }
+        state::note_shell_viewport(1200.0, 800.0);
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        locale::set_locale("en");
     }
 }
