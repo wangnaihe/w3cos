@@ -41,10 +41,17 @@ struct TextMeasureKey {
     word_break: u8,
 }
 
+struct WrappedTextMeasure {
+    key: TextMeasureKey,
+    /// Registry revision at which `key.font` was resolved for this string.
+    revision: u64,
+    height: f32,
+}
+
 #[derive(Default)]
 struct TextMeasureCache {
     intrinsic: HashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
-    wrapped_height: HashMap<String, Vec<(TextMeasureKey, f32)>>,
+    wrapped_height: HashMap<String, Vec<WrappedTextMeasure>>,
     entries: usize,
 }
 
@@ -3886,26 +3893,57 @@ pub(crate) fn block_text_border_height(
     wrapped_text_height(content, containing_content_width, style)
 }
 
+fn text_measure_keys_match_ignoring_font(left: &TextMeasureKey, right: &TextMeasureKey) -> bool {
+    let mut left = *left;
+    let mut right = *right;
+    left.font = 0;
+    right.font = 0;
+    left == right
+}
+
 pub(crate) fn wrapped_text_height(
     content: &str,
     width: f32,
     style: &w3cos_std::style::Style,
 ) -> f32 {
     let registry = crate::font_face::FontRegistry::global();
-    // Registry revision changes when a face is registered or dropped, so a
-    // hit does not resolve runs or shape glyphs again.
-    let key = text_measure_key(width, style, registry.revision());
+    let revision = registry.revision();
+    let probe = text_measure_key(width, style, 0);
     if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
         cache
             .borrow()
             .wrapped_height
             .get(content)
-            .and_then(|entries| entries.iter().find(|(cached, _)| *cached == key))
-            .map(|(_, measured)| *measured)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.revision == revision
+                            && text_measure_keys_match_ignoring_font(&entry.key, &probe)
+                    })
+                    .map(|entry| entry.height)
+            })
     }) {
         return measured;
     }
 
+    // An unrelated `@font-face` bumps the global revision without changing
+    // the faces this string uses. Reuse the retained height in that case
+    // instead of storing a second identical measurement.
+    let cascade = registry.cascade_cache_key(style, content);
+    if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entries = cache.wrapped_height.get_mut(content)?;
+        let entry = entries.iter_mut().find(|entry| {
+            entry.key.font == cascade && text_measure_keys_match_ignoring_font(&entry.key, &probe)
+        })?;
+        entry.revision = revision;
+        Some(entry.height)
+    }) {
+        return measured;
+    }
+
+    let key = text_measure_key(width, style, cascade);
     let measured = {
         #[cfg(feature = "skia")]
         {
@@ -3928,7 +3966,11 @@ pub(crate) fn wrapped_text_height(
             .wrapped_height
             .entry(content.to_owned())
             .or_default()
-            .push((key, measured));
+            .push(WrappedTextMeasure {
+                key,
+                revision,
+                height: measured,
+            });
         cache.entries += 1;
     });
     measured
