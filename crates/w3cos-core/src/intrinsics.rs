@@ -601,6 +601,11 @@ pub struct DomFast {
     /// when `epoch` is stale or the runtime refuses, so the caller runs the
     /// ordinary lookup. `tag_atom == u32::MAX` resolves the name.
     pub build_block: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
+    /// Fused create + text + `height` + `flex` + append for a column-flex
+    /// parent of definite uniform rows. `Value::Undefined` when `epoch` is
+    /// stale or the parent/row shape is not that flex list, so the caller
+    /// runs the ordinary lookup.
+    pub build_flex_row: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -854,6 +859,29 @@ pub fn dom_build_block_guarded(
         style_name,
         style_value,
         epoch,
+    )
+}
+
+/// Fused create + textContent + height + flex + appendChild for a column flex
+/// list, or [`Value::Undefined`] when `epoch` is stale or the runtime refuses.
+pub fn dom_build_flex_row_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    height: &str,
+    flex_value: &str,
+    epoch: u64,
+) -> Value {
+    if dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let Some(fast) = DOM_FAST.get() else {
+        return Value::Undefined;
+    };
+    (fast.build_flex_row)(
+        document, parent, tag, tag_atom, text, height, flex_value, epoch,
     )
 }
 

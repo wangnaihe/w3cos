@@ -1502,6 +1502,7 @@ fn ensure_dom_fast() {
         build_appended: fast_build_appended,
         build_guarded: fast_build_guarded,
         build_block: fast_build_block_guarded,
+        build_flex_row: fast_build_flex_row_guarded,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -1770,6 +1771,66 @@ fn fast_build_block_guarded(
     }) else {
         return Value::Undefined;
     };
+    dom::mark_dom_dirty();
+    dom_handle(child)
+}
+
+fn fast_build_flex_row_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    height: &str,
+    flex_value: &str,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !is_document_value(document)
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::has_rules()
+        || node_id_of(parent).is_none()
+        || !valid_element_name(tag)
+    {
+        return Value::Undefined;
+    }
+    let parent_id = node_id_of(parent).expect("parent checked");
+    let lowered;
+    let mut tag_atom = tag_atom;
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
+    let text = text.to_js_string();
+    let Some(child) = dom::with_document_mut(|doc| {
+        doc.append_column_flex_row(
+            w3cos_dom::NodeId::from_u32(parent_id),
+            tag,
+            tag_atom,
+            &text,
+            height,
+            flex_value,
+        )
+        .map(|id| id.as_u32())
+    }) else {
+        return Value::Undefined;
+    };
+    // `el.style.flex` is read from this cache. The declaration stores the
+    // same strings; height also serializes from the typed length.
+    let height_cache = height.trim().to_string();
+    let flex_cache = flex_value.trim().to_string();
+    STYLE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.insert_value(child, "height", height_cache);
+        cache.insert_value(child, "flex", flex_cache);
+    });
     dom::mark_dom_dirty();
     dom_handle(child)
 }
@@ -26747,6 +26808,143 @@ try {
             8.0
         );
         assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+    }
+
+    #[test]
+    fn column_flex_uniform_rows_take_fused_create() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        ensure_dom_fast();
+        seal_dom_shape_baseline();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("display", Value::string("flex"));
+        root_style.set_property("flexDirection", Value::string("column"));
+        assert!(
+            surface_ok(&document, &root, None),
+            "column flex setup must leave the style surface builtin"
+        );
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        for i in 0..8 {
+            let built = w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string(&format!("f {i}")),
+                "18px",
+                "0 0 auto",
+                epoch,
+            );
+            assert!(
+                !built.is_undefined(),
+                "column flex uniform rows must take the fused path"
+            );
+        }
+        let built = root.get_property("childNodes").get_property("0");
+        let built_style = built.get_property("style");
+        let ordinary = document.call_method("createElement", vec![Value::string("div")]);
+        ordinary.set_property("textContent", Value::string("f 0"));
+        let ordinary_style = ordinary.get_property("style");
+        ordinary_style.set_property("height", Value::string("18px"));
+        ordinary_style.set_property("flex", Value::string("0 0 auto"));
+        assert_eq!(built.get_property("textContent").to_js_string(), "f 0");
+        assert_eq!(
+            built_style.get_property("height").to_js_string(),
+            ordinary_style.get_property("height").to_js_string()
+        );
+        assert_eq!(
+            built_style.get_property("flex").to_js_string(),
+            ordinary_style.get_property("flex").to_js_string()
+        );
+        assert_eq!(
+            built_style.get_property("cssText").to_js_string(),
+            ordinary_style.get_property("cssText").to_js_string()
+        );
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            8.0
+        );
+        assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+
+        let block = create_in_body("div");
+        let block_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &block,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "18px",
+                "0 0 auto",
+                block_epoch,
+            )
+            .is_undefined(),
+            "a block parent stays on the ordinary path"
+        );
+        let row_flex = create_in_body("div");
+        row_flex
+            .get_property("style")
+            .set_property("display", Value::string("flex"));
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &row_flex,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "18px",
+                "0 0 auto",
+                w3cos_core::intrinsics::dom_shape_epoch(),
+            )
+            .is_undefined(),
+            "a row flex parent stays on the ordinary path"
+        );
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "18px",
+                "1 0 auto",
+                shape_epoch,
+            )
+            .is_undefined(),
+            "a growing flex item stays on the ordinary path"
+        );
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "auto",
+                "0 0 auto",
+                shape_epoch,
+            )
+            .is_undefined(),
+            "an automatic height stays on the ordinary path"
+        );
+        assert_eq!(
+            block
+                .get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            0.0
+        );
     }
 
     #[test]

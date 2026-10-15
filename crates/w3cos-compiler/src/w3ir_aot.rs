@@ -4151,6 +4151,8 @@ struct StyledBlock {
     tag: String,
     style_name: String,
     style_value: String,
+    /// `flex` value when the row is `style.height` then `style.flex`.
+    flex_value: Option<String>,
     text_expr_at: usize,
     text_expr_end: usize,
     store_at: usize,
@@ -4169,7 +4171,71 @@ fn pure_value_inst(inst: &Instruction) -> bool {
     )
 }
 
+/// One `element.style.name = "value"` with both sides constant.
+///
+/// A miss restores `i` so the caller can parse `appendChild` instead.
+fn take_constant_style(
+    body: &[Instruction],
+    i: &mut usize,
+    element_binding: u32,
+) -> Option<(String, String)> {
+    let saved = *i;
+    let parsed = parse_constant_style(body, i, element_binding);
+    if parsed.is_none() {
+        *i = saved;
+    }
+    parsed
+}
+
+fn parse_constant_style(
+    body: &[Instruction],
+    i: &mut usize,
+    element_binding: u32,
+) -> Option<(String, String)> {
+    let (style_object, style_bind) = load_binding_inst(pull(body, i)?)?;
+    if style_bind != element_binding {
+        return None;
+    }
+    let (style_key_reg, style_key) = load_string_inst(pull(body, i)?)?;
+    if style_key != "style" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: style_dst,
+        object,
+        key,
+    } = pull(body, i)?
+    else {
+        return None;
+    };
+    if object.0 != style_object || key.0 != style_key_reg {
+        return None;
+    }
+    let style_reg = style_dst.0;
+    let (prop_reg, style_name) = load_string_inst(pull(body, i)?)?;
+    let (value_reg, style_value) = load_string_inst(pull(body, i)?)?;
+    if style_name.is_empty() || style_value.is_empty() {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict: _,
+    } = pull(body, i)?
+    else {
+        return None;
+    };
+    if object.0 != style_reg || key.0 != prop_reg || value.0 != value_reg {
+        return None;
+    }
+    Some((style_name, style_value))
+}
+
 /// `createElement` + `textContent` + one constant `style.*` + `appendChild`.
+///
+/// A second assignment `style.height` then `style.flex` is the column-flex
+/// row shape. Any other second property stays on the ordinary lookup.
 fn match_styled_block(body: &[Instruction]) -> Option<StyledBlock> {
     let mut i = 0usize;
     let (document_reg, document_binding) = load_binding_inst(pull(body, &mut i)?)?;
@@ -4276,6 +4342,11 @@ fn match_styled_block(body: &[Instruction]) -> Option<StyledBlock> {
     if object.0 != style_reg || key.0 != prop_reg || value.0 != value_reg {
         return None;
     }
+    let flex_value = match take_constant_style(body, &mut i, element_binding) {
+        Some((name, value)) if style_name == "height" && name == "flex" => Some(value),
+        Some(_) => return None,
+        None => None,
+    };
 
     let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
     let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
@@ -4323,6 +4394,7 @@ fn match_styled_block(body: &[Instruction]) -> Option<StyledBlock> {
         tag,
         style_name,
         style_value,
+        flex_value,
         text_expr_at,
         text_expr_end,
         store_at,
@@ -4401,11 +4473,22 @@ fn emit_guarded_block(
         ],
         &fusion_surface_expr(&suffix, false, &shape.tag),
     );
+    let call = if let Some(flex_value) = &shape.flex_value {
+        format!(
+            "w3cos_core::intrinsics::dom_build_flex_row_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, &self.registers[{text_slot}], {height:?}, {flex_value:?}, __w3cos_dom_epoch_{suffix})",
+            tag = shape.tag,
+            height = shape.style_value,
+        )
+    } else {
+        format!(
+            "w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch_{suffix})",
+            tag = shape.tag,
+            style_name = shape.style_name,
+            style_value = shape.style_value,
+        )
+    };
     let fast = format!(
-        "{open}{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch_{suffix});\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
-        tag = shape.tag,
-        style_name = shape.style_name,
-        style_value = shape.style_value,
+        "{open}{text_expr}let __w3cos_built = {call};\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
     );
     Ok(Some((prelude, fast)))
 }
@@ -8177,6 +8260,87 @@ fn main() {{
                 && generated.contains("\"height\"")
                 && generated.contains(".call_method_slice(\"appendChild\""),
             "ordinary lookup stays on the module fallback: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_column_flex_row_loop_is_guarded() {
+        let source = r#"
+            export {};
+            var FLEX_LIST_NODES = 400;
+            function runFlexList() {
+                var root = document.createElement("div");
+                root.style.display = "flex";
+                root.style.flexDirection = "column";
+                document.body.appendChild(root);
+                for (var i = 0; i < FLEX_LIST_NODES; i++) {
+                    var el = document.createElement("div");
+                    el.textContent = "f " + (i % 20);
+                    el.style.height = "18px";
+                    el.style.flex = "0 0 auto";
+                    root.appendChild(el);
+                }
+                return root.offsetHeight;
+            }
+        "#;
+        let module = crate::w3ir_lowering::lower_module(source, "app:///flex-list.mjs").unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("runFlexList"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "flex_list_aot").unwrap();
+        assert_fused_after_gate(&generated, "dom_build_flex_row_guarded");
+        assert!(
+            generated.contains("\"18px\"")
+                && generated.contains("\"0 0 auto\"")
+                && generated.contains(".call_method_slice(\"createElement\"")
+                && generated.contains("set_property_strict(")
+                && generated.contains("\"textContent\"")
+                && generated.contains("\"height\"")
+                && generated.contains("\"flex\"")
+                && generated.contains(".call_method_slice(\"appendChild\""),
+            "ordinary lookup stays on the flex-list fallback: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_block_guarded"),
+            "a second style is not the single-property block path: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_two_style_block_stays_unfused() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                function fill(document, root) {
+                    for (var i = 0; i < 400; i++) {
+                        var el = document.createElement("div");
+                        el.textContent = "m " + (i % 50);
+                        el.style.height = "18px";
+                        el.style.width = "40px";
+                        root.appendChild(el);
+                    }
+                    return root;
+                }
+                fill;
+            "#,
+            "app:///two-style.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("fill"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "two_style_aot").unwrap();
+        assert!(
+            !generated.contains("dom_build_flex_row_guarded")
+                && !generated.contains("dom_build_block_guarded")
+                && !generated.contains("dom_build_guarded"),
+            "height plus width stays on the ordinary lookup: {generated}"
         );
     }
 
