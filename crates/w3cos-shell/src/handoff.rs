@@ -9,8 +9,6 @@ use std::cell::RefCell;
 use std::net::UdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -39,12 +37,6 @@ impl DeviceKey {
 
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.public)
-    }
-
-    fn shared_with(&self, peer_public: &[u8; 32]) -> [u8; 32] {
-        let secret = StaticSecret::from(self.secret);
-        let peer = PublicKey::from(*peer_public);
-        secret.diffie_hellman(&peer).to_bytes()
     }
 }
 
@@ -92,11 +84,19 @@ pub struct SyncPayload {
     pub receipts: Vec<String>,
     pub draft: String,
     pub path: String,
+    /// Present only when clipboard sync was explicitly opted in.
+    pub clipboard: Option<String>,
 }
 
 impl SyncPayload {
     /// An already executed confirmation is not copied. Geometry is not a field.
-    pub fn from_local(receipts: Vec<String>, draft: &str, path: &str, executed: bool) -> Self {
+    pub fn from_local(
+        receipts: Vec<String>,
+        draft: &str,
+        path: &str,
+        executed: bool,
+        clipboard: Option<&str>,
+    ) -> Self {
         Self {
             receipts,
             draft: if executed {
@@ -105,16 +105,25 @@ impl SyncPayload {
                 draft.to_string()
             },
             path: path.to_string(),
+            clipboard: clipboard.and_then(nonempty_clipboard),
         }
     }
 
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(b"w3sync1\n");
+        if self.clipboard.is_some() {
+            out.extend_from_slice(b"w3sync2\n");
+        } else {
+            out.extend_from_slice(b"w3sync1\n");
+        }
         out.extend_from_slice(self.path.as_bytes());
         out.extend_from_slice(b"\n");
         out.extend_from_slice(self.draft.as_bytes());
         out.extend_from_slice(b"\n");
+        if let Some(clipboard) = &self.clipboard {
+            out.extend_from_slice(clipboard.as_bytes());
+            out.extend_from_slice(b"\n");
+        }
         for line in &self.receipts {
             out.extend_from_slice(line.as_bytes());
             out.extend_from_slice(b"\n");
@@ -125,11 +134,16 @@ impl SyncPayload {
     fn decode(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
-        if lines.next()? != "w3sync1" {
-            return None;
-        }
+        let version = lines.next()?;
         let path = lines.next()?.to_string();
         let draft = lines.next()?.to_string();
+        let clipboard = if version == "w3sync2" {
+            Some(lines.next()?.to_string()).and_then(|text| nonempty_clipboard(&text))
+        } else if version == "w3sync1" {
+            None
+        } else {
+            return None;
+        };
         let receipts = lines
             .map(str::to_string)
             .filter(|line| !line.is_empty())
@@ -138,24 +152,26 @@ impl SyncPayload {
             receipts,
             draft,
             path,
+            clipboard,
         })
     }
 }
 
-pub fn seal(local: &DeviceKey, peer_public: &[u8; 32], payload: &SyncPayload) -> Option<Vec<u8>> {
-    let key = local.shared_with(peer_public);
-    if key == [0; 32] {
-        return None;
+fn nonempty_clipboard(text: &str) -> Option<String> {
+    let flat = text.replace(['\n', '\r'], " ");
+    let trimmed = flat.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).ok()?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher_text = cipher.encrypt(nonce, payload.encode().as_slice()).ok()?;
-    let mut out = Vec::with_capacity(12 + cipher_text.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&cipher_text);
-    Some(out)
+}
+
+pub fn seal(local: &DeviceKey, peer_public: &[u8; 32], payload: &SyncPayload) -> Option<Vec<u8>> {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).ok()?;
+    let plain = payload.encode();
+    crate::hpke::seal(peer_public, &local.public_bytes(), &plain, seed)
 }
 
 pub fn open_sealed(
@@ -163,14 +179,7 @@ pub fn open_sealed(
     peer_public: &[u8; 32],
     sealed: &[u8],
 ) -> Option<SyncPayload> {
-    if sealed.len() < 12 + 16 {
-        return None;
-    }
-    let key = local.shared_with(peer_public);
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let (nonce_bytes, cipher_text) = sealed.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let plain = cipher.decrypt(nonce, cipher_text).ok()?;
+    let plain = crate::hpke::open(&local.secret, peer_public, sealed)?;
     SyncPayload::decode(&plain)
 }
 
@@ -203,8 +212,10 @@ struct Store {
     incoming_path: String,
     incoming_draft: String,
     incoming_from: String,
+    incoming_clipboard: Option<String>,
     sync_receipts: bool,
     sync_drafts: bool,
+    sync_clipboard: bool,
     listener: bool,
 }
 
@@ -220,8 +231,10 @@ impl Store {
             incoming_path: String::new(),
             incoming_draft: String::new(),
             incoming_from: String::new(),
+            incoming_clipboard: None,
             sync_receipts: false,
             sync_drafts: false,
+            sync_clipboard: false,
             listener: false,
         }
     }
@@ -387,6 +400,7 @@ pub fn codes_match() -> bool {
         store.phase = Phase::ChooseSync;
         store.sync_receipts = false;
         store.sync_drafts = false;
+        store.sync_clipboard = false;
         store.notice = "pair-trusted".to_string();
         true
     })
@@ -398,6 +412,15 @@ pub fn allow_receipt_sync() {
 
 pub fn allow_draft_sync() {
     STORE.with(|slot| slot.borrow_mut().sync_drafts = true);
+}
+
+/// Clipboard leaves the device only after this is called. It starts off.
+pub fn allow_clipboard_sync() {
+    STORE.with(|slot| slot.borrow_mut().sync_clipboard = true);
+}
+
+pub fn clipboard_sync_enabled() -> bool {
+    STORE.with(|slot| slot.borrow().sync_clipboard)
 }
 
 pub fn hide_banner() {
@@ -415,6 +438,7 @@ pub fn begin_send(
     draft: &str,
     path: &str,
     executed: bool,
+    clipboard: Option<&str>,
 ) -> Option<Vec<u8>> {
     STORE.with(|slot| {
         let mut store = slot.borrow_mut();
@@ -428,6 +452,11 @@ pub fn begin_send(
             if store.sync_drafts { draft } else { "" },
             path,
             executed,
+            if store.sync_clipboard {
+                clipboard
+            } else {
+                None
+            },
         );
         let sealed = seal(&store.local, &peer.public, &payload)?;
         store.phase = Phase::Sending;
@@ -462,6 +491,7 @@ pub fn receive_sealed(peer_public: &[u8; 32], from: &str, sealed: &[u8]) -> bool
         store.incoming_from = from.to_string();
         store.incoming_path = payload.path;
         store.incoming_draft = payload.draft;
+        store.incoming_clipboard = payload.clipboard;
         store.phase = Phase::Incoming;
         store.notice = "handoff-incoming".to_string();
     });
@@ -535,7 +565,11 @@ pub fn ensure_listener() {
                 let changed = if bytes.starts_with(b"W3COS1") {
                     std::str::from_utf8(bytes).is_ok_and(|text| note_announcement(text, now_unix()))
                 } else if let Some(sealed) = bytes.strip_prefix(b"W3COS2") {
-                    accept_sealed(sealed)
+                    let accepted = accept_sealed(sealed);
+                    if accepted {
+                        publish_incoming_clipboard();
+                    }
+                    accepted
                 } else {
                     false
                 };
@@ -550,6 +584,191 @@ pub fn ensure_listener() {
             }
         }
     });
+    std::thread::spawn(mdns_loop);
+}
+
+const MDNS_SERVICE: &str = "_w3cos._udp.local";
+
+/// Unsolicited mDNS TXT for `_w3cos._udp.local`. The TXT is the UDP announcement.
+pub fn mdns_announce(announcement: &str) -> Vec<u8> {
+    let mut answer = Vec::new();
+    write_dns_name(&mut answer, MDNS_SERVICE);
+    answer.extend_from_slice(&16u16.to_be_bytes());
+    answer.extend_from_slice(&1u16.to_be_bytes());
+    answer.extend_from_slice(&90u32.to_be_bytes());
+    let rdata = txt_rdata(announcement);
+    answer.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    answer.extend_from_slice(&rdata);
+    let mut packet = Vec::with_capacity(12 + answer.len());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0x8400u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&answer);
+    packet
+}
+
+pub fn mdns_announcement_text(packet: &[u8]) -> Option<String> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]);
+    let mut offset = 12usize;
+    for _ in 0..qdcount {
+        skip_dns_name(packet, &mut offset)?;
+        offset = offset.checked_add(4)?;
+    }
+    for _ in 0..ancount {
+        let name = read_dns_name(packet, &mut offset)?;
+        if offset + 10 > packet.len() {
+            return None;
+        }
+        let typ = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let rdlen = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+        offset += 10;
+        if offset + rdlen > packet.len() {
+            return None;
+        }
+        let rdata = &packet[offset..offset + rdlen];
+        offset += rdlen;
+        if name.eq_ignore_ascii_case(MDNS_SERVICE) && typ == 16 {
+            return txt_text(rdata);
+        }
+    }
+    None
+}
+
+fn mdns_loop() {
+    use std::net::Ipv4Addr;
+    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 5353)) else {
+        return;
+    };
+    let group = Ipv4Addr::new(224, 0, 0, 251);
+    let _ = socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED);
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(400)));
+    let mut buf = [0u8; 2048];
+    let mut ticks = 0u32;
+    loop {
+        ticks = ticks.wrapping_add(1);
+        if let Ok((size, _)) = socket.recv_from(&mut buf)
+            && let Some(text) = mdns_announcement_text(&buf[..size])
+            && note_announcement(&text, now_unix())
+        {
+            w3cos_runtime::state::mark_dirty();
+            w3cos_runtime::uitest::poke_event_loop();
+        }
+        if ticks % 5 == 0 {
+            let packet = mdns_announce(&announcement("live", now_unix() + CODE_TTL_SECS));
+            let _ = socket.send_to(&packet, (group, 5353));
+        }
+    }
+}
+
+fn write_dns_name(out: &mut Vec<u8>, name: &str) {
+    for label in name.split('.') {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+}
+
+fn txt_rdata(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + 255).min(bytes.len());
+        let chunk = &bytes[offset..end];
+        out.push(chunk.len() as u8);
+        out.extend_from_slice(chunk);
+        offset = end;
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out
+}
+
+fn txt_text(rdata: &[u8]) -> Option<String> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < rdata.len() {
+        let len = rdata[offset] as usize;
+        offset += 1;
+        if offset + len > rdata.len() {
+            return None;
+        }
+        out.extend_from_slice(&rdata[offset..offset + len]);
+        offset += len;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn skip_dns_name(packet: &[u8], offset: &mut usize) -> Option<()> {
+    read_dns_name(packet, offset).map(|_| ())
+}
+
+fn read_dns_name(packet: &[u8], offset: &mut usize) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut cursor = *offset;
+    let mut jumped = false;
+    for _ in 0..16 {
+        if cursor >= packet.len() {
+            return None;
+        }
+        let len = packet[cursor];
+        if len == 0 {
+            if !jumped {
+                *offset = cursor + 1;
+            }
+            return Some(labels.join("."));
+        }
+        if len & 0xc0 == 0xc0 {
+            if cursor + 1 >= packet.len() {
+                return None;
+            }
+            let pointer = (usize::from(len & 0x3f) << 8) | usize::from(packet[cursor + 1]);
+            if !jumped {
+                *offset = cursor + 2;
+                jumped = true;
+            }
+            cursor = pointer;
+            continue;
+        }
+        cursor += 1;
+        let end = cursor + usize::from(len);
+        if end > packet.len() {
+            return None;
+        }
+        labels.push(std::str::from_utf8(&packet[cursor..end]).ok()?.to_string());
+        cursor = end;
+        if !jumped {
+            *offset = cursor;
+        }
+    }
+    None
+}
+
+fn publish_incoming_clipboard() {
+    let Some(text) = STORE.with(|slot| slot.borrow_mut().incoming_clipboard.take()) else {
+        return;
+    };
+    write_system_clipboard(&text);
+}
+
+fn write_system_clipboard(text: &str) {
+    if let Ok(mut child) = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        use std::io::Write;
+        let _ = stdin.write_all(text.as_bytes());
+    }
 }
 
 fn send_sealed(bytes: &[u8]) -> bool {
@@ -643,8 +862,10 @@ mod tests {
             "打开文件",
             "/docs/notes.txt",
             true,
+            None,
         );
         assert!(payload.draft.is_empty());
+        assert!(payload.clipboard.is_none());
         let encoded = String::from_utf8(payload.encode()).unwrap();
         assert!(!encoded.contains("window"));
         assert!(!encoded.contains("maximize"));
@@ -675,11 +896,62 @@ mod tests {
     fn receiving_a_payload_does_not_mark_it_executed() {
         let local = DeviceKey::from_seed([4; 32]);
         let peer = DeviceKey::from_seed([5; 32]);
-        let payload = SyncPayload::from_local(Vec::new(), "打开夜间模式", "/docs/a.txt", false);
+        let payload =
+            SyncPayload::from_local(Vec::new(), "打开夜间模式", "/docs/a.txt", false, None);
+        assert!(payload.clipboard.is_none());
         let sealed = seal(&peer, &local.public_bytes(), &payload).unwrap();
         // The store's key is random, so open with the explicit keys here.
         let opened = open_sealed(&local, &peer.public_bytes(), &sealed).unwrap();
         assert_eq!(opened.draft, "打开夜间模式");
         assert_ne!(opened.draft, "executed");
+        assert!(opened.clipboard.is_none());
+    }
+
+    #[test]
+    fn clipboard_is_absent_until_the_sender_opts_in() {
+        let plain = SyncPayload::from_local(Vec::new(), "打开文件", "/docs/a.txt", false, None);
+        let encoded = String::from_utf8(plain.encode()).unwrap();
+        assert!(encoded.starts_with("w3sync1\n"));
+        assert!(!encoded.contains("clip-secret"));
+        let with = SyncPayload::from_local(
+            Vec::new(),
+            "打开文件",
+            "/docs/a.txt",
+            false,
+            Some("  clip-secret \n"),
+        );
+        assert_eq!(with.clipboard.as_deref(), Some("clip-secret"));
+        let encoded = with.encode();
+        let text = String::from_utf8(encoded.clone()).unwrap();
+        assert!(text.starts_with("w3sync2\n"));
+        let opened = SyncPayload::decode(&encoded).unwrap();
+        assert_eq!(opened.clipboard.as_deref(), Some("clip-secret"));
+        assert_eq!(opened.draft, "打开文件");
+        let blank = SyncPayload::from_local(Vec::new(), "d", "/p", false, Some("  \n"));
+        assert!(blank.clipboard.is_none());
+        assert!(
+            String::from_utf8(blank.encode())
+                .unwrap()
+                .starts_with("w3sync1\n")
+        );
+        assert!(!clipboard_sync_enabled());
+        allow_clipboard_sync();
+        assert!(clipboard_sync_enabled());
+    }
+
+    #[test]
+    fn mdns_txt_roundtrips_the_udp_announcement() {
+        let peer = DeviceKey::from_seed([6; 32]);
+        let text = format!(
+            "W3COS1\t手机\t{}\t{}\tnonce\t{}",
+            peer.fingerprint(),
+            hex_key(&peer.public_bytes()),
+            now_unix() + 30
+        );
+        let packet = mdns_announce(&text);
+        let recovered = mdns_announcement_text(&packet).expect("txt");
+        assert_eq!(recovered, text);
+        assert!(note_announcement(&recovered, now_unix()));
+        assert!(peers().iter().any(|item| item.name == "手机"));
     }
 }

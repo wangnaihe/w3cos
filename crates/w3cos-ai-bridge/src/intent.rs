@@ -438,12 +438,16 @@ impl IntentSession {
         true
     }
 
-    pub fn unlock_identity_stub(&mut self, assertion: &str) -> bool {
-        let unlocked = self.identity.unlock_with_passkey_stub(assertion);
+    pub fn unlock_with_passphrase(&mut self, passphrase: &str) -> bool {
+        let unlocked = self.identity.unlock_with_passphrase(passphrase);
         if unlocked {
             self.persist();
         }
         unlocked
+    }
+
+    pub fn unlock_identity_stub(&mut self, assertion: &str) -> bool {
+        self.unlock_with_passphrase(assertion)
     }
 
     pub fn revoke_context(&mut self) {
