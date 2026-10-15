@@ -224,8 +224,10 @@ decision-denied = 拒绝
 decision-cancelled = 取消
 decision-unrecognized = 未识别
 receipt-empty-long = 还没有收据。你确认并执行之后，每一条会出现在这里。取消和拒绝也会留下。
-win-maximize = []
-win-restore = 回
+win-minimize = 最小化
+win-maximize = 最大化
+win-restore = 还原
+win-close = 关闭
 
 browser-tagline = 面向 AI 的本机操作系统
 browser-welcome = 欢迎使用 W3C OS 浏览器

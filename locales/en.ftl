@@ -225,8 +225,10 @@ decision-denied = Refused
 decision-cancelled = Cancelled
 decision-unrecognized = Unrecognized
 receipt-empty-long = No receipts yet. After you confirm and run something, each line shows up here. Cancels and refusals stay too.
-win-maximize = []
-win-restore = R
+win-minimize = Minimize
+win-maximize = Maximize
+win-restore = Restore
+win-close = Close
 
 browser-tagline = The AI-native operating system
 browser-welcome = Welcome to the W3C OS browser

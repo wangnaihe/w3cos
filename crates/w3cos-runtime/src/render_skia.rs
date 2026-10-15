@@ -2744,7 +2744,9 @@ fn render_node_with_applied_decorations(
             }
         }
         ComponentKind::Button { label } => {
-            draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
+            if style.color.a > 0 {
+                draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
+            }
         }
         ComponentKind::TextInput {
             value,
