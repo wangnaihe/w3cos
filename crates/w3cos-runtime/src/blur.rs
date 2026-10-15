@@ -66,6 +66,22 @@ pub fn blur_alpha(alpha: &mut [u8], width: u32, height: u32, sigma: f32, edge: B
     if kernel_radius(sigma) == 0 || width == 0 || height == 0 {
         return;
     }
+    // Large σ is low-frequency. Blurring a 2× or 4× smaller plane keeps the
+    // same shape and cuts the separable pass by roughly scale² × scale.
+    let scale = downsample_scale(sigma);
+    if scale == 1 {
+        blur_alpha_full(alpha, width, height, sigma, edge);
+        return;
+    }
+    let (small_w, small_h, mut small) = downsample_plane(alpha, width, height, scale);
+    blur_alpha_full(&mut small, small_w, small_h, sigma / scale as f32, edge);
+    upsample_plane(&small, small_w, small_h, alpha, width, height, scale);
+}
+
+fn blur_alpha_full(alpha: &mut [u8], width: u32, height: u32, sigma: f32, edge: BlurEdge) {
+    if kernel_radius(sigma) == 0 || width == 0 || height == 0 {
+        return;
+    }
     let n = (width as usize).saturating_mul(height as usize);
     if alpha.len() < n {
         return;
@@ -88,6 +104,151 @@ pub fn blur_alpha(alpha: &mut [u8], width: u32, height: u32, sigma: f32, edge: B
 
 /// Blur premultiplied RGBA in place (`pixels.len()` is `width * height * 4`).
 pub fn blur_premultiplied(pixels: &mut [u8], width: u32, height: u32, sigma: f32, edge: BlurEdge) {
+    if kernel_radius(sigma) == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let scale = downsample_scale(sigma);
+    if scale == 1 {
+        blur_premultiplied_full(pixels, width, height, sigma, edge);
+        return;
+    }
+    let (small_w, small_h, mut small) = downsample_rgba(pixels, width, height, scale);
+    blur_premultiplied_full(&mut small, small_w, small_h, sigma / scale as f32, edge);
+    upsample_rgba(&small, small_w, small_h, pixels, width, height, scale);
+}
+
+fn downsample_scale(sigma: f32) -> u32 {
+    if sigma >= 16.0 {
+        4
+    } else if sigma >= 8.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn downsample_plane(src: &[u8], width: u32, height: u32, scale: u32) -> (u32, u32, Vec<u8>) {
+    let small_w = width.div_ceil(scale).max(1);
+    let small_h = height.div_ceil(scale).max(1);
+    let mut dst = vec![0_u8; (small_w * small_h) as usize];
+    for y in 0..small_h {
+        for x in 0..small_w {
+            let mut sum = 0_u32;
+            let mut count = 0_u32;
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let sx = x * scale + dx;
+                    let sy = y * scale + dy;
+                    if sx < width && sy < height {
+                        sum += u32::from(src[(sy * width + sx) as usize]);
+                        count += 1;
+                    }
+                }
+            }
+            dst[(y * small_w + x) as usize] = (sum / count.max(1)) as u8;
+        }
+    }
+    (small_w, small_h, dst)
+}
+
+fn upsample_plane(
+    src: &[u8],
+    small_w: u32,
+    small_h: u32,
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+    scale: u32,
+) {
+    for y in 0..height {
+        let fy = (y as f32 + 0.5) / scale as f32 - 0.5;
+        let y0 = fy.floor().clamp(0.0, small_h as f32 - 1.0);
+        let y1 = (y0 + 1.0).min(small_h as f32 - 1.0);
+        let ty = fy - y0;
+        for x in 0..width {
+            let fx = (x as f32 + 0.5) / scale as f32 - 0.5;
+            let x0 = fx.floor().clamp(0.0, small_w as f32 - 1.0);
+            let x1 = (x0 + 1.0).min(small_w as f32 - 1.0);
+            let tx = fx - x0;
+            let index = (y * width + x) as usize;
+            let sample =
+                |sx: f32, sy: f32| f32::from(src[(sy as u32 * small_w + sx as u32) as usize]);
+            let value = sample(x0, y0) * (1.0 - tx) * (1.0 - ty)
+                + sample(x1, y0) * tx * (1.0 - ty)
+                + sample(x0, y1) * (1.0 - tx) * ty
+                + sample(x1, y1) * tx * ty;
+            dst[index] = value.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn downsample_rgba(src: &[u8], width: u32, height: u32, scale: u32) -> (u32, u32, Vec<u8>) {
+    let small_w = width.div_ceil(scale).max(1);
+    let small_h = height.div_ceil(scale).max(1);
+    let mut dst = vec![0_u8; (small_w * small_h * 4) as usize];
+    for y in 0..small_h {
+        for x in 0..small_w {
+            let mut sum = [0_u32; 4];
+            let mut count = 0_u32;
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let sx = x * scale + dx;
+                    let sy = y * scale + dy;
+                    if sx < width && sy < height {
+                        let index = ((sy * width + sx) * 4) as usize;
+                        for channel in 0..4 {
+                            sum[channel] += u32::from(src[index + channel]);
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            let index = ((y * small_w + x) * 4) as usize;
+            for channel in 0..4 {
+                dst[index + channel] = (sum[channel] / count.max(1)) as u8;
+            }
+        }
+    }
+    (small_w, small_h, dst)
+}
+
+fn upsample_rgba(
+    src: &[u8],
+    small_w: u32,
+    small_h: u32,
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+    scale: u32,
+) {
+    for y in 0..height {
+        let fy = (y as f32 + 0.5) / scale as f32 - 0.5;
+        let y0 = fy.floor().clamp(0.0, small_h as f32 - 1.0);
+        let y1 = (y0 + 1.0).min(small_h as f32 - 1.0);
+        let ty = fy - y0;
+        for x in 0..width {
+            let fx = (x as f32 + 0.5) / scale as f32 - 0.5;
+            let x0 = fx.floor().clamp(0.0, small_w as f32 - 1.0);
+            let x1 = (x0 + 1.0).min(small_w as f32 - 1.0);
+            let tx = fx - x0;
+            let index = ((y * width + x) * 4) as usize;
+            for channel in 0..4 {
+                let sample = |sx: f32, sy: f32| -> f32 {
+                    f32::from(
+                        src[((sy as u32 * small_w + sx as u32) * 4 + channel as u32) as usize],
+                    )
+                };
+                let value = sample(x0, y0) * (1.0 - tx) * (1.0 - ty)
+                    + sample(x1, y0) * tx * (1.0 - ty)
+                    + sample(x0, y1) * (1.0 - tx) * ty
+                    + sample(x1, y1) * tx * ty;
+                dst[index + channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+fn blur_premultiplied_full(pixels: &mut [u8], width: u32, height: u32, sigma: f32, edge: BlurEdge) {
     if kernel_radius(sigma) == 0 || width == 0 || height == 0 {
         return;
     }
@@ -479,6 +640,33 @@ mod tests {
         assert_eq!(alpha_at(rect.x - 2.0, rect.y + 8.0), 0);
         assert!(alpha_at(rect.x + 2.0, rect.y + 8.0) > 0);
         assert!(alpha_at(rect.x + 20.0, rect.y + 20.0) < alpha_at(rect.x + 2.0, rect.y + 8.0));
+    }
+
+    #[test]
+    fn dock_sized_backdrop_and_window_shadow_stay_interactive() {
+        let mut backdrop = vec![80_u8; 1200 * 120 * 4];
+        let backdrop_started = std::time::Instant::now();
+        blur_premultiplied(&mut backdrop, 1200, 120, 18.0, BlurEdge::Clamp);
+        let backdrop_elapsed = backdrop_started.elapsed();
+        let rect = LayoutRect {
+            x: 40.0,
+            y: 40.0,
+            width: 640.0,
+            height: 400.0,
+        };
+        let shadow = BoxShadow::new(0.0, 24.0, 60.0, 0.0, Color::rgba(0, 0, 0, 115));
+        let shadow_started = std::time::Instant::now();
+        let sprite = raster_box_shadow(rect, 14.0, &shadow).expect("window shadow");
+        let shadow_elapsed = shadow_started.elapsed();
+        assert!(
+            backdrop_elapsed.as_millis() < 750,
+            "backdrop {backdrop_elapsed:?}"
+        );
+        assert!(
+            shadow_elapsed.as_millis() < 750,
+            "shadow {shadow_elapsed:?}"
+        );
+        assert!(sprite.pixels.iter().any(|pixel| *pixel > 0));
     }
 
     #[test]
