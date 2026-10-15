@@ -4390,21 +4390,19 @@ fn prototype_chain_has_authored_lifecycle(mut prototype: Value) -> bool {
         let Some(object) = prototype.as_object() else {
             return false;
         };
-        let (observable, next) = {
+        let next = {
             let object = object.borrow();
             // Do not run an authored Proxy trap before the DOM mutation. The
             // normal lifecycle walk will perform the authoritative lookup
             // with the real wrapper as receiver after detach.
-            (
-                object.is_proxy()
-                    || object.has_own_property("__w3cos_custom_element_upgraded")
-                    || object.has_own_property("disconnectedCallback"),
-                object.get_prototype_of(),
-            )
+            if object.is_proxy()
+                || object.has_own_property("__w3cos_custom_element_upgraded")
+                || object.has_own_property("disconnectedCallback")
+            {
+                return true;
+            }
+            object.get_prototype_of()
         };
-        if observable {
-            return true;
-        }
         if next.is_null() || next.is_undefined() {
             return false;
         }
@@ -21977,6 +21975,107 @@ mod tests {
             nodes.iter().all(|node| memoized_element(*node).is_none()),
             "an empty registry must not materialize any node in a fresh removed subtree"
         );
+    }
+
+    #[test]
+    fn lifecycle_proxy_get_runs_only_after_detach_with_exact_receiver() {
+        setup();
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let observations = Rc::new(RefCell::new(Vec::<(String, u32, bool)>::new()));
+        let observations_cb = Rc::clone(&observations);
+        let callback = Value::function(move |_, _| {
+            calls_cb.set(calls_cb.get() + 1);
+            Value::Undefined
+        });
+        let callback_cb = callback.clone();
+        let second = doc.call_method("createElement", vec![Value::string("span")]);
+        let expected_node = node_id_of(&second).unwrap();
+        body.call_method("appendChild", vec![second.clone()]);
+        let handler = ProxyBuilder::new()
+            .get(move |_, key, receiver| {
+                let receiver_node =
+                    node_id_of(receiver).expect("receiver must be the target DOM node");
+                observations_cb.borrow_mut().push((
+                    key.to_string(),
+                    receiver_node,
+                    dom::is_connected(receiver_node),
+                ));
+                match key {
+                    "__w3cos_custom_element_upgraded" => Value::Bool(true),
+                    "disconnectedCallback" => callback_cb.clone(),
+                    _ => Value::Undefined,
+                }
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        w3cos_core::class::set_prototype_of(&second, &proxy);
+        body.call_method("removeChild", vec![second]);
+        assert_eq!(calls.get(), 1, "observations={:?}", observations.borrow());
+        assert!(
+            !observations.borrow().is_empty(),
+            "authoritative lookup must reach Proxy"
+        );
+        assert!(
+            observations
+                .borrow()
+                .iter()
+                .all(|(_, node, connected)| *node == expected_node && !connected),
+            "all get traps must run after detach with the exact removed node receiver"
+        );
+    }
+
+    #[test]
+    fn lifecycle_guard_never_runs_proxy_get_prototype_of_trap() {
+        struct PrototypeRestore {
+            object: Value,
+            prototype: Value,
+        }
+
+        impl Drop for PrototypeRestore {
+            fn drop(&mut self) {
+                w3cos_core::class::set_prototype_of(&self.object, &self.prototype);
+            }
+        }
+
+        setup();
+        let node = dom::create_element("span");
+        dom::append_child(dom::body_id(), node);
+        assert!(
+            memoized_element(node).is_none(),
+            "test must exercise the prototype scan"
+        );
+        let traps = Rc::new(Cell::new(0u32));
+        let traps_cb = Rc::clone(&traps);
+        let handler = ProxyBuilder::new()
+            .get_prototype_of(move |_| {
+                traps_cb.set(traps_cb.get() + 1);
+                Value::Null
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        let shared = crate::dom_constructors::prototype("HTMLElement");
+        let old_parent = w3cos_core::class::get_prototype_of(&shared);
+        w3cos_core::class::set_prototype_of(&shared, &proxy);
+        let _restore = PrototypeRestore {
+            object: shared.clone(),
+            prototype: old_parent,
+        };
+        assert!(disconnected_lifecycle_may_be_observable(node));
+        assert_eq!(
+            traps.get(),
+            0,
+            "detach guard must not run authored Proxy traps"
+        );
+        dom::remove_child(dom::body_id(), node);
     }
 
     #[test]
