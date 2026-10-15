@@ -6623,7 +6623,7 @@ fn draw_skia_backdrop(canvas: &Canvas, rect: LayoutRect, radius: f32, sigma: f32
     } else {
         canvas.clip_rect(bounds, None, Some(false));
     }
-    canvas.save_layer(SaveLayerRec::default().backdrop(&filter).bounds(&bounds));
+    canvas.save_layer(&SaveLayerRec::default().backdrop(&filter).bounds(&bounds));
     canvas.restore();
     canvas.restore_to_count(save);
 }
