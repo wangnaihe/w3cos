@@ -1676,7 +1676,7 @@ const RESIDENT_APPS: [ResidentApp; 5] = [
     ResidentApp {
         id: 3,
         glyph: "settings",
-        color: "#9b59b6",
+        color: "#d4a017",
     },
     ResidentApp {
         id: 5,
@@ -2545,7 +2545,7 @@ fn build_tablet_rail() -> Component {
         "grid",
         String::new(),
         OP_LAUNCHER,
-        "#5b4fe0",
+        "#1c8f62",
         48.0,
     )];
     for app in RESIDENT_APPS {
@@ -3597,7 +3597,7 @@ fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
                 icon,
                 Style {
                     font_size: 12.0,
-                    color: Color::from_hex("#6c5ce7"),
+                    color: Color::from_hex("#1c8f62"),
                     ..Style::default()
                 },
             ),
@@ -3726,7 +3726,7 @@ fn build_settings_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar(locale::t("app-settings"), "#5b4fe0", 3),
+            app_titlebar(locale::t("app-settings"), "#d4a017", 3),
             Component::row(
                 Style {
                     flex_grow: 1.0,
@@ -4654,7 +4654,7 @@ fn build_browser_app() -> Component {
                         "W3C OS",
                         Style {
                             font_size: 48.0,
-                            color: Color::from_hex("#6c5ce7"),
+                            color: Color::from_hex("#1c8f62"),
                             font_weight: 700,
                             ..Style::default()
                         },
@@ -4703,7 +4703,7 @@ fn build_browser_app() -> Component {
                                     Component::button(
                                         locale::t("browser-start"),
                                         Style {
-                                            background: Color::from_hex("#6c5ce7"),
+                                            background: Color::from_hex("#1c8f62"),
                                             border_radius: 8.0,
                                             font_size: 14.0,
                                             color: Color::WHITE,
@@ -5032,7 +5032,7 @@ fn build_editor_app() -> Component {
             Component::row(
                 Style {
                     height: Dimension::Px(24.0),
-                    background: Color::from_hex("#6c5ce7"),
+                    background: Color::from_hex("#1c8f62"),
                     padding: Edges::xy(12.0, 4.0),
                     gap: 16.0,
                     align_items: AlignItems::Center,
@@ -5089,7 +5089,7 @@ fn build_editor_app() -> Component {
 fn editor_tab(name: &str, active: bool) -> Component {
     let bg = if active { "#1e1e2e" } else { "#14142a" };
     let color = if active { "#e0e0f0" } else { "#606080" };
-    let border_color = if active { "#6c5ce7" } else { "#14142a" };
+    let border_color = if active { "#1c8f62" } else { "#14142a" };
     Component::column(
         Style {
             padding: Edges::xy(14.0, 8.0),
@@ -5131,7 +5131,7 @@ fn explorer_item(name: &str, indent: u8, is_dir: bool) -> Component {
                 icon,
                 Style {
                     font_size: 12.0,
-                    color: Color::from_hex("#6c5ce7"),
+                    color: Color::from_hex("#1c8f62"),
                     ..Style::default()
                 },
             ),
@@ -5314,7 +5314,7 @@ const LAUNCH_APPS: [LaunchApp; 6] = [
         id: 0,
         letter: "D",
         glyph: "grid",
-        color: "#6c5ce7",
+        color: "#1c8f62",
     },
     LaunchApp {
         id: 1,
@@ -5332,7 +5332,7 @@ const LAUNCH_APPS: [LaunchApp; 6] = [
         id: 3,
         letter: "S",
         glyph: "settings",
-        color: "#9b59b6",
+        color: "#d4a017",
     },
     LaunchApp {
         id: 5,
@@ -5413,7 +5413,7 @@ fn build_launcher() -> Component {
                 Component::button_with_click(
                     locale::t("launcher-search"),
                     Style {
-                        background: Color::from_hex("#5b4fe0"),
+                        background: Color::from_hex("#1c8f62"),
                         border_radius: 8.0,
                         font_size: 13.0,
                         font_weight: 700,
@@ -6232,6 +6232,26 @@ mod shell_ux_tests {
         assert!(!desktop.contains("--w3cos-softkey"));
         state::clear_ime_field();
         ime_bar::sync_field_presence();
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn chrome_accents_are_not_indigo() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        state::note_shell_viewport(768.0, 1024.0);
+        let rail = format!("{:?}", build_tablet_rail());
+        let launcher = format!("{:?}", build_launcher());
+        let settings = format!("{:?}", build_settings_app());
+        for (name, dumped) in [
+            ("rail", rail),
+            ("launcher", launcher),
+            ("settings", settings),
+        ] {
+            for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+                assert!(!dumped.contains(hex), "{name} still uses {hex}");
+            }
+        }
         state::note_shell_viewport(1200.0, 800.0);
     }
 
