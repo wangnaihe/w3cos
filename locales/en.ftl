@@ -283,3 +283,6 @@ ime-mode-pinyin = 拼
 ime-mode-direct = EN
 ime-preedit = { $spelling }
 ime-candidate = { $n } { $text }
+kbd-space = space
+kbd-backspace = del
+kbd-enter = done

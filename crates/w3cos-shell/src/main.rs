@@ -153,6 +153,7 @@ const OP_IME_7: u8 = 83;
 const OP_IME_8: u8 = 84;
 const OP_IME_9: u8 = 85;
 const OP_IME_MODE: u8 = 86;
+const OP_SOFTKEY: u8 = 87;
 
 fn main() {
     shell_main();
@@ -330,6 +331,7 @@ fn apply_ime_field() {
             "terminal" => state::set_text_signal(TERMINAL_SIGNAL, update.text),
             "launcher" => state::set_text_signal(LAUNCHER_QUERY_SIGNAL, update.text),
             "text" => state::set_text_signal(RECEIPT_QUERY_SIGNAL, update.text),
+            "secure" => state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, update.text),
             _ => {}
         }
     }
@@ -1299,6 +1301,22 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             ime_bar::toggle_mode();
             apply_ime_field();
         }
+        OP_SOFTKEY => match ime_bar::on_soft_key(draft) {
+            ime_bar::SoftOutcome::Edit => apply_ime_field(),
+            ime_bar::SoftOutcome::Submit { role, text } => {
+                apply_ime_field();
+                let code = match role.as_str() {
+                    "intent" => OP_PROPOSE,
+                    "terminal" => OP_RUN_TERMINAL,
+                    "launcher" => OP_LAUNCHER_SEARCH,
+                    "text" => OP_RECEIPT_QUERY,
+                    "secure" => OP_UNLOCK,
+                    _ => return true,
+                };
+                on_shell_intent(code, &text);
+            }
+            ime_bar::SoftOutcome::None => {}
+        },
         _ => return false,
     }
     true
@@ -1451,6 +1469,7 @@ fn build_shell() -> Component {
     }
     boot_session_once();
     apply_screen_override();
+    ime_bar::sync_field_presence();
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut column = match posture() {
@@ -1494,6 +1513,9 @@ fn build_shell() -> Component {
     }
     if !unlocked {
         column.push(place_overlay(build_lock_screen()));
+    }
+    if let Some(keyboard) = ime_bar::phone_keyboard() {
+        column.push(keyboard);
     }
 
     Component::column(
@@ -2474,6 +2496,9 @@ fn build_phone_stack() -> Component {
         },
         vec![build_intent_panel()],
     ));
+    if let Some(strip) = ime_bar::phone_candidate_strip() {
+        children.push(strip);
+    }
     children.push(Component::row(
         Style {
             height: Dimension::Px(20.0),
@@ -2493,6 +2518,16 @@ fn build_phone_stack() -> Component {
             vec![],
         )],
     ));
+    if ime_bar::keyboard_open() {
+        children.push(Component::column(
+            Style {
+                height: Dimension::Px(ime_bar::KEYBOARD_HEIGHT),
+                flex_shrink: 0.0,
+                ..Style::default()
+            },
+            vec![],
+        ));
+    }
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -2849,6 +2884,11 @@ fn build_lock_screen() -> Component {
         44.0
     });
     unlock.style.border_radius = 12.0;
+    let keyboard_pad = if ime_bar::keyboard_open() {
+        ime_bar::KEYBOARD_HEIGHT
+    } else {
+        0.0
+    };
     Component::column(
         Style {
             width: Dimension::Vw(100.0),
@@ -2857,6 +2897,12 @@ fn build_lock_screen() -> Component {
             background_image: Some(WALLPAPER.to_string()),
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(keyboard_pad),
+                left: Spacing::Px(0.0),
+            },
             ..Style::default()
         },
         vec![Component::column(
@@ -6140,6 +6186,53 @@ mod shell_ux_tests {
             bottom <= intent_top - 8.0,
             "notify ends at {bottom}, intent starts at {intent_top}"
         );
+    }
+
+    #[test]
+    fn phone_keyboard_is_in_the_phone_shell_only_while_a_field_is_focused() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        ime_bar::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".to_string(),
+            secure: false,
+            x: 16.0,
+            y: 640.0,
+            width: 300.0,
+            height: 36.0,
+        });
+        let phone = format!("{:?}", build_shell());
+        assert!(
+            phone.contains("--w3cos-softkey"),
+            "phone shell is missing the keyboard"
+        );
+        assert!(phone.contains(&locale::t("kbd-backspace")));
+        state::clear_ime_field();
+        let hidden = format!("{:?}", build_shell());
+        assert!(
+            !hidden.contains("--w3cos-softkey"),
+            "keyboard stayed up without a field"
+        );
+        state::note_shell_viewport(1200.0, 800.0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".to_string(),
+            secure: false,
+            x: 16.0,
+            y: 640.0,
+            width: 300.0,
+            height: 36.0,
+        });
+        let desktop = format!("{:?}", build_shell());
+        assert!(!desktop.contains("--w3cos-softkey"));
+        state::clear_ime_field();
+        ime_bar::sync_field_presence();
+        state::note_shell_viewport(1200.0, 800.0);
     }
 
     #[test]
