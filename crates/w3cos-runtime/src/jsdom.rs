@@ -21235,6 +21235,25 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
     }
 }
 
+/// Touch the builtin DOM and array surface, then record the shape epoch.
+///
+/// Generated heads call this after the bootstrap node exists and before user
+/// script. Later `defineProperty`, `setPrototypeOf`, or assignment of
+/// `createElement`, `appendChild`, `push`, `id`, `className`, or
+/// `textContent` moves the epoch, and the fused create path stays off.
+pub fn seal_dom_shape_baseline() {
+    ensure_dom_fast();
+    let _ = document_value().get_property("createElement");
+    let element = document_value().call_method("createElement", vec![Value::string("div")]);
+    let _ = element.get_property("appendChild");
+    let _ = window_value()
+        .get_property("Element")
+        .get_property("prototype")
+        .get_property("id");
+    let _ = Value::array(Vec::new()).get_property("push");
+    w3cos_core::intrinsics::note_dom_shape_baseline();
+}
+
 /// Install benchmark controls before the generated bundle runs.
 ///
 /// Unset environment variables leave the document untouched, so ordinary

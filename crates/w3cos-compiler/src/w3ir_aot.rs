@@ -4017,10 +4017,40 @@ fn match_appended_element(body: &[Instruction]) -> Option<AppendedShape> {
     })
 }
 
-fn emit_stable_binding(name: &str, id: u32) -> String {
+fn stable_binding_expr(id: u32) -> String {
     format!(
-        "let __w3cos_{name} = if let Some(getter) = __w3cos_cg_{id}.as_ref() {{ match w3cos_core::catch_js(|| getter.call_slice(w3cos_core::Value::Undefined, &[])) {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => {{ return Err(__w3cos_exception); }} }} }} else if let Some(cell) = __w3cos_cb_{id}.as_ref() {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }} }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }};\n"
+        "if let Some(getter) = __w3cos_cg_{id}.as_ref() {{ match w3cos_core::catch_js(|| getter.call_slice(w3cos_core::Value::Undefined, &[])) {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => {{ return Err(__w3cos_exception); }} }} }} else if let Some(cell) = __w3cos_cb_{id}.as_ref() {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }} }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); return Err(__w3cos_exception); }}"
     )
+}
+
+/// Declarations are pure. Binding reads happen later, after the loop gate.
+fn fusion_latch_prelude(suffix: &str, atoms: &str, names: &[&str]) -> String {
+    let mut out = format!(
+        "let mut __w3cos_fuse_latched_{suffix} = false;\nlet mut __w3cos_fuse_fast_{suffix} = false;\nlet mut __w3cos_dom_epoch_{suffix}: u64 = 0;\n{atoms}"
+    );
+    for name in names {
+        out.push_str(&format!(
+            "let mut __w3cos_{name}_{suffix} = w3cos_core::Value::Undefined;\n"
+        ));
+    }
+    out
+}
+
+/// Load the fused receivers only once the loop body is known to run, then
+/// accept the fast path only while the sealed builtin epoch is unchanged.
+fn fusion_latch_open(suffix: &str, names: &[(&str, u32)]) -> String {
+    let mut out =
+        format!("if !__w3cos_fuse_latched_{suffix} {{\n__w3cos_fuse_latched_{suffix} = true;\n");
+    for (name, id) in names {
+        out.push_str(&format!(
+            "__w3cos_{name}_{suffix} = {};\n",
+            stable_binding_expr(*id)
+        ));
+    }
+    out.push_str(&format!(
+        "if w3cos_core::intrinsics::dom_shape_is_pristine() {{\n__w3cos_dom_epoch_{suffix} = w3cos_core::intrinsics::dom_shape_epoch();\n__w3cos_fuse_fast_{suffix} = true;\n}}\n}}\nif __w3cos_fuse_fast_{suffix} {{\n"
+    ));
+    out
 }
 
 /// Stamp-guarded fused create. The else branch is the ordinary lookup body.
@@ -4070,14 +4100,27 @@ fn emit_guarded_append(
     )?;
     let tag_atom = qualified_atom_expr(&shape.tag);
     let class_atom = qualified_atom_expr(&shape.class_name);
-    let prelude = format!(
-        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_tag_atom: u32 = {tag_atom};\nlet __w3cos_class_atom: u32 = {class_atom};\n{}{}{}",
-        emit_stable_binding("doc", shape.document_binding),
-        emit_stable_binding("parent", shape.parent_binding),
-        emit_stable_binding("nodes", shape.nodes_binding),
+    let suffix = format!(
+        "a{}_{}_{}",
+        shape.document_binding, shape.parent_binding, shape.nodes_binding
+    );
+    let prelude = fusion_latch_prelude(
+        &suffix,
+        &format!(
+            "let __w3cos_tag_atom_{suffix}: u32 = {tag_atom};\nlet __w3cos_class_atom_{suffix}: u32 = {class_atom};\n"
+        ),
+        &["doc", "parent", "nodes"],
+    );
+    let open = fusion_latch_open(
+        &suffix,
+        &[
+            ("doc", shape.document_binding),
+            ("parent", shape.parent_binding),
+            ("nodes", shape.nodes_binding),
+        ],
     );
     let fast = format!(
-        "let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, __w3cos_tag_atom, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, __w3cos_class_atom, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n",
+        "{open}let __w3cos_built = w3cos_core::intrinsics::dom_build_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, {id_prefix:?}, self.num_bindings[{index_slot}], {class_name:?}, __w3cos_class_atom_{suffix}, {text_prefix:?}, self.num_bindings[{index_slot}], __w3cos_dom_epoch_{suffix});\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}w3cos_core::intrinsics::array_push(&__w3cos_nodes_{suffix}, &self.registers[{element_slot}]);\n{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
         tag = shape.tag,
         id_prefix = shape.id_prefix,
         class_name = shape.class_name,
@@ -4330,13 +4373,21 @@ fn emit_guarded_block(
         back_edges,
     )?;
     let tag_atom = qualified_atom_expr(&shape.tag);
-    let prelude = format!(
-        "let __w3cos_dom_epoch = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_tag_atom: u32 = {tag_atom};\n{}{}",
-        emit_stable_binding("doc", shape.document_binding),
-        emit_stable_binding("parent", shape.parent_binding),
+    let suffix = format!("b{}_{}", shape.document_binding, shape.parent_binding);
+    let prelude = fusion_latch_prelude(
+        &suffix,
+        &format!("let __w3cos_tag_atom_{suffix}: u32 = {tag_atom};\n"),
+        &["doc", "parent"],
+    );
+    let open = fusion_latch_open(
+        &suffix,
+        &[
+            ("doc", shape.document_binding),
+            ("parent", shape.parent_binding),
+        ],
     );
     let fast = format!(
-        "{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc, &__w3cos_parent, {tag:?}, __w3cos_tag_atom, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch);\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n",
+        "{open}{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_block_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, &self.registers[{text_slot}], {style_name:?}, {style_value:?}, __w3cos_dom_epoch_{suffix});\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
         tag = shape.tag,
         style_name = shape.style_name,
         style_value = shape.style_value,
@@ -4396,10 +4447,41 @@ fn emit_native_sync_loop(
     } else {
         format!("if {condition} {{ break; }}")
     };
-    // A sampled shape epoch cannot prove that methods/accessors were still
-    // builtin before entering this loop. Keep ordinary operations until that
-    // proof exists; in particular, body-only reads must stay after the gate.
-    let loop_body = format!("{header_code}{gate}\n{body_code}");
+    // Fuse only behind a pristine baseline sampled after the gate. Binding
+    // reads stay in the body so a zero-trip loop does not observe them.
+    // A stale stamp or a bumped epoch falls through to `body_code`.
+    let guarded = match emit_guarded_append(
+        &body[..body.len() - 1],
+        &body_code,
+        function,
+        factories,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )? {
+        some @ Some(_) => some,
+        None => emit_guarded_block(
+            &body[..body.len() - 1],
+            &body_code,
+            function,
+            factories,
+            module_specifier,
+            type_name,
+            storage,
+            plan,
+            back_edges,
+        )?,
+    };
+    let loop_body = if let Some((_, fast)) = &guarded {
+        format!("{header_code}{gate}\n{fast}")
+    } else {
+        format!("{header_code}{gate}\n{body_code}")
+    };
+    if loop_body.contains("continue 'drive") || loop_body.contains("self.block") {
+        return Ok(None);
+    }
     // A per-iteration environment replaces its Rc cell. Initializers can also
     // install a previously missing cell. Neither lookup is invariant.
     let replaced_bindings = function
@@ -4412,7 +4494,10 @@ fn emit_native_sync_loop(
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let (hoisted, loop_body) = tighten_native_loop(&loop_body, &replaced_bindings);
+    let (mut hoisted, loop_body) = tighten_native_loop(&loop_body, &replaced_bindings);
+    if let Some((prelude, _)) = &guarded {
+        hoisted.push_str(prelude);
+    }
     let (mut prologue, loop_body, epilogue) = promote_unboxed_locals(&loop_body)
         .unwrap_or_else(|| (String::new(), loop_body.clone(), String::new()));
     prologue.insert_str(0, &hoisted);
@@ -7819,8 +7904,47 @@ fn main() {{
         assert!(generated.contains("let refreshed = binding.borrow().clone()"));
     }
 
+    fn assert_fused_after_gate(generated: &str, intrinsic: &str) {
+        let loop_at = generated
+            .find("loop {")
+            .unwrap_or_else(|| panic!("native loop missing: {generated}"));
+        let break_at = generated[loop_at..]
+            .find("break;")
+            .unwrap_or_else(|| panic!("loop gate missing: {generated}"));
+        let proof_at = generated
+            .find("dom_shape_is_pristine")
+            .unwrap_or_else(|| panic!("pristine proof missing: {generated}"));
+        assert!(
+            loop_at + break_at < proof_at,
+            "the pristine proof must follow the loop gate so a zero-trip body is not observed: {generated}"
+        );
+        assert!(
+            generated.contains(intrinsic)
+                && generated.contains("dom_shape_epoch")
+                && generated.contains("is_undefined()")
+                && generated.contains("4_u32"),
+            "the benchmark shape must fuse behind the stamp and the static div id: {generated}"
+        );
+        assert!(
+            !generated.contains("dom_build_appended"),
+            "unguarded fusion must stay out of the loop: {generated}"
+        );
+        let mut depth = 0i32;
+        for ch in generated.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    assert!(depth >= 0, "unbalanced fused loop: {generated}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced fused loop: {generated}");
+    }
+
     #[test]
-    fn native_dom_loop_with_binding_limit_keeps_ordinary_lookup() {
+    fn native_dom_loop_with_binding_limit_is_guarded() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
                 "use strict";
@@ -7850,13 +7974,46 @@ fn main() {{
             .unwrap();
         let generated =
             generate_sync_function_from_module(&module, function, "dom_once_aot").unwrap();
+        assert_fused_after_gate(&generated, "dom_build_guarded");
         assert!(
-            generated.contains(".call_method_slice(\"createElement\"")
-                && generated.contains("set_property_strict")
-                && !generated.contains("dom_build_guarded")
-                && !generated.contains("dom_shape_epoch"),
-            "without a pristine proof the loop must use observable operations: {generated}"
+            generated.contains("set_property_strict")
+                && generated.contains(".call_method_slice(\"createElement\"")
+                && generated.contains("dom_intern_prehashed("),
+            "strict create loop keeps the observable fallback and interns the class once: {generated}"
         );
+    }
+
+    #[test]
+    fn native_module_dom_list_loop_is_guarded() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                var DOM_NODES = 1000;
+                function domOnce() {
+                    var root = document.createElement("div");
+                    var nodes = [];
+                    for (var i = 0; i < DOM_NODES; i++) {
+                        var el = document.createElement("div");
+                        el.id = "row-" + i;
+                        el.className = "row";
+                        el.textContent = "item " + i;
+                        root.appendChild(el);
+                        nodes.push(el);
+                    }
+                    return nodes;
+                }
+            "#,
+            "app:///dom-list.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("domOnce"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "dom_list_module_aot").unwrap();
+        assert_fused_after_gate(&generated, "dom_build_guarded");
     }
 
     #[test]
@@ -7885,13 +8042,15 @@ fn main() {{
             .find(|function| function.name.as_deref() == Some("fill"))
             .unwrap();
         let generated = generate_sync_function_from_module(&module, function, "fill_aot").unwrap();
+        assert_fused_after_gate(&generated, "dom_build_guarded");
         assert!(
             generated.contains("loop {"),
             "element create loop should be native: {generated}"
         );
+        let loop_at = generated.find("loop {").unwrap();
         assert!(
-            !generated.contains("dom_build_guarded") && !generated.contains("__w3cos_doc ="),
-            "body reads and operations must not be pulled into an unproven prologue: {generated}"
+            generated[loop_at..].contains("__w3cos_doc_"),
+            "fused receivers are loaded inside the loop, after the gate: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"createElement\""),
@@ -7932,7 +8091,7 @@ fn main() {{
     }
 
     #[test]
-    fn native_fixed_block_loop_keeps_observable_body() {
+    fn native_fixed_block_loop_is_guarded() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
                 "use strict";
@@ -7957,14 +8116,7 @@ fn main() {{
             .unwrap();
         let generated =
             generate_sync_function_from_module(&module, function, "memory_block_aot").unwrap();
-        assert!(
-            generated.contains("loop {")
-                && !generated.contains("dom_build_block_guarded")
-                && !generated.contains("dom_shape_epoch")
-                && !generated.contains("let __w3cos_doc =")
-                && !generated.contains("let __w3cos_parent ="),
-            "an unproven fixed-block fusion must keep the observable loop body: {generated}"
-        );
+        assert_fused_after_gate(&generated, "dom_build_block_guarded");
         assert!(
             generated.contains(".call_method_slice(\"createElement\"")
                 && generated.contains("set_property_strict(")
@@ -7973,14 +8125,10 @@ fn main() {{
                 && generated.contains(".call_method_slice(\"appendChild\""),
             "ordinary lookup stays on the fallback: {generated}"
         );
-        assert!(
-            !generated.contains("dom_build_appended"),
-            "unguarded fusion must stay out of the block loop: {generated}"
-        );
     }
 
     #[test]
-    fn native_fixed_block_module_loop_keeps_observable_body() {
+    fn native_fixed_block_module_loop_is_guarded() {
         let module = crate::w3ir_lowering::lower_module(
             r#"
                 export {};
@@ -8005,14 +8153,7 @@ fn main() {{
         let generated =
             generate_sync_function_from_module(&module, function, "memory_block_module_aot")
                 .unwrap();
-        assert!(
-            generated.contains("loop {")
-                && !generated.contains("dom_build_block_guarded")
-                && !generated.contains("dom_shape_epoch")
-                && !generated.contains("let __w3cos_doc =")
-                && !generated.contains("let __w3cos_parent ="),
-            "an unproven fixed-block fusion must keep the observable loop body: {generated}"
-        );
+        assert_fused_after_gate(&generated, "dom_build_block_guarded");
         assert!(
             generated.contains(".call_method_slice(\"createElement\"")
                 && generated.contains("set_property_strict(")
@@ -8020,10 +8161,6 @@ fn main() {{
                 && generated.contains("\"height\"")
                 && generated.contains(".call_method_slice(\"appendChild\""),
             "ordinary lookup stays on the module fallback: {generated}"
-        );
-        assert!(
-            !generated.contains("dom_build_appended"),
-            "unguarded fusion must stay out of the module block loop: {generated}"
         );
     }
 

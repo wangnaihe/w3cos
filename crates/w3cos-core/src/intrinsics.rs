@@ -611,6 +611,9 @@ thread_local! {
     /// Bumped by `defineProperty`, `setPrototypeOf`, and assignments that
     /// override the element/document/array surface the fused create path uses.
     static DOM_SHAPE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// Epoch after builtins are installed and before user script. Zero means
+    /// the runtime has not sealed a baseline, so fusion stays off.
+    static DOM_SHAPE_BASELINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Stamp sampled once per fused create loop. The fast path compares it on
@@ -621,6 +624,25 @@ pub fn dom_shape_epoch() -> u64 {
 
 pub fn bump_dom_shape() {
     DOM_SHAPE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
+
+/// Record the epoch once builtins exist and before user script runs.
+///
+/// A sample taken at the loop would match an already-overridden surface,
+/// because the epoch only moves. Fusion is allowed only while the epoch is
+/// still this baseline.
+pub fn note_dom_shape_baseline() {
+    let epoch = dom_shape_epoch();
+    DOM_SHAPE_BASELINE.with(|cell| cell.set(epoch));
+}
+
+/// True when no watched method or accessor has changed since [`note_dom_shape_baseline`].
+pub fn dom_shape_is_pristine() -> bool {
+    let epoch = dom_shape_epoch();
+    DOM_SHAPE_BASELINE.with(|cell| {
+        let baseline = cell.get();
+        baseline != 0 && baseline == epoch
+    })
 }
 
 pub fn install_dom_fast(fast: DomFast) {
@@ -863,6 +885,18 @@ pub fn await_value(value: &Value) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn dom_shape_baseline_is_the_pristine_stamp() {
+        note_dom_shape_baseline();
+        assert!(dom_shape_is_pristine());
+        let stamped = dom_shape_epoch();
+        bump_dom_shape();
+        assert!(!dom_shape_is_pristine());
+        assert_ne!(dom_shape_epoch(), stamped);
+        note_dom_shape_baseline();
+        assert!(dom_shape_is_pristine());
+    }
 
     #[test]
     fn addition_uses_ecmascript_coercion() {
