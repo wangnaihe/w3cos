@@ -7,15 +7,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use w3cos_ime::{ImeHub, InputIntent, Modality, PinyinEngine, Proposal, Purpose};
+use w3cos_ime::{
+    ImeHub, InputIntent, IntentHint, IntentPayload, Modality, PinyinEngine, Proposal, Purpose,
+};
 use w3cos_runtime::state::{self, ImeFieldNote};
 use w3cos_std::Component;
 use w3cos_std::color::Color;
 use w3cos_std::style::*;
 
 use super::{
-    CHROME_Z, OP_IME_1, OP_IME_MODE, OP_IME_PAGE_NEXT, OP_IME_PAGE_PREV, OP_SOFTKEY, ink_token,
-    invoke, line_strong,
+    CHROME_Z, OP_IME_1, OP_IME_ACTION, OP_IME_MODE, OP_IME_PAGE_NEXT, OP_IME_PAGE_PREV, OP_SOFTKEY,
+    ink_token, invoke, line_strong,
 };
 use crate::locale;
 
@@ -39,10 +41,18 @@ struct Caret {
     h: f32,
 }
 
+#[derive(Clone)]
+struct CommandOffer {
+    utterance: String,
+    summary: String,
+}
+
 struct Session {
     /// `Some(true)` forces pinyin. `None` follows the active locale.
     override_pinyin: Option<bool>,
     spelling: String,
+    /// Segmented composition from the hub preedit, when one is open.
+    preedit: String,
     base: String,
     role: String,
     index: usize,
@@ -51,6 +61,9 @@ struct Session {
     undo: Vec<String>,
     caret: Caret,
     candidates: Vec<String>,
+    actions: Vec<CommandOffer>,
+    ime: Option<w3cos_ime::Session>,
+    focus_gen: u64,
     page: usize,
     pending: Vec<FieldUpdate>,
 }
@@ -65,6 +78,7 @@ impl Default for Session {
         Self {
             override_pinyin: None,
             spelling: String::new(),
+            preedit: String::new(),
             base: String::new(),
             role: String::new(),
             index: 0,
@@ -78,6 +92,9 @@ impl Default for Session {
                 h: 0.0,
             },
             candidates: Vec::new(),
+            actions: Vec::new(),
+            ime: None,
+            focus_gen: 0,
             page: 0,
             pending: Vec::new(),
         }
@@ -98,18 +115,48 @@ fn pinyin_mode(session: &mut Session) -> bool {
         .unwrap_or_else(|| locale::current().starts_with("zh"))
 }
 
-fn lookup(spelling: &str) -> Vec<String> {
-    let mut engine = PinyinEngine::new();
+fn text_slots(session: &Session) -> usize {
+    let size = page_size();
+    if session.actions.is_empty() {
+        size
+    } else {
+        size.saturating_sub(1).max(1)
+    }
+}
+
+fn reopen_ime(session: &mut Session) {
+    let purpose = Purpose::for_field(&session.role, session.secure);
+    if session
+        .ime
+        .as_ref()
+        .is_some_and(|ime| !ime.id.is_empty() && ime.purpose == purpose)
+    {
+        return;
+    }
+    if let Some(ime) = session.ime.as_mut() {
+        ime.end();
+    }
+    session.focus_gen = session.focus_gen.saturating_add(1);
     let hub = ImeHub::with_l2(false);
-    let session = hub.begin_session("shell", Purpose::Text, vec!["zh-Hans".into()]);
-    let intent = InputIntent::text(Modality::Key, spelling, &["zh-Hans"]);
-    hub.handle_intent(&session, &intent, &mut [&mut engine])
-        .into_iter()
-        .filter_map(|proposal| match proposal {
-            Proposal::Candidate { text, .. } => Some(text),
-            _ => None,
-        })
-        .collect()
+    session.ime = Some(hub.begin_session(
+        format!("shell-{}-{}", session.index, session.focus_gen),
+        purpose,
+        vec!["zh-Hans".into(), "en".into()],
+    ));
+}
+
+fn wipe_ime(session: &mut Session) {
+    if let Some(ime) = session.ime.as_mut() {
+        ime.end();
+    }
+    session.ime = None;
+    session.spelling.clear();
+    session.preedit.clear();
+    session.base.clear();
+    session.candidates.clear();
+    session.actions.clear();
+    session.undo.clear();
+    session.page = 0;
 }
 
 fn queue(session: &mut Session, text: String) {
@@ -129,12 +176,68 @@ fn page_size() -> usize {
 }
 
 fn refresh(session: &mut Session) {
-    session.candidates = if session.spelling.is_empty() || session.secure || !pinyin_mode(session) {
-        Vec::new()
-    } else {
-        lookup(&session.spelling)
+    session.candidates.clear();
+    session.actions.clear();
+    session.preedit.clear();
+    if session.secure || !session.has_field {
+        return;
+    }
+    reopen_ime(session);
+    let Some(ime) = session.ime.clone() else {
+        return;
     };
-    let pages = session.candidates.len().div_ceil(page_size()).max(1);
+    let composing = pinyin_mode(session) && !session.spelling.is_empty();
+    let text = if composing {
+        session.spelling.clone()
+    } else if ime.purpose == Purpose::Command {
+        session.base.clone()
+    } else {
+        String::new()
+    };
+    if text.is_empty() {
+        return;
+    }
+    let hint = match ime.purpose {
+        Purpose::Command => Some(IntentHint::Command),
+        Purpose::Search => Some(IntentHint::Search),
+        _ => Some(IntentHint::Insert),
+    };
+    let intent = InputIntent {
+        modality: Modality::Key,
+        payload: IntentPayload::Text { text },
+        interim: composing,
+        locale: ime.locales.clone(),
+        hint,
+    };
+    let hub = ImeHub::with_l2(false);
+    let mut engine = PinyinEngine::new();
+    let proposals = if composing {
+        hub.handle_intent(&ime, &intent, &mut [&mut engine])
+    } else {
+        hub.handle_intent(
+            &ime,
+            &intent,
+            &mut [] as &mut [&mut dyn w3cos_ime::InputEngine],
+        )
+    };
+    for proposal in proposals {
+        match proposal {
+            Proposal::Preedit { text, .. } => session.preedit = text,
+            Proposal::Candidate { text, .. } => session.candidates.push(text),
+            Proposal::Action {
+                kind,
+                summary,
+                requires_confirm,
+                ..
+            } if requires_confirm => session.actions.push(CommandOffer {
+                utterance: kind,
+                summary,
+            }),
+            _ => {}
+        }
+    }
+    let slots = text_slots(session);
+    let pages = session.candidates.len().div_ceil(slots).max(1);
     if session.page >= pages {
         session.page = pages - 1;
     }
@@ -144,11 +247,12 @@ fn composed_field(session: &mut Session) -> String {
     if session.spelling.is_empty() || session.secure || !pinyin_mode(session) {
         return session.base.clone();
     }
-    format!(
-        "{}{}",
-        session.base,
+    let suffix = if session.preedit.is_empty() {
         w3cos_ime::preedit_display(&session.spelling)
-    )
+    } else {
+        session.preedit.clone()
+    };
+    format!("{}{}", session.base, suffix)
 }
 
 fn commit_at(session: &mut Session, index: usize) -> bool {
@@ -167,8 +271,8 @@ fn commit_at(session: &mut Session, index: usize) -> bool {
     session.base.push_str(&chunk);
     session.undo.push(chunk);
     session.spelling.clear();
-    session.candidates.clear();
     session.page = 0;
+    refresh(session);
     queue(session, session.base.clone());
     true
 }
@@ -185,16 +289,35 @@ fn undo(session: &mut Session) -> bool {
     }
     session.undo.pop();
     session.base.truncate(session.base.len() - chunk.len());
+    refresh(session);
     queue(session, session.base.clone());
     true
 }
 
 fn adopt(session: &mut Session, note: &ImeFieldNote) {
-    if session.has_field && note.index != session.index && !session.spelling.is_empty() {
+    let switched = session.has_field
+        && (note.index != session.index
+            || note.role != session.role
+            || note.secure != session.secure);
+    if switched && !session.spelling.is_empty() {
         session.spelling.clear();
+        session.preedit.clear();
         session.candidates.clear();
+        session.actions.clear();
         session.page = 0;
         queue(session, session.base.clone());
+    }
+    if switched {
+        if let Some(ime) = session.ime.as_mut() {
+            ime.end();
+        }
+        session.ime = None;
+        session.undo.clear();
+        session.spelling.clear();
+        session.preedit.clear();
+        session.candidates.clear();
+        session.actions.clear();
+        session.page = 0;
     }
     let starting = session.spelling.is_empty();
     session.index = note.index;
@@ -210,6 +333,14 @@ fn adopt(session: &mut Session, note: &ImeFieldNote) {
     if starting {
         session.base = note.value.clone();
     }
+    if session.secure {
+        session.spelling.clear();
+        session.preedit.clear();
+        session.candidates.clear();
+        session.actions.clear();
+        session.page = 0;
+    }
+    reopen_ime(session);
 }
 
 fn is_letter(name: &str) -> bool {
@@ -221,10 +352,11 @@ pub(crate) fn on_key(name: &str) -> bool {
     with_session(|session| {
         if name == "Mod+Space" {
             session.override_pinyin = Some(!pinyin_mode(session));
-            if !session.spelling.is_empty() {
-                session.spelling.clear();
-                session.candidates.clear();
-                session.page = 0;
+            let had_spelling = !session.spelling.is_empty();
+            session.spelling.clear();
+            session.page = 0;
+            refresh(session);
+            if had_spelling {
                 queue(session, session.base.clone());
             } else {
                 state::mark_dirty();
@@ -239,8 +371,8 @@ pub(crate) fn on_key(name: &str) -> bool {
                 return false;
             }
             session.spelling.clear();
-            session.candidates.clear();
             session.page = 0;
+            refresh(session);
             queue(session, session.base.clone());
             return true;
         }
@@ -255,14 +387,9 @@ pub(crate) fn on_key(name: &str) -> bool {
                 if !session.spelling.is_empty() {
                     session.spelling.pop();
                     session.page = 0;
-                    if session.spelling.is_empty() {
-                        session.candidates.clear();
-                        queue(session, session.base.clone());
-                    } else {
-                        refresh(session);
-                        let shown = composed_field(session);
-                        queue(session, shown);
-                    }
+                    refresh(session);
+                    let shown = composed_field(session);
+                    queue(session, shown);
                     return true;
                 }
                 undo(session)
@@ -279,8 +406,9 @@ pub(crate) fn on_key(name: &str) -> bool {
                     return false;
                 }
                 let visible = (name.as_bytes()[0] - b'1') as usize;
-                if visible < page_size() {
-                    let _ = commit_at(session, session.page * page_size() + visible);
+                let slots = text_slots(session);
+                if visible < slots {
+                    let _ = commit_at(session, session.page * slots + visible);
                 }
                 true
             }
@@ -306,7 +434,7 @@ pub(crate) fn commit_candidate(visible: usize) -> bool {
         if session.secure || !pinyin_mode(session) {
             return false;
         }
-        commit_at(session, session.page * page_size() + visible)
+        commit_at(session, session.page * text_slots(session) + visible)
     })
 }
 
@@ -315,7 +443,11 @@ pub(crate) fn page_by(delta: isize) -> bool {
         if !candidates_visible(session) {
             return false;
         }
-        let pages = session.candidates.len().div_ceil(page_size()).max(1);
+        let pages = session
+            .candidates
+            .len()
+            .div_ceil(text_slots(session))
+            .max(1);
         let next = (session.page as isize + delta).clamp(0, pages as isize - 1) as usize;
         if next == session.page {
             return false;
@@ -336,7 +468,11 @@ pub(crate) fn preedit_suffix(role: &str) -> Option<String> {
         {
             return None;
         }
-        Some(w3cos_ime::preedit_display(&session.spelling))
+        Some(if session.preedit.is_empty() {
+            w3cos_ime::preedit_display(&session.spelling)
+        } else {
+            session.preedit.clone()
+        })
     })
 }
 
@@ -399,11 +535,29 @@ pub(crate) fn sync_field_presence() {
         return;
     }
     with_session(|session| {
-        session.spelling.clear();
-        session.candidates.clear();
-        session.page = 0;
+        wipe_ime(session);
         session.has_field = false;
     });
+}
+
+/// Utterance for the visible command chip. The shell proposes it; it does not run it.
+pub(crate) fn command_utterance() -> Option<String> {
+    with_session(|session| session.actions.first().map(|offer| offer.utterance.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn focused_purpose() -> Option<Purpose> {
+    with_session(|session| session.ime.as_ref().map(|ime| ime.purpose))
+}
+
+#[cfg(test)]
+pub(crate) fn focused_grants_empty() -> bool {
+    with_session(|session| {
+        session
+            .ime
+            .as_ref()
+            .is_some_and(|ime| ime.granted.is_empty())
+    })
 }
 
 pub(crate) fn keyboard_open() -> bool {
@@ -432,6 +586,7 @@ pub(crate) fn on_soft_key(name: &str) -> SoftOutcome {
                 let mut chars: Vec<char> = session.base.chars().collect();
                 if chars.pop().is_some() {
                     session.base = chars.into_iter().collect();
+                    refresh(session);
                     queue(session, session.base.clone());
                 }
                 SoftOutcome::Edit
@@ -442,11 +597,13 @@ pub(crate) fn on_soft_key(name: &str) -> SoftOutcome {
             },
             "Space" => {
                 session.base.push(' ');
+                refresh(session);
                 queue(session, session.base.clone());
                 SoftOutcome::Edit
             }
             other if other.chars().count() == 1 && !other.chars().any(|ch| ch.is_control()) => {
                 session.base.push_str(other);
+                refresh(session);
                 queue(session, session.base.clone());
                 SoftOutcome::Edit
             }
@@ -456,23 +613,37 @@ pub(crate) fn on_soft_key(name: &str) -> SoftOutcome {
 }
 
 fn candidates_visible(session: &mut Session) -> bool {
-    pinyin_mode(session) && !session.secure && !session.spelling.is_empty()
+    if session.secure || !session.has_field {
+        return false;
+    }
+    let composing = pinyin_mode(session) && !session.spelling.is_empty();
+    composing || !session.actions.is_empty()
 }
 
 fn candidate_children(show_preedit: bool) -> Vec<Component> {
-    let (spelling, candidates, page) = with_session(|session| {
+    let (spelling, preedit, candidates, page, actions) = with_session(|session| {
         (
             session.spelling.clone(),
+            session.preedit.clone(),
             session.candidates.clone(),
             session.page,
+            session.actions.clone(),
         )
     });
-    let size = page_size();
+    let size = if actions.is_empty() {
+        page_size()
+    } else {
+        page_size().saturating_sub(1).max(1)
+    };
     let pages = candidates.len().div_ceil(size).max(1);
     let page = page.min(pages - 1);
     let mut children = vec![mode_button()];
-    if show_preedit {
-        let shown = w3cos_ime::preedit_display(&spelling);
+    if show_preedit && !spelling.is_empty() {
+        let shown = if preedit.is_empty() {
+            w3cos_ime::preedit_display(&spelling)
+        } else {
+            preedit
+        };
         // An auto-sized text item in this fixed-height row collapses, which
         // previously clipped `nihao` down to `nih`. Reserve the full spelling.
         let width = shown
@@ -511,6 +682,9 @@ fn candidate_children(show_preedit: bool) -> Vec<Component> {
             OP_IME_PAGE_NEXT,
         ));
     }
+    if let Some(offer) = actions.first() {
+        children.push(action_button(offer));
+    }
     children
 }
 
@@ -519,8 +693,7 @@ pub(crate) fn candidate_layer() -> Option<Component> {
     if width < 600.0 {
         return None;
     }
-    let visible = with_session(candidates_visible);
-    if !visible {
+    if !with_session(candidates_visible) {
         return None;
     }
     let (width, height) = state::shell_viewport();
@@ -746,6 +919,30 @@ fn mode_button() -> Component {
     };
     keep_ime(&mut style);
     Component::button_with_click(label, style, invoke(OP_IME_MODE))
+}
+
+fn action_button(offer: &CommandOffer) -> Component {
+    let mark = locale::t("ime-action-mark");
+    let label = locale::t_args("ime-action", &[("text", &offer.summary), ("mark", &mark)]);
+    let mut style = Style {
+        background: Color::from_hex("#f4f1ea"),
+        border_width: 1.0,
+        border_color: Color::from_hex("#d4a017"),
+        border_radius: 8.0,
+        font_size: 13.0,
+        font_weight: 650,
+        color: Color::from_hex("#1a2836"),
+        padding: Edges::xy(6.0, 0.0),
+        height: Dimension::Px(CHIP_H),
+        min_height: Dimension::Px(CHIP_H),
+        flex_shrink: 0.0,
+        flex_grow: 0.0,
+        box_sizing: BoxSizing::BorderBox,
+        white_space: WhiteSpace::NoWrap,
+        ..Style::default()
+    };
+    keep_ime(&mut style);
+    Component::button_with_click(label, style, invoke(OP_IME_ACTION))
 }
 
 fn candidate_button(label: String, code: u8) -> Component {
@@ -985,6 +1182,85 @@ mod tests {
         assert!(on_key("1"));
         assert!(!composed_text().is_empty());
         assert_ne!(composed_text(), "yi");
+    }
+
+    #[test]
+    fn purpose_follows_the_field_and_blur_clears_the_session() {
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        note("intent", "", false, 4, 200.0);
+        assert!(!on_key("Escape"));
+        assert_eq!(focused_purpose(), Some(Purpose::Command));
+        note("terminal", "", false, 8, 180.0);
+        assert!(!on_key("Escape"));
+        assert_eq!(focused_purpose(), Some(Purpose::Code));
+        note("editor", "", false, 9, 160.0);
+        assert!(!on_key("Escape"));
+        assert_eq!(focused_purpose(), Some(Purpose::Code));
+        note("launcher", "", false, 3, 120.0);
+        assert!(!on_key("Escape"));
+        assert_eq!(focused_purpose(), Some(Purpose::Search));
+        note("text", "", false, 6, 100.0);
+        assert!(!on_key("Escape"));
+        assert_eq!(focused_purpose(), Some(Purpose::Text));
+        note("intent", "", false, 4, 200.0);
+        type_spelling("ni");
+        assert!(candidate_layer().is_some());
+        state::clear_ime_field();
+        sync_field_presence();
+        assert!(focused_purpose().is_none());
+        assert_eq!(composed_text(), "");
+        assert!(candidate_layer().is_none());
+    }
+
+    #[test]
+    fn secure_fields_skip_candidates_and_grants() {
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        note("secure", "", true, 2, 300.0);
+        assert!(!on_key("n"));
+        assert!(!on_key("i"));
+        assert!(candidate_layer().is_none());
+        assert_eq!(focused_purpose(), Some(Purpose::Secure));
+        assert!(focused_grants_empty());
+        assert!(command_utterance().is_none());
+        note("password", "", true, 2, 300.0);
+        assert!(!on_key("n"));
+        assert_eq!(focused_purpose(), Some(Purpose::Password));
+        assert!(focused_grants_empty());
+    }
+
+    #[test]
+    fn command_field_offers_a_confirm_chip_and_text_still_commits() {
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        note("intent", "", false, 4, 700.0);
+        type_spelling("wenjian");
+        assert_eq!(focused_purpose(), Some(Purpose::Command));
+        assert_eq!(preedit_suffix("intent").as_deref(), Some("wen jian"));
+        assert_eq!(command_utterance().as_deref(), Some("open files"));
+        let layer = candidate_layer().expect("command bar");
+        let dumped = format!("{layer:?}");
+        assert!(dumped.contains("文件"), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-action-mark")), "{dumped}");
+        assert_eq!(layer.style.flex_wrap, FlexWrap::NoWrap);
+        assert!(on_key("1"));
+        assert_eq!(composed_text(), "文件");
+        assert_eq!(command_utterance().as_deref(), Some("open files"));
+        note("intent", "文件", false, 4, 700.0);
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "");
+        assert!(command_utterance().is_none());
+
+        note("terminal", "", false, 8, 180.0);
+        type_spelling("wenjian");
+        assert_eq!(focused_purpose(), Some(Purpose::Code));
+        let dumped = format!("{:?}", candidate_layer().expect("code bar"));
+        assert!(dumped.contains("文件"), "{dumped}");
+        assert!(!dumped.contains(&locale::t("ime-action-mark")), "{dumped}");
+        assert!(command_utterance().is_none());
+        state::note_shell_viewport(1200.0, 800.0);
     }
 
     #[test]

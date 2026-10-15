@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://w3cos.dev/spec/ime/w3cos-ime-1.schema.json",
+  "title": "w3cos-ime/1",
+  "description": "InputIntent and Proposal messages from docs/ime/smart-ime-protocol.md. ActionProposal always requires shell confirmation.",
+  "$defs": {
+    "InputIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modality", "payload", "interim", "locale"],
+      "properties": {
+        "modality": {
+          "enum": ["key", "swipe", "handwriting", "voice", "gesture", "camera", "clipboard", "handoff"]
+        },
+        "payload": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["text", "keys", "ink", "audio", "empty"] },
+            "text": { "type": "string" },
+            "keys": { "type": "array", "items": { "type": "string" } },
+            "strokes": { "type": "integer", "minimum": 0 },
+            "reference": { "type": "string" }
+          }
+        },
+        "interim": { "type": "boolean" },
+        "locale": { "type": "array", "items": { "type": "string" } },
+        "hint": { "enum": ["insert", "replace-selection", "command", "search", null] }
+      }
+    },
+    "ActionProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "action", "requires_confirm", "source"],
+      "properties": {
+        "kind": { "const": "action" },
+        "id": { "type": "string" },
+        "action": { "type": "string", "description": "Existing shell utterance. Not executed by the engine." },
+        "requires_confirm": { "const": true },
+        "source": { "type": "string" },
+        "summary": { "type": "string" }
+      }
+    },
+    "Scope": {
+      "enum": ["ctx.purpose", "ctx.surrounding", "ctx.selection", "ctx.document", "ctx.app", "ctx.screen", "ctx.personal"]
+    }
+  }
+}

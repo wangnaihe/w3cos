@@ -1,4 +1,6 @@
-use crate::{InputEngine, InputIntent, Proposal, Purpose, Scope, Session};
+use crate::{
+    InputEngine, InputIntent, IntentPayload, Proposal, Purpose, Scope, Session, command_utterance,
+};
 
 /// `W3COS_L2=1`, `true`, or `script` turns L2 on. Anything else, including
 /// unset, leaves it off.
@@ -56,13 +58,30 @@ impl ImeHub {
         }
     }
 
+    /// Extra scope for a local engine. Screen, personal, document, and app
+    /// stay refused until a visible grant exists. Secure sessions refuse all.
+    pub fn grant(session: &mut Session, scope: Scope) -> bool {
+        if session.purpose.is_secure() || session.id.is_empty() {
+            return false;
+        }
+        match scope {
+            Scope::Purpose | Scope::Surrounding | Scope::Selection => {
+                if !session.granted.contains(&scope) {
+                    session.granted.push(scope);
+                }
+                true
+            }
+            Scope::Document | Scope::App | Scope::Screen | Scope::Personal => false,
+        }
+    }
+
     pub fn handle_intent(
         &self,
         session: &Session,
         intent: &InputIntent,
         engines: &mut [&mut dyn InputEngine],
     ) -> Vec<Proposal> {
-        if session.purpose.is_secure() {
+        if session.purpose.is_secure() || session.id.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -72,7 +91,49 @@ impl ImeHub {
             }
             out.extend(engine.on_intent(session, intent));
         }
+        for proposal in &mut out {
+            if let Proposal::Action {
+                requires_confirm, ..
+            } = proposal
+            {
+                *requires_confirm = true;
+            }
+        }
+        append_command_actions(session.purpose, intent, &mut out);
         out
+    }
+}
+
+/// Command fields can offer one existing shell utterance. Text candidates stay.
+fn append_command_actions(purpose: Purpose, intent: &InputIntent, proposals: &mut Vec<Proposal>) {
+    if purpose != Purpose::Command {
+        return;
+    }
+    let mut texts = Vec::new();
+    for proposal in proposals.iter() {
+        if let Proposal::Candidate { text, .. } = proposal {
+            texts.push(text.clone());
+        }
+    }
+    if let IntentPayload::Text { text } = &intent.payload {
+        texts.push(text.clone());
+    }
+    for text in texts {
+        let Some(utterance) = command_utterance(&text) else {
+            continue;
+        };
+        if proposals
+            .iter()
+            .any(|proposal| matches!(proposal, Proposal::Action { kind, .. } if kind == utterance))
+        {
+            continue;
+        }
+        proposals.push(Proposal::command(
+            format!("cmd-{utterance}"),
+            utterance,
+            text,
+        ));
+        break;
     }
 }
 
@@ -81,7 +142,8 @@ mod tests {
     use super::*;
     use crate::{
         BufferContext, CommitId, Edit, EngineManifest, Feedback, ImeContext, InputEngine,
-        InputIntent, IntentPayload, Modality, Proposal, Purpose, SURROUNDING_CAP, Scope, TextRange,
+        InputIntent, IntentPayload, Modality, PinyinEngine, Proposal, Purpose, SURROUNDING_CAP,
+        Scope, TextRange,
     };
 
     struct CountingEngine {
@@ -261,6 +323,144 @@ mod tests {
         assert!(field.text().starts_with('甲'));
         assert!(field.undo(id));
         assert!(field.text().starts_with('字'));
+    }
+
+    #[test]
+    fn field_roles_pick_a_purpose_and_secure_always_bypasses() {
+        assert_eq!(Purpose::for_field("intent", false), Purpose::Command);
+        assert_eq!(Purpose::for_field("terminal", false), Purpose::Code);
+        assert_eq!(Purpose::for_field("editor", false), Purpose::Code);
+        assert_eq!(Purpose::for_field("code", false), Purpose::Code);
+        assert_eq!(Purpose::for_field("launcher", false), Purpose::Search);
+        assert_eq!(Purpose::for_field("search", false), Purpose::Search);
+        assert_eq!(Purpose::for_field("text", false), Purpose::Text);
+        assert_eq!(Purpose::for_field("password", false), Purpose::Password);
+        assert_eq!(Purpose::for_field("secure", false), Purpose::Secure);
+        assert_eq!(Purpose::for_field("intent", true), Purpose::Secure);
+        assert_eq!(Purpose::for_field("password", true), Purpose::Password);
+    }
+
+    #[test]
+    fn grants_stop_at_local_context_and_end_clears_them() {
+        let hub = ImeHub::with_l2(false);
+        let mut session = hub.begin_session("s", Purpose::Command, vec!["zh-Hans".into()]);
+        assert!(session.allows(Scope::Purpose));
+        assert!(session.allows(Scope::Surrounding));
+        assert!(session.allows(Scope::Selection));
+        assert!(!session.allows(Scope::Document));
+        assert!(!session.allows(Scope::App));
+        assert!(!session.allows(Scope::Screen));
+        assert!(!session.allows(Scope::Personal));
+        assert!(!ImeHub::grant(&mut session, Scope::Screen));
+        assert!(!ImeHub::grant(&mut session, Scope::Personal));
+        assert!(!ImeHub::grant(&mut session, Scope::Document));
+        assert!(ImeHub::grant(&mut session, Scope::Surrounding));
+        session.end();
+        assert!(session.id.is_empty());
+        assert!(session.granted.is_empty());
+        assert!(!ImeHub::grant(&mut session, Scope::Purpose));
+
+        let mut locked = hub.begin_session("lock", Purpose::Password, vec!["zh-Hans".into()]);
+        assert!(locked.granted.is_empty());
+        assert!(!ImeHub::grant(&mut locked, Scope::Purpose));
+    }
+
+    #[test]
+    fn command_purpose_offers_one_confirmable_action() {
+        let hub = ImeHub::with_l2(false);
+        let session = hub.begin_session("intent", Purpose::Command, vec!["zh-Hans".into()]);
+        let mut engine = PinyinEngine::new();
+        let intent = InputIntent::text(Modality::Key, "wenjian", &["zh-Hans"]);
+        let proposals = hub.handle_intent(&session, &intent, &mut [&mut engine]);
+        assert!(proposals.iter().any(|proposal| {
+            matches!(proposal, Proposal::Candidate { text, .. } if text == "文件")
+        }));
+        let action = proposals.iter().find_map(|proposal| match proposal {
+            Proposal::Action {
+                kind,
+                summary,
+                requires_confirm,
+                source,
+                ..
+            } => Some((
+                kind.as_str(),
+                summary.as_str(),
+                *requires_confirm,
+                source.as_str(),
+            )),
+            _ => None,
+        });
+        assert_eq!(action, Some(("open files", "文件", true, "L0")));
+        assert_eq!(
+            proposals
+                .iter()
+                .filter(|proposal| matches!(proposal, Proposal::Action { .. }))
+                .count(),
+            1
+        );
+
+        let code = hub.begin_session("term", Purpose::Code, vec!["zh-Hans".into()]);
+        let code_proposals = hub.handle_intent(&code, &intent, &mut [&mut engine]);
+        assert!(code_proposals.iter().any(|proposal| {
+            matches!(proposal, Proposal::Candidate { text, .. } if text == "文件")
+        }));
+        assert!(
+            !code_proposals
+                .iter()
+                .any(|proposal| matches!(proposal, Proposal::Action { .. }))
+        );
+
+        let search = hub.begin_session("find", Purpose::Search, vec!["zh-Hans".into()]);
+        assert!(
+            !hub.handle_intent(&search, &intent, &mut [&mut engine])
+                .iter()
+                .any(|proposal| matches!(proposal, Proposal::Action { .. }))
+        );
+    }
+
+    #[test]
+    fn an_engine_cannot_mark_an_action_as_auto_run() {
+        let hub = ImeHub::with_l2(true);
+        let session = hub.begin_session("s", Purpose::Chat, vec!["zh-Hans".into()]);
+        let mut engine = CountingEngine {
+            calls: 0,
+            l2: true,
+            proposals: vec![Proposal::Action {
+                id: "a".into(),
+                kind: "calendar.create".into(),
+                requires_confirm: false,
+                source: "L2".into(),
+                summary: "calendar.create".into(),
+            }],
+        };
+        let intent = InputIntent::text(Modality::Key, "meet", &["zh-Hans"]);
+        let proposals = hub.handle_intent(&session, &intent, &mut [&mut engine]);
+        match proposals.last() {
+            Some(Proposal::Action {
+                requires_confirm, ..
+            }) => assert!(*requires_confirm),
+            other => panic!("expected an action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_intent_and_action_json_match_the_schema_names() {
+        let schema = include_str!("../../../spec/ime/w3cos-ime-1.schema.json");
+        assert!(schema.contains("InputIntent"));
+        assert!(schema.contains("ActionProposal"));
+        assert!(schema.contains("ctx.purpose"));
+        assert!(schema.contains("requires_confirm"));
+        let intent = InputIntent::text(Modality::Key, "wenjian", &["zh-Hans"]);
+        let json = serde_json::to_value(&intent).unwrap();
+        assert_eq!(json["modality"], "key");
+        assert_eq!(json["payload"]["kind"], "text");
+        let action = Proposal::command("cmd-open-files", "open files", "文件");
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["kind"], "action");
+        assert_eq!(json["action"], "open files");
+        assert_eq!(json["summary"], "文件");
+        assert_eq!(json["requires_confirm"], true);
+        assert_eq!(json["source"], "L0");
     }
 
     #[test]

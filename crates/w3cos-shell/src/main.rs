@@ -156,6 +156,7 @@ const OP_IME_MODE: u8 = 86;
 const OP_SOFTKEY: u8 = 87;
 const OP_IME_PAGE_PREV: u8 = 88;
 const OP_IME_PAGE_NEXT: u8 = 89;
+const OP_IME_ACTION: u8 = 90;
 
 fn main() {
     shell_main();
@@ -344,6 +345,17 @@ fn on_shell_intent(code: u8, draft: &str) {
         eprintln!("[W3C OS][INTENT] code={code} draft={draft:?}");
     }
     ensure_shell_signals();
+    if code == OP_IME_ACTION {
+        let Some(utterance) = ime_bar::command_utterance() else {
+            return;
+        };
+        let ctx = ShellContext {
+            app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
+            night: state::get_signal(NIGHT_SIGNAL) != 0,
+        };
+        with_session(|session| apply_propose(session, &utterance, &ctx));
+        return;
+    }
     let mut draft_owned = draft.to_string();
     if let Some(role) = ime_role_for_submit(code)
         && let Some(text) = ime_bar::commit_active(role)
@@ -6538,6 +6550,45 @@ mod shell_ux_tests {
             }
         }
         state::note_shell_viewport(1200.0, 800.0);
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn command_action_opens_confirm_without_executing() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        ime_bar::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 120.0,
+            y: 700.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        for ch in "wenjian".chars() {
+            assert!(ime_bar::on_key(&ch.to_string()));
+        }
+        assert_eq!(ime_bar::command_utterance().as_deref(), Some("open files"));
+        let app_before = state::get_signal(APP_SIGNAL);
+        on_shell_intent(OP_IME_ACTION, "");
+        assert_eq!(
+            state::get_signal(PHASE_SIGNAL),
+            1,
+            "the action opens the confirm card"
+        );
+        assert_eq!(state::get_signal(APP_SIGNAL), app_before);
+        assert!(!state::get_signal_text(SUMMARY_SIGNAL).is_empty());
+        on_shell_intent(OP_CANCEL, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+        assert_eq!(state::get_signal(APP_SIGNAL), app_before);
         ime_bar::reset_for_tests();
         state::clear_ime_field();
         locale::set_locale("en");

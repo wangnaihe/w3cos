@@ -2,7 +2,7 @@
 
 > 状态：草案 v0.1 · 2026-10-15 · 面向 w3cos AI Shell（意图优先 / 本地优先 / 提议→确认→执行→回执）
 >
-> 本文位置：`docs/ime/smart-ime-protocol.md`。JSON Schema 仍计划放在 `spec/ime/`，尚未落地。
+> 本文位置：`docs/ime/smart-ime-protocol.md`。InputIntent / Proposal 的最小 JSON Schema 在 `spec/ime/w3cos-ime-1.schema.json`。
 
 ## 0. 一句话
 

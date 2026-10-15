@@ -5,12 +5,14 @@
 //! (`dict/pinyin.dict`); librime is not linked. L2 stays off unless
 //! `W3COS_L2` is `1`, `true`, or `script`.
 
+mod commands;
 mod context;
 mod engine;
 mod hub;
 mod intent;
 mod pinyin;
 
+pub use commands::command_utterance;
 pub use context::{
     BufferContext, CommitId, Edit, ImeContext, Rect, SURROUNDING_CAP, Surrounding, TextRange,
 };
