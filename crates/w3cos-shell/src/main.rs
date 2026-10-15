@@ -12,6 +12,7 @@ mod gesture;
 mod handoff;
 mod hpke;
 mod ime_bar;
+mod lexicon;
 mod locale;
 mod windows;
 
@@ -68,6 +69,7 @@ const SWITCHER_SIGNAL: usize = 31;
 const FILE_PREVIEW_SIGNAL: usize = 32;
 const RECEIPT_QUERY_SIGNAL: usize = 33;
 const LOCK_PASSPHRASE_SIGNAL: usize = 34;
+const LEXICON_DRAFT_SIGNAL: usize = 35;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -163,6 +165,13 @@ const OP_HANDOFF_CANCEL: u8 = 93;
 const OP_HANDOFF_REVEAL: u8 = 94;
 const OP_CLIP_MINE: u8 = 95;
 const OP_CLIP_THEIRS: u8 = 96;
+const OP_SETTINGS_LEXICON: u8 = 97;
+const OP_LEXICON_STEALTH: u8 = 98;
+const OP_LEXICON_APP: u8 = 99;
+const OP_LEXICON_SAVE: u8 = 100;
+const OP_LEXICON_DROP: u8 = 101;
+const OP_LEXICON_EXPORT: u8 = 102;
+const OP_LEXICON_CLEAR: u8 = 103;
 
 fn main() {
     shell_main();
@@ -280,6 +289,7 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -318,6 +328,7 @@ fn boot_session_once() {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "w3cos-local".to_string());
             session.unlock_with_passphrase(&passphrase);
+            lexicon::unlock(&passphrase);
         }
         sync_session(session, 0, "");
     });
@@ -418,6 +429,7 @@ fn on_shell_intent(code: u8, draft: &str) {
         }
         OP_LOCK => {
             session.lock_identity();
+            lexicon::lock();
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
@@ -428,6 +440,7 @@ fn on_shell_intent(code: u8, draft: &str) {
             let passphrase = draft.trim();
             if session.unlock_with_passphrase(passphrase) {
                 state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, "");
+                lexicon::unlock(passphrase);
                 sync_session(
                     session,
                     state::get_signal(PHASE_SIGNAL),
@@ -1262,6 +1275,59 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             focus_app(3);
             state::set_signal(SETTINGS_TAB_SIGNAL, 4);
         }
+        OP_SETTINGS_LEXICON => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 5);
+        }
+        OP_LEXICON_STEALTH => {
+            if lexicon::unlocked() {
+                lexicon::toggle_stealth();
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_APP => {
+            if lexicon::unlocked() {
+                lexicon::toggle_app(app_key(state::get_signal(APP_SIGNAL)));
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_SAVE => {
+            state::set_text_signal(LEXICON_DRAFT_SIGNAL, draft.trim());
+            if lexicon::save_line(draft) {
+                push_toast(&locale::t("lexicon-saved"));
+            } else if !lexicon::unlocked() {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_DROP => {
+            if lexicon::remove_line(draft) {
+                push_toast(&locale::t("lexicon-removed"));
+            } else if !lexicon::unlocked() {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_EXPORT => {
+            if let Some(json) = lexicon::export_json() {
+                handoff::publish_clipboard(&json);
+                push_toast(&locale::t("lexicon-exported"));
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+        }
+        OP_LEXICON_CLEAR => {
+            if lexicon::clear() {
+                push_toast(&locale::t("lexicon-cleared"));
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
         OP_PAIR_NO => {
             handoff::codes_differ();
             state::mark_dirty();
@@ -1509,6 +1575,26 @@ fn apply_screen_override() {
         Some("handoff-phone") => {
             focus_app(0);
             handoff::demo_incoming();
+        }
+        Some("lexicon") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 5);
+            lexicon::seed_demo();
+        }
+        Some("lexicon-rank") => {
+            focus_app(0);
+            lexicon::seed_demo();
+            state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+                index: 4,
+                value: String::new(),
+                role: "intent".to_string(),
+                secure: false,
+                x: 280.0,
+                y: 700.0,
+                width: 640.0,
+                height: 36.0,
+            });
+            ime_bar::demo_compose("nihao");
         }
         Some("windows") => {
             state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
@@ -3879,7 +3965,11 @@ fn build_settings_app() -> Component {
                 vec![
                     Component::column(
                         Style {
-                            width: Dimension::Px(200.0),
+                            width: Dimension::Px(if posture() == Posture::Phone {
+                                108.0
+                            } else {
+                                200.0
+                            }),
                             background: Color::from_hex("#1b2c3e"),
                             padding: Edges::all(12.0),
                             gap: 4.0,
@@ -3902,6 +3992,11 @@ fn build_settings_app() -> Component {
                                 &locale::t("settings-devices"),
                                 tab == 4,
                                 OP_SETTINGS_DEVICES,
+                            ),
+                            nav_button(
+                                &locale::t("settings-lexicon"),
+                                tab == 5,
+                                OP_SETTINGS_LEXICON,
                             ),
                         ],
                     ),
@@ -3926,6 +4021,7 @@ fn settings_page(tab: i64) -> Vec<Component> {
         2 => settings_permissions_page(),
         3 => settings_l2_page(),
         4 => settings_devices_page(),
+        5 => settings_lexicon_page(),
         _ => settings_local_page(),
     }
 }
@@ -4455,6 +4551,147 @@ fn settings_heading(title: &str, detail: &str) -> Vec<Component> {
             },
         ),
     ]
+}
+
+fn settings_lexicon_page() -> Vec<Component> {
+    let mut rows = settings_heading(
+        &locale::t("settings-lexicon-title"),
+        &locale::t("settings-lexicon-detail"),
+    );
+    if !lexicon::unlocked() {
+        rows.push(Component::text(
+            locale::t("lexicon-locked"),
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        ));
+        return rows;
+    }
+    rows.extend(lexicon_entry_rows());
+    let stealth_label = if lexicon::stealth_on() {
+        locale::t("lexicon-stealth-on")
+    } else {
+        locale::t("lexicon-stealth-off")
+    };
+    let app = state::get_signal(APP_SIGNAL);
+    let hidden = if lexicon::app_hidden(app_key(app)) {
+        locale::t("on")
+    } else {
+        locale::t("off")
+    };
+    rows.push(lexicon_pair(
+        chrome_button(stealth_label, OP_LEXICON_STEALTH, "#3d5570"),
+        chrome_button(
+            format!("{} · {hidden}", locale::t("lexicon-stealth-app")),
+            OP_LEXICON_APP,
+            "#3d5570",
+        ),
+    ));
+    rows.push(lexicon_draft_field());
+    let placeholder = locale::t("lexicon-entry-placeholder");
+    let mut save = chrome_button(locale::t("lexicon-save"), OP_LEXICON_SAVE, "#0c6d4c");
+    save.on_click = EventAction::Invoke {
+        code: OP_LEXICON_SAVE,
+        input_placeholder: placeholder.clone(),
+    };
+    let mut drop = chrome_button(locale::t("lexicon-drop"), OP_LEXICON_DROP, "#3d5570");
+    drop.on_click = EventAction::Invoke {
+        code: OP_LEXICON_DROP,
+        input_placeholder: placeholder,
+    };
+    rows.push(lexicon_pair(save, drop));
+    rows.push(lexicon_pair(
+        chrome_button(locale::t("lexicon-export"), OP_LEXICON_EXPORT, "#3d5570"),
+        chrome_button(locale::t("lexicon-clear"), OP_LEXICON_CLEAR, "#9a3412"),
+    ));
+    rows
+}
+
+fn lexicon_pair(mut left: Component, mut right: Component) -> Component {
+    left.style.flex_grow = 1.0;
+    right.style.flex_grow = 1.0;
+    Component::row(
+        Style {
+            gap: 8.0,
+            align_items: AlignItems::Center,
+            ..Style::default()
+        },
+        vec![left, right],
+    )
+}
+
+fn lexicon_entry_rows() -> Vec<Component> {
+    let entries = lexicon::entries();
+    if entries.is_empty() {
+        return vec![Component::text(
+            locale::t("lexicon-empty"),
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        )];
+    }
+    entries
+        .iter()
+        .take(8)
+        .map(|entry| {
+            let line = if entry.kind == w3cos_ime::EntryKind::Alias {
+                locale::t_args(
+                    "lexicon-alias",
+                    &[("alias", &entry.text), ("target", &entry.extra)],
+                )
+            } else {
+                let freq = entry.freq.to_string();
+                locale::t_args(
+                    "lexicon-row",
+                    &[
+                        ("text", &entry.text),
+                        ("extra", &entry.extra),
+                        ("freq", &freq),
+                    ],
+                )
+            };
+            Component::text(
+                line,
+                Style {
+                    font_size: 14.0,
+                    color: Color::from_hex("#f4f7fb"),
+                    ..Style::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn lexicon_draft_field() -> Component {
+    let mut style = Style {
+        font_size: 13.0,
+        color: ink_token(),
+        background: Color::rgba(244, 241, 234, 18),
+        border_radius: 10.0,
+        border_width: 1.0,
+        border_color: Color::rgba(244, 241, 234, 31),
+        padding: Edges::xy(10.0, 6.0),
+        min_height: Dimension::Px(if state::pointer_is_coarse() {
+            48.0
+        } else {
+            32.0
+        }),
+        ..Style::default()
+    };
+    style.custom_properties = Some(HashMap::from([(
+        "--w3cos-ime".to_string(),
+        "text".to_string(),
+    )]));
+    note_preedit(&mut style, "text");
+    Component::text_input(
+        state::get_signal_text(LEXICON_DRAFT_SIGNAL),
+        locale::t("lexicon-entry-placeholder"),
+        style,
+    )
 }
 
 fn settings_local_page() -> Vec<Component> {
@@ -7145,5 +7382,125 @@ mod shell_ux_tests {
         assert!(page.contains("从书桌继续"));
         locale::set_locale("en");
         state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    fn type_spelling(spelling: &str) {
+        for ch in spelling.chars() {
+            assert!(ime_bar::on_key(&ch.to_string()));
+        }
+    }
+
+    #[test]
+    fn personal_lexicon_learns_on_accept_and_skips_secure_fields() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        lexicon::reset_for_tests();
+        ime_bar::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 120.0,
+            y: 700.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        type_spelling("nihao");
+        assert_eq!(
+            ime_bar::candidate_texts().first().map(String::as_str),
+            Some("你好"),
+            "an empty store keeps the dictionary head"
+        );
+        for step in 0..3 {
+            let texts = ime_bar::candidate_texts();
+            if step == 1 {
+                assert_eq!(
+                    texts.first().map(String::as_str),
+                    Some("你好"),
+                    "one accept stays under the dictionary head"
+                );
+            }
+            let at = texts.iter().position(|text| text == "您好").expect("您好");
+            assert!(ime_bar::commit_candidate(at));
+            if step < 2 {
+                type_spelling("nihao");
+            }
+        }
+        assert_eq!(lexicon::freq_of("您好"), Some(3));
+        assert!(lexicon::neg_of("你好").unwrap_or(0) >= 1);
+        type_spelling("nihao");
+        assert_eq!(
+            ime_bar::candidate_texts().first().map(String::as_str),
+            Some("您好")
+        );
+
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 8,
+            value: String::new(),
+            role: "password".into(),
+            secure: true,
+            x: 120.0,
+            y: 400.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        for ch in "mima".chars() {
+            assert!(!ime_bar::on_key(&ch.to_string()));
+        }
+        lexicon::note_commit("app-desktop", true, "mima", "密码词", &["另一词".into()]);
+        assert!(lexicon::freq_of("密码词").is_none());
+        assert_eq!(lexicon::freq_of("您好"), Some(3));
+
+        lexicon::reset_for_tests();
+        lexicon::seed_demo();
+        state::set_signal(SETTINGS_TAB_SIGNAL, 5);
+        let page = Component::column(Style::default(), settings_lexicon_page());
+        let blob = text_blob(&page);
+        assert!(blob.contains("您好"), "{blob}");
+        assert!(blob.contains("nihao"), "{blob}");
+        assert!(blob.contains("老王"), "{blob}");
+        assert!(blob.contains("王明"), "{blob}");
+        assert!(blob.contains("导出"), "{blob}");
+        assert!(blob.contains("清空词库"), "{blob}");
+        assert!(blob.contains("隐身输入"), "{blob}");
+        assert!(!blob.contains("已连接"), "{blob}");
+        let dumped = format!("{page:?}");
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!dumped.contains(hex), "{hex}");
+        }
+        on_shell_intent(OP_LEXICON_SAVE, "词库乙 ceshi");
+        assert_eq!(lexicon::freq_of("词库乙"), Some(1));
+        on_shell_intent(OP_LEXICON_STEALTH, "");
+        assert!(lexicon::stealth_on());
+        ime_bar::reset_for_tests();
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 120.0,
+            y: 700.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        type_spelling("nihao");
+        let at = ime_bar::candidate_texts()
+            .iter()
+            .position(|text| text == "您好")
+            .expect("您好");
+        assert!(ime_bar::commit_candidate(at));
+        assert_eq!(lexicon::freq_of("您好"), Some(3));
+        on_shell_intent(OP_LEXICON_CLEAR, "");
+        assert!(lexicon::entries().is_empty());
+        assert!(lexicon::stealth_on());
+
+        lexicon::reset_for_tests();
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        locale::set_locale("en");
     }
 }

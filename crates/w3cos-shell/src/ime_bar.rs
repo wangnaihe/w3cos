@@ -236,6 +236,12 @@ fn refresh(session: &mut Session) {
             _ => {}
         }
     }
+    if composing
+        && !session.secure
+        && let Some(ranked) = crate::lexicon::ranked(&session.spelling)
+    {
+        session.candidates = ranked;
+    }
     let slots = text_slots(session);
     let pages = session.candidates.len().div_ceil(slots).max(1);
     if session.page >= pages {
@@ -259,6 +265,8 @@ fn commit_at(session: &mut Session, index: usize) -> bool {
     if session.spelling.is_empty() {
         return false;
     }
+    let spelling = session.spelling.clone();
+    let skipped: Vec<String> = session.candidates.iter().take(index).cloned().collect();
     let Some(chunk) = session.candidates.get(index).cloned().or_else(|| {
         if index == 0 {
             Some(session.spelling.clone())
@@ -268,6 +276,9 @@ fn commit_at(session: &mut Session, index: usize) -> bool {
     }) else {
         return false;
     };
+    if !session.secure {
+        crate::lexicon::note_commit(&learning_scope(), false, &spelling, &chunk, &skipped);
+    }
     session.base.push_str(&chunk);
     session.undo.push(chunk);
     session.spelling.clear();
@@ -343,6 +354,10 @@ fn adopt(session: &mut Session, note: &ImeFieldNote) {
     reopen_ime(session);
 }
 
+fn learning_scope() -> String {
+    super::app_key(state::get_signal(super::APP_SIGNAL)).to_string()
+}
+
 fn is_letter(name: &str) -> bool {
     name.len() == 1 && name.as_bytes()[0].is_ascii_lowercase()
 }
@@ -369,6 +384,12 @@ pub(crate) fn on_key(name: &str) -> bool {
         if name == "Escape" {
             if session.spelling.is_empty() {
                 return false;
+            }
+            if !session.secure
+                && let Some(top) = session.candidates.first().cloned()
+            {
+                let spelling = session.spelling.clone();
+                crate::lexicon::note_reject(&learning_scope(), false, &spelling, &top);
             }
             session.spelling.clear();
             session.page = 0;
@@ -962,6 +983,24 @@ fn candidate_button(label: String, code: u8) -> Component {
     };
     keep_ime(&mut style);
     Component::button_with_click(label, style, invoke(code))
+}
+
+pub(crate) fn demo_compose(spelling: &str) {
+    with_session(|session| {
+        session.secure = false;
+        session.has_field = true;
+        session.role = "intent".into();
+        session.override_pinyin = Some(true);
+        session.spelling = spelling.to_string();
+        session.base.clear();
+        session.page = 0;
+        refresh(session);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn candidate_texts() -> Vec<String> {
+    with_session(|session| session.candidates.clone())
 }
 
 #[cfg(test)]
