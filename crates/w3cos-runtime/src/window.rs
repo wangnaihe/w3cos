@@ -246,17 +246,59 @@ const BACK_SWIPE_SLOP: f32 = 12.0;
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
 const BACK_SWIPE_COMMIT_DISTANCE: f32 = 72.0;
 
+const IME_LETTERS: [&str; 26] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+const IME_DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
 fn shell_shortcut_name(logical: &Key, control: bool, super_key: bool) -> &'static str {
     if matches!(logical, Key::Named(NamedKey::Escape)) {
         return "Escape";
     }
-    if (control || super_key)
-        && let Key::Character(text) = logical
-        && text.eq_ignore_ascii_case("k")
-    {
-        return "Mod+K";
+    let modified = control || super_key;
+    if modified && matches!(logical, Key::Named(NamedKey::Space)) {
+        return "Mod+Space";
+    }
+    if modified && let Key::Character(text) = logical {
+        if text.eq_ignore_ascii_case("k") {
+            return "Mod+K";
+        }
+        if text.eq_ignore_ascii_case("z") {
+            return "Mod+Z";
+        }
+        if text.as_str() == " " {
+            return "Mod+Space";
+        }
     }
     ""
+}
+
+fn ime_char_name(text: impl AsRef<str>) -> Option<&'static str> {
+    let text = text.as_ref();
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    match ch {
+        'a'..='z' => Some(IME_LETTERS[(ch as u8 - b'a') as usize]),
+        'A'..='Z' => Some(IME_LETTERS[(ch as u8 - b'A') as usize]),
+        '1'..='9' => Some(IME_DIGITS[(ch as u8 - b'1') as usize]),
+        ' ' => Some("Space"),
+        _ => None,
+    }
+}
+
+/// Keys the shell pinyin session may consume before they reach the field.
+fn ime_key_name(logical: &Key) -> Option<&'static str> {
+    match logical {
+        Key::Named(NamedKey::Backspace) => Some("Backspace"),
+        Key::Named(NamedKey::Space) => Some("Space"),
+        Key::Named(NamedKey::Enter) => Some("Enter"),
+        Key::Character(text) => ime_char_name(text),
+        _ => None,
+    }
 }
 
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
@@ -5864,6 +5906,69 @@ impl App {
                 .any(|id| crate::dom::tag_name(id as u32).eq_ignore_ascii_case("label"))
     }
 
+    fn note_ime_target(&self, idx: usize) {
+        let flat = layout::pre_flatten(&self.root);
+        let Some(node) = flat.get(idx) else {
+            return;
+        };
+        let ComponentKind::TextInput { value, secure, .. } = node.kind else {
+            return;
+        };
+        let role = node
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-ime"))
+            .cloned()
+            .unwrap_or_default();
+        let current = self
+            .text_input_values
+            .get(&idx)
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        let rect = self
+            .hit_nodes
+            .iter()
+            .find(|hit| hit.index == idx)
+            .map(|hit| hit.rect);
+        state::note_ime_field(state::ImeFieldNote {
+            index: idx,
+            value: current,
+            role,
+            secure: *secure,
+            x: rect.map(|rect| rect.x).unwrap_or(0.0),
+            y: rect.map(|rect| rect.y).unwrap_or(0.0),
+            width: rect.map(|rect| rect.width).unwrap_or(0.0),
+            height: rect.map(|rect| rect.height).unwrap_or(0.0),
+        });
+    }
+
+    fn apply_queued_ime_text(&mut self) {
+        let queued = state::take_ime_replacements();
+        if queued.is_empty() {
+            return;
+        }
+        let mut restore = None;
+        for (index, text) in queued {
+            if !matches!(
+                self.get_kind_at(index),
+                Some(ComponentKind::TextInput { .. })
+            ) {
+                continue;
+            }
+            self.apply_native_text_input(index, text, "", "insertReplacementText", false);
+            restore = Some(index);
+        }
+        if let Some(index) = restore {
+            let focused_is_text = self.focused_index.is_some_and(|idx| {
+                matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. }))
+            });
+            if !focused_is_text {
+                self.focus_text_input(index);
+            }
+        }
+    }
+
     fn apply_native_text_input(
         &mut self,
         idx: usize,
@@ -5980,6 +6085,7 @@ impl App {
                 if refreshed && matches!(action, EventAction::Invoke { .. }) {
                     sync_marked_text_inputs(&self.root, &mut self.text_input_values);
                 }
+                self.apply_queued_ime_text();
                 self.repaint_after_interaction();
                 return;
             }
@@ -8641,19 +8747,31 @@ impl ApplicationHandler for App {
                 is_synthetic: false,
                 ..
             } => {
+                if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                    eprintln!(
+                        "[W3C OS][KEY] logical={:?} state={:?} text={:?}",
+                        event.logical_key, event.state, event.text
+                    );
+                }
                 if event.state == ElementState::Pressed && !event.repeat {
                     let shortcut = shell_shortcut_name(
                         &event.logical_key,
                         self.modifiers.control_key(),
                         self.modifiers.super_key(),
                     );
-                    if !shortcut.is_empty() && state::shell_key(shortcut) {
-                        if let Some(placeholder) = state::take_focus_placeholder() {
-                            self.focus_input_placeholder(&placeholder);
+                    if !shortcut.is_empty() {
+                        if let Some(focus_idx) = self.focused_index {
+                            self.note_ime_target(focus_idx);
                         }
-                        self.rebuild_if_dirty();
-                        self.request_repaint();
-                        return;
+                        if state::shell_key(shortcut) {
+                            self.apply_queued_ime_text();
+                            if let Some(placeholder) = state::take_focus_placeholder() {
+                                self.focus_input_placeholder(&placeholder);
+                            }
+                            self.rebuild_if_dirty();
+                            self.request_repaint();
+                            return;
+                        }
                     }
                 }
                 if event.state == ElementState::Pressed
@@ -8727,6 +8845,19 @@ impl ApplicationHandler for App {
                                     .is_some_and(|composition| composition.index == focus_idx)
                                 {
                                     return;
+                                }
+                                if !self.modifiers.control_key()
+                                    && !self.modifiers.super_key()
+                                    && !self.modifiers.alt_key()
+                                    && let Some(name) = ime_key_name(&event.logical_key)
+                                {
+                                    self.note_ime_target(focus_idx);
+                                    if state::shell_key(name) {
+                                        self.apply_queued_ime_text();
+                                        self.rebuild_if_dirty();
+                                        self.request_repaint();
+                                        return;
+                                    }
                                 }
                                 if let Key::Named(NamedKey::Backspace) = event.logical_key {
                                     let next = if self.dom_mode {
@@ -9009,6 +9140,12 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                }
+            }
+
+            WindowEvent::Focused(focused) => {
+                if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                    eprintln!("[W3C OS][FOCUS] {focused}");
                 }
             }
 
