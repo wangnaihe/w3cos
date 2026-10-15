@@ -4663,8 +4663,9 @@ impl App {
                 self.mouse_x, self.mouse_y, self.pressed_index, self.touch_scroll_active
             );
         }
+        let drag_consumed = state::shell_drag_end();
         if let Some(pressed_idx) = self.pressed_index.take() {
-            if state::shell_drag_end() {
+            if drag_consumed {
                 self.pointer_down_default_prevented = false;
                 self.rebuild_if_dirty();
                 self.repaint_after_interaction();
@@ -4701,6 +4702,10 @@ impl App {
                     self.repaint_after_interaction();
                 }
             }
+        } else if drag_consumed {
+            self.pointer_down_default_prevented = false;
+            self.rebuild_if_dirty();
+            self.repaint_after_interaction();
         } else {
             self.pointer_down_default_prevented = false;
         }
@@ -8238,7 +8243,7 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 // winit gives physical pixels; convert to logical for hit testing
                 self.set_pointer_logical(position.x, position.y);
-                if self.pressed_index.is_some() {
+                if self.pressed_index.is_some() || state::shell_drag_is_active() {
                     state::shell_drag_move(self.mouse_x, self.mouse_y);
                     self.rebuild_if_dirty();
                 }

@@ -307,6 +307,10 @@ pub fn shell_drag_move(x: f32, y: f32) {
     }
 }
 
+pub fn shell_drag_is_active() -> bool {
+    DRAG_CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
 /// Returns true when the pointer moved far enough that the click should not run.
 pub fn shell_drag_end() -> bool {
     let finished = DRAG_CAPTURE.with(|slot| slot.borrow_mut().take());
