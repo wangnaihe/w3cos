@@ -194,6 +194,10 @@ pub(super) fn pin_test_fontconfig() {
     }
 }
 
+/// Test builds ship a CJK subset so layout checks do not depend on the host.
+/// Release linkage probes stay inside the AOT size budget, so production
+/// fallback keeps using installed faces.
+#[cfg(test)]
 fn bundled_cjk_face() -> Option<LoadedFont> {
     static FACE: OnceLock<Option<LoadedFont>> = OnceLock::new();
     FACE.get_or_init(|| {
@@ -245,6 +249,7 @@ fn lookup_fallback(character: char) -> Option<LoadedFont> {
     {
         return Some(font);
     }
+    #[cfg(test)]
     if is_cjk(character)
         && let Some(font) = bundled_cjk_face()
         && inks(&font, character)
