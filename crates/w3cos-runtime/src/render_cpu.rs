@@ -761,7 +761,7 @@ fn render_node(
                 );
             }
         }
-        if let Some(ref shadow) = style.box_shadow {
+        if let Some(ref shadow) = style.box_shadow.filter(|shadow| !shadow.inset) {
             draw_box_shadow(
                 pixmap,
                 rect,
@@ -843,6 +843,17 @@ fn render_node(
                 }
             }
         }
+    }
+
+    if let Some(ref shadow) = style.box_shadow.filter(|shadow| shadow.inset) {
+        draw_box_shadow(
+            pixmap,
+            rect,
+            shadow,
+            style.border_radius,
+            style.opacity,
+            clip_mask,
+        );
     }
 
     let has_edge_border = style.border_top_width.is_some()
@@ -1242,6 +1253,10 @@ fn draw_box_shadow(
     opacity: f32,
     clip_mask: Option<&Mask>,
 ) {
+    if shadow.inset {
+        draw_inset_box_shadow(pixmap, rect, shadow, radius, opacity, clip_mask);
+        return;
+    }
     let spread = shadow.spread_radius;
     let shadow_rect = LayoutRect {
         x: rect.x + shadow.offset_x - spread,
@@ -1269,6 +1284,91 @@ fn draw_box_shadow(
         };
         draw_rect(pixmap, r, c, radius + expand, clip_mask);
     }
+}
+
+fn draw_inset_box_shadow(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    shadow: &w3cos_std::style::BoxShadow,
+    radius: f32,
+    opacity: f32,
+    clip_mask: Option<&Mask>,
+) {
+    let Some(mut mask) = Mask::new(pixmap.width(), pixmap.height()) else {
+        return;
+    };
+    let Some(outer) = rounded_rect_path(rect.x, rect.y, rect.width, rect.height, radius) else {
+        return;
+    };
+    mask.fill_path(&outer, FillRule::Winding, true, Transform::identity());
+    if let Some(parent) = clip_mask {
+        for (pixel, parent_pixel) in mask.data_mut().iter_mut().zip(parent.data().iter()) {
+            *pixel = ((*pixel as u16 * *parent_pixel as u16) / 255) as u8;
+        }
+    }
+    let color = apply_opacity(shadow.color, opacity);
+    let steps = ((shadow.blur_radius / 2.0).ceil() as u32).clamp(1, 8);
+    for step in 0..steps {
+        let t = step as f32 / steps as f32;
+        let expand = shadow.blur_radius * t;
+        let alpha = ((1.0 - t) * color.a as f32 / steps as f32) as u8;
+        if alpha == 0 {
+            continue;
+        }
+        let shrink = shadow.spread_radius + expand;
+        let inner = LayoutRect {
+            x: rect.x + shadow.offset_x + shrink,
+            y: rect.y + shadow.offset_y + shrink,
+            width: (rect.width - shrink * 2.0).max(0.0),
+            height: (rect.height - shrink * 2.0).max(0.0),
+        };
+        let mut builder = PathBuilder::new();
+        push_round_rect(
+            &mut builder,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            radius,
+        );
+        if inner.width > 0.5 && inner.height > 0.5 {
+            push_round_rect(
+                &mut builder,
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height,
+                (radius - shrink).max(0.0),
+            );
+        }
+        let Some(path) = builder.finish() else {
+            continue;
+        };
+        let mut paint = Paint::default();
+        paint.set_color(SkColor::from_rgba8(color.r, color.g, color.b, alpha));
+        paint.anti_alias = true;
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::EvenOdd,
+            Transform::identity(),
+            Some(&mask),
+        );
+    }
+}
+
+fn push_round_rect(builder: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+    let radius = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    builder.move_to(x + radius, y);
+    builder.line_to(x + w - radius, y);
+    builder.quad_to(x + w, y, x + w, y + radius);
+    builder.line_to(x + w, y + h - radius);
+    builder.quad_to(x + w, y + h, x + w - radius, y + h);
+    builder.line_to(x + radius, y + h);
+    builder.quad_to(x, y + h, x, y + h - radius);
+    builder.line_to(x, y + radius);
+    builder.quad_to(x, y, x + radius, y);
+    builder.close();
 }
 
 fn draw_rect(
@@ -1865,8 +1965,9 @@ fn draw_gradient_pixels(
             center_x,
             center_y,
             shape,
+            radius,
         } => Some(crate::background_image::radial_gradient_axes(
-            rect, *center_x, *center_y, *shape,
+            rect, *center_x, *center_y, *shape, *radius,
         )),
         _ => None,
     };
@@ -2116,6 +2217,95 @@ mod font_cjk_tests {
 
         assert!(pixmap.pixels().iter().any(|pixel| pixel.red() > 0));
         assert!(pixmap.pixels().iter().any(|pixel| pixel.blue() > 0));
+    }
+
+    #[test]
+    fn inset_shadow_stays_inside_the_box_and_outer_shadow_does_not() {
+        let rect = LayoutRect {
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let mut inset = Pixmap::new(40, 40).unwrap();
+        draw_box_shadow(
+            &mut inset,
+            rect,
+            &w3cos_std::style::BoxShadow {
+                offset_x: 0.0,
+                offset_y: 4.0,
+                blur_radius: 0.0,
+                spread_radius: 0.0,
+                color: Color::rgb(255, 0, 0),
+                inset: true,
+            },
+            0.0,
+            1.0,
+            None,
+        );
+        assert_eq!(inset.pixel(1, 1).unwrap().alpha(), 0);
+        assert!(inset.pixel(20, 12).unwrap().red() > 200);
+        assert_eq!(inset.pixel(20, 24).unwrap().alpha(), 0);
+
+        let mut outer = Pixmap::new(40, 40).unwrap();
+        draw_box_shadow(
+            &mut outer,
+            rect,
+            &w3cos_std::style::BoxShadow::new(0.0, 6.0, 0.0, 0.0, Color::rgb(0, 0, 255)),
+            0.0,
+            1.0,
+            None,
+        );
+        assert!(outer.pixel(20, 32).unwrap().blue() > 0);
+    }
+
+    #[test]
+    fn layered_wallpaper_gradient_is_not_a_flat_fill() {
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let style = Style {
+            background: Color::from_hex("#101820"),
+            background_image: Some(
+                "radial-gradient(40px 16px at 0% 0%, rgba(120, 168, 186, 0.95), transparent 70%), linear-gradient(180deg, #1b3344 0%, #101820 100%)"
+                    .to_string(),
+            ),
+            ..Style::default()
+        };
+        let kind = ComponentKind::Box;
+        let nodes = [(
+            0usize,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 40.0,
+            },
+            &kind,
+            &style,
+        )];
+        let mut pixmap = Pixmap::new(80, 40).unwrap();
+        render_frame(
+            &mut pixmap,
+            &nodes,
+            &font,
+            &[None],
+            &HashMap::new(),
+            None,
+            &mut ClipMaskCache::default(),
+        );
+        let top = pixmap.pixel(2, 2).unwrap();
+        let bottom = pixmap.pixel(2, 36).unwrap();
+        assert!(
+            top.red() != bottom.red()
+                || top.green() != bottom.green()
+                || top.blue() != bottom.blue(),
+            "top {:?} bottom {:?}",
+            (top.red(), top.green(), top.blue()),
+            (bottom.red(), bottom.green(), bottom.blue())
+        );
     }
 
     #[test]

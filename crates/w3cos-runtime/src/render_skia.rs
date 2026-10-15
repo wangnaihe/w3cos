@@ -6478,9 +6478,11 @@ fn gradient_shader_for_layer(
             center_x,
             center_y,
             shape,
+            radius: explicit,
         } => {
-            let (center, (radius_x, radius_y)) =
-                crate::background_image::radial_gradient_axes(rect, *center_x, *center_y, *shape);
+            let (center, (radius_x, radius_y)) = crate::background_image::radial_gradient_axes(
+                rect, *center_x, *center_y, *shape, *explicit,
+            );
             let radius = radius_x.max(radius_y);
             gradient_shader::radial(
                 center,

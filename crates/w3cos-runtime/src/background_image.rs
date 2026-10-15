@@ -109,6 +109,8 @@ pub(crate) enum GradientKind {
         center_x: f32,
         center_y: f32,
         shape: RadialShape,
+        /// Explicit CSS radii in px. `None` uses the farthest-side default.
+        radius: Option<(f32, f32)>,
     },
 }
 
@@ -396,11 +398,15 @@ pub(crate) fn radial_gradient_axes(
     center_x: f32,
     center_y: f32,
     shape: RadialShape,
+    explicit: Option<(f32, f32)>,
 ) -> ((f32, f32), (f32, f32)) {
     let center = (
         rect.x + center_x * rect.width,
         rect.y + center_y * rect.height,
     );
+    if let Some((radius_x, radius_y)) = explicit {
+        return (center, (radius_x.max(1.0), radius_y.max(1.0)));
+    }
     if shape == RadialShape::Circle {
         let (_, radius) = radial_gradient_circle(rect, center_x, center_y);
         return (center, (radius, radius));
@@ -808,6 +814,7 @@ fn parse_gradient(value: &str) -> Option<(GradientKind, Vec<GradientStop>)> {
                     center_x: 0.5,
                     center_y: 0.5,
                     shape: RadialShape::Ellipse,
+                    radius: None,
                 },
                 arguments,
                 false,
@@ -818,6 +825,7 @@ fn parse_gradient(value: &str) -> Option<(GradientKind, Vec<GradientStop>)> {
                     center_x: 0.5,
                     center_y: 0.5,
                     shape: RadialShape::Ellipse,
+                    radius: None,
                 },
                 arguments,
                 true,
@@ -839,14 +847,26 @@ fn parse_gradient(value: &str) -> Option<(GradientKind, Vec<GradientStop>)> {
         GradientKind::Radial { .. } => {
             let mut center = (0.5, 0.5);
             let mut shape = RadialShape::Ellipse;
+            let mut radius = None;
             if let Some(header) = parts.first().copied()
                 && parse_gradient_stop(header).is_none()
             {
-                if header
+                let sizing = header.split(" at ").next().unwrap_or(header);
+                if sizing
                     .split_ascii_whitespace()
                     .any(|part| part.eq_ignore_ascii_case("circle"))
                 {
                     shape = RadialShape::Circle;
+                }
+                let lengths = sizing
+                    .split_ascii_whitespace()
+                    .filter_map(parse_css_px)
+                    .collect::<Vec<_>>();
+                if lengths.len() >= 2 {
+                    shape = RadialShape::Ellipse;
+                    radius = Some((lengths[0], lengths[1]));
+                } else if let Some(radius_px) = lengths.first().copied() {
+                    radius = Some((radius_px, radius_px));
                 }
                 if let Some(at) = header.find(" at ") {
                     let coords = header[at + 4..].split_whitespace().collect::<Vec<_>>();
@@ -861,6 +881,7 @@ fn parse_gradient(value: &str) -> Option<(GradientKind, Vec<GradientStop>)> {
                 center_x: center.0,
                 center_y: center.1,
                 shape,
+                radius,
             }
         }
     };
@@ -936,8 +957,17 @@ fn gradient_position(value: &str, horizontal: bool) -> Option<f32> {
         "center" => Some(0.5),
         "right" if horizontal => Some(1.0),
         "bottom" if !horizontal => Some(1.0),
-        value => parse_percent(value),
+        value => value
+            .strip_suffix('%')
+            .and_then(|number| number.trim().parse::<f32>().ok())
+            .map(|number| number / 100.0),
     }
+}
+
+fn parse_css_px(value: &str) -> Option<f32> {
+    let number = value.trim().strip_suffix("px")?;
+    let parsed = number.trim().parse::<f32>().ok()?;
+    parsed.is_finite().then_some(parsed)
 }
 
 fn expand_repeating_stops(
@@ -1742,6 +1772,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_radial_size_and_negative_position_are_kept() {
+        let (kind, stops) = parse_gradient(
+            "radial-gradient(980px 560px at 12% -8%, rgba(120, 168, 186, 0.22), transparent 62%)",
+        )
+        .expect("wallpaper radial");
+        match kind {
+            GradientKind::Radial {
+                center_x,
+                center_y,
+                shape,
+                radius,
+            } => {
+                assert!((center_x - 0.12).abs() < 0.001);
+                assert!((center_y + 0.08).abs() < 0.001);
+                assert_eq!(shape, RadialShape::Ellipse);
+                assert_eq!(radius, Some((980.0, 560.0)));
+            }
+            other => panic!("expected a radial gradient, got {other:?}"),
+        }
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[1].position, 0.62);
+    }
+
+    #[test]
     fn repeating_directional_and_shaped_gradients_normalize_once() {
         let style = Style {
             background_image: Some(
@@ -1774,7 +1828,8 @@ mod tests {
             GradientKind::Radial {
                 center_x: 1.0,
                 center_y: 1.0,
-                shape: RadialShape::Circle
+                shape: RadialShape::Circle,
+                radius: None
             }
         ));
         assert_eq!(layers[0].blend_mode, BackgroundBlendMode::Multiply);

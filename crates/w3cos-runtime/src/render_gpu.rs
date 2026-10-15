@@ -1023,6 +1023,12 @@ fn draw_box_shadow(
     radius: f32,
     dpi: Affine,
 ) {
+    // Inset shadows are clipped to the padding box. Painting them as a drop
+    // shadow puts the blur outside the control. CPU renders the inset; this
+    // path still has no clip-to-self for an inner blur.
+    if shadow.inset {
+        return;
+    }
     let spread = shadow.spread_radius;
     let shadow_rect = Rect::new(
         (rect.x + shadow.offset_x - spread) as f64,
@@ -1080,9 +1086,12 @@ fn draw_gradient(
             center_x,
             center_y,
             shape,
+            radius,
         } => {
-            let (center, (radius_x, radius_y)) =
-                crate::background_image::radial_gradient_axes(rect, *center_x, *center_y, *shape);
+            let (center, (radius_x, radius_y)) = crate::background_image::radial_gradient_axes(
+                rect, *center_x, *center_y, *shape, *radius,
+            );
+            // Vello's radial gradient is a circle. An ellipse uses the longer axis.
             let radius = radius_x.max(radius_y);
             Gradient::new_radial(center, radius).with_stops(stops.as_slice())
         }
