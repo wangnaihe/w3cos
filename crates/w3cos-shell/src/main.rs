@@ -21,7 +21,7 @@ use crate::state;
 use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
+    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellCommand, ShellContext,
 };
 use w3cos_ai_bridge::permissions::{AgentPermissions, BridgeOp};
 use w3cos_ai_bridge::shell_tools::{self, ShellView};
@@ -70,6 +70,7 @@ const FILE_PREVIEW_SIGNAL: usize = 32;
 const RECEIPT_QUERY_SIGNAL: usize = 33;
 const LOCK_PASSPHRASE_SIGNAL: usize = 34;
 const LEXICON_DRAFT_SIGNAL: usize = 35;
+const CONFIRM_FOCUS_SIGNAL: usize = 36;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -290,6 +291,7 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -505,9 +507,20 @@ fn on_shell_intent(code: u8, draft: &str) {
         }
         OP_RUN_TERMINAL => open_process_permission(session),
         OP_PERM_ONCE => {
-            state::set_signal(PERM_SIGNAL, 0);
-            if session.identity_unlocked() {
+            if !session.identity_unlocked() {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("perm-locked"),
+                );
+            } else {
+                state::set_signal(PERM_SIGNAL, 0);
                 run_terminal_from_button(session);
+            }
+        }
+        OP_PERM_DENY => {
+            if session.identity_unlocked() {
+                deny_process_permission(session);
             } else {
                 sync_session(
                     session,
@@ -516,7 +529,6 @@ fn on_shell_intent(code: u8, draft: &str) {
                 );
             }
         }
-        OP_PERM_DENY => deny_process_permission(session),
         OP_L2_TOGGLE => toggle_l2(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
@@ -536,10 +548,22 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
     state::set_text_signal(DRAFT_SIGNAL, utterance);
     match session.propose(utterance, ctx) {
         ProposeResult::Confirm(proposal) => {
-            state::set_text_signal(SUMMARY_SIGNAL, proposal.summary);
-            state::set_text_signal(IMPACT_SIGNAL, proposal.impact);
+            let focus = if matches!(proposal.command, ShellCommand::ToggleNight) {
+                "cancel"
+            } else {
+                "confirm"
+            };
+            state::set_text_signal(SUMMARY_SIGNAL, confirm_title(&proposal.command, ctx));
+            state::set_text_signal(
+                IMPACT_SIGNAL,
+                confirm_impact(&proposal.command, session.context_shared()),
+            );
             state::set_text_signal(TIER_SIGNAL, tier_name(proposal.tier));
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, focus);
             sync_session(session, 1, "");
+            if session.identity_unlocked() {
+                state::request_focus_label(&locale::t(focus));
+            }
         }
         ProposeResult::Plan { utterance } => match agent_host::begin(&utterance) {
             Ok(update) => apply_host_update(session, update),
@@ -594,6 +618,37 @@ fn tier_name(tier: IntentTier) -> &'static str {
         IntentTier::L1 => "L1",
         IntentTier::L0 => "L0",
         IntentTier::Unspecified => "",
+    }
+}
+
+fn confirm_title(command: &ShellCommand, ctx: &ShellContext) -> String {
+    match command {
+        ShellCommand::OpenApp(ShellApp::Files) => locale::t("chip-files"),
+        ShellCommand::OpenApp(ShellApp::Terminal) => locale::t("chip-terminal"),
+        ShellCommand::OpenApp(ShellApp::Settings) => locale::t("chip-settings"),
+        ShellCommand::OpenApp(ShellApp::Browser) => locale::t("confirm-open-browser"),
+        ShellCommand::OpenApp(ShellApp::Editor) => locale::t("confirm-open-editor"),
+        ShellCommand::OpenApp(ShellApp::Agent) => locale::t("confirm-open-agent"),
+        ShellCommand::OpenApp(ShellApp::Desktop) => locale::t("confirm-open-desktop"),
+        ShellCommand::ToggleNight if ctx.night => locale::t("confirm-night-off"),
+        ShellCommand::ToggleNight => locale::t("confirm-night-on"),
+        ShellCommand::ListApps => locale::t("chip-apps"),
+        ShellCommand::ShowContext => locale::t("confirm-context"),
+        ShellCommand::Help => locale::t("confirm-help"),
+    }
+}
+
+fn confirm_impact(command: &ShellCommand, shared: bool) -> String {
+    match command {
+        ShellCommand::OpenApp(app) => {
+            let name = app_label(app.signal_value());
+            locale::t_args("impact-navigate", &[("name", &name)])
+        }
+        ShellCommand::ToggleNight => locale::t("impact-night"),
+        ShellCommand::ListApps => locale::t("impact-list"),
+        ShellCommand::ShowContext if shared => locale::t("impact-context"),
+        ShellCommand::ShowContext => locale::t("impact-context-hidden"),
+        ShellCommand::Help => locale::t("impact-help"),
     }
 }
 
@@ -698,6 +753,12 @@ fn apply_host_update(session: &mut IntentSession, update: agent_host::HostUpdate
     state::set_text_signal(IMPACT_SIGNAL, update.impact);
     state::set_text_signal(TIER_SIGNAL, update.tier);
     state::set_text_signal(STEPS_SIGNAL, update.steps);
+    if update.phase == 1 {
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "cancel");
+        if session.identity_unlocked() {
+            state::request_focus_label(&locale::t("cancel"));
+        }
+    }
     sync_session(session, update.phase, &update.notice);
     if let Ok(path) = std::env::var("W3COS_AGENT_TRACE") {
         let line = format!(
@@ -876,7 +937,10 @@ fn remember_notice(text: &str) {
 
 fn open_process_permission(session: &mut IntentSession) {
     state::set_signal(PERM_SIGNAL, 1);
-    if !session.identity_unlocked() {
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+    if session.identity_unlocked() {
+        state::request_focus_label(&locale::t("perm-deny"));
+    } else {
         sync_session(
             session,
             state::get_signal(PHASE_SIGNAL),
@@ -1514,6 +1578,10 @@ fn session_l2_on() -> bool {
     })
 }
 
+fn screenshot_shows_locked_permission() -> bool {
+    std::env::var("W3COS_SCREEN").ok().as_deref() == Some("permission-locked")
+}
+
 fn apply_screen_override() {
     // Screenshot hook. Set once so a later click can still change the screen.
     thread_local! {
@@ -1564,16 +1632,27 @@ fn apply_screen_override() {
             focus_app(1);
             state::set_signal(PHASE_SIGNAL, 1);
             state::set_text_signal(TIER_SIGNAL, "L0");
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
             state::set_text_signal(SUMMARY_SIGNAL, "打开文件");
             state::set_text_signal(
                 IMPACT_SIGNAL,
                 "切换到文件窗口。不读取、不修改磁盘上的内容。",
             );
+            state::request_focus_label(&locale::t("confirm"));
         }
         Some("permission") => {
             focus_app(2);
             state::set_text_signal(TERMINAL_SIGNAL, "echo");
             state::set_signal(PERM_SIGNAL, 1);
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+            state::request_focus_label(&locale::t("perm-deny"));
+        }
+        Some("permission-locked") => {
+            focus_app(2);
+            state::set_text_signal(TERMINAL_SIGNAL, "echo");
+            state::set_signal(PERM_SIGNAL, 1);
+            state::set_signal(UNLOCKED_SIGNAL, 0);
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "");
         }
         Some("lock") => state::set_signal(UNLOCKED_SIGNAL, 0),
         Some("switcher") => {
@@ -1678,7 +1757,7 @@ fn build_shell() -> Component {
         column.push(modal_layer(build_confirm_dialog()));
     }
     if state::get_signal(PERM_SIGNAL) != 0 {
-        column.push(modal_layer(build_permission_sheet()));
+        column.push(permission_layer(build_permission_sheet()));
     }
     if state::get_signal(NOTIFY_SIGNAL) != 0 {
         column.push(chrome_layer(build_notify_panel()));
@@ -1696,7 +1775,7 @@ fn build_shell() -> Component {
     if let Some(bar) = ime_bar::candidate_layer() {
         column.push(bar);
     }
-    if !unlocked {
+    if !unlocked && !screenshot_shows_locked_permission() {
         column.push(place_overlay(build_lock_screen()));
     }
     if let Some(keyboard) = ime_bar::phone_keyboard() {
@@ -1719,10 +1798,14 @@ fn build_shell() -> Component {
 }
 
 fn modal_layer(card: Component) -> Component {
-    place_modal(card, false)
+    place_modal(card, false, 320.0)
 }
 
-fn place_modal(mut card: Component, fill: bool) -> Component {
+fn permission_layer(card: Component) -> Component {
+    place_modal(card, false, 420.0)
+}
+
+fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
     let (width, height) = state::shell_viewport();
     let scrim_h = if fill || posture() == Posture::Phone {
         height
@@ -1751,7 +1834,7 @@ fn place_modal(mut card: Component, fill: bool) -> Component {
         card.style.width = Dimension::Px(width);
         card.style.height = Dimension::Px(height);
     } else if posture() == Posture::Phone {
-        let sheet_h = 280.0_f32.min(height - 24.0);
+        let sheet_h = phone_sheet.min(height - 24.0);
         card.style.left = Dimension::Px(0.0);
         card.style.width = Dimension::Px(width);
         card.style.height = Dimension::Px(sheet_h);
@@ -2953,76 +3036,106 @@ fn sheet_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Componen
     button
 }
 
+fn layer_mark(tier: &str) -> Option<Component> {
+    let (key, bg, fg) = match tier {
+        "L2" => (
+            "layer-l2",
+            Color::from_hex("#14362c"),
+            Color::from_hex("#d7f6e8"),
+        ),
+        "L1" => (
+            "layer-l1",
+            Color::from_hex("#f0d7b4"),
+            Color::from_hex("#2a1c0c"),
+        ),
+        "L0" => ("layer-l0", Color::rgba(244, 241, 234, 20), ink_token()),
+        _ => return None,
+    };
+    Some(Component::text(
+        locale::t(key),
+        Style {
+            font_size: 12.0,
+            font_weight: 650,
+            color: fg,
+            background: bg,
+            border_radius: 999.0,
+            padding: Edges::xy(8.0, 2.0),
+            align_self: AlignSelf::FlexStart,
+            ..Style::default()
+        },
+    ))
+}
+
+fn mark_initial_focus(button: &mut Component) {
+    let props = button
+        .style
+        .custom_properties
+        .get_or_insert_with(HashMap::new);
+    props.insert("--w3cos-initial-focus".to_string(), "1".to_string());
+}
+
+fn focus_kind(default: &str) -> String {
+    let set = state::get_signal_text(CONFIRM_FOCUS_SIGNAL);
+    if set.is_empty() {
+        default.to_string()
+    } else {
+        set
+    }
+}
+
 fn build_confirm_dialog() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let tier = state::get_signal_text(TIER_SIGNAL);
+    let focus = focus_kind("confirm");
     let mut rows = Vec::new();
-    if tier == "L0" || tier == "L1" || tier == "L2" {
-        let (label, bg, fg) = if tier == "L2" {
-            (
-                locale::t("tier-l2"),
-                Color::from_hex("#2a315c"),
-                Color::from_hex("#b7c0ff"),
-            )
-        } else if tier == "L1" {
-            (
-                locale::t("tier-l1"),
-                Color::from_hex("#f0d7b4"),
-                Color::from_hex("#2a1c0c"),
-            )
-        } else {
-            (
-                locale::t("tier-l0"),
-                Color::rgba(244, 241, 234, 20),
-                ink_token(),
-            )
-        };
-        rows.push(Component::text(
-            label,
-            Style {
-                font_size: 12.0,
-                font_weight: 650,
-                color: fg,
-                background: bg,
-                border_radius: 999.0,
-                padding: Edges::xy(8.0, 2.0),
-                align_self: AlignSelf::FlexStart,
-                ..Style::default()
-            },
-        ));
+    if let Some(mark) = layer_mark(&tier) {
+        rows.push(mark);
     }
     rows.push(Component::text(
         state::get_signal_text(SUMMARY_SIGNAL),
         Style {
-            font_size: 18.0,
+            font_size: 22.0,
             font_weight: 700,
             color: ink(),
             ..Style::default()
         },
     ));
+    if tier == "L1" {
+        rows.push(Component::text(
+            locale::t("l1-same"),
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#f0d7b4"),
+                ..Style::default()
+            },
+        ));
+    }
     rows.push(Component::text(
         state::get_signal_text(IMPACT_SIGNAL),
         Style {
-            font_size: 13.0,
+            font_size: 14.0,
             color: muted_ink(),
             ..Style::default()
         },
     ));
-    let accept = if unlocked {
+    let mut cancel = sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost);
+    let mut accept = if unlocked {
         sheet_button(locale::t("confirm"), OP_CONFIRM, SheetKind::Primary)
     } else {
         sheet_button(locale::t("lock-first"), OP_UNLOCK, SheetKind::Primary)
     };
+    if focus == "cancel" {
+        mark_initial_focus(&mut cancel);
+    } else if unlocked {
+        mark_initial_focus(&mut accept);
+    }
     rows.push(Component::row(
         Style {
             gap: 8.0,
             justify_content: JustifyContent::FlexEnd,
             ..Style::default()
         },
-        vec![
-            sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost),
-            accept,
-        ],
+        vec![cancel, accept],
     ));
     rows.push(Component::text(
         locale::t("confirm-footnote"),
@@ -3035,117 +3148,112 @@ fn build_confirm_dialog() -> Component {
     dialog_shell(rows)
 }
 
+fn disabled_choice(label: impl Into<String>) -> Component {
+    let mut button = sheet_button(label, OP_PERM_DENY, SheetKind::Ghost);
+    button.on_click = EventAction::None;
+    button.style.opacity = 0.4;
+    button
+}
+
 fn build_permission_sheet() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let command = process_command();
-    let mut rows = vec![Component::text(
-        locale::t_args("perm-sheet-title", &[("command", &command)]),
+    let mut rows = vec![
+        Component::text(
+            locale::t("perm-cap-title"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#e2a45c"),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t_args("perm-sheet-title", &[("command", &command)]),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+    ];
+    rows.push(Component::text(
+        if unlocked {
+            locale::t("perm-sheet-detail")
+        } else {
+            locale::t("perm-locked")
+        },
         Style {
-            font_size: 18.0,
-            font_weight: 700,
-            color: ink(),
+            font_size: 14.0,
+            font_weight: if unlocked { 400 } else { 700 },
+            color: if unlocked {
+                Color::from_hex("#f0d7b4")
+            } else {
+                Color::from_hex("#ffe08a")
+            },
             ..Style::default()
         },
-    )];
-    if unlocked {
-        rows.push(Component::text(
-            locale::t("perm-sheet-detail"),
-            Style {
-                font_size: 13.0,
-                color: muted_ink(),
-                ..Style::default()
-            },
-        ));
-        rows.push(Component::row(
-            Style {
-                gap: 12.0,
-                padding: Edges::all(12.0),
-                border_radius: 12.0,
-                border_width: 1.0,
-                border_color: Color::rgba(244, 241, 234, 31),
-                background: Color::rgba(244, 241, 234, 10),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                ..Style::default()
-            },
-            vec![
-                Component::column(
-                    Style {
-                        gap: 4.0,
-                        flex_grow: 1.0,
-                        ..Style::default()
-                    },
-                    vec![
-                        Component::text(
-                            locale::t("perm-cap-title"),
-                            Style {
-                                font_size: 13.0,
-                                font_weight: 650,
-                                color: ink_token(),
-                                ..Style::default()
-                            },
-                        ),
-                        Component::text(
-                            locale::t("perm-sheet-scope"),
-                            Style {
-                                font_size: 12.0,
-                                color: faint_token(),
-                                ..Style::default()
-                            },
-                        ),
-                    ],
-                ),
-                Component::text(
-                    locale::t("perm-cap-id"),
-                    Style {
-                        font_size: 12.0,
-                        color: faint_token(),
-                        ..Style::default()
-                    },
-                ),
-            ],
-        ));
-        rows.push(Component::row(
-            Style {
-                gap: 8.0,
-                justify_content: JustifyContent::FlexEnd,
-                ..Style::default()
-            },
-            vec![
-                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
-                sheet_button(locale::t("perm-once"), OP_PERM_ONCE, SheetKind::Primary),
-            ],
-        ));
+    ));
+    rows.push(Component::text(
+        locale::t("perm-sheet-scope"),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#fff4e5"),
+            background: Color::rgba(226, 164, 92, 28),
+            border_radius: 12.0,
+            padding: Edges::all(12.0),
+            ..Style::default()
+        },
+    ));
+    let mut deny = if unlocked {
+        sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger)
     } else {
-        rows.push(Component::text(
-            locale::t("perm-locked"),
-            Style {
-                font_size: 14.0,
-                font_weight: 700,
-                color: Color::from_hex("#ffe08a"),
-                ..Style::default()
-            },
-        ));
-        rows.push(Component::row(
-            Style {
-                gap: 8.0,
-                ..Style::default()
-            },
-            vec![
-                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
-                {
-                    let mut unlock =
-                        sheet_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary);
-                    unlock.on_click = EventAction::Invoke {
-                        code: OP_UNLOCK,
-                        input_placeholder: locale::t("lock-passphrase"),
-                    };
-                    unlock
-                },
-            ],
-        ));
+        disabled_choice(locale::t("perm-deny"))
+    };
+    let once = if unlocked {
+        sheet_button(locale::t("perm-once"), OP_PERM_ONCE, SheetKind::Warm)
+    } else {
+        disabled_choice(locale::t("perm-once"))
+    };
+    if unlocked && focus_kind("deny") == "deny" {
+        mark_initial_focus(&mut deny);
     }
-    dialog_shell(rows)
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![deny, once],
+    ));
+    rows.push(Component::text(
+        locale::t("perm-footnote"),
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#e2a45c"),
+            ..Style::default()
+        },
+    ));
+    permission_shell(rows)
+}
+
+fn permission_shell(children: Vec<Component>) -> Component {
+    let phone = posture() == Posture::Phone;
+    Component::column(
+        Style {
+            gap: 10.0,
+            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            background: Color::from_hex("#241c14"),
+            border_width: 1.0,
+            border_color: Color::from_hex("#e2a45c"),
+            border_radius: if phone { 22.0 } else { 16.0 },
+            box_shadow: Some(shadow_lg()),
+            ..Style::default()
+        },
+        children,
+    )
 }
 
 fn build_lock_screen() -> Component {
@@ -5137,12 +5245,14 @@ enum SheetKind {
     Ghost,
     Primary,
     Danger,
+    Warm,
 }
 
 fn action_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Component {
     let (background, color, border) = match kind {
         SheetKind::Ghost => (Color::TRANSPARENT, ink_token(), Some(line_strong())),
         SheetKind::Primary => (Color::from_hex("#0c6d4c"), Color::from_hex("#e9fff5"), None),
+        SheetKind::Warm => (Color::from_hex("#9a5410"), Color::from_hex("#fff4e5"), None),
         SheetKind::Danger => (
             Color::TRANSPARENT,
             Color::from_hex("#ffd5d4"),
@@ -7964,6 +8074,243 @@ mod shell_ux_tests {
 
         locale::set_locale("en");
         state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn initial_focus(root: &Component) -> Vec<String> {
+        let mut labels = Vec::new();
+        walk(root, &mut |node| {
+            let marked = node.style.custom_properties.as_ref().is_some_and(|props| {
+                props
+                    .get("--w3cos-initial-focus")
+                    .is_some_and(|value| value == "1")
+            });
+            if marked && let ComponentKind::Button { label } = &node.kind {
+                labels.push(label.clone());
+            }
+        });
+        labels
+    }
+
+    fn clicks_disabled(root: &Component, label: &str) -> bool {
+        let mut disabled = false;
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label: button } = &node.kind
+                && button == label
+                && matches!(node.on_click, EventAction::None)
+            {
+                disabled = true;
+            }
+        });
+        disabled
+    }
+
+    #[test]
+    fn confirm_does_not_grant_process_and_permission_is_once() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_text_signal(TERMINAL_SIGNAL, "");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        capability_gate::deny(shell_tools::CAP_PROCESS);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        on_shell_intent(OP_PROPOSE, "打开终端");
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开终端");
+        assert!(
+            state::get_signal_text(IMPACT_SIGNAL).contains("切换到终端窗口"),
+            "{}",
+            state::get_signal_text(IMPACT_SIGNAL)
+        );
+        let dialog = build_confirm_dialog();
+        let blob = text_blob(&dialog);
+        assert!(blob.contains("L0 规则"), "{blob}");
+        assert!(blob.contains("打开终端"), "{blob}");
+        assert!(blob.contains("确认后才会执行，并写下一张收据。"), "{blob}");
+        assert!(!blob.contains("请确认"), "{blob}");
+        assert_eq!(
+            button_labels(&dialog)
+                .into_iter()
+                .filter(|label| label == "取消" || label == "确认")
+                .collect::<Vec<_>>(),
+            vec!["取消".to_string(), "确认".to_string()]
+        );
+        assert_eq!(initial_focus(&dialog), vec!["确认".to_string()]);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), 2);
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).is_empty());
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+
+        state::set_text_signal(TERMINAL_SIGNAL, "echo w3cos-once");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).is_empty());
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        let sheet = build_permission_sheet();
+        let perm = text_blob(&sheet);
+        assert!(perm.contains("允许运行这一次 echo"), "{perm}");
+        assert!(
+            perm.contains("这不是刚才那个确认。打开终端已经完成。现在要单独授权进程，用完即收回。"),
+            "{perm}"
+        );
+        assert!(
+            perm.contains("只放行 echo、pwd、help。没有系统 shell。"),
+            "{perm}"
+        );
+        assert!(perm.contains("拒绝也会写收据。身份必须已解锁。"), "{perm}");
+        assert_eq!(
+            button_labels(&sheet)
+                .into_iter()
+                .filter(|label| label == "拒绝" || label == "仅此一次")
+                .collect::<Vec<_>>(),
+            vec!["拒绝".to_string(), "仅此一次".to_string()]
+        );
+        assert!(
+            !button_labels(&sheet).iter().any(|label| label == "确认"),
+            "{perm}"
+        );
+        assert_eq!(initial_focus(&sheet), vec!["拒绝".to_string()]);
+        assert_ne!(
+            dialog.style.background, sheet.style.background,
+            "the permission sheet should not reuse the confirm card"
+        );
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{dialog:?}").contains(hex), "{hex}");
+            assert!(!format!("{sheet:?}").contains(hex), "{hex}");
+        }
+
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).is_empty());
+        let denied = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(
+            denied.contains("Denied") && denied.contains("refused"),
+            "{denied}"
+        );
+
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        on_shell_intent(OP_PERM_ONCE, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        let ran = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(ran.contains("w3cos-once"), "{ran}");
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("allowed"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), ran);
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+
+        on_shell_intent(OP_LOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        let locked = build_permission_sheet();
+        let locked_blob = text_blob(&locked);
+        assert!(
+            locked_blob.contains("先解锁。这次不会运行。"),
+            "{locked_blob}"
+        );
+        assert!(
+            locked_blob.contains("拒绝也会写收据。身份必须已解锁。"),
+            "{locked_blob}"
+        );
+        assert!(clicks_disabled(&locked, "拒绝"));
+        assert!(clicks_disabled(&locked, "仅此一次"));
+        on_shell_intent(OP_PERM_ONCE, "");
+        assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), ran);
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        on_shell_intent(OP_PROPOSE, "夜间模式");
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开夜间模式");
+        assert_eq!(
+            initial_focus(&build_confirm_dialog()),
+            vec!["取消".to_string()]
+        );
+        on_shell_intent(OP_CANCEL, "");
+        on_shell_intent(OP_PROPOSE, "file manager");
+        assert_eq!(state::get_signal_text(TIER_SIGNAL), "L1");
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开文件");
+        let synonym = text_blob(&build_confirm_dialog());
+        assert!(synonym.contains("L1 同义"), "{synonym}");
+        assert!(
+            synonym.contains("这句话没有对上规则表，本机把它当成同一件事。"),
+            "{synonym}"
+        );
+        assert_eq!(
+            initial_focus(&build_confirm_dialog()),
+            vec!["确认".to_string()]
+        );
+
+        state::note_shell_viewport(390.0, 760.0);
+        let phone = build_confirm_dialog();
+        walk(&phone, &mut |node| {
+            if let ComponentKind::Button { label } = &node.kind
+                && (label == "取消" || label == "确认")
+            {
+                assert_eq!(px(node.style.height), 48.0, "{label}");
+            }
+        });
+        let phone_perm = build_permission_sheet();
+        walk(&phone_perm, &mut |node| {
+            if let ComponentKind::Button { label } = &node.kind
+                && (label == "拒绝" || label == "仅此一次")
+            {
+                assert_eq!(px(node.style.height), 48.0, "{label}");
+            }
+        });
+
+        locale::set_locale("en");
+        assert_eq!(locale::t("perm-deny"), "Deny");
+        assert_eq!(
+            locale::t("perm-footnote"),
+            "A denial is written on the receipt too. Identity has to be unlocked."
+        );
+        assert_eq!(
+            locale::t("l1-same"),
+            "That sentence missed the rule table. This device treated it as the same action."
+        );
+        capability_gate::deny(shell_tools::CAP_PROCESS);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
         state::set_signal(UNLOCKED_SIGNAL, 0);
         state::note_shell_viewport(1200.0, 800.0);
         drop(isolated);
