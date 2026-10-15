@@ -233,3 +233,15 @@ editor-edit = 编辑
 editor-view = 视图
 editor-help = 帮助
 editor-explorer = 资源管理器
+
+filter-all = 全部
+filter-allowed = 允许
+filter-denied = 拒绝
+filter-cancelled = 取消
+receipt-copied = 已复制主体
+receipt-filter-empty = 这一类还没有收据。
+files-preview = 预览
+files-preview-empty = 选一个文件，在这里看它的名字和类型。
+switcher-title = 打开的应用
+switcher-empty = 没有打开的应用
+switcher-close = 关闭

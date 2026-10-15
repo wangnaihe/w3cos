@@ -4161,6 +4161,21 @@ pub fn layout_shape_unchanged(old: &[FlatNodeInfo<'_>], new: &[FlatNodeInfo<'_>]
     true
 }
 
+/// Text payload can change without a Taffy rebuild. Paint still has to see it.
+pub fn layout_text_unchanged(old: &[FlatNodeInfo<'_>], new: &[FlatNodeInfo<'_>]) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    old.iter()
+        .zip(new.iter())
+        .all(|(previous, next)| match (previous.kind, next.kind) {
+            (ComponentKind::Text { content: previous }, ComponentKind::Text { content: next }) => {
+                previous == next
+            }
+            _ => true,
+        })
+}
+
 /// Returns true when reactive Show slots only toggled `display` (tree shape unchanged).
 pub fn layout_display_unchanged(old: &[FlatNodeInfo<'_>], new: &[FlatNodeInfo<'_>]) -> bool {
     if old.len() != new.len() {

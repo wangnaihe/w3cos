@@ -234,3 +234,15 @@ editor-edit = Edit
 editor-view = View
 editor-help = Help
 editor-explorer = Explorer
+
+filter-all = All
+filter-allowed = Allowed
+filter-denied = Refused
+filter-cancelled = Cancelled
+receipt-copied = Subject copied
+receipt-filter-empty = Nothing in this filter yet.
+files-preview = Preview
+files-preview-empty = Choose a file to see its name and type here.
+switcher-title = Open apps
+switcher-empty = No open apps
+switcher-close = Close

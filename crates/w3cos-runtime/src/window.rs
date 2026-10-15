@@ -246,6 +246,19 @@ const BACK_SWIPE_SLOP: f32 = 12.0;
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
 const BACK_SWIPE_COMMIT_DISTANCE: f32 = 72.0;
 
+fn shell_shortcut_name(logical: &Key, control: bool, super_key: bool) -> &'static str {
+    if matches!(logical, Key::Named(NamedKey::Escape)) {
+        return "Escape";
+    }
+    if (control || super_key)
+        && let Key::Character(text) = logical
+        && text.eq_ignore_ascii_case("k")
+    {
+        return "Mod+K";
+    }
+    ""
+}
+
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
 fn is_horizontal_back_swipe(dx: f32, dy: f32) -> bool {
     dx > BACK_SWIPE_SLOP && dx > dy.abs() * 1.25
@@ -1561,6 +1574,7 @@ struct App {
     needs_layout: bool,
     needs_tree_rebuild: bool,
     needs_style_refresh: bool,
+    needs_text_refresh: bool,
     animations: Vec<ActiveAnimation>,
     last_frame_time: Option<Instant>,
     modifiers: ModifiersState,
@@ -1721,6 +1735,7 @@ impl App {
             needs_layout: true,
             needs_tree_rebuild: true,
             needs_style_refresh: false,
+            needs_text_refresh: false,
             animations: Vec::new(),
             last_frame_time: None,
             modifiers: ModifiersState::default(),
@@ -2339,6 +2354,7 @@ impl App {
             self.needs_tree_rebuild =
                 !layout::layout_shape_unchanged(&old_flat, &new_flat) || other_style_changed;
             self.needs_style_refresh = display_changed && !self.needs_tree_rebuild;
+            self.needs_text_refresh = !layout::layout_text_unchanged(&old_flat, &new_flat);
             self.repaint_mode = if visual_output_changed {
                 // A standard virtualizer reuses the same host slots for
                 // different rows. Once their text/image/input payload changes,
@@ -2835,8 +2851,12 @@ impl App {
 
         let dummy_action = EventAction::None;
         let old_paint_nodes = std::mem::take(&mut self.paint_artifact.nodes);
-        let reuse_flatten =
-            !self.needs_tree_rebuild && !self.needs_style_refresh && !old_paint_nodes.is_empty();
+        let refresh_text = self.needs_text_refresh;
+        self.needs_text_refresh = false;
+        let reuse_flatten = !self.needs_tree_rebuild
+            && !self.needs_style_refresh
+            && !refresh_text
+            && !old_paint_nodes.is_empty();
         let retained_flat = if reuse_flatten {
             Some(paint_nodes_as_flat(&old_paint_nodes, &dummy_action))
         } else {
@@ -4614,6 +4634,7 @@ impl App {
 
     fn pointer_pressed(&mut self, pointer_type: &str, pointer_id: i64) {
         self.ensure_layout();
+        state::note_pointer_sample(pointer_type, self.mouse_x, self.mouse_y);
         let hit = self.hit_test(self.mouse_x, self.mouse_y);
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
             eprintln!(
@@ -4671,6 +4692,13 @@ impl App {
             );
         }
         let drag_consumed = state::shell_drag_end();
+        if !drag_consumed && state::take_shell_swipe(self.mouse_x, self.mouse_y) {
+            self.pressed_index = None;
+            self.pointer_down_default_prevented = false;
+            self.rebuild_if_dirty();
+            self.repaint_after_interaction();
+            return;
+        }
         if let Some(pressed_idx) = self.pressed_index.take() {
             if drag_consumed {
                 self.pointer_down_default_prevented = false;
@@ -6208,6 +6236,22 @@ impl App {
         }
     }
 
+    fn focus_input_placeholder(&mut self, placeholder: &str) {
+        self.ensure_layout();
+        let found = self.focusable_indices.iter().copied().find(|index| {
+            matches!(
+                self.get_kind_at(*index),
+                Some(ComponentKind::TextInput {
+                    placeholder: current,
+                    ..
+                }) if current == placeholder
+            )
+        });
+        if let Some(index) = found {
+            self.set_focused_index(Some(index));
+        }
+    }
+
     #[cfg(feature = "ai-bridge")]
     fn poll_ai_bridge(&mut self) {
         state::run_agent_poll_hook();
@@ -7677,17 +7721,22 @@ fn draw_hover_outline_cpu(pixmap: &mut Pixmap, rect: LayoutRect) {
 
 #[cfg(feature = "cpu-render")]
 fn draw_focus_ring_cpu(pixmap: &mut Pixmap, rect: LayoutRect) {
-    let color = tiny_skia::Color::from_rgba8(108, 92, 231, 180);
+    // Jade ring, 2px thick, drawn 2px outside the control.
+    let color = tiny_skia::Color::from_rgba8(233, 255, 245, 230);
     let mut paint = tiny_skia::Paint::default();
     paint.set_color(color);
     paint.anti_alias = true;
 
-    let w = 3.0;
+    let w = 2.0;
+    let x = rect.x - 2.0;
+    let y = rect.y - 2.0;
+    let width = rect.width + 4.0;
+    let height = rect.height + 4.0;
     for r in [
-        tiny_skia::Rect::from_xywh(rect.x, rect.y, rect.width, w),
-        tiny_skia::Rect::from_xywh(rect.x, rect.y + rect.height - w, rect.width, w),
-        tiny_skia::Rect::from_xywh(rect.x, rect.y, w, rect.height),
-        tiny_skia::Rect::from_xywh(rect.x + rect.width - w, rect.y, w, rect.height),
+        tiny_skia::Rect::from_xywh(x, y, width, w),
+        tiny_skia::Rect::from_xywh(x, y + height - w, width, w),
+        tiny_skia::Rect::from_xywh(x, y, w, height),
+        tiny_skia::Rect::from_xywh(x + width - w, y, w, height),
     ]
     .into_iter()
     .flatten()
@@ -7817,15 +7866,15 @@ impl ApplicationHandler for App {
             });
         }
 
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            let timer_actions = crate::timers::tick();
-            for action in &timer_actions {
-                state::execute_action(action);
-            }
-            if !timer_actions.is_empty() {
-                self.rebuild_if_dirty();
-                self.request_repaint();
-            }
+        // Native timers used to run only on ResumeTimeReached. A loop that
+        // wakes from a user event or a redraw otherwise left the clock stuck.
+        let timer_actions = crate::timers::tick();
+        for action in &timer_actions {
+            state::execute_action(action);
+        }
+        if !timer_actions.is_empty() {
+            self.rebuild_if_dirty();
+            self.request_repaint();
         }
 
         // A due JS timer is eligible at every native task boundary. Limiting
@@ -8559,6 +8608,21 @@ impl ApplicationHandler for App {
                 is_synthetic: false,
                 ..
             } => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    let shortcut = shell_shortcut_name(
+                        &event.logical_key,
+                        self.modifiers.control_key(),
+                        self.modifiers.super_key(),
+                    );
+                    if !shortcut.is_empty() && state::shell_key(shortcut) {
+                        if let Some(placeholder) = state::take_focus_placeholder() {
+                            self.focus_input_placeholder(&placeholder);
+                        }
+                        self.rebuild_if_dirty();
+                        self.request_repaint();
+                        return;
+                    }
+                }
                 if event.state == ElementState::Pressed
                     && crate::w3cos_extensions::shortcuts_active()
                     && crate::w3cos_extensions::dispatch_matching_shortcut(

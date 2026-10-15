@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 mod agent_host;
+mod gesture;
 mod locale;
 mod windows;
 
@@ -59,6 +60,9 @@ const PERM_SIGNAL: usize = 26;
 const RECEIPT_PAGE_SIGNAL: usize = 27;
 const NOTIFY_SIGNAL: usize = 28;
 const NOTIFY_UNREAD_SIGNAL: usize = 29;
+const RECEIPT_FILTER_SIGNAL: usize = 30;
+const SWITCHER_SIGNAL: usize = 31;
+const FILE_PREVIEW_SIGNAL: usize = 32;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -115,6 +119,14 @@ const OP_RECEIPT_PREV: u8 = 54;
 const OP_RECEIPT_NEXT: u8 = 55;
 const OP_TRAY_L2: u8 = 56;
 const OP_SCRIM: u8 = 57;
+const OP_CLOCK: u8 = 58;
+const OP_FILTER_ALL: u8 = 59;
+const OP_FILTER_ALLOWED: u8 = 60;
+const OP_FILTER_DENIED: u8 = 61;
+const OP_FILTER_CANCELLED: u8 = 62;
+const OP_COPY_SUBJECT: u8 = 63;
+const OP_PREVIEW: u8 = 64;
+const OP_SWITCHER: u8 = 65;
 
 fn main() {
     shell_main();
@@ -154,7 +166,10 @@ pub(crate) fn shell_main() {
 
     state::set_invoke_hook(on_shell_intent);
     state::set_shell_drag_hook(on_window_drag);
+    state::set_shell_swipe_hook(on_shell_swipe);
+    state::set_shell_key_hook(on_shell_key);
     state::set_agent_poll_hook(on_agent_poll);
+    ensure_clock_timer();
     agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     #[cfg(feature = "desktop")]
@@ -186,6 +201,9 @@ thread_local! {
     static SESSION: RefCell<Option<IntentSession>> = const { RefCell::new(None) };
     static SESSION_BOOTED: Cell<bool> = const { Cell::new(false) };
     static NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static LAST_CLOCK: RefCell<String> = const { RefCell::new(String::new()) };
+    static COPIED_SUBJECT: RefCell<String> = const { RefCell::new(String::new()) };
+    static CLOCK_ARMED: Cell<bool> = const { Cell::new(false) };
 }
 
 fn ensure_shell_signals() {
@@ -220,6 +238,9 @@ fn ensure_shell_signals() {
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -653,6 +674,17 @@ fn app_label(id: i64) -> String {
     locale::t(app_key(id))
 }
 
+fn app_accent(id: i64) -> &'static str {
+    match id {
+        1 => "#3498db",
+        2 => "#1c8f62",
+        3 => "#f0d7b4",
+        4 => "#e07a5f",
+        5 => "#8ec8ff",
+        _ => "#d5dee8",
+    }
+}
+
 fn toast_named(key: &str, id: i64) -> String {
     let name = app_label(id);
     locale::t_args(key, &[("name", &name)])
@@ -818,6 +850,7 @@ fn stage_bounds() -> (f32, f32) {
     }
     let reserved = match posture() {
         Posture::Desktop => 96.0,
+        Posture::WideTablet => 84.0,
         Posture::Tablet => 84.0,
         Posture::Phone => 72.0,
     };
@@ -828,6 +861,7 @@ fn stage_bounds() -> (f32, f32) {
 enum Posture {
     Phone,
     Tablet,
+    WideTablet,
     Desktop,
 }
 
@@ -837,9 +871,141 @@ fn posture() -> Posture {
         Posture::Phone
     } else if width < 1024.0 {
         Posture::Tablet
+    } else if state::pointer_is_coarse() {
+        Posture::WideTablet
     } else {
         Posture::Desktop
     }
+}
+
+fn ensure_clock_timer() {
+    if CLOCK_ARMED.with(|armed| armed.replace(true)) {
+        return;
+    }
+    let _ = w3cos_runtime::timers::set_interval(
+        EventAction::Invoke {
+            code: OP_CLOCK,
+            input_placeholder: String::new(),
+        },
+        1000,
+    );
+    // Wake the window once a second. Xvfb can sit in Wait and never deliver
+    // the timer deadline on its own.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            w3cos_runtime::uitest::poke_event_loop();
+        }
+    });
+}
+
+fn on_shell_key(name: &str) -> bool {
+    ensure_shell_signals();
+    match name {
+        "Escape" => dismiss_top_layer(),
+        "Mod+K" => {
+            state::request_focus_placeholder(&locale::t("intent-placeholder"));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn dismiss_top_layer() -> bool {
+    if state::get_signal(UNLOCKED_SIGNAL) == 0 {
+        return false;
+    }
+    if state::get_signal(PERM_SIGNAL) != 0 {
+        state::set_signal(PERM_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(PHASE_SIGNAL) == 1 {
+        on_shell_intent(OP_CANCEL, "");
+        return true;
+    }
+    if state::get_signal(NOTIFY_SIGNAL) != 0 {
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(SWITCHER_SIGNAL) != 0 {
+        state::set_signal(SWITCHER_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(LAUNCHER_SIGNAL) != 0 {
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        return true;
+    }
+    false
+}
+
+fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
+    ensure_shell_signals();
+    let (width, height) = state::shell_viewport();
+    let action = gesture::classify(
+        x0,
+        y0,
+        dx,
+        dy,
+        width,
+        height,
+        matches!(posture(), Posture::Phone),
+        state::get_signal(PHASE_SIGNAL) == 1,
+        state::get_signal(PERM_SIGNAL) != 0,
+        state::get_signal(SWITCHER_SIGNAL) != 0,
+    );
+    match action {
+        gesture::Swipe::None => false,
+        gesture::Swipe::EdgeIgnored => true,
+        gesture::Swipe::Switcher => {
+            state::set_signal(SWITCHER_SIGNAL, 1);
+            true
+        }
+        gesture::Swipe::Notifications => {
+            state::set_signal(NOTIFY_SIGNAL, 1);
+            state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
+            true
+        }
+        gesture::Swipe::EdgeBack => edge_back(),
+        gesture::Swipe::CloseFront => {
+            let focused = state::get_signal(APP_SIGNAL);
+            if focused != 0 {
+                close_window(focused);
+            }
+            state::set_signal(SWITCHER_SIGNAL, 0);
+            true
+        }
+    }
+}
+
+fn edge_back() -> bool {
+    if state::get_signal(PERM_SIGNAL) != 0 || state::get_signal(PHASE_SIGNAL) == 1 {
+        return false;
+    }
+    if state::get_signal(SWITCHER_SIGNAL) != 0 {
+        state::set_signal(SWITCHER_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(NOTIFY_SIGNAL) != 0 {
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(LAUNCHER_SIGNAL) != 0 {
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        return true;
+    }
+    if state::get_signal(APP_SIGNAL) != 0 {
+        focus_app(0);
+        return true;
+    }
+    false
 }
 
 fn remember_windows() {
@@ -956,9 +1122,36 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::set_signal(SETTINGS_TAB_SIGNAL, 3);
         }
         OP_RECEIPT_NEXT => {
-            let pages = receipt_page_count(receipt_entries().len());
+            let pages = receipt_page_count(visible_receipts().len());
             let page = (state::get_signal(RECEIPT_PAGE_SIGNAL) + 1).min(pages - 1);
             state::set_signal(RECEIPT_PAGE_SIGNAL, page);
+        }
+        OP_CLOCK => {
+            let now = live_clock();
+            let changed = LAST_CLOCK.with(|slot| {
+                let mut shown = slot.borrow_mut();
+                if *shown == now {
+                    false
+                } else {
+                    *shown = now;
+                    true
+                }
+            });
+            if changed {
+                state::mark_dirty();
+            }
+        }
+        OP_FILTER_ALL => set_receipt_filter(0),
+        OP_FILTER_ALLOWED => set_receipt_filter(1),
+        OP_FILTER_DENIED => set_receipt_filter(2),
+        OP_FILTER_CANCELLED => set_receipt_filter(3),
+        OP_COPY_SUBJECT => copy_subject(),
+        OP_PREVIEW => {
+            state::set_text_signal(FILE_PREVIEW_SIGNAL, draft.trim());
+        }
+        OP_SWITCHER => {
+            let next = i64::from(state::get_signal(SWITCHER_SIGNAL) == 0);
+            state::set_signal(SWITCHER_SIGNAL, next);
         }
         OP_SCRIM => {}
         _ => return false,
@@ -1044,6 +1237,11 @@ fn apply_screen_override() {
         Some("terminal") => focus_app(2),
         Some("launcher") => state::set_signal(LAUNCHER_SIGNAL, 1),
         Some("receipts") => state::set_signal(RECEIPTS_OPEN_SIGNAL, 1),
+        Some("switcher") => {
+            focus_app(1);
+            state::set_signal(SWITCHER_SIGNAL, 1);
+        }
+        Some("notify") => state::set_signal(NOTIFY_SIGNAL, 1),
         Some("windows") => {
             state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
             state::set_signal(MINIMIZED_MASK_SIGNAL, app_bit(5));
@@ -1068,9 +1266,12 @@ fn build_shell() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut column = match posture() {
         Posture::Phone => vec![build_phone_stack()],
-        Posture::Tablet => vec![build_tablet_row()],
+        Posture::Tablet | Posture::WideTablet => vec![build_tablet_row()],
         Posture::Desktop => vec![build_stage(), floating_intent(), floating_taskbar()],
     };
+    if state::get_signal(SWITCHER_SIGNAL) != 0 && matches!(posture(), Posture::Phone) {
+        column.push(chrome_layer(build_switcher()));
+    }
     if state::get_signal(TASKS_SIGNAL) != 0 && posture() == Posture::Desktop {
         column.push(dock_right(build_task_center()));
     }
@@ -1296,7 +1497,35 @@ fn icon_button(
 }
 
 fn live_clock() -> String {
-    chrono::Local::now().format("%H:%M").to_string()
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+fn set_receipt_filter(kind: i64) {
+    state::set_signal(RECEIPT_FILTER_SIGNAL, kind);
+    state::set_signal(RECEIPT_PAGE_SIGNAL, 0);
+}
+
+fn copy_subject() {
+    let subject = current_subject();
+    COPIED_SUBJECT.with(|slot| *slot.borrow_mut() = subject.clone());
+    if let Ok(mut child) = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        use std::io::Write;
+        let _ = stdin.write_all(subject.as_bytes());
+    }
+    push_toast(&locale::t("receipt-copied"));
+}
+
+fn visible_receipts() -> Vec<String> {
+    let filter = state::get_signal(RECEIPT_FILTER_SIGNAL);
+    receipt_entries()
+        .into_iter()
+        .filter(|line| gesture::receipt_matches(filter, line))
+        .collect()
 }
 
 fn live_battery() -> Option<String> {
@@ -2369,6 +2598,7 @@ fn build_files_app() -> Component {
                             rows
                         },
                     ),
+                    file_preview_pane(),
                 ],
             ),
         ],
@@ -2452,6 +2682,47 @@ fn folder_rows(folder: i64) -> Vec<Component> {
     }
 }
 
+fn file_preview_pane() -> Component {
+    if !matches!(posture(), Posture::WideTablet) {
+        return Component::column(Style::default(), vec![]);
+    }
+    let selected = state::get_signal_text(FILE_PREVIEW_SIGNAL);
+    let body = if selected.is_empty() {
+        locale::t("files-preview-empty")
+    } else {
+        selected
+    };
+    Component::column(
+        Style {
+            width: Dimension::Px(280.0),
+            flex_shrink: 0.0,
+            background: Color::from_hex("#1c2631"),
+            padding: Edges::all(16.0),
+            gap: 12.0,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                locale::t("files-preview"),
+                Style {
+                    font_size: 16.0,
+                    font_weight: 700,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                body,
+                Style {
+                    font_size: 14.0,
+                    color: muted_ink(),
+                    ..Style::default()
+                },
+            ),
+        ],
+    )
+}
+
 fn nav_button(name: &str, active: bool, code: u8) -> Component {
     let bg = if active { "#3d5570" } else { "#243447" };
     let color = if active { "#f4f7fb" } else { "#d5dee8" };
@@ -2461,8 +2732,9 @@ fn nav_button(name: &str, active: bool, code: u8) -> Component {
             font_size: 13.0,
             color: Color::from_hex(color),
             background: Color::from_hex(bg),
-            border_radius: 6.0,
-            padding: Edges::xy(10.0, 8.0),
+            border_radius: 10.0,
+            padding: Edges::xy(12.0, 12.0),
+            min_height: Dimension::Px(48.0),
             ..Style::default()
         },
         invoke(code),
@@ -2477,17 +2749,22 @@ fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
         flex_grow: 1.0,
         ..Style::default()
     };
-    let name_node = if let Some(code) = open {
-        Component::button_with_click(name, name_style, invoke(code))
-    } else {
-        Component::text(name, name_style)
-    };
+    let mut name_node =
+        Component::button_with_click(name, name_style, invoke(open.unwrap_or(OP_PREVIEW)));
+    name_node.style.min_height = Dimension::Px(48.0);
+    if open.is_none() {
+        name_node.style.custom_properties = Some(HashMap::from([(
+            "--w3cos-draft".to_string(),
+            name.to_string(),
+        )]));
+    }
     Component::row(
         Style {
-            padding: Edges::xy(8.0, 10.0),
+            padding: Edges::xy(8.0, 8.0),
             gap: 16.0,
-            border_radius: 4.0,
+            border_radius: 10.0,
             align_items: AlignItems::Center,
+            min_height: Dimension::Px(48.0),
             ..Style::default()
         },
         vec![
@@ -3105,7 +3382,8 @@ fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Compon
             font_size: 13.0,
             font_weight: 700,
             color: Color::WHITE,
-            padding: Edges::xy(12.0, 8.0),
+            padding: Edges::xy(12.0, 12.0),
+            min_height: Dimension::Px(48.0),
             ..Style::default()
         },
         action,
@@ -3828,14 +4106,19 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // ==========================================================================
 
 fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -> Component {
+    let side = gesture::coarse_target(state::pointer_is_coarse());
     let mut button = Component::button_with_click(
         label,
         Style {
             font_size: 12.0,
             color: Color::from_hex(color),
             background: Color::from_hex("#2a2a3e"),
-            border_radius: 4.0,
-            padding: Edges::xy(8.0, 4.0),
+            border_radius: 10.0,
+            padding: Edges::all(4.0),
+            width: Dimension::Px(side),
+            height: Dimension::Px(side),
+            min_width: Dimension::Px(side),
+            min_height: Dimension::Px(side),
             ..Style::default()
         },
         invoke(code),
@@ -3851,9 +4134,14 @@ fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Componen
     } else {
         locale::t("win-maximize")
     };
+    let bar_height = if state::pointer_is_coarse() {
+        56.0
+    } else {
+        40.0
+    };
     let mut bar = Component::row(
         Style {
-            height: Dimension::Px(40.0),
+            height: Dimension::Px(bar_height),
             flex_shrink: 0.0,
             background: Color::from_hex("#2a3e52"),
             padding: Edges::xy(16.0, 8.0),
@@ -4175,6 +4463,80 @@ fn build_toast(text: &str) -> Component {
     )
 }
 
+fn filter_chip(key: &str, code: u8, selected: bool) -> Component {
+    chrome_button(
+        locale::t(key),
+        code,
+        if selected { "#0c6d4c" } else { "#3d5570" },
+    )
+}
+
+fn open_app_ids() -> Vec<i64> {
+    let mask = state::get_signal(OPEN_MASK_SIGNAL);
+    (1..=6).filter(|id| mask & app_bit(*id) != 0).collect()
+}
+
+fn build_switcher() -> Component {
+    let (width, height) = state::shell_viewport();
+    let open = open_app_ids();
+    let mut cards = vec![Component::text(
+        locale::t("switcher-title"),
+        Style {
+            font_size: 20.0,
+            font_weight: 700,
+            color: ink(),
+            ..Style::default()
+        },
+    )];
+    if open.is_empty() {
+        cards.push(Component::text(
+            locale::t("switcher-empty"),
+            Style {
+                font_size: 14.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+    } else {
+        for id in open {
+            cards.push(Component::row(
+                Style {
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    background: Color::from_hex("#1c2631"),
+                    border_radius: 16.0,
+                    padding: Edges::all(12.0),
+                    min_height: Dimension::Px(72.0),
+                    ..Style::default()
+                },
+                vec![
+                    chrome_button(app_label(id), focus_code(id), app_accent(id)),
+                    window_button(locale::t("switcher-close"), OP_CLOSE, "#e07a78", id),
+                ],
+            ));
+        }
+    }
+    cards.push(chrome_button(locale::t("back"), OP_SWITCHER, "#3d5570"));
+    let mut panel = Component::column(
+        Style {
+            padding: Edges::all(16.0),
+            gap: 12.0,
+            background: Color::rgba(12, 18, 24, 230),
+            border_radius: 22.0,
+            overflow: Overflow::Auto,
+            ..Style::default()
+        },
+        cards,
+    );
+    panel.style.position = Position::Absolute;
+    panel.style.left = Dimension::Px(16.0);
+    panel.style.top = Dimension::Px(24.0);
+    panel.style.width = Dimension::Px((width - 32.0).max(200.0));
+    panel.style.height = Dimension::Px((height - 140.0).max(240.0));
+    panel.style.z_index = CHROME_Z + 1;
+    panel
+}
+
 fn build_receipts_viewer() -> Component {
     let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
     let storage_label = if storage_owned.is_empty() {
@@ -4183,13 +4545,14 @@ fn build_receipts_viewer() -> Component {
         storage_owned
     };
     let subject_label = truncate_middle(&current_subject(), 22);
-    let entries = receipt_entries();
+    let entries = visible_receipts();
     let pages = receipt_page_count(entries.len());
     let page = state::get_signal(RECEIPT_PAGE_SIGNAL).clamp(0, pages - 1);
     let start = (page as usize) * RECEIPT_PAGE_SIZE;
     let end = (start + RECEIPT_PAGE_SIZE).min(entries.len());
     let page_label = (page + 1).to_string();
     let pages_label = pages.to_string();
+    let filter = state::get_signal(RECEIPT_FILTER_SIGNAL);
     let mut body = vec![
         Component::text(
             locale::t("ledger"),
@@ -4200,13 +4563,24 @@ fn build_receipts_viewer() -> Component {
                 ..Style::default()
             },
         ),
-        Component::text(
+        chrome_button(
             format!("{subject_label} · {storage_label}"),
+            OP_COPY_SUBJECT,
+            "#243447",
+        ),
+        Component::row(
             Style {
-                font_size: 12.0,
-                color: muted_ink(),
+                gap: 8.0,
+                align_items: AlignItems::Center,
+                flex_wrap: FlexWrap::Wrap,
                 ..Style::default()
             },
+            vec![
+                filter_chip("filter-all", OP_FILTER_ALL, filter == 0),
+                filter_chip("filter-allowed", OP_FILTER_ALLOWED, filter == 1),
+                filter_chip("filter-denied", OP_FILTER_DENIED, filter == 2),
+                filter_chip("filter-cancelled", OP_FILTER_CANCELLED, filter == 3),
+            ],
         ),
         chrome_button(locale::t("close"), OP_TOGGLE_RECEIPTS, "#3d5570"),
         Component::row(
@@ -4233,8 +4607,13 @@ fn build_receipts_viewer() -> Component {
         ),
     ];
     if entries.is_empty() {
+        let empty_key = if filter == 0 {
+            "receipt-empty-long"
+        } else {
+            "receipt-filter-empty"
+        };
         body.push(Component::text(
-            locale::t("receipt-empty-long"),
+            locale::t(empty_key),
             Style {
                 font_size: 12.0,
                 color: muted_ink(),
@@ -4255,7 +4634,7 @@ fn build_receipts_viewer() -> Component {
     }
     Component::column(
         Style {
-            width: Dimension::Px(300.0),
+            width: Dimension::Px(360.0),
             flex_shrink: 0.0,
             min_height: Dimension::Px(0.0),
             overflow: Overflow::Auto,
@@ -4272,6 +4651,23 @@ fn build_receipts_viewer() -> Component {
 mod shell_ux_tests {
     use super::*;
 
+    static POSTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvFlag(&'static str);
+
+    impl EnvFlag {
+        fn set(key: &'static str, value: &str) -> Self {
+            unsafe { std::env::set_var(key, value) };
+            Self(key)
+        }
+    }
+
+    impl Drop for EnvFlag {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
     #[test]
     fn task_center_starts_collapsed() {
         ensure_shell_signals();
@@ -4280,6 +4676,7 @@ mod shell_ux_tests {
 
     #[test]
     fn posture_follows_width_breakpoints() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
         state::note_shell_viewport(390.0, 760.0);
         assert!(matches!(posture(), Posture::Phone));
         state::note_shell_viewport(800.0, 600.0);
@@ -4304,5 +4701,51 @@ mod shell_ux_tests {
         assert!(shown.contains("Allowed"), "{shown}");
         assert!(shown.contains("opened"), "{shown}");
         assert!(!shown.contains(" allowed"), "{shown}");
+    }
+
+    #[test]
+    fn coarse_pointer_at_desktop_width_is_a_wide_tablet() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _env = EnvFlag::set("W3COS_POINTER", "coarse");
+        state::note_shell_viewport(1280.0, 800.0);
+        assert!(matches!(posture(), Posture::WideTablet));
+    }
+
+    #[test]
+    fn escape_closes_the_launcher_and_leaves_the_lock_alone() {
+        ensure_shell_signals();
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(LAUNCHER_SIGNAL, 1);
+        assert!(on_shell_key("Escape"));
+        assert_eq!(state::get_signal(LAUNCHER_SIGNAL), 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(LAUNCHER_SIGNAL, 1);
+        assert!(!on_shell_key("Escape"));
+        assert_eq!(state::get_signal(LAUNCHER_SIGNAL), 1);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+    }
+
+    #[test]
+    fn edge_back_returns_home_and_spares_a_permission_sheet() {
+        ensure_shell_signals();
+        state::note_shell_viewport(390.0, 760.0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        focus_app(1);
+        assert!(on_shell_swipe(8.0, 300.0, 90.0, 2.0));
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        state::set_signal(PERM_SIGNAL, 1);
+        assert!(on_shell_swipe(8.0, 300.0, 90.0, 2.0));
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        state::set_signal(PERM_SIGNAL, 0);
+    }
+
+    #[test]
+    fn copying_the_subject_keeps_the_full_did() {
+        ensure_shell_signals();
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkhaXgexample");
+        copy_subject();
+        let copied = COPIED_SUBJECT.with(|slot| slot.borrow().clone());
+        assert_eq!(copied, "did:key:z6MkhaXgexample");
     }
 }
