@@ -4620,6 +4620,9 @@ impl App {
         crate::uitest::set_pointer_hit(self.mouse_x, self.mouse_y, hit);
         if let Some(idx) = hit {
             if let Some((id, mode)) = state::shell_gesture_at(&self.root, idx) {
+                if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                    eprintln!("[W3C OS][GESTURE] id={id} mode={mode}");
+                }
                 state::shell_drag_begin(id, mode, self.mouse_x, self.mouse_y);
             } else {
                 state::shell_drag_clear();

@@ -1053,13 +1053,26 @@ fn build_window_frame(id: i64, focused: bool) -> Component {
                         },
                         vec![app_body(id)],
                     ),
-                    resize_handle(id, "e", Dimension::Px(6.0), Dimension::Percent(100.0)),
+                    Component::column(
+                        Style {
+                            width: Dimension::Px(16.0),
+                            flex_shrink: 0.0,
+                            gap: 0.0,
+                            ..Style::default()
+                        },
+                        vec![
+                            {
+                                let mut east =
+                                    resize_handle(id, "e", Dimension::Px(16.0), Dimension::Auto);
+                                east.style.flex_grow = 1.0;
+                                east
+                            },
+                            resize_corner(id),
+                        ],
+                    ),
                 ],
             ),
             resize_handle(id, "s", Dimension::Percent(100.0), Dimension::Px(6.0)),
-            resize_corner(id, "nw", true, true),
-            resize_corner(id, "sw", false, true),
-            resize_corner(id, "se", false, false),
         ],
     );
     window.kind = ComponentKind::Button {
@@ -1096,42 +1109,21 @@ fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) ->
     handle
 }
 
-fn resize_corner(id: i64, gesture: &str, top: bool, left: bool) -> Component {
+fn resize_corner(id: i64) -> Component {
     let mut corner = Component::button_with_click(
         " ",
         Style {
-            position: Position::Absolute,
             width: Dimension::Px(16.0),
             height: Dimension::Px(16.0),
-            top: if top {
-                Dimension::Px(0.0)
-            } else {
-                Dimension::Auto
-            },
-            bottom: if top {
-                Dimension::Auto
-            } else {
-                Dimension::Px(0.0)
-            },
-            left: if left {
-                Dimension::Px(0.0)
-            } else {
-                Dimension::Auto
-            },
-            right: if left {
-                Dimension::Auto
-            } else {
-                Dimension::Px(0.0)
-            },
+            flex_shrink: 0.0,
             padding: Edges::ZERO,
             font_size: 1.0,
             background: Color::from_hex("#d5dee8"),
-            border_radius: 2.0,
             ..Style::default()
         },
         invoke(focus_code(id)),
     );
-    corner.style.custom_properties = Some(win_props(id, Some(gesture)));
+    corner.style.custom_properties = Some(win_props(id, Some("se")));
     corner
 }
 
