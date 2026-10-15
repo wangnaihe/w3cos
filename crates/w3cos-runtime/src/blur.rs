@@ -381,12 +381,29 @@ pub fn raster_box_shadow(
     if kernel_radius(sigma) == 0 || rect.width < 0.5 || rect.height < 0.5 {
         return None;
     }
+    let key = shadow_key(rect, radius, shadow);
+    let cached = CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        let found = caches.shadows.iter().position(|entry| entry.key == key);
+        let Some(index) = found else {
+            return None;
+        };
+        let stamp = caches.bump();
+        caches.shadows[index].stamp = stamp;
+        caches.hits += 1;
+        Some(place_shadow(&caches.shadows[index], rect))
+    });
+    if cached.is_some() {
+        return cached;
+    }
     let pad = kernel_radius(sigma) as f32;
-    if shadow.inset {
+    let sprite = if shadow.inset {
         raster_inset(rect, radius, shadow, sigma, pad)
     } else {
         raster_outer(rect, radius, shadow, sigma, pad)
-    }
+    }?;
+    remember_shadow(key, &sprite, rect);
+    Some(sprite)
 }
 
 fn raster_outer(
@@ -565,6 +582,573 @@ pub fn apply_affine6(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
     (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
 }
 
+// --- frame caches -------------------------------------------------------
+//
+// A gaussian over a dock-sized strip is too slow to redo every animation
+// frame. Two caches keep a 1200×800 CPU frame interactive:
+//
+// * Backdrop tiles remember the blurred strip. Unchanged tiles are copied.
+//   A damage rect reblurs only the dirty tiles plus the kernel margin.
+// * Shadow sprites are independent of the pixels underneath, so they are
+//   keyed by shape and subpixel phase, not by absolute position.
+// * Chrome snapshots remember the framebuffer after backdrop, shadows, and
+//   the element's own background. The next frame with the same underlay is
+//   a copy instead of another composite.
+
+const TILE: u32 = 64;
+const MAX_BACKDROP_SLOTS: usize = 4;
+const MAX_SHADOW_SLOTS: usize = 8;
+const MAX_CHROME_SLOTS: usize = 4;
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        let word = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        hash ^= word;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in chunks.remainder() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn mix64(hash: u64, value: u64) -> u64 {
+    hash ^ value.wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+fn quantize(value: f32) -> i32 {
+    (value * 4.0).round() as i32
+}
+
+struct BackdropSlot {
+    width: u32,
+    height: u32,
+    sigma_bits: u32,
+    edge: u8,
+    tile_hashes: Vec<u64>,
+    pixels: Vec<u8>,
+    stamp: u64,
+}
+
+struct ShadowSlot {
+    key: u64,
+    origin_dx: f32,
+    origin_dy: f32,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    stamp: u64,
+}
+
+struct ChromeSlot {
+    tag: u64,
+    underlay: u64,
+    origin_x: i32,
+    origin_y: i32,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    stamp: u64,
+}
+
+struct FrameCaches {
+    backdrops: Vec<BackdropSlot>,
+    shadows: Vec<ShadowSlot>,
+    chrome: Vec<ChromeSlot>,
+    stamp: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl FrameCaches {
+    fn new() -> Self {
+        Self {
+            backdrops: Vec::new(),
+            shadows: Vec::new(),
+            chrome: Vec::new(),
+            stamp: 1,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn bump(&mut self) -> u64 {
+        self.stamp = self.stamp.wrapping_add(1);
+        self.stamp
+    }
+}
+
+thread_local! {
+    static CACHES: RefCell<FrameCaches> = RefCell::new(FrameCaches::new());
+}
+
+fn tile_hashes(pixels: &[u8], width: u32, height: u32) -> Vec<u64> {
+    let tiles_x = width.div_ceil(TILE).max(1);
+    let tiles_y = height.div_ceil(TILE).max(1);
+    let mut hashes = Vec::with_capacity((tiles_x * tiles_y) as usize);
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let x0 = tx * TILE;
+            let y0 = ty * TILE;
+            let x1 = (x0 + TILE).min(width);
+            let y1 = (y0 + TILE).min(height);
+            let mut hash = 0xcbf29ce484222325u64;
+            for y in y0..y1 {
+                let start = ((y * width + x0) * 4) as usize;
+                let end = ((y * width + x1) * 4) as usize;
+                hash = mix64(hash, fnv64(&pixels[start..end]));
+            }
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+fn dirty_tile_bounds(
+    before: &[u64],
+    after: &[u64],
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if before.len() != after.len() {
+        return None;
+    }
+    let tiles_x = width.div_ceil(TILE).max(1);
+    let mut any = false;
+    let mut x0 = tiles_x;
+    let mut y0 = height.div_ceil(TILE).max(1);
+    let mut x1 = 0u32;
+    let mut y1 = 0u32;
+    for (index, (left, right)) in before.iter().zip(after.iter()).enumerate() {
+        if left == right {
+            continue;
+        }
+        any = true;
+        let tx = index as u32 % tiles_x;
+        let ty = index as u32 / tiles_x;
+        x0 = x0.min(tx);
+        y0 = y0.min(ty);
+        x1 = x1.max(tx + 1);
+        y1 = y1.max(ty + 1);
+    }
+    if !any {
+        return Some((0, 0, 0, 0));
+    }
+    let px0 = x0 * TILE;
+    let py0 = y0 * TILE;
+    let px1 = (x1 * TILE).min(width);
+    let py1 = (y1 * TILE).min(height);
+    Some((px0, py0, px1, py1))
+}
+
+fn blur_influence_pad(sigma: f32) -> i32 {
+    let scale = downsample_scale(sigma).max(1) as i32;
+    let small = kernel_radius(sigma / scale as f32) + 2;
+    (small * scale).max(kernel_radius(sigma))
+}
+
+fn reblur_dirty(
+    source: &[u8],
+    cached: &[u8],
+    width: u32,
+    height: u32,
+    sigma: f32,
+    edge: BlurEdge,
+    dirty: (u32, u32, u32, u32),
+) -> Option<Vec<u8>> {
+    let (x0, y0, x1, y1) = dirty;
+    if x1 <= x0 || y1 <= y0 {
+        return Some(cached.to_vec());
+    }
+    let pad = blur_influence_pad(sigma).max(0) as u32;
+    let sx0 = x0.saturating_sub(pad);
+    let sy0 = y0.saturating_sub(pad);
+    let sx1 = (x1 + pad).min(width);
+    let sy1 = (y1 + pad).min(height);
+    let sub_w = sx1 - sx0;
+    let sub_h = sy1 - sy0;
+    if sub_w == 0 || sub_h == 0 {
+        return None;
+    }
+    // A dirty region that covers most of the strip is cheaper to blur whole.
+    if u64::from(sub_w) * u64::from(sub_h) * 2 > u64::from(width) * u64::from(height) {
+        return None;
+    }
+    let mut sub = vec![0u8; (sub_w as usize) * (sub_h as usize) * 4];
+    for row in 0..sub_h {
+        let src = (((sy0 + row) * width + sx0) * 4) as usize;
+        let dst = (row * sub_w * 4) as usize;
+        let len = (sub_w * 4) as usize;
+        sub[dst..dst + len].copy_from_slice(&source[src..src + len]);
+    }
+    blur_premultiplied(&mut sub, sub_w, sub_h, sigma, edge);
+    let mut out = cached.to_vec();
+    // Only the inner dirty rect is valid. The pad exists so the kernel does
+    // not see a hard edge that the full-frame blur never had.
+    let local_x0 = x0 - sx0;
+    let local_y0 = y0 - sy0;
+    for row in y0..y1 {
+        let local_row = local_y0 + (row - y0);
+        let src = ((local_row * sub_w + local_x0) * 4) as usize;
+        let dst = ((row * width + x0) * 4) as usize;
+        let len = ((x1 - x0) * 4) as usize;
+        out[dst..dst + len].copy_from_slice(&sub[src..src + len]);
+    }
+    Some(out)
+}
+
+/// Blur premultiplied RGBA, reusing an identical or partly-identical strip.
+pub fn blur_premultiplied_cached(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    sigma: f32,
+    edge: BlurEdge,
+) {
+    if kernel_radius(sigma) == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let n = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if pixels.len() < n {
+        return;
+    }
+    let pixels = &mut pixels[..n];
+    let sigma_bits = (sigma.clamp(0.0, MAX_SIGMA) * 100.0).round() as u32;
+    let edge_id = match edge {
+        BlurEdge::Zero => 0u8,
+        BlurEdge::Clamp => 1u8,
+    };
+    let hashes = tile_hashes(pixels, width, height);
+    let reused = CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        let found = caches.backdrops.iter().position(|entry| {
+            entry.width == width
+                && entry.height == height
+                && entry.sigma_bits == sigma_bits
+                && entry.edge == edge_id
+        });
+        let Some(index) = found else {
+            caches.misses += 1;
+            return None;
+        };
+        let dirty = dirty_tile_bounds(&caches.backdrops[index].tile_hashes, &hashes, width, height);
+        let Some(dirty) = dirty else {
+            caches.misses += 1;
+            return None;
+        };
+        if dirty.2 <= dirty.0 || dirty.3 <= dirty.1 {
+            pixels.copy_from_slice(&caches.backdrops[index].pixels);
+            let stamp = caches.bump();
+            caches.backdrops[index].stamp = stamp;
+            caches.hits += 1;
+            return Some(());
+        }
+        let cached = caches.backdrops[index].pixels.clone();
+        let updated = reblur_dirty(pixels, &cached, width, height, sigma, edge, dirty)?;
+        pixels.copy_from_slice(&updated);
+        let stamp = caches.bump();
+        let entry = &mut caches.backdrops[index];
+        entry.tile_hashes = hashes.clone();
+        entry.pixels = updated;
+        entry.stamp = stamp;
+        caches.hits += 1;
+        Some(())
+    });
+    if reused.is_some() {
+        return;
+    }
+    let mut blurred = pixels.to_vec();
+    blur_premultiplied(&mut blurred, width, height, sigma, edge);
+    pixels.copy_from_slice(&blurred);
+    CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        let stamp = caches.bump();
+        if let Some(entry) = caches.backdrops.iter_mut().find(|entry| {
+            entry.width == width
+                && entry.height == height
+                && entry.sigma_bits == sigma_bits
+                && entry.edge == edge_id
+        }) {
+            entry.tile_hashes = hashes;
+            entry.pixels = blurred;
+            entry.stamp = stamp;
+            return;
+        }
+        if caches.backdrops.len() >= MAX_BACKDROP_SLOTS {
+            let oldest = caches
+                .backdrops
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(index, _)| index);
+            if let Some(index) = oldest {
+                caches.backdrops.remove(index);
+            }
+        }
+        caches.backdrops.push(BackdropSlot {
+            width,
+            height,
+            sigma_bits,
+            edge: edge_id,
+            tile_hashes: hashes,
+            pixels: blurred,
+            stamp,
+        });
+    });
+}
+
+fn shadow_key(rect: LayoutRect, radius: f32, shadow: &BoxShadow) -> u64 {
+    let mut hash = 0x6a09e667f3bcc909u64;
+    hash = mix64(hash, quantize(rect.width) as u64);
+    hash = mix64(hash, quantize(rect.height) as u64);
+    hash = mix64(hash, quantize(rect.x.fract()) as u64);
+    hash = mix64(hash, quantize(rect.y.fract()) as u64);
+    hash = mix64(hash, quantize(radius) as u64);
+    hash = mix64(hash, quantize(shadow.offset_x) as u64);
+    hash = mix64(hash, quantize(shadow.offset_y) as u64);
+    hash = mix64(hash, quantize(shadow.blur_radius) as u64);
+    hash = mix64(hash, quantize(shadow.spread_radius) as u64);
+    hash = mix64(
+        hash,
+        u64::from(shadow.color.r)
+            | (u64::from(shadow.color.g) << 8)
+            | (u64::from(shadow.color.b) << 16)
+            | (u64::from(shadow.color.a) << 24),
+    );
+    hash = mix64(hash, u64::from(u8::from(shadow.inset)));
+    hash
+}
+
+fn place_shadow(slot: &ShadowSlot, rect: LayoutRect) -> PremulSprite {
+    PremulSprite {
+        origin_x: rect.x + slot.origin_dx,
+        origin_y: rect.y + slot.origin_dy,
+        width: slot.width,
+        height: slot.height,
+        pixels: slot.pixels.clone(),
+    }
+}
+
+fn remember_shadow(key: u64, sprite: &PremulSprite, rect: LayoutRect) {
+    CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        let stamp = caches.bump();
+        if caches.shadows.len() >= MAX_SHADOW_SLOTS {
+            let oldest = caches
+                .shadows
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(index, _)| index);
+            if let Some(index) = oldest {
+                caches.shadows.remove(index);
+            }
+        }
+        caches.shadows.push(ShadowSlot {
+            key,
+            origin_dx: sprite.origin_x - rect.x,
+            origin_dy: sprite.origin_y - rect.y,
+            width: sprite.width,
+            height: sprite.height,
+            pixels: sprite.pixels.clone(),
+            stamp,
+        });
+    });
+}
+
+/// Style bits that change the painted chrome. Position is included so a
+/// moved dock does not reuse another dock's pixels.
+pub fn chrome_tag(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    sigma: f32,
+    background: u32,
+    border: u32,
+    shadows: u64,
+) -> u64 {
+    let mut hash = 0xbb67ae8584caa73bu64;
+    hash = mix64(hash, quantize(x) as u64);
+    hash = mix64(hash, quantize(y) as u64);
+    hash = mix64(hash, quantize(width) as u64);
+    hash = mix64(hash, quantize(height) as u64);
+    hash = mix64(hash, quantize(radius) as u64);
+    hash = mix64(hash, quantize(sigma) as u64);
+    hash = mix64(hash, u64::from(background));
+    hash = mix64(hash, u64::from(border));
+    mix64(hash, shadows)
+}
+
+fn rect_sample_bounds(
+    bounds: LayoutRect,
+    stride_w: u32,
+    height: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    let x0 = bounds.x.floor() as i32;
+    let y0 = bounds.y.floor() as i32;
+    let x1 = (bounds.x + bounds.width).ceil() as i32;
+    let y1 = (bounds.y + bounds.height).ceil() as i32;
+    let x0 = x0.clamp(0, stride_w as i32);
+    let y0 = y0.clamp(0, height as i32);
+    let x1 = x1.clamp(0, stride_w as i32);
+    let y1 = y1.clamp(0, height as i32);
+    let w = (x1 - x0) as u32;
+    let h = (y1 - y0) as u32;
+    if w == 0 || h == 0 {
+        None
+    } else {
+        Some((x0, y0, w, h))
+    }
+}
+
+pub fn hash_pixmap_rect(data: &[u8], stride_w: u32, height: u32, bounds: LayoutRect) -> u64 {
+    let Some((x0, y0, w, h)) = rect_sample_bounds(bounds, stride_w, height) else {
+        return 0;
+    };
+    let mut hash = 0xcbf29ce484222325u64;
+    let row_bytes = stride_w as usize * 4;
+    for row in 0..h {
+        let start = ((y0 as u32 + row) as usize) * row_bytes + x0 as usize * 4;
+        let end = start + (w as usize) * 4;
+        if end <= data.len() {
+            hash = mix64(hash, fnv64(&data[start..end]));
+        }
+    }
+    hash
+}
+
+fn copy_rect(data: &[u8], stride_w: u32, x0: i32, y0: i32, w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let row_bytes = stride_w as usize * 4;
+    for row in 0..h {
+        let start = ((y0 as u32 + row) as usize) * row_bytes + x0 as usize * 4;
+        let dst = (row * w * 4) as usize;
+        let len = (w * 4) as usize;
+        if start + len <= data.len() {
+            out[dst..dst + len].copy_from_slice(&data[start..start + len]);
+        }
+    }
+    out
+}
+
+fn paste_rect(data: &mut [u8], stride_w: u32, x0: i32, y0: i32, w: u32, h: u32, src: &[u8]) {
+    let row_bytes = stride_w as usize * 4;
+    for row in 0..h {
+        let start = ((y0 as u32 + row) as usize) * row_bytes + x0 as usize * 4;
+        let src_off = (row * w * 4) as usize;
+        let len = (w * 4) as usize;
+        if start + len <= data.len() && src_off + len <= src.len() {
+            data[start..start + len].copy_from_slice(&src[src_off..src_off + len]);
+        }
+    }
+}
+
+/// Copy a previously painted dock/intent chrome when the pixels underneath
+/// still match. Returns false when the caller must paint and then `store_chrome`.
+pub fn restore_chrome(
+    data: &mut [u8],
+    stride_w: u32,
+    _height: u32,
+    bounds: LayoutRect,
+    tag: u64,
+    underlay: u64,
+) -> bool {
+    let _ = bounds;
+    CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        let found = caches
+            .chrome
+            .iter()
+            .position(|entry| entry.tag == tag && entry.underlay == underlay);
+        let Some(index) = found else {
+            caches.misses += 1;
+            return false;
+        };
+        let stamp = caches.bump();
+        let origin_x = caches.chrome[index].origin_x;
+        let origin_y = caches.chrome[index].origin_y;
+        let width = caches.chrome[index].width;
+        let height_px = caches.chrome[index].height;
+        let pixels = caches.chrome[index].pixels.clone();
+        caches.chrome[index].stamp = stamp;
+        caches.hits += 1;
+        drop(caches);
+        paste_rect(
+            data, stride_w, origin_x, origin_y, width, height_px, &pixels,
+        );
+        true
+    })
+}
+
+pub fn store_chrome(
+    data: &[u8],
+    stride_w: u32,
+    height: u32,
+    bounds: LayoutRect,
+    tag: u64,
+    underlay: u64,
+) {
+    let Some((x0, y0, w, h)) = rect_sample_bounds(bounds, stride_w, height) else {
+        return;
+    };
+    let pixels = copy_rect(data, stride_w, x0, y0, w, h);
+    CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        let stamp = caches.bump();
+        if let Some(entry) = caches
+            .chrome
+            .iter_mut()
+            .find(|entry| entry.tag == tag && entry.underlay == underlay)
+        {
+            entry.origin_x = x0;
+            entry.origin_y = y0;
+            entry.width = w;
+            entry.height = h;
+            entry.pixels = pixels;
+            entry.stamp = stamp;
+            return;
+        }
+        if caches.chrome.len() >= MAX_CHROME_SLOTS {
+            let oldest = caches
+                .chrome
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(index, _)| index);
+            if let Some(index) = oldest {
+                caches.chrome.remove(index);
+            }
+        }
+        caches.chrome.push(ChromeSlot {
+            tag,
+            underlay,
+            origin_x: x0,
+            origin_y: y0,
+            width: w,
+            height: h,
+            pixels,
+            stamp,
+        });
+    });
+}
+
+pub fn cache_hit_count() -> u64 {
+    CACHES.with(|slot| slot.borrow().hits)
+}
+
+pub fn clear_frame_caches() {
+    CACHES.with(|slot| *slot.borrow_mut() = FrameCaches::new());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +1251,54 @@ mod tests {
             "shadow {shadow_elapsed:?}"
         );
         assert!(sprite.pixels.iter().any(|pixel| *pixel > 0));
+    }
+
+    #[test]
+    fn unchanged_backdrop_is_a_copy_and_a_dirty_tile_matches_a_full_blur() {
+        clear_frame_caches();
+        let width = 320u32;
+        let height = 96u32;
+        let mut source = vec![0u8; (width * height * 4) as usize];
+        for (index, pixel) in source.chunks_exact_mut(4).enumerate() {
+            pixel[0] = (index % 251) as u8;
+            pixel[1] = 40;
+            pixel[2] = 180;
+            pixel[3] = 255;
+        }
+        let mut first = source.clone();
+        blur_premultiplied_cached(&mut first, width, height, 12.0, BlurEdge::Clamp);
+        let hits = cache_hit_count();
+        let mut second = source.clone();
+        blur_premultiplied_cached(&mut second, width, height, 12.0, BlurEdge::Clamp);
+        assert!(cache_hit_count() > hits);
+        assert_eq!(first, second);
+
+        source[16] = source[16].wrapping_add(90);
+        let mut partial = source.clone();
+        blur_premultiplied_cached(&mut partial, width, height, 12.0, BlurEdge::Clamp);
+        let mut reference = source.clone();
+        blur_premultiplied(&mut reference, width, height, 12.0, BlurEdge::Clamp);
+        assert_eq!(partial, reference);
+    }
+
+    #[test]
+    fn a_translated_shadow_reuses_the_sprite() {
+        clear_frame_caches();
+        let rect = LayoutRect {
+            x: 20.25,
+            y: 30.25,
+            width: 180.0,
+            height: 48.0,
+        };
+        let shadow = BoxShadow::new(0.0, 8.0, 16.0, 0.0, Color::rgba(0, 0, 0, 90));
+        let first = raster_box_shadow(rect, 12.0, &shadow).expect("shadow");
+        let moved = LayoutRect {
+            x: rect.x + 40.0,
+            ..rect
+        };
+        let second = raster_box_shadow(moved, 12.0, &shadow).expect("cached");
+        assert_eq!(first.pixels, second.pixels);
+        assert!((second.origin_x - first.origin_x - 40.0).abs() < 0.02);
     }
 
     #[test]
