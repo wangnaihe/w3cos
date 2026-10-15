@@ -695,8 +695,103 @@ fn paint_nodes(
             text_value,
             is_focused,
             false,
+            damage_rect,
         );
     }
+}
+
+struct ChromePaint {
+    bounds: LayoutRect,
+    tag: u64,
+    underlay: u64,
+}
+
+fn chrome_bounds(rect: LayoutRect, style: &Style) -> LayoutRect {
+    let mut left = rect.x;
+    let mut top = rect.y;
+    let mut right = rect.x + rect.width;
+    let mut bottom = rect.y + rect.height;
+    for shadow in style.box_shadow_layers() {
+        if shadow.inset {
+            continue;
+        }
+        let pad = shadow.blur_radius + shadow.spread_radius.abs();
+        left = left.min(rect.x + shadow.offset_x - pad);
+        top = top.min(rect.y + shadow.offset_y - pad);
+        right = right.max(rect.x + rect.width + shadow.offset_x + pad);
+        bottom = bottom.max(rect.y + rect.height + shadow.offset_y + pad);
+    }
+    LayoutRect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
+}
+
+fn color_bits(color: Color) -> u32 {
+    u32::from(color.r)
+        | (u32::from(color.g) << 8)
+        | (u32::from(color.b) << 16)
+        | (u32::from(color.a) << 24)
+}
+
+fn chrome_style_tag(rect: LayoutRect, style: &Style) -> u64 {
+    let mut shadows = 0u64;
+    for shadow in style.box_shadow_layers() {
+        shadows = shadows.wrapping_mul(0x100000001b3).wrapping_add(
+            (shadow.offset_x.to_bits() as u64)
+                ^ (shadow.offset_y.to_bits() as u64).rotate_left(11)
+                ^ (shadow.blur_radius.to_bits() as u64).rotate_left(22)
+                ^ (shadow.spread_radius.to_bits() as u64).rotate_left(33)
+                ^ u64::from(color_bits(shadow.color))
+                ^ u64::from(u8::from(shadow.inset)),
+        );
+    }
+    crate::blur::chrome_tag(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        style.border_radius,
+        style.backdrop_blur.unwrap_or(0.0),
+        color_bits(style.background),
+        color_bits(style.border_color) ^ (style.border_width.to_bits()),
+        shadows,
+    )
+}
+
+/// `true` when a cached chrome sprite was written and decorations can be skipped.
+fn begin_chrome(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    style: &Style,
+    in_layer: bool,
+    clip_mask: Option<&Mask>,
+) -> (bool, Option<ChromePaint>) {
+    if in_layer || clip_mask.is_some() || style.filter.is_some() {
+        return (false, None);
+    }
+    let blurred = style.backdrop_blur.is_some_and(|sigma| sigma > 0.0);
+    if !blurred && !style.has_box_shadow() {
+        return (false, None);
+    }
+    let bounds = chrome_bounds(rect, style);
+    let tag = chrome_style_tag(rect, style);
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let underlay = crate::blur::hash_pixmap_rect(pixmap.data(), width, height, bounds);
+    if crate::blur::restore_chrome(pixmap.data_mut(), width, height, bounds, tag, underlay) {
+        return (true, None);
+    }
+    (
+        false,
+        Some(ChromePaint {
+            bounds,
+            tag,
+            underlay,
+        }),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,6 +805,7 @@ fn render_node(
     text_input_value: Option<&str>,
     is_focused: bool,
     in_layer: bool,
+    damage: Option<LayoutRect>,
 ) {
     if style.opacity <= 0.0 {
         return;
@@ -750,9 +846,30 @@ fn render_node(
 
     // Box shadow (render before the element; shadows stay outside filtered layer)
     let css_filter = style.filter.as_deref().and_then(filter::parse_css_filter);
-    if !in_layer {
-        if let Some(ref chain) = css_filter {
-            if let Some(shadow) = chain.drop_shadow() {
+    let opacity = style.opacity;
+    let color_chain = if in_layer { None } else { css_filter.as_ref() };
+    let bg = node_color(style.background, opacity, color_chain);
+    let (chrome_restored, chrome_paint) = begin_chrome(pixmap, rect, style, in_layer, clip_mask);
+    if !chrome_restored {
+        if !in_layer {
+            if let Some(ref chain) = css_filter {
+                if let Some(shadow) = chain.drop_shadow() {
+                    draw_box_shadow(
+                        pixmap,
+                        rect,
+                        shadow,
+                        style.border_radius,
+                        style.opacity,
+                        clip_mask,
+                        damage,
+                    );
+                }
+            }
+            let outer_shadows = style
+                .box_shadow_layers()
+                .filter(|shadow| !shadow.inset)
+                .collect::<Vec<_>>();
+            for shadow in outer_shadows.into_iter().rev() {
                 draw_box_shadow(
                     pixmap,
                     rect,
@@ -760,14 +877,90 @@ fn render_node(
                     style.border_radius,
                     style.opacity,
                     clip_mask,
+                    damage,
                 );
             }
+            if let Some(sigma) = style.backdrop_blur.filter(|sigma| *sigma > 0.0) {
+                draw_backdrop_blur(pixmap, rect, style.border_radius, sigma, clip_mask, damage);
+            }
+
+            if css_filter.as_ref().is_some_and(|c| c.has_blur()) {
+                if let Some(ref chain) = css_filter {
+                    render_node_layer_blur(
+                        pixmap,
+                        rect,
+                        kind,
+                        style,
+                        font,
+                        clip_mask,
+                        text_input_value,
+                        is_focused,
+                        chain,
+                    );
+                }
+                return;
+            }
         }
-        let outer_shadows = style
+
+        let bg = node_color(style.background, opacity, color_chain);
+        for background_rect in
+            crate::paint_artifact::box_background_paint_rects(style, decoration_rect)
+        {
+            if bg.a > 0 {
+                draw_rect(pixmap, background_rect, bg, style.border_radius, clip_mask);
+            }
+            for layer in crate::background_image::background_paint_layers_with_overrides(
+                style,
+                decoration_rect,
+                crate::paint_artifact::box_background_positioning_rect(style, rect),
+                Some(background_rect),
+            )
+            .into_iter()
+            .rev()
+            {
+                match layer {
+                    crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                        if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
+                            for tile in layer.tiles {
+                                let viewport = decoded.svg_viewport(tile.width, tile.height);
+                                let decoded = viewport.as_ref().unwrap_or(&decoded);
+                                draw_image_pixels(
+                                    pixmap,
+                                    tile,
+                                    decoded.width,
+                                    decoded.height,
+                                    &decoded.data,
+                                    opacity,
+                                    clip_mask,
+                                    Some(layer.clip),
+                                    layer.blend_mode,
+                                );
+                            }
+                        }
+                    }
+                    crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                        for tile in layer.geometry.tiles {
+                            draw_gradient_pixels(
+                                pixmap,
+                                tile,
+                                &layer.kind,
+                                &layer.stops,
+                                opacity,
+                                clip_mask,
+                                layer.geometry.clip,
+                                layer.blend_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let inset_shadows = style
             .box_shadow_layers()
-            .filter(|shadow| !shadow.inset)
+            .filter(|shadow| shadow.inset)
             .collect::<Vec<_>>();
-        for shadow in outer_shadows.into_iter().rev() {
+        for shadow in inset_shadows.into_iter().rev() {
             draw_box_shadow(
                 pixmap,
                 rect,
@@ -775,198 +968,124 @@ fn render_node(
                 style.border_radius,
                 style.opacity,
                 clip_mask,
+                damage,
             );
         }
-        if let Some(sigma) = style.backdrop_blur.filter(|sigma| *sigma > 0.0) {
-            draw_backdrop_blur(pixmap, rect, style.border_radius, sigma, clip_mask);
-        }
 
-        if css_filter.as_ref().is_some_and(|c| c.has_blur()) {
-            if let Some(ref chain) = css_filter {
-                render_node_layer_blur(
-                    pixmap,
-                    rect,
-                    kind,
-                    style,
-                    font,
-                    clip_mask,
-                    text_input_value,
-                    is_focused,
-                    chain,
-                );
-            }
-            return;
-        }
-    }
-
-    let opacity = style.opacity;
-    let color_chain = if in_layer { None } else { css_filter.as_ref() };
-    let bg = node_color(style.background, opacity, color_chain);
-    for background_rect in crate::paint_artifact::box_background_paint_rects(style, decoration_rect)
-    {
-        if bg.a > 0 {
-            draw_rect(pixmap, background_rect, bg, style.border_radius, clip_mask);
-        }
-        for layer in crate::background_image::background_paint_layers_with_overrides(
-            style,
-            decoration_rect,
-            crate::paint_artifact::box_background_positioning_rect(style, rect),
-            Some(background_rect),
-        )
-        .into_iter()
-        .rev()
-        {
-            match layer {
-                crate::background_image::BackgroundPaintLayer::Raster(layer) => {
-                    if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
-                        for tile in layer.tiles {
-                            let viewport = decoded.svg_viewport(tile.width, tile.height);
-                            let decoded = viewport.as_ref().unwrap_or(&decoded);
-                            draw_image_pixels(
-                                pixmap,
-                                tile,
-                                decoded.width,
-                                decoded.height,
-                                &decoded.data,
-                                opacity,
-                                clip_mask,
-                                Some(layer.clip),
-                                layer.blend_mode,
+        let has_edge_border = style.border_top_width.is_some()
+            || style.border_right_width.is_some()
+            || style.border_bottom_width.is_some()
+            || style.border_left_width.is_some()
+            || style.border_top_color.is_some()
+            || style.border_right_color.is_some()
+            || style.border_bottom_color.is_some()
+            || style.border_left_color.is_some()
+            || (style.border_collapse && style.display == w3cos_std::style::Display::TableCell);
+        let has_edge_border = has_edge_border
+            || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
+        if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
+            draw_border(
+                pixmap,
+                rect,
+                node_color(style.border_color, opacity, color_chain),
+                style.border_width,
+                style.border_radius,
+                clip_mask,
+            );
+        } else if has_edge_border {
+            let widths = [
+                style.border_top_width.unwrap_or(style.border_width),
+                style.border_right_width.unwrap_or(style.border_width),
+                style.border_bottom_width.unwrap_or(style.border_width),
+                style.border_left_width.unwrap_or(style.border_width),
+            ];
+            let colors = [
+                style.border_top_color.unwrap_or(style.border_color),
+                style.border_right_color.unwrap_or(style.border_color),
+                style.border_bottom_color.unwrap_or(style.border_color),
+                style.border_left_color.unwrap_or(style.border_color),
+            ];
+            let edges =
+                crate::paint_artifact::border_edge_paint_rects(style, decoration_rect, widths);
+            if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
+                let origin = (rect.x.floor(), rect.y.floor());
+                let layer_width = (rect.x + rect.width).ceil() - origin.0;
+                let layer_height = (rect.y + rect.height).ceil() - origin.1;
+                let mut border_layer =
+                    Pixmap::new(layer_width.max(1.0) as u32, layer_height.max(1.0) as u32);
+                for layer in
+                    crate::border_paint::three_dimensional_layers(style, rect, widths, colors)
+                {
+                    let mut builder = PathBuilder::new();
+                    for points in layer.polygons {
+                        builder.move_to(points[0].0 - origin.0, points[0].1 - origin.1);
+                        for point in &points[1..] {
+                            builder.line_to(point.0 - origin.0, point.1 - origin.1);
+                        }
+                        builder.close();
+                    }
+                    if let Some(path) = builder.finish() {
+                        let mut color = node_color(layer.color, 1.0, color_chain);
+                        if layer.shadow {
+                            color.a = 255;
+                        }
+                        let mut paint = Paint::default();
+                        paint.set_color(SkColor::from_rgba8(color.r, color.g, color.b, color.a));
+                        paint.anti_alias = true;
+                        if layer.shadow {
+                            paint.blend_mode = tiny_skia::BlendMode::SourceAtop;
+                        }
+                        if let Some(border_layer) = border_layer.as_mut() {
+                            border_layer.fill_path(
+                                &path,
+                                &paint,
+                                FillRule::Winding,
+                                Transform::identity(),
+                                None,
                             );
                         }
                     }
                 }
-                crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
-                    for tile in layer.geometry.tiles {
-                        draw_gradient_pixels(
+                if let Some(border_layer) = border_layer {
+                    let paint = tiny_skia::PixmapPaint {
+                        opacity,
+                        ..Default::default()
+                    };
+                    pixmap.draw_pixmap(
+                        origin.0 as i32,
+                        origin.1 as i32,
+                        border_layer.as_ref(),
+                        &paint,
+                        Transform::identity(),
+                        clip_mask,
+                    );
+                }
+            } else {
+                for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
+                    if width > 0.0 && color.a > 0 {
+                        draw_rect(
                             pixmap,
-                            tile,
-                            &layer.kind,
-                            &layer.stops,
-                            opacity,
+                            edge,
+                            node_color(color, opacity, color_chain),
+                            0.0,
                             clip_mask,
-                            layer.geometry.clip,
-                            layer.blend_mode,
                         );
                     }
                 }
             }
         }
-    }
 
-    let inset_shadows = style
-        .box_shadow_layers()
-        .filter(|shadow| shadow.inset)
-        .collect::<Vec<_>>();
-    for shadow in inset_shadows.into_iter().rev() {
-        draw_box_shadow(
-            pixmap,
-            rect,
-            shadow,
-            style.border_radius,
-            style.opacity,
-            clip_mask,
-        );
-    }
-
-    let has_edge_border = style.border_top_width.is_some()
-        || style.border_right_width.is_some()
-        || style.border_bottom_width.is_some()
-        || style.border_left_width.is_some()
-        || style.border_top_color.is_some()
-        || style.border_right_color.is_some()
-        || style.border_bottom_color.is_some()
-        || style.border_left_color.is_some()
-        || (style.border_collapse && style.display == w3cos_std::style::Display::TableCell);
-    let has_edge_border = has_edge_border
-        || (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side));
-    if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
-        draw_border(
-            pixmap,
-            rect,
-            node_color(style.border_color, opacity, color_chain),
-            style.border_width,
-            style.border_radius,
-            clip_mask,
-        );
-    } else if has_edge_border {
-        let widths = [
-            style.border_top_width.unwrap_or(style.border_width),
-            style.border_right_width.unwrap_or(style.border_width),
-            style.border_bottom_width.unwrap_or(style.border_width),
-            style.border_left_width.unwrap_or(style.border_width),
-        ];
-        let colors = [
-            style.border_top_color.unwrap_or(style.border_color),
-            style.border_right_color.unwrap_or(style.border_color),
-            style.border_bottom_color.unwrap_or(style.border_color),
-            style.border_left_color.unwrap_or(style.border_color),
-        ];
-        let edges = crate::paint_artifact::border_edge_paint_rects(style, decoration_rect, widths);
-        if (0..4).any(|side| crate::border_paint::is_three_dimensional(style, side)) {
-            let origin = (rect.x.floor(), rect.y.floor());
-            let layer_width = (rect.x + rect.width).ceil() - origin.0;
-            let layer_height = (rect.y + rect.height).ceil() - origin.1;
-            let mut border_layer =
-                Pixmap::new(layer_width.max(1.0) as u32, layer_height.max(1.0) as u32);
-            for layer in crate::border_paint::three_dimensional_layers(style, rect, widths, colors)
-            {
-                let mut builder = PathBuilder::new();
-                for points in layer.polygons {
-                    builder.move_to(points[0].0 - origin.0, points[0].1 - origin.1);
-                    for point in &points[1..] {
-                        builder.line_to(point.0 - origin.0, point.1 - origin.1);
-                    }
-                    builder.close();
-                }
-                if let Some(path) = builder.finish() {
-                    let mut color = node_color(layer.color, 1.0, color_chain);
-                    if layer.shadow {
-                        color.a = 255;
-                    }
-                    let mut paint = Paint::default();
-                    paint.set_color(SkColor::from_rgba8(color.r, color.g, color.b, color.a));
-                    paint.anti_alias = true;
-                    if layer.shadow {
-                        paint.blend_mode = tiny_skia::BlendMode::SourceAtop;
-                    }
-                    if let Some(border_layer) = border_layer.as_mut() {
-                        border_layer.fill_path(
-                            &path,
-                            &paint,
-                            FillRule::Winding,
-                            Transform::identity(),
-                            None,
-                        );
-                    }
-                }
-            }
-            if let Some(border_layer) = border_layer {
-                let paint = tiny_skia::PixmapPaint {
-                    opacity,
-                    ..Default::default()
-                };
-                pixmap.draw_pixmap(
-                    origin.0 as i32,
-                    origin.1 as i32,
-                    border_layer.as_ref(),
-                    &paint,
-                    Transform::identity(),
-                    clip_mask,
-                );
-            }
-        } else {
-            for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
-                if width > 0.0 && color.a > 0 {
-                    draw_rect(
-                        pixmap,
-                        edge,
-                        node_color(color, opacity, color_chain),
-                        0.0,
-                        clip_mask,
-                    );
-                }
-            }
+        if let Some(paint) = chrome_paint {
+            let width = pixmap.width();
+            let height = pixmap.height();
+            crate::blur::store_chrome(
+                pixmap.data(),
+                width,
+                height,
+                paint.bounds,
+                paint.tag,
+                paint.underlay,
+            );
         }
     }
 
@@ -1233,6 +1352,7 @@ fn render_node_layer_blur(
         text_input_value,
         is_focused,
         true,
+        None,
     );
     filter::apply_chain_to_rgba(layer.data_mut(), lw, lh, chain);
 
@@ -1264,8 +1384,12 @@ fn draw_backdrop_blur(
     radius: f32,
     sigma: f32,
     clip_mask: Option<&Mask>,
+    damage: Option<LayoutRect>,
 ) {
     let sigma = sigma.min(crate::blur::MAX_SIGMA);
+    if damage.is_some_and(|damage| !rects_intersect(rect, damage)) {
+        return;
+    }
     let pad = crate::blur::kernel_radius(sigma);
     if pad == 0 {
         return;
@@ -1292,7 +1416,7 @@ fn draw_backdrop_blur(
                 .copy_from_slice(&data[src..src + width as usize * 4]);
         }
     }
-    crate::blur::blur_premultiplied(
+    crate::blur::blur_premultiplied_cached(
         &mut region,
         width,
         height,
@@ -1305,6 +1429,14 @@ fn draw_backdrop_blur(
         for col in 0..width {
             let px = x0 + col as i32;
             let py = y0 + row as i32;
+            if damage.is_some_and(|damage| {
+                (px as f32) < damage.x
+                    || (py as f32) < damage.y
+                    || (px as f32) >= damage.x + damage.width
+                    || (py as f32) >= damage.y + damage.height
+            }) {
+                continue;
+            }
             let cover =
                 crate::blur::round_rect_coverage(px as f32 + 0.5, py as f32 + 0.5, rect, radius);
             if cover <= 0.0 {
@@ -1332,11 +1464,32 @@ fn draw_backdrop_blur(
     }
 }
 
+fn sprite_damage_span(
+    sprite: &crate::blur::PremulSprite,
+    damage: Option<LayoutRect>,
+) -> (u32, u32, u32, u32) {
+    let Some(damage) = damage else {
+        return (0, sprite.width, 0, sprite.height);
+    };
+    let x0 = damage.x.floor() as i32;
+    let y0 = damage.y.floor() as i32;
+    let x1 = (damage.x + damage.width).ceil() as i32;
+    let y1 = (damage.y + damage.height).ceil() as i32;
+    let origin_x = sprite.origin_x.floor() as i32;
+    let origin_y = sprite.origin_y.floor() as i32;
+    let col0 = (x0 - origin_x).clamp(0, sprite.width as i32) as u32;
+    let row0 = (y0 - origin_y).clamp(0, sprite.height as i32) as u32;
+    let col1 = (x1 - origin_x).clamp(0, sprite.width as i32) as u32;
+    let row1 = (y1 - origin_y).clamp(0, sprite.height as i32) as u32;
+    (col0, col1, row0, row1)
+}
+
 fn blit_premul_sprite(
     pixmap: &mut Pixmap,
     sprite: &crate::blur::PremulSprite,
     opacity: f32,
     clip_mask: Option<&Mask>,
+    damage: Option<LayoutRect>,
 ) {
     let opacity = opacity.clamp(0.0, 1.0);
     if opacity <= 0.0 {
@@ -1346,10 +1499,11 @@ fn blit_premul_sprite(
     let dst_h = pixmap.height() as i32;
     let origin_x = sprite.origin_x as i32;
     let origin_y = sprite.origin_y as i32;
+    let (col_start, col_end, row_start, row_end) = sprite_damage_span(sprite, damage);
     let data = pixmap.data_mut();
     let row_bytes = dst_w as usize * 4;
-    for row in 0..sprite.height {
-        for col in 0..sprite.width {
+    for row in row_start..row_end {
+        for col in col_start..col_end {
             let px = origin_x + col as i32;
             let py = origin_y + row as i32;
             if px < 0 || py < 0 || px >= dst_w || py >= dst_h {
@@ -1395,9 +1549,25 @@ fn draw_box_shadow(
     radius: f32,
     opacity: f32,
     clip_mask: Option<&Mask>,
+    damage: Option<LayoutRect>,
 ) {
+    if let Some(damage) = damage {
+        let pad = shadow.blur_radius + shadow.spread_radius.abs() + 2.0;
+        let bounds = LayoutRect {
+            x: rect.x + shadow.offset_x - pad,
+            y: rect.y + shadow.offset_y - pad,
+            width: rect.width + pad * 2.0,
+            height: rect.height + pad * 2.0,
+        };
+        if !rects_intersect(bounds, damage) && !shadow.inset {
+            return;
+        }
+        if shadow.inset && !rects_intersect(rect, damage) {
+            return;
+        }
+    }
     if let Some(sprite) = crate::blur::raster_box_shadow(rect, radius, shadow) {
-        blit_premul_sprite(pixmap, &sprite, opacity, clip_mask);
+        blit_premul_sprite(pixmap, &sprite, opacity, clip_mask, damage);
         return;
     }
     if shadow.inset {
@@ -2112,7 +2282,7 @@ fn paint_text_shadows(
                     pixels
                 },
             };
-            blit_premul_sprite(pixmap, &sprite, style.opacity, clip_mask);
+            blit_premul_sprite(pixmap, &sprite, style.opacity, clip_mask, None);
         }
     });
 }
@@ -2546,6 +2716,7 @@ mod font_cjk_tests {
             0.0,
             1.0,
             None,
+            None,
         );
         assert_eq!(inset.pixel(1, 1).unwrap().alpha(), 0);
         assert!(inset.pixel(20, 12).unwrap().red() > 200);
@@ -2558,6 +2729,7 @@ mod font_cjk_tests {
             &w3cos_std::style::BoxShadow::new(0.0, 6.0, 0.0, 0.0, Color::rgb(0, 0, 255)),
             0.0,
             1.0,
+            None,
             None,
         );
         assert!(outer.pixel(20, 32).unwrap().blue() > 0);
@@ -2578,6 +2750,7 @@ mod font_cjk_tests {
             &w3cos_std::style::BoxShadow::new(0.0, 0.0, 8.0, 0.0, Color::rgb(0, 0, 255)),
             0.0,
             1.0,
+            None,
             None,
         );
         let edge = pixmap.pixel(45, 26).unwrap().alpha();
@@ -2607,6 +2780,7 @@ mod font_cjk_tests {
             },
             0.0,
             4.0,
+            None,
             None,
         );
         let mixed = backdrop.pixel(20, 10).unwrap();
@@ -2995,5 +3169,146 @@ mod font_cjk_tests {
         assert_eq!(pixmap.pixel(0, 0).unwrap().alpha(), 0);
         assert!(pixmap.pixel(2, 5).unwrap().red() > pixmap.pixel(2, 5).unwrap().blue());
         assert!(pixmap.pixel(8, 5).unwrap().blue() > pixmap.pixel(8, 5).unwrap().red());
+    }
+
+    #[test]
+    fn dock_and_intent_bar_reuse_cached_chrome_under_4ms_when_release() {
+        crate::blur::clear_frame_caches();
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let mut wallpaper = Style::default();
+        wallpaper.background = Color::rgb(32, 48, 72);
+        let mut dock = Style::default();
+        dock.background = Color::rgba(12, 18, 24, 190);
+        dock.border_radius = 22.0;
+        dock.border_width = 1.0;
+        dock.border_color = Color::rgba(244, 241, 234, 40);
+        dock.backdrop_blur = Some(18.0);
+        dock.box_shadow = Some(w3cos_std::style::BoxShadow::new(
+            0.0,
+            8.0,
+            24.0,
+            0.0,
+            Color::rgba(0, 0, 0, 82),
+        ));
+        let mut intent = Style::default();
+        intent.background = Color::rgba(16, 22, 29, 210);
+        intent.border_radius = 16.0;
+        intent.border_width = 1.0;
+        intent.border_color = Color::rgba(244, 241, 234, 40);
+        intent.backdrop_blur = Some(16.0);
+        intent.box_shadow = Some(w3cos_std::style::BoxShadow::new(
+            0.0,
+            8.0,
+            24.0,
+            0.0,
+            Color::rgba(0, 0, 0, 82),
+        ));
+        let mut corner = Style::default();
+        corner.background = Color::rgb(200, 80, 40);
+        let kind = ComponentKind::Box;
+        let nodes = [
+            (
+                0usize,
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1200.0,
+                    height: 800.0,
+                },
+                &kind,
+                &wallpaper,
+            ),
+            (
+                1usize,
+                LayoutRect {
+                    x: 16.0,
+                    y: 708.0,
+                    width: 1168.0,
+                    height: 72.0,
+                },
+                &kind,
+                &dock,
+            ),
+            (
+                2usize,
+                LayoutRect {
+                    x: 280.0,
+                    y: 636.0,
+                    width: 640.0,
+                    height: 52.0,
+                },
+                &kind,
+                &intent,
+            ),
+            (
+                3usize,
+                LayoutRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 24.0,
+                    height: 24.0,
+                },
+                &kind,
+                &corner,
+            ),
+        ];
+        let scroll = [None, None, None, None];
+        let values = HashMap::new();
+        let mut masks = ClipMaskCache {
+            framebuffer_size: (0, 0),
+            masks: HashMap::new(),
+        };
+        let mut pixmap = Pixmap::new(1200, 800).unwrap();
+        let cold = Instant::now();
+        render_frame(
+            &mut pixmap,
+            &nodes,
+            &font,
+            &scroll,
+            &values,
+            None,
+            &mut masks,
+        );
+        let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
+        let dock_pixel = pixmap.pixel(600, 740).unwrap();
+        let warm_started = Instant::now();
+        let frames = 4u32;
+        for _ in 0..frames {
+            render_frame(
+                &mut pixmap,
+                &nodes,
+                &font,
+                &scroll,
+                &values,
+                None,
+                &mut masks,
+            );
+        }
+        let warm_ms = warm_started.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+        assert_eq!(pixmap.pixel(600, 740).unwrap().red(), dock_pixel.red());
+        assert_eq!(pixmap.pixel(600, 740).unwrap().blue(), dock_pixel.blue());
+        let damage = render_damage_nodes(
+            &mut pixmap,
+            &nodes,
+            &font,
+            &scroll,
+            &values,
+            None,
+            &[3],
+            &mut masks,
+        );
+        assert!(damage.is_some());
+        assert_eq!(pixmap.pixel(600, 740).unwrap().red(), dock_pixel.red());
+        let budget = if cfg!(debug_assertions) { 80.0 } else { 4.0 };
+        assert!(
+            warm_ms < budget,
+            "cold {cold_ms:.2}ms warm {warm_ms:.2}ms budget {budget}ms hits {}",
+            crate::blur::cache_hit_count()
+        );
+        eprintln!("dock+intent 1200x800 cold {cold_ms:.2}ms warm {warm_ms:.2}ms");
     }
 }
