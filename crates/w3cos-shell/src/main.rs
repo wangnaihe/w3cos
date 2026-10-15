@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 mod agent_host;
 mod gesture;
+mod handoff;
 mod locale;
 mod windows;
 
@@ -127,6 +128,15 @@ const OP_FILTER_CANCELLED: u8 = 62;
 const OP_COPY_SUBJECT: u8 = 63;
 const OP_PREVIEW: u8 = 64;
 const OP_SWITCHER: u8 = 65;
+const OP_SETTINGS_DEVICES: u8 = 66;
+const OP_PAIR_NO: u8 = 67;
+const OP_PAIR_YES: u8 = 68;
+const OP_HANDOFF_LATER: u8 = 69;
+const OP_HANDOFF_GO: u8 = 70;
+const OP_HANDOFF_OPEN: u8 = 71;
+const OP_HANDOFF_HIDE: u8 = 72;
+const OP_SYNC_RECEIPTS: u8 = 73;
+const OP_SYNC_DRAFTS: u8 = 74;
 
 fn main() {
     shell_main();
@@ -170,6 +180,7 @@ pub(crate) fn shell_main() {
     state::set_shell_key_hook(on_shell_key);
     state::set_agent_poll_hook(on_agent_poll);
     ensure_clock_timer();
+    handoff::ensure_listener();
     agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     #[cfg(feature = "desktop")]
@@ -1153,6 +1164,51 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             let next = i64::from(state::get_signal(SWITCHER_SIGNAL) == 0);
             state::set_signal(SWITCHER_SIGNAL, next);
         }
+        OP_SETTINGS_DEVICES => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+        }
+        OP_PAIR_NO => {
+            handoff::codes_differ();
+            state::mark_dirty();
+        }
+        OP_PAIR_YES => {
+            let _ = handoff::codes_match();
+            state::mark_dirty();
+        }
+        OP_SYNC_RECEIPTS => {
+            handoff::allow_receipt_sync();
+            state::mark_dirty();
+        }
+        OP_SYNC_DRAFTS => {
+            handoff::allow_draft_sync();
+            state::mark_dirty();
+        }
+        OP_HANDOFF_LATER => {
+            handoff::hide_banner();
+            state::mark_dirty();
+        }
+        OP_HANDOFF_GO => {
+            let sealed = handoff::begin_send(
+                receipt_entries(),
+                &state::get_signal_text(DRAFT_SIGNAL),
+                &state::get_signal_text(FILE_PREVIEW_SIGNAL),
+                false,
+            );
+            if sealed.is_none() {
+                push_toast(&locale::t("handoff-no-peer"));
+            }
+            state::mark_dirty();
+        }
+        OP_HANDOFF_OPEN => {
+            focus_app(1);
+            handoff::dismiss_incoming();
+            push_toast(&locale::t("handoff-opened"));
+        }
+        OP_HANDOFF_HIDE => {
+            handoff::dismiss_incoming();
+            state::mark_dirty();
+        }
         OP_SCRIM => {}
         _ => return false,
     }
@@ -1242,6 +1298,19 @@ fn apply_screen_override() {
             state::set_signal(SWITCHER_SIGNAL, 1);
         }
         Some("notify") => state::set_signal(NOTIFY_SIGNAL, 1),
+        Some("devices") => {
+            focus_app(3);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            handoff::demo_pending();
+        }
+        Some("handoff") => {
+            focus_app(1);
+            handoff::demo_banner();
+        }
+        Some("handoff-phone") => {
+            focus_app(0);
+            handoff::demo_incoming();
+        }
         Some("windows") => {
             state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
             state::set_signal(MINIMIZED_MASK_SIGNAL, app_bit(5));
@@ -1271,6 +1340,12 @@ fn build_shell() -> Component {
     };
     if state::get_signal(SWITCHER_SIGNAL) != 0 && matches!(posture(), Posture::Phone) {
         column.push(chrome_layer(build_switcher()));
+    }
+    if handoff::show_banner() && matches!(posture(), Posture::Desktop | Posture::WideTablet) {
+        column.push(chrome_layer(build_handoff_banner()));
+    }
+    if handoff::incoming().is_some() {
+        column.push(chrome_layer(build_handoff_incoming()));
     }
     if state::get_signal(TASKS_SIGNAL) != 0 && posture() == Posture::Desktop {
         column.push(dock_right(build_task_center()));
@@ -2932,6 +3007,11 @@ fn build_settings_app() -> Component {
                                 OP_SETTINGS_BRIDGE,
                             ),
                             nav_button(&locale::t("settings-l2"), tab == 3, OP_SETTINGS_L2),
+                            nav_button(
+                                &locale::t("settings-devices"),
+                                tab == 4,
+                                OP_SETTINGS_DEVICES,
+                            ),
                         ],
                     ),
                     Component::column(
@@ -2954,8 +3034,231 @@ fn settings_page(tab: i64) -> Vec<Component> {
         1 => settings_identity_page(),
         2 => settings_permissions_page(),
         3 => settings_l2_page(),
+        4 => settings_devices_page(),
         _ => settings_local_page(),
     }
+}
+
+fn settings_devices_page() -> Vec<Component> {
+    let mut page = settings_heading(
+        &locale::t("settings-devices-title"),
+        &locale::t("settings-devices-detail"),
+    );
+    let fingerprint = truncate_middle(&handoff::local_fingerprint(), 28);
+    page.push(Component::text(
+        format!("{} · {fingerprint}", handoff::local_name()),
+        Style {
+            font_size: 14.0,
+            color: ink(),
+            ..Style::default()
+        },
+    ));
+    if let Some(peer) = handoff::pending_peer() {
+        let (grouped, spaced) = handoff::short_code(
+            &handoff::local_fingerprint(),
+            &peer.fingerprint,
+            &peer.nonce,
+        );
+        page.push(Component::text(
+            format!("{} · {}", peer.name, locale::t("pair-pending")),
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#f0d7b4"),
+                ..Style::default()
+            },
+        ));
+        page.push(Component::text(
+            grouped,
+            Style {
+                font_size: 28.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ));
+        page.push(Component::text(
+            spaced,
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+        page.push(chrome_button(
+            locale::t("pair-mismatch-button"),
+            OP_PAIR_NO,
+            "#9a3412",
+        ));
+        page.push(chrome_button(
+            locale::t("pair-trust-button"),
+            OP_PAIR_YES,
+            "#0c6d4c",
+        ));
+    } else if handoff::choosing_sync() {
+        page.push(Component::text(
+            locale::t("pair-trusted"),
+            Style {
+                font_size: 14.0,
+                color: ink(),
+                ..Style::default()
+            },
+        ));
+        page.push(chrome_button(
+            locale::t("sync-receipts"),
+            OP_SYNC_RECEIPTS,
+            "#0c6d4c",
+        ));
+        page.push(chrome_button(
+            locale::t("sync-drafts"),
+            OP_SYNC_DRAFTS,
+            "#0c6d4c",
+        ));
+    } else if handoff::peers().is_empty() {
+        page.push(Component::text(
+            locale::t("devices-empty"),
+            Style {
+                font_size: 14.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+    } else {
+        for peer in handoff::peers() {
+            let state = if peer.trusted {
+                locale::t("pair-trusted")
+            } else {
+                locale::t("pair-pending")
+            };
+            page.push(Component::text(
+                format!("{} · {state}", peer.name),
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
+    }
+    if handoff::sending() {
+        page.push(Component::text(
+            locale::t("handoff-sending"),
+            Style {
+                font_size: 14.0,
+                color: ink(),
+                ..Style::default()
+            },
+        ));
+    }
+    let notice = handoff::notice();
+    if !notice.is_empty() {
+        page.push(Component::text(
+            locale::t(&notice),
+            Style {
+                font_size: 13.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ));
+    }
+    page
+}
+
+fn build_handoff_banner() -> Component {
+    let mut card = Component::column(
+        Style {
+            width: Dimension::Px(420.0),
+            padding: Edges::all(16.0),
+            gap: 8.0,
+            background: Color::from_hex("#1c2631"),
+            border_radius: 16.0,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                locale::t("handoff-title"),
+                Style {
+                    font_size: 16.0,
+                    font_weight: 700,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                locale::t("handoff-detail"),
+                Style {
+                    font_size: 13.0,
+                    color: muted_ink(),
+                    ..Style::default()
+                },
+            ),
+            chrome_button(locale::t("handoff-later"), OP_HANDOFF_LATER, "#3d5570"),
+            chrome_button(locale::t("handoff-go"), OP_HANDOFF_GO, "#0c6d4c"),
+        ],
+    );
+    let (width, _) = state::shell_viewport();
+    card.style.position = Position::Absolute;
+    card.style.left = Dimension::Px(((width - 420.0) / 2.0).max(16.0));
+    card.style.top = Dimension::Px(24.0);
+    card.style.z_index = CHROME_Z + 1;
+    card
+}
+
+fn build_handoff_incoming() -> Component {
+    let (from, path, draft) = handoff::incoming().unwrap_or_default();
+    let (width, height) = state::shell_viewport();
+    let mut card = Component::column(
+        Style {
+            padding: Edges::all(20.0),
+            gap: 12.0,
+            background: Color::from_hex("#1c2631"),
+            border_radius: 22.0,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                locale::t_args("handoff-from", &[("name", &from)]),
+                Style {
+                    font_size: 20.0,
+                    font_weight: 700,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                path,
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                draft,
+                Style {
+                    font_size: 14.0,
+                    color: muted_ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                locale::t("handoff-l2-still-off"),
+                Style {
+                    font_size: 13.0,
+                    color: muted_ink(),
+                    ..Style::default()
+                },
+            ),
+            chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
+            chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
+        ],
+    );
+    card.style.position = Position::Absolute;
+    card.style.left = Dimension::Px(16.0);
+    card.style.top = Dimension::Px(24.0);
+    card.style.width = Dimension::Px((width - 32.0).max(200.0));
+    card.style.max_height = Dimension::Px((height - 120.0).max(240.0));
+    card.style.z_index = CHROME_Z + 1;
+    card
 }
 
 fn settings_heading(title: &str, detail: &str) -> Vec<Component> {
