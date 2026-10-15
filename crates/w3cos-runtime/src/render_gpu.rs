@@ -1478,13 +1478,13 @@ pub fn draw_hover_outline(scene: &mut Scene, rect: LayoutRect, scale_factor: f32
 
 pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
     let dpi = Affine::scale(scale_factor as f64);
-    let color = Color::new([108.0 / 255.0, 92.0 / 255.0, 231.0 / 255.0, 180.0 / 255.0]);
-    let stroke = Stroke::new(3.0);
+    let color = Color::new([233.0 / 255.0, 255.0 / 255.0, 245.0 / 255.0, 230.0 / 255.0]);
+    let stroke = Stroke::new(2.0);
     let r = Rect::new(
-        rect.x as f64,
-        rect.y as f64,
-        (rect.x + rect.width) as f64,
-        (rect.y + rect.height) as f64,
+        (rect.x - 2.0) as f64,
+        (rect.y - 2.0) as f64,
+        (rect.x + rect.width + 2.0) as f64,
+        (rect.y + rect.height + 2.0) as f64,
     );
     scene.stroke(&stroke, dpi, color, None, &r);
 }

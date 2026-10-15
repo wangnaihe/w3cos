@@ -204,6 +204,123 @@ pub fn mark_dirty() {
     STORE.with(|s| s.borrow_mut().dirty = true);
 }
 
+thread_local! {
+    static SHELL_VIEWPORT: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+fn configured_viewport() -> (f32, f32) {
+    if let Ok(raw) = std::env::var("W3COS_VIEW") {
+        let mut parts = raw.split(['x', 'X', ',']);
+        if let (Some(width), Some(height)) = (parts.next(), parts.next())
+            && let (Ok(width), Ok(height)) =
+                (width.trim().parse::<f32>(), height.trim().parse::<f32>())
+            && width >= 200.0
+            && height >= 200.0
+        {
+            return (width, height);
+        }
+    }
+    (1200.0, 800.0)
+}
+
+/// Logical window size the shell should lay out against.
+/// `W3COS_VIEW=390x760` overrides the 1200×800 desktop default.
+pub fn shell_viewport() -> (f32, f32) {
+    SHELL_VIEWPORT.with(|slot| {
+        let current = slot.get();
+        if current.0 < 1.0 {
+            let initial = configured_viewport();
+            slot.set(initial);
+            initial
+        } else {
+            current
+        }
+    })
+}
+
+/// Remember the platform viewport. Returns true when the size changed so the
+/// shell can rebuild its desktop, tablet, or phone posture.
+pub fn note_shell_viewport(width: f32, height: f32) -> bool {
+    let width = width.round();
+    let height = height.round();
+    if width < 1.0 || height < 1.0 {
+        return false;
+    }
+    let (current_w, current_h) = shell_viewport();
+    if (current_w - width).abs() < 0.5 && (current_h - height).abs() < 0.5 {
+        return false;
+    }
+    SHELL_VIEWPORT.with(|slot| slot.set((width, height)));
+    true
+}
+
+thread_local! {
+    static POINTER_COARSE: Cell<Option<bool>> = const { Cell::new(None) };
+    static PRESS_ORIGIN: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
+    static SWIPE_HOOK: Cell<Option<fn(f32, f32, f32, f32) -> bool>> = const { Cell::new(None) };
+    static KEY_HOOK: Cell<Option<fn(&str) -> bool>> = const { Cell::new(None) };
+    static FOCUS_PLACEHOLDER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// `W3COS_POINTER=coarse` or `fine` overrides the last pointer sample.
+/// Touch and pen count as coarse. Mouse counts as fine. Unknown stays fine.
+pub fn pointer_is_coarse() -> bool {
+    match std::env::var("W3COS_POINTER").ok().as_deref() {
+        Some("coarse") => true,
+        Some("fine") => false,
+        _ => POINTER_COARSE.with(|slot| slot.get().unwrap_or(false)),
+    }
+}
+
+/// Record a pointer sample. Returns true when coarse/fine changed.
+pub fn note_pointer_coarse(coarse: bool) -> bool {
+    POINTER_COARSE.with(|slot| {
+        if slot.get() == Some(coarse) {
+            return false;
+        }
+        slot.set(Some(coarse));
+        true
+    })
+}
+
+/// Remember where this press started, and whether the pointer is coarse.
+pub fn note_pointer_sample(kind: &str, x: f32, y: f32) {
+    let coarse = matches!(kind, "touch" | "pen");
+    if note_pointer_coarse(coarse) {
+        mark_dirty();
+    }
+    PRESS_ORIGIN.with(|slot| slot.set(Some((x, y))));
+}
+
+pub fn set_shell_swipe_hook(hook: fn(f32, f32, f32, f32) -> bool) {
+    SWIPE_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+/// Deliver a completed press if it moved. The hook returns true when the
+/// shell consumed the gesture and the runtime must not also click.
+pub fn take_shell_swipe(x: f32, y: f32) -> bool {
+    let Some((x0, y0)) = PRESS_ORIGIN.with(|slot| slot.take()) else {
+        return false;
+    };
+    SWIPE_HOOK.with(|slot| slot.get().is_some_and(|hook| hook(x0, y0, x - x0, y - y0)))
+}
+
+pub fn set_shell_key_hook(hook: fn(&str) -> bool) {
+    KEY_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+pub fn shell_key(name: &str) -> bool {
+    KEY_HOOK.with(|slot| slot.get().is_some_and(|hook| hook(name)))
+}
+
+pub fn request_focus_placeholder(placeholder: &str) {
+    FOCUS_PLACEHOLDER.with(|slot| *slot.borrow_mut() = Some(placeholder.to_string()));
+}
+
+pub fn take_focus_placeholder() -> Option<String> {
+    FOCUS_PLACEHOLDER.with(|slot| slot.borrow_mut().take())
+}
+
 /// All signal values in registration order (for UI tests).
 pub fn all_signal_values() -> Vec<i64> {
     STORE.with(|s| s.borrow().values.clone())
@@ -355,6 +472,13 @@ pub fn shell_win_label(root: &Component, index: usize) -> Option<String> {
 pub fn with_shell_win_draft(root: &Component, index: usize, draft: String) -> String {
     if !draft.is_empty() {
         return draft;
+    }
+    if let Some(label) = node_at(root, index)
+        .and_then(|node| node.style.custom_properties.as_ref())
+        .and_then(|props| props.get("--w3cos-draft"))
+        .cloned()
+    {
+        return label;
     }
     shell_win_label(root, index).unwrap_or(draft)
 }
