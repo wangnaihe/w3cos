@@ -10,6 +10,7 @@ mod context;
 mod engine;
 mod hub;
 mod intent;
+mod lexicon;
 mod pinyin;
 
 pub use commands::command_utterance;
@@ -20,6 +21,10 @@ pub use engine::{EngineManifest, Feedback, InputEngine};
 pub use hub::{ImeHub, l2_from_value};
 pub use intent::{
     InputIntent, IntentHint, IntentPayload, Modality, Proposal, Purpose, Scope, Session,
+};
+pub use lexicon::{
+    Entry, EntryKind, Lexicon, derive_lexicon_key, learn, open_lexicon, rank_candidates,
+    seal_lexicon, seal_with_key,
 };
 pub use pinyin::{
     PinyinEngine, candidates as pinyin_candidates, preedit_display, segment as pinyin_segment,
