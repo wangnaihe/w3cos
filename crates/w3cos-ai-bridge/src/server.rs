@@ -139,6 +139,21 @@ fn confirm_slot() -> &'static Mutex<Option<ConfirmHook>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
+type McpHook = fn(&str);
+
+fn mcp_hook_slot() -> &'static Mutex<Option<McpHook>> {
+    static SLOT: OnceLock<Mutex<Option<McpHook>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Shell hook for `POST /mcp/propose`. The proposal is stored before this runs.
+/// The hook only opens the confirm card. It does not execute the tool.
+pub fn set_mcp_hook(hook: fn(&str)) {
+    if let Ok(mut slot) = mcp_hook_slot().lock() {
+        *slot = Some(hook);
+    }
+}
+
 /// Shell hook for `POST /intent`. The HTTP permission check still runs first.
 pub fn set_intent_hooks(propose: fn(&str) -> String, confirm: fn() -> String) {
     if let Ok(mut slot) = propose_slot().lock() {
@@ -182,6 +197,16 @@ impl AiBridgeHandle {
     /// Poll for pending requests from the HTTP server.
     /// Called from the main event loop (same thread as Document).
     pub fn poll_and_respond(&self, doc: &mut Document) {
+        if let Some(call) = crate::mcp::take_armed() {
+            match bridge_call_to_request(&call) {
+                Ok(request) => {
+                    let response = self.handle_request(request, doc);
+                    let (status, note) = outcome_parts(&response);
+                    crate::mcp::store_bridge_response(status, &note);
+                }
+                Err(message) => crate::mcp::store_bridge_response(400, &message),
+            }
+        }
         while let Ok((request, reply_tx)) = self.rx.try_recv() {
             let response = self.handle_request(request, doc);
             let _ = reply_tx.send(response);
@@ -720,6 +745,33 @@ fn handle_connection(
             }
         },
         ("POST", "/intent/confirm") => Some(AiBridgeRequest::ConfirmIntent),
+        ("POST", "/mcp/propose") => {
+            match crate::mcp::submit_propose(&body_str) {
+                Ok(view) => {
+                    if let Ok(slot) = mcp_hook_slot().lock()
+                        && let Some(hook) = *slot
+                    {
+                        hook(&view.name);
+                    }
+                    let body = serde_json::json!({
+                        "pending": true,
+                        "summary": view.summary
+                    })
+                    .to_string();
+                    send_response(&mut stream, 200, "application/json", body.as_bytes())?;
+                }
+                Err(err) => {
+                    let status = if err.pending { 409 } else { 400 };
+                    send_json_error(&mut stream, status, &err.message)?;
+                }
+            }
+            return Ok(());
+        }
+        ("GET", "/mcp/result") => {
+            let body = crate::mcp::result_json().to_string();
+            send_response(&mut stream, 200, "application/json", body.as_bytes())?;
+            return Ok(());
+        }
         ("POST", "/act") => match parse_act(&body_str) {
             Ok(request) => Some(request),
             Err(message) => {
@@ -754,6 +806,8 @@ fn handle_connection(
                     {"method": "POST", "path": "/act", "description": "Run a DOM action"},
                     {"method": "POST", "path": "/intent", "description": "Propose an L0 intent utterance"},
                     {"method": "POST", "path": "/intent/confirm", "description": "Confirm the pending intent"},
+                    {"method": "POST", "path": "/mcp/propose", "description": "Store one MCP tool proposal. Does not execute it."},
+                    {"method": "GET", "path": "/mcp/result", "description": "Read the proposal or the stored outcome."},
                     {"method": "GET", "path": "/query?selector=...", "description": "Query element info"},
                 ]
             });
@@ -873,6 +927,75 @@ fn tokens_match(expected: &str, presented: &str) -> bool {
         diff |= usize::from(left ^ right);
     }
     diff == 0
+}
+
+fn outcome_parts(response: &AiBridgeResponse) -> (u16, String) {
+    let (status, note) = match response {
+        AiBridgeResponse::Text(text) => (200, text.clone()),
+        AiBridgeResponse::Json(json) => (200, json.clone()),
+        AiBridgeResponse::Png(data) => (200, format!("png {} bytes", data.len())),
+        AiBridgeResponse::Error(message) => (500, message.clone()),
+        AiBridgeResponse::Denied(message) => (403, message.clone()),
+        AiBridgeResponse::NotFound(message) => (404, message.clone()),
+        AiBridgeResponse::Unavailable(message) => (503, message.clone()),
+        AiBridgeResponse::RateLimited(message) => (429, message.clone()),
+    };
+    let note: String = note.chars().take(240).collect();
+    (status, note)
+}
+
+fn bridge_call_to_request(call: &crate::mcp::BridgeCall) -> Result<AiBridgeRequest, String> {
+    match (call.method, call.path.as_str()) {
+        ("GET", "/a11y") => Ok(AiBridgeRequest::GetA11yTree),
+        ("GET", "/a11y/json") => Ok(AiBridgeRequest::GetA11yJson),
+        ("GET", "/a11y/index") => Ok(AiBridgeRequest::GetA11yIndex),
+        ("GET", "/screenshot") => Ok(AiBridgeRequest::Screenshot),
+        ("GET", "/screenshot/annotated") => Ok(AiBridgeRequest::AnnotatedScreenshot),
+        ("GET", path) if path.starts_with("/query?") => {
+            let selector = path
+                .split_once("selector=")
+                .map(|(_, value)| percent_decode(value))
+                .unwrap_or_default();
+            if selector.is_empty() {
+                return Err("missing 'selector' query param".into());
+            }
+            Ok(AiBridgeRequest::Query { selector })
+        }
+        ("POST", "/click") => json_target(call.body.as_deref().unwrap_or(""))
+            .map(|target| AiBridgeRequest::Click { target })
+            .map_err(str::to_string),
+        ("POST", "/type") => json_target_and_text(call.body.as_deref().unwrap_or(""))
+            .map(|(target, text)| AiBridgeRequest::Type { target, text })
+            .map_err(str::to_string),
+        ("POST", "/intent") => json_utterance(call.body.as_deref().unwrap_or(""))
+            .map(|utterance| AiBridgeRequest::Propose { utterance })
+            .map_err(str::to_string),
+        ("POST", "/intent/confirm") => Ok(AiBridgeRequest::ConfirmIntent),
+        _ => Err(format!("unknown bridge call {} {}", call.method, call.path)),
+    }
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        if bytes[index] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[index]);
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn json_utterance(body: &str) -> Result<String, &'static str> {
