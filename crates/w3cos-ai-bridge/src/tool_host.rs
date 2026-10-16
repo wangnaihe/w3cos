@@ -18,6 +18,9 @@ use crate::intent::{Decision, IntentTier};
 
 const MAX_MESSAGE_BYTES: usize = 4096;
 
+/// POST a JSON-RPC body and return the response body.
+pub type ChainTransport = fn(&str, &str) -> Result<String, String>;
+
 /// Device key that signs receipts. Implementations wrap the P2P Ed25519 key.
 pub trait DeviceSigner {
     /// Spec `did:key` for this device's Ed25519 public key.
@@ -102,6 +105,9 @@ enum ToolKind {
     DeviceDid,
     WalletAddress,
     WalletSign,
+    ChainBalance,
+    ChainNonce,
+    ChainTx,
 }
 
 #[derive(Clone)]
@@ -122,6 +128,8 @@ pub struct ToolHost<D, W> {
     next_id: u64,
     pending: Option<Pending>,
     receipts: Vec<SignedReceipt>,
+    chain_endpoint: String,
+    chain_transport: ChainTransport,
 }
 
 impl<D, W> ToolHost<D, W>
@@ -140,7 +148,19 @@ where
             next_id: 1,
             pending: None,
             receipts: Vec::new(),
+            chain_endpoint: String::new(),
+            chain_transport: crate::chain::post_json,
         }
+    }
+
+    /// The endpoint the person saved. Empty means a chain read cannot run.
+    pub fn set_chain_endpoint(&mut self, url: &str) {
+        self.chain_endpoint = url.trim().to_string();
+    }
+
+    /// Replace the HTTP call. Tests use this so a read does not leave the process.
+    pub fn set_chain_transport(&mut self, transport: ChainTransport) {
+        self.chain_transport = transport;
     }
 
     /// Unlock or lock. Locking does not drop a pending proposal.
@@ -182,8 +202,11 @@ where
     /// Does not read the wallet and does not sign.
     pub fn propose_tool(&mut self, name: &str, message: &str) -> Result<ToolProposal, HostError> {
         match name {
-            "device_did" | "wallet_address" => self.propose(name, &json!({})),
+            "device_did" | "wallet_address" | "chain_balance" | "chain_nonce" => {
+                self.propose(name, &json!({}))
+            }
             "wallet_sign" => self.propose_sign(message),
+            "chain_tx" => self.propose(name, &json!({ "hash": message })),
             _ => Err(self.err_args("host-unknown-tool", &[("name", name)])),
         }
     }
@@ -328,6 +351,9 @@ where
             "device_did" => Ok(ToolKind::DeviceDid),
             "wallet_address" => Ok(ToolKind::WalletAddress),
             "wallet_sign" => Ok(ToolKind::WalletSign),
+            "chain_balance" => Ok(ToolKind::ChainBalance),
+            "chain_nonce" => Ok(ToolKind::ChainNonce),
+            "chain_tx" => Ok(ToolKind::ChainTx),
             _ => Err(self.err_args("host-unknown-tool", &[("name", name)])),
         }
     }
@@ -338,7 +364,21 @@ where
         arguments: &Value,
     ) -> Result<(String, Option<String>), HostError> {
         match kind {
-            ToolKind::DeviceDid | ToolKind::WalletAddress => Ok(("{}".to_string(), None)),
+            ToolKind::DeviceDid
+            | ToolKind::WalletAddress
+            | ToolKind::ChainBalance
+            | ToolKind::ChainNonce => Ok(("{}".to_string(), None)),
+            ToolKind::ChainTx => {
+                let raw = arguments
+                    .get("hash")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if !crate::chain::is_tx_hash(raw) {
+                    return Err(self.err("host-bad-hash"));
+                }
+                Ok((json!({ "hash": raw }).to_string(), Some(raw.to_string())))
+            }
             ToolKind::WalletSign => {
                 let raw = arguments
                     .get("message")
@@ -377,6 +417,24 @@ where
                 "wallet-sign-summary",
                 "wallet-sign-impact",
             ),
+            ToolKind::ChainBalance => (
+                "chain_balance",
+                IntentTier::L0,
+                "chain-balance-summary",
+                "chain-balance-impact",
+            ),
+            ToolKind::ChainNonce => (
+                "chain_nonce",
+                IntentTier::L0,
+                "chain-nonce-summary",
+                "chain-nonce-impact",
+            ),
+            ToolKind::ChainTx => (
+                "chain_tx",
+                IntentTier::L0,
+                "chain-tx-summary",
+                "chain-tx-impact",
+            ),
         };
         let preview = message.map(preview_message).unwrap_or_default();
         ToolProposal {
@@ -408,7 +466,46 @@ where
                     Err(_) => Err(self.outcome_text("host-wallet-failed")),
                 }
             }
+            ToolKind::ChainBalance | ToolKind::ChainNonce | ToolKind::ChainTx => {
+                self.execute_chain(pending)
+            }
         }
+    }
+
+    fn execute_chain(&self, pending: &Pending) -> Result<String, String> {
+        let Some(endpoint) = crate::chain::parse_endpoint(&self.chain_endpoint) else {
+            return Err(self.outcome_text("host-no-rpc"));
+        };
+        let kind = match pending.kind {
+            ToolKind::ChainBalance => crate::chain::ChainRead::Balance,
+            ToolKind::ChainNonce => crate::chain::ChainRead::Nonce,
+            ToolKind::ChainTx => crate::chain::ChainRead::TxStatus,
+            _ => return Err(self.outcome_text("host-rpc-failed")),
+        };
+        let hash = pending.message.as_deref().unwrap_or("");
+        let body = crate::chain::request_body(kind, self.wallet.address(), hash)
+            .map_err(|_| self.outcome_text("host-bad-hash"))?;
+        let response = (self.chain_transport)(&endpoint.url, &body)
+            .map_err(|_| self.outcome_text("host-rpc-failed"))?;
+        let fact = crate::chain::interpret(kind, &response)
+            .map_err(|_| self.outcome_text("host-rpc-failed"))?;
+        let text =
+            match kind {
+                crate::chain::ChainRead::Balance => self
+                    .outcome_text_args("host-balance", &[("wei", fact.as_deref().unwrap_or("0"))]),
+                crate::chain::ChainRead::Nonce => self
+                    .outcome_text_args("host-nonce", &[("nonce", fact.as_deref().unwrap_or("0"))]),
+                crate::chain::ChainRead::TxStatus => {
+                    let status = match fact.as_deref() {
+                        Some("ok") => "chain-tx-ok",
+                        Some("fail") => "chain-tx-fail",
+                        _ => "chain-tx-pending",
+                    };
+                    let word = copy::line(&self.locale, status, &[]);
+                    self.outcome_text_args("host-tx", &[("status", &word)])
+                }
+            };
+        Ok(text)
     }
 
     fn seal(
@@ -461,6 +558,18 @@ where
     }
 }
 
+fn is_host_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "device_did"
+            | "wallet_address"
+            | "wallet_sign"
+            | "chain_balance"
+            | "chain_nonce"
+            | "chain_tx"
+    )
+}
+
 fn tool(name: &str, description: &str, schema: Value) -> Value {
     json!({
         "name": name,
@@ -474,13 +583,20 @@ fn tool_name(kind: ToolKind) -> &'static str {
         ToolKind::DeviceDid => "device_did",
         ToolKind::WalletAddress => "wallet_address",
         ToolKind::WalletSign => "wallet_sign",
+        ToolKind::ChainBalance => "chain_balance",
+        ToolKind::ChainNonce => "chain_nonce",
+        ToolKind::ChainTx => "chain_tx",
     }
 }
 
 fn tool_tier(kind: ToolKind) -> IntentTier {
     match kind {
         ToolKind::WalletSign => IntentTier::L2,
-        ToolKind::DeviceDid | ToolKind::WalletAddress => IntentTier::L0,
+        ToolKind::DeviceDid
+        | ToolKind::WalletAddress
+        | ToolKind::ChainBalance
+        | ToolKind::ChainNonce
+        | ToolKind::ChainTx => IntentTier::L0,
     }
 }
 
@@ -506,6 +622,17 @@ pub fn host_catalog(locale: &str) -> Value {
                     "type": "object",
                     "properties": { "message": { "type": "string" } },
                     "required": ["message"]
+                })
+            ),
+            tool("chain_balance", &copy::line(locale, "tool-chain-balance", &[]), json!({})),
+            tool("chain_nonce", &copy::line(locale, "tool-chain-nonce", &[]), json!({})),
+            tool(
+                "chain_tx",
+                &copy::line(locale, "tool-chain-tx", &[]),
+                json!({
+                    "type": "object",
+                    "properties": { "hash": { "type": "string" } },
+                    "required": ["hash"]
                 })
             ),
         ]
@@ -576,10 +703,26 @@ pub fn submit_host(body: &str) -> Result<HostTicket, HostSubmitError> {
         .trim()
         .to_string();
     let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
-    if !matches!(name, "device_did" | "wallet_address" | "wallet_sign") {
+    if !is_host_tool(name) {
         return Err(HostSubmitError {
             pending: false,
             message: copy::line(&locale, "host-unknown-tool", &[("name", name)]),
+        });
+    }
+    let message = if name == "chain_tx" {
+        arguments
+            .get("hash")
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        message
+    };
+    if name == "chain_tx" && !crate::chain::is_tx_hash(&message) {
+        return Err(HostSubmitError {
+            pending: false,
+            message: copy::line(&locale, "host-bad-hash", &[]),
         });
     }
     if name == "wallet_sign" && (message.is_empty() || message.len() > MAX_MESSAGE_BYTES) {
@@ -596,6 +739,9 @@ pub fn submit_host(body: &str) -> Result<HostTicket, HostSubmitError> {
     let (summary_key, impact_key) = match name {
         "wallet_address" => ("wallet-address-summary", "wallet-address-impact"),
         "wallet_sign" => ("wallet-sign-summary", "wallet-sign-impact"),
+        "chain_balance" => ("chain-balance-summary", "chain-balance-impact"),
+        "chain_nonce" => ("chain-nonce-summary", "chain-nonce-impact"),
+        "chain_tx" => ("chain-tx-summary", "chain-tx-impact"),
         _ => ("device-did-summary", "device-did-impact"),
     };
     let preview = preview_message(&message);
@@ -690,7 +836,7 @@ pub fn drive_host_call(
         .unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
-    if !matches!(name, "device_did" | "wallet_address" | "wallet_sign") {
+    if !is_host_tool(name) {
         return Err(copy::line(&locale, "host-unknown-tool", &[("name", name)]));
     }
     let propose = crate::mcp::BridgeCall {
@@ -938,7 +1084,17 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["device_did", "wallet_address", "wallet_sign"]);
+        assert_eq!(
+            names,
+            vec![
+                "device_did",
+                "wallet_address",
+                "wallet_sign",
+                "chain_balance",
+                "chain_nonce",
+                "chain_tx"
+            ]
+        );
         let confirm = json!({"jsonrpc": "2.0", "id": 4, "method": "w3cos/confirm"});
         let refused = host.dispatch(&confirm).unwrap();
         assert!(refused.get("error").is_some());
@@ -1109,5 +1265,72 @@ mod tests {
         .unwrap();
         assert!(response.get("error").is_some(), "{response}");
         reset_host_mail();
+    }
+
+    thread_local! {
+        static CHAIN_CALLS: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_chain(url: &str, body: &str) -> Result<String, String> {
+        CHAIN_CALLS.with(|slot| slot.borrow_mut().push((url.to_string(), body.to_string())));
+        if body.contains("eth_getBalance") {
+            Ok(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#.into())
+        } else if body.contains("eth_getTransactionCount") {
+            Ok(r#"{"jsonrpc":"2.0","id":1,"result":"0xa"}"#.into())
+        } else if body.contains("eth_getTransactionReceipt") {
+            Ok(r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into())
+        } else {
+            Err("unexpected method".into())
+        }
+    }
+
+    #[test]
+    fn a_chain_read_waits_for_confirm_and_has_no_default_endpoint() {
+        CHAIN_CALLS.with(|slot| slot.borrow_mut().clear());
+        let mut host = harness(false);
+        host.set_chain_transport(record_chain);
+        host.set_unlocked(true);
+        host.propose("chain_balance", &json!({})).unwrap();
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        let missing = host.confirm().unwrap();
+        assert_eq!(missing.decision, Decision::Denied);
+        assert!(missing.outcome.contains("节点") || missing.outcome.contains("endpoint"));
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        assert!(!missing.outcome.contains("eth_send"));
+
+        host.set_chain_endpoint("http://127.0.0.1:8545");
+        host.set_unlocked(false);
+        host.propose("chain_balance", &json!({})).unwrap();
+        let locked = host.confirm().unwrap();
+        assert_eq!(locked.decision, Decision::Denied);
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+
+        host.set_unlocked(true);
+        host.propose("chain_balance", &json!({})).unwrap();
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        let balance = host.confirm().unwrap();
+        assert_eq!(balance.decision, Decision::Allowed);
+        assert!(balance.outcome.contains('1'));
+        assert!(!balance.outcome.contains("0xsig"));
+        let calls = CHAIN_CALLS.with(|slot| slot.borrow().clone());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "http://127.0.0.1:8545");
+        assert!(calls[0].1.contains("eth_getBalance"));
+        assert!(!calls[0].1.contains("eth_sendRawTransaction"));
+
+        host.propose("chain_nonce", &json!({})).unwrap();
+        let nonce = host.confirm().unwrap();
+        assert!(nonce.outcome.contains("10"));
+        let hash = format!("0x{}", "ab".repeat(32));
+        host.propose("chain_tx", &json!({ "hash": hash })).unwrap();
+        let pending = host.confirm().unwrap();
+        assert_eq!(pending.decision, Decision::Allowed);
+        assert!(pending.outcome.contains("还没") || pending.outcome.contains("not"));
+        assert!(
+            host.propose("chain_tx", &json!({ "hash": "0x11" }))
+                .is_err()
+        );
+        assert_eq!(host.wallet.signs.get(), 0);
     }
 }

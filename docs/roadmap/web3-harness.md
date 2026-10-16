@@ -23,7 +23,7 @@ local signing tool that cannot sign on its own.
 | Receipt signatures | `DeviceIdentity::sign` | The same Ed25519 key that signs presence cards. |
 | Local identity in the shell | `w3cos-ai-bridge::identity` | Lock screen still stores a PBKDF2 verifier. A passkey is installed only after `clientDataJSON` and the Ed25519 assertion verify, and the subject becomes the canonical `did:key` of the device key. Pairing still uses the letter fingerprint. |
 | Chain account | `w3cos-p2p::LocalWallet` | secp256k1 key from HKDF of the device seed. EIP-191 `personal_sign` only. No chain id. |
-| Chain access | — | None. No RPC provider, no default endpoint, no broadcast. |
+| Chain reads | `w3cos-ai-bridge::chain` | Balance, nonce, and transaction status from an `http` or `https` endpoint the person saved. No built-in endpoint. A permission sheet gates the call. No broadcast. |
 | Page credentials | `w3cos-runtime` credentials | Web Credential Management types. The module says wallet and consent flows need a host adapter. They are not wired to the device key. |
 
 ### Agent harness
@@ -93,7 +93,7 @@ Each slice is one review. Later slices do not start inside this one.
 4. **Move shell tools onto propose-first.** Done. `observe`, `click`, `type`, and `propose_intent` wait for confirm. Reads do not run before that. The existing `w3cos-ai-mcp` `tools/call` proposes into the shell and does not perform the bridge call until the window confirms. Direct HTTP routes do the same. `POST /intent/confirm` is refused. L2 stays off unless `W3COS_L2` is set.
 5. **stdio for external agents.** Done. `w3cos-tool-host` speaks MCP on stdio and forwards `tools/call` to `/host/propose`. The process that owns the window is still the only caller of `confirm`. The model does not get that method.
 6. **Passkey enrollment.** Done. The window verifies `clientDataJSON` and the Ed25519 assertion before `IdentityMethod::Passkey`, then installs the canonical `did:key` of the device key. Old receipt actors stay as written. The P2P seed and the pairing fingerprint are not replaced.
-7. **Read a chain, still no broadcast.** A tool that reads a balance or a nonce from an RPC the person typed in. No default Infura, Alchemy, or other hosted endpoint. The call goes through the host and a permission sheet.
+7. **Read a chain, still no broadcast.** Done. `chain_balance`, `chain_nonce`, and `chain_tx` propose first. The window shows a permission sheet and calls only the `http` or `https` endpoint the person saved. There is no built-in endpoint. Nothing signs or broadcasts.
 8. **Sign a transaction.** Propose the fields, L2 confirm, sign on device, and only then offer broadcast to the RPC from the previous slice. No custodian and no hosted signer.
 9. **Show the spec `did:key` next to the pairing fingerprint.** Keep the letter fingerprint until paired devices can match the new identifier. Do not silently replace stored peer records.
 10. **Sandbox untrusted tools.** Anything beyond the `echo` / `pwd` / `help` allowlist runs where it cannot read the device seed. The wallet stays in the host process and is still only reached from confirm.

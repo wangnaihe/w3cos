@@ -103,6 +103,12 @@ pub(crate) fn propose_wallet_sign(
     })?
 }
 
+pub(crate) fn set_chain_endpoint(url: &str) {
+    let _ = with_host(|host| {
+        host.set_chain_endpoint(url);
+    });
+}
+
 pub(crate) fn confirm(unlocked: bool, locale: &str, now_ms: u64) -> Result<SignedReceipt, String> {
     with_host(|host| {
         host.set_unlocked(unlocked);

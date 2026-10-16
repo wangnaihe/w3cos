@@ -81,6 +81,8 @@ const SIGN_SUMMARY_SIGNAL: usize = 41;
 const SIGN_IMPACT_SIGNAL: usize = 42;
 const TOOL_SIGNAL: usize = 43;
 const HOST_SIGNAL: usize = 44;
+const CHAIN_RPC_SIGNAL: usize = 45;
+const CHAIN_SIGNAL: usize = 46;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -200,6 +202,9 @@ const OP_IME_SCREEN_MODEL: u8 = 117;
 const OP_SIGN_PROPOSE: u8 = 118;
 const OP_SIGN_ONCE: u8 = 119;
 const OP_SIGN_DENY: u8 = 120;
+const OP_CHAIN_ONCE: u8 = 121;
+const OP_CHAIN_DENY: u8 = 122;
+const OP_CHAIN_SAVE: u8 = 123;
 
 fn main() {
     shell_main();
@@ -294,6 +299,18 @@ fn bridge_host_propose(name: &str, summary: &str, impact: &str, message: &str) {
         }
         return;
     }
+    if name.starts_with("chain_") {
+        state::set_signal(CHAIN_SIGNAL, 1);
+        state::set_signal(HOST_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(SUMMARY_SIGNAL, summary);
+        state::set_text_signal(IMPACT_SIGNAL, impact);
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+        if state::get_signal(UNLOCKED_SIGNAL) != 0 {
+            state::request_focus_label(&locale::t("chain-deny"));
+        }
+        return;
+    }
     state::set_signal(HOST_SIGNAL, 1);
     state::set_signal(PHASE_SIGNAL, 1);
     state::set_signal(TOOL_SIGNAL, 0);
@@ -304,6 +321,17 @@ fn bridge_host_propose(name: &str, summary: &str, impact: &str, message: &str) {
     if state::get_signal(UNLOCKED_SIGNAL) != 0 {
         state::request_focus_label(&locale::t("confirm"));
     }
+}
+
+fn show_chain_read() {
+    ensure_shell_signals();
+    state::set_text_signal(CHAIN_RPC_SIGNAL, "http://127.0.0.1:8545");
+    bridge_host_propose(
+        "chain_balance",
+        &locale::t("chain-balance-summary"),
+        &locale::t("chain-balance-impact"),
+        "",
+    );
 }
 
 fn show_host_confirm() {
@@ -417,6 +445,8 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
         let _ = state::create_signal(0);
     });
 }
@@ -700,6 +730,9 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_SIGN_PROPOSE => open_sign_permission(session, draft),
         OP_SIGN_ONCE => accept_sign_permission(session),
         OP_SIGN_DENY => deny_sign_permission(session),
+        OP_CHAIN_ONCE => accept_chain_read(session),
+        OP_CHAIN_DENY => deny_chain_read(session),
+        OP_CHAIN_SAVE => save_chain_endpoint(session, draft),
         OP_L2_TOGGLE => toggle_l2(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
@@ -1704,6 +1737,92 @@ fn deny_sign_permission(session: &mut IntentSession) {
     }
 }
 
+fn save_chain_endpoint(session: &mut IntentSession, draft: &str) {
+    let raw = draft.trim();
+    if raw.is_empty() {
+        state::set_text_signal(CHAIN_RPC_SIGNAL, "");
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("chain-rpc-cleared"),
+        );
+        return;
+    }
+    if w3cos_ai_bridge::chain::parse_endpoint(raw).is_none() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("chain-rpc-bad"),
+        );
+        return;
+    }
+    state::set_text_signal(CHAIN_RPC_SIGNAL, raw);
+    sync_session(
+        session,
+        state::get_signal(PHASE_SIGNAL),
+        &locale::t("chain-rpc-saved"),
+    );
+}
+
+fn accept_chain_read(session: &mut IntentSession) {
+    if state::get_signal(CHAIN_SIGNAL) == 0 {
+        return;
+    }
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("perm-locked"),
+        );
+        return;
+    }
+    sign_host::set_chain_endpoint(&state::get_signal_text(CHAIN_RPC_SIGNAL));
+    apply_host_mail(session);
+    match sign_host::confirm(true, &locale::current(), now_ms()) {
+        Ok(receipt) => {
+            publish_host_receipt(&receipt);
+            session.record_signed(receipt);
+            state::set_signal(CHAIN_SIGNAL, 0);
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                &locale::t("chain-read-notice"),
+            );
+            restore_after_dialog();
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
+fn deny_chain_read(session: &mut IntentSession) {
+    if state::get_signal(CHAIN_SIGNAL) == 0 {
+        return;
+    }
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("perm-locked"),
+        );
+        return;
+    }
+    apply_host_mail(session);
+    match sign_host::cancel(&locale::current(), now_ms()) {
+        Ok(receipt) => {
+            publish_host_receipt(&receipt);
+            session.record_signed(receipt);
+            state::set_signal(CHAIN_SIGNAL, 0);
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                &locale::t("chain-denied-notice"),
+            );
+            restore_after_dialog();
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
 fn deny_process_permission(session: &mut IntentSession) {
     state::set_signal(PERM_SIGNAL, 0);
     let line = state::get_signal_text(TERMINAL_SIGNAL);
@@ -1906,6 +2025,10 @@ fn dismiss_top_layer() -> bool {
         with_session(deny_sign_permission);
         return true;
     }
+    if state::get_signal(CHAIN_SIGNAL) != 0 {
+        with_session(deny_chain_read);
+        return true;
+    }
     if state::get_signal(PERM_SIGNAL) != 0 {
         state::set_signal(PERM_SIGNAL, 0);
         restore_after_dialog();
@@ -1940,7 +2063,10 @@ fn dismiss_top_layer() -> bool {
 /// next layout pass can focus. The intent field itself is a text input;
 /// label focus only matches buttons.
 fn restore_after_dialog() {
-    if state::get_signal(SIGN_SIGNAL) != 0 || state::get_signal(PERM_SIGNAL) != 0 {
+    if state::get_signal(SIGN_SIGNAL) != 0
+        || state::get_signal(PERM_SIGNAL) != 0
+        || state::get_signal(CHAIN_SIGNAL) != 0
+    {
         return;
     }
     if state::get_signal(PHASE_SIGNAL) == 1 {
@@ -1967,7 +2093,9 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
         height,
         matches!(posture(), Posture::Phone),
         state::get_signal(PHASE_SIGNAL) == 1,
-        state::get_signal(PERM_SIGNAL) != 0 || state::get_signal(SIGN_SIGNAL) != 0,
+        state::get_signal(PERM_SIGNAL) != 0
+            || state::get_signal(SIGN_SIGNAL) != 0
+            || state::get_signal(CHAIN_SIGNAL) != 0,
         state::get_signal(SWITCHER_SIGNAL) != 0,
     );
     match action {
@@ -1997,6 +2125,7 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
 fn edge_back() -> bool {
     if state::get_signal(PERM_SIGNAL) != 0
         || state::get_signal(SIGN_SIGNAL) != 0
+        || state::get_signal(CHAIN_SIGNAL) != 0
         || state::get_signal(PHASE_SIGNAL) == 1
     {
         return false;
@@ -2541,6 +2670,7 @@ fn apply_screen_override() {
         Some("tool-confirm") => show_tool_confirm("a11y_index"),
         Some("http-confirm") => show_tool_confirm("click"),
         Some("host-confirm") => show_host_confirm(),
+        Some("chain-read") => show_chain_read(),
         Some("passkey") => {
             present_settings(1, 0);
             with_session(|session| {
@@ -2890,6 +3020,9 @@ fn build_shell() -> Component {
     if state::get_signal(SIGN_SIGNAL) != 0 {
         column.push(place_modal(build_sign_sheet(), false, 520.0));
     }
+    if state::get_signal(CHAIN_SIGNAL) != 0 {
+        column.push(place_modal(build_chain_sheet(), false, 480.0));
+    }
     if state::get_signal(NOTIFY_SIGNAL) != 0 {
         column.push(chrome_layer(build_notify_panel()));
     }
@@ -2949,6 +3082,8 @@ fn trap_modal_focus(root: &mut Component) {
     }
     let role = if state::get_signal(SIGN_SIGNAL) != 0 {
         "sign"
+    } else if state::get_signal(CHAIN_SIGNAL) != 0 {
+        "chain"
     } else if state::get_signal(PERM_SIGNAL) != 0 {
         "permission"
     } else if state::get_signal(PHASE_SIGNAL) == 1 {
@@ -4655,6 +4790,112 @@ fn build_permission_sheet() -> Component {
     ));
     let mut card = permission_shell(rows);
     mark_dialog(&mut card, "permission");
+    card
+}
+
+fn build_chain_sheet() -> Component {
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let endpoint = state::get_signal_text(CHAIN_RPC_SIGNAL);
+    let origin = w3cos_ai_bridge::chain::parse_endpoint(&endpoint)
+        .map(|parsed| parsed.origin)
+        .unwrap_or_default();
+    let mut rows = vec![
+        Component::text(
+            locale::t("chain-cap-title"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#e2a45c"),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t("chain-sheet-title"),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            state::get_signal_text(SUMMARY_SIGNAL),
+            Style {
+                font_size: 16.0,
+                font_weight: 650,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+    ];
+    rows.push(Component::text(
+        if unlocked {
+            locale::t("chain-sheet-detail")
+        } else {
+            locale::t("perm-locked")
+        },
+        Style {
+            font_size: 14.0,
+            color: Color::from_hex("#f0d7b4"),
+            ..Style::default()
+        },
+    ));
+    let scope = if origin.is_empty() {
+        locale::t("chain-sheet-empty")
+    } else {
+        locale::t_args("chain-sheet-scope", &[("origin", &origin)])
+    };
+    rows.push(Component::text(
+        scope,
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#fff4e5"),
+            background: Color::rgba(226, 164, 92, 28),
+            border_radius: 12.0,
+            padding: Edges::all(12.0),
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        state::get_signal_text(IMPACT_SIGNAL),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#f0d7b4"),
+            ..Style::default()
+        },
+    ));
+    let mut deny = if unlocked {
+        sheet_button(locale::t("chain-deny"), OP_CHAIN_DENY, SheetKind::Danger)
+    } else {
+        disabled_choice(locale::t("chain-deny"))
+    };
+    let once = if unlocked {
+        sheet_button(locale::t("chain-once"), OP_CHAIN_ONCE, SheetKind::Warm)
+    } else {
+        disabled_choice(locale::t("chain-once"))
+    };
+    if unlocked {
+        mark_initial_focus(&mut deny);
+    }
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![deny, once],
+    ));
+    rows.push(Component::text(
+        locale::t("chain-footnote"),
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#e2a45c"),
+            ..Style::default()
+        },
+    ));
+    let mut card = permission_shell(rows);
+    mark_dialog(&mut card, "chain");
     card
 }
 
@@ -6802,6 +7043,22 @@ fn settings_identity_page() -> Vec<Component> {
         rows.push(chrome_button(locale::t("lock"), OP_LOCK, "#3d5570"));
     }
     rows.push(settings_row(&locale::t("settings-storage"), &storage_label));
+    rows.push(Component::text(
+        locale::t("chain-rpc-label"),
+        Style {
+            font_size: 14.0,
+            font_weight: 650,
+            color: Color::from_hex("#f4f7fb"),
+            ..Style::default()
+        },
+    ));
+    rows.push(chain_rpc_field());
+    let mut save_rpc = chrome_button(locale::t("chain-rpc-save"), OP_CHAIN_SAVE, "#3d5570");
+    save_rpc.on_click = EventAction::Invoke {
+        code: OP_CHAIN_SAVE,
+        input_placeholder: locale::t("chain-rpc-placeholder"),
+    };
+    rows.push(save_rpc);
     rows.push(sign_message_field());
     let mut sign = chrome_button(locale::t("sign-open"), OP_SIGN_PROPOSE, "#9a5410");
     sign.on_click = EventAction::Invoke {
@@ -6815,6 +7072,24 @@ fn settings_identity_page() -> Vec<Component> {
         "#3d5570",
     ));
     rows
+}
+
+fn chain_rpc_field() -> Component {
+    let coarse = state::pointer_is_coarse();
+    Component::text_input(
+        state::get_signal_text(CHAIN_RPC_SIGNAL),
+        locale::t("chain-rpc-placeholder"),
+        Style {
+            width: Dimension::Percent(100.0),
+            font_size: 15.0,
+            color: Color::from_hex("#1a2836"),
+            background: Color::from_hex("#f4f7fb"),
+            border_radius: 10.0,
+            padding: Edges::xy(12.0, if coarse { 12.0 } else { 8.0 }),
+            min_height: Dimension::Px(if coarse { 48.0 } else { 36.0 }),
+            ..Style::default()
+        },
+    )
 }
 
 fn sign_message_field() -> Component {
@@ -10548,6 +10823,51 @@ mod shell_ux_tests {
     }
 
     #[test]
+    #[test]
+    fn chain_sheet_names_the_saved_endpoint_and_does_not_broadcast() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::note_pointer_coarse(false);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(CHAIN_SIGNAL, 0);
+        show_chain_read();
+        assert_eq!(state::get_signal(CHAIN_SIGNAL), 1);
+        assert_eq!(
+            state::get_signal_text(CHAIN_RPC_SIGNAL),
+            "http://127.0.0.1:8545"
+        );
+        let sheet = build_chain_sheet();
+        let blob = text_blob(&sheet);
+        assert!(blob.contains("允许读取这一次"), "{blob}");
+        assert!(blob.contains("读取本机地址的余额"), "{blob}");
+        assert!(blob.contains("http://127.0.0.1:8545"), "{blob}");
+        assert!(blob.contains("不会广播"), "{blob}");
+        assert!(!blob.contains("infura"), "{blob}");
+        assert!(!blob.contains("alchemy"), "{blob}");
+        assert_eq!(codes_for(&sheet, "允许这一次"), vec![OP_CHAIN_ONCE]);
+        assert_eq!(codes_for(&sheet, "拒绝"), vec![OP_CHAIN_DENY]);
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        let phone = build_chain_sheet();
+        let (_, _, _, height) = button_face(&phone, "允许这一次");
+        assert!(height >= 48.0, "{height}");
+        locale::set_locale("en");
+        let english = text_blob(&build_chain_sheet());
+        assert!(english.contains("Allow this read"), "{english}");
+        assert!(english.contains("http://127.0.0.1:8545"), "{english}");
+        assert!(
+            english.contains("Nothing is signed or broadcast"),
+            "{english}"
+        );
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(CHAIN_SIGNAL, 0);
+    }
+
     fn passkey_binds_the_device_did_and_keeps_the_pairing_fingerprint() {
         let _guard = POSTURE_LOCK.lock().unwrap();
         ensure_shell_signals();
