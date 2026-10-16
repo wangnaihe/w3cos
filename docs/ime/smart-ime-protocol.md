@@ -276,14 +276,14 @@ C ABI 1.1 插件接口增加 `w3cos_ime_engine_v1` 入口，与共享运行时�
 - P0：`spec/ime/w3cos-ime-1.schema.json` 已在仓库中。
 - P1：Hub、捆绑拼音词典、preedit / candidate / commit / undo、安全字段旁路已在 `w3cos-ime` 与 shell 中。未链接 librime。
 - P2：意图栏与 ActionProposal 确认（#77）；加密个人词库（#79）。
-- P3：剪贴板、长按麦克风与手写板已落地，见下。OCR 未做。语音模型和手写模型不随仓库分发，须经确认后下载到本机。
+- P3：剪贴板、长按麦克风、手写板与识屏已落地，见下。语音模型、手写模型和识屏检测模型不随仓库分发，须经确认后下载到本机。
 - P4–P7：未开始。
 
 P3 已落地（本机，无网络，无账号服务）：
 
-- 协议面 `p3_surface`：未接本地引擎时，语音与手写为 `NoLocalModel`；识屏（`camera` / `ctx.screen`）为 `ScreenRefused`，`ImeHub::grant` 仍拒绝截图；剪贴板为 `Ready`。
+- 协议面 `p3_surface`：未接本地引擎时，语音与手写为 `NoLocalModel`；识屏（`camera` / `ctx.screen`）在 Hub 里仍是 `ScreenRefused`，`ImeHub::grant` 仍拒绝长期截图授权，摄像头载荷到不了引擎。剪贴板为 `Ready`。真正的一次区域识屏不走这条载荷，由 shell 在单独确认之后调用 `LocalScreenText`。
 - 剪贴板只在用户点按后读一次本机文字，变成 Candidate 写入当前输入框，可撤销。不进个人词库，不发到另一台设备。空白或超过 1024 个字符则不写入。
-- 音频引用、笔迹载荷，以及任何摄像头载荷在到达 Hub 之前被丢掉，不会经 `route_p3` 变成文字。语音和手写由 shell 直接调用本机 trait，不把原始音频或笔迹送进 Hub。安全字段旁路：不显示智能条，不读剪贴板，不打开麦克风，也不打开手写板。
+- 音频引用、笔迹载荷，以及任何摄像头载荷在到达 Hub 之前被丢掉，不会经 `route_p3` 变成文字。语音、手写和识屏由 shell 直接调用本机 trait，不把原始音频、笔迹或画面送进 Hub。安全字段旁路：不显示智能条，不读剪贴板，不打开麦克风，不打开手写板，也不打开识屏。
 - 手机在键盘上方显示这一行。桌面在字段聚焦且没有候选条时，在光标旁显示同一行。
 - 麦克风是长按。`LocalSpeech` 是可替换的本机流式接口。捆绑的 `NoLocalSpeech` 与还没有模型的 `WhisperSpeech` manifest 都是不可用且 `network: false`。`press_speech` 在没有模型、要求网络、安全字段或会话已结束时不调用 `begin`，因此不录音、不上传。点按只说明原因。
 - 接上 `available` 且不要求网络的本地引擎后，按住开始听写，轮询得到 interim / final 文本（超过 1024 个字符的片段丢掉），松开前再取一次 final，写入输入框，可撤销，不进个人词库。`end` 关闭采集并丢掉缓冲的音频。引擎若在 `begin` 里没有真正开始采集，也会被 `end` 关掉。
@@ -294,5 +294,10 @@ P3 已落地（本机，无网络，无账号服务）：
 - 比较过的方案：Zinnia 本身是 BSD-3，笔划原生、体积小、能出 n-best，但公开的简体中文模型（Tegaki / Tomoe `handwriting-zh_CN`）是 LGPL-2.1，而且没有英文模型，模型文件还是架构相关的二进制。完整的 PaddleOCR 检测加识别，以及 sherpa 那类要带 ONNX Runtime 和约 180MB 模型的路径，语音一节已经因为体积放弃。这里只留识别网络：PaddlePaddle 官方 `PP-OCRv5_mobile_rec` 的 ONNX（Apache-2.0），一个模型同时覆盖简体中文、繁体中文和英文（含手写），约 16MB。推理只用 CPU 执行提供者，不启用 CUDA / TensorRT / CoreML，也不跑检测器。笔迹在本机栅格化成 48 像素高的黑字白底，按训练配置归一化后做 CTC，候选进现有候选条。
 - 权重是 `inference.onnx`（16 534 782 字节，SHA-256 `da72dc72ca4dc220df0dfde68c1dedc31c58d3e76a25871122e5056227d50092`）和字符表 `inference.yml`（148 345 字节，SHA-256 `5dfeb2777f6d0db8177d8128a8acfcf6e6276dc4ac73ea3bf0dc06d6a5e85d8e`），来自 `https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_rec_onnx`。语言设置里第一次点按只确认，第二次才下载。两份文件都要校验通过才算就绪；不符就两份都丢掉。识别路径不发起连接。没有这两份文件时，手写芯片仍是「手写关」。
 - 模型就绪后，手机智能条和桌面输入法都能打开手写板。笔迹进现有候选条。点选才写入，可撤销；识别、清除、收起和没点到的候选都不进个人词库。点选记下的词用 `extra = "*"`，不参与拼音排序。界面见 `docs/ime/ink-off-desktop.png`、`docs/ime/ink-off-phone.png`、`docs/ime/ink-model-desktop.png`、`docs/ime/ink-pad-desktop.png`（英文对照：`docs/ime/ink-off-desktop-en.png`、`docs/ime/ink-model-desktop-en.png`）。
+- 识屏是可替换的 `LocalScreenText`。捆绑的 `NoLocalScreenText` 与还没有模型的 `PaddleScreenText` manifest 都是不可用且 `network: false`。`recognize_screen` 在没有模型、要求网络、安全字段、会话已结束、区域为空，或这次没有确认时不调用 `recognize`，因此不识别、不上传、也不截图。点按只说明原因。安全字段不显示识屏。
+- 检测用的是 PaddlePaddle 官方 `PP-OCRv5_mobile_det` 的 ONNX（Apache-2.0）。识别复用上面的 `PP-OCRv5_mobile_rec`，不再另下一份识别网络。推理只用 CPU，不启用 CUDA / TensorRT / CoreML。区域先按导出配置把长边缩放到 960（边长对齐到 32），BGR，ImageNet 均值和方差，DB 阈值 0.3、框阈值 0.6、unclip 1.5。每一行再交给识别网络做 CTC。没有检测文件，或手写那份识别文件还没校验通过时，识屏芯片仍是「识屏关」。
+- 检测权重是 `inference.onnx`（4 826 518 字节，SHA-256 `a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d`）和 `inference.yml`（903 字节，SHA-256 `98069072e1b6b37d727fd9d9f11725faa46d6ea0de012f2ed26caea011c37699`），来自 `https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_det_onnx`，放在本机 `screen-text` 目录，与手写目录分开。语言设置里第一次点按只确认，第二次才下载。识别文件若还没有，同一次确认会把它下到已有的手写目录。任一校验不符就丢掉新文件。识别路径不发起连接。
+- 看屏幕的允许和下载模型是两件事。模型下载是上面的二次确认。每一次识屏还要走提议→确认→回执：点芯片只弹出确认卡，不截图；确认写入一条回执（不含画面，也不含识别出的文字），然后才能拖一个区域；取消也写回执，并且不截图。松开之前不读像素。松开后只读这一块，读的时候指示层已经拿开，避免把指示画进画面。不在后台轮询，不保留图片。Hub 仍然拒绝 `ctx.screen` 的长期授权。
+- 识别出的文字进现有候选条，一条一个片段。点选才写入，可撤销；没点到的不进个人词库，也不发到另一台设备。点选记下的词同样用 `extra = "*"`。界面见 `docs/ime/screen-off-desktop.png`、`docs/ime/screen-off-phone.png`、`docs/ime/screen-model-desktop.png`、`docs/ime/screen-ask-desktop.png`、`docs/ime/screen-region-desktop.png`（英文对照：`docs/ime/screen-off-desktop-en.png`、`docs/ime/screen-model-desktop-en.png`）。
 
-仍属 P3、本段不做：OCR（[#51](https://github.com/wangnaihe/w3cos/issues/51)）。模型不打进仓库。
+P3 的本机多模态到这里齐了。模型仍然不打进仓库。标注截图接口是 [#51](https://github.com/wangnaihe/w3cos/issues/51)，那条 issue 已经关闭；识屏不把原始画面交给那个接口。

@@ -9,11 +9,14 @@ use std::collections::HashMap;
 
 use w3cos_ime::{
     ClipboardDecision, ImeHub, InkModelError, InkPoint, InkResult, InkStroke, InputIntent,
-    IntentHint, IntentPayload, LocalHandwriting, LocalSpeech, Modality, ModalityBlock, ModelError,
-    NoLocalHandwriting, NoLocalSpeech, PaddleHandwriting, PinyinEngine, Proposal, Purpose,
-    SpeechOff, SpeechStart, WhisperSpeech, clipboard_decision, default_handwriting_dir,
-    download_handwriting_model, download_speech_model, flush_speech, handwriting_model_ready,
-    model_ready, poll_speech, press_speech, recognize_ink, release_speech,
+    IntentHint, IntentPayload, LocalHandwriting, LocalScreenText, LocalSpeech, Modality,
+    ModalityBlock, ModelError, NoLocalHandwriting, NoLocalScreenText, NoLocalSpeech,
+    PaddleHandwriting, PaddleScreenText, PinyinEngine, Proposal, Purpose, ScreenImage,
+    ScreenModelError, ScreenOff, ScreenRegion, ScreenResult, SpeechOff, SpeechStart, WhisperSpeech,
+    clipboard_decision, default_handwriting_dir, default_screen_text_dir,
+    download_handwriting_model, download_screen_text_model, download_speech_model, flush_speech,
+    handwriting_model_ready, model_ready, poll_speech, press_speech, recognize_ink,
+    recognize_screen, release_speech, screen_text_ready,
 };
 use w3cos_runtime::state::{self, ImeFieldNote};
 use w3cos_std::Component;
@@ -22,8 +25,8 @@ use w3cos_std::style::*;
 
 use super::{
     CHROME_Z, OP_IME_1, OP_IME_ACTION, OP_IME_CLIPBOARD, OP_IME_INK, OP_IME_INK_CLEAR, OP_IME_MODE,
-    OP_IME_PAGE_NEXT, OP_IME_PAGE_PREV, OP_IME_SCREEN, OP_IME_VOICE, OP_SCRIM, OP_SOFTKEY,
-    ink_token, invoke, line_strong,
+    OP_IME_PAGE_NEXT, OP_IME_PAGE_PREV, OP_IME_SCREEN, OP_IME_SCREEN_NO, OP_IME_SCREEN_YES,
+    OP_IME_VOICE, OP_SCRIM, OP_SOFTKEY, ink_token, invoke, line_strong,
 };
 use crate::locale;
 
@@ -39,6 +42,14 @@ const KEY_ROW: f32 = 48.0;
 const KEY_GAP: f32 = 4.0;
 const KEY_MARGIN: f32 = 8.0;
 const KEY_BORDER: f32 = 1.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreenPhase {
+    Idle,
+    Ask,
+    Drag,
+    Read,
+}
 
 struct Caret {
     x: f32,
@@ -80,6 +91,16 @@ struct Session {
     ink_open: bool,
     ink_strokes: Vec<InkStroke>,
     ink_candidates: Vec<String>,
+    /// Ask, then one drag. Idle does not capture. Snippets stay until a pick.
+    screen_phase: ScreenPhase,
+    screen_candidates: Vec<String>,
+    screen_x0: f32,
+    screen_y0: f32,
+    screen_x1: f32,
+    screen_y1: f32,
+    screen_dragging: bool,
+    /// Frame generation already in the cache when this capture was asked for.
+    screen_wait_gen: u64,
 }
 
 pub(crate) struct FieldUpdate {
@@ -116,6 +137,14 @@ impl Default for Session {
             ink_open: false,
             ink_strokes: Vec::new(),
             ink_candidates: Vec::new(),
+            screen_phase: ScreenPhase::Idle,
+            screen_candidates: Vec::new(),
+            screen_x0: 0.0,
+            screen_y0: 0.0,
+            screen_x1: 0.0,
+            screen_y1: 0.0,
+            screen_dragging: false,
+            screen_wait_gen: 0,
         }
     }
 }
@@ -131,6 +160,14 @@ thread_local! {
     static HAND_DIR: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
     static INK_CONSENT: Cell<bool> = const { Cell::new(false) };
     static INK_TOAST: Cell<Option<&'static str>> = const { Cell::new(None) };
+    static SCREEN: RefCell<Box<dyn LocalScreenText>> =
+        RefCell::new(Box::new(PaddleScreenText::open_default()));
+    static SCREEN_DIR: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    static SCREEN_CONSENT: Cell<bool> = const { Cell::new(false) };
+    static SCREEN_TOAST: Cell<Option<&'static str>> = const { Cell::new(None) };
+    /// 0 none, 1 allowed, 2 cancelled. The shell writes the receipt.
+    static SCREEN_DECISION: Cell<u8> = const { Cell::new(0) };
+    static SCREEN_PIXELS: RefCell<Option<ScreenImage>> = const { RefCell::new(None) };
 }
 
 fn with_session<R>(body: impl FnOnce(&mut Session) -> R) -> R {
@@ -145,7 +182,10 @@ fn pinyin_mode(session: &mut Session) -> bool {
 
 fn text_slots(session: &Session) -> usize {
     let size = page_size();
-    if !session.ink_candidates.is_empty() || session.actions.is_empty() {
+    if !session.screen_candidates.is_empty()
+        || !session.ink_candidates.is_empty()
+        || session.actions.is_empty()
+    {
         size
     } else {
         size.saturating_sub(1).max(1)
@@ -353,6 +393,7 @@ fn adopt(session: &mut Session, note: &ImeFieldNote) {
     if switched || note.secure {
         stop_voice(session);
         close_ink(session);
+        abandon_screen(session);
     }
     if switched {
         if let Some(ime) = session.ime.as_mut() {
@@ -405,6 +446,7 @@ pub(crate) fn on_key(name: &str) -> bool {
             session.override_pinyin = Some(!pinyin_mode(session));
             let had_spelling = !session.spelling.is_empty();
             close_ink(session);
+            abandon_screen(session);
             session.spelling.clear();
             session.page = 0;
             refresh(session);
@@ -423,6 +465,12 @@ pub(crate) fn on_key(name: &str) -> bool {
             state::mark_dirty();
         }
         if name == "Escape" {
+            if session.screen_phase != ScreenPhase::Idle || !session.screen_candidates.is_empty() {
+                abandon_screen(session);
+                refresh(session);
+                state::mark_dirty();
+                return true;
+            }
             if session.ink_open {
                 close_ink(session);
                 refresh(session);
@@ -453,6 +501,23 @@ pub(crate) fn on_key(name: &str) -> bool {
             session.page = 0;
             state::mark_dirty();
             return true;
+        }
+        if !session.screen_candidates.is_empty() && !session.secure {
+            match name {
+                "Space" | "Enter" => {
+                    commit_screen_at(session, 0);
+                    return true;
+                }
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                    let visible = (name.as_bytes()[0] - b'1') as usize;
+                    let slots = text_slots(session);
+                    if visible < slots {
+                        let _ = commit_screen_at(session, session.page * slots + visible);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
         }
         if !session.ink_candidates.is_empty() && !session.secure {
             match name {
@@ -526,6 +591,12 @@ pub(crate) fn toggle_mode() {
 
 pub(crate) fn commit_candidate(visible: usize) -> bool {
     with_session(|session| {
+        if !session.screen_candidates.is_empty() {
+            if session.secure {
+                return false;
+            }
+            return commit_screen_at(session, session.page * text_slots(session) + visible);
+        }
         if !session.ink_candidates.is_empty() {
             if session.secure {
                 return false;
@@ -544,7 +615,9 @@ pub(crate) fn page_by(delta: isize) -> bool {
         if !candidates_visible(session) {
             return false;
         }
-        let len = if session.ink_candidates.is_empty() {
+        let len = if !session.screen_candidates.is_empty() {
+            session.screen_candidates.len()
+        } else if session.ink_candidates.is_empty() {
             session.candidates.len()
         } else {
             session.ink_candidates.len()
@@ -855,6 +928,7 @@ pub(crate) fn voice_press() -> SpeechStart {
         let start = SPEECH.with(|slot| press_speech(&mut **slot.borrow_mut(), &ime));
         if matches!(start, SpeechStart::Listening) {
             close_ink(session);
+            abandon_screen(session);
             session.spelling.clear();
             session.preedit.clear();
             session.page = 0;
@@ -1031,7 +1105,7 @@ fn candidates_visible(session: &mut Session) -> bool {
     if session.secure || !session.has_field {
         return false;
     }
-    if !session.ink_candidates.is_empty() {
+    if !session.screen_candidates.is_empty() || !session.ink_candidates.is_empty() {
         return true;
     }
     let composing = pinyin_mode(session) && !session.spelling.is_empty();
@@ -1039,16 +1113,20 @@ fn candidates_visible(session: &mut Session) -> bool {
 }
 
 fn candidate_children(show_preedit: bool) -> Vec<Component> {
-    let (spelling, preedit, candidates, ink, page, actions) = with_session(|session| {
+    let (spelling, preedit, candidates, ink, screen, page, actions) = with_session(|session| {
         (
             session.spelling.clone(),
             session.preedit.clone(),
             session.candidates.clone(),
             session.ink_candidates.clone(),
+            session.screen_candidates.clone(),
             session.page,
             session.actions.clone(),
         )
     });
+    if !screen.is_empty() {
+        return ink_candidate_children(&screen, page);
+    }
     if !ink.is_empty() {
         return ink_candidate_children(&ink, page);
     }
@@ -1223,7 +1301,7 @@ fn modality_children() -> Vec<Component> {
         modality_button(voice_key, OP_IME_VOICE, ready || recording, true),
         modality_button(ink_chip_key(), OP_IME_INK, ink_chip_ready(), false),
         modality_button("ime-clip", OP_IME_CLIPBOARD, true, false),
-        modality_button("ime-screen", OP_IME_SCREEN, false, false),
+        modality_button(screen_chip_key(), OP_IME_SCREEN, screen_chip_ready(), false),
     ]
 }
 
@@ -1785,6 +1863,7 @@ pub(crate) fn ink_tap() -> Option<&'static str> {
             return None;
         }
         stop_voice(session);
+        abandon_screen(session);
         session.spelling.clear();
         session.preedit.clear();
         session.candidates.clear();
@@ -1821,6 +1900,597 @@ pub(crate) fn show_ink_pad_for_screen() {
             },
         ];
         recognize_open_ink(session);
+        state::mark_dirty();
+    });
+}
+
+/// A queued permission decision for the shell receipt log. Capture does not
+/// write the receipt itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScreenDecision {
+    Allowed,
+    Cancelled,
+}
+
+pub(crate) fn take_screen_decision() -> Option<ScreenDecision> {
+    match SCREEN_DECISION.with(|slot| slot.replace(0)) {
+        1 => Some(ScreenDecision::Allowed),
+        2 => Some(ScreenDecision::Cancelled),
+        _ => None,
+    }
+}
+
+fn queue_screen_decision(code: u8) {
+    SCREEN_DECISION.with(|slot| slot.set(code));
+}
+
+fn note_screen_toast(key: &'static str) {
+    SCREEN_TOAST.with(|slot| slot.set(Some(key)));
+}
+
+pub(crate) fn take_screen_toast() -> Option<&'static str> {
+    SCREEN_TOAST.with(|slot| slot.take())
+}
+
+fn abandon_screen(session: &mut Session) {
+    if matches!(session.screen_phase, ScreenPhase::Drag | ScreenPhase::Read) {
+        queue_screen_decision(2);
+        w3cos_runtime::frame_cache::clear();
+    }
+    session.screen_phase = ScreenPhase::Idle;
+    session.screen_candidates.clear();
+    session.screen_dragging = false;
+    SCREEN_PIXELS.with(|slot| slot.borrow_mut().take());
+}
+
+fn screen_engine_ready() -> bool {
+    SCREEN.with(|slot| {
+        let manifest = slot.borrow().manifest();
+        manifest.available && !manifest.network
+    })
+}
+
+fn screen_chip_ready() -> bool {
+    with_session(|session| session.screen_phase != ScreenPhase::Idle) || screen_engine_ready()
+}
+
+fn screen_chip_key() -> &'static str {
+    match with_session(|session| session.screen_phase) {
+        ScreenPhase::Ask => "ime-screen-ask",
+        ScreenPhase::Drag | ScreenPhase::Read => "ime-screen-live",
+        ScreenPhase::Idle if screen_engine_ready() => "ime-screen-ready",
+        ScreenPhase::Idle => "ime-screen",
+    }
+}
+
+fn screen_dir() -> std::path::PathBuf {
+    SCREEN_DIR.with(|slot| {
+        slot.borrow()
+            .clone()
+            .unwrap_or_else(default_screen_text_dir)
+    })
+}
+
+pub(crate) fn screen_model_status_key() -> &'static str {
+    if screen_text_ready(&screen_dir(), &handwriting_dir()) {
+        "ime-screen-model-ready"
+    } else {
+        "ime-screen-model-off"
+    }
+}
+
+pub(crate) fn screen_model_button_key() -> Option<&'static str> {
+    if screen_text_ready(&screen_dir(), &handwriting_dir()) {
+        None
+    } else if SCREEN_CONSENT.with(Cell::get) {
+        Some("ime-screen-model-confirm")
+    } else {
+        Some("ime-screen-model-get")
+    }
+}
+
+/// First press only arms consent. The second press downloads. Recognition does not call this.
+pub(crate) fn confirm_screen_model() -> &'static str {
+    if screen_text_ready(&screen_dir(), &handwriting_dir()) {
+        SCREEN_CONSENT.with(|flag| flag.set(false));
+        return "ime-toast-screen-saved";
+    }
+    if !SCREEN_CONSENT.with(Cell::get) {
+        SCREEN_CONSENT.with(|flag| flag.set(true));
+        return "ime-toast-screen-confirm";
+    }
+    SCREEN_CONSENT.with(|flag| flag.set(false));
+    match download_screen_text_model(&screen_dir(), &handwriting_dir(), true) {
+        Ok(()) => "ime-toast-screen-saved",
+        Err(ScreenModelError::ChecksumMismatch { .. }) => "ime-toast-screen-checksum",
+        Err(ScreenModelError::ConsentRequired) => "ime-toast-screen-confirm",
+        Err(_) => "ime-toast-screen-download-fail",
+    }
+}
+
+/// Ask for one region. Without a local model this only explains why.
+pub(crate) fn screen_tap() -> Option<&'static str> {
+    with_session(|session| {
+        adopt_for_capture(session);
+        if !session.has_field {
+            return Some("ime-toast-screen-closed");
+        }
+        if session.secure
+            || session
+                .ime
+                .as_ref()
+                .is_some_and(|ime| ime.purpose.is_secure())
+        {
+            abandon_screen(session);
+            return Some("ime-toast-screen-secure");
+        }
+        let Some(ime) = session.ime.clone() else {
+            return Some("ime-toast-screen-closed");
+        };
+        if ime.id.is_empty() {
+            return Some("ime-toast-screen-closed");
+        }
+        let manifest = SCREEN.with(|slot| slot.borrow().manifest());
+        if manifest.network {
+            return Some("ime-toast-screen-net");
+        }
+        if !manifest.available {
+            return Some(if screen_text_ready(&screen_dir(), &handwriting_dir()) {
+                "ime-toast-screen"
+            } else {
+                "ime-toast-screen-offer"
+            });
+        }
+        if session.screen_phase != ScreenPhase::Idle {
+            let asking = session.screen_phase == ScreenPhase::Ask;
+            if asking {
+                queue_screen_decision(2);
+            }
+            abandon_screen(session);
+            state::mark_dirty();
+            return Some("ime-toast-screen-cancel");
+        }
+        stop_voice(session);
+        close_ink(session);
+        session.spelling.clear();
+        session.preedit.clear();
+        session.candidates.clear();
+        session.page = 0;
+        session.screen_candidates.clear();
+        session.screen_dragging = false;
+        session.screen_phase = ScreenPhase::Ask;
+        refresh(session);
+        state::mark_dirty();
+        Some("ime-toast-screen-ask")
+    })
+}
+
+/// Confirm the proposed capture. The region is still not read.
+pub(crate) fn screen_allow() -> Option<&'static str> {
+    with_session(|session| {
+        adopt_for_capture(session);
+        if session.secure
+            || session
+                .ime
+                .as_ref()
+                .is_some_and(|ime| ime.purpose.is_secure())
+        {
+            abandon_screen(session);
+            return Some("ime-toast-screen-secure");
+        }
+        if session.screen_phase != ScreenPhase::Ask {
+            return None;
+        }
+        queue_screen_decision(1);
+        session.screen_phase = ScreenPhase::Drag;
+        session.screen_dragging = false;
+        state::mark_dirty();
+        Some("ime-toast-screen-allow")
+    })
+}
+
+/// Refuse the proposal, or leave the selector before a region is read.
+pub(crate) fn screen_cancel() -> Option<&'static str> {
+    with_session(|session| {
+        if session.screen_phase == ScreenPhase::Idle {
+            return None;
+        }
+        queue_screen_decision(2);
+        session.screen_phase = ScreenPhase::Idle;
+        session.screen_dragging = false;
+        session.screen_candidates.clear();
+        SCREEN_PIXELS.with(|slot| slot.borrow_mut().take());
+        w3cos_runtime::frame_cache::clear();
+        state::mark_dirty();
+        Some("ime-toast-screen-cancel")
+    })
+}
+
+pub(crate) fn screen_drag_active() -> bool {
+    with_session(|session| session.screen_phase == ScreenPhase::Drag)
+}
+
+/// Pointer samples for the open selector. Phase 0 begins, 1 moves, 2 reads once.
+pub(crate) fn screen_pointer(phase: u8, x: f32, y: f32) {
+    with_session(|session| {
+        if session.screen_phase != ScreenPhase::Drag || session.secure || !session.has_field {
+            return;
+        }
+        match phase {
+            0 => {
+                session.screen_dragging = true;
+                session.screen_x0 = x;
+                session.screen_y0 = y;
+                session.screen_x1 = x;
+                session.screen_y1 = y;
+                state::mark_dirty();
+            }
+            1 => {
+                if !session.screen_dragging {
+                    return;
+                }
+                session.screen_x1 = x;
+                session.screen_y1 = y;
+                state::mark_dirty();
+            }
+            2 => {
+                if !session.screen_dragging {
+                    return;
+                }
+                session.screen_dragging = false;
+                release_screen_region(session);
+            }
+            _ => {}
+        }
+    });
+}
+
+/// One requested frame, after the selector is hidden. Older cache entries are ignored.
+pub(crate) fn poll_screen() -> bool {
+    with_session(|session| {
+        if session.screen_phase != ScreenPhase::Read {
+            return false;
+        }
+        let Some((width, height, rgba, generation)) = w3cos_runtime::frame_cache::snapshot() else {
+            return false;
+        };
+        if generation <= session.screen_wait_gen {
+            return false;
+        }
+        finish_screen(
+            session,
+            ScreenImage {
+                width,
+                height,
+                rgba,
+            },
+        );
+        true
+    })
+}
+
+fn release_screen_region(session: &mut Session) {
+    let width = (session.screen_x0 - session.screen_x1).abs();
+    let height = (session.screen_y0 - session.screen_y1).abs();
+    if width < 8.0 || height < 8.0 {
+        note_screen_toast("ime-toast-screen-small");
+        state::mark_dirty();
+        return;
+    }
+    if let Some(image) = SCREEN_PIXELS.with(|slot| slot.borrow_mut().take()) {
+        finish_screen(session, image);
+        return;
+    }
+    session.screen_wait_gen = w3cos_runtime::frame_cache::snapshot()
+        .map(|frame| frame.3)
+        .unwrap_or(0);
+    session.screen_phase = ScreenPhase::Read;
+    w3cos_runtime::frame_cache::request_screenshot();
+    state::note_shell_poll_soon(true);
+    state::mark_dirty();
+}
+
+fn map_screen_region(session: &Session, image: &ScreenImage) -> ScreenRegion {
+    let (viewport_w, viewport_h) = state::shell_viewport();
+    let left = session.screen_x0.min(session.screen_x1).max(0.0);
+    let top = session.screen_y0.min(session.screen_y1).max(0.0);
+    let right = session.screen_x0.max(session.screen_x1);
+    let bottom = session.screen_y0.max(session.screen_y1);
+    let scale_x = image.width as f32 / viewport_w.max(1.0);
+    let scale_y = image.height as f32 / viewport_h.max(1.0);
+    let x = (left * scale_x).floor().clamp(0.0, image.width as f32) as u32;
+    let y = (top * scale_y).floor().clamp(0.0, image.height as f32) as u32;
+    let x1 = (right * scale_x).ceil().clamp(0.0, image.width as f32) as u32;
+    let y1 = (bottom * scale_y).ceil().clamp(0.0, image.height as f32) as u32;
+    ScreenRegion {
+        x,
+        y,
+        width: x1.saturating_sub(x),
+        height: y1.saturating_sub(y),
+    }
+}
+
+fn finish_screen(session: &mut Session, image: ScreenImage) {
+    let region = map_screen_region(session, &image);
+    session.screen_phase = ScreenPhase::Idle;
+    session.screen_dragging = false;
+    w3cos_runtime::frame_cache::clear();
+    let Some(ime) = session.ime.clone().filter(|ime| !ime.id.is_empty()) else {
+        note_screen_toast("ime-toast-screen-closed");
+        state::mark_dirty();
+        return;
+    };
+    let result =
+        SCREEN.with(|slot| recognize_screen(&mut **slot.borrow_mut(), &ime, &image, region, true));
+    drop(image);
+    session.page = 0;
+    match result {
+        ScreenResult::Snippets(list) if !list.is_empty() => {
+            session.screen_candidates = list.into_iter().map(|item| item.text).collect();
+            note_screen_toast("ime-toast-screen-ready");
+        }
+        ScreenResult::Off(ScreenOff::SecureField) => {
+            note_screen_toast("ime-toast-screen-secure");
+        }
+        ScreenResult::Off(ScreenOff::NoSession) => {
+            note_screen_toast("ime-toast-screen-closed");
+        }
+        ScreenResult::Off(ScreenOff::NetworkRefused) => {
+            note_screen_toast("ime-toast-screen-net");
+        }
+        ScreenResult::Off(ScreenOff::NoLocalModel) => note_screen_toast("ime-toast-screen"),
+        ScreenResult::Off(ScreenOff::Empty | ScreenOff::Unconfirmed) => {
+            note_screen_toast("ime-toast-screen-small");
+        }
+        ScreenResult::Snippets(_) => note_screen_toast("ime-toast-screen-empty"),
+    }
+    state::mark_dirty();
+}
+
+fn commit_screen_at(session: &mut Session, index: usize) -> bool {
+    let Some(chunk) = session.screen_candidates.get(index).cloned() else {
+        return false;
+    };
+    if !session.secure {
+        crate::lexicon::note_screen_pick(&learning_scope(), &chunk);
+    }
+    session.base.push_str(&chunk);
+    session.undo.push(chunk);
+    session.screen_candidates.clear();
+    session.page = 0;
+    sync_note_value(session);
+    refresh(session);
+    queue(session, session.base.clone());
+    note_screen_toast("ime-toast-screen-ok");
+    true
+}
+
+fn screen_surface_geom() -> (f32, f32, f32, f32) {
+    let (width, height) = state::shell_viewport();
+    (0.0, 48.0, width, (height - 48.0).max(8.0))
+}
+
+pub(crate) fn screen_layer() -> Option<Component> {
+    let phase = with_session(|session| {
+        if session.secure || !session.has_field {
+            return ScreenPhase::Idle;
+        }
+        session.screen_phase
+    });
+    match phase {
+        ScreenPhase::Ask => Some(screen_ask_card()),
+        ScreenPhase::Drag => Some(screen_drag_layer()),
+        ScreenPhase::Idle | ScreenPhase::Read => None,
+    }
+}
+
+fn screen_ask_card() -> Component {
+    let (width, height) = state::shell_viewport();
+    let card_w = (width - 48.0).clamp(280.0, 440.0);
+    let mut card = Component::column(
+        Style {
+            width: Dimension::Px(card_w),
+            padding: Edges::all(16.0),
+            gap: 12.0,
+            background: Color::from_hex("#162433"),
+            border_width: 1.0,
+            border_color: line_strong(),
+            border_radius: 16.0,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                locale::t("ime-screen-title"),
+                Style {
+                    font_size: 18.0,
+                    font_weight: 700,
+                    color: Color::from_hex("#f4f7fb"),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                locale::t("ime-screen-impact"),
+                Style {
+                    font_size: 14.0,
+                    color: Color::from_hex("#c5d0dc"),
+                    ..Style::default()
+                },
+            ),
+            Component::row(
+                Style {
+                    height: Dimension::Px(40.0),
+                    gap: 8.0,
+                    ..Style::default()
+                },
+                vec![
+                    ink_pad_button(
+                        &locale::t("confirm"),
+                        OP_IME_SCREEN_YES,
+                        (card_w - 40.0) * 0.5,
+                    ),
+                    ink_pad_button(
+                        &locale::t("cancel"),
+                        OP_IME_SCREEN_NO,
+                        (card_w - 40.0) * 0.5,
+                    ),
+                ],
+            ),
+        ],
+    );
+    keep_ime(&mut card.style);
+    mark_prop(&mut card.style, "--w3cos-screen", "ask");
+    let mut wrap = Component::column(
+        Style {
+            position: Position::Absolute,
+            left: Dimension::Px(((width - card_w) * 0.5).max(16.0)),
+            top: Dimension::Px((height * 0.28).clamp(24.0, 220.0)),
+            z_index: CHROME_Z + 8,
+            ..Style::default()
+        },
+        vec![card],
+    );
+    keep_ime(&mut wrap.style);
+    wrap
+}
+
+fn screen_drag_layer() -> Component {
+    let (width, height) = state::shell_viewport();
+    let (sx, sy, sw, sh) = screen_surface_geom();
+    let selection = with_session(|session| {
+        if !session.screen_dragging {
+            return None;
+        }
+        let left = (session.screen_x0.min(session.screen_x1) - sx).clamp(0.0, sw);
+        let top = (session.screen_y0.min(session.screen_y1) - sy).clamp(0.0, sh);
+        let rect_w = (session.screen_x0 - session.screen_x1).abs().min(sw - left);
+        let rect_h = (session.screen_y0 - session.screen_y1).abs().min(sh - top);
+        Some((left, top, rect_w.max(1.0), rect_h.max(1.0)))
+    });
+    let mut surface_style = Style {
+        width: Dimension::Px(sw),
+        height: Dimension::Px(sh),
+        min_height: Dimension::Px(sh),
+        flex_shrink: 0.0,
+        background: Color::from_hex("#07101899"),
+        ..Style::default()
+    };
+    keep_ime(&mut surface_style);
+    mark_prop(&mut surface_style, "--w3cos-ink", "1");
+    mark_prop(&mut surface_style, "--w3cos-screen", "region");
+    let mut surface_children = vec![Component::text(
+        locale::t("ime-screen-hint"),
+        Style {
+            font_size: 15.0,
+            font_weight: 650,
+            color: Color::from_hex("#f4f7fb"),
+            margin: Edges::xy(16.0, 12.0),
+            ..Style::default()
+        },
+    )];
+    if let Some((left, top, rect_w, rect_h)) = selection {
+        surface_children.push(Component::column(
+            Style {
+                position: Position::Absolute,
+                left: Dimension::Px(left),
+                top: Dimension::Px(top),
+                width: Dimension::Px(rect_w),
+                height: Dimension::Px(rect_h),
+                border_width: 2.0,
+                border_color: Color::from_hex("#f0d7b4"),
+                background: Color::from_hex("#f0d7b433"),
+                ..Style::default()
+            },
+            Vec::new(),
+        ));
+    }
+    let mut surface = Component::column(surface_style, surface_children);
+    surface.on_click = invoke(OP_SCRIM);
+    let mut layer = Component::column(
+        Style {
+            position: Position::Absolute,
+            left: Dimension::Px(0.0),
+            top: Dimension::Px(0.0),
+            width: Dimension::Px(width),
+            height: Dimension::Px(height),
+            background: Color::from_hex("#071018cc"),
+            z_index: CHROME_Z + 8,
+            ..Style::default()
+        },
+        vec![
+            Component::row(
+                Style {
+                    height: Dimension::Px(sy),
+                    padding: Edges::xy(12.0, 6.0),
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+                vec![
+                    Component::text(
+                        locale::t("ime-screen-live"),
+                        Style {
+                            font_size: 14.0,
+                            font_weight: 700,
+                            color: Color::from_hex("#f4f7fb"),
+                            flex_grow: 1.0,
+                            ..Style::default()
+                        },
+                    ),
+                    ink_pad_button(&locale::t("cancel"), OP_IME_SCREEN_NO, 96.0),
+                ],
+            ),
+            surface,
+        ],
+    );
+    keep_ime(&mut layer.style);
+    mark_prop(&mut layer.style, "--w3cos-screen", "live");
+    layer.on_click = invoke(OP_SCRIM);
+    layer
+}
+
+/// Screenshot hook. Arms the download button without opening a socket.
+pub(crate) fn arm_screen_model_confirm_for_screen() {
+    if !screen_text_ready(&screen_dir(), &handwriting_dir()) {
+        SCREEN_CONSENT.with(|flag| flag.set(true));
+    }
+}
+
+/// Screenshot hook. Opens the permission card when a local engine is ready.
+pub(crate) fn show_screen_ask_for_screen() {
+    if !screen_engine_ready() {
+        return;
+    }
+    with_session(|session| {
+        adopt_for_capture(session);
+        if session.secure || !session.has_field {
+            return;
+        }
+        close_ink(session);
+        session.screen_candidates.clear();
+        session.screen_phase = ScreenPhase::Ask;
+        state::mark_dirty();
+    });
+}
+
+/// Screenshot hook. Shows the region indicator without reading pixels.
+pub(crate) fn show_screen_region_for_screen() {
+    if !screen_engine_ready() {
+        return;
+    }
+    with_session(|session| {
+        adopt_for_capture(session);
+        if session.secure || !session.has_field {
+            return;
+        }
+        close_ink(session);
+        let (width, height) = state::shell_viewport();
+        session.screen_phase = ScreenPhase::Drag;
+        session.screen_dragging = true;
+        session.screen_x0 = width * 0.18;
+        session.screen_y0 = height * 0.28;
+        session.screen_x1 = width * 0.72;
+        session.screen_y1 = height * 0.52;
         state::mark_dirty();
     });
 }
@@ -1999,6 +2669,22 @@ pub(crate) fn install_handwriting_for_tests(engine: Box<dyn LocalHandwriting>) {
 }
 
 #[cfg(test)]
+pub(crate) fn install_screen_for_tests(engine: Box<dyn LocalScreenText>) {
+    SCREEN.with(|slot| *slot.borrow_mut() = engine);
+}
+
+#[cfg(test)]
+pub(crate) fn install_screen_pixels_for_tests(image: ScreenImage) {
+    SCREEN_PIXELS.with(|slot| *slot.borrow_mut() = Some(image));
+}
+
+#[cfg(test)]
+pub(crate) fn set_screen_dir_for_tests(dir: Option<std::path::PathBuf>) {
+    SCREEN_DIR.with(|slot| *slot.borrow_mut() = dir);
+    SCREEN_CONSENT.with(|flag| flag.set(false));
+}
+
+#[cfg(test)]
 pub(crate) fn reset_for_tests() {
     SESSION.with(|slot| *slot.borrow_mut() = Session::default());
     SPEECH.with(|slot| {
@@ -2011,6 +2697,12 @@ pub(crate) fn reset_for_tests() {
     HAND_DIR.with(|slot| *slot.borrow_mut() = None);
     INK_CONSENT.with(|flag| flag.set(false));
     INK_TOAST.with(|slot| slot.set(None));
+    SCREEN.with(|slot| *slot.borrow_mut() = Box::new(NoLocalScreenText::default()));
+    SCREEN_DIR.with(|slot| *slot.borrow_mut() = None);
+    SCREEN_CONSENT.with(|flag| flag.set(false));
+    SCREEN_TOAST.with(|slot| slot.set(None));
+    SCREEN_DECISION.with(|slot| slot.set(0));
+    SCREEN_PIXELS.with(|slot| slot.borrow_mut().take());
     state::note_shell_poll_soon(false);
     let _ = state::take_ime_replacements();
     state::clear_ime_field();
@@ -2813,6 +3505,141 @@ mod tests {
         assert_eq!(ink_tap(), Some("ime-toast-ink-secure"));
         assert!(ink_pad_layer().is_none());
         assert!(phone_smart_bar().is_none());
+
+        state::note_shell_viewport(1200.0, 800.0);
+        reset_for_tests();
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn screen_text_asks_before_one_region_and_learns_only_a_pick() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use w3cos_ime::{LocalScreenText, ScreenSnippet, ScreenTextManifest};
+
+        struct Probe {
+            network: bool,
+            available: bool,
+            calls: std::sync::Arc<AtomicU32>,
+            out: Vec<String>,
+        }
+
+        impl LocalScreenText for Probe {
+            fn manifest(&self) -> ScreenTextManifest {
+                ScreenTextManifest {
+                    id: "test.local-screen-text".into(),
+                    locales: vec!["zh-Hans".into(), "en".into()],
+                    network: self.network,
+                    available: self.available,
+                }
+            }
+
+            fn recognize(
+                &mut self,
+                _image: &ScreenImage,
+                _region: ScreenRegion,
+            ) -> Vec<ScreenSnippet> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.out
+                    .iter()
+                    .map(|text| ScreenSnippet {
+                        text: text.clone(),
+                        score: 1.0,
+                    })
+                    .collect()
+            }
+        }
+
+        reset_for_tests();
+        crate::lexicon::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        note("intent", "已有", false, 4, 180.0);
+        let refused = std::sync::Arc::new(AtomicU32::new(0));
+        install_screen_for_tests(Box::new(Probe {
+            network: true,
+            available: true,
+            calls: refused.clone(),
+            out: vec!["周五".into()],
+        }));
+        assert_eq!(screen_tap(), Some("ime-toast-screen-net"));
+        assert!(screen_layer().is_none());
+        assert_eq!(refused.load(Ordering::SeqCst), 0);
+        assert!(take_screen_decision().is_none());
+
+        let calls = std::sync::Arc::new(AtomicU32::new(0));
+        install_screen_for_tests(Box::new(Probe {
+            network: false,
+            available: true,
+            calls: calls.clone(),
+            out: vec!["周五".into(), "评审".into()],
+        }));
+        assert_eq!(screen_chip_key(), "ime-screen-ready");
+        assert_eq!(screen_tap(), Some("ime-toast-screen-ask"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let card = screen_layer().expect("permission card");
+        let dumped = format!("{card:?}");
+        assert!(dumped.contains("--w3cos-screen"), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-screen-title")), "{dumped}");
+        assert!(dumped.contains(&locale::t("confirm")), "{dumped}");
+        assert_eq!(take_screen_decision(), None);
+        assert_eq!(screen_cancel(), Some("ime-toast-screen-cancel"));
+        assert_eq!(take_screen_decision(), Some(ScreenDecision::Cancelled));
+        assert!(screen_layer().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(crate::lexicon::freq_of("周五").is_none());
+
+        assert_eq!(screen_tap(), Some("ime-toast-screen-ask"));
+        assert_eq!(screen_allow(), Some("ime-toast-screen-allow"));
+        assert_eq!(take_screen_decision(), Some(ScreenDecision::Allowed));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let overlay = screen_layer().expect("region indicator");
+        let dumped = format!("{overlay:?}");
+        assert!(dumped.contains(&locale::t("ime-screen-hint")), "{dumped}");
+        assert!(dumped.contains("--w3cos-ink"), "{dumped}");
+        install_screen_pixels_for_tests(ScreenImage {
+            width: 120,
+            height: 80,
+            rgba: vec![255; 120 * 80 * 4],
+        });
+        screen_pointer(0, 200.0, 160.0);
+        screen_pointer(1, 800.0, 420.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "drag does not capture");
+        screen_pointer(2, 800.0, 420.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            screen_layer().is_none(),
+            "the indicator leaves after the read"
+        );
+        assert_eq!(
+            with_session(|session| session.screen_candidates.clone()),
+            vec!["周五".to_string(), "评审".to_string()]
+        );
+        assert!(crate::lexicon::freq_of("周五").is_none());
+        assert!(crate::lexicon::freq_of("评审").is_none());
+        assert_eq!(take_screen_toast(), Some("ime-toast-screen-ready"));
+        assert!(commit_candidate(0));
+        assert_eq!(composed_text(), "已有周五");
+        assert_eq!(crate::lexicon::freq_of("周五"), Some(1));
+        assert!(crate::lexicon::freq_of("评审").is_none());
+        assert_eq!(take_screen_toast(), Some("ime-toast-screen-ok"));
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "已有");
+        assert_eq!(crate::lexicon::freq_of("周五"), Some(1));
+
+        assert_eq!(screen_tap(), Some("ime-toast-screen-ask"));
+        assert_eq!(screen_allow(), Some("ime-toast-screen-allow"));
+        let _ = take_screen_decision();
+        screen_pointer(0, 220.0, 180.0);
+        screen_pointer(2, 226.0, 184.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a tiny region is not read");
+        assert_eq!(take_screen_toast(), Some("ime-toast-screen-small"));
+        assert_eq!(screen_cancel(), Some("ime-toast-screen-cancel"));
+        assert_eq!(take_screen_decision(), Some(ScreenDecision::Cancelled));
+
+        note("secure", "", true, 9, 180.0);
+        assert_eq!(screen_tap(), Some("ime-toast-screen-secure"));
+        assert!(screen_layer().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         state::note_shell_viewport(1200.0, 800.0);
         reset_for_tests();

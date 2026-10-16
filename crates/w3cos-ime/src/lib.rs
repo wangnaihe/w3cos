@@ -16,6 +16,9 @@ mod intent;
 mod lexicon;
 mod modality;
 mod pinyin;
+mod screen_engine;
+mod screen_model;
+mod screen_text;
 mod speech;
 mod speech_engine;
 mod speech_model;
@@ -50,6 +53,15 @@ pub use modality::{
 };
 pub use pinyin::{
     PinyinEngine, candidates as pinyin_candidates, preedit_display, segment as pinyin_segment,
+};
+pub use screen_engine::PaddleScreenText;
+pub use screen_model::{
+    DET_FILE, DET_LEN, DET_SHA256, DET_URL, DET_YML, DET_YML_LEN, DET_YML_SHA256, DET_YML_URL,
+    ScreenModelError, default_screen_text_dir, download_screen_text_model, screen_text_ready,
+};
+pub use screen_text::{
+    LocalScreenText, NoLocalScreenText, SCREEN_LIMIT, ScreenImage, ScreenOff, ScreenRegion,
+    ScreenResult, ScreenSnippet, ScreenTextManifest, recognize_screen, screen_state,
 };
 pub use speech::{
     LocalSpeech, NoLocalSpeech, SpeechChunk, SpeechManifest, SpeechOff, SpeechStart, VOICE_LIMIT,

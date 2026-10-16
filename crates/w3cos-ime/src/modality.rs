@@ -1,10 +1,11 @@
 //! P3 modality surface.
 //!
-//! Voice, handwriting, and screen OCR stay blocked on this device until a
-//! local engine is plugged in. `ctx.screen` is still refused. Clipboard text
-//! is the one always-ready path. It becomes a candidate only after the person
-//! asks, and the hub does not keep the text. A local speech engine is a
-//! separate trait; this surface does not record on its own.
+//! Voice and handwriting stay blocked on this surface until a local engine is
+//! plugged in. `ctx.screen` stays refused here: a camera payload is dropped,
+//! and a standing screenshot grant does not exist. One region is a separate
+//! shell decision (`LocalScreenText`) after propose, confirm, and a receipt.
+//! Clipboard text is the one always-ready path. It becomes a candidate only
+//! after the person asks, and the hub does not keep the text.
 
 use crate::{IntentPayload, Modality, Proposal, Scope, Session};
 
@@ -16,7 +17,7 @@ pub const CLIPBOARD_LIMIT: usize = 1024;
 pub enum ModalityBlock {
     /// No on-device recognizer is installed. Nothing is recorded.
     NoLocalModel,
-    /// Screen capture stays refused. No screenshot is taken.
+    /// The hub does not take screenshots. A one-time region is a shell decision.
     ScreenRefused,
     /// Secure fields bypass every capture modality.
     SecureField,

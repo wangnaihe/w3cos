@@ -143,7 +143,10 @@ pub(crate) fn note_commit(
     });
 }
 
-/// Remember one handwriting pick. Recognition, clear, and dismiss do not call this.
+/// Remember one picked handwriting or screen snippet.
+///
+/// Recognition, clear, and dismiss do not call this. Unpicked text is not
+/// learned and is not sent to another device. A secure field never calls it.
 pub(crate) fn note_ink_pick(scope: &str, text: &str) {
     if text.is_empty() {
         return;
@@ -156,6 +159,11 @@ pub(crate) fn note_ink_pick(scope: &str, text: &str) {
             persist(store);
         }
     });
+}
+
+/// Same store as a handwriting pick. Only a chosen snippet is remembered.
+pub(crate) fn note_screen_pick(scope: &str, text: &str) {
+    note_ink_pick(scope, text);
 }
 
 pub(crate) fn note_reject(scope: &str, secure: bool, spelling: &str, text: &str) {
