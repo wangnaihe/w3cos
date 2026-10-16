@@ -13,6 +13,7 @@ mod intent;
 mod lexicon;
 mod modality;
 mod pinyin;
+mod speech;
 
 pub use commands::command_utterance;
 pub use context::{
@@ -33,4 +34,8 @@ pub use modality::{
 };
 pub use pinyin::{
     PinyinEngine, candidates as pinyin_candidates, preedit_display, segment as pinyin_segment,
+};
+pub use speech::{
+    LocalSpeech, NoLocalSpeech, SpeechChunk, SpeechManifest, SpeechOff, SpeechStart, VOICE_LIMIT,
+    poll_speech, press_speech, release_speech, voice_state,
 };

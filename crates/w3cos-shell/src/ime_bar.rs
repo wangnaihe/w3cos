@@ -8,8 +8,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use w3cos_ime::{
-    ClipboardDecision, ImeHub, InputIntent, IntentHint, IntentPayload, Modality, ModalityBlock,
-    PinyinEngine, Proposal, Purpose, clipboard_decision,
+    ClipboardDecision, ImeHub, InputIntent, IntentHint, IntentPayload, LocalSpeech, Modality,
+    ModalityBlock, NoLocalSpeech, PinyinEngine, Proposal, Purpose, SpeechOff, SpeechStart,
+    clipboard_decision, poll_speech, press_speech, release_speech,
 };
 use w3cos_runtime::state::{self, ImeFieldNote};
 use w3cos_std::Component;
@@ -67,6 +68,10 @@ struct Session {
     focus_gen: u64,
     page: usize,
     pending: Vec<FieldUpdate>,
+    /// Microphone hold is open. False means nothing is being captured.
+    voice_recording: bool,
+    /// Latest local transcript, not yet committed.
+    voice_preview: String,
 }
 
 pub(crate) struct FieldUpdate {
@@ -98,12 +103,16 @@ impl Default for Session {
             focus_gen: 0,
             page: 0,
             pending: Vec::new(),
+            voice_recording: false,
+            voice_preview: String::new(),
         }
     }
 }
 
 thread_local! {
     static SESSION: RefCell<Session> = RefCell::new(Session::default());
+    static SPEECH: RefCell<Box<dyn LocalSpeech>> =
+        RefCell::new(Box::new(NoLocalSpeech::default()));
 }
 
 fn with_session<R>(body: impl FnOnce(&mut Session) -> R) -> R {
@@ -147,6 +156,7 @@ fn reopen_ime(session: &mut Session) {
 }
 
 fn wipe_ime(session: &mut Session) {
+    stop_voice(session);
     if let Some(ime) = session.ime.as_mut() {
         ime.end();
     }
@@ -320,6 +330,9 @@ fn adopt(session: &mut Session, note: &ImeFieldNote) {
         session.actions.clear();
         session.page = 0;
         queue(session, session.base.clone());
+    }
+    if switched || note.secure {
+        stop_voice(session);
     }
     if switched {
         if let Some(ime) = session.ime.as_mut() {
@@ -519,7 +532,13 @@ pub(crate) fn take_field_updates() -> Vec<FieldUpdate> {
 
 #[cfg(test)]
 pub(crate) fn composed_text() -> String {
-    with_session(|session| format!("{}{}", session.base, session.spelling))
+    with_session(|session| {
+        if session.voice_recording && !session.voice_preview.is_empty() {
+            format!("{}{}", session.base, session.voice_preview)
+        } else {
+            format!("{}{}", session.base, session.spelling)
+        }
+    })
 }
 
 pub(crate) fn candidate_origin(width: f32, height: f32) -> (f32, f32) {
@@ -665,6 +684,142 @@ fn sync_note_value(session: &Session) {
     }
     note.value = session.base.clone();
     state::note_ime_field(note);
+}
+
+fn close_microphone(session: &mut Session) {
+    let was = session.voice_recording;
+    session.voice_recording = false;
+    SPEECH.with(|slot| release_speech(&mut **slot.borrow_mut(), was));
+    state::note_shell_poll_soon(false);
+}
+
+fn stop_voice(session: &mut Session) {
+    close_microphone(session);
+    session.voice_preview.clear();
+}
+
+/// The bundled engine is off. A plugged-in local engine with no network can arm.
+pub(crate) fn voice_engine_ready() -> bool {
+    SPEECH.with(|slot| {
+        let manifest = slot.borrow().manifest();
+        manifest.available && !manifest.network
+    })
+}
+
+pub(crate) fn voice_recording() -> bool {
+    with_session(|session| session.voice_recording)
+}
+
+/// Short tap explains the mic. It does not start a capture.
+pub(crate) fn voice_tap_key() -> &'static str {
+    if voice_engine_ready() {
+        "ime-toast-voice-hold"
+    } else {
+        "ime-toast-voice"
+    }
+}
+
+pub(crate) fn voice_off_key(reason: SpeechOff) -> &'static str {
+    match reason {
+        SpeechOff::NoLocalModel => "ime-toast-voice",
+        SpeechOff::NetworkRefused => "ime-toast-voice-net",
+        SpeechOff::SecureField => "ime-toast-voice-secure",
+        SpeechOff::NoSession => "ime-toast-voice-closed",
+    }
+}
+
+/// Pointer down on the microphone. Off states return before any capture.
+pub(crate) fn voice_press() -> SpeechStart {
+    with_session(|session| {
+        adopt_for_capture(session);
+        let Some(ime) = session.ime.clone() else {
+            return SpeechStart::Off(SpeechOff::NoSession);
+        };
+        if ime.id.is_empty() {
+            return SpeechStart::Off(SpeechOff::NoSession);
+        }
+        let start = SPEECH.with(|slot| press_speech(&mut **slot.borrow_mut(), &ime));
+        if matches!(start, SpeechStart::Listening) {
+            session.spelling.clear();
+            session.preedit.clear();
+            session.page = 0;
+            session.voice_preview.clear();
+            session.voice_recording = true;
+            state::note_shell_poll_soon(true);
+            state::mark_dirty();
+        } else {
+            session.voice_recording = false;
+            state::note_shell_poll_soon(false);
+        }
+        start
+    })
+}
+
+/// Pull one local transcript into the field preview. No-op when not recording.
+pub(crate) fn poll_voice() -> bool {
+    with_session(|session| {
+        if !session.voice_recording {
+            return false;
+        }
+        let Some(chunk) = SPEECH.with(|slot| poll_speech(&mut **slot.borrow_mut(), true)) else {
+            return false;
+        };
+        if chunk.text == session.voice_preview {
+            return false;
+        }
+        session.voice_preview = chunk.text;
+        queue(
+            session,
+            format!("{}{}", session.base, session.voice_preview),
+        );
+        true
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoiceRelease {
+    Wrote,
+    Empty,
+    Idle,
+}
+
+/// Pointer up. Commits the latest local transcript once, then closes the mic.
+pub(crate) fn voice_release() -> VoiceRelease {
+    with_session(|session| {
+        let was = session.voice_recording;
+        let text = std::mem::take(&mut session.voice_preview);
+        close_microphone(session);
+        if !was {
+            return VoiceRelease::Idle;
+        }
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            queue(session, session.base.clone());
+            return VoiceRelease::Empty;
+        }
+        session.spelling.clear();
+        session.preedit.clear();
+        session.page = 0;
+        session.base.push_str(&text);
+        session.undo.push(text);
+        sync_note_value(session);
+        refresh(session);
+        queue(session, session.base.clone());
+        VoiceRelease::Wrote
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn install_speech_for_tests(engine: Box<dyn LocalSpeech>) {
+    SPEECH.with(|slot| {
+        release_speech(&mut **slot.borrow_mut(), true);
+        *slot.borrow_mut() = engine;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn speech_capturing() -> bool {
+    SPEECH.with(|slot| slot.borrow().capturing())
 }
 
 fn gate_of(session: &Session) -> ClipboardGate {
@@ -873,8 +1028,9 @@ fn field_blocks_capture() -> bool {
     Purpose::for_field(&note.role, note.secure).is_secure()
 }
 
-/// Phone row above the keyboard: voice, handwriting, and screen stay off.
-/// Clipboard is the one control that can read, and only after a tap.
+/// Phone row above the keyboard. The microphone is a hold target. It stays
+/// off until a local speech engine is plugged in. Clipboard still reads only
+/// after a tap.
 pub(crate) fn phone_smart_bar() -> Option<Component> {
     if !keyboard_open() || field_blocks_capture() {
         return None;
@@ -928,15 +1084,24 @@ fn smart_bar_style(desktop: bool) -> Style {
 }
 
 fn modality_children() -> Vec<Component> {
+    let recording = voice_recording();
+    let ready = voice_engine_ready();
+    let voice_key = if recording {
+        "ime-voice-live"
+    } else if ready {
+        "ime-voice-ready"
+    } else {
+        "ime-voice"
+    };
     vec![
-        modality_button("ime-voice", OP_IME_VOICE, false),
-        modality_button("ime-ink", OP_IME_INK, false),
-        modality_button("ime-clip", OP_IME_CLIPBOARD, true),
-        modality_button("ime-screen", OP_IME_SCREEN, false),
+        modality_button(voice_key, OP_IME_VOICE, ready || recording, true),
+        modality_button("ime-ink", OP_IME_INK, false, false),
+        modality_button("ime-clip", OP_IME_CLIPBOARD, true, false),
+        modality_button("ime-screen", OP_IME_SCREEN, false, false),
     ]
 }
 
-fn modality_button(key: &str, code: u8, ready: bool) -> Component {
+fn modality_button(key: &str, code: u8, ready: bool, hold: bool) -> Component {
     let mut style = Style {
         background: Color::from_hex(if ready { "#14362c" } else { "#243444" }),
         border_width: 1.0,
@@ -955,6 +1120,11 @@ fn modality_button(key: &str, code: u8, ready: bool) -> Component {
         ..Style::default()
     };
     keep_ime(&mut style);
+    if hold {
+        let mut props = style.custom_properties.take().unwrap_or_default();
+        props.insert("--w3cos-hold".to_string(), code.to_string());
+        style.custom_properties = Some(props);
+    }
     Component::button_with_click(locale::t(key), style, invoke(code))
 }
 
@@ -1218,6 +1388,11 @@ pub(crate) fn candidate_texts() -> Vec<String> {
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     SESSION.with(|slot| *slot.borrow_mut() = Session::default());
+    SPEECH.with(|slot| {
+        release_speech(&mut **slot.borrow_mut(), true);
+        *slot.borrow_mut() = Box::new(NoLocalSpeech::default());
+    });
+    state::note_shell_poll_soon(false);
     let _ = state::take_ime_replacements();
     state::clear_ime_field();
 }
@@ -1562,6 +1737,16 @@ mod tests {
         let bar = phone_smart_bar().expect("phone smart bar");
         let dumped = format!("{bar:?}");
         assert!(dumped.contains(&locale::t("ime-voice")), "{dumped}");
+        assert_eq!(dumped.matches("--w3cos-hold").count(), 1, "{dumped}");
+        assert!(dumped.contains(&OP_IME_VOICE.to_string()), "{dumped}");
+        assert!(matches!(
+            voice_press(),
+            SpeechStart::Off(SpeechOff::NoLocalModel)
+        ));
+        assert!(!voice_recording());
+        assert!(!speech_capturing());
+        assert_eq!(voice_release(), VoiceRelease::Idle);
+        assert_eq!(composed_text(), "");
         assert!(dumped.contains(&locale::t("ime-ink")), "{dumped}");
         assert!(dumped.contains(&locale::t("ime-clip")), "{dumped}");
         assert!(dumped.contains(&locale::t("ime-screen")), "{dumped}");
@@ -1629,7 +1814,9 @@ mod tests {
         state::note_shell_viewport(1200.0, 800.0);
         note("intent", "", false, 4, 200.0);
         let layer = modality_layer().expect("desktop row");
-        assert!(format!("{layer:?}").contains(&locale::t("ime-clip")));
+        let layer_dump = format!("{layer:?}");
+        assert!(layer_dump.contains(&locale::t("ime-clip")));
+        assert_eq!(layer_dump.matches("--w3cos-hold").count(), 1);
         assert!(candidate_layer().is_none());
         type_spelling("ni");
         assert!(modality_layer().is_none());
@@ -1646,6 +1833,211 @@ mod tests {
         state::clear_ime_field();
         reset_for_tests();
         locale::set_locale("zh-CN");
+    }
+
+    #[test]
+    fn voice_hold_streams_on_device_and_refuses_upload() {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use w3cos_ime::{LocalSpeech, SpeechChunk, SpeechManifest, SpeechStart as Start};
+
+        struct Probe {
+            network: bool,
+            available: bool,
+            capturing: bool,
+            begins: Arc<AtomicU32>,
+            ends: Arc<AtomicU32>,
+            chunks: VecDeque<SpeechChunk>,
+        }
+
+        impl LocalSpeech for Probe {
+            fn manifest(&self) -> SpeechManifest {
+                SpeechManifest {
+                    id: "test.local-speech".into(),
+                    locales: vec!["zh-Hans".into()],
+                    network: self.network,
+                    available: self.available,
+                }
+            }
+
+            fn begin(&mut self, _locales: &[String]) -> Start {
+                self.begins.fetch_add(1, Ordering::SeqCst);
+                self.capturing = !self.network;
+                if self.network {
+                    Start::Off(SpeechOff::NetworkRefused)
+                } else {
+                    Start::Listening
+                }
+            }
+
+            fn poll(&mut self) -> Option<SpeechChunk> {
+                if !self.capturing {
+                    return None;
+                }
+                self.chunks.pop_front()
+            }
+
+            fn end(&mut self) {
+                self.ends.fetch_add(1, Ordering::SeqCst);
+                self.capturing = false;
+            }
+
+            fn capturing(&self) -> bool {
+                self.capturing
+            }
+        }
+
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        note("intent", "已有", false, 4, 640.0);
+        let begins = Arc::new(AtomicU32::new(0));
+        let ends = Arc::new(AtomicU32::new(0));
+        install_speech_for_tests(Box::new(Probe {
+            network: true,
+            available: true,
+            capturing: false,
+            begins: begins.clone(),
+            ends: ends.clone(),
+            chunks: VecDeque::new(),
+        }));
+        assert!(!voice_engine_ready());
+        assert!(matches!(
+            voice_press(),
+            SpeechStart::Off(SpeechOff::NetworkRefused)
+        ));
+        assert_eq!(begins.load(Ordering::SeqCst), 0);
+        assert_eq!(ends.load(Ordering::SeqCst), 0);
+        assert!(!speech_capturing());
+        assert!(!voice_recording());
+        assert_eq!(composed_text(), "已有");
+        assert!(!poll_voice());
+
+        let begins = Arc::new(AtomicU32::new(0));
+        let ends = Arc::new(AtomicU32::new(0));
+        let mut chunks = VecDeque::new();
+        chunks.push_back(SpeechChunk {
+            text: "  改到  ".into(),
+            interim: true,
+        });
+        chunks.push_back(SpeechChunk {
+            text: "改到下周一上午".into(),
+            interim: false,
+        });
+        install_speech_for_tests(Box::new(Probe {
+            network: false,
+            available: true,
+            capturing: false,
+            begins: begins.clone(),
+            ends: ends.clone(),
+            chunks,
+        }));
+        let bar = phone_smart_bar().expect("ready mic");
+        assert_eq!(
+            invoke_label(&bar, OP_IME_VOICE).as_deref(),
+            Some(locale::t("ime-voice-ready").as_str())
+        );
+        assert!(matches!(voice_press(), SpeechStart::Listening));
+        assert!(voice_recording());
+        assert!(speech_capturing());
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+        assert!(poll_voice());
+        assert_eq!(composed_text(), "已有改到");
+        let live = phone_smart_bar().expect("listening mic");
+        assert_eq!(
+            invoke_label(&live, OP_IME_VOICE).as_deref(),
+            Some(locale::t("ime-voice-live").as_str())
+        );
+        assert!(poll_voice());
+        assert_eq!(composed_text(), "已有改到下周一上午");
+        assert_eq!(voice_release(), VoiceRelease::Wrote);
+        assert!(!voice_recording());
+        assert!(!speech_capturing());
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert_eq!(composed_text(), "已有改到下周一上午");
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "已有");
+
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        note("intent", "", false, 4, 640.0);
+        let begins = Arc::new(AtomicU32::new(0));
+        let ends = Arc::new(AtomicU32::new(0));
+        let mut chunks = VecDeque::new();
+        chunks.push_back(SpeechChunk {
+            text: "打开文件".into(),
+            interim: true,
+        });
+        install_speech_for_tests(Box::new(Probe {
+            network: false,
+            available: true,
+            capturing: false,
+            begins: begins.clone(),
+            ends: ends.clone(),
+            chunks,
+        }));
+        assert!(matches!(voice_press(), SpeechStart::Listening));
+        assert!(poll_voice());
+        assert_eq!(voice_release(), VoiceRelease::Wrote);
+        assert_eq!(composed_text(), "打开文件");
+        assert_eq!(command_utterance().as_deref(), Some("open files"));
+        assert!(on_key("Mod+Z"));
+        assert!(command_utterance().is_none());
+
+        let begins = Arc::new(AtomicU32::new(0));
+        let ends = Arc::new(AtomicU32::new(0));
+        install_speech_for_tests(Box::new(Probe {
+            network: false,
+            available: true,
+            capturing: false,
+            begins: begins.clone(),
+            ends: ends.clone(),
+            chunks: VecDeque::new(),
+        }));
+        assert!(matches!(voice_press(), SpeechStart::Listening));
+        assert!(!poll_voice());
+        state::clear_ime_field();
+        sync_field_presence();
+        assert!(!voice_recording());
+        assert!(!speech_capturing());
+        assert!(ends.load(Ordering::SeqCst) >= 1);
+
+        note("secure", "保持", true, 2, 400.0);
+        assert!(phone_smart_bar().is_none());
+        assert!(modality_layer().is_none());
+        assert!(matches!(
+            voice_press(),
+            SpeechStart::Off(SpeechOff::SecureField)
+        ));
+        assert!(!speech_capturing());
+        assert_eq!(composed_text(), "保持");
+        assert_eq!(voice_release(), VoiceRelease::Idle);
+
+        state::note_shell_viewport(1200.0, 800.0);
+        state::clear_ime_field();
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+    }
+
+    fn invoke_label(node: &Component, code: u8) -> Option<String> {
+        fn walk(node: &Component, code: u8) -> Option<String> {
+            if let ComponentKind::Button { label } = &node.kind
+                && let EventAction::Invoke { code: found, .. } = node.on_click
+                && found == code
+            {
+                return Some(label.clone());
+            }
+            for child in &node.children {
+                if let Some(found) = walk(child, code) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(node, code)
     }
 
     fn px(dim: Dimension) -> f32 {

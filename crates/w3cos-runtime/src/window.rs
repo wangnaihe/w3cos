@@ -4718,6 +4718,7 @@ impl App {
             );
         }
         crate::uitest::set_pointer_hit(self.mouse_x, self.mouse_y, hit);
+        let hold_code = hit.and_then(|idx| state::shell_hold_code(&self.root, idx));
         if let Some(idx) = hit {
             if let Some((id, mode)) = state::shell_gesture_at(&self.root, idx) {
                 if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
@@ -4757,6 +4758,14 @@ impl App {
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             self.request_repaint();
         }
+        if let Some(code) = hold_code {
+            state::shell_hold_begin(code);
+            self.rebuild_if_dirty();
+            self.apply_queued_ime_text();
+            self.request_repaint();
+        } else {
+            let _ = state::shell_hold_end();
+        }
     }
 
     fn pointer_released(&mut self, pointer_type: &str, pointer_id: i64) {
@@ -4766,18 +4775,25 @@ impl App {
                 self.mouse_x, self.mouse_y, self.pressed_index, self.touch_scroll_active
             );
         }
+        let hold_consumed = state::shell_hold_end();
         let drag_consumed = state::shell_drag_end();
         if !drag_consumed && state::take_shell_swipe(self.mouse_x, self.mouse_y) {
             self.pressed_index = None;
             self.pointer_down_default_prevented = false;
             self.rebuild_if_dirty();
+            if hold_consumed {
+                self.apply_queued_ime_text();
+            }
             self.repaint_after_interaction();
             return;
         }
         if let Some(pressed_idx) = self.pressed_index.take() {
-            if drag_consumed {
+            if drag_consumed || hold_consumed {
                 self.pointer_down_default_prevented = false;
                 self.rebuild_if_dirty();
+                if hold_consumed {
+                    self.apply_queued_ime_text();
+                }
                 self.repaint_after_interaction();
                 return;
             }
@@ -4812,9 +4828,12 @@ impl App {
                     self.repaint_after_interaction();
                 }
             }
-        } else if drag_consumed {
+        } else if drag_consumed || hold_consumed {
             self.pointer_down_default_prevented = false;
             self.rebuild_if_dirty();
+            if hold_consumed {
+                self.apply_queued_ime_text();
+            }
             self.repaint_after_interaction();
         } else {
             self.pointer_down_default_prevented = false;
@@ -8081,6 +8100,14 @@ impl ApplicationHandler for App {
             self.rebuild_if_dirty();
             self.request_repaint();
         }
+        if state::shell_poll_soon() {
+            state::run_shell_poll_hook();
+            if state::is_dirty() {
+                self.rebuild_if_dirty();
+                self.apply_queued_ime_text();
+                self.request_repaint();
+            }
+        }
 
         #[cfg(target_os = "ios")]
         if self
@@ -8252,6 +8279,14 @@ impl ApplicationHandler for App {
                 timer_deadline
                     .map(|deadline| deadline.min(speech_deadline))
                     .unwrap_or(speech_deadline),
+            );
+        }
+        if state::shell_poll_soon() {
+            let soon = now + Duration::from_millis(50);
+            timer_deadline = Some(
+                timer_deadline
+                    .map(|deadline| deadline.min(soon))
+                    .unwrap_or(soon),
             );
         }
 
