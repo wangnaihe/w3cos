@@ -7,7 +7,9 @@
 
 **An AI-native operating system and application runtime built on W3C standards. TypeScript + DOM run as native code, without embedding Chromium or V8.**
 
-![W3C OS Demo](docs/screenshot.png)
+![Desktop home: icons, the intent bar, and L2 off on the taskbar](docs/screenshot.png)
+
+![Phone home of the same shell](docs/screenshot-phone.png)
 
 ```
 app.ts  →  w3cos build  →  native binary (2.4 MB)
