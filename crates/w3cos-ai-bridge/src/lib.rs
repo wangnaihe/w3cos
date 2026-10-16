@@ -1,6 +1,7 @@
 pub mod a11y_api;
 pub mod agent;
 pub mod agent_loop;
+mod copy;
 pub mod dom_access;
 pub mod identity;
 pub mod intent;
@@ -13,6 +14,7 @@ mod receipt_ledger;
 pub mod screenshot;
 pub mod server;
 pub mod shell_tools;
+pub mod tool_host;
 
 pub use agent::AiAgent;
 pub use server::{AiBridgeHandle, start as start_server};

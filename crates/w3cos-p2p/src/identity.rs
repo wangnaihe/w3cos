@@ -1,9 +1,12 @@
 //! One 32-byte seed is the device. It expands to the libp2p Ed25519 identity
 //! and to the X25519 key the shell already uses for HPKE.
 
-use libp2p::identity::{self, PeerId};
+use libp2p::identity::{self, PeerId, ed25519};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+/// Multicodec prefix for a raw Ed25519 public key (`ed25519-pub`).
+const ED25519_PUB_PREFIX: [u8; 2] = [0xed, 0x01];
 
 use crate::hex_encode;
 
@@ -38,6 +41,49 @@ impl DeviceIdentity {
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.x25519_public)
     }
+
+    /// Spec `did:key` for the Ed25519 signing key. This is not the pairing
+    /// fingerprint, which is a spelling of the X25519 key.
+    pub fn did_key(&self) -> String {
+        did_key_ed25519(&self.ed25519_public)
+    }
+
+    /// Sign `message` with the same Ed25519 key libp2p uses for this device.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        self.keypair.sign(message).map_err(|err| err.to_string())
+    }
+}
+
+/// `did:key` for an Ed25519 public key: `did:key:z` plus base58btc of
+/// `0xed 0x01 || public_key`.
+pub fn did_key_ed25519(public: &[u8; 32]) -> String {
+    let mut payload = Vec::with_capacity(34);
+    payload.extend_from_slice(&ED25519_PUB_PREFIX);
+    payload.extend_from_slice(public);
+    format!("did:key:z{}", bs58::encode(payload).into_string())
+}
+
+/// Recover the raw Ed25519 public key from a `did:key` this module produced.
+pub fn ed25519_public_from_did(did: &str) -> Option<[u8; 32]> {
+    let rest = did.strip_prefix("did:key:z")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let bytes = bs58::decode(rest).into_vec().ok()?;
+    if bytes.len() != 34 || bytes[0] != ED25519_PUB_PREFIX[0] || bytes[1] != ED25519_PUB_PREFIX[1] {
+        return None;
+    }
+    let mut public = [0u8; 32];
+    public.copy_from_slice(&bytes[2..]);
+    Some(public)
+}
+
+/// Verify an Ed25519 signature from [`DeviceIdentity::sign`].
+pub fn verify_ed25519(public: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
+    let Ok(public) = ed25519::PublicKey::try_from_bytes(public) else {
+        return false;
+    };
+    public.verify(message, signature)
 }
 
 /// Same spelling as the shell pairing fingerprint: `did:key:z` plus letters.
@@ -100,9 +146,61 @@ mod tests {
         assert_eq!(first.x25519_public, second.x25519_public);
         assert_eq!(first.ed25519_public, second.ed25519_public);
         assert!(first.fingerprint().starts_with("did:key:z"));
+        assert_ne!(first.fingerprint(), first.did_key());
+        assert_eq!(
+            ed25519_public_from_did(&first.did_key()),
+            Some(first.ed25519_public)
+        );
+        let body = b"receipt-body";
+        let signature = first.sign(body).unwrap();
+        assert!(verify_ed25519(&first.ed25519_public, body, &signature));
+        assert!(!verify_ed25519(&first.ed25519_public, b"other", &signature));
         assert_ne!(first.x25519_public, first.ed25519_public);
         let nostr = nostr_secret(&[7; 32]);
         assert_eq!(nostr, nostr_secret(&[7; 32]));
         assert_ne!(nostr, [7; 32]);
+    }
+
+    #[test]
+    fn did_key_matches_the_ed25519_multicodec_vectors() {
+        // W3C CCG did:key example. The bytes are the base58btc payload, not a seed.
+        let spec = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let public = ed25519_public_from_did(spec).unwrap();
+        assert_eq!(
+            hex_of(&public),
+            "2e6fcce36701dc791488e0d0b1745cc1e33a4c1c9fcc41c63bd343dbbe0970e6"
+        );
+        assert_eq!(did_key_ed25519(&public), spec);
+
+        // RFC 8032 §7.1 TEST 1 public key, prefixed with ed25519-pub.
+        let mut rfc = [0u8; 32];
+        for (index, byte) in
+            hex_bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+                .iter()
+                .enumerate()
+        {
+            rfc[index] = *byte;
+        }
+        assert_eq!(
+            did_key_ed25519(&rfc),
+            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+        );
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(char::from(HEX[(byte >> 4) as usize]));
+            out.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+        out
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+            .collect()
     }
 }
