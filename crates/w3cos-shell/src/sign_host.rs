@@ -38,6 +38,20 @@ impl ChainWallet for Wallet {
     fn sign_personal(&self, message: &str) -> Result<String, String> {
         self.inner.sign_personal(message)
     }
+
+    fn sign_legacy(
+        &self,
+        chain_id: u64,
+        nonce: u64,
+        gas_price: u128,
+        gas_limit: u64,
+        to: &[u8; 20],
+        value: &[u8; 32],
+        data: &[u8],
+    ) -> Result<String, String> {
+        self.inner
+            .sign_legacy(chain_id, nonce, gas_price, gas_limit, to, value, data)
+    }
 }
 
 thread_local! {
@@ -123,5 +137,26 @@ pub(crate) fn cancel(locale: &str, now_ms: u64) -> Result<SignedReceipt, String>
         host.set_locale(locale);
         host.set_now_ms(now_ms);
         host.cancel().map_err(|error| error.text)
+    })?
+}
+
+pub(crate) fn broadcast(
+    unlocked: bool,
+    locale: &str,
+    now_ms: u64,
+) -> Result<SignedReceipt, String> {
+    with_host(|host| {
+        host.set_unlocked(unlocked);
+        host.set_locale(locale);
+        host.set_now_ms(now_ms);
+        host.broadcast().map_err(|error| error.text)
+    })?
+}
+
+pub(crate) fn decline_broadcast(locale: &str, now_ms: u64) -> Result<SignedReceipt, String> {
+    with_host(|host| {
+        host.set_locale(locale);
+        host.set_now_ms(now_ms);
+        host.decline_broadcast().map_err(|error| error.text)
     })?
 }

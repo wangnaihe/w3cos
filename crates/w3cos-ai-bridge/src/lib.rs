@@ -16,6 +16,7 @@ pub mod screenshot;
 pub mod server;
 pub mod shell_tools;
 pub mod tool_host;
+pub mod tx;
 
 pub use agent::AiAgent;
 pub use server::{AiBridgeHandle, start as start_server};
