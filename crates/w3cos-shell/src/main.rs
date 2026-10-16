@@ -1174,11 +1174,11 @@ fn post_notice(title: &str, detail: &str, draft: &str) {
 
 fn receipt_notice_sub(parts: &ReceiptParts) -> String {
     let when = notice_when(&parts.recorded_at);
-    let tier = if parts.tier.is_empty() {
-        "L0".to_string()
+    let tier = layer_label(if parts.tier.is_empty() {
+        "L0"
     } else {
-        parts.tier.clone()
-    };
+        parts.tier.as_str()
+    });
     locale::t_args(
         "notify-receipt-sub",
         &[("id", &parts.id), ("tier", &tier), ("when", &when)],
@@ -3047,6 +3047,31 @@ fn l2_badge() -> String {
     }
 }
 
+/// Tray label for local planning. It stays on the desktop taskbar, the phone
+/// status row, and the tablet rail, so the off state is visible without
+/// opening the task center. The button opens the planning settings.
+fn l2_status_button(height: f32) -> Component {
+    Component::button_with_click(
+        l2_badge(),
+        Style {
+            background: Color::TRANSPARENT,
+            color: if session_l2_on() {
+                Color::from_hex("#b7c0ff")
+            } else {
+                muted_token()
+            },
+            font_size: 12.0,
+            font_weight: 650,
+            padding: Edges::xy(6.0, 0.0),
+            height: Dimension::Px(height),
+            min_height: Dimension::Px(height),
+            border_radius: 8.0,
+            ..Style::default()
+        },
+        invoke(OP_TRAY_L2),
+    )
+}
+
 fn truncate_middle(value: &str, keep: usize) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= keep {
@@ -3265,7 +3290,7 @@ fn build_intent_panel() -> Component {
             ],
         ),
     ];
-    if state::get_signal(PHASE_SIGNAL) == 3 {
+    if state::get_signal(PHASE_SIGNAL) == 3 && session_l2_on() {
         rows.push(Component::text(
             locale::t("planning"),
             Style {
@@ -3299,6 +3324,15 @@ fn floating_intent() -> Component {
     bar
 }
 
+fn app_button_name(id: i64, focused: bool) -> String {
+    let name = app_label(id);
+    if focused {
+        format!("{name} · {}", locale::t("using-now"))
+    } else {
+        name
+    }
+}
+
 fn taskbar_app(id: i64, current: i64) -> Component {
     let focused = current == id;
     let glyph = RESIDENT_APPS
@@ -3307,7 +3341,13 @@ fn taskbar_app(id: i64, current: i64) -> Component {
         .map(|app| app.glyph)
         .unwrap_or("grid");
     let (fill, _) = squircle_tone(glyph);
-    dock_icon(glyph, app_label(id), focus_code(id), fill, focused)
+    dock_icon(
+        glyph,
+        app_button_name(id, focused),
+        focus_code(id),
+        fill,
+        focused,
+    )
 }
 
 fn build_floating_taskbar() -> Component {
@@ -3353,19 +3393,7 @@ fn build_floating_taskbar() -> Component {
             false,
         ),
         tray_bell(),
-        Component::button_with_click(
-            l2_badge(),
-            Style {
-                background: Color::TRANSPARENT,
-                color: faint_token(),
-                font_size: 12.0,
-                padding: Edges::xy(8.0, 0.0),
-                min_height: Dimension::Px(touch_min()),
-                border_radius: 8.0,
-                ..Style::default()
-            },
-            invoke(OP_TRAY_L2),
-        ),
+        l2_status_button(touch_min()),
     ];
     if let Some(battery) = live_battery() {
         tray.push(Component::text(
@@ -3451,6 +3479,7 @@ fn build_phone_home() -> Component {
     let mut status_right = vec![
         // The status row is 36px tall, so these glyphs stay 28px.
         // Home tiles are 64px and sheet actions use the coarse 48px target.
+        l2_status_button(28.0),
         glyph_face(
             "tasks",
             locale::t("tasks"),
@@ -3640,14 +3669,15 @@ fn build_tablet_rail() -> Component {
         48.0,
     )];
     for app in RESIDENT_APPS {
+        let focused = current == app.id;
         let mut button = icon_button(
             app.glyph,
-            String::new(),
+            app_button_name(app.id, focused),
             focus_code(app.id),
             app.color,
             48.0,
         );
-        if current == app.id {
+        if focused {
             button.style.border_width = 2.0;
             button.style.border_color = Color::from_hex("#f4f7fb");
         }
@@ -3660,6 +3690,7 @@ fn build_tablet_rail() -> Component {
         "#31475e",
         48.0,
     ));
+    icons.push(l2_status_button(48.0));
     Component::column(
         Style {
             width: Dimension::Px(72.0),
@@ -3754,18 +3785,20 @@ fn sheet_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Componen
 }
 
 fn layer_mark(tier: &str) -> Option<Component> {
+    // Words come first. Color repeats the tier; it is not the only signal.
+    // L0 uses a solid pill so the rules badge is visible on the card.
     let (key, bg, fg) = match tier {
         "L2" => (
             "layer-l2",
-            Color::from_hex("#14362c"),
-            Color::from_hex("#d7f6e8"),
+            Color::from_hex("#2a315c"),
+            Color::from_hex("#b7c0ff"),
         ),
         "L1" => (
             "layer-l1",
             Color::from_hex("#f0d7b4"),
             Color::from_hex("#2a1c0c"),
         ),
-        "L0" => ("layer-l0", Color::rgba(244, 241, 234, 20), ink_token()),
+        "L0" => ("layer-l0", Color::from_hex("#243444"), ink_token()),
         _ => return None,
     };
     Some(Component::text(
@@ -3775,6 +3808,8 @@ fn layer_mark(tier: &str) -> Option<Component> {
             font_weight: 650,
             color: fg,
             background: bg,
+            border_width: 1.0,
+            border_color: line_strong(),
             border_radius: 999.0,
             padding: Edges::xy(8.0, 2.0),
             align_self: AlignSelf::FlexStart,
@@ -6262,19 +6297,22 @@ fn build_task_center() -> Component {
 }
 
 fn planner_subtitle() -> String {
+    // L2 off never claims a model or a background thread. The on-copy names
+    // the fixture or the path, and says inference has not been started.
+    if !session_l2_on() {
+        return if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
+            locale::t("planner-encrypted")
+        } else {
+            locale::t("planner-memory")
+        };
+    }
     match std::env::var("W3COS_L2").ok().as_deref().map(str::trim) {
         Some("script") => locale::t("planner-script"),
         Some("1") | Some("true") => {
             let model = std::env::var("W3COS_L2_MODEL").unwrap_or_else(|_| "local".into());
             locale::t_args("planner-model", &[("model", &model)])
         }
-        _ => {
-            if state::get_signal_text(STORAGE_SIGNAL) == "encrypted-file" {
-                locale::t("planner-encrypted")
-            } else {
-                locale::t("planner-memory")
-            }
-        }
+        _ => locale::t("planner-memory"),
     }
 }
 
@@ -8961,9 +8999,9 @@ mod shell_ux_tests {
         ] {
             assert!(blob.contains(word), "{word} missing from {blob}");
         }
-        assert!(blob.contains("L0 规则"), "{blob}");
-        assert!(blob.contains("L1 同义"), "{blob}");
-        assert!(blob.contains("L2 规划"), "{blob}");
+        assert!(blob.contains("规则 L0"), "{blob}");
+        assert!(blob.contains("同义 L1"), "{blob}");
+        assert!(blob.contains("规划 L2"), "{blob}");
         assert!(blob.contains("结果 · 已切换到文件"), "{blob}");
         assert!(blob.contains("did:key:z6MkOLD"), "{blob}");
         assert!(blob.contains(':'));
@@ -9372,7 +9410,7 @@ mod shell_ux_tests {
         );
         let dialog = build_confirm_dialog();
         let blob = text_blob(&dialog);
-        assert!(blob.contains("L0 规则"), "{blob}");
+        assert!(blob.contains("规则 L0"), "{blob}");
         assert!(blob.contains("打开终端"), "{blob}");
         assert!(blob.contains("确认后才会执行，并写下一张收据。"), "{blob}");
         assert!(!blob.contains("请确认"), "{blob}");
@@ -9489,7 +9527,7 @@ mod shell_ux_tests {
         assert_eq!(state::get_signal_text(TIER_SIGNAL), "L1");
         assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开文件");
         let synonym = text_blob(&build_confirm_dialog());
-        assert!(synonym.contains("L1 同义"), "{synonym}");
+        assert!(synonym.contains("同义 L1"), "{synonym}");
         assert!(
             synonym.contains("这句话没有对上规则表，本机把它当成同一件事。"),
             "{synonym}"
@@ -9673,7 +9711,7 @@ mod shell_ux_tests {
         assert!(pending.contains("待确认"), "{pending}");
         let card = build_locale_confirm();
         let card_blob = text_blob(&card);
-        assert!(card_blob.contains("L0 规则"), "{card_blob}");
+        assert!(card_blob.contains("规则 L0"), "{card_blob}");
         assert!(card_blob.contains("把界面改成 English"), "{card_blob}");
         assert!(
             card_blob
@@ -10094,7 +10132,7 @@ mod shell_ux_tests {
         let fed = text_blob(&build_notify_panel());
         assert!(fed.contains("已打开文件。"), "{fed}");
         assert!(fed.contains("收据 #"), "{fed}");
-        assert!(fed.contains("L0"), "{fed}");
+        assert!(fed.contains("规则 L0"), "{fed}");
         assert!(fed.contains("刚刚"), "{fed}");
         assert_eq!(state::get_signal(NOTIFY_UNREAD_SIGNAL), 1);
         let open_code = codes_for(&build_notify_panel(), "已打开文件。");
@@ -10341,5 +10379,106 @@ mod shell_ux_tests {
         state::set_signal(OPEN_MASK_SIGNAL, 0);
         state::set_signal(APP_SIGNAL, 0);
         locale::set_locale("zh-CN");
+    }
+
+    #[test]
+    fn tier_badges_lead_with_words_and_l2_off_stays_on_the_chrome() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 1);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_text_signal(SUMMARY_SIGNAL, "打开文件");
+        state::set_text_signal(IMPACT_SIGNAL, "会打开文件窗口。");
+        state::set_text_signal(TIER_SIGNAL, "L0");
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
+
+        let mark = |tier: &str| {
+            let card = layer_mark(tier).unwrap_or_else(|| panic!("missing {tier}"));
+            let ComponentKind::Text { content } = &card.kind else {
+                panic!("badge is not text");
+            };
+            (content.clone(), card.style.background)
+        };
+        let (l0, l0_bg) = mark("L0");
+        assert_eq!(l0, "规则 L0");
+        assert!(l0_bg.a > 200, "L0 badge background is missing");
+        let (l1, l1_bg) = mark("L1");
+        assert_eq!(l1, "同义 L1");
+        assert_eq!((l1_bg.r, l1_bg.g, l1_bg.b), (0xf0, 0xd7, 0xb4));
+        let (l2, l2_bg) = mark("L2");
+        assert_eq!(l2, "规划 L2");
+        assert_eq!((l2_bg.r, l2_bg.g, l2_bg.b), (0x2a, 0x31, 0x5c));
+
+        let card = text_blob(&build_confirm_dialog());
+        assert!(card.contains("规则 L0"), "{card}");
+        state::set_text_signal(TIER_SIGNAL, "L1");
+        let synonym = text_blob(&build_confirm_dialog());
+        assert!(synonym.contains("同义 L1"), "{synonym}");
+
+        let tasks = text_blob(&build_task_center());
+        assert!(tasks.contains("没有模型在运行"), "{tasks}");
+        assert!(!tasks.contains("后台线程"), "{tasks}");
+        assert!(!tasks.contains("background thread"), "{tasks}");
+
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(1));
+        state::set_signal(APP_SIGNAL, 1);
+        let bar = button_labels(&build_floating_taskbar());
+        assert!(bar.iter().any(|label| label == "L2 关"), "{bar:?}");
+        assert!(
+            bar.iter()
+                .any(|label| label.contains("文件") && label.contains("正在使用")),
+            "{bar:?}"
+        );
+        assert!(
+            button_labels(&build_phone_home())
+                .iter()
+                .any(|label| label == "L2 关")
+        );
+        assert!(
+            button_labels(&build_tablet_rail())
+                .iter()
+                .any(|label| label == "L2 关")
+        );
+        let rail = button_labels(&build_tablet_rail());
+        assert!(
+            rail.iter()
+                .any(|label| label.contains("文件") && label.contains("正在使用")),
+            "{rail:?}"
+        );
+
+        let hidden = locale::t("toast-context-hidden");
+        let shared = locale::t("toast-context-shared");
+        assert!(!hidden.contains('×'), "{hidden}");
+        assert!(hidden.contains("窗口"), "{hidden}");
+        assert!(!shared.contains('×'), "{shared}");
+        assert!(shared.contains("窗口"), "{shared}");
+        for surface in [
+            text_blob(&build_intent_panel()),
+            text_blob(&build_floating_taskbar()),
+            text_blob(&build_phone_home()),
+            text_blob(&build_task_center()),
+        ] {
+            assert!(!surface.contains('×'), "{surface}");
+        }
+
+        locale::set_locale("en");
+        assert_eq!(layer_label("L0"), "Rules L0");
+        assert_eq!(layer_label("L1"), "Synonym L1");
+        assert_eq!(layer_label("L2"), "Plan L2");
+        assert!(!locale::t("planner-memory").contains("background thread"));
+        assert!(!locale::t("toast-context-hidden").contains('×'));
+
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_text_signal(TIER_SIGNAL, "");
     }
 }
