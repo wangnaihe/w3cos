@@ -5009,6 +5009,9 @@ fn match_indexed_text_rewrite(
 }
 
 fn binding_number_expr(plan: &EscapePlan, binding: u32) -> String {
+    if let Some(number) = plan.constants.get(&binding) {
+        return format!("{number:?}");
+    }
     if let Some(slot) = num_binding_slot(plan, binding) {
         format!("self.num_bindings[{slot}]")
     } else if is_shared_number(binding) {
@@ -8699,8 +8702,9 @@ fn main() {{
             generated.contains("__w3cos_rewrite_tried_")
                 && generated.contains("is_undefined()")
                 && generated.contains("\"upd \"")
-                && generated.contains("17.0"),
-            "the whole update loop is one guarded call: {generated}"
+                && generated.contains("17.0, 1000.0,")
+                && generated.contains(", 8000.0,"),
+            "the whole update loop is one guarded call with folded limits: {generated}"
         );
         let fallback = &generated[rewrite_at..];
         assert!(
