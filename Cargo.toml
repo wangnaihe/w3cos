@@ -16,6 +16,7 @@ members = [
     "crates/w3cos-ai-bridge",
     "crates/w3cos-demo",
     "crates/w3cos-shell",
+    "crates/w3cos-p2p",
     "crates/w3cos-ime",
     "crates/w3cos-rn-compat",
     "crates/w3cos-ffi",
@@ -133,3 +134,7 @@ panic = "unwind"
 inherits = "release"
 opt-level = "z"
 lto = "fat"
+
+# libp2p-quic 0.14 disables QUIC connection migration. The patched copy enables it.
+[patch.crates-io]
+libp2p-quic = { path = "third_party/libp2p-quic" }

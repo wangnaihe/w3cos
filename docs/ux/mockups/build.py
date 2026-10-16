@@ -596,7 +596,7 @@ def handoff_pair() -> str:
         <h3 style="margin:0 0 4px;font-size:20px">同一把身份下的设备</h3>
         <p class="who">did:key:z6MkhaXg…ta2doK</p>
         <div class="list-dev">
-          <div class="dev">{ico("desktop", 22)}<div><b>书桌</b><span>本机 · 已解锁这台</span></div><span class="pill ok">本机</span></div>
+          <div class="dev">{ico("desktop", 22)}<div><b>书桌</b><span>本机 · 已解锁这台</span></div><span class="pill unk">离线</span></div>
           <div class="dev" style="outline:1px solid rgba(20,150,106,.5)">{ico("phone", 22)}<div><b>手机</b><span>局域网发现 · 尚未信任</span></div><span class="pill stop">待核对</span></div>
         </div>
         <p style="margin:16px 0 0">两边都要看到同一个短码。没有账号服务器。</p>
@@ -624,6 +624,7 @@ def handoff_desktop() -> str:
       <div class="txt">
         <b>在手机上继续</b>
         <p>加密发送当前路径和未执行的草稿。确认不会跟着过去。像素不发送。</p>
+        <p><span class="pill ok">直连</span></p>
       </div>
       <button class="btn ghost">不是现在</button>
       <button class="btn primary">继续</button>
@@ -785,6 +786,7 @@ def handoff_phone() -> str:
       {phone_status()}
       <div style="padding:12px 16px 0">
         <p class="fine" style="margin:0">来自书桌 · 刚刚</p>
+        <p style="margin:8px 0 0"><span class="pill unk">中继</span></p>
         <h1 style="font-size:28px;line-height:1.35;margin:8px 0">从书桌继续</h1>
         <div class="card" style="box-shadow:none">
           <b style="font-size:15px">文件 · /home/lin/w3cos</b>

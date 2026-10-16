@@ -194,6 +194,10 @@ pub struct Peer {
     pub nonce: String,
     pub expiry_unix: u64,
     pub trusted: bool,
+    /// libp2p peer id, empty until a pairing payload carries one.
+    pub peer_id: String,
+    pub ed25519: [u8; 32],
+    pub link: w3cos_p2p::LinkMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,9 +572,18 @@ pub fn note_clock_at(now: u64) -> bool {
 }
 
 pub fn note_announcement(packet: &str, now: u64) -> bool {
-    let Some((name, fingerprint, public, nonce, expiry_unix)) = parse_announcement(packet) else {
+    let Some(parsed) = parse_announcement(packet) else {
         return false;
     };
+    let ParsedAnnounce {
+        name,
+        fingerprint,
+        public,
+        nonce,
+        expiry_unix,
+        peer_id,
+        ed25519,
+    } = parsed;
     if code_expired(expiry_unix, now) {
         return false;
     }
@@ -588,6 +601,12 @@ pub fn note_announcement(packet: &str, now: u64) -> bool {
             existing.public = public;
             existing.nonce = nonce;
             existing.expiry_unix = expiry_unix;
+            if !peer_id.is_empty() {
+                existing.peer_id = peer_id;
+            }
+            if ed25519 != [0; 32] {
+                existing.ed25519 = ed25519;
+            }
             return true;
         }
         store.peers.push(Peer {
@@ -597,6 +616,9 @@ pub fn note_announcement(packet: &str, now: u64) -> bool {
             nonce,
             expiry_unix,
             trusted: false,
+            peer_id,
+            ed25519,
+            link: w3cos_p2p::LinkMode::Offline,
         });
         if matches!(store.phase, Phase::Idle | Phase::Failed | Phase::NoAnswer) {
             store.phase = Phase::Pending;
@@ -606,10 +628,11 @@ pub fn note_announcement(packet: &str, now: u64) -> bool {
 }
 
 pub fn announcement(nonce: &str, expiry_unix: u64) -> String {
+    let (peer_id, ed25519) = local_transport_card();
     STORE.with(|slot| {
         let store = slot.borrow();
         format!(
-            "W3COS1\t{}\t{}\t{}\t{nonce}\t{expiry_unix}",
+            "W3COS1\t{}\t{}\t{}\t{nonce}\t{expiry_unix}\t{peer_id}\t{ed25519}",
             store.name,
             store.local.fingerprint(),
             hex_key(&store.local.public_bytes()),
@@ -627,17 +650,18 @@ pub fn codes_differ() {
 }
 
 pub fn codes_match() -> bool {
-    STORE.with(|slot| {
+    let trusted = STORE.with(|slot| {
         let mut store = slot.borrow_mut();
         let Some(peer) = store.peers.iter_mut().find(|peer| !peer.trusted) else {
-            return false;
+            return None;
         };
         if code_expired(peer.expiry_unix, now_unix()) {
             store.phase = Phase::Failed;
             store.notice = "pair-expired".to_string();
-            return false;
+            return None;
         }
         peer.trusted = true;
+        let armed = peer.clone();
         store.phase = Phase::ChooseSync;
         store.sync_step = SyncStep::Receipts;
         store.sync_receipts = false;
@@ -647,8 +671,12 @@ pub fn codes_match() -> bool {
         store.scene_decided = false;
         store.scene_gate = false;
         store.notice.clear();
-        true
-    })
+        Some(armed)
+    });
+    if let Some(peer) = trusted.as_ref() {
+        arm_transport(peer);
+    }
+    trusted.is_some()
 }
 
 pub fn allow_receipt_sync() {
@@ -722,21 +750,25 @@ pub fn begin_send(
     executed: bool,
     clipboard: Option<&str>,
 ) -> Option<Vec<u8>> {
-    STORE.with(|slot| {
-        let mut store = slot.borrow_mut();
+    let sealed = STORE.with(|slot| {
+        let store = slot.borrow();
         let peer = store.peers.iter().find(|peer| peer.trusted)?.clone();
         let payload = compose_payload(&store, receipts, draft, path, executed, clipboard);
-        let sealed = seal(&store.local, &peer.public, &payload)?;
+        seal(&store.local, &peer.public, &payload)
+    })?;
+    let sent = send_sealed(&sealed);
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
         store.send_started = now_unix();
-        if send_sealed(&sealed) {
+        if sent {
             store.phase = Phase::Sending;
             store.notice = "handoff-sending".to_string();
         } else {
             store.phase = Phase::NoAnswer;
             store.notice = "handoff-no-answer".to_string();
         }
-        Some(sealed)
-    })
+    });
+    Some(sealed)
 }
 
 fn accept_sealed(sealed: &[u8]) -> bool {
@@ -962,6 +994,7 @@ pub fn ensure_listener() {
         }
     });
     std::thread::spawn(mdns_loop);
+    ensure_transport();
 }
 
 const MDNS_SERVICE: &str = "_w3cos._udp.local";
@@ -1159,12 +1192,15 @@ fn write_system_clipboard(text: &str) {
 fn send_sealed(bytes: &[u8]) -> bool {
     let mut packet = b"W3COS2".to_vec();
     packet.extend_from_slice(bytes);
-    broadcast_packet(&packet)
+    let udp = broadcast_packet(&packet);
+    let p2p = send_over_transport(bytes);
+    udp || p2p
 }
 
 fn send_ack() {
     let packet = format!("W3COS3\t{}", local_fingerprint());
     let _ = broadcast_packet(packet.as_bytes());
+    let _ = send_over_transport(packet.as_bytes());
 }
 
 fn broadcast_packet(bytes: &[u8]) -> bool {
@@ -1179,7 +1215,17 @@ fn broadcast_packet(bytes: &[u8]) -> bool {
     socket.send_to(bytes, ("255.255.255.255", port)).is_ok()
 }
 
-fn parse_announcement(packet: &str) -> Option<(String, String, [u8; 32], String, u64)> {
+struct ParsedAnnounce {
+    name: String,
+    fingerprint: String,
+    public: [u8; 32],
+    nonce: String,
+    expiry_unix: u64,
+    peer_id: String,
+    ed25519: [u8; 32],
+}
+
+fn parse_announcement(packet: &str) -> Option<ParsedAnnounce> {
     let mut parts = packet.split('\t');
     if parts.next() != Some("W3COS1") {
         return None;
@@ -1189,7 +1235,17 @@ fn parse_announcement(packet: &str) -> Option<(String, String, [u8; 32], String,
     let public = parse_hex_key(parts.next()?)?;
     let nonce = parts.next()?.to_string();
     let expiry_unix = parts.next()?.parse().ok()?;
-    Some((name, fingerprint, public, nonce, expiry_unix))
+    let peer_id = parts.next().unwrap_or("").trim().to_string();
+    let ed25519 = parts.next().and_then(parse_hex_key).unwrap_or([0; 32]);
+    Some(ParsedAnnounce {
+        name,
+        fingerprint,
+        public,
+        nonce,
+        expiry_unix,
+        peer_id,
+        ed25519,
+    })
 }
 
 fn parse_hex_key(text: &str) -> Option<[u8; 32]> {
@@ -1201,6 +1257,162 @@ fn parse_hex_key(text: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+fn local_seed() -> [u8; 32] {
+    STORE.with(|slot| slot.borrow().local.secret)
+}
+
+fn local_transport_card() -> (String, String) {
+    let identity = w3cos_p2p::DeviceIdentity::from_seed(local_seed());
+    (
+        identity.peer_id.to_string(),
+        hex_key(&identity.ed25519_public),
+    )
+}
+
+static TRANSPORT: std::sync::Mutex<Option<w3cos_p2p::Endpoint>> = std::sync::Mutex::new(None);
+
+fn ensure_transport() {
+    if std::env::var("W3COS_P2P").ok().as_deref() == Some("0") {
+        return;
+    }
+    let mut slot = TRANSPORT.lock().expect("transport");
+    if slot.is_some() {
+        return;
+    }
+    let mut config = w3cos_p2p::NetConfig::from_env();
+    config.name = local_name();
+    if let Ok(endpoint) = w3cos_p2p::Endpoint::spawn(config, local_seed()) {
+        endpoint.publish();
+        *slot = Some(endpoint);
+    }
+}
+
+fn arm_transport(peer: &Peer) {
+    if peer.peer_id.is_empty() || peer.ed25519 == [0; 32] {
+        return;
+    }
+    let Ok(id) = peer.peer_id.parse() else {
+        return;
+    };
+    let slot = TRANSPORT.lock().expect("transport");
+    let Some(endpoint) = slot.as_ref() else {
+        return;
+    };
+    endpoint.track(id, &peer.fingerprint, peer.ed25519);
+    endpoint.resolve(id, &peer.fingerprint, peer.ed25519);
+    endpoint.publish();
+}
+
+fn send_over_transport(bytes: &[u8]) -> bool {
+    let targets = peers()
+        .into_iter()
+        .filter(|peer| peer.trusted && !peer.peer_id.is_empty())
+        .map(|peer| peer.peer_id)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return false;
+    }
+    let slot = TRANSPORT.lock().expect("transport");
+    let Some(endpoint) = slot.as_ref() else {
+        return false;
+    };
+    let mut sent = false;
+    for peer in targets {
+        let Ok(id) = peer.parse() else {
+            continue;
+        };
+        sent |= endpoint.send(id, bytes.to_vec());
+    }
+    sent
+}
+
+/// Apply swarm events on the UI thread. The listener thread does not touch
+/// the thread-local pairing store.
+pub fn poll_transport() -> bool {
+    let drain = {
+        let slot = TRANSPORT.lock().expect("transport");
+        let Some(endpoint) = slot.as_ref() else {
+            return false;
+        };
+        endpoint.drain()
+    };
+    let mut changed = false;
+    for (peer, mode) in drain.changes {
+        changed |= note_link(&peer, mode);
+    }
+    for bytes in drain.inbound {
+        changed |= accept_transport_bytes(&bytes);
+    }
+    changed
+}
+
+fn accept_transport_bytes(bytes: &[u8]) -> bool {
+    if let Some(rest) = bytes.strip_prefix(b"W3COS3\t") {
+        return std::str::from_utf8(rest).is_ok_and(|fingerprint| note_ack(fingerprint.trim()));
+    }
+    let accepted = accept_sealed(bytes);
+    if accepted {
+        if let Some(text) = take_auto_clipboard() {
+            write_system_clipboard(&text);
+        }
+        send_ack();
+    }
+    accepted
+}
+
+pub fn note_link(peer_id: &str, mode: w3cos_p2p::LinkMode) -> bool {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        let Some(peer) = store.peers.iter_mut().find(|peer| peer.peer_id == peer_id) else {
+            return false;
+        };
+        if peer.link == mode {
+            return false;
+        }
+        peer.link = mode;
+        true
+    })
+}
+
+/// The path a continue banner would use. Direct wins over a relay.
+pub fn offer_link() -> w3cos_p2p::LinkMode {
+    let trusted = peers()
+        .into_iter()
+        .filter(|peer| peer.trusted)
+        .collect::<Vec<_>>();
+    if trusted
+        .iter()
+        .any(|peer| peer.link == w3cos_p2p::LinkMode::Direct)
+    {
+        w3cos_p2p::LinkMode::Direct
+    } else if trusted
+        .iter()
+        .any(|peer| peer.link == w3cos_p2p::LinkMode::Relay)
+    {
+        w3cos_p2p::LinkMode::Relay
+    } else {
+        w3cos_p2p::LinkMode::Offline
+    }
+}
+
+pub fn import_pairing_payload(text: &str) -> bool {
+    let text = text.trim();
+    if !text.starts_with("W3COS1\t") {
+        return false;
+    }
+    note_announcement(text, now_unix())
+}
+
+pub fn pairing_qr_svg() -> String {
+    let payload = announcement("live", now_unix() + CODE_TTL_SECS);
+    let Ok(code) = qrcode::QrCode::new(payload.as_bytes()) else {
+        return String::new();
+    };
+    code.render::<qrcode::render::svg::Color>()
+        .min_dimensions(132, 132)
+        .build()
 }
 
 fn hex_key(bytes: &[u8; 32]) -> String {
@@ -1556,5 +1768,42 @@ mod tests {
         cancel_send();
         assert!(!sending());
         assert_eq!(banner_kind(), Some(BannerKind::Offer));
+    }
+
+    #[test]
+    fn pairing_payload_keeps_the_transport_identity_and_old_packets_parse() {
+        reset_for_tests();
+        let mine = announcement("live", now_unix() + 30);
+        assert_eq!(mine.split('\t').count(), 8);
+        assert!(!note_announcement(&mine, now_unix()));
+        let remote_key = DeviceKey::from_seed([6; 32]);
+        let remote = w3cos_p2p::DeviceIdentity::from_seed([6; 32]);
+        let legacy = format!(
+            "W3COS1\t手机\t{}\t{}\tlive\t{}",
+            remote_key.fingerprint(),
+            hex_key(&remote_key.public_bytes()),
+            now_unix() + 30
+        );
+        assert!(import_pairing_payload(&legacy));
+        let extended = format!(
+            "{legacy}\t{}\t{}",
+            remote.peer_id,
+            hex_key(&remote.ed25519_public)
+        );
+        assert!(note_announcement(&extended, now_unix()));
+        let peer = peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .unwrap();
+        assert_eq!(peer.peer_id, remote.peer_id.to_string());
+        assert_eq!(peer.ed25519, remote.ed25519_public);
+        assert_eq!(peer.link, w3cos_p2p::LinkMode::Offline);
+        assert!(note_link(&peer.peer_id, w3cos_p2p::LinkMode::Direct));
+        assert!(codes_match());
+        assert_eq!(offer_link(), w3cos_p2p::LinkMode::Direct);
+        assert!(!import_pairing_payload("not a code"));
+        let svg = pairing_qr_svg();
+        assert!(svg.contains("<svg"), "{svg}");
+        assert!(!svg.contains("已连接"));
     }
 }
