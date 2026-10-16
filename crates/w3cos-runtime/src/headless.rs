@@ -8,6 +8,24 @@ use crate::paint_artifact::{PaintArtifact, PaintNode};
 #[cfg(feature = "skia")]
 use crate::render_skia::SkiaRasterizer;
 
+/// Pixel checksum used to prove a headless frame was actually painted.
+///
+/// Equivalent to `len + Σ byte[i] * ((i % 251) + 1)` over every byte, with
+/// wrapping arithmetic. The factor walks 1..=251 so the hot loop does not
+/// divide once per byte.
+pub(crate) fn frame_byte_checksum(rgba: &[u8]) -> u64 {
+    let mut checksum = rgba.len() as u64;
+    let mut factor = 1u64;
+    for &byte in rgba {
+        checksum = checksum.wrapping_add(u64::from(byte).wrapping_mul(factor));
+        factor += 1;
+        if factor == 252 {
+            factor = 1;
+        }
+    }
+    checksum
+}
+
 /// One fully rasterized document frame in premultiplied RGBA byte order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadlessFrame {
@@ -33,9 +51,23 @@ fn render_document_rgba_inner(width: u32, height: u32, force_cpu: bool) -> Resul
         bail!("headless viewport dimensions must be positive");
     }
 
-    let root = crate::dom::to_component_tree();
-    let flat = layout::pre_flatten(&root);
-    let layout_results = layout::compute_with_scroll_details(&root, width as f32, height as f32)?;
+    crate::incremental_layout::with_paint_layout(
+        width as f32,
+        height as f32,
+        |root, layout_results| {
+            finish_headless_frame(width, height, force_cpu, root, layout_results)
+        },
+    )
+}
+
+fn finish_headless_frame(
+    width: u32,
+    height: u32,
+    force_cpu: bool,
+    root: &w3cos_std::Component,
+    layout_results: &layout::LayoutResults,
+) -> Result<HeadlessFrame> {
+    let flat = layout::pre_flatten(root);
     let layout_cache = &layout_results.layout_cache;
     if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
         for (rect, index) in layout_cache {
@@ -283,6 +315,30 @@ fn rasterize_prepared_frame(
     {
         let _ = (width, height, nodes, scroll_info, artifact);
         bail!("headless rasterizer is not compiled in");
+    }
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::frame_byte_checksum;
+
+    fn naive(rgba: &[u8]) -> u64 {
+        let mut checksum = rgba.len() as u64;
+        for (index, byte) in rgba.iter().enumerate() {
+            checksum =
+                checksum.wrapping_add(u64::from(*byte).wrapping_mul((index as u64 % 251) + 1));
+        }
+        checksum
+    }
+
+    #[test]
+    fn frame_checksum_matches_the_modulo_formula() {
+        for len in [0usize, 1, 250, 251, 252, 503, 4096] {
+            let rgba = (0..len)
+                .map(|index| (index.wrapping_mul(17)) as u8)
+                .collect::<Vec<_>>();
+            assert_eq!(frame_byte_checksum(&rgba), naive(&rgba), "len {len}");
+        }
     }
 }
 
