@@ -410,8 +410,18 @@ pub struct Document {
     scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
+    /// Bumps only when used geometry can change. A definite box can repaint
+    /// new text without solving layout again.
+    layout_generation: u64,
+    /// Bumps on every stored layout rect so scroll-size caches notice geometry
+    /// changes that do not rebuild the tree.
+    geometry_epoch: u64,
     /// Bumps when inherited or selector-driven styles may have changed.
     cascade_generation: u64,
+    /// `text_stable_stamp[id] == text_stable_epoch` means this node's text
+    /// cannot change its used border box until style or tree shape changes.
+    text_stable_epoch: u32,
+    text_stable_stamp: Vec<u32>,
     style_revision_clock: u64,
     style_revisions: Vec<u64>,
     focused_node: Option<NodeId>,
@@ -542,7 +552,11 @@ impl Document {
             scope_epoch: 1,
             scope_stamp: Vec::new(),
             structure_generation: 0,
+            layout_generation: 0,
+            geometry_epoch: 1,
             cascade_generation: 0,
+            text_stable_epoch: 1,
+            text_stable_stamp: Vec::new(),
             style_revision_clock: 0,
             style_revisions: Vec::new(),
             focused_node: None,
@@ -1376,7 +1390,12 @@ impl Document {
         let idx = id.0 as usize;
         if idx < self.layout_rects.len() {
             self.layout_rects[idx] = rect;
+            self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
         }
+    }
+
+    pub fn geometry_epoch(&self) -> u64 {
+        self.geometry_epoch
     }
 
     /// Bulk-update layout rects from a slice of (NodeId, DOMRect) pairs.
@@ -1675,18 +1694,90 @@ impl Document {
     /// Text mutations can change the parent's `:empty` state. Relational
     /// selectors such as `:has()` conservatively fall back to document scope.
     pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
+        if self.text_box_is_stable(id)
+            && !stylesheet::has_structural_dependencies()
+            && !stylesheet::has_relational_dependencies()
+        {
+            self.note_repaint_without_layout();
+            return;
+        }
+        let changes_box = self.text_mutation_changes_used_box(id);
         if stylesheet::has_relational_dependencies() {
             self.invalidate_style_subtree(NodeId::ROOT);
         } else if stylesheet::has_structural_dependencies() {
             let invalidation_root = self.get_node(id).parent.unwrap_or(id);
             self.invalidate_style_subtree(invalidation_root);
+        } else if !changes_box {
+            // Leave the style revision in place so the next write hits the
+            // computed-style cache, then skips this check entirely.
+            self.note_text_box_stable(id);
+            self.note_repaint_without_layout();
+            return;
         } else {
-            // Text does not change tag/id/class matching. Touching the node
-            // keeps the cascade cache honest without walking the subtree.
             self.touch_style_revision(id);
         }
         self.record_layout_dirty(id);
         self.note_structure_change();
+    }
+
+    fn text_box_is_stable(&self, id: NodeId) -> bool {
+        self.text_stable_stamp.get(id.0 as usize).copied() == Some(self.text_stable_epoch)
+    }
+
+    fn note_text_box_stable(&mut self, id: NodeId) {
+        let idx = id.0 as usize;
+        if self.text_stable_stamp.len() <= idx {
+            self.text_stable_stamp.resize(idx + 1, 0);
+        }
+        self.text_stable_stamp[idx] = self.text_stable_epoch;
+    }
+
+    fn invalidate_text_box_stability(&mut self) {
+        bump_dirty_epoch(&mut self.text_stable_epoch, &mut self.text_stable_stamp);
+    }
+
+    /// `true` when replacing this node's text can change a used border box.
+    fn text_mutation_changes_used_box(&self, id: NodeId) -> bool {
+        if stylesheet::has_structural_dependencies() || stylesheet::has_relational_dependencies() {
+            return true;
+        }
+        let style = self.computed_style_for(id);
+        // Both axes must be specified lengths. An auto width on a
+        // shrink-to-fit box still grows with the text.
+        let w3cos_std::style::Dimension::Px(width) = style.width else {
+            return true;
+        };
+        let w3cos_std::style::Dimension::Px(height) = style.height else {
+            return true;
+        };
+        if !width.is_finite()
+            || width < 0.0
+            || !height.is_finite()
+            || height < 0.0
+        {
+            return true;
+        }
+        let clips = matches!(
+            style.overflow,
+            w3cos_std::style::Overflow::Hidden | w3cos_std::style::Overflow::Scroll
+        ) || matches!(
+            style.overflow_y,
+            Some(w3cos_std::style::Overflow::Hidden | w3cos_std::style::Overflow::Scroll)
+        );
+        // CSS table heights are minimums unless the cell clips its content.
+        if matches!(
+            style.display,
+            w3cos_std::style::Display::Table
+                | w3cos_std::style::Display::InlineTable
+                | w3cos_std::style::Display::TableRow
+                | w3cos_std::style::Display::TableRowGroup
+                | w3cos_std::style::Display::TableHeaderGroup
+                | w3cos_std::style::Display::TableFooterGroup
+                | w3cos_std::style::Display::TableCell
+        ) {
+            return !clips;
+        }
+        false
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
@@ -1709,17 +1800,29 @@ impl Document {
     /// must be rebuilt rather than patched.
     pub fn note_structure_change(&mut self) {
         self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.layout_generation = self.layout_generation.wrapping_add(1);
         self.cascade_generation = self.cascade_generation.wrapping_add(1);
+        self.invalidate_text_box_stability();
         bump_structure_tick();
+    }
+
+    /// The next paint must read new text, and the used boxes stay valid.
+    pub fn note_repaint_without_layout(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
     }
 
     /// Inherited or selector-matched styles may have changed below `id`.
     pub fn note_cascade_change(&mut self) {
         self.cascade_generation = self.cascade_generation.wrapping_add(1);
+        self.invalidate_text_box_stability();
     }
 
     pub fn structure_generation(&self) -> u64 {
         self.structure_generation
+    }
+
+    pub fn layout_generation(&self) -> u64 {
+        self.layout_generation
     }
 
     pub fn cascade_generation(&self) -> u64 {
@@ -4183,6 +4286,36 @@ impl Document {
 
     /// Resolve stylesheet rules, ancestor selectors, user-agent defaults, and
     /// inline declarations for a node.
+    /// Position from the current computed-style cache, without cloning `Style`.
+    pub fn cached_position(&self, id: NodeId) -> Option<w3cos_std::style::Position> {
+        let style = self.cached_style(id)?;
+        Some(style.position)
+    }
+
+    /// Border-left and border-top from the current computed-style cache.
+    pub fn cached_border_left_top(&self, id: NodeId) -> Option<(f32, f32)> {
+        let style = self.cached_style(id)?;
+        Some((
+            style.border_left_width.unwrap_or(style.border_width),
+            style.border_top_width.unwrap_or(style.border_width),
+        ))
+    }
+
+    fn cached_style(&self, id: NodeId) -> Option<std::cell::Ref<'_, w3cos_std::style::Style>> {
+        let revision = self.style_revisions.get(id.0 as usize).copied()?;
+        let cache = self.computed_style_cache.borrow();
+        let current = cache.get(&id).is_some_and(|cached| {
+            cached.node_revision == revision
+                && cached.stylesheet_generation == stylesheet::generation()
+        });
+        if !current {
+            return None;
+        }
+        Some(std::cell::Ref::map(cache, |cache| {
+            &cache.get(&id).expect("style cache entry").style
+        }))
+    }
+
     pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
         let mut ancestor_ids = Vec::new();
         let document_element = self.document_element_id();
@@ -25741,6 +25874,31 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn definite_text_rewrite_reuses_the_computed_style() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        let div = document.create_element("div");
+        div.style_mut(&mut document).set_property("width", "160px");
+        div.style_mut(&mut document).set_property("height", "40px");
+        body.append_child(&mut document, div);
+        assert!(document.set_inline_text_child(div.id, "short").is_some());
+        let _ = document.computed_style_for(div.id);
+        let generation = document.layout_generation();
+        let (_, misses) = document.computed_style_cache_stats();
+        assert!(document
+            .set_inline_text_child(div.id, "one two three four five six seven eight")
+            .is_some());
+        assert!(document
+            .set_inline_text_child(div.id, "nine ten eleven twelve thirteen fourteen fifteen")
+            .is_some());
+        let _ = document.computed_style_for(div.id);
+        let (_, misses_after) = document.computed_style_cache_stats();
+        assert_eq!(document.layout_generation(), generation);
+        assert_eq!(misses_after, misses, "definite text must not restyle");
+    }
 
     #[test]
     fn viewport_propagated_body_overflow_allows_first_child_margin_collapse() {
