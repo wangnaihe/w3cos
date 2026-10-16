@@ -436,6 +436,25 @@ impl IntentSession {
         Some(challenge)
     }
 
+    /// Check `clientDataJSON` and the assertion, then point later actions at
+    /// the canonical `did:key` of `device_public`. Receipts already stored
+    /// keep their actor. Returns false when the assertion does not verify.
+    pub fn accept_webauthn_assertion(&mut self, assertion: &str, device_public: &[u8; 32]) -> bool {
+        if self
+            .identity
+            .accept_webauthn_assertion(assertion, device_public)
+            .is_err()
+        {
+            return false;
+        }
+        self.persist();
+        true
+    }
+
+    pub fn identity_method(&self) -> crate::identity::IdentityMethod {
+        self.identity.method()
+    }
+
     /// Remember public-key bytes for a challenge that was already minted.
     /// Returns false when there is no challenge, or the key is empty or
     /// longer than 128 bytes. Does not change the subject or unlock.
@@ -453,6 +472,10 @@ impl IntentSession {
 
     pub fn enrollment_copy(&self) -> String {
         self.identity.enrollment_copy()
+    }
+
+    pub fn enrollment_state(&self) -> crate::identity::EnrollmentState {
+        self.identity.enrollment()
     }
 
     /// Point later actions at a new `did:key:`. Receipts already stored keep
@@ -1538,8 +1561,56 @@ mod tests {
         let legacy = IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
             .with_ledger(ReceiptLedger::open(&legacy_dir).expect("reopen"));
         assert_eq!(legacy.actor(), LocalIdentityStub::SUBJECT);
-        assert!(legacy.enrollment_copy().contains("not implemented"));
+        assert!(legacy.enrollment_copy().contains("not checked"));
         let _ = std::fs::remove_dir_all(&legacy_dir);
+    }
+
+    #[test]
+    fn a_verified_passkey_keeps_old_receipts_and_the_device_seed() {
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "passkey-assert"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("ledger"));
+        assert!(session.unlock_identity_stub("alpha"));
+        let effect = confirm_open(&mut session, "open files");
+        assert_eq!(effect.receipt.actor, LocalIdentityStub::SUBJECT);
+        let device = w3cos_p2p::DeviceIdentity::from_seed([11u8; 32]);
+        let challenge = session.begin_passkey_enrollment().expect("challenge");
+        let assertion =
+            crate::identity::device_assertion(&challenge, &device.ed25519_public, |message| {
+                device.sign(message).ok()
+            })
+            .expect("assertion");
+        assert!(!session.accept_webauthn_assertion(&assertion, &device.x25519_public));
+        assert_eq!(session.actor(), LocalIdentityStub::SUBJECT);
+        assert_eq!(session.receipts()[0].actor, LocalIdentityStub::SUBJECT);
+        assert!(session.accept_webauthn_assertion(&assertion, &device.ed25519_public));
+        assert_eq!(session.actor(), device.did_key());
+        assert_ne!(session.actor(), device.fingerprint());
+        assert_eq!(
+            session.identity_method(),
+            crate::identity::IdentityMethod::Passkey
+        );
+        assert_eq!(session.receipts()[0].actor, LocalIdentityStub::SUBJECT);
+        assert!(session.enrollment_copy().contains("bound to the did:key"));
+        drop(session);
+
+        let reloaded =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("reopen"));
+        assert_eq!(reloaded.actor(), device.did_key());
+        assert_eq!(reloaded.receipts()[0].actor, LocalIdentityStub::SUBJECT);
+        assert_eq!(
+            reloaded.identity_method(),
+            crate::identity::IdentityMethod::Passkey
+        );
+        assert_ne!(reloaded.actor(), device.fingerprint());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

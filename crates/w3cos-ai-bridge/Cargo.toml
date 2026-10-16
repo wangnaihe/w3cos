@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 getrandom = "0.3"
 ring = "0.17"
+bs58 = "0.5.1"
 png = { workspace = true }
 tiny-skia = { workspace = true }
 fontdue = { workspace = true }

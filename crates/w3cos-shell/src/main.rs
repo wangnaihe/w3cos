@@ -635,10 +635,12 @@ fn on_shell_intent(code: u8, draft: &str) {
             }
         }
         OP_ENROLL => {
-            let notice = if session.begin_passkey_enrollment().is_some() {
-                locale::t("toast-enroll-ok")
+            let notice = if !session.identity_unlocked() {
+                locale::t("toast-identity-locked")
+            } else if enroll_device_passkey(session) {
+                locale::t("toast-passkey-ok")
             } else {
-                locale::t("toast-enroll-fail")
+                locale::t("toast-passkey-fail")
             };
             sync_session(session, state::get_signal(PHASE_SIGNAL), &notice);
         }
@@ -1271,7 +1273,28 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
     }
     state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
     state::set_text_signal(SUBJECT_SIGNAL, session.actor());
-    state::set_text_signal(ENROLL_SIGNAL, session.enrollment_copy());
+    let enroll = match session.enrollment_state() {
+        w3cos_ai_bridge::identity::EnrollmentState::AssertionVerified => "verified",
+        w3cos_ai_bridge::identity::EnrollmentState::KeyMaterialStored => "stored",
+        w3cos_ai_bridge::identity::EnrollmentState::AwaitingPasskey => "awaiting",
+        w3cos_ai_bridge::identity::EnrollmentState::Stub => "stub",
+    };
+    state::set_text_signal(ENROLL_SIGNAL, enroll);
+}
+
+fn enroll_device_passkey(session: &mut IntentSession) -> bool {
+    let Some(challenge) = session.begin_passkey_enrollment() else {
+        return false;
+    };
+    let device = w3cos_p2p::DeviceIdentity::from_seed(handoff::device_seed());
+    let Some(assertion) = w3cos_ai_bridge::identity::device_assertion(
+        &challenge,
+        &device.ed25519_public,
+        |message| device.sign(message).ok(),
+    ) else {
+        return false;
+    };
+    session.accept_webauthn_assertion(&assertion, &device.ed25519_public)
 }
 
 fn now_ms() -> u64 {
@@ -2518,6 +2541,16 @@ fn apply_screen_override() {
         Some("tool-confirm") => show_tool_confirm("a11y_index"),
         Some("http-confirm") => show_tool_confirm("click"),
         Some("host-confirm") => show_host_confirm(),
+        Some("passkey") => {
+            present_settings(1, 0);
+            with_session(|session| {
+                if !session.identity_unlocked() {
+                    session.unlock_with_passphrase("w3cos-local");
+                }
+                let _ = enroll_device_passkey(session);
+                sync_session(session, 0, "");
+            });
+        }
         Some("confirm") => {
             focus_app(1);
             state::set_signal(PHASE_SIGNAL, 1);
@@ -6716,14 +6749,19 @@ fn settings_identity_page() -> Vec<Component> {
         &locale::t("settings-identity-title"),
         &locale::t("settings-identity-detail"),
     );
-    rows.push(Component::text(
-        truncate_middle(&subject_label, 28),
-        Style {
-            font_size: 16.0,
-            font_weight: 650,
-            color: Color::from_hex("#f4f7fb"),
-            ..Style::default()
-        },
+    let keep = if state::shell_viewport().0 < 700.0 {
+        16
+    } else {
+        28
+    };
+    let verified = state::get_signal_text(ENROLL_SIGNAL) == "verified";
+    rows.push(settings_row(
+        &locale::t("passkey-did"),
+        &truncate_middle(&subject_label, keep),
+    ));
+    rows.push(settings_row(
+        &locale::t("passkey-fingerprint"),
+        &truncate_middle(&handoff::local_fingerprint(), keep),
     ));
     rows.push(chrome_button(
         locale::t("settings-copy"),
@@ -6731,7 +6769,11 @@ fn settings_identity_page() -> Vec<Component> {
         "#31475e",
     ));
     rows.push(Component::text(
-        locale::t("passkey-unregistered"),
+        if verified {
+            locale::t("passkey-verified")
+        } else {
+            locale::t("passkey-unregistered")
+        },
         Style {
             font_size: 14.0,
             font_weight: 650,
@@ -6744,10 +6786,12 @@ fn settings_identity_page() -> Vec<Component> {
         OP_ENROLL,
         "#3d5570",
     ));
-    rows.push(settings_row(
-        &locale::t("settings-identity-title"),
-        &locale::t("settings-not-passkey"),
-    ));
+    if !verified {
+        rows.push(settings_row(
+            &locale::t("settings-identity-title"),
+            &locale::t("settings-not-passkey"),
+        ));
+    }
     let status = if unlocked {
         locale::t("unlocked")
     } else {
@@ -6991,8 +7035,13 @@ fn build_task_center() -> Component {
                     } else {
                         locale::t("locked")
                     };
+                    let line = if state::get_signal_text(ENROLL_SIGNAL) == "verified" {
+                        "identity-line-passkey"
+                    } else {
+                        "identity-line"
+                    };
                     locale::t_args(
-                        "identity-line",
+                        line,
                         &[("subject", &subject_label), ("state", &state_label)],
                     )
                 }
@@ -10496,6 +10545,78 @@ mod shell_ux_tests {
         state::set_signal(UNLOCKED_SIGNAL, 0);
         state::set_signal(PHASE_SIGNAL, 0);
         state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn passkey_binds_the_device_did_and_keeps_the_pairing_fingerprint() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-passkey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        let seed_before = handoff::device_seed();
+        let fingerprint_before = handoff::local_fingerprint();
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        on_shell_intent(OP_ENROLL, "");
+        assert_eq!(handoff::device_seed(), seed_before);
+        assert_eq!(handoff::local_fingerprint(), fingerprint_before);
+        let device = w3cos_p2p::DeviceIdentity::from_seed(seed_before);
+        assert_eq!(state::get_signal_text(SUBJECT_SIGNAL), device.did_key());
+        assert_ne!(device.did_key(), fingerprint_before);
+        assert_eq!(state::get_signal_text(ENROLL_SIGNAL), "verified");
+        let toast = state::get_signal_text(TOAST_SIGNAL);
+        assert!(toast.contains("已核对断言"), "{toast}");
+        on_shell_intent(OP_SETTINGS_IDENTITY, "");
+        let page = text_blob(&build_settings_app());
+        assert!(page.contains("通行证已绑定这台设备的 did:key"), "{page}");
+        assert!(page.contains("配对指纹"), "{page}");
+        assert!(!page.contains("PBKDF2"), "{page}");
+        assert!(!page.contains(&device.did_key()), "{page}");
+        assert!(!page.contains(&fingerprint_before), "{page}");
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        let phone = build_settings_app();
+        let (_, _, _, height) = button_face(&phone, "注册本机通行证");
+        assert!(height >= 48.0, "{height}");
+        let phone_blob = text_blob(&phone);
+        assert!(phone_blob.contains("配对指纹"), "{phone_blob}");
+        assert!(phone_blob.contains("断言已核对"), "{phone_blob}");
+
+        locale::set_locale("en");
+        let english = text_blob(&Component::column(
+            Style::default(),
+            settings_identity_page(),
+        ));
+        assert!(
+            english.contains("Passkey is bound to this device's did:key"),
+            "{english}"
+        );
+        assert!(english.contains("Pairing fingerprint"), "{english}");
+        assert!(!english.contains("PBKDF2"), "{english}");
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
     }
 
     struct IsolatedSession {

@@ -21,7 +21,7 @@ local signing tool that cannot sign on its own.
 | Pairing fingerprint | `w3cos-p2p::fingerprint` | The string `did:key:z` plus one letter per X25519 byte. It is a spelling shared with the shell. It is not a W3C `did:key`. |
 | Spec `did:key` | `did_key_ed25519` | Ed25519 public key as `did:key:z` + base58btc(`0xed 0x01 \|\| key`). Receipts use this. Pairing still uses the letter fingerprint, so existing pairs do not move. |
 | Receipt signatures | `DeviceIdentity::sign` | The same Ed25519 key that signs presence cards. |
-| Local identity in the shell | `w3cos-ai-bridge::identity` | PBKDF2 verifier, locked by default. `install_subject` accepts a `did:key`. The stub does not create that key. Passkey enrollment stores a challenge and optional public-key bytes and does not check a WebAuthn assertion. |
+| Local identity in the shell | `w3cos-ai-bridge::identity` | Lock screen still stores a PBKDF2 verifier. A passkey is installed only after `clientDataJSON` and the Ed25519 assertion verify, and the subject becomes the canonical `did:key` of the device key. Pairing still uses the letter fingerprint. |
 | Chain account | `w3cos-p2p::LocalWallet` | secp256k1 key from HKDF of the device seed. EIP-191 `personal_sign` only. No chain id. |
 | Chain access | — | None. No RPC provider, no default endpoint, no broadcast. |
 | Page credentials | `w3cos-runtime` credentials | Web Credential Management types. The module says wallet and consent flows need a host adapter. They are not wired to the device key. |
@@ -50,7 +50,7 @@ L2 stays off in a normal boot. Confirm does not travel with handoff (#94). Unloc
 2. Shell receipts name an actor and are encrypted at rest. They are not signed, so a copied file does not prove which device wrote it.
 3. Direct HTTP, the DOM MCP, and the in-process shell tools all propose first. A read does not touch the view until the window confirms. `POST /intent/confirm` is refused. `confirm_intent` is not a tool and `w3cos/confirm` is not a method.
 4. There is no local account and no signing tool. There is also no chain client, which should stay true until a later slice asks for one.
-5. Passkey enrollment does not produce a `did:key` and does not verify an assertion.
+5. Passkey enrollment checks `clientDataJSON` and the assertion, then installs the canonical `did:key`. The pairing fingerprint and the P2P seed stay where they were. Old receipt actors are not rewritten.
 6. The model cannot be kept in-process without pulling an inference stack into the shell. That split is deliberate and should stay.
 7. Tool execution beyond the terminal allowlist has no sandbox.
 8. Host receipts used to live only in memory. The shell sheet now writes them beside the older action rows, and the drawer shows the decision, the `did:key`, and that the device key signed the row. Action receipts written earlier stay unsigned.
@@ -92,7 +92,7 @@ Each slice is one review. Later slices do not start inside this one.
 3. **Persist host receipts.** Done, in the same change as the sheet. `signed_receipts` is a sibling of `receipts` and defaults to empty on older files. Appending a host receipt does not rewrite action rows.
 4. **Move shell tools onto propose-first.** Done. `observe`, `click`, `type`, and `propose_intent` wait for confirm. Reads do not run before that. The existing `w3cos-ai-mcp` `tools/call` proposes into the shell and does not perform the bridge call until the window confirms. Direct HTTP routes do the same. `POST /intent/confirm` is refused. L2 stays off unless `W3COS_L2` is set.
 5. **stdio for external agents.** Done. `w3cos-tool-host` speaks MCP on stdio and forwards `tools/call` to `/host/propose`. The process that owns the window is still the only caller of `confirm`. The model does not get that method.
-6. **Passkey enrollment.** Verify `clientDataJSON` and the assertion before `IdentityMethod::Passkey`. Installing a `did:key` from that key must not rewrite old receipts. The P2P seed remains the device key until a person replaces it.
+6. **Passkey enrollment.** Done. The window verifies `clientDataJSON` and the Ed25519 assertion before `IdentityMethod::Passkey`, then installs the canonical `did:key` of the device key. Old receipt actors stay as written. The P2P seed and the pairing fingerprint are not replaced.
 7. **Read a chain, still no broadcast.** A tool that reads a balance or a nonce from an RPC the person typed in. No default Infura, Alchemy, or other hosted endpoint. The call goes through the host and a permission sheet.
 8. **Sign a transaction.** Propose the fields, L2 confirm, sign on device, and only then offer broadcast to the RPC from the previous slice. No custodian and no hosted signer.
 9. **Show the spec `did:key` next to the pairing fingerprint.** Keep the letter fingerprint until paired devices can match the new identifier. Do not silently replace stored peer records.
