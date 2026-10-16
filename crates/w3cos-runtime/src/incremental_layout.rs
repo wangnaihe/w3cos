@@ -540,8 +540,10 @@ fn rebuild_paint_cache(
     let flat = pre_flatten(&component);
     let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
     let mut engine = LayoutEngine::new();
-    // Match `compute_with_scroll_details`: always measure text and run projections.
-    engine.set_skip_projections(false);
+    // Floats, tables, and inline-block need the post-Taffy projections. A
+    // block/absolute tree already matches `compute_with_scroll_details`
+    // without that walk, which is most of a retained frame.
+    engine.set_skip_projections(can_skip_projections(&component));
     engine.set_measure_text(true);
     let results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
     write_rects(&flat, &results.layout_cache);
@@ -574,6 +576,7 @@ fn sync_paint_cache(
         return true;
     }
     let mut styles = Vec::with_capacity(dirty.len());
+    let mut insets_only = true;
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         let Some(old) = component_style(&cache.component, id.as_u32()) else {
@@ -582,6 +585,7 @@ fn sync_paint_cache(
         if !paint_geometry_edit(old, &style) || !style_patch_is_safe(&style) {
             return false;
         }
+        insets_only &= paint_insets_only(old, &style);
         styles.push((id.as_u32(), style));
     }
     for (id, style) in &styles {
@@ -607,12 +611,17 @@ fn sync_paint_cache(
     {
         return false;
     }
+    // Inset edits do not change text wrap widths, so retained text metrics
+    // stay valid. Width and padding edits measure again.
+    cache.engine.set_measure_text(!insets_only);
     let Ok(results) = cache
         .engine
         .compute(&cache.component, &flat, viewport_w, viewport_h)
     else {
+        cache.engine.set_measure_text(true);
         return false;
     };
+    cache.engine.set_measure_text(true);
     write_rects(&flat, &results.layout_cache);
     cache.results = results;
     cache.cascade = cascade;
@@ -630,6 +639,18 @@ fn flat_host_id(info: &crate::layout::FlatNodeInfo<'_>) -> u32 {
 /// True when `new` differs from `old` only in fields the retained Taffy
 /// style can absorb. Inherited paint fields (color, font, writing mode)
 /// stay in the comparison, so those edits rebuild the component tree.
+fn paint_insets_only(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    if old == new {
+        return true;
+    }
+    let mut adjusted = old.clone();
+    adjusted.top = new.top;
+    adjusted.right = new.right;
+    adjusted.bottom = new.bottom;
+    adjusted.left = new.left;
+    adjusted == *new
+}
+
 fn paint_geometry_edit(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
     if old == new {
         return true;
@@ -734,6 +755,14 @@ mod paint_layout_tests {
 
         let (rebuilds, patches) = paint_layout_stats();
         let first = paint_rect(box_node);
+        let first_fresh = fresh_rect(box_node);
+        assert!(
+            (first.x - first_fresh.x).abs() < 0.05
+                && (first.y - first_fresh.y).abs() < 0.05
+                && (first.width - first_fresh.width).abs() < 0.05
+                && (first.height - first_fresh.height).abs() < 0.05,
+            "first retained rect {first:?} diverges from full layout {first_fresh:?}"
+        );
         crate::dom::set_style_property(box_node, "top", "40px");
         let second = paint_rect(box_node);
         let (rebuilds_after, patches_after) = paint_layout_stats();

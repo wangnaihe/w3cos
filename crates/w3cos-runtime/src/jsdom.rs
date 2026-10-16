@@ -21533,10 +21533,7 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
         let frame = crate::headless::render_document_rgba(width, height)
             .map_err(|error| error.to_string())?;
         let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let mut checksum = frame.rgba.len() as u64;
-        for (index, byte) in frame.rgba.iter().enumerate() {
-            checksum = checksum.wrapping_add((*byte as u64).wrapping_mul((index as u64 % 251) + 1));
-        }
+        let checksum = crate::headless::frame_byte_checksum(&frame.rgba);
         return Ok((checksum, paint_ms));
     }
     #[cfg(not(any(feature = "skia", feature = "cpu-render")))]
