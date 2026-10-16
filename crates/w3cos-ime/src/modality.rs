@@ -1,9 +1,10 @@
 //! P3 modality surface.
 //!
-//! Voice, handwriting, and screen OCR stay blocked on this device: there is
-//! no local model, and `ctx.screen` is still refused. Clipboard text is the
-//! one live path. It becomes a candidate only after the person asks, and the
-//! hub does not keep the text.
+//! Voice, handwriting, and screen OCR stay blocked on this device until a
+//! local engine is plugged in. `ctx.screen` is still refused. Clipboard text
+//! is the one always-ready path. It becomes a candidate only after the person
+//! asks, and the hub does not keep the text. A local speech engine is a
+//! separate trait; this surface does not record on its own.
 
 use crate::{IntentPayload, Modality, Proposal, Scope, Session};
 

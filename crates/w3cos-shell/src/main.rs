@@ -224,6 +224,7 @@ pub(crate) fn shell_main() {
     state::set_shell_swipe_hook(on_shell_swipe);
     state::set_shell_key_hook(on_shell_key);
     state::set_agent_poll_hook(on_agent_poll);
+    install_ime_hooks();
     ensure_clock_timer();
     handoff::ensure_listener();
     agent_host::install_wake();
@@ -1974,7 +1975,7 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_IME_PAGE_NEXT => {
             ime_bar::page_by(1);
         }
-        OP_IME_VOICE => push_toast(&locale::t("ime-toast-voice")),
+        OP_IME_VOICE => push_toast(&locale::t(ime_bar::voice_tap_key())),
         OP_IME_INK => push_toast(&locale::t("ime-toast-ink")),
         OP_IME_SCREEN => push_toast(&locale::t("ime-toast-screen")),
         OP_IME_CLIPBOARD => {
@@ -2251,7 +2252,7 @@ fn apply_screen_override() {
             push_toast(&locale::t("toast-browser-min"));
         }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
-        Some("ime-smart") => {
+        Some("ime-smart") | Some("ime-voice") => {
             focus_app(0);
             state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
                 index: 4,
@@ -2263,13 +2264,57 @@ fn apply_screen_override() {
                 width: 280.0,
                 height: 36.0,
             });
+            if std::env::var("W3COS_SCREEN").ok().as_deref() == Some("ime-voice") {
+                push_toast(&locale::t("ime-toast-voice"));
+            }
         }
         _ => {}
     }
 }
 
+fn install_ime_hooks() {
+    state::set_shell_hold_hook(on_shell_hold);
+    state::set_shell_poll_hook(on_shell_poll);
+}
+
+fn on_shell_hold(code: u8, phase: u8) {
+    if code != OP_IME_VOICE {
+        return;
+    }
+    match phase {
+        0 => match ime_bar::voice_press() {
+            w3cos_ime::SpeechStart::Listening => {
+                push_toast(&locale::t("ime-toast-voice-live"));
+                apply_ime_field();
+            }
+            w3cos_ime::SpeechStart::Off(reason) => {
+                push_toast(&locale::t(ime_bar::voice_off_key(reason)));
+            }
+        },
+        2 => match ime_bar::voice_release() {
+            ime_bar::VoiceRelease::Wrote => {
+                push_toast(&locale::t("ime-toast-voice-ok"));
+                apply_ime_field();
+            }
+            ime_bar::VoiceRelease::Empty => {
+                push_toast(&locale::t("ime-toast-voice-empty"));
+                apply_ime_field();
+            }
+            ime_bar::VoiceRelease::Idle => {}
+        },
+        _ => {}
+    }
+}
+
+fn on_shell_poll() {
+    if ime_bar::poll_voice() {
+        apply_ime_field();
+    }
+}
+
 fn build_shell() -> Component {
     ensure_shell_signals();
+    install_ime_hooks();
     if let Some(session) = windows::load_once() {
         let agent = app_bit(4);
         let retired =
@@ -8721,6 +8766,18 @@ mod shell_ux_tests {
             state::get_signal_text(TOAST_SIGNAL),
             locale::t("ime-toast-voice")
         );
+        let root_dump = format!("{root:?}");
+        assert_eq!(root_dump.matches("--w3cos-hold").count(), 1, "{root_dump}");
+        state::set_text_signal(DRAFT_SIGNAL, "");
+        on_shell_hold(OP_IME_VOICE, 0);
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-voice")
+        );
+        assert!(!ime_bar::voice_recording());
+        on_shell_hold(OP_IME_VOICE, 2);
+        assert!(!ime_bar::voice_recording());
+        assert_eq!(state::get_signal_text(DRAFT_SIGNAL), "");
         on_shell_intent(OP_IME_INK, "");
         assert_eq!(
             state::get_signal_text(TOAST_SIGNAL),
