@@ -82,6 +82,164 @@ The host has no GPU node. Native raster is tiny-skia. Chrome is launched with
 `--disable-gpu` so it does not wait on a missing GPU device. Sandbox, site
 isolation, and V8 optimizations stay at their headless defaults.
 
+## Profile comparison (`9a87534`)
+
+Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, no `/dev/dri`. Rustc 1.99.0
+(`b940084d7`, 2026-09-28). Google Chrome 154.0.8037.92. The binaries are
+commit `9a875348c29a55a7f11c11d18ba2193e1d176594`. `workloads.ts` sha256 is
+`ec367da79305f2a65333e7b4408d1c57ec2bdcfe563a5022b549986b4139aceb`. Five
+fresh processes per workload. One Chromium series is shared by all three
+profiles. Paired checksums agreed on every run. The `09c29fc` table below
+is the previous script and is unchanged.
+
+Three workloads were added on both engines. `table-repaint` is a 24×6
+fixed table with collapsed borders, zero spacing, and clipped 22px cells.
+Four passes rewrite every cell, then read `offsetHeight`. Checksum 5704.
+`styled-scroll` is 800 class-styled rows in an `overflow:auto` box, 30
+`scrollTop` steps, and the last row's `offsetTop`. Checksum 650115.
+`text-layout` is 80 paragraphs in the same `w3perf` face as `layout-css`,
+with the column width toggled between 640px and 360px. Both widths are
+laid out before the timer. Checksum 34320.
+
+A definite px width and height does not relayout when its text changes.
+Auto height still grows. Setting that height back to `auto` after the
+text change matches a fresh layout. A clipped table cell keeps its
+specified height. Scroll size is remembered until a layout rect is stored
+again, and the walk follows sibling links. An authored column of definite
+blocks may use one-sided px margins and a definite overflow box. Adjacent
+non-zero vertical margins stay on Taffy. The row stack matches
+`compute_with_scroll_details`.
+
+A win means the native maximum is strictly below the Chromium minimum.
+Every comparable row in this table is a win. Native first raster has no
+Chromium sample.
+
+### Binary size
+
+Stripped `cpu-render` binaries. The instrumented max binary was used only
+to collect the profile.
+
+| profile | bytes | sha256 |
+| --- | ---: | --- |
+| size | 18272600 | `3d30b0e09431589ba5cf2fb7890b405511b95977bd1ed3f25e5aab2d77185d1b` |
+| speed | 31720400 | `04a24f2d476e142b4009e8883ba42e0189fbe5240dba5b4ad21ded6f1c7759f2` |
+| max | 23910232 | `e59928f50c5283c298f4882e41ba090c2b986b07b1954b3339bb0b4369a50330` |
+
+The merged profdata is 23385472 bytes. The instrumented binary is 75448912
+bytes, sha256
+`aaa84b988d6386d6e9293b912589050899b84e728b4be687222fc7570646d99a`.
+
+### Five-run table
+
+Times are milliseconds, median (min–max) of the five process results. RSS
+is `VmRSS` in MB. Checksums are the common value. The compute checksum is
+`-362647.901806622` on every native and Chromium sample.
+
+| workload | metric | size | speed | max | Chromium |
+| --- | --- | ---: | ---: | ---: | ---: |
+| startup | cold start | 52.836 (51.432–73.417) | 47.234 (44.296–68.998) | 35.573 (33.783–42.890) | 202.317 (194.003–322.253) |
+| startup | native first raster | 39.974 (38.751–44.237) | 35.032 (32.478–39.912) | 28.088 (26.272–35.201) | n/a |
+| startup | CPU | 40 (40–50) | 40 (40–40) | 30 (20–40) | 90 (80–120) |
+| startup | peak RSS | 24.7 (22.7–26.8) | 33.0 (28.6–33.1) | 19.5 (15.9–19.6) | 918.8 (908.8–920.9) |
+| startup | steady RSS | 30.6 (30.3–30.8) | 33.0 (33.0–33.2) | 27.5 (27.4–27.6) | 918.8 (909.1–921.2) |
+| dom-list | wall | 2.120 (2.113–2.147) | 1.424 (1.415–1.428) | 0.757 (0.754–0.784) | 5.900 (5.700–6.000) |
+| dom-list | create | 0.440 (0.432–0.446) | 0.353 (0.341–0.360) | 0.218 (0.208–0.240) | 0.700 (0.700–0.800) |
+| dom-list | update | 1.687 (1.678–1.714) | 1.067 (1.065–1.070) | 0.544 (0.534–0.550) | 5.100 (5.000–5.300) |
+| dom-list | CPU | 30 (30–30) | 20 (20–30) | 10 (10–10) | 210 (180–210) |
+| dom-list | peak RSS | 17.2 (17.1–17.5) | 19.9 (19.8–20.0) | 7.9 (7.9–8.2) | 937.3 (937.0–939.7) |
+| dom-list | steady RSS | 19.1 (18.7–19.2) | 20.9 (20.7–21.1) | 16.3 (16.1–16.4) | 937.3 (937.0–939.7) |
+| dom-list | checksum | 62890 | 62890 | 62890 | 62890 |
+| layout | wall | 1.012 (1.008–1.022) | 0.763 (0.758–0.773) | 0.545 (0.538–0.548) | 10.500 (10.300–10.800) |
+| layout | CPU | 50 (40–50) | 40 (40–40) | 20 (10–20) | 270 (260–280) |
+| layout | peak RSS | 22.4 (22.2–22.4) | 21.7 (21.4–21.8) | 21.0 (20.8–21.0) | 977.2 (975.6–979.3) |
+| layout | steady RSS | 24.2 (24.2–24.3) | 26.5 (26.1–26.6) | 21.6 (21.6–21.7) | 977.2 (975.6–979.3) |
+| layout | checksum | 20016 | 20016 | 20016 | 20016 |
+| layout-css | wall | 0.477 (0.468–0.486) | 0.366 (0.363–0.369) | 0.273 (0.269–0.277) | 1.100 (1.100–1.200) |
+| layout-css | CPU | 50 (50–50) | 40 (40–40) | 30 (30–40) | 110 (80–120) |
+| layout-css | peak RSS | 25.8 (24.5–26.6) | 30.6 (29.1–31.1) | 18.5 (18.1–18.8) | 922.8 (921.1–923.9) |
+| layout-css | steady RSS | 29.1 (28.9–29.1) | 31.0 (30.8–31.2) | 26.0 (25.9–26.1) | 922.8 (921.4–924.2) |
+| layout-css | checksum | 7680 | 7680 | 7680 | 7680 |
+| frames | work p50 | 0.156 (0.154–0.157) | 0.130 (0.129–0.130) | 0.076 (0.074–0.078) | 0.200 (0.200–0.250) |
+| frames | work p95 | 0.163 (0.162–0.168) | 0.137 (0.134–0.143) | 0.082 (0.080–0.090) | 0.300 (0.300–0.300) |
+| frames | native pipeline p50 | 5.012 (4.965–5.044) | 3.601 (3.593–3.607) | 2.921 (2.900–2.930) | n/a |
+| frames | browser rAF gap p50 | n/a | n/a | n/a | 16.700 (16.650–16.700) |
+| frames | CPU | 170 (160–170) | 130 (120–130) | 100 (90–110) | 300 (270–310) |
+| frames | peak RSS | 35.2 (35.1–35.3) | 37.9 (37.7–38.0) | 32.4 (32.3–32.5) | 925.8 (922.1–927.3) |
+| frames | steady RSS | 35.3 (35.2–35.4) | 37.9 (37.8–38.1) | 32.5 (32.4–32.6) | 925.8 (922.1–927.3) |
+| frames | checksum | 11000 | 11000 | 11000 | 11000 |
+| compute | wall | 0.808 (0.808–0.816) | 0.810 (0.809–0.815) | 0.815 (0.813–0.816) | 1.400 (1.400–1.500) |
+| compute | CPU | 10 (0–10) | 10 (10–10) | 0 (0–10) | 120 (100–140) |
+| compute | peak RSS | 9.0 (8.4–9.3) | 10.1 (9.7–10.1) | 8.0 (7.9–8.1) | 918.8 (918.7–921.9) |
+| compute | steady RSS | 15.5 (15.4–15.8) | 17.5 (17.2–17.7) | 13.0 (12.8–13.3) | 919.1 (919.0–922.2) |
+| compute | checksum | -362647.901806622 | -362647.901806622 | -362647.901806622 | -362647.901806622 |
+| memory | wall | 2.836 (2.816–2.973) | 2.257 (2.175–2.361) | 1.458 (1.435–1.468) | 19.300 (17.900–20.200) |
+| memory | CPU | 10 (10–10) | 10 (0–10) | 0 (0–0) | 130 (110–150) |
+| memory | peak RSS | 9.2 (9.0–9.4) | 9.9 (9.8–10.2) | 8.0 (8.0–8.2) | 940.0 (936.0–942.1) |
+| memory | steady RSS | 18.0 (17.8–18.2) | 19.9 (19.8–20.0) | 15.1 (14.9–15.2) | 940.2 (936.0–942.4) |
+| memory | checksum | 72000 | 72000 | 72000 | 72000 |
+| css-list | wall | 1.209 (1.193–1.238) | 1.024 (0.990–1.063) | 0.685 (0.669–0.725) | 7.100 (4.600–8.500) |
+| css-list | CPU | 10 (0–10) | 10 (0–10) | 0 (0–0) | 100 (80–110) |
+| css-list | peak RSS | 9.2 (9.0–9.2) | 10.1 (9.9–10.2) | 8.2 (8.0–8.3) | 925.0 (920.9–926.5) |
+| css-list | steady RSS | 16.9 (16.7–17.2) | 18.6 (18.4–18.7) | 14.0 (13.9–14.1) | 925.0 (920.9–926.5) |
+| css-list | checksum | 18000 | 18000 | 18000 | 18000 |
+| flex-list | wall | 0.575 (0.551–0.623) | 0.481 (0.471–0.499) | 0.358 (0.347–0.364) | 3.100 (3.000–5.000) |
+| flex-list | CPU | 10 (10–10) | 10 (0–10) | 0 (0–0) | 90 (60–120) |
+| flex-list | peak RSS | 9.2 (9.0–9.3) | 10.1 (9.8–10.3) | 7.9 (7.7–8.1) | 920.3 (919.7–923.3) |
+| flex-list | steady RSS | 16.6 (16.3–16.8) | 18.5 (18.3–18.6) | 13.8 (13.6–13.9) | 920.3 (919.7–923.3) |
+| flex-list | checksum | 7200 | 7200 | 7200 | 7200 |
+| events | wall | 0.238 (0.236–0.253) | 0.212 (0.211–0.216) | 0.103 (0.102–0.117) | 0.400 (0.300–0.400) |
+| events | CPU | 10 (10–10) | 10 (10–10) | 0 (0–0) | 90 (80–110) |
+| events | peak RSS | 9.2 (9.1–9.2) | 10.0 (9.9–10.2) | 7.9 (7.8–8.0) | 924.9 (924.3–926.5) |
+| events | steady RSS | 16.7 (16.4–16.9) | 18.5 (18.5–18.7) | 13.6 (13.6–13.8) | 924.9 (924.3–926.2) |
+| events | checksum | 400 | 400 | 400 | 400 |
+| table-repaint | wall | 2.301 (2.196–2.308) | 1.855 (1.819–1.901) | 1.147 (1.079–1.210) | 4.900 (4.500–5.000) |
+| table-repaint | CPU | 70 (60–70) | 60 (50–60) | 40 (40–50) | 100 (100–140) |
+| table-repaint | peak RSS | 30.5 (30.3–31.0) | 28.7 (28.3–32.6) | 28.3 (28.1–28.5) | 928.0 (926.2–929.5) |
+| table-repaint | steady RSS | 30.8 (30.8–31.2) | 33.9 (33.8–33.9) | 28.7 (28.5–28.9) | 928.2 (926.4–929.7) |
+| table-repaint | checksum | 5704 | 5704 | 5704 | 5704 |
+| styled-scroll | wall | 1.313 (1.298–1.324) | 1.065 (1.046–1.096) | 0.737 (0.730–0.771) | 4.400 (4.000–6.400) |
+| styled-scroll | CPU | 10 (0–10) | 10 (10–10) | 0 (0–0) | 100 (80–110) |
+| styled-scroll | peak RSS | 9.1 (8.9–9.3) | 10.0 (9.7–10.2) | 8.0 (7.9–8.3) | 925.8 (924.3–927.8) |
+| styled-scroll | steady RSS | 16.9 (16.9–17.2) | 18.6 (18.5–18.8) | 13.8 (13.8–14.0) | 926.1 (924.3–928.0) |
+| styled-scroll | checksum | 650115 | 650115 | 650115 | 650115 |
+| text-layout | wall | 0.171 (0.170–0.177) | 0.137 (0.132–0.142) | 0.084 (0.082–0.089) | 2.000 (1.900–2.300) |
+| text-layout | CPU | 50 (50–60) | 50 (40–50) | 30 (30–40) | 110 (90–120) |
+| text-layout | peak RSS | 25.2 (24.5–26.0) | 29.5 (29.3–30.0) | 18.4 (18.2–18.5) | 924.1 (923.3–926.3) |
+| text-layout | steady RSS | 28.5 (28.4–28.7) | 30.8 (30.7–31.0) | 25.9 (25.7–25.9) | 924.4 (923.3–926.6) |
+| text-layout | checksum | 34320 | 34320 | 34320 | 34320 |
+
+Native first raster is inside native cold start and has no Chromium sample.
+The native pipeline is the rAF callback plus tiny-skia. The browser rAF gap
+includes headless scheduling, so those two rows stay separate.
+
+Frame CPU on the size profile is 170 ms (160–170) against Chromium 300 ms
+(270–310). The size maximum, 170 ms, is under 270 ms. On `09c29fc` that
+maximum was 190 ms. Checksum 11000 matched. Size pipeline p50 is 5.012 ms
+(4.965–5.044), against 6.233 ms on `09c29fc`. Speed is 3.601 ms
+(3.593–3.607) and max is 2.921 ms (2.900–2.930).
+
+Author-CSS CPU on the size profile is flat at 50 ms against Chromium 110 ms
+(80–120). The size maximum is under this series' 80 ms minimum. On
+`09c29fc` the size range was 50–60 ms. Checksum 7680 matched.
+
+DOM update on the size profile is 1.687 ms (1.678–1.714) against Chromium
+5.100 ms (5.000–5.300). On `09c29fc` the size median was 2.147 ms. Checksum
+62890 matched. DOM wall is 2.120 ms (2.113–2.147) against 5.900 ms
+(5.700–6.000).
+
+Startup cold start on the size profile is 52.836 ms (51.432–73.417) against
+202.317 ms (194.003–322.253). Steady RSS is 30.6 MB (30.3–30.8) against
+918.8 MB (909.1–921.2). The `09c29fc` size median was 54.301 ms and steady
+RSS was 30.4 MB.
+
+`table-repaint` wall is 2.301 / 1.855 / 1.147 ms against 4.900 ms
+(4.500–5.000). The size maximum, 2.308 ms, is under 4.500 ms. Checksum
+5704 matched. `styled-scroll` wall is 1.313 / 1.065 / 0.737 ms against
+4.400 ms (4.000–6.400). The size maximum, 1.324 ms, is under 4.000 ms.
+Checksum 650115 matched. `text-layout` wall is 0.171 / 0.137 / 0.084 ms
+against 2.000 ms (1.900–2.300). The size maximum, 0.177 ms, is under
+1.900 ms. Checksum 34320 matched.
+
 ## Profile comparison (`09c29fc`)
 
 Pinned host: Linux 6.12.94+, 4 vCPU Intel Xeon, no `/dev/dri`. Rustc 1.99.0
