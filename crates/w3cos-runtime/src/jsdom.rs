@@ -9533,7 +9533,10 @@ fn offset_parent_node(node: u32) -> Option<u32> {
     while let Some(candidate) = ancestor {
         if dom::node_type(candidate) == 1 {
             let tag = dom::tag_name(candidate);
-            let positioned = !matches!(element_position(candidate), w3cos_std::style::Position::Static);
+            let positioned = !matches!(
+                element_position(candidate),
+                w3cos_std::style::Position::Static
+            );
             if positioned || matches!(tag.as_str(), "body" | "table" | "td" | "th") {
                 return Some(candidate);
             }
@@ -22771,18 +22774,21 @@ mod tests {
         let expected = ["v 2-0", "v 2-1", "v 2-2"];
         let sum: usize = expected.iter().map(|text| text.len()).sum();
         assert_eq!(filled.to_number(), sum as f64);
-        assert_eq!(
-            child_texts(&root),
-            expected.map(str::to_string).to_vec()
-        );
+        assert_eq!(child_texts(&root), expected.map(str::to_string).to_vec());
         let refused = w3cos_core::intrinsics::dom_fill_sequential_text_guarded(
-            &nodes, "v ", 2.0, "-", 0.0, 3.0, epoch.wrapping_add(1),
+            &nodes,
+            "v ",
+            2.0,
+            "-",
+            0.0,
+            3.0,
+            epoch.wrapping_add(1),
         );
-        assert!(refused.is_undefined(), "a stale epoch refuses before writing");
-        assert_eq!(
-            child_texts(&root),
-            expected.map(str::to_string).to_vec()
+        assert!(
+            refused.is_undefined(),
+            "a stale epoch refuses before writing"
         );
+        assert_eq!(child_texts(&root), expected.map(str::to_string).to_vec());
     }
 
     fn indexed_rewrite_fixture() -> (Value, Value, Vec<u32>) {

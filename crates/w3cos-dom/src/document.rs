@@ -1751,11 +1751,7 @@ impl Document {
         let w3cos_std::style::Dimension::Px(height) = style.height else {
             return true;
         };
-        if !width.is_finite()
-            || width < 0.0
-            || !height.is_finite()
-            || height < 0.0
-        {
+        if !width.is_finite() || width < 0.0 || !height.is_finite() || height < 0.0 {
             return true;
         }
         let clips = matches!(
@@ -25889,12 +25885,16 @@ mod computed_style_cache_tests {
         let _ = document.computed_style_for(div.id);
         let generation = document.layout_generation();
         let (_, misses) = document.computed_style_cache_stats();
-        assert!(document
-            .set_inline_text_child(div.id, "one two three four five six seven eight")
-            .is_some());
-        assert!(document
-            .set_inline_text_child(div.id, "nine ten eleven twelve thirteen fourteen fifteen")
-            .is_some());
+        assert!(
+            document
+                .set_inline_text_child(div.id, "one two three four five six seven eight")
+                .is_some()
+        );
+        assert!(
+            document
+                .set_inline_text_child(div.id, "nine ten eleven twelve thirteen fourteen fifteen")
+                .is_some()
+        );
         let _ = document.computed_style_for(div.id);
         let (_, misses_after) = document.computed_style_cache_stats();
         assert_eq!(document.layout_generation(), generation);

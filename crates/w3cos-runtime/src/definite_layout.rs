@@ -1110,9 +1110,11 @@ mod tests {
         for index in 0..4 {
             let row = crate::dom::create_element("div");
             crate::dom::with_document_mut(|document| {
-                assert!(document
-                    .set_inline_text_child(NodeId::from_u32(row), &format!("styled {index}"))
-                    .is_some());
+                assert!(
+                    document
+                        .set_inline_text_child(NodeId::from_u32(row), &format!("styled {index}"))
+                        .is_some()
+                );
             });
             crate::dom::append_child(scroller, row);
             rows.push(row);
@@ -1130,7 +1132,10 @@ mod tests {
     fn opposing_vertical_margins_do_not_use_the_row_stack() {
         crate::dom::reset_document();
         w3cos_dom::stylesheet::clear_rules();
-        w3cos_dom::stylesheet::register_rule("#scroller", &[("width", "200px"), ("height", "80px")]);
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller",
+            &[("width", "200px"), ("height", "80px")],
+        );
         w3cos_dom::stylesheet::register_rule(
             "#scroller div",
             &[("height", "20px"), ("margin", "8px 0 8px 0")],

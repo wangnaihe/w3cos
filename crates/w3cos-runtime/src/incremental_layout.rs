@@ -91,12 +91,7 @@ pub fn flush() -> bool {
             }
         }
         ok = rebuild(
-            &mut slot,
-            layout_gen,
-            structure,
-            cascade,
-            viewport_w,
-            viewport_h,
+            &mut slot, layout_gen, structure, cascade, viewport_w, viewport_h,
         );
     });
     if ok {
@@ -1339,7 +1334,10 @@ mod paint_layout_tests {
         assert!(layout_gen() > generation, "auto height text must relayout");
         assert_stored_matches_fresh(node);
         let after = crate::dom::bounding_rect(node).height;
-        assert!(after > before + 8.0, "text must grow the box, {before} -> {after}");
+        assert!(
+            after > before + 8.0,
+            "text must grow the box, {before} -> {after}"
+        );
     }
 
     #[test]
@@ -1370,7 +1368,11 @@ mod paint_layout_tests {
         assert_stored_matches_fresh(cell);
         let generation = layout_gen();
         write_text(cell, "v 3-143 a much longer cell label");
-        assert_eq!(layout_gen(), generation, "clipped cell text must not relayout");
+        assert_eq!(
+            layout_gen(),
+            generation,
+            "clipped cell text must not relayout"
+        );
         assert_stored_matches_fresh(cell);
         let height = crate::dom::bounding_rect(cell).height;
         assert!((height - 22.0).abs() < 1.0, "cell height {height}");
