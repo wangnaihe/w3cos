@@ -147,10 +147,16 @@ file-typescript = TypeScript
 file-rust = Rust
 file-folder = 文件夹
 
-terminal-allow = 允许 echo、pwd、help。运行时申请一次性的 w3cos-process。
-terminal-ready = 终端已就绪
+terminal-allow = 这里只运行 echo、pwd、help。其他命令不会执行。
+terminal-ready = 这里只运行 echo、pwd、help。
 terminal-run = 运行
-terminal-hint = 允许 echo、pwd、help。需要一次性的 w3cos-process。
+terminal-prompt = 命令
+terminal-hint = 输入其中一条，然后点运行。其他命令不会执行。
+terminal-empty = 先写一条命令。可以试 echo、pwd 或 help。
+terminal-refused = 没有运行 { $command }。这里只接受 echo、pwd、help。
+terminal-meta = 这条含有特殊符号，没有运行。请改成 echo、pwd 或 help。
+terminal-failed = 没有运行。可以改成 echo、pwd 或 help。
+terminal-help = 可以运行 echo、pwd、help。echo 后面可以跟文字。没有系统 shell。
 
 settings-local = 本机
 settings-identity = 身份

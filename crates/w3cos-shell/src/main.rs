@@ -540,7 +540,14 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
             state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-page"));
         }
-        OP_RUN_TERMINAL => open_process_permission(session),
+        OP_RUN_TERMINAL => {
+            let line = state::get_signal_text(TERMINAL_SIGNAL);
+            if let Some(shown) = explain_terminal_block(&line) {
+                refuse_terminal_without_grant(session, &line, &shown);
+            } else {
+                open_process_permission(session);
+            }
+        }
         OP_PERM_ONCE => {
             if !session.identity_unlocked() {
                 sync_session(
@@ -813,6 +820,81 @@ fn apply_host_update(session: &mut IntentSession, update: agent_host::HostUpdate
     }
 }
 
+fn terminal_has_metacharacters(line: &str) -> bool {
+    line.chars().any(|ch| {
+        matches!(
+            ch,
+            ';' | '|' | '&' | '`' | '$' | '\n' | '>' | '<' | '\\' | '(' | ')' | '\'' | '"'
+        )
+    })
+}
+
+/// Whether this line can reach the process grant. The bridge remains the
+/// authority at execution time; this only avoids asking for a grant that
+/// cannot run.
+fn explain_terminal_block(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Some(locale::t("terminal-empty"));
+    }
+    if terminal_has_metacharacters(line) {
+        return Some(locale::t("terminal-meta"));
+    }
+    let mut parts = line.split_whitespace();
+    let command = parts.next().unwrap_or("");
+    let has_args = parts.next().is_some();
+    match command {
+        "echo" => None,
+        "pwd" | "help" if !has_args => None,
+        other => Some(locale::t_args("terminal-refused", &[("command", other)])),
+    }
+}
+
+fn terminal_refusal(line: &str, err: &str) -> String {
+    let err = err.to_ascii_lowercase();
+    if err.contains("empty") {
+        return locale::t("terminal-empty");
+    }
+    if err.contains("metacharacter") {
+        return locale::t("terminal-meta");
+    }
+    let command = line.split_whitespace().next().unwrap_or("");
+    if command.is_empty() {
+        locale::t("terminal-empty")
+    } else if err.contains("allowlist") || err.contains("refused") {
+        locale::t_args("terminal-refused", &[("command", command)])
+    } else {
+        locale::t("terminal-failed")
+    }
+}
+
+fn refuse_terminal_without_grant(session: &mut IntentSession, line: &str, shown: &str) {
+    state::set_signal(PERM_SIGNAL, 0);
+    if line.trim().is_empty() {
+        state::set_text_signal(TERM_OUT_SIGNAL, shown);
+        return;
+    }
+    if !session.identity_unlocked() {
+        state::set_text_signal(TERM_OUT_SIGNAL, &locale::t("perm-locked"));
+        return;
+    }
+    state::set_text_signal(TERM_OUT_SIGNAL, shown);
+    let err = if terminal_has_metacharacters(line) {
+        "refused: the command has shell metacharacters"
+    } else {
+        "refused: not allowlisted (echo, pwd, help)"
+    };
+    session.record_external(
+        line,
+        "l2:run",
+        w3cos_ai_bridge::intent::Decision::Denied,
+        true,
+        &format!("Denied: {err}. Nothing was changed."),
+        IntentTier::L0,
+    );
+    sync_session(session, 2, &locale::t("perm-denied-notice"));
+}
+
 fn run_terminal_from_button(session: &mut IntentSession) {
     let line = state::get_signal_text(TERMINAL_SIGNAL);
     if let Err(reason) = session.gate_mutation(now_ms()) {
@@ -829,25 +911,42 @@ fn run_terminal_from_button(session: &mut IntentSession) {
     }
     capability_gate::grant(shell_tools::CAP_PROCESS);
     let granted = capability_gate::is_granted(shell_tools::CAP_PROCESS);
-    let outcome = if !granted {
-        "Denied: w3cos-process is not granted. Nothing was changed.".to_string()
+    let (shown, outcome, denied) = if !granted {
+        (
+            locale::t("terminal-failed"),
+            "Denied: w3cos-process is not granted. Nothing was changed.".to_string(),
+            true,
+        )
     } else {
         match shell_tools::run_allowlisted(&line) {
             Ok(output) => {
-                state::set_text_signal(TERM_OUT_SIGNAL, &output);
-                output
+                let shown = if line.trim() == "help" {
+                    locale::t("terminal-help")
+                } else {
+                    output.clone()
+                };
+                (shown, output, false)
             }
-            Err(err) => format!("Denied: {err}. Nothing was changed."),
+            Err(err) => (
+                terminal_refusal(&line, &err),
+                format!("Denied: {err}. Nothing was changed."),
+                true,
+            ),
         }
     };
     capability_gate::deny(shell_tools::CAP_PROCESS);
-    let decision = if outcome.starts_with("Denied") {
+    state::set_text_signal(TERM_OUT_SIGNAL, &shown);
+    let decision = if denied {
         w3cos_ai_bridge::intent::Decision::Denied
     } else {
         w3cos_ai_bridge::intent::Decision::Allowed
     };
     session.record_external(&line, "l2:run", decision, true, &outcome, IntentTier::L2);
-    sync_session(session, 2, &outcome);
+    if denied {
+        sync_session(session, 2, &locale::t("perm-denied-notice"));
+    } else {
+        sync_session(session, 2, &outcome);
+    }
 }
 
 fn show_settings_pane(tab: i64) {
@@ -1951,6 +2050,26 @@ fn apply_screen_override() {
             state::set_signal(FILES_FOLDER_SIGNAL, 1);
         }
         Some("terminal") => focus_app(2),
+        Some("terminal-echo") => {
+            focus_app(2);
+            state::set_text_signal(TERMINAL_SIGNAL, "echo 已运行");
+            with_session(|session| {
+                if session.identity_unlocked() {
+                    run_terminal_from_button(session);
+                }
+            });
+        }
+        Some("terminal-refused") => {
+            focus_app(2);
+            state::set_text_signal(TERMINAL_SIGNAL, "ls");
+            with_session(|session| {
+                if session.identity_unlocked() {
+                    if let Some(shown) = explain_terminal_block("ls") {
+                        refuse_terminal_without_grant(session, "ls", &shown);
+                    }
+                }
+            });
+        }
         Some("launcher") => state::set_signal(LAUNCHER_SIGNAL, 1),
         Some("receipts") => {
             state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
@@ -4720,7 +4839,7 @@ fn build_terminal_app() -> Component {
                         },
                         vec![
                             Component::text(
-                                "user@w3cos:~$",
+                                locale::t("terminal-prompt"),
                                 Style {
                                     font_size: 14.0,
                                     color: Color::from_hex("#9eb6ff"),
@@ -7981,20 +8100,128 @@ mod shell_ux_tests {
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_text_signal(TERM_OUT_SIGNAL, "");
+        state::set_text_signal(TERMINAL_SIGNAL, "");
         let app = build_terminal_app();
-        let mut texts = Vec::new();
-        walk(&app, &mut |node| {
-            if let ComponentKind::Text { content } = &node.kind {
-                texts.push(content.clone());
-            }
-        });
-        let grants = texts
-            .iter()
-            .filter(|text| text.contains("echo") || text.contains("w3cos-process"))
-            .count();
-        assert_eq!(grants, 1, "{texts:?}");
-        assert!(texts.iter().any(|text| text.contains("终端已就绪")));
+        let blob = text_blob(&app);
+        assert!(blob.contains("这里只运行 echo、pwd、help。"), "{blob}");
+        assert!(blob.contains("其他命令不会执行。"), "{blob}");
+        assert!(blob.contains("命令"), "{blob}");
+        assert!(!blob.contains("命令还不会执行"), "{blob}");
+        assert!(!blob.contains("w3cos-process"), "{blob}");
+        assert!(!blob.contains("user@w3cos"), "{blob}");
         locale::set_locale("en");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        let english = text_blob(&build_terminal_app());
+        assert!(
+            english.contains("Only echo, pwd, and help run here."),
+            "{english}"
+        );
+        assert!(!english.contains("Shell ready"), "{english}");
+        assert!(!english.contains("w3cos-process"), "{english}");
+        locale::set_locale("zh-CN");
+    }
+
+    #[test]
+    fn terminal_copy_matches_what_run_can_do() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-term-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(TERMINAL_SIGNAL, "");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        capability_gate::deny(shell_tools::CAP_PROCESS);
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        state::set_text_signal(TERMINAL_SIGNAL, "ls");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        let refused = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(refused.contains("没有运行 ls。"), "{refused}");
+        assert!(
+            refused.contains("这里只接受 echo、pwd、help。"),
+            "{refused}"
+        );
+        assert!(!refused.to_lowercase().contains("bin/ls"), "{refused}");
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("Denied"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+
+        state::set_text_signal(TERMINAL_SIGNAL, "echo 你好");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), refused);
+        let sheet = text_blob(&build_permission_sheet());
+        assert!(sheet.contains("允许运行这一次 echo"), "{sheet}");
+        on_shell_intent(OP_PERM_ONCE, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), "你好");
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("allowed"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+
+        state::set_text_signal(TERMINAL_SIGNAL, "");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).contains("先写一条命令"));
+
+        state::set_text_signal(TERMINAL_SIGNAL, "echo hi; ls");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        let meta = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(meta.contains("特殊符号"), "{meta}");
+        assert!(!meta.contains("hi"), "{meta}");
+
+        state::set_text_signal(TERMINAL_SIGNAL, "help");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        on_shell_intent(OP_PERM_ONCE, "");
+        let help = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(help.contains("可以运行 echo、pwd、help。"), "{help}");
+        assert!(help.contains("没有系统 shell。"), "{help}");
+        assert!(!help.contains("Other programs"), "{help}");
+
+        locale::set_locale("en");
+        assert_eq!(
+            locale::t_args("terminal-refused", &[("command", "ls")]),
+            "Did not run ls. Only echo, pwd, and help are accepted."
+        );
+        assert!(!locale::t("terminal-hint").contains("w3cos-process"));
+
+        locale::set_locale("zh-CN");
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(TERMINAL_SIGNAL, "");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        drop(isolated);
     }
 
     fn ime_role(root: &Component, role: &str) -> bool {

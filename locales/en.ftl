@@ -147,10 +147,16 @@ file-typescript = TypeScript
 file-rust = Rust
 file-folder = Folder
 
-terminal-allow = Allows echo, pwd, and help. Run asks for a one-shot w3cos-process grant.
-terminal-ready = Shell ready
+terminal-allow = Only echo, pwd, and help run here. Anything else does not run.
+terminal-ready = Only echo, pwd, and help run here.
 terminal-run = Run
-terminal-hint = echo, pwd, and help are allowed. They need a one-shot w3cos-process grant.
+terminal-prompt = Command
+terminal-hint = Type one of those, then Run. Anything else does not run.
+terminal-empty = Write a command first. Try echo, pwd, or help.
+terminal-refused = Did not run { $command }. Only echo, pwd, and help are accepted.
+terminal-meta = That line has special characters, so it did not run. Use echo, pwd, or help.
+terminal-failed = It did not run. Try echo, pwd, or help.
+terminal-help = echo, pwd, and help can run. echo may be followed by text. There is no system shell.
 
 settings-local = Local
 settings-identity = Identity
