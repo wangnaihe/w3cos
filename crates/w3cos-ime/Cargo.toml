@@ -8,6 +8,15 @@ description = "IME Hub and the bundled on-device pinyin engine."
 [dependencies]
 cpal = "0.15"
 getrandom = "0.2"
+ndarray = "0.17"
+ort = { version = "=2.0.0-rc.14", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "copy-dylibs",
+    "api-31",
+    "tls-rustls",
+] }
 ring = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }

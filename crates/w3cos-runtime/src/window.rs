@@ -4766,6 +4766,15 @@ impl App {
         } else {
             let _ = state::shell_hold_end();
         }
+        let ink_hit = hit.is_some_and(|idx| state::shell_ink_at(&self.root, idx));
+        if ink_hit {
+            state::shell_ink_begin(self.mouse_x, self.mouse_y);
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        } else if state::shell_ink_is_active() {
+            let _ = state::shell_ink_end();
+            self.rebuild_if_dirty();
+        }
     }
 
     fn pointer_released(&mut self, pointer_type: &str, pointer_id: i64) {
@@ -4775,23 +4784,25 @@ impl App {
                 self.mouse_x, self.mouse_y, self.pressed_index, self.touch_scroll_active
             );
         }
+        let ink_consumed = state::shell_ink_end();
         let hold_consumed = state::shell_hold_end();
         let drag_consumed = state::shell_drag_end();
+        let capture_consumed = hold_consumed || ink_consumed;
         if !drag_consumed && state::take_shell_swipe(self.mouse_x, self.mouse_y) {
             self.pressed_index = None;
             self.pointer_down_default_prevented = false;
             self.rebuild_if_dirty();
-            if hold_consumed {
+            if capture_consumed {
                 self.apply_queued_ime_text();
             }
             self.repaint_after_interaction();
             return;
         }
         if let Some(pressed_idx) = self.pressed_index.take() {
-            if drag_consumed || hold_consumed {
+            if drag_consumed || capture_consumed {
                 self.pointer_down_default_prevented = false;
                 self.rebuild_if_dirty();
-                if hold_consumed {
+                if capture_consumed {
                     self.apply_queued_ime_text();
                 }
                 self.repaint_after_interaction();
@@ -4828,10 +4839,10 @@ impl App {
                     self.repaint_after_interaction();
                 }
             }
-        } else if drag_consumed || hold_consumed {
+        } else if drag_consumed || capture_consumed {
             self.pointer_down_default_prevented = false;
             self.rebuild_if_dirty();
-            if hold_consumed {
+            if capture_consumed {
                 self.apply_queued_ime_text();
             }
             self.repaint_after_interaction();
@@ -8589,7 +8600,11 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 // winit gives physical pixels; convert to logical for hit testing
                 self.set_pointer_logical(position.x, position.y);
-                if self.pressed_index.is_some() || state::shell_drag_is_active() {
+                if state::shell_ink_is_active() {
+                    state::shell_ink_move(self.mouse_x, self.mouse_y);
+                    self.rebuild_if_dirty();
+                    self.request_repaint();
+                } else if self.pressed_index.is_some() || state::shell_drag_is_active() {
                     state::shell_drag_move(self.mouse_x, self.mouse_y);
                     self.rebuild_if_dirty();
                 }
@@ -8645,6 +8660,13 @@ impl ApplicationHandler for App {
                         self.touch_pointer_target = self.pressed_index;
                     }
                     TouchPhase::Moved => {
+                        if state::shell_ink_is_active() {
+                            state::shell_ink_move(self.mouse_x, self.mouse_y);
+                            self.rebuild_if_dirty();
+                            self.last_touch_y = Some(self.mouse_y);
+                            self.request_repaint();
+                            return;
+                        }
                         #[cfg(any(target_os = "ios", target_os = "android"))]
                         if let Some((start_x, start_y)) = self.back_swipe_start {
                             let dx = self.mouse_x - start_x;
@@ -8853,6 +8875,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     TouchPhase::Cancelled => {
+                        let _ = state::shell_ink_end();
                         #[cfg(any(target_os = "ios", target_os = "android"))]
                         {
                             self.back_swipe_start = None;
