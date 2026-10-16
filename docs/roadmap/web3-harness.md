@@ -40,7 +40,7 @@ local signing tool that cannot sign on its own.
 | Harness receipts | `tool_host::SignedReceipt` | In memory. Confirm, deny, and cancel each append one. The device Ed25519 key signs the canonical JSON. |
 | Model | `docs/AI_HARNESS.md` | Not linked. `w3cos-inferd.sh` starts llama-server. Weights are not in git. |
 | Gated tool host | `tool_host::ToolHost` | `device_did`, `wallet_address`, `wallet_sign`. `tools/call` proposes. Confirm is not a tool and not a JSON-RPC method. |
-| Sandbox | terminal allowlist, `capability_gate` | No WASM or container around an agent. The HTTP bridge defaults to `observer`. |
+| Sandbox | `sandbox::run`, shell permission sheet | `echo`, `pwd`, and `help` still use the one-shot process grant. Anything else runs in a new user and mount namespace, with an empty environment. Files and the network stay closed until the sheet grants that one run. The wallet stays in the host process. |
 
 L2 stays off in a normal boot. Confirm does not travel with handoff (#94). Unlock does not travel either.
 
@@ -52,7 +52,7 @@ L2 stays off in a normal boot. Confirm does not travel with handoff (#94). Unloc
 4. There is no local account and no signing tool. There is also no chain client, which should stay true until a later slice asks for one.
 5. Passkey enrollment checks `clientDataJSON` and the assertion, then installs the canonical `did:key`. The pairing fingerprint and the P2P seed stay where they were. Old receipt actors are not rewritten.
 6. The model cannot be kept in-process without pulling an inference stack into the shell. That split is deliberate and should stay.
-7. Tool execution beyond the terminal allowlist has no sandbox.
+7. Anything beyond `echo`, `pwd`, and `help` runs in a separate process. Files and the network stay closed unless the permission sheet grants them for that one run. The device key and the wallet stay in the window process.
 8. Host receipts used to live only in memory. The shell sheet now writes them beside the older action rows, and the drawer shows the decision, the `did:key`, and that the device key signed the row. Action receipts written earlier stay unsigned.
 
 ## Crate choice
@@ -96,7 +96,7 @@ Each slice is one review. Later slices do not start inside this one.
 7. **Read a chain, still no broadcast.** Done. `chain_balance`, `chain_nonce`, and `chain_tx` propose first. The window shows a permission sheet and calls only the `http` or `https` endpoint the person saved. There is no built-in endpoint. Nothing signs or broadcasts.
 8. **Sign a transaction.** Done. `wallet_sign_tx` proposes decoded fields. Confirm signs a legacy transaction on the device and writes a receipt that does not contain the signed bytes. A second sheet is the only path to `eth_sendRawTransaction`, and only for that signed transaction, and only to the endpoint the person saved. No custodian and no hosted signer.
 9. **Show the spec `did:key` next to the pairing fingerprint.** Keep the letter fingerprint until paired devices can match the new identifier. Do not silently replace stored peer records.
-10. **Sandbox untrusted tools.** Anything beyond the `echo` / `pwd` / `help` allowlist runs where it cannot read the device seed. The wallet stays in the host process and is still only reached from confirm.
+10. **Sandbox untrusted tools.** Done. Anything beyond `echo`, `pwd`, and `help` opens a permission sheet and runs in another process with an empty environment. A user namespace is used when the kernel allows it. Otherwise Landlock keeps files and TCP closed. Either way, files and the network stay closed unless that sheet grants them for the one run. The wallet is not in the sandbox and is still only reached from confirm.
 11. **Inference stays out of process.** Keep `w3cos-inferd`. Revisit `mistral.rs`, `candle`, or `llama-cpp-2` only when a GPU or NPU backend is actually linked.
 
 ## Out of scope here

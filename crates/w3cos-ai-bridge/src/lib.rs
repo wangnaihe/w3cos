@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod permissions;
 pub mod planner;
 mod receipt_ledger;
+pub mod sandbox;
 pub mod screenshot;
 pub mod server;
 pub mod shell_tools;
