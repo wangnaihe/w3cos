@@ -80,6 +80,7 @@ const SIGN_MESSAGE_SIGNAL: usize = 40;
 const SIGN_SUMMARY_SIGNAL: usize = 41;
 const SIGN_IMPACT_SIGNAL: usize = 42;
 const TOOL_SIGNAL: usize = 43;
+const HOST_SIGNAL: usize = 44;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -247,6 +248,7 @@ pub(crate) fn shell_main() {
     agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
     w3cos_ai_bridge::server::set_mcp_hook(bridge_mcp_propose);
+    w3cos_ai_bridge::server::set_host_hook(bridge_host_propose);
     #[cfg(feature = "desktop")]
     let launched = crate::run_app(build_shell);
     #[cfg(not(feature = "desktop"))]
@@ -277,6 +279,63 @@ fn bridge_mcp_propose(name: &str) {
     if state::get_signal(UNLOCKED_SIGNAL) != 0 {
         state::request_focus_label(&locale::t("confirm"));
     }
+}
+
+fn bridge_host_propose(name: &str, summary: &str, impact: &str, message: &str) {
+    ensure_shell_signals();
+    if name == "wallet_sign" {
+        state::set_text_signal(SIGN_MESSAGE_SIGNAL, message);
+        state::set_text_signal(SIGN_SUMMARY_SIGNAL, summary);
+        state::set_text_signal(SIGN_IMPACT_SIGNAL, impact);
+        state::set_signal(SIGN_SIGNAL, 1);
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+        if state::get_signal(UNLOCKED_SIGNAL) != 0 {
+            state::request_focus_label(&locale::t("sign-deny"));
+        }
+        return;
+    }
+    state::set_signal(HOST_SIGNAL, 1);
+    state::set_signal(PHASE_SIGNAL, 1);
+    state::set_signal(TOOL_SIGNAL, 0);
+    state::set_text_signal(TIER_SIGNAL, "L0");
+    state::set_text_signal(SUMMARY_SIGNAL, summary);
+    state::set_text_signal(IMPACT_SIGNAL, impact);
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
+    if state::get_signal(UNLOCKED_SIGNAL) != 0 {
+        state::request_focus_label(&locale::t("confirm"));
+    }
+}
+
+fn show_host_confirm() {
+    bridge_host_propose(
+        "device_did",
+        &locale::t("device-did-summary"),
+        &locale::t("device-did-impact"),
+        "",
+    );
+}
+
+fn apply_host_mail(session: &mut IntentSession) {
+    let Some(ticket) = w3cos_ai_bridge::tool_host::take_unapplied() else {
+        return;
+    };
+    if let Err(text) = sign_host::propose_tool(
+        &ticket.name,
+        &ticket.message,
+        session.identity_unlocked(),
+        &locale::current(),
+        now_ms(),
+        session.signed_high_water().saturating_add(1),
+    ) {
+        w3cos_ai_bridge::tool_host::fail_host(&text);
+        state::set_signal(HOST_SIGNAL, 0);
+        state::set_signal(SIGN_SIGNAL, 0);
+        sync_session(session, state::get_signal(PHASE_SIGNAL), &text);
+    }
+}
+
+fn publish_host_receipt(receipt: &w3cos_ai_bridge::tool_host::SignedReceipt) {
+    w3cos_ai_bridge::tool_host::publish_host_receipt(receipt);
 }
 
 fn show_tool_confirm(name: &str) {
@@ -357,6 +416,7 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
         let _ = state::create_signal(0);
     });
 }
@@ -480,6 +540,10 @@ fn on_shell_intent(code: u8, draft: &str) {
             }
         }
         OP_CANCEL => {
+            if state::get_signal(HOST_SIGNAL) != 0 {
+                cancel_host_proposal(session);
+                return;
+            }
             if state::get_signal(TOOL_SIGNAL) != 0 {
                 cancel_tool_proposal(session);
                 return;
@@ -696,6 +760,25 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
     }
 }
 
+fn cancel_host_proposal(session: &mut IntentSession) {
+    apply_host_mail(session);
+    match sign_host::cancel(&locale::current(), now_ms()) {
+        Ok(receipt) => {
+            publish_host_receipt(&receipt);
+            session.record_signed(receipt);
+        }
+        Err(text) => {
+            w3cos_ai_bridge::tool_host::fail_host(&text);
+        }
+    }
+    state::set_signal(HOST_SIGNAL, 0);
+    state::set_signal(PHASE_SIGNAL, 0);
+    state::set_text_signal(SUMMARY_SIGNAL, "");
+    state::set_text_signal(IMPACT_SIGNAL, "");
+    sync_session(session, 0, &locale::t("tool-cancelled-notice"));
+    restore_after_dialog();
+}
+
 fn cancel_tool_proposal(session: &mut IntentSession) {
     let summary = state::get_signal_text(SUMMARY_SIGNAL);
     let name = w3cos_ai_bridge::mcp::cancel().unwrap_or_else(|| "mcp".to_string());
@@ -739,6 +822,24 @@ fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
             state::get_signal(PHASE_SIGNAL),
             &locale::t("locked-hint"),
         );
+        return;
+    }
+    if state::get_signal(HOST_SIGNAL) != 0 {
+        apply_host_mail(session);
+        match sign_host::confirm(true, &locale::current(), now_ms()) {
+            Ok(receipt) => {
+                publish_host_receipt(&receipt);
+                session.record_signed(receipt);
+                state::set_signal(HOST_SIGNAL, 0);
+                sync_session(session, 0, &locale::t("host-window-confirmed"));
+            }
+            Err(text) => {
+                state::set_signal(HOST_SIGNAL, 0);
+                w3cos_ai_bridge::tool_host::fail_host(&text);
+                sync_session(session, 0, &text);
+            }
+        }
+        restore_after_dialog();
         return;
     }
     if state::get_signal(TOOL_SIGNAL) != 0 {
@@ -810,6 +911,7 @@ fn confirm_impact(command: &ShellCommand, shared: bool) -> String {
 
 fn on_agent_poll() {
     ensure_shell_signals();
+    with_session(apply_host_mail);
     if let Some(done) = w3cos_ai_bridge::mcp::take_done() {
         with_session(|session| record_tool_outcome(session, &done));
     }
@@ -1533,8 +1635,10 @@ fn accept_sign_permission(session: &mut IntentSession) {
         );
         return;
     }
+    apply_host_mail(session);
     match sign_host::confirm(true, &locale::current(), now_ms()) {
         Ok(receipt) => {
+            publish_host_receipt(&receipt);
             session.record_signed(receipt);
             state::set_signal(SIGN_SIGNAL, 0);
             sync_session(
@@ -1560,8 +1664,10 @@ fn deny_sign_permission(session: &mut IntentSession) {
         );
         return;
     }
+    apply_host_mail(session);
     match sign_host::cancel(&locale::current(), now_ms()) {
         Ok(receipt) => {
+            publish_host_receipt(&receipt);
             session.record_signed(receipt);
             state::set_signal(SIGN_SIGNAL, 0);
             sync_session(
@@ -2410,6 +2516,8 @@ fn apply_screen_override() {
             state::set_text_signal(RECEIPT_SIGNAL, "");
         }
         Some("tool-confirm") => show_tool_confirm("a11y_index"),
+        Some("http-confirm") => show_tool_confirm("click"),
+        Some("host-confirm") => show_host_confirm(),
         Some("confirm") => {
             focus_app(1);
             state::set_signal(PHASE_SIGNAL, 1);
@@ -8659,6 +8767,35 @@ mod shell_ux_tests {
         locale::set_locale("zh-CN");
         state::set_signal(PHASE_SIGNAL, 0);
         state::set_signal(TOOL_SIGNAL, 0);
+    }
+
+    #[test]
+    fn host_confirm_card_reads_the_did_only_after_confirm() {
+        ensure_shell_signals();
+        w3cos_ai_bridge::tool_host::reset_host_mail();
+        w3cos_ai_bridge::mcp::reset_gate();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        show_host_confirm();
+        let dialog = build_confirm_dialog();
+        assert_eq!(dialog_role(&dialog), Some("confirm"));
+        let blob = text_blob(&dialog);
+        assert!(blob.contains("显示这台设备的 did:key"), "{blob}");
+        assert!(blob.contains("确认后才会显示"), "{blob}");
+        assert!(w3cos_ai_bridge::mcp::take_armed().is_none());
+        assert!(!w3cos_ai_bridge::mcp::arm());
+        assert_eq!(
+            w3cos_ai_bridge::tool_host::host_result_json()["pending"],
+            false
+        );
+        locale::set_locale("en");
+        show_host_confirm();
+        let blob = text_blob(&build_confirm_dialog());
+        assert!(blob.contains("Show this device's did:key"), "{blob}");
+        assert!(blob.contains("Nothing is signed"), "{blob}");
+        locale::set_locale("zh-CN");
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(HOST_SIGNAL, 0);
     }
 
     #[test]

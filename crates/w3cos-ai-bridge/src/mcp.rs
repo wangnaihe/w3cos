@@ -257,6 +257,8 @@ struct FinishedTool {
     summary: String,
     status: u16,
     note: String,
+    /// Client-facing body. The receipt keeps the shorter `note`.
+    body: String,
     recorded: bool,
 }
 
@@ -291,6 +293,36 @@ pub fn submit_propose(body: &str) -> Result<ProposeView, ProposeError> {
         .unwrap_or("");
     let arguments = value.get("arguments").cloned().unwrap_or(Value::Null);
     propose(name, &arguments)
+}
+
+/// Store one bridge call. Does not run it. A second call is refused.
+pub fn propose_call(name: &str, call: BridgeCall) -> Result<ProposeView, ProposeError> {
+    if name.is_empty() || name == "confirm_intent" {
+        return Err(ProposeError {
+            pending: false,
+            message: say("mcp-not-a-tool", &[]),
+        });
+    }
+    let mut gate = lock_gate();
+    if gate.pending.is_some() {
+        return Err(ProposeError {
+            pending: true,
+            message: say("mcp-pending", &[]),
+        });
+    }
+    let summary = say("mcp-tool-summary", &[("name", name)]);
+    let view = ProposeView {
+        name: name.to_string(),
+        summary,
+        impact: say("mcp-tool-impact", &[]),
+    };
+    gate.pending = Some(PendingTool {
+        name: view.name.clone(),
+        summary: view.summary.clone(),
+        call,
+        armed: false,
+    });
+    Ok(view)
 }
 
 pub fn propose(name: &str, arguments: &Value) -> Result<ProposeView, ProposeError> {
@@ -364,28 +396,41 @@ pub fn take_armed() -> Option<BridgeCall> {
 pub fn cancel() -> Option<String> {
     let mut gate = lock_gate();
     let pending = gate.pending.take()?;
+    let note = say("tool-cancelled-notice", &[]);
     gate.done.push_back(FinishedTool {
         name: pending.name.clone(),
         summary: pending.summary,
         status: 499,
-        note: say("tool-cancelled-notice", &[]),
+        body: note.clone(),
+        note,
         recorded: true,
     });
     Some(pending.name)
 }
 
 pub fn store_bridge_response(status: u16, note: &str) {
+    store_bridge_outcome(status, note, note);
+}
+
+/// `note` is what the ledger keeps. `body` is what `/mcp/result` returns.
+pub fn store_bridge_outcome(status: u16, note: &str, body: &str) {
     let mut gate = lock_gate();
     let (name, summary) = gate
         .inflight
         .take()
         .unwrap_or_else(|| ("tool".into(), String::new()));
     let note: String = note.chars().take(240).collect();
+    let body = if body.len() > 256 * 1024 {
+        format!("HTTP {status} · {} bytes", body.len())
+    } else {
+        body.to_string()
+    };
     gate.done.push_back(FinishedTool {
         name,
         summary,
         status,
         note,
+        body,
         recorded: false,
     });
     while gate.done.len() > 8 {
@@ -417,11 +462,16 @@ pub fn result_json() -> Value {
         });
     }
     if let Some(done) = gate.done.back() {
+        let body = if done.body.is_empty() {
+            done.note.as_str()
+        } else {
+            done.body.as_str()
+        };
         return json!({
             "pending": false,
             "name": done.name,
             "status": done.status,
-            "body": done.note
+            "body": body
         });
     }
     json!({
@@ -496,7 +546,7 @@ fn target_body(args: &Value) -> Result<String, String> {
     }
 }
 
-fn url_encode(text: &str) -> String {
+pub(crate) fn url_encode(text: &str) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
         match byte {

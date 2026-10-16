@@ -70,6 +70,23 @@ pub(crate) fn reset() {
     HOST.with(|slot| *slot.borrow_mut() = None);
 }
 
+pub(crate) fn propose_tool(
+    name: &str,
+    message: &str,
+    unlocked: bool,
+    locale: &str,
+    now_ms: u64,
+    next_id: u64,
+) -> Result<ToolProposal, String> {
+    with_host(|host| {
+        host.set_unlocked(unlocked);
+        host.set_locale(locale);
+        host.set_now_ms(now_ms);
+        host.set_next_id(next_id);
+        host.propose_tool(name, message).map_err(|error| error.text)
+    })?
+}
+
 pub(crate) fn propose_wallet_sign(
     message: &str,
     unlocked: bool,

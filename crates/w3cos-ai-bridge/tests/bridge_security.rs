@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -44,6 +45,11 @@ fn button() -> (Document, Rc<Cell<u32>>) {
     );
     doc.body().append_child(&mut doc, button);
     (doc, hits)
+}
+
+fn gate_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 fn serve(permissions: AgentPermissions) -> RunningBridge {
@@ -94,13 +100,41 @@ fn exchange(
         let _ = tx.send(result);
     });
     let started = Instant::now();
-    loop {
+    let (status, headers, body) = loop {
         bridge.handle.poll_and_respond(doc);
         if let Ok(result) = rx.try_recv() {
-            return result;
+            break result;
         }
         if started.elapsed() > Duration::from_secs(3) {
             panic!("timed out waiting for {method} {path}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    if status == 200 && body.contains("\"pending\":true") {
+        let (status, body) = finish_pending(bridge, doc);
+        return (status, headers, body);
+    }
+    (status, headers, body)
+}
+
+fn finish_pending(bridge: &RunningBridge, doc: &mut Document) -> (u16, String) {
+    assert!(
+        w3cos_ai_bridge::mcp::arm(),
+        "the window confirm arms the stored call"
+    );
+    let started = Instant::now();
+    loop {
+        bridge.handle.poll_and_respond(doc);
+        let value = w3cos_ai_bridge::mcp::result_json();
+        if value.get("pending").and_then(|item| item.as_bool()) == Some(false)
+            && value.get("status").is_some()
+        {
+            let status = value["status"].as_u64().unwrap_or(0) as u16;
+            let body = value["body"].as_str().unwrap_or("").to_string();
+            return (status, body);
+        }
+        if started.elapsed() > Duration::from_secs(2) {
+            panic!("timed out waiting for the window to run the proposal: {value}");
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -149,7 +183,39 @@ fn assert_no_cors(headers: &str) {
 }
 
 #[test]
+fn direct_http_waits_for_the_window_before_it_reads_or_clicks() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
+    let bridge = serve(AgentPermissions::interactive());
+    let (mut doc, hits) = button();
+    let (status, _, body) = http(bridge.addr, "GET", "/a11y", Some("test-token-secret"), None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"pending\":true"), "{body}");
+    assert!(!body.contains("button: Go"), "{body}");
+    assert_eq!(hits.get(), 0);
+    let (status, body) = finish_pending(&bridge, &mut doc);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("button: Go"), "{body}");
+
+    let (status, _, body) = http(
+        bridge.addr,
+        "POST",
+        "/click",
+        Some("test-token-secret"),
+        Some("{\"selector\":\"#go\"}"),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"pending\":true"), "{body}");
+    assert_eq!(hits.get(), 0);
+    let (status, body) = finish_pending(&bridge, &mut doc);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits.get(), 1);
+}
+
+#[test]
 fn health_is_public_and_does_not_leak_the_token_or_cors() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::interactive());
     assert!(bridge.addr.ip().is_loopback());
     let (mut doc, _) = button();
@@ -163,6 +229,8 @@ fn health_is_public_and_does_not_leak_the_token_or_cors() {
 
 #[test]
 fn missing_or_wrong_token_is_401_and_does_not_click() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::interactive());
     let (mut doc, hits) = button();
     let (status, headers, body) = exchange(
@@ -184,6 +252,8 @@ fn missing_or_wrong_token_is_401_and_does_not_click() {
 
 #[test]
 fn bearer_token_allows_a_read() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::observer());
     let (mut doc, _) = button();
     let (status, headers, body) = exchange(
@@ -201,6 +271,8 @@ fn bearer_token_allows_a_read() {
 
 #[test]
 fn query_token_is_accepted() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::observer());
     let (mut doc, _) = button();
     let (status, _, body) = exchange(
@@ -217,6 +289,8 @@ fn query_token_is_accepted() {
 
 #[test]
 fn observer_cannot_click_and_the_document_stays_put() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::observer());
     let (mut doc, hits) = button();
     let (status, _, body) = exchange(
@@ -234,6 +308,8 @@ fn observer_cannot_click_and_the_document_stays_put() {
 
 #[test]
 fn blocked_selector_is_rejected() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let mut perms = AgentPermissions::interactive();
     perms.blocked_selectors.push("#go".into());
     let bridge = serve(perms);
@@ -253,6 +329,8 @@ fn blocked_selector_is_rejected() {
 
 #[test]
 fn interactive_click_fires_and_then_rate_limits() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let mut perms = AgentPermissions::interactive();
     perms.max_actions_per_second = 1;
     let bridge = serve(perms);
@@ -281,6 +359,8 @@ fn interactive_click_fires_and_then_rate_limits() {
 
 #[test]
 fn type_requires_write_permission() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::default());
     let (mut doc, _) = button();
     let (status, _, body) = exchange(
@@ -304,6 +384,8 @@ fn type_requires_write_permission() {
 
 #[test]
 fn act_sets_an_attribute_and_rejects_unknown_actions() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::interactive());
     let (mut doc, hits) = button();
     let (status, _, body) = exchange(
@@ -353,6 +435,8 @@ fn act_sets_an_attribute_and_rejects_unknown_actions() {
 
 #[test]
 fn screenshot_without_permission_does_not_capture() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let called = Arc::new(AtomicBool::new(false));
     let bridge = serve_with_shot(
         {
@@ -436,6 +520,8 @@ impl ScreenshotProvider for AnnotatedShot {
 
 #[test]
 fn observer_can_read_the_a11y_index_but_cannot_click_it() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::observer());
     let (mut doc, hits) = button();
     let (status, body) = token(&bridge, &mut doc, "GET", "/a11y", None);
@@ -464,6 +550,8 @@ fn observer_can_read_the_a11y_index_but_cannot_click_it() {
 
 #[test]
 fn interactive_click_type_and_focus_accept_an_a11y_index() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::interactive());
     let (mut doc, hits) = button();
     let input = doc.create_element("input");
@@ -520,6 +608,8 @@ fn interactive_click_type_and_focus_accept_an_a11y_index() {
 
 #[test]
 fn stale_or_ambiguous_index_does_not_mutate() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::interactive());
     let (mut doc, hits) = button();
     let (status, body) = token(&bridge, &mut doc, "POST", "/click", Some("{\"index\":999}"));
@@ -547,6 +637,8 @@ fn stale_or_ambiguous_index_does_not_mutate() {
 
 #[test]
 fn blocked_selector_denies_the_resolved_index() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let mut perms = AgentPermissions::interactive();
     perms.blocked_selectors.push("#go".into());
     let bridge = serve(perms);
@@ -567,6 +659,8 @@ fn blocked_selector_denies_the_resolved_index() {
 
 #[test]
 fn annotated_screenshot_needs_layout_bounds_and_capture_permission() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let bridge = serve(AgentPermissions::observer());
     let (mut doc, _) = button();
     let (status, raw) = token(&bridge, &mut doc, "GET", "/screenshot", None);
@@ -662,6 +756,8 @@ fn intent_confirm() -> String {
 
 #[test]
 fn component_layout_index_is_readable_and_clickable() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     let invoked = Arc::new(AtomicBool::new(false));
     let bridge = serve_with_shot(
         AgentPermissions::observer(),
@@ -698,6 +794,8 @@ fn component_layout_index_is_readable_and_clickable() {
 
 #[test]
 fn observer_cannot_propose_an_intent() {
+    let _lock = gate_lock();
+    w3cos_ai_bridge::mcp::reset_gate();
     w3cos_ai_bridge::server::set_intent_hooks(intent_propose, intent_confirm);
     let bridge = serve(AgentPermissions::observer());
     let mut doc = Document::new();
@@ -720,8 +818,9 @@ fn observer_cannot_propose_an_intent() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("proposed 打开终端"), "{body}");
     let (status, body) = token(&bridge, &mut doc, "POST", "/intent/confirm", None);
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("confirmed"), "{body}");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("确认") || body.contains("Confirm"), "{body}");
+    assert!(!body.contains("confirmed"), "{body}");
     let (status, body) = token(&bridge, &mut doc, "POST", "/intent", Some("{}"));
     assert_eq!(status, 400, "{body}");
 }

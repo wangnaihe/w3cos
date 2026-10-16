@@ -513,3 +513,4 @@ mcp-not-a-tool = 确认不是工具。窗口上的按钮才会确认。
 mcp-unknown = 没有这个工具 { $name }。
 tool-armed-notice = 已确认，等待窗口执行。
 tool-cancelled-notice = 已取消，没有执行。
+host-window-confirmed = 已在窗口确认。结果留在这台设备上。

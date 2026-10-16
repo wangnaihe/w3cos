@@ -514,3 +514,4 @@ mcp-not-a-tool = Confirm is not a tool. The button on the window confirms.
 mcp-unknown = Unknown tool { $name }.
 tool-armed-notice = Confirmed. The window will run it.
 tool-cancelled-notice = Cancelled. Nothing ran.
+host-window-confirmed = Confirmed in the window. The result stays on this device.
