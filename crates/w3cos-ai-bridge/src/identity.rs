@@ -1,20 +1,13 @@
 //! Local shell subject.
 //!
-//! This is the interface a later passkey-backed `did:key` would satisfy.
-//! It does not generate a key, speak to a chain, hold a wallet, or verify a
-//! WebAuthn assertion. [`LocalIdentityStub::install_subject`] accepts a real
-//! `did:key` from the device Ed25519 key. Receipts already written keep the
-//! actor they recorded.
+//! A passkey is this device's Ed25519 key. [`accept_webauthn_assertion`]
+//! checks `clientDataJSON` and the assertion signature before
+//! [`IdentityMethod::Passkey`], then installs the canonical `did:key` for that
+//! key. Receipts already written keep the actor they recorded. This module
+//! does not replace the P2P seed and does not read the pairing fingerprint.
 //!
-//! The unlock string is not stored. The stub keeps a PBKDF2-HMAC-SHA256
-//! verifier (salt + hash). The subject is a `did:key:` string that can be
-//! replaced later.
-//!
-//! Passkey enrollment can mint a challenge and store public-key bytes.
-//! It does not speak to an authenticator and does not check an assertion.
-//! TODO(webauthn): verify `clientDataJSON` against the stored challenge and
-//! the assertion signature against the stored key before setting
-//! [`IdentityMethod::Passkey`] or installing a `did:key` from that key.
+//! The unlock string is not stored. The lock screen still keeps a
+//! PBKDF2-HMAC-SHA256 verifier. That verifier is not a passkey.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,8 +21,7 @@ pub enum IdentityMethod {
     Passkey,
 }
 
-/// How far passkey enrollment has gone. `AwaitingPasskey` is a note, not a
-/// WebAuthn credential.
+/// How far passkey enrollment has gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EnrollmentState {
@@ -39,7 +31,25 @@ pub enum EnrollmentState {
     AwaitingPasskey,
     /// Public-key bytes were stored for a challenge. The signature was not checked.
     KeyMaterialStored,
+    /// `clientDataJSON` and the assertion signature matched this device key.
+    AssertionVerified,
 }
+
+/// Why an assertion was refused. The subject is left as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionFault {
+    Malformed,
+    Challenge,
+    Origin,
+    Authenticator,
+    Key,
+    Signature,
+}
+
+/// Origin inside `clientDataJSON`. The rpId is the host of this origin.
+pub const WEBAUTHN_ORIGIN: &str = "https://shell.w3cos.local";
+/// Relying party id. `authenticatorData` must carry SHA-256 of this string.
+pub const WEBAUTHN_RP_ID: &str = "shell.w3cos.local";
 
 /// What the shell needs from a local identity service.
 pub trait LocalIdentity {
@@ -84,12 +94,11 @@ impl LocalIdentityStub {
         self.enrollment
     }
 
-    /// Copy for the Settings identity section. This does not start WebAuthn.
+    /// Short status for tests and the ledger. The shell paints Fluent strings.
     pub fn enrollment_copy(&self) -> String {
         match self.enrollment {
             EnrollmentState::Stub => {
-                "WebAuthn 仪式还没做。当前是 did:key 占位，换成真钥匙时不改已有收据。Passkey ceremony is not implemented."
-                    .to_string()
+                "Passkey is not registered. No assertion was checked.".to_string()
             }
             EnrollmentState::AwaitingPasskey => match self.passkey_challenge.as_deref() {
                 Some(challenge) => format!(
@@ -101,6 +110,9 @@ impl LocalIdentityStub {
             EnrollmentState::KeyMaterialStored => {
                 "公钥已保存，签名还没验证。Public key stored. The assertion was not checked."
                     .to_string()
+            }
+            EnrollmentState::AssertionVerified => {
+                "Assertion checked. Passkey is bound to the did:key.".to_string()
             }
         }
     }
@@ -158,6 +170,107 @@ impl LocalIdentityStub {
 
     pub fn restore_enrollment(&mut self, state: EnrollmentState) {
         self.enrollment = state;
+        if state == EnrollmentState::AssertionVerified
+            && is_did_key(&self.subject)
+            && !self.subject.contains("stub")
+        {
+            self.method = IdentityMethod::Passkey;
+        }
+    }
+
+    /// Check a WebAuthn assertion and bind the subject to the canonical
+    /// `did:key` of `device_public`.
+    ///
+    /// The public key in the assertion must be that same 32-byte Ed25519 key.
+    /// A pairing fingerprint is not a public key and does not match. A failed
+    /// check leaves the subject, the method, and the unlock verifier alone.
+    pub fn accept_webauthn_assertion(
+        &mut self,
+        assertion: &str,
+        device_public: &[u8; 32],
+    ) -> Result<(), AssertionFault> {
+        if assertion.len() > 8192 {
+            return Err(AssertionFault::Malformed);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(assertion).map_err(|_| AssertionFault::Malformed)?;
+        let client_b64 = value
+            .get("clientDataJSON")
+            .and_then(|item| item.as_str())
+            .ok_or(AssertionFault::Malformed)?;
+        let auth_b64 = value
+            .get("authenticatorData")
+            .and_then(|item| item.as_str())
+            .ok_or(AssertionFault::Malformed)?;
+        let sig_b64 = value
+            .get("signature")
+            .and_then(|item| item.as_str())
+            .ok_or(AssertionFault::Malformed)?;
+        let key_b64 = value
+            .get("publicKey")
+            .and_then(|item| item.as_str())
+            .ok_or(AssertionFault::Key)?;
+        let client = base64url_decode(client_b64).ok_or(AssertionFault::Malformed)?;
+        let auth = base64url_decode(auth_b64).ok_or(AssertionFault::Malformed)?;
+        let signature = base64url_decode(sig_b64).ok_or(AssertionFault::Malformed)?;
+        let public = base64url_decode(key_b64).ok_or(AssertionFault::Key)?;
+        if public.as_slice() != device_public.as_slice() {
+            return Err(AssertionFault::Key);
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&client).map_err(|_| AssertionFault::Malformed)?;
+        if parsed.get("type").and_then(|item| item.as_str()) != Some("webauthn.get") {
+            return Err(AssertionFault::Malformed);
+        }
+        let challenge = parsed
+            .get("challenge")
+            .and_then(|item| item.as_str())
+            .ok_or(AssertionFault::Challenge)?;
+        let stored = self
+            .passkey_challenge
+            .as_deref()
+            .ok_or(AssertionFault::Challenge)?;
+        if !constant_eq(challenge, stored) {
+            return Err(AssertionFault::Challenge);
+        }
+        let origin = parsed
+            .get("origin")
+            .and_then(|item| item.as_str())
+            .ok_or(AssertionFault::Origin)?;
+        if origin != WEBAUTHN_ORIGIN
+            || parsed.get("crossOrigin").and_then(|item| item.as_bool()) == Some(true)
+        {
+            return Err(AssertionFault::Origin);
+        }
+        if auth.len() < 37 || signature.len() != 64 {
+            return Err(AssertionFault::Authenticator);
+        }
+        let rp_hash = sha256(WEBAUTHN_RP_ID.as_bytes());
+        if auth[..32] != rp_hash.as_ref()[..] {
+            return Err(AssertionFault::Authenticator);
+        }
+        let flags = auth[32];
+        if flags & 0x01 == 0 || flags & 0x04 == 0 {
+            return Err(AssertionFault::Authenticator);
+        }
+        let mut message = Vec::with_capacity(auth.len() + 32);
+        message.extend_from_slice(&auth);
+        message.extend_from_slice(sha256(&client).as_ref());
+        let key = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ED25519,
+            device_public.as_slice(),
+        );
+        if key.verify(&message, &signature).is_err() {
+            return Err(AssertionFault::Signature);
+        }
+        let did = canonical_did(device_public);
+        if !self.install_subject(&did) {
+            return Err(AssertionFault::Key);
+        }
+        self.method = IdentityMethod::Passkey;
+        self.enrollment = EnrollmentState::AssertionVerified;
+        self.passkey_public_key = Some(base64url_encode(device_public));
+        Ok(())
     }
 
     /// Install a persisted `did:key:` subject. Returns false when `subject`
@@ -212,8 +325,7 @@ impl LocalIdentityStub {
 
     /// Returns false when `passphrase` is empty or does not match the verifier.
     /// The first non-empty value is stretched with PBKDF2-HMAC-SHA256 and only
-    /// the verifier is stored. Nothing here is checked against an authenticator.
-    /// Passkey / `did:key` is still next.
+    /// the verifier is stored. This is the lock screen, not a passkey.
     pub fn unlock_with_passphrase(&mut self, passphrase: &str) -> bool {
         if passphrase.is_empty() {
             return false;
@@ -240,6 +352,71 @@ impl LocalIdentityStub {
 
 const PBKDF2_ITERATIONS: u32 = 100_000;
 const VERIFIER_PREFIX: &str = "pbkdf2-sha256$";
+
+/// Build a WebAuthn assertion for `challenge`, signed by `sign`.
+///
+/// `sign` is the device Ed25519 signer. This function does not hold the seed.
+pub fn device_assertion(
+    challenge: &str,
+    public: &[u8; 32],
+    sign: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
+) -> Option<String> {
+    if !is_stored_challenge(challenge) {
+        return None;
+    }
+    let client = format!(
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"{WEBAUTHN_ORIGIN}\",\"crossOrigin\":false}}"
+    );
+    let auth = authenticator_data();
+    let mut message = auth.to_vec();
+    message.extend_from_slice(sha256(client.as_bytes()).as_ref());
+    let signature = sign(&message)?;
+    if signature.len() != 64 {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "type": "public-key",
+            "clientDataJSON": base64url_encode(client.as_bytes()),
+            "authenticatorData": base64url_encode(&auth),
+            "signature": base64url_encode(&signature),
+            "publicKey": base64url_encode(public),
+        })
+        .to_string(),
+    )
+}
+
+fn authenticator_data() -> [u8; 37] {
+    let mut out = [0u8; 37];
+    let rp_hash = sha256(WEBAUTHN_RP_ID.as_bytes());
+    out[..32].copy_from_slice(rp_hash.as_ref());
+    out[32] = 0x01 | 0x04;
+    out
+}
+
+fn sha256(data: &[u8]) -> ring::digest::Digest {
+    ring::digest::digest(&ring::digest::SHA256, data)
+}
+
+fn canonical_did(public: &[u8; 32]) -> String {
+    let mut payload = Vec::with_capacity(34);
+    payload.extend_from_slice(&[0xed, 0x01]);
+    payload.extend_from_slice(public);
+    format!("did:key:z{}", bs58::encode(payload).into_string())
+}
+
+fn constant_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
 
 fn is_verifier(stored: &str) -> bool {
     stored.starts_with(VERIFIER_PREFIX)
@@ -282,6 +459,50 @@ fn base64url_encode(data: &[u8]) -> String {
         out.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
     }
     out
+}
+
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() || text.len() > 4096 || !is_base64url(text) {
+        return None;
+    }
+    fn value(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let data = text.as_bytes();
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let mut index = 0;
+    while index + 4 <= data.len() {
+        let chunk = (value(data[index])? << 18)
+            | (value(data[index + 1])? << 12)
+            | (value(data[index + 2])? << 6)
+            | value(data[index + 3])?;
+        out.push((chunk >> 16) as u8);
+        out.push((chunk >> 8) as u8);
+        out.push(chunk as u8);
+        index += 4;
+    }
+    let rest = data.len() - index;
+    if rest == 1 {
+        return None;
+    }
+    if rest == 2 {
+        let chunk = (value(data[index])? << 18) | (value(data[index + 1])? << 12);
+        out.push((chunk >> 16) as u8);
+    } else if rest == 3 {
+        let chunk = (value(data[index])? << 18)
+            | (value(data[index + 1])? << 12)
+            | (value(data[index + 2])? << 6);
+        out.push((chunk >> 16) as u8);
+        out.push((chunk >> 8) as u8);
+    }
+    Some(out)
 }
 
 fn is_did_key(subject: &str) -> bool {
@@ -512,5 +733,93 @@ mod tests {
         assert!(!id.unlocked());
         assert!(id.remembered_pin().is_none());
         assert!(id.enrollment_copy().contains("was not checked"));
+    }
+
+    #[test]
+    fn a_checked_assertion_binds_the_canonical_did_and_rejects_the_rest() {
+        let device = w3cos_p2p::DeviceIdentity::from_seed([9u8; 32]);
+        let other = w3cos_p2p::DeviceIdentity::from_seed([4u8; 32]);
+        assert_eq!(canonical_did(&device.ed25519_public), device.did_key());
+        assert_ne!(device.did_key(), device.fingerprint());
+        assert!(device.fingerprint().starts_with("did:key:z"));
+
+        let mut id = LocalIdentityStub::new();
+        assert!(id.unlock_with_passphrase("alpha"));
+        let verifier = id.remembered_pin().expect("verifier").to_string();
+        let challenge = id.begin_passkey_enrollment().expect("challenge");
+        let assertion = device_assertion(&challenge, &device.ed25519_public, |message| {
+            device.sign(message).ok()
+        })
+        .expect("assertion");
+
+        assert_eq!(
+            id.accept_webauthn_assertion(&assertion, &other.ed25519_public),
+            Err(AssertionFault::Key)
+        );
+        assert_eq!(id.subject(), LocalIdentityStub::SUBJECT);
+        assert_eq!(id.method(), IdentityMethod::Stub);
+
+        let mut flipped: serde_json::Value = serde_json::from_str(&assertion).unwrap();
+        let signature = flipped["signature"].as_str().unwrap().to_string();
+        let mut bad = signature.into_bytes();
+        bad[0] = if bad[0] == b'A' { b'B' } else { b'A' };
+        flipped["signature"] = serde_json::Value::String(String::from_utf8(bad).unwrap());
+        assert_eq!(
+            id.accept_webauthn_assertion(&flipped.to_string(), &device.ed25519_public),
+            Err(AssertionFault::Signature)
+        );
+        assert_eq!(id.subject(), LocalIdentityStub::SUBJECT);
+
+        let mut client = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://evil.example\",\"crossOrigin\":false}}"
+        );
+        let mut forged = serde_json::from_str::<serde_json::Value>(&assertion).unwrap();
+        forged["clientDataJSON"] = serde_json::Value::String(base64url_encode(client.as_bytes()));
+        assert_eq!(
+            id.accept_webauthn_assertion(&forged.to_string(), &device.ed25519_public),
+            Err(AssertionFault::Origin)
+        );
+
+        client = format!(
+            "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{WEBAUTHN_ORIGIN}\",\"crossOrigin\":false}}"
+        );
+        forged["clientDataJSON"] = serde_json::Value::String(base64url_encode(client.as_bytes()));
+        assert_eq!(
+            id.accept_webauthn_assertion(&forged.to_string(), &device.ed25519_public),
+            Err(AssertionFault::Malformed)
+        );
+
+        forged = serde_json::from_str(&assertion).unwrap();
+        forged["publicKey"] =
+            serde_json::Value::String(base64url_encode(device.fingerprint().as_bytes()));
+        assert_eq!(
+            id.accept_webauthn_assertion(&forged.to_string(), &device.ed25519_public),
+            Err(AssertionFault::Key)
+        );
+        assert_eq!(id.method(), IdentityMethod::Stub);
+        assert!(!id.subject().contains(&device.fingerprint()));
+
+        assert!(
+            id.accept_webauthn_assertion(&assertion, &device.ed25519_public)
+                .is_ok()
+        );
+        assert_eq!(id.method(), IdentityMethod::Passkey);
+        assert_eq!(id.enrollment(), EnrollmentState::AssertionVerified);
+        assert_eq!(id.subject(), device.did_key());
+        assert_ne!(id.subject(), device.fingerprint());
+        assert!(id.enrollment_copy().contains("bound to the did:key"));
+        assert!(id.unlocked());
+        assert_eq!(id.remembered_pin(), Some(verifier.as_str()));
+        assert!(verifier.starts_with("pbkdf2-sha256$"));
+        id.lock();
+        assert!(id.unlock_with_passphrase("alpha"));
+
+        let mut again = LocalIdentityStub::new();
+        again.restore_subject(id.subject());
+        again
+            .restore_passkey_material(Some(challenge), id.passkey_public_key().map(str::to_string));
+        again.restore_enrollment(EnrollmentState::AssertionVerified);
+        assert_eq!(again.method(), IdentityMethod::Passkey);
+        assert_eq!(again.subject(), device.did_key());
     }
 }
