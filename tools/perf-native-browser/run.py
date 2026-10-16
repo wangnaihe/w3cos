@@ -37,6 +37,9 @@ WORKLOADS = (
     "css-list",
     "flex-list",
     "events",
+    "table-repaint",
+    "styled-scroll",
+    "text-layout",
 )
 # Per-side limits in milliseconds. Every WORKLOADS entry must appear here;
 # a missing key aborts the run before results are written.
@@ -51,6 +54,9 @@ TIMEOUTS_MS = {
     "css-list": 180000,
     "flex-list": 240000,
     "events": 180000,
+    "table-repaint": 180000,
+    "styled-scroll": 180000,
+    "text-layout": 180000,
 }
 # Production `w3cos build --release` embeds the size profile. speed and max
 # are measurement-only. panic stays unwind in every profile: JS exceptions
@@ -112,6 +118,10 @@ PGO_TRAIN_SUBSTITUTIONS = (
     ("var CSS_LIST_NODES = 1000;", "var CSS_LIST_NODES = 500;"),
     ("var FLEX_LIST_NODES = 400;", "var FLEX_LIST_NODES = 200;"),
     ("var EVENT_NODES = 400;", "var EVENT_NODES = 200;"),
+    ("var TABLE_ROWS = 24;", "var TABLE_ROWS = 12;"),
+    ("var TABLE_COLS = 6;", "var TABLE_COLS = 3;"),
+    ("var STYLED_NODES = 800;", "var STYLED_NODES = 400;"),
+    ("var TEXT_PARAS = 80;", "var TEXT_PARAS = 40;"),
     ("var cards = 40;", "var cards = 20;"),
     ("(k * 17)", "(k * 13)"),
     ("(frameIndex * 17)", "(frameIndex * 13)"),
@@ -718,9 +728,25 @@ def comparable(workload, native, browser):
             native_result.get("frames") == browser_result.get("frames")
             and numbers_close(native_result.get("checksum"), browser_result.get("checksum"), rel=0.02, abs_tol=4)
         )
-    if workload in ("layout", "layout-css", "memory", "css-list", "flex-list"):
+    if workload in (
+        "layout",
+        "layout-css",
+        "memory",
+        "css-list",
+        "flex-list",
+        "table-repaint",
+        "styled-scroll",
+        "text-layout",
+    ):
         count_ok = True
-        if workload in ("memory", "css-list", "flex-list"):
+        if workload in (
+            "memory",
+            "css-list",
+            "flex-list",
+            "table-repaint",
+            "styled-scroll",
+            "text-layout",
+        ):
             count_ok = native_result.get("count") == browser_result.get("count")
         return count_ok and numbers_close(checksum_of(native_result), checksum_of(browser_result), rel=0.02, abs_tol=8)
     if workload == "events":

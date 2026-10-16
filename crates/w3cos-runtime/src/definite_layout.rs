@@ -909,15 +909,6 @@ fn layout_authored(
     let margin_right = spacing_px(style.margin.right)?;
     let margin_bottom = spacing_px(style.margin.bottom)?;
     let margin_left = spacing_px(style.margin.left)?;
-    let root_margin = document
-        .get_node(id)
-        .tag
-        .with_str(|name| name.eq_ignore_ascii_case("html") || name.eq_ignore_ascii_case("body"));
-    if (margin_top != 0.0 || margin_right != 0.0 || margin_bottom != 0.0 || margin_left != 0.0)
-        && !root_margin
-    {
-        return None;
-    }
     let width = match style.width {
         Dimension::Px(width) if width.is_finite() && width >= 0.0 => width,
         Dimension::Percent(percent) if percent.is_finite() && percent >= 0.0 => {
@@ -935,9 +926,26 @@ fn layout_authored(
         Dimension::Auto => None,
         other => Some(px_size(other)?),
     };
+    let clips = !overflow_is_visible(style.overflow)
+        || style
+            .overflow_x
+            .is_some_and(|value| !overflow_is_visible(value))
+        || style
+            .overflow_y
+            .is_some_and(|value| !overflow_is_visible(value));
+    // An auto-height overflow box grows with its contents. A definite one
+    // keeps the specified border box and stacks children inside it.
+    if clips && specified_height.is_none() {
+        return None;
+    }
+    // Auto-height visible boxes collapse child margins through the parent.
+    // Definite or clipping boxes do not, so sibling margins still have to
+    // collapse with each other or this walk falls back to Taffy.
+    let child_margin_collapses_with_parent = specified_height.is_none() && !clips;
     let border_x = x + margin_left;
     let border_y = y + margin_top;
     let mut cursor = border_y;
+    let mut pending_bottom = 0.0;
     let mut child = document.get_node(id).first_child;
     while let Some(cid) = child {
         let (node_type, next) = {
@@ -957,6 +965,15 @@ fn layout_authored(
                     walk,
                     out,
                 )?;
+                if child_margin_collapses_with_parent
+                    && (placed.margin_top > 0.0 || placed.margin_bottom > 0.0)
+                {
+                    return None;
+                }
+                if pending_bottom > 0.0 && placed.margin_top > 0.0 {
+                    return None;
+                }
+                pending_bottom = placed.margin_bottom;
                 cursor += placed.margin_top + placed.border_height + placed.margin_bottom;
             }
             NodeType::Text => {
@@ -1002,9 +1019,6 @@ fn authored_box_ok(style: &Style) -> bool {
         && style.gap == 0.0
         && style.row_gap.unwrap_or(0.0) == 0.0
         && style.column_gap.unwrap_or(0.0) == 0.0
-        && overflow_is_visible(style.overflow)
-        && style.overflow_x.is_none_or(overflow_is_visible)
-        && style.overflow_y.is_none_or(overflow_is_visible)
         && spacing_is_zero(style.padding.top)
         && spacing_is_zero(style.padding.right)
         && spacing_is_zero(style.padding.bottom)
@@ -1033,5 +1047,110 @@ fn zero_subtree(document: &w3cos_dom::Document, id: NodeId, out: &mut Vec<(NodeI
     while let Some(cid) = child {
         zero_subtree(document, cid, out);
         child = w3cos_dom::node::sib(document.get_node(cid).next_sibling);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use w3cos_dom::node::NodeId;
+
+    fn fresh_rect(id: u32) -> crate::layout::LayoutRect {
+        let component = crate::dom::to_component_tree();
+        let results = crate::layout::compute_with_scroll_details(&component, 1024.0, 768.0)
+            .expect("full layout");
+        let flat = crate::layout::pre_flatten(&component);
+        results
+            .layout_cache
+            .iter()
+            .find_map(|(rect, index)| {
+                let info = flat.get(*index)?;
+                let w3cos_std::EventAction::NativeHost { id: host, .. } = info.on_click else {
+                    return None;
+                };
+                (*host == u64::from(id)).then_some(*rect)
+            })
+            .unwrap_or_else(|| panic!("node {id} missing from full layout"))
+    }
+
+    fn assert_matches(id: u32) {
+        let stored = crate::dom::bounding_rect(id);
+        let fresh = fresh_rect(id);
+        assert!(
+            (stored.x - fresh.x).abs() < 0.05
+                && (stored.y - fresh.y).abs() < 0.05
+                && (stored.width - fresh.width).abs() < 0.05
+                && (stored.height - fresh.height).abs() < 0.05,
+            "stored ({}, {}, {}, {}) diverges from {fresh:?}",
+            stored.x,
+            stored.y,
+            stored.width,
+            stored.height
+        );
+    }
+
+    #[test]
+    fn clipped_rows_with_one_sided_margin_match_full_layout() {
+        crate::dom::reset_document();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller",
+            &[
+                ("width", "420px"),
+                ("height", "120px"),
+                ("overflow", "auto"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller div",
+            &[("height", "24px"), ("margin", "0 0 2px 0")],
+        );
+        let scroller = crate::dom::create_element("div");
+        crate::dom::set_attribute(scroller, "id", "scroller");
+        let mut rows = Vec::new();
+        for index in 0..4 {
+            let row = crate::dom::create_element("div");
+            crate::dom::with_document_mut(|document| {
+                assert!(
+                    document
+                        .set_inline_text_child(NodeId::from_u32(row), &format!("styled {index}"))
+                        .is_some()
+                );
+            });
+            crate::dom::append_child(scroller, row);
+            rows.push(row);
+        }
+        crate::dom::append_child(crate::dom::body_id(), scroller);
+        assert!(super::try_apply(), "definite rows must skip Taffy");
+        assert_matches(scroller);
+        for row in rows {
+            assert_matches(row);
+        }
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn opposing_vertical_margins_do_not_use_the_row_stack() {
+        crate::dom::reset_document();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller",
+            &[("width", "200px"), ("height", "80px")],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller div",
+            &[("height", "20px"), ("margin", "8px 0 8px 0")],
+        );
+        let scroller = crate::dom::create_element("div");
+        crate::dom::set_attribute(scroller, "id", "scroller");
+        for _ in 0..2 {
+            let row = crate::dom::create_element("div");
+            crate::dom::append_child(scroller, row);
+        }
+        crate::dom::append_child(crate::dom::body_id(), scroller);
+        assert!(
+            !super::try_apply(),
+            "adjacent non-zero vertical margins stay on Taffy"
+        );
+        w3cos_dom::stylesheet::clear_rules();
     }
 }

@@ -1,0 +1,34 @@
+[package]
+name = "fontdue"
+version = "0.9.4"
+authors = ["Joe Cumbo <mooman219@gmail.com>"]
+license = "MIT OR Apache-2.0 OR Zlib"
+documentation = "https://docs.rs/fontdue"
+homepage = "https://github.com/mooman219/fontdue"
+repository = "https://github.com/mooman219/fontdue"
+description = "A simple no_std font parser and rasterizer."
+keywords = ["font", "text", "truetype", "opentype", "ttf"]
+categories = ["no-std", "gui"]
+readme = "README.md"
+edition = "2018"
+exclude = ["dev/**"]
+
+[badges]
+maintenance = { status = "experimental" }
+
+[features]
+# If using no default features, you must enable either hashbrown or std.
+default = ["simd", "hashbrown", "std"]
+# Enable this flag to use std::HashMap instead of hashbrown::HashMap
+std = []
+# Enable this flag to leverage SIMD usage on x86/x86_64 platforms.
+simd = []
+# Enable this flag to parallelize font loading using threads.
+parallel = ["rayon", "hashbrown", "hashbrown/rayon"]
+
+[dependencies]
+ttf-parser = { version = "0.25", default-features = false, features = [
+    "opentype-layout", "no-std-float"
+] }
+hashbrown = { version = "0.15", optional = true }
+rayon = { version = "1.10", optional = true }

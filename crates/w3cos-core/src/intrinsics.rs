@@ -614,6 +614,10 @@ pub struct DomFast {
     /// Returns the sum of the assigned string lengths, or `Undefined` when the
     /// fast path refuses before any mutation.
     pub rewrite_indexed_text: fn(&Value, &Value, &str, f64, f64, f64, f64, u64) -> Value,
+    /// One-shot `nodes[i].textContent = prefix + left + mid + i` for `i` in
+    /// `start..limit`. Returns the sum of the assigned string lengths, or
+    /// `Undefined` when the fast path refuses before any mutation.
+    pub fill_sequential_text: fn(&Value, &str, f64, &str, f64, f64, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -763,6 +767,37 @@ pub fn format_prefix_index<'a>(prefix: &str, index: f64, buf: &'a mut [u8]) -> O
     std::str::from_utf8(&buf[..prefix.len() + digits]).ok()
 }
 
+/// `prefix + left + mid + index` for two integer operands. ASCII pieces keep
+/// the UTF-16 length equal to the byte length.
+pub fn format_prefix_pair<'a>(
+    prefix: &str,
+    left: f64,
+    mid: &str,
+    index: f64,
+    buf: &'a mut [u8],
+) -> Option<&'a str> {
+    if !left.is_finite() || left.fract() != 0.0 || !(0.0..1e15).contains(&left) {
+        return None;
+    }
+    if !index.is_finite() || index.fract() != 0.0 || !(0.0..1e15).contains(&index) {
+        return None;
+    }
+    if !prefix.is_ascii() || !mid.is_ascii() {
+        return None;
+    }
+    if prefix.len() + mid.len() + 40 > buf.len() {
+        return None;
+    }
+    let mut at = 0usize;
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    at += prefix.len();
+    at += crate::value::write_i64(left as i64, &mut buf[at..]);
+    buf[at..at + mid.len()].copy_from_slice(mid.as_bytes());
+    at += mid.len();
+    at += crate::value::write_i64(index as i64, &mut buf[at..]);
+    std::str::from_utf8(&buf[..at]).ok()
+}
+
 /// `document.createElement(tag)` + id/class/text + `parent.appendChild` in one
 /// call. `id` and `text` are `prefix + index` with an integer index.
 pub fn dom_build_appended(
@@ -899,6 +934,24 @@ pub fn dom_rewrite_indexed_text_guarded(
 ) -> Value {
     if let Some(fast) = DOM_FAST.get() {
         (fast.rewrite_indexed_text)(nodes, parent, prefix, stride, modulus, start, limit, epoch)
+    } else {
+        Value::Undefined
+    }
+}
+
+/// Fused `nodes[i].textContent = prefix + left + mid + i`, or
+/// [`Value::Undefined`] when `epoch` is stale or the runtime refuses.
+pub fn dom_fill_sequential_text_guarded(
+    nodes: &Value,
+    prefix: &str,
+    left: f64,
+    mid: &str,
+    start: f64,
+    limit: f64,
+    epoch: u64,
+) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.fill_sequential_text)(nodes, prefix, left, mid, start, limit, epoch)
     } else {
         Value::Undefined
     }

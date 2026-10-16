@@ -380,6 +380,92 @@ fn family_rank(name: &str) -> u8 {
     }
 }
 
+/// Named families tried before the generic sans-serif fallback.
+/// The order is the host UI query; do not reorder it.
+const HOST_UI_NAMED_FAMILIES: &[&str] = &[
+    "PingFang SC",
+    "Microsoft YaHei",
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+    "Noto Sans",
+    "Roboto",
+];
+
+pub(super) fn host_ui_families() -> [fontdb::Family<'static>; 7] {
+    [
+        fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[0]),
+        fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[1]),
+        fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[2]),
+        fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[3]),
+        fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[4]),
+        fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[5]),
+        fontdb::Family::SansSerif,
+    ]
+}
+
+pub(super) struct PreferredHostFace {
+    pub bytes: Arc<Vec<u8>>,
+    pub index: u32,
+    pub family: String,
+}
+
+/// Fontconfig match for the host UI list, accepted only when a one-file
+/// fontdb query selects a regular face of one of those families.
+///
+/// A full `load_system_fonts` scan stays the fallback when this file would
+/// not be the database's choice (different weight, or only the generic
+/// sans-serif alias).
+pub(super) fn preferred_host_face() -> Option<PreferredHostFace> {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        pin_test_fontconfig();
+        let (path, _) = fontconfig_match_named(
+            "PingFang SC,Microsoft YaHei,Noto Sans CJK SC,Noto Sans SC,Noto Sans,Roboto,sans-serif:weight=regular:slant=0",
+        )?;
+        let mut database = fontdb::Database::new();
+        database.load_font_file(&path).ok()?;
+        let families = [
+            fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[0]),
+            fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[1]),
+            fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[2]),
+            fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[3]),
+            fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[4]),
+            fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[5]),
+        ];
+        let id = database.query(&fontdb::Query {
+            families: &families,
+            weight: fontdb::Weight::NORMAL,
+            ..fontdb::Query::default()
+        })?;
+        let face = database.face(id)?;
+        let weight = face.weight.0;
+        if !(350..=450).contains(&weight) {
+            return None;
+        }
+        let family = face
+            .families
+            .iter()
+            .find(|(name, _)| {
+                HOST_UI_NAMED_FAMILIES
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(name))
+            })?
+            .0
+            .clone();
+        let index = face.index;
+        let bytes = database.with_face_data(id, |data, _| Arc::new(data.to_vec()))?;
+        return Some(PreferredHostFace {
+            bytes,
+            index,
+            family,
+        });
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    {
+        None
+    }
+}
+
 fn fontconfig_fallback(character: char) -> Option<LoadedFont> {
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
@@ -402,6 +488,99 @@ fn fontconfig_fallback(character: char) -> Option<LoadedFont> {
     {
         let _ = character;
         None
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn fontconfig_match_named(pattern: &str) -> Option<(std::path::PathBuf, u32)> {
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::sync::OnceLock;
+
+    struct Fc {
+        init: unsafe extern "C" fn() -> *mut c_void,
+        name_parse: unsafe extern "C" fn(*const u8) -> *mut c_void,
+        pattern_destroy: unsafe extern "C" fn(*mut c_void),
+        config_substitute: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int) -> c_int,
+        default_substitute: unsafe extern "C" fn(*mut c_void),
+        font_match: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_int) -> *mut c_void,
+        pattern_get_string:
+            unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut *mut u8) -> c_int,
+        pattern_get_integer:
+            unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut c_int) -> c_int,
+    }
+
+    fn library() -> Option<&'static Fc> {
+        static LOADED: OnceLock<Option<Fc>> = OnceLock::new();
+        LOADED.get_or_init(|| unsafe { load_fontconfig() }).as_ref()
+    }
+
+    unsafe fn load_fontconfig() -> Option<Fc> {
+        unsafe {
+            let name = CString::new("libfontconfig.so.1").ok()?;
+            let handle = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+            if handle.is_null() {
+                return None;
+            }
+            let symbol = |symbol: &[u8]| unsafe {
+                let name = CString::new(symbol).ok()?;
+                let pointer = libc::dlsym(handle, name.as_ptr());
+                if pointer.is_null() {
+                    None
+                } else {
+                    Some(pointer)
+                }
+            };
+            Some(Fc {
+                init: std::mem::transmute(symbol(b"FcInitLoadConfigAndFonts")?),
+                name_parse: std::mem::transmute(symbol(b"FcNameParse")?),
+                pattern_destroy: std::mem::transmute(symbol(b"FcPatternDestroy")?),
+                config_substitute: std::mem::transmute(symbol(b"FcConfigSubstitute")?),
+                default_substitute: std::mem::transmute(symbol(b"FcDefaultSubstitute")?),
+                font_match: std::mem::transmute(symbol(b"FcFontMatch")?),
+                pattern_get_string: std::mem::transmute(symbol(b"FcPatternGetString")?),
+                pattern_get_integer: std::mem::transmute(symbol(b"FcPatternGetInteger")?),
+            })
+        }
+    }
+
+    let fc = library()?;
+    let pattern_name = CString::new(pattern).ok()?;
+    unsafe {
+        if (fc.init)().is_null() {
+            return None;
+        }
+        let pattern = (fc.name_parse)(pattern_name.as_ptr() as *const u8);
+        if pattern.is_null() {
+            return None;
+        }
+        let file_key = c"file".as_ptr();
+        let index_key = c"index".as_ptr();
+        (fc.config_substitute)(std::ptr::null_mut(), pattern, 0);
+        (fc.default_substitute)(pattern);
+        let mut result = 0;
+        let matched = (fc.font_match)(std::ptr::null_mut(), pattern, &mut result);
+        let resolved = if matched.is_null() || result != 0 {
+            None
+        } else {
+            let mut file_ptr: *mut u8 = std::ptr::null_mut();
+            let mut index = 0;
+            let file_ok = (fc.pattern_get_string)(matched, file_key, 0, &mut file_ptr) == 0
+                && !file_ptr.is_null();
+            let _ = (fc.pattern_get_integer)(matched, index_key, 0, &mut index);
+            if file_ok {
+                CStr::from_ptr(file_ptr as *const c_char)
+                    .to_str()
+                    .ok()
+                    .map(|file| (std::path::PathBuf::from(file), index.max(0) as u32))
+            } else {
+                None
+            }
+        };
+        if !matched.is_null() {
+            (fc.pattern_destroy)(matched);
+        }
+        (fc.pattern_destroy)(pattern);
+        resolved
     }
 }
 
@@ -526,6 +705,58 @@ fn fontconfig_match(character: char) -> Option<(std::path::PathBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn preferred_host_face_is_a_regular_named_family() {
+        let fast = preferred_host_face().expect("fontconfig host face");
+        assert!(!fast.bytes.is_empty());
+        assert!(
+            HOST_UI_NAMED_FAMILIES
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&fast.family)),
+            "fast face family {}",
+            fast.family
+        );
+        let mut lone = fontdb::Database::new();
+        let path = std::env::temp_dir().join("w3cos-preferred-host-face.ttf");
+        std::fs::write(&path, fast.bytes.as_slice()).unwrap();
+        lone.load_font_file(&path).unwrap();
+        let id = lone
+            .query(&fontdb::Query {
+                families: &HOST_UI_NAMED_FAMILIES
+                    .iter()
+                    .copied()
+                    .map(fontdb::Family::Name)
+                    .collect::<Vec<_>>(),
+                weight: fontdb::Weight::NORMAL,
+                ..fontdb::Query::default()
+            })
+            .expect("named regular face");
+        let face = lone.face(id).unwrap();
+        assert!((350..=450).contains(&face.weight.0));
+        assert_eq!(face.index, fast.index);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn host_ui_font_matches_the_database_query() {
+        let host = crate::font_face::host_ui_font();
+        let database = database();
+        let id = database
+            .query(&fontdb::Query {
+                families: &host_ui_families(),
+                weight: fontdb::Weight::NORMAL,
+                ..fontdb::Query::default()
+            })
+            .or_else(|| database.faces().next().map(|face| face.id))
+            .expect("database host face");
+        let (bytes, index) = database
+            .with_face_data(id, |data, index| (data.to_vec(), index))
+            .expect("database face bytes");
+        assert_eq!(host.index, index);
+        assert_eq!(host.data.as_slice(), bytes.as_slice());
+    }
 
     #[test]
     fn latin_face_without_cjk_falls_back_to_an_installed_cjk_face() {

@@ -67,7 +67,7 @@ taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout",
 parley = "0.7"
 unicode-bidi = "0.3.18"
 unicode-bidi-mirroring = "0.4.0"
-fontdue = "0.9"
+fontdue = { path = "third_party/fontdue" }
 
 # Rendering: Skia (Blink-aligned primary) + Vello/tiny-skia compatibility backends
 vello = { path = "third_party/vello" }

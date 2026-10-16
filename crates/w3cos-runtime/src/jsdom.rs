@@ -1508,6 +1508,7 @@ fn ensure_dom_fast() {
         build_flex_row: fast_build_flex_row_guarded,
         build_text: fast_build_text_guarded,
         rewrite_indexed_text: fast_rewrite_indexed_text,
+        fill_sequential_text: fast_fill_sequential_text,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -1928,19 +1929,138 @@ fn fast_rewrite_indexed_text(
     }
     let mut sum = 0usize;
     let mut buf = [0u8; 96];
+    let mut applied = true;
     dom::with_document_mut(|doc| {
         let parent = w3cos_dom::NodeId::from_u32(parent_id);
         for k in start..limit {
             let index = js_positive_mod(k.wrapping_mul(stride), modulus) as usize;
             let child = w3cos_dom::NodeId::from_u32(ids[index]);
-            // Prefix length and the integer range were checked above.
+            // Prefix length and the integer range were checked above. The
+            // prefix is ASCII and the suffix is decimal digits, so the
+            // UTF-16 length is the byte length.
             let text = w3cos_core::intrinsics::format_prefix_index(prefix, k as f64, &mut buf)
                 .expect("indexed text format");
-            sum += text.encode_utf16().count();
-            let _ = doc.set_inline_text_child(child, text);
-            doc.append_child(parent, child);
+            if !doc.set_inline_text_unnoted(child, text)
+                || !doc.move_child_to_end_unnoted(parent, child)
+            {
+                applied = false;
+                break;
+            }
+            sum += text.len();
+        }
+        if applied {
+            doc.note_batched_child_edits(parent);
         }
     });
+    assert!(
+        applied,
+        "indexed text rewrite preconditions passed but a node refused the batch"
+    );
+    dom::mark_dom_dirty();
+    Value::Number(sum as f64)
+}
+
+/// `nodes[i].textContent = prefix + left + mid + i` for a dense element list.
+///
+/// Refuses before the first write when any index is not a single text child
+/// or `textContent` is no longer the builtin. Each write still goes through
+/// `mark_text_dirty`, so a fixed clipped cell stays a repaint and a
+/// shrink-to-fit cell still invalidates layout.
+fn fast_fill_sequential_text(
+    nodes: &Value,
+    prefix: &str,
+    left: f64,
+    mid: &str,
+    start: f64,
+    limit: f64,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !prefix.is_ascii()
+        || !mid.is_ascii()
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::tree_order_affects_matching()
+    {
+        return Value::Undefined;
+    }
+    let Some(left) = integer_in_range(left, 0, 1_000_000_000) else {
+        return Value::Undefined;
+    };
+    let Some(start) = integer_in_range(start, 0, 1_000_000) else {
+        return Value::Undefined;
+    };
+    let Some(limit) = integer_in_range(limit, 0, 1_000_000) else {
+        return Value::Undefined;
+    };
+    if limit < start {
+        return Value::Undefined;
+    }
+    if start == limit {
+        return Value::Number(0.0);
+    }
+    let Some(array) = nodes.as_array() else {
+        return Value::Undefined;
+    };
+    let stored = array.borrow();
+    if stored.len() < limit as usize {
+        return Value::Undefined;
+    }
+    let mut ids = Vec::with_capacity((limit - start) as usize);
+    for index in start..limit {
+        let Some(value) = stored.get(index as usize) else {
+            return Value::Undefined;
+        };
+        let Some(id) = node_id_of(value) else {
+            return Value::Undefined;
+        };
+        if !matches!(silent_lookup(value, "textContent"), SilentLookup::Missing) {
+            return Value::Undefined;
+        }
+        ids.push(id);
+    }
+    drop(stored);
+    let ready = dom::with_document(|doc| {
+        ids.iter().all(|id| {
+            let node = doc.get_node(w3cos_dom::NodeId::from_u32(*id));
+            node.node_type == w3cos_dom::node::NodeType::Element
+                && node.first_child.is_some_and(|text| {
+                    let text = doc.get_node(text);
+                    text.node_type == w3cos_dom::node::NodeType::Text && text.next_sibling == 0
+                })
+        })
+    });
+    if !ready {
+        return Value::Undefined;
+    }
+    let mut sum = 0usize;
+    let mut buf = [0u8; 96];
+    let mut applied = true;
+    dom::with_document_mut(|doc| {
+        for (offset, id) in ids.iter().enumerate() {
+            let index = start + offset as i64;
+            let text = w3cos_core::intrinsics::format_prefix_pair(
+                prefix,
+                left as f64,
+                mid,
+                index as f64,
+                &mut buf,
+            )
+            .expect("sequential text format");
+            let child = w3cos_dom::NodeId::from_u32(*id);
+            if doc.set_inline_text_child(child, text).is_none() {
+                applied = false;
+                break;
+            }
+            sum += text.len();
+        }
+    });
+    assert!(
+        applied,
+        "sequential text fill preconditions passed but a node refused the write"
+    );
     dom::mark_dom_dirty();
     Value::Number(sum as f64)
 }
@@ -9148,28 +9268,66 @@ fn scroll_element_into_view(node: u32, options: Value) {
     }
 }
 
+struct ScrollSizeEntry {
+    node: u32,
+    epoch: u64,
+    size: (f64, f64),
+}
+
+thread_local! {
+    static SCROLL_SIZES: RefCell<Vec<ScrollSizeEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn invalidate_scroll_size_cache() {
+    SCROLL_SIZES.with(|cache| cache.borrow_mut().clear());
+}
+
 fn forced_scroll_size(node: u32) -> (f64, f64) {
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
             (
+                document.geometry_epoch(),
                 element.scroll_width(document) as f64,
                 element.scroll_height(document) as f64,
             )
         })
     };
-    let live = read();
-    if live.0 > 0.0 || live.1 > 0.0 {
-        return live;
+    let epoch_now = dom::with_document(|document| document.geometry_epoch());
+    if let Some(hit) = SCROLL_SIZES.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|entry| entry.node == node && entry.epoch == epoch_now)
+            .map(|entry| entry.size)
+    }) {
+        return hit;
     }
-
-    // CSSOM layout reads are synchronous in browsers. React relies on that
-    // when it reads scrollHeight in an effect that can run before our first
-    // native paint, so flush the persistent tree rather than exposing zero.
-    if !crate::incremental_layout::flush() {
-        return live;
+    let mut live = read();
+    if live.1 == 0.0 && live.2 == 0.0 && crate::incremental_layout::flush() {
+        // A layout pass before the first paint publishes the scrollport.
+        live = read();
     }
-    read()
+    SCROLL_SIZES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.iter_mut().find(|entry| entry.node == node) {
+            *entry = ScrollSizeEntry {
+                node,
+                epoch: live.0,
+                size: (live.1, live.2),
+            };
+        } else {
+            if cache.len() == 8 {
+                cache.remove(0);
+            }
+            cache.push(ScrollSizeEntry {
+                node,
+                epoch: live.0,
+                size: (live.1, live.2),
+            });
+        }
+    });
+    (live.1, live.2)
 }
 
 fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
@@ -9354,9 +9512,17 @@ fn definite_independent_border_box(
     ))
 }
 
+fn element_position(node: u32) -> w3cos_std::style::Position {
+    dom::with_document(|document| {
+        let id = NodeId::from_u32(node);
+        document
+            .cached_position(id)
+            .unwrap_or_else(|| document.computed_style_for(id).position)
+    })
+}
+
 fn offset_parent_node(node: u32) -> Option<u32> {
-    let position =
-        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)).position);
+    let position = element_position(node);
     if matches!(position, w3cos_std::style::Position::Fixed)
         || matches!(dom::tag_name(node).as_str(), "html" | "body")
     {
@@ -9367,14 +9533,10 @@ fn offset_parent_node(node: u32) -> Option<u32> {
     while let Some(candidate) = ancestor {
         if dom::node_type(candidate) == 1 {
             let tag = dom::tag_name(candidate);
-            let positioned = dom::with_document(|document| {
-                !matches!(
-                    document
-                        .computed_style_for(NodeId::from_u32(candidate))
-                        .position,
-                    w3cos_std::style::Position::Static
-                )
-            });
+            let positioned = !matches!(
+                element_position(candidate),
+                w3cos_std::style::Position::Static
+            );
             if positioned || matches!(tag.as_str(), "body" | "table" | "td" | "th") {
                 return Some(candidate);
             }
@@ -9390,14 +9552,20 @@ fn offset_position(node: u32) -> (f32, f32) {
         return (rect.x, rect.y);
     };
     let parent_rect = forced_bounding_rect(parent);
-    let parent_style =
-        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(parent)));
-    let border_left = parent_style
-        .border_left_width
-        .unwrap_or(parent_style.border_width);
-    let border_top = parent_style
-        .border_top_width
-        .unwrap_or(parent_style.border_width);
+    let (border_left, border_top) = dom::with_document(|document| {
+        let id = NodeId::from_u32(parent);
+        document.cached_border_left_top(id).unwrap_or_else(|| {
+            let parent_style = document.computed_style_for(id);
+            (
+                parent_style
+                    .border_left_width
+                    .unwrap_or(parent_style.border_width),
+                parent_style
+                    .border_top_width
+                    .unwrap_or(parent_style.border_width),
+            )
+        })
+    });
     (
         rect.x - parent_rect.x - border_left,
         rect.y - parent_rect.y - border_top,
@@ -21530,10 +21698,9 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     {
         let started = Instant::now();
-        let frame = crate::headless::render_document_rgba(width, height)
+        let checksum = crate::headless::render_document_checksum(width, height)
             .map_err(|error| error.to_string())?;
         let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let checksum = crate::headless::frame_byte_checksum(&frame.rgba);
         return Ok((checksum, paint_ms));
     }
     #[cfg(not(any(feature = "skia", feature = "cpu-render")))]
@@ -22561,6 +22728,7 @@ mod tests {
             nodes.call_method("push", vec![el]);
         }
         let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let generation = dom::with_document(|doc| doc.structure_generation());
         let rewritten = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
             &nodes, &root, "upd ", 17.0, 4.0, 0.0, 6.0, epoch,
         );
@@ -22568,12 +22736,59 @@ mod tests {
         let (sum, texts) = simulate_indexed_rewrite(4, 17, 0, 6);
         assert_eq!(rewritten.to_number(), sum);
         assert_eq!(child_texts(&root), texts);
+        let generation_after = dom::with_document(|doc| doc.structure_generation());
+        assert_eq!(
+            generation_after.wrapping_sub(generation),
+            1,
+            "the fused rewrite dirties the tree once"
+        );
         assert_eq!(
             root.get_property("childNodes")
                 .get_property("length")
                 .to_u32(),
             4
         );
+    }
+
+    #[test]
+    fn sequential_text_fill_matches_prefix_pair_lengths() {
+        setup();
+        ensure_dom_fast();
+        w3cos_dom::stylesheet::clear_rules();
+        let doc = document_value();
+        let root = doc.call_method("createElement", vec![Value::string("div")]);
+        doc.get_property("body")
+            .call_method("appendChild", vec![root.clone()]);
+        let nodes = Value::array(Vec::new());
+        for i in 0..3 {
+            let el = doc.call_method("createElement", vec![Value::string("div")]);
+            el.set_property("textContent", Value::string(&format!("c {i}")));
+            root.call_method("appendChild", vec![el.clone()]);
+            nodes.call_method("push", vec![el]);
+        }
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let filled = w3cos_core::intrinsics::dom_fill_sequential_text_guarded(
+            &nodes, "v ", 2.0, "-", 0.0, 3.0, epoch,
+        );
+        assert!(!filled.is_undefined(), "dense text cells take the fill");
+        let expected = ["v 2-0", "v 2-1", "v 2-2"];
+        let sum: usize = expected.iter().map(|text| text.len()).sum();
+        assert_eq!(filled.to_number(), sum as f64);
+        assert_eq!(child_texts(&root), expected.map(str::to_string).to_vec());
+        let refused = w3cos_core::intrinsics::dom_fill_sequential_text_guarded(
+            &nodes,
+            "v ",
+            2.0,
+            "-",
+            0.0,
+            3.0,
+            epoch.wrapping_add(1),
+        );
+        assert!(
+            refused.is_undefined(),
+            "a stale epoch refuses before writing"
+        );
+        assert_eq!(child_texts(&root), expected.map(str::to_string).to_vec());
     }
 
     fn indexed_rewrite_fixture() -> (Value, Value, Vec<u32>) {
@@ -31241,6 +31456,15 @@ try {
         assert_eq!(container.get_property("clientHeight").to_number(), 100.0);
         assert_eq!(container.get_property("scrollWidth").to_number(), 180.0);
         assert_eq!(container.get_property("scrollHeight").to_number(), 270.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 270.0);
+        dom::with_document_mut(|document| {
+            document.set_layout_rect(
+                NodeId::from_u32(target_id),
+                w3cos_dom::DOMRect::new(10.0, 250.0, 180.0, 80.0),
+            );
+        });
+        assert_eq!(container.get_property("scrollHeight").to_number(), 310.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 310.0);
     }
 
     #[test]

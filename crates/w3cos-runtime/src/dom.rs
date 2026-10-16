@@ -73,6 +73,7 @@ pub fn reset_document() {
     clear_document_dirty();
     crate::incremental_layout::invalidate();
     crate::definite_layout::invalidate();
+    crate::jsdom::invalidate_scroll_size_cache();
 }
 
 // ---------------------------------------------------------------------------
