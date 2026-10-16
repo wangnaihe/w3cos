@@ -159,7 +159,7 @@ struct Gray {
 }
 
 fn load_session(path: &Path) -> Option<Session> {
-    let env = shared_env()?;
+    let env = ort_environment()?;
     Session::builder(env)
         .ok()?
         .with_optimization_level(GraphOptimizationLevel::Level1)
@@ -170,7 +170,9 @@ fn load_session(path: &Path) -> Option<Session> {
         .ok()
 }
 
-fn shared_env() -> Option<&'static ort::environment::Environment> {
+/// One process-wide ONNX Runtime environment. CPU is the only provider this
+/// crate enables. A second `ort::init` would fail, so screen text uses this.
+pub(crate) fn ort_environment() -> Option<&'static ort::environment::Environment> {
     static SLOT: Mutex<Option<&'static ort::environment::Environment>> = Mutex::new(None);
     let mut guard = SLOT.lock().unwrap_or_else(|poison| poison.into_inner());
     if let Some(env) = *guard {
@@ -396,6 +398,18 @@ fn class_label(class: usize, classes: usize, dict: &[String]) -> Option<&str> {
         return Some(" ");
     }
     None
+}
+
+/// One line, greedy CTC. Handwriting n-best stays in [`ctc_nbest`], which
+/// keeps only short candidates. Screen lines can be longer than that.
+pub(crate) fn ctc_greedy(
+    logits: &[f32],
+    time: usize,
+    classes: usize,
+    dict: &[String],
+) -> Option<String> {
+    let text = greedy_decode(logits, time, classes, dict);
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn greedy_decode(logits: &[f32], time: usize, classes: usize, dict: &[String]) -> String {

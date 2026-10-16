@@ -21,7 +21,8 @@ use crate::state;
 use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellCommand, ShellContext,
+    Decision, ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellCommand,
+    ShellContext,
 };
 use w3cos_ai_bridge::permissions::{AgentPermissions, BridgeOp};
 use w3cos_ai_bridge::shell_tools::{self, ShellView};
@@ -186,6 +187,9 @@ const OP_PAIR_IMPORT: u8 = 111;
 const OP_IME_MODEL: u8 = 112;
 const OP_IME_INK_CLEAR: u8 = 113;
 const OP_IME_INK_MODEL: u8 = 114;
+const OP_IME_SCREEN_YES: u8 = 115;
+const OP_IME_SCREEN_NO: u8 = 116;
+const OP_IME_SCREEN_MODEL: u8 = 117;
 
 fn main() {
     shell_main();
@@ -1979,6 +1983,9 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             if let Some(key) = ime_bar::take_ink_toast() {
                 push_toast(&locale::t(key));
             }
+            if let Some(key) = ime_bar::take_screen_toast() {
+                push_toast(&locale::t(key));
+            }
         }
         OP_IME_MODE => {
             ime_bar::toggle_mode();
@@ -2006,7 +2013,34 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::mark_dirty();
         }
         OP_IME_INK_CLEAR => ime_bar::clear_ink(),
-        OP_IME_SCREEN => push_toast(&locale::t("ime-toast-screen")),
+        OP_IME_SCREEN => {
+            let key = ime_bar::screen_tap();
+            flush_screen_decision();
+            if let Some(key) = key {
+                push_toast(&locale::t(key));
+            }
+            state::mark_dirty();
+        }
+        OP_IME_SCREEN_YES => {
+            let key = ime_bar::screen_allow();
+            flush_screen_decision();
+            if let Some(key) = key {
+                push_toast(&locale::t(key));
+            }
+            state::mark_dirty();
+        }
+        OP_IME_SCREEN_NO => {
+            let key = ime_bar::screen_cancel();
+            flush_screen_decision();
+            if let Some(key) = key {
+                push_toast(&locale::t(key));
+            }
+            state::mark_dirty();
+        }
+        OP_IME_SCREEN_MODEL => {
+            push_toast(&locale::t(ime_bar::confirm_screen_model()));
+            state::mark_dirty();
+        }
         OP_IME_CLIPBOARD => {
             let text = match ime_bar::local_clipboard_gate() {
                 ime_bar::ClipboardGate::Read => read_clipboard(),
@@ -2281,7 +2315,14 @@ fn apply_screen_override() {
             push_toast(&locale::t("toast-browser-min"));
         }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
-        Some("ime-smart") | Some("ime-voice") | Some("ime-ink") | Some("ime-ink-pad") => {
+        Some("ime-smart")
+        | Some("ime-voice")
+        | Some("ime-ink")
+        | Some("ime-ink-pad")
+        | Some("ime-screen")
+        | Some("ime-screen-model")
+        | Some("ime-screen-ask")
+        | Some("ime-screen-region") => {
             focus_app(0);
             state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
                 index: 4,
@@ -2301,6 +2342,17 @@ fn apply_screen_override() {
                     }
                 }
                 Some("ime-ink-pad") => ime_bar::show_ink_pad_for_screen(),
+                Some("ime-screen") => {
+                    if let Some(key) = ime_bar::screen_tap() {
+                        push_toast(&locale::t(key));
+                    }
+                }
+                Some("ime-screen-model") => {
+                    present_settings(6, 0);
+                    ime_bar::arm_screen_model_confirm_for_screen();
+                }
+                Some("ime-screen-ask") => ime_bar::show_screen_ask_for_screen(),
+                Some("ime-screen-region") => ime_bar::show_screen_region_for_screen(),
                 _ => {}
             }
         }
@@ -2315,6 +2367,14 @@ fn install_ime_hooks() {
 }
 
 fn on_shell_ink(phase: u8, x: f32, y: f32) {
+    if ime_bar::screen_drag_active() {
+        ime_bar::screen_pointer(phase, x, y);
+        flush_screen_decision();
+        if let Some(key) = ime_bar::take_screen_toast() {
+            push_toast(&locale::t(key));
+        }
+        return;
+    }
     ime_bar::ink_pointer(phase, x, y);
 }
 
@@ -2348,9 +2408,47 @@ fn on_shell_hold(code: u8, phase: u8) {
 }
 
 fn on_shell_poll() {
+    flush_screen_decision();
+    if ime_bar::poll_screen() {
+        if let Some(key) = ime_bar::take_screen_toast() {
+            push_toast(&locale::t(key));
+        }
+    }
     if ime_bar::poll_voice() {
         apply_ime_field();
     }
+}
+
+fn flush_screen_decision() {
+    let Some(decision) = ime_bar::take_screen_decision() else {
+        return;
+    };
+    let (decision, outcome) = match decision {
+        ime_bar::ScreenDecision::Allowed => {
+            (Decision::Allowed, locale::t("ime-screen-receipt-allowed"))
+        }
+        ime_bar::ScreenDecision::Cancelled => (
+            Decision::Cancelled,
+            locale::t("ime-screen-receipt-cancelled"),
+        ),
+    };
+    record_screen_receipt(decision, &outcome);
+}
+
+fn record_screen_receipt(decision: Decision, outcome: &str) {
+    let utterance = locale::t("ime-screen-title");
+    with_session(|session| {
+        session.record_external(
+            &utterance,
+            "screen-region",
+            decision,
+            decision == Decision::Allowed,
+            outcome,
+            IntentTier::L0,
+        );
+        state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(48));
+    });
+    let _ = absorb_new_receipts();
 }
 
 fn build_shell() -> Component {
@@ -2437,6 +2535,9 @@ fn build_shell() -> Component {
     }
     if let Some(pad) = ime_bar::ink_pad_layer() {
         column.push(pad);
+    }
+    if let Some(screen) = ime_bar::screen_layer() {
+        column.push(screen);
     }
     if !unlocked && !screenshot_shows_locked_permission() {
         column.push(place_overlay(build_lock_screen()));
@@ -6060,6 +6161,13 @@ fn settings_language_page() -> Vec<Component> {
     if let Some(key) = ime_bar::ink_model_button_key() {
         rows.push(settings_link(locale::t(key), OP_IME_INK_MODEL));
     }
+    rows.push(settings_row(
+        &locale::t("ime-screen-model"),
+        &locale::t(ime_bar::screen_model_status_key()),
+    ));
+    if let Some(key) = ime_bar::screen_model_button_key() {
+        rows.push(settings_link(locale::t(key), OP_IME_SCREEN_MODEL));
+    }
     rows
 }
 
@@ -8904,7 +9012,7 @@ mod shell_ux_tests {
         on_shell_intent(OP_IME_SCREEN, "");
         assert_eq!(
             state::get_signal_text(TOAST_SIGNAL),
-            locale::t("ime-toast-screen")
+            locale::t("ime-toast-screen-offer")
         );
         assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
         assert_eq!(state::get_signal(APP_SIGNAL), 0);
@@ -8932,6 +9040,112 @@ mod shell_ux_tests {
         state::clear_ime_field();
         ime_bar::reset_for_tests();
         state::set_text_signal(TOAST_SIGNAL, "");
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn screen_permission_is_a_receipt_and_does_not_capture_by_itself() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use w3cos_ime::{
+            LocalScreenText, ScreenImage, ScreenRegion, ScreenSnippet, ScreenTextManifest,
+        };
+
+        struct Probe {
+            calls: std::sync::Arc<AtomicU32>,
+        }
+
+        impl LocalScreenText for Probe {
+            fn manifest(&self) -> ScreenTextManifest {
+                ScreenTextManifest {
+                    id: "test.screen".into(),
+                    locales: vec!["zh-Hans".into()],
+                    network: false,
+                    available: true,
+                }
+            }
+
+            fn recognize(
+                &mut self,
+                _image: &ScreenImage,
+                _region: ScreenRegion,
+            ) -> Vec<ScreenSnippet> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                vec![ScreenSnippet {
+                    text: "不应出现".into(),
+                    score: 1.0,
+                }]
+            }
+        }
+
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        ime_bar::reset_for_tests();
+        let calls = std::sync::Arc::new(AtomicU32::new(0));
+        ime_bar::install_screen_for_tests(Box::new(Probe {
+            calls: calls.clone(),
+        }));
+        state::note_ime_field(state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 80.0,
+            y: 180.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        on_shell_intent(OP_IME_SCREEN, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-screen-ask")
+        );
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(blob.contains(&locale::t("ime-screen-title")), "{blob}");
+        assert!(blob.contains(&locale::t("ime-screen-impact")), "{blob}");
+        on_shell_intent(OP_IME_SCREEN_NO, "");
+        let log = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(log.contains("cancelled"), "{log}");
+        assert!(log.contains("screen-region"), "{log}");
+        assert!(!log.contains("不应出现"), "{log}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+
+        on_shell_intent(OP_IME_SCREEN, "");
+        on_shell_intent(OP_IME_SCREEN_YES, "");
+        let log = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(log.contains("allowed"), "{log}");
+        assert!(log.contains("screen-region"), "{log}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(blob.contains(&locale::t("ime-screen-hint")), "{blob}");
+
+        let dir =
+            std::env::temp_dir().join(format!("w3cos-screen-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ime_bar::reset_for_tests();
+        ime_bar::set_screen_dir_for_tests(Some(dir.clone()));
+        ime_bar::set_handwriting_dir_for_tests(Some(dir.clone()));
+        present_settings(6, 0);
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(blob.contains(&locale::t("ime-screen-model")), "{blob}");
+        assert!(blob.contains(&locale::t("ime-screen-model-off")), "{blob}");
+        on_shell_intent(OP_IME_SCREEN_MODEL, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-screen-confirm")
+        );
+        assert!(!dir.join(w3cos_ime::DET_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
         locale::set_locale("en");
     }
 
