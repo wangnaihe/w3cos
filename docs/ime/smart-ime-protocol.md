@@ -243,7 +243,7 @@ C ABI 1.1 插件接口增加 `w3cos_ime_engine_v1` 入口，与共享运行时�
 ## 13. 交互要点（桌面 + 手机）
 
 - 桌面：候选条贴近光标；意图提议以浅色芯片显示在候选末尾；`Tab` 接受补全，`Ctrl+Z` 原子撤销，`Esc` 收起。
-- 手机：键盘上方“智能条”= 候选 + 动作芯片；长按麦克风流式语音；手写区直接写入字段（Scribble 式）；划除手势删除。P3 在键盘上方另有一行模态：没有本机语音模型时麦克风标为关闭，按住也不会录音；接上本地引擎后按住麦克风出流式文字，松开写入，可撤销。手写、识屏在没有本机模型或截图授权时标为关闭。剪贴板仅在点按后读一次本机文字。
+- 手机：键盘上方“智能条”= 候选 + 动作芯片；长按麦克风流式语音；手写板占键盘的位置，候选进同一条候选条，点选后写入，可撤销。划除手势删除仍未做。P3 在键盘上方另有一行模态：没有本机语音模型时麦克风标为关闭，按住也不会录音；接上本地引擎后按住麦克风出流式文字，松开写入，可撤销。没有本机手写模型时手写标为关闭，点按不识别。识屏在没有截图授权时标为关闭。剪贴板仅在点按后读一次本机文字。
 - 统一：动作芯片永远带图标与“需确认”标识；远端引擎工作时显示网络标记。
 
 ## 14. 开放问题
@@ -276,19 +276,23 @@ C ABI 1.1 插件接口增加 `w3cos_ime_engine_v1` 入口，与共享运行时�
 - P0：`spec/ime/w3cos-ime-1.schema.json` 已在仓库中。
 - P1：Hub、捆绑拼音词典、preedit / candidate / commit / undo、安全字段旁路已在 `w3cos-ime` 与 shell 中。未链接 librime。
 - P2：意图栏与 ActionProposal 确认（#77）；加密个人词库（#79）。
-- P3：剪贴板与长按麦克风已落地，见下。手写识别与 OCR 未做。语音模型不随仓库分发，须经确认后下载到本机。
+- P3：剪贴板、长按麦克风与手写板已落地，见下。OCR 未做。语音模型和手写模型不随仓库分发，须经确认后下载到本机。
 - P4–P7：未开始。
 
 P3 已落地（本机，无网络，无账号服务）：
 
 - 协议面 `p3_surface`：未接本地引擎时，语音与手写为 `NoLocalModel`；识屏（`camera` / `ctx.screen`）为 `ScreenRefused`，`ImeHub::grant` 仍拒绝截图；剪贴板为 `Ready`。
 - 剪贴板只在用户点按后读一次本机文字，变成 Candidate 写入当前输入框，可撤销。不进个人词库，不发到另一台设备。空白或超过 1024 个字符则不写入。
-- 音频引用、笔迹、以及任何摄像头载荷在到达引擎之前被丢掉，不会变成文字。安全字段旁路：不显示智能条，不读剪贴板，不打开麦克风。
+- 音频引用、笔迹载荷，以及任何摄像头载荷在到达 Hub 之前被丢掉，不会经 `route_p3` 变成文字。语音和手写由 shell 直接调用本机 trait，不把原始音频或笔迹送进 Hub。安全字段旁路：不显示智能条，不读剪贴板，不打开麦克风，也不打开手写板。
 - 手机在键盘上方显示这一行。桌面在字段聚焦且没有候选条时，在光标旁显示同一行。
 - 麦克风是长按。`LocalSpeech` 是可替换的本机流式接口。捆绑的 `NoLocalSpeech` 与还没有模型的 `WhisperSpeech` manifest 都是不可用且 `network: false`。`press_speech` 在没有模型、要求网络、安全字段或会话已结束时不调用 `begin`，因此不录音、不上传。点按只说明原因。
 - 接上 `available` 且不要求网络的本地引擎后，按住开始听写，轮询得到 interim / final 文本（超过 1024 个字符的片段丢掉），松开前再取一次 final，写入输入框，可撤销，不进个人词库。`end` 关闭采集并丢掉缓冲的音频。引擎若在 `begin` 里没有真正开始采集，也会被 `end` 关掉。
 - 本机引擎是 whisper.cpp（crate `whisper-rs` 0.16，CPU，不启用 CUDA / Metal / Vulkan）。比较过的另外两个是：sherpa-onnx（官方 Rust crate，流式 Zipformer，中英双语包的 int8 编码器约 180MB，构建还要带 ONNX Runtime）和 Vosk（`vosk` crate 依赖各平台预编译的 libvosk，中文和英文是两个模型）。whisper.cpp 已有开源绑定，一个多语言模型同时覆盖中文和英文，权重可选下载。它不是逐帧 transducer：按住期间对不断变长的 16 kHz 窗口做贪心解码，得到 interim，松开时再解码一次作为 final。
 - 权重是 `ggml-tiny-q5_1.bin`（多语言 tiny 的 q5_1，32 152 673 字节，SHA-256 `818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7`），来自 whisper.cpp 发布的 GGML 文件。语言设置里第一次点按只确认，第二次才下载。校验不符就丢弃，不留下模型文件。识别路径不发起连接。没有这份文件时，麦克风芯片仍是「语音关」。界面见 `docs/ime/voice-off-desktop.png`、`docs/ime/voice-off-phone.png`、`docs/ime/speech-model-desktop.png`（英文对照：`docs/ime/voice-off-desktop-en.png`、`docs/ime/speech-model-desktop-en.png`，手机设置：`docs/ime/speech-model-phone.png`）。
 - 测试夹具 `crates/w3cos-ime/fixtures/jfk-excerpt.wav` 是肯尼迪就职演说的前五秒（美国政府作品，公有领域）。仓库里没有中文录音。中文走同一个多语言模型，语言标签为 `zh`。
+- 手写是可替换的 `LocalHandwriting`。捆绑的 `NoLocalHandwriting` 与还没有模型的 `PaddleHandwriting` manifest 都是不可用且 `network: false`。`recognize_ink` 在没有模型、要求网络、安全字段、会话已结束或笔迹为空时不调用 `recognize`，因此不识别、不上传。点按只说明原因。安全字段不显示手写板。
+- 比较过的方案：Zinnia 本身是 BSD-3，笔划原生、体积小、能出 n-best，但公开的简体中文模型（Tegaki / Tomoe `handwriting-zh_CN`）是 LGPL-2.1，而且没有英文模型，模型文件还是架构相关的二进制。完整的 PaddleOCR 检测加识别，以及 sherpa 那类要带 ONNX Runtime 和约 180MB 模型的路径，语音一节已经因为体积放弃。这里只留识别网络：PaddlePaddle 官方 `PP-OCRv5_mobile_rec` 的 ONNX（Apache-2.0），一个模型同时覆盖简体中文、繁体中文和英文（含手写），约 16MB。推理只用 CPU 执行提供者，不启用 CUDA / TensorRT / CoreML，也不跑检测器。笔迹在本机栅格化成 48 像素高的黑字白底，按训练配置归一化后做 CTC，候选进现有候选条。
+- 权重是 `inference.onnx`（16 534 782 字节，SHA-256 `da72dc72ca4dc220df0dfde68c1dedc31c58d3e76a25871122e5056227d50092`）和字符表 `inference.yml`（148 345 字节，SHA-256 `5dfeb2777f6d0db8177d8128a8acfcf6e6276dc4ac73ea3bf0dc06d6a5e85d8e`），来自 `https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_rec_onnx`。语言设置里第一次点按只确认，第二次才下载。两份文件都要校验通过才算就绪；不符就两份都丢掉。识别路径不发起连接。没有这两份文件时，手写芯片仍是「手写关」。
+- 模型就绪后，手机智能条和桌面输入法都能打开手写板。笔迹进现有候选条。点选才写入，可撤销；识别、清除、收起和没点到的候选都不进个人词库。点选记下的词用 `extra = "*"`，不参与拼音排序。界面见 `docs/ime/ink-off-desktop.png`、`docs/ime/ink-off-phone.png`、`docs/ime/ink-model-desktop.png`、`docs/ime/ink-pad-desktop.png`（英文对照：`docs/ime/ink-off-desktop-en.png`、`docs/ime/ink-model-desktop-en.png`）。
 
-仍属 P3、本段不做：手写识别入框、OCR（[#51](https://github.com/wangnaihe/w3cos/issues/51)）。模型不打进仓库。
+仍属 P3、本段不做：OCR（[#51](https://github.com/wangnaihe/w3cos/issues/51)）。模型不打进仓库。

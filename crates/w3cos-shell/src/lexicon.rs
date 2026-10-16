@@ -143,6 +143,21 @@ pub(crate) fn note_commit(
     });
 }
 
+/// Remember one handwriting pick. Recognition, clear, and dismiss do not call this.
+pub(crate) fn note_ink_pick(scope: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    with_store(|store| {
+        if !store.unlocked || store.lexicon.app_hidden(scope) {
+            return;
+        }
+        if store.lexicon.accept_surface(text) {
+            persist(store);
+        }
+    });
+}
+
 pub(crate) fn note_reject(scope: &str, secure: bool, spelling: &str, text: &str) {
     if secure || text.is_empty() {
         return;

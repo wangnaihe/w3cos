@@ -100,6 +100,35 @@ impl Lexicon {
         true
     }
 
+    /// Remember a handwriting pick. `extra` is `"*"` so it never matches a
+    /// pinyin spelling. Showing candidates does not call this.
+    pub fn accept_surface(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if !short_text(text) {
+            return false;
+        }
+        let extra = "*";
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.kind != EntryKind::Alias && entry.text == text && entry.extra == extra
+        }) {
+            entry.freq = entry.freq.saturating_add(1);
+            return true;
+        }
+        let kind = if text.chars().count() >= 3 {
+            EntryKind::Phrase
+        } else {
+            EntryKind::Word
+        };
+        self.entries.push(Entry {
+            kind,
+            text: text.to_string(),
+            extra: extra.to_string(),
+            freq: 1,
+            neg: 0,
+        });
+        true
+    }
+
     pub fn reject(&mut self, spelling: &str, text: &str) {
         let Some((_, text, spelling)) = learnable(spelling, text) else {
             return;
@@ -538,5 +567,24 @@ mod tests {
                 .map(String::as_str),
             Some("你好")
         );
+    }
+
+    #[test]
+    fn a_picked_ink_word_stays_out_of_pinyin_order() {
+        let mut lexicon = Lexicon::default();
+        let before = rank_candidates("nihao", &lexicon);
+        assert!(!lexicon.accept_surface("  "));
+        assert!(!lexicon.accept_surface("你 好"));
+        assert!(lexicon.accept_surface("永"));
+        assert_eq!(rank_candidates("nihao", &lexicon), before);
+        assert!(lexicon.accept_surface("永"));
+        let entry = lexicon
+            .entries()
+            .iter()
+            .find(|entry| entry.text == "永")
+            .expect("picked");
+        assert_eq!(entry.extra, "*");
+        assert_eq!(entry.freq, 2);
+        assert_eq!(rank_candidates("nihao", &lexicon), before);
     }
 }

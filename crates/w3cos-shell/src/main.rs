@@ -184,6 +184,8 @@ const OP_IME_CLIPBOARD: u8 = 109;
 const OP_IME_SCREEN: u8 = 110;
 const OP_PAIR_IMPORT: u8 = 111;
 const OP_IME_MODEL: u8 = 112;
+const OP_IME_INK_CLEAR: u8 = 113;
+const OP_IME_INK_MODEL: u8 = 114;
 
 fn main() {
     shell_main();
@@ -1548,6 +1550,9 @@ fn on_shell_key(name: &str) -> bool {
     ensure_shell_signals();
     if ime_bar::on_key(name) {
         apply_ime_field();
+        if let Some(key) = ime_bar::take_ink_toast() {
+            push_toast(&locale::t(key));
+        }
         return true;
     }
     match name {
@@ -1971,6 +1976,9 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         | OP_IME_9 => {
             ime_bar::commit_candidate((code - OP_IME_1) as usize);
             apply_ime_field();
+            if let Some(key) = ime_bar::take_ink_toast() {
+                push_toast(&locale::t(key));
+            }
         }
         OP_IME_MODE => {
             ime_bar::toggle_mode();
@@ -1987,7 +1995,17 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             push_toast(&locale::t(ime_bar::confirm_speech_model()));
             state::mark_dirty();
         }
-        OP_IME_INK => push_toast(&locale::t("ime-toast-ink")),
+        OP_IME_INK_MODEL => {
+            push_toast(&locale::t(ime_bar::confirm_handwriting_model()));
+            state::mark_dirty();
+        }
+        OP_IME_INK => {
+            if let Some(key) = ime_bar::ink_tap() {
+                push_toast(&locale::t(key));
+            }
+            state::mark_dirty();
+        }
+        OP_IME_INK_CLEAR => ime_bar::clear_ink(),
         OP_IME_SCREEN => push_toast(&locale::t("ime-toast-screen")),
         OP_IME_CLIPBOARD => {
             let text = match ime_bar::local_clipboard_gate() {
@@ -2263,7 +2281,7 @@ fn apply_screen_override() {
             push_toast(&locale::t("toast-browser-min"));
         }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
-        Some("ime-smart") | Some("ime-voice") => {
+        Some("ime-smart") | Some("ime-voice") | Some("ime-ink") | Some("ime-ink-pad") => {
             focus_app(0);
             state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
                 index: 4,
@@ -2275,8 +2293,15 @@ fn apply_screen_override() {
                 width: 280.0,
                 height: 36.0,
             });
-            if std::env::var("W3COS_SCREEN").ok().as_deref() == Some("ime-voice") {
-                push_toast(&locale::t("ime-toast-voice"));
+            match std::env::var("W3COS_SCREEN").ok().as_deref() {
+                Some("ime-voice") => push_toast(&locale::t("ime-toast-voice")),
+                Some("ime-ink") => {
+                    if let Some(key) = ime_bar::ink_tap() {
+                        push_toast(&locale::t(key));
+                    }
+                }
+                Some("ime-ink-pad") => ime_bar::show_ink_pad_for_screen(),
+                _ => {}
             }
         }
         _ => {}
@@ -2286,6 +2311,11 @@ fn apply_screen_override() {
 fn install_ime_hooks() {
     state::set_shell_hold_hook(on_shell_hold);
     state::set_shell_poll_hook(on_shell_poll);
+    state::set_shell_ink_hook(on_shell_ink);
+}
+
+fn on_shell_ink(phase: u8, x: f32, y: f32) {
+    ime_bar::ink_pointer(phase, x, y);
 }
 
 fn on_shell_hold(code: u8, phase: u8) {
@@ -2404,6 +2434,9 @@ fn build_shell() -> Component {
     }
     if let Some(bar) = ime_bar::candidate_layer() {
         column.push(bar);
+    }
+    if let Some(pad) = ime_bar::ink_pad_layer() {
+        column.push(pad);
     }
     if !unlocked && !screenshot_shows_locked_permission() {
         column.push(place_overlay(build_lock_screen()));
@@ -6020,6 +6053,13 @@ fn settings_language_page() -> Vec<Component> {
     if let Some(key) = ime_bar::speech_model_button_key() {
         rows.push(settings_link(locale::t(key), OP_IME_MODEL));
     }
+    rows.push(settings_row(
+        &locale::t("ime-ink-model"),
+        &locale::t(ime_bar::ink_model_status_key()),
+    ));
+    if let Some(key) = ime_bar::ink_model_button_key() {
+        rows.push(settings_link(locale::t(key), OP_IME_INK_MODEL));
+    }
     rows
 }
 
@@ -8851,11 +8891,16 @@ mod shell_ux_tests {
         on_shell_hold(OP_IME_VOICE, 2);
         assert!(!ime_bar::voice_recording());
         assert_eq!(state::get_signal_text(DRAFT_SIGNAL), "");
+        let ink_dir = std::env::temp_dir().join(format!("w3cos-ink-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ink_dir);
+        std::fs::create_dir_all(&ink_dir).unwrap();
+        ime_bar::set_handwriting_dir_for_tests(Some(ink_dir.clone()));
         on_shell_intent(OP_IME_INK, "");
         assert_eq!(
             state::get_signal_text(TOAST_SIGNAL),
-            locale::t("ime-toast-ink")
+            locale::t("ime-toast-ink-offer")
         );
+        let _ = std::fs::remove_dir_all(&ink_dir);
         on_shell_intent(OP_IME_SCREEN, "");
         assert_eq!(
             state::get_signal_text(TOAST_SIGNAL),
@@ -8924,6 +8969,41 @@ mod shell_ux_tests {
             "{blob}"
         );
         assert!(!blob.contains(&locale::t("ime-voice-model-get")), "{blob}");
+        ime_bar::reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn handwriting_model_stays_off_until_a_second_confirmation() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        let dir = std::env::temp_dir().join(format!("w3cos-ink-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ime_bar::reset_for_tests();
+        ime_bar::set_handwriting_dir_for_tests(Some(dir.clone()));
+        present_settings(6, 0);
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(blob.contains(&locale::t("ime-ink-model")), "{blob}");
+        assert!(blob.contains(&locale::t("ime-ink-model-off")), "{blob}");
+        assert!(blob.contains(&locale::t("ime-ink-model-get")), "{blob}");
+        on_shell_intent(OP_IME_INK_MODEL, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-ink-confirm")
+        );
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(blob.contains(&locale::t("ime-ink-model-confirm")), "{blob}");
+        assert!(!blob.contains(&locale::t("ime-ink-model-get")), "{blob}");
         ime_bar::reset_for_tests();
         let _ = std::fs::remove_dir_all(&dir);
         locale::set_locale("en");

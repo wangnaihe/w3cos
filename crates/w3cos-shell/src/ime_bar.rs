@@ -8,10 +8,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use w3cos_ime::{
-    ClipboardDecision, ImeHub, InputIntent, IntentHint, IntentPayload, LocalSpeech, Modality,
-    ModalityBlock, ModelError, NoLocalSpeech, PinyinEngine, Proposal, Purpose, SpeechOff,
-    SpeechStart, WhisperSpeech, clipboard_decision, download_speech_model, flush_speech,
-    model_ready, poll_speech, press_speech, release_speech,
+    ClipboardDecision, ImeHub, InkModelError, InkPoint, InkResult, InkStroke, InputIntent,
+    IntentHint, IntentPayload, LocalHandwriting, LocalSpeech, Modality, ModalityBlock, ModelError,
+    NoLocalHandwriting, NoLocalSpeech, PaddleHandwriting, PinyinEngine, Proposal, Purpose,
+    SpeechOff, SpeechStart, WhisperSpeech, clipboard_decision, default_handwriting_dir,
+    download_handwriting_model, download_speech_model, flush_speech, handwriting_model_ready,
+    model_ready, poll_speech, press_speech, recognize_ink, release_speech,
 };
 use w3cos_runtime::state::{self, ImeFieldNote};
 use w3cos_std::Component;
@@ -19,8 +21,9 @@ use w3cos_std::color::Color;
 use w3cos_std::style::*;
 
 use super::{
-    CHROME_Z, OP_IME_1, OP_IME_ACTION, OP_IME_CLIPBOARD, OP_IME_INK, OP_IME_MODE, OP_IME_PAGE_NEXT,
-    OP_IME_PAGE_PREV, OP_IME_SCREEN, OP_IME_VOICE, OP_SOFTKEY, ink_token, invoke, line_strong,
+    CHROME_Z, OP_IME_1, OP_IME_ACTION, OP_IME_CLIPBOARD, OP_IME_INK, OP_IME_INK_CLEAR, OP_IME_MODE,
+    OP_IME_PAGE_NEXT, OP_IME_PAGE_PREV, OP_IME_SCREEN, OP_IME_VOICE, OP_SCRIM, OP_SOFTKEY,
+    ink_token, invoke, line_strong,
 };
 use crate::locale;
 
@@ -73,6 +76,10 @@ struct Session {
     voice_recording: bool,
     /// Latest local transcript, not yet committed.
     voice_preview: String,
+    /// The handwriting pad is open. Strokes stay out of the lexicon until a pick.
+    ink_open: bool,
+    ink_strokes: Vec<InkStroke>,
+    ink_candidates: Vec<String>,
 }
 
 pub(crate) struct FieldUpdate {
@@ -106,6 +113,9 @@ impl Default for Session {
             pending: Vec::new(),
             voice_recording: false,
             voice_preview: String::new(),
+            ink_open: false,
+            ink_strokes: Vec::new(),
+            ink_candidates: Vec::new(),
         }
     }
 }
@@ -116,6 +126,11 @@ thread_local! {
         RefCell::new(Box::new(WhisperSpeech::open_default()));
     static SPEECH_DIR: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
     static MODEL_CONSENT: Cell<bool> = const { Cell::new(false) };
+    static HAND: RefCell<Box<dyn LocalHandwriting>> =
+        RefCell::new(Box::new(PaddleHandwriting::open_default()));
+    static HAND_DIR: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    static INK_CONSENT: Cell<bool> = const { Cell::new(false) };
+    static INK_TOAST: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
 fn with_session<R>(body: impl FnOnce(&mut Session) -> R) -> R {
@@ -130,7 +145,7 @@ fn pinyin_mode(session: &mut Session) -> bool {
 
 fn text_slots(session: &Session) -> usize {
     let size = page_size();
-    if session.actions.is_empty() {
+    if !session.ink_candidates.is_empty() || session.actions.is_empty() {
         size
     } else {
         size.saturating_sub(1).max(1)
@@ -160,6 +175,7 @@ fn reopen_ime(session: &mut Session) {
 
 fn wipe_ime(session: &mut Session) {
     stop_voice(session);
+    close_ink(session);
     if let Some(ime) = session.ime.as_mut() {
         ime.end();
     }
@@ -336,6 +352,7 @@ fn adopt(session: &mut Session, note: &ImeFieldNote) {
     }
     if switched || note.secure {
         stop_voice(session);
+        close_ink(session);
     }
     if switched {
         if let Some(ime) = session.ime.as_mut() {
@@ -387,6 +404,7 @@ pub(crate) fn on_key(name: &str) -> bool {
         if name == "Mod+Space" {
             session.override_pinyin = Some(!pinyin_mode(session));
             let had_spelling = !session.spelling.is_empty();
+            close_ink(session);
             session.spelling.clear();
             session.page = 0;
             refresh(session);
@@ -400,7 +418,17 @@ pub(crate) fn on_key(name: &str) -> bool {
         if let Some(note) = state::current_ime_field() {
             adopt(session, &note);
         }
+        if session.ink_open && is_letter(name) {
+            close_ink(session);
+            state::mark_dirty();
+        }
         if name == "Escape" {
+            if session.ink_open {
+                close_ink(session);
+                refresh(session);
+                state::mark_dirty();
+                return true;
+            }
             if session.spelling.is_empty() {
                 return false;
             }
@@ -418,6 +446,33 @@ pub(crate) fn on_key(name: &str) -> bool {
         }
         if name == "Mod+Z" {
             return undo(session);
+        }
+        if session.ink_open && !session.ink_strokes.is_empty() && name == "Backspace" {
+            session.ink_strokes.clear();
+            session.ink_candidates.clear();
+            session.page = 0;
+            state::mark_dirty();
+            return true;
+        }
+        if !session.ink_candidates.is_empty() && !session.secure {
+            match name {
+                "Space" | "Enter" => {
+                    commit_ink_at(session, 0);
+                    return true;
+                }
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                    let visible = (name.as_bytes()[0] - b'1') as usize;
+                    let slots = text_slots(session);
+                    if visible < slots {
+                        let _ = commit_ink_at(session, session.page * slots + visible);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        } else if session.ink_open && matches!(name, "Space" | "Enter") {
+            note_ink_toast("ime-toast-ink-empty");
+            return true;
         }
         if session.secure || !pinyin_mode(session) || !session.has_field {
             return false;
@@ -471,6 +526,12 @@ pub(crate) fn toggle_mode() {
 
 pub(crate) fn commit_candidate(visible: usize) -> bool {
     with_session(|session| {
+        if !session.ink_candidates.is_empty() {
+            if session.secure {
+                return false;
+            }
+            return commit_ink_at(session, session.page * text_slots(session) + visible);
+        }
         if session.secure || !pinyin_mode(session) {
             return false;
         }
@@ -483,11 +544,12 @@ pub(crate) fn page_by(delta: isize) -> bool {
         if !candidates_visible(session) {
             return false;
         }
-        let pages = session
-            .candidates
-            .len()
-            .div_ceil(text_slots(session))
-            .max(1);
+        let len = if session.ink_candidates.is_empty() {
+            session.candidates.len()
+        } else {
+            session.ink_candidates.len()
+        };
+        let pages = len.div_ceil(text_slots(session)).max(1);
         let next = (session.page as isize + delta).clamp(0, pages as isize - 1) as usize;
         if next == session.page {
             return false;
@@ -792,6 +854,7 @@ pub(crate) fn voice_press() -> SpeechStart {
         }
         let start = SPEECH.with(|slot| press_speech(&mut **slot.borrow_mut(), &ime));
         if matches!(start, SpeechStart::Listening) {
+            close_ink(session);
             session.spelling.clear();
             session.preedit.clear();
             session.page = 0;
@@ -968,20 +1031,27 @@ fn candidates_visible(session: &mut Session) -> bool {
     if session.secure || !session.has_field {
         return false;
     }
+    if !session.ink_candidates.is_empty() {
+        return true;
+    }
     let composing = pinyin_mode(session) && !session.spelling.is_empty();
     composing || !session.actions.is_empty()
 }
 
 fn candidate_children(show_preedit: bool) -> Vec<Component> {
-    let (spelling, preedit, candidates, page, actions) = with_session(|session| {
+    let (spelling, preedit, candidates, ink, page, actions) = with_session(|session| {
         (
             session.spelling.clone(),
             session.preedit.clone(),
             session.candidates.clone(),
+            session.ink_candidates.clone(),
             session.page,
             session.actions.clone(),
         )
     });
+    if !ink.is_empty() {
+        return ink_candidate_children(&ink, page);
+    }
     let size = if actions.is_empty() {
         page_size()
     } else {
@@ -1151,7 +1221,7 @@ fn modality_children() -> Vec<Component> {
     };
     vec![
         modality_button(voice_key, OP_IME_VOICE, ready || recording, true),
-        modality_button("ime-ink", OP_IME_INK, false, false),
+        modality_button(ink_chip_key(), OP_IME_INK, ink_chip_ready(), false),
         modality_button("ime-clip", OP_IME_CLIPBOARD, true, false),
         modality_button("ime-screen", OP_IME_SCREEN, false, false),
     ]
@@ -1283,7 +1353,7 @@ fn letter_row(letters: &[&str], key_w: f32) -> Component {
 
 /// Basic QWERTY keyboard for the 390×760 phone posture, including the pinyin toggle.
 pub(crate) fn phone_keyboard() -> Option<Component> {
-    if !keyboard_open() {
+    if !keyboard_open() || with_session(|session| session.ink_open) {
         return None;
     }
     let (width, height) = state::shell_viewport();
@@ -1423,6 +1493,476 @@ fn candidate_button(label: String, code: u8) -> Component {
     Component::button_with_click(label, style, invoke(code))
 }
 
+fn ink_candidate_children(candidates: &[String], page: usize) -> Vec<Component> {
+    let size = page_size();
+    let pages = candidates.len().div_ceil(size).max(1);
+    let page = page.min(pages - 1);
+    let mut children = vec![mode_button()];
+    if page > 0 {
+        children.push(candidate_button(
+            locale::t("ime-page-prev"),
+            OP_IME_PAGE_PREV,
+        ));
+    }
+    for (index, text) in candidates.iter().skip(page * size).take(size).enumerate() {
+        let n = (index + 1).to_string();
+        let label = locale::t_args("ime-candidate", &[("n", &n), ("text", text)]);
+        children.push(candidate_button(label, OP_IME_1 + index as u8));
+    }
+    if page + 1 < pages {
+        children.push(candidate_button(
+            locale::t("ime-page-next"),
+            OP_IME_PAGE_NEXT,
+        ));
+    }
+    children
+}
+
+fn ink_chip_ready() -> bool {
+    with_session(|session| session.ink_open) || ink_engine_ready()
+}
+
+fn ink_chip_key() -> &'static str {
+    if with_session(|session| session.ink_open) {
+        "ime-ink-live"
+    } else if ink_engine_ready() {
+        "ime-ink-ready"
+    } else {
+        "ime-ink"
+    }
+}
+
+fn ink_engine_ready() -> bool {
+    HAND.with(|slot| {
+        let manifest = slot.borrow().manifest();
+        manifest.available && !manifest.network
+    })
+}
+
+fn handwriting_dir() -> std::path::PathBuf {
+    HAND_DIR.with(|slot| {
+        slot.borrow()
+            .clone()
+            .unwrap_or_else(default_handwriting_dir)
+    })
+}
+
+fn note_ink_toast(key: &'static str) {
+    INK_TOAST.with(|slot| slot.set(Some(key)));
+}
+
+pub(crate) fn take_ink_toast() -> Option<&'static str> {
+    INK_TOAST.with(|slot| slot.take())
+}
+
+fn close_ink(session: &mut Session) {
+    session.ink_open = false;
+    session.ink_strokes.clear();
+    session.ink_candidates.clear();
+}
+
+struct InkGeom {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    sx: f32,
+    sy: f32,
+    sw: f32,
+    sh: f32,
+}
+
+fn ink_geom(session: &Session) -> InkGeom {
+    let (width, height) = state::shell_viewport();
+    let (x, y, w, h) = if width < 600.0 {
+        (
+            0.0,
+            (height - KEYBOARD_HEIGHT).max(0.0),
+            width,
+            KEYBOARD_HEIGHT,
+        )
+    } else {
+        let (cx, cy) = place(width, height, &session.caret);
+        let w = bar_width(width);
+        let h = 200.0;
+        let y = (cy + BAR_H + 8.0).min((height - h - 8.0).max(8.0));
+        (cx, y, w, h)
+    };
+    let sx = x + 8.0;
+    let sy = y + 8.0;
+    let sw = (w - 16.0).max(8.0);
+    let sh = (h - 64.0).max(8.0);
+    InkGeom {
+        x,
+        y,
+        w,
+        h,
+        sx,
+        sy,
+        sw,
+        sh,
+    }
+}
+
+fn local_ink(x: f32, y: f32, geom: &InkGeom) -> (f32, f32) {
+    (
+        (x - geom.sx).clamp(0.0, geom.sw),
+        (y - geom.sy).clamp(0.0, geom.sh),
+    )
+}
+
+fn commit_ink_at(session: &mut Session, index: usize) -> bool {
+    let Some(chunk) = session.ink_candidates.get(index).cloned() else {
+        return false;
+    };
+    if !session.secure {
+        crate::lexicon::note_ink_pick(&learning_scope(), &chunk);
+    }
+    session.base.push_str(&chunk);
+    session.undo.push(chunk);
+    session.ink_strokes.clear();
+    session.ink_candidates.clear();
+    session.page = 0;
+    sync_note_value(session);
+    refresh(session);
+    queue(session, session.base.clone());
+    note_ink_toast("ime-toast-ink-ok");
+    true
+}
+
+fn recognize_open_ink(session: &mut Session) {
+    let Some(ime) = session.ime.clone() else {
+        session.ink_candidates.clear();
+        return;
+    };
+    let geom = ink_geom(session);
+    let result = HAND.with(|slot| {
+        recognize_ink(
+            &mut **slot.borrow_mut(),
+            &ime,
+            geom.sw.max(1.0) as u32,
+            geom.sh.max(1.0) as u32,
+            &session.ink_strokes,
+        )
+    });
+    session.ink_candidates = match result {
+        InkResult::Candidates(list) => list.into_iter().map(|item| item.text).collect(),
+        InkResult::Off(_) => Vec::new(),
+    };
+}
+
+/// Pointer samples for the open pad. Phase 0 begins, 1 extends, 2 recognizes.
+pub(crate) fn ink_pointer(phase: u8, x: f32, y: f32) {
+    with_session(|session| {
+        if !session.ink_open || session.secure || !session.has_field {
+            return;
+        }
+        let geom = ink_geom(session);
+        match phase {
+            0 => {
+                let (px, py) = local_ink(x, y, &geom);
+                session.ink_strokes.push(InkStroke {
+                    points: vec![InkPoint { x: px, y: py }],
+                });
+                if session.ink_strokes.len() > 64 {
+                    session.ink_strokes.remove(0);
+                }
+                state::mark_dirty();
+            }
+            1 => {
+                let (px, py) = local_ink(x, y, &geom);
+                let Some(stroke) = session.ink_strokes.last_mut() else {
+                    return;
+                };
+                if let Some(last) = stroke.points.last() {
+                    let dx = last.x - px;
+                    let dy = last.y - py;
+                    if dx * dx + dy * dy < 2.25 {
+                        return;
+                    }
+                }
+                if stroke.points.len() < 512 {
+                    stroke.points.push(InkPoint { x: px, y: py });
+                    state::mark_dirty();
+                }
+            }
+            2 => {
+                session.page = 0;
+                recognize_open_ink(session);
+                state::mark_dirty();
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Drop the current strokes. The pad stays open and nothing is learned.
+pub(crate) fn clear_ink() {
+    with_session(|session| {
+        if !session.ink_open {
+            return;
+        }
+        session.ink_strokes.clear();
+        session.ink_candidates.clear();
+        session.page = 0;
+        state::mark_dirty();
+    });
+}
+
+pub(crate) fn ink_model_status_key() -> &'static str {
+    if handwriting_model_ready(&handwriting_dir()) {
+        "ime-ink-model-ready"
+    } else {
+        "ime-ink-model-off"
+    }
+}
+
+pub(crate) fn ink_model_button_key() -> Option<&'static str> {
+    if handwriting_model_ready(&handwriting_dir()) {
+        None
+    } else if INK_CONSENT.with(Cell::get) {
+        Some("ime-ink-model-confirm")
+    } else {
+        Some("ime-ink-model-get")
+    }
+}
+
+/// First press only arms consent. The second press downloads. Recognition does not call this.
+pub(crate) fn confirm_handwriting_model() -> &'static str {
+    if handwriting_model_ready(&handwriting_dir()) {
+        INK_CONSENT.with(|flag| flag.set(false));
+        return "ime-toast-ink-saved";
+    }
+    if !INK_CONSENT.with(Cell::get) {
+        INK_CONSENT.with(|flag| flag.set(true));
+        return "ime-toast-ink-confirm";
+    }
+    INK_CONSENT.with(|flag| flag.set(false));
+    match download_handwriting_model(&handwriting_dir(), true) {
+        Ok(_) => "ime-toast-ink-saved",
+        Err(InkModelError::ChecksumMismatch { .. }) => "ime-toast-ink-checksum",
+        Err(InkModelError::ConsentRequired) => "ime-toast-ink-confirm",
+        Err(_) => "ime-toast-ink-download-fail",
+    }
+}
+
+/// Toggle the pad. Without a local model this only explains why, and does not recognize.
+pub(crate) fn ink_tap() -> Option<&'static str> {
+    with_session(|session| {
+        adopt_for_capture(session);
+        if !session.has_field {
+            return Some("ime-toast-ink-closed");
+        }
+        if session.secure
+            || session
+                .ime
+                .as_ref()
+                .is_some_and(|ime| ime.purpose.is_secure())
+        {
+            close_ink(session);
+            return Some("ime-toast-ink-secure");
+        }
+        let Some(ime) = session.ime.clone() else {
+            return Some("ime-toast-ink-closed");
+        };
+        if ime.id.is_empty() {
+            return Some("ime-toast-ink-closed");
+        }
+        let manifest = HAND.with(|slot| slot.borrow().manifest());
+        if manifest.network {
+            return Some("ime-toast-ink-net");
+        }
+        if !manifest.available {
+            return Some(if handwriting_model_ready(&handwriting_dir()) {
+                "ime-toast-ink"
+            } else {
+                "ime-toast-ink-offer"
+            });
+        }
+        if session.ink_open {
+            close_ink(session);
+            state::mark_dirty();
+            return None;
+        }
+        stop_voice(session);
+        session.spelling.clear();
+        session.preedit.clear();
+        session.candidates.clear();
+        session.page = 0;
+        session.ink_strokes.clear();
+        session.ink_candidates.clear();
+        session.ink_open = true;
+        refresh(session);
+        state::mark_dirty();
+        Some("ime-toast-ink-ready")
+    })
+}
+
+/// Screenshot hook. Opens the pad once and seeds a horizontal stroke.
+pub(crate) fn show_ink_pad_for_screen() {
+    if ink_tap().is_none() && !with_session(|session| session.ink_open) {
+        return;
+    }
+    with_session(|session| {
+        if !session.ink_open || !session.ink_strokes.is_empty() {
+            return;
+        }
+        let geom = ink_geom(session);
+        let at = |x: f32, y: f32| InkPoint {
+            x: geom.sw * x,
+            y: geom.sh * y,
+        };
+        session.ink_strokes = vec![
+            InkStroke {
+                points: vec![at(22.0 / 48.0, 6.0 / 48.0), at(6.0 / 48.0, 42.0 / 48.0)],
+            },
+            InkStroke {
+                points: vec![at(18.0 / 48.0, 20.0 / 48.0), at(42.0 / 48.0, 42.0 / 48.0)],
+            },
+        ];
+        recognize_open_ink(session);
+        state::mark_dirty();
+    });
+}
+
+fn ink_svg(strokes: &[InkStroke], width: f32, height: f32) -> String {
+    let mut paths = String::new();
+    for stroke in strokes {
+        let Some(first) = stroke.points.first() else {
+            continue;
+        };
+        let mut data = format!("M {:.1} {:.1}", first.x, first.y);
+        for point in stroke.points.iter().skip(1) {
+            data.push_str(&format!(" L {:.1} {:.1}", point.x, point.y));
+        }
+        paths.push_str(&format!(
+            "<path d=\"{data}\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"3.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+        ));
+    }
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">{paths}</svg>"
+    )
+}
+
+fn mark_prop(style: &mut Style, key: &str, value: &str) {
+    let mut props = style.custom_properties.take().unwrap_or_default();
+    props.insert(key.to_string(), value.to_string());
+    style.custom_properties = Some(props);
+}
+
+/// Drawing surface. Hidden for secure fields. Phone pad replaces the keyboard rect.
+pub(crate) fn ink_pad_layer() -> Option<Component> {
+    let drawn = with_session(|session| {
+        if !session.ink_open || !session.has_field || session.secure {
+            return None;
+        }
+        Some((ink_geom(session), session.ink_strokes.clone()))
+    })?;
+    if field_blocks_capture() {
+        return None;
+    }
+    let (geom, strokes) = drawn;
+    let phone = state::shell_viewport().0 < 600.0;
+    let mut surface_style = Style {
+        width: Dimension::Px(geom.sw),
+        height: Dimension::Px(geom.sh),
+        min_height: Dimension::Px(geom.sh),
+        flex_shrink: 0.0,
+        background: Color::from_hex("#f7f4ee"),
+        border_radius: 10.0,
+        border_width: 1.0,
+        border_color: Color::from_hex("#d7c7a2"),
+        overflow: Overflow::Hidden,
+        align_items: AlignItems::Center,
+        justify_content: JustifyContent::Center,
+        ..Style::default()
+    };
+    keep_ime(&mut surface_style);
+    mark_prop(&mut surface_style, "--w3cos-ink", "1");
+    let surface_child = if strokes.is_empty() {
+        Component::text(
+            locale::t("ime-ink-hint"),
+            Style {
+                font_size: 15.0,
+                font_weight: 650,
+                color: Color::from_hex("#8a7b62"),
+                ..Style::default()
+            },
+        )
+    } else {
+        Component::svg_document(
+            ink_svg(&strokes, geom.sw, geom.sh),
+            geom.sw.max(1.0) as u32,
+            geom.sh.max(1.0) as u32,
+            Style {
+                width: Dimension::Px(geom.sw),
+                height: Dimension::Px(geom.sh),
+                ..Style::default()
+            },
+        )
+    };
+    let mut surface = Component::column(surface_style, vec![surface_child]);
+    surface.on_click = invoke(OP_SCRIM);
+    let button_w = ((geom.w - 16.0 - 8.0) * 0.5).max(48.0);
+    let mut pad = Component::column(
+        Style {
+            position: Position::Absolute,
+            left: Dimension::Px(geom.x),
+            top: Dimension::Px(geom.y),
+            width: Dimension::Px(geom.w),
+            height: Dimension::Px(geom.h),
+            padding: Edges::all(8.0),
+            gap: 8.0,
+            background: Color::from_hex("#10161d"),
+            border_width: 1.0,
+            border_color: line_strong(),
+            border_radius: if phone { 0.0 } else { 12.0 },
+            box_sizing: BoxSizing::BorderBox,
+            overflow: Overflow::Hidden,
+            z_index: if phone { CHROME_Z + 6 } else { CHROME_Z + 4 },
+            ..Style::default()
+        },
+        vec![
+            surface,
+            Component::row(
+                Style {
+                    height: Dimension::Px(40.0),
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+                vec![
+                    ink_pad_button(&locale::t("ime-ink-clear"), OP_IME_INK_CLEAR, button_w),
+                    ink_pad_button(&locale::t("ime-ink-close"), OP_IME_INK, button_w),
+                ],
+            ),
+        ],
+    );
+    keep_ime(&mut pad.style);
+    pad.on_click = invoke(OP_SCRIM);
+    pad.style.z_index = if phone { CHROME_Z + 6 } else { CHROME_Z + 4 };
+    Some(pad)
+}
+
+fn ink_pad_button(label: &str, code: u8, width: f32) -> Component {
+    let mut style = Style {
+        width: Dimension::Px(width),
+        min_width: Dimension::Px(width),
+        height: Dimension::Px(36.0),
+        min_height: Dimension::Px(36.0),
+        flex_grow: 1.0,
+        background: Color::from_hex("#24384a"),
+        border_radius: 8.0,
+        font_size: 14.0,
+        font_weight: 650,
+        color: Color::from_hex("#f4f7fb"),
+        ..Style::default()
+    };
+    keep_ime(&mut style);
+    Component::button_with_click(label.to_string(), style, invoke(code))
+}
+
 pub(crate) fn demo_compose(spelling: &str) {
     with_session(|session| {
         session.secure = false;
@@ -1448,6 +1988,17 @@ pub(crate) fn set_speech_dir_for_tests(dir: Option<std::path::PathBuf>) {
 }
 
 #[cfg(test)]
+pub(crate) fn set_handwriting_dir_for_tests(dir: Option<std::path::PathBuf>) {
+    HAND_DIR.with(|slot| *slot.borrow_mut() = dir);
+    INK_CONSENT.with(|flag| flag.set(false));
+}
+
+#[cfg(test)]
+pub(crate) fn install_handwriting_for_tests(engine: Box<dyn LocalHandwriting>) {
+    HAND.with(|slot| *slot.borrow_mut() = engine);
+}
+
+#[cfg(test)]
 pub(crate) fn reset_for_tests() {
     SESSION.with(|slot| *slot.borrow_mut() = Session::default());
     SPEECH.with(|slot| {
@@ -1456,6 +2007,10 @@ pub(crate) fn reset_for_tests() {
     });
     SPEECH_DIR.with(|slot| *slot.borrow_mut() = None);
     MODEL_CONSENT.with(|flag| flag.set(false));
+    HAND.with(|slot| *slot.borrow_mut() = Box::new(NoLocalHandwriting::default()));
+    HAND_DIR.with(|slot| *slot.borrow_mut() = None);
+    INK_CONSENT.with(|flag| flag.set(false));
+    INK_TOAST.with(|slot| slot.set(None));
     state::note_shell_poll_soon(false);
     let _ = state::take_ime_replacements();
     state::clear_ime_field();
@@ -2133,5 +2688,134 @@ mod tests {
         }
         walk(node, &mut labels);
         labels
+    }
+
+    #[test]
+    fn handwriting_pad_commits_a_pick_and_does_not_learn_the_rest() {
+        use w3cos_ime::{HandwritingManifest, InkCandidate, LocalHandwriting};
+
+        struct Probe {
+            network: bool,
+            available: bool,
+            calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+            out: Vec<String>,
+        }
+
+        impl LocalHandwriting for Probe {
+            fn manifest(&self) -> HandwritingManifest {
+                HandwritingManifest {
+                    id: "test.local-handwriting".into(),
+                    locales: vec!["zh-Hans".into(), "en".into()],
+                    network: self.network,
+                    available: self.available,
+                }
+            }
+
+            fn recognize(
+                &mut self,
+                _width: u32,
+                _height: u32,
+                _strokes: &[InkStroke],
+            ) -> Vec<InkCandidate> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.out
+                    .iter()
+                    .map(|text| InkCandidate {
+                        text: text.clone(),
+                        score: 1.0,
+                    })
+                    .collect()
+            }
+        }
+
+        reset_for_tests();
+        crate::lexicon::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        note("intent", "已有", false, 4, 480.0);
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        install_handwriting_for_tests(Box::new(Probe {
+            network: true,
+            available: true,
+            calls: refused.clone(),
+            out: vec!["永".into()],
+        }));
+        assert_eq!(ink_tap(), Some("ime-toast-ink-net"));
+        assert!(ink_pad_layer().is_none());
+        assert_eq!(composed_text(), "已有");
+        assert_eq!(refused.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        install_handwriting_for_tests(Box::new(Probe {
+            network: false,
+            available: true,
+            calls: calls.clone(),
+            out: vec!["永".into(), "水".into()],
+        }));
+        assert_eq!(ink_chip_key(), "ime-ink-ready");
+        assert_eq!(ink_tap(), Some("ime-toast-ink-ready"));
+        assert_eq!(ink_chip_key(), "ime-ink-live");
+        let pad = ink_pad_layer().expect("phone pad");
+        let dumped = format!("{pad:?}");
+        assert!(dumped.contains("--w3cos-ink"), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-ink-hint")), "{dumped}");
+        assert!(phone_keyboard().is_none());
+        let geom = with_session(|session| ink_geom(session));
+        ink_pointer(0, geom.sx + 12.0, geom.sy + 20.0);
+        ink_pointer(1, geom.sx + 80.0, geom.sy + 20.0);
+        ink_pointer(2, 0.0, 0.0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            with_session(|session| session.ink_candidates.clone()),
+            vec!["永".to_string(), "水".to_string()]
+        );
+        assert!(crate::lexicon::freq_of("永").is_none());
+        assert!(candidate_layer().is_none());
+        let strip = phone_candidate_strip().expect("candidates");
+        let labels = candidate_labels(&strip);
+        assert!(
+            labels.iter().any(|label| label.contains('永')),
+            "{labels:?}"
+        );
+        assert!(commit_candidate(0));
+        assert_eq!(composed_text(), "已有永");
+        assert_eq!(crate::lexicon::freq_of("永"), Some(1));
+        assert_eq!(take_ink_toast(), Some("ime-toast-ink-ok"));
+        assert!(with_session(
+            |session| session.ink_open && session.ink_strokes.is_empty()
+        ));
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "已有");
+        assert_eq!(crate::lexicon::freq_of("永"), Some(1));
+
+        ink_pointer(0, geom.sx + 8.0, geom.sy + 8.0);
+        ink_pointer(2, 0.0, 0.0);
+        assert!(!with_session(|session| session.ink_candidates.is_empty()));
+        clear_ink();
+        assert!(with_session(|session| session.ink_candidates.is_empty()));
+        assert_eq!(crate::lexicon::freq_of("水"), None);
+        assert!(on_key("Escape"));
+        assert!(ink_pad_layer().is_none());
+        assert_eq!(crate::lexicon::freq_of("水"), None);
+
+        state::note_shell_viewport(1200.0, 800.0);
+        note("intent", "已有", false, 4, 180.0);
+        assert_eq!(ink_tap(), Some("ime-toast-ink-ready"));
+        let desk = ink_pad_layer().expect("desktop pad");
+        let dumped = format!("{desk:?}");
+        assert!(dumped.contains("--w3cos-ink"), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-ink-close")), "{dumped}");
+        assert!(on_key("Escape"));
+        assert!(ink_pad_layer().is_none());
+
+        state::note_shell_viewport(390.0, 760.0);
+        note("secure", "", true, 9, 480.0);
+        assert_eq!(ink_tap(), Some("ime-toast-ink-secure"));
+        assert!(ink_pad_layer().is_none());
+        assert!(phone_smart_bar().is_none());
+
+        state::note_shell_viewport(1200.0, 800.0);
+        reset_for_tests();
+        locale::set_locale("en");
     }
 }

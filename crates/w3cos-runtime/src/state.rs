@@ -602,6 +602,75 @@ pub fn shell_hold_end() -> bool {
     true
 }
 
+thread_local! {
+    static INK_HOOK: Cell<Option<fn(u8, f32, f32)>> = const { Cell::new(None) };
+    static INK_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `true` when this node or an ancestor is the handwriting surface.
+///
+/// Sibling buttons (clear, close) stay ordinary clicks. A stroke drawn on
+/// the SVG inside the surface still counts.
+pub fn shell_ink_at(root: &Component, index: usize) -> bool {
+    fn walk(comp: &Component, target: usize, counter: &mut usize, inherited: bool) -> Option<bool> {
+        let here = *counter;
+        *counter += 1;
+        let marked = inherited
+            || comp
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|props| props.get("--w3cos-ink"))
+                .is_some();
+        if here == target {
+            return Some(marked);
+        }
+        for child in &comp.children {
+            if let Some(found) = walk(child, target, counter, marked) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(root, index, &mut 0, false).unwrap_or(false)
+}
+
+pub fn set_shell_ink_hook(hook: fn(u8, f32, f32)) {
+    INK_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+/// `phase` 0 begins a stroke, 1 extends it, 2 ends it.
+pub fn shell_ink_begin(x: f32, y: f32) {
+    INK_ACTIVE.with(|slot| slot.set(true));
+    if let Some(hook) = INK_HOOK.with(Cell::get) {
+        hook(0, x, y);
+    }
+}
+
+pub fn shell_ink_move(x: f32, y: f32) {
+    if !INK_ACTIVE.with(Cell::get) {
+        return;
+    }
+    if let Some(hook) = INK_HOOK.with(Cell::get) {
+        hook(1, x, y);
+    }
+}
+
+pub fn shell_ink_is_active() -> bool {
+    INK_ACTIVE.with(Cell::get)
+}
+
+/// End the stroke. True when a press was active, so the click must not run.
+pub fn shell_ink_end() -> bool {
+    if !INK_ACTIVE.with(|slot| slot.replace(false)) {
+        return false;
+    }
+    if let Some(hook) = INK_HOOK.with(Cell::get) {
+        hook(2, 0.0, 0.0);
+    }
+    true
+}
+
 pub fn set_shell_poll_hook(hook: fn()) {
     POLL_HOOK.with(|slot| slot.set(Some(hook)));
 }
@@ -874,5 +943,26 @@ mod tests {
             with_shell_win_draft(&root, 1, "keep".to_string()),
             "keep".to_string()
         );
+    }
+
+    #[test]
+    fn ink_surface_includes_descendants_and_skips_sibling_buttons() {
+        let mut stroke = Component::text("一", w3cos_std::Style::default());
+        stroke.style.custom_properties = None;
+        let mut surface = Component::column(w3cos_std::Style::default(), vec![stroke]);
+        surface.style.custom_properties = Some(HashMap::from([(
+            "--w3cos-ink".to_string(),
+            "1".to_string(),
+        )]));
+        let clear = Component::button_with_click(
+            "清除",
+            w3cos_std::Style::default(),
+            w3cos_std::EventAction::None,
+        );
+        let root = Component::column(w3cos_std::Style::default(), vec![surface, clear]);
+        assert!(shell_ink_at(&root, 1), "surface");
+        assert!(shell_ink_at(&root, 2), "stroke inside the surface");
+        assert!(!shell_ink_at(&root, 3), "clear stays a click");
+        assert!(!shell_ink_at(&root, 0));
     }
 }

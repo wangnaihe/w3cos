@@ -8,6 +8,9 @@
 mod commands;
 mod context;
 mod engine;
+mod handwriting;
+mod handwriting_engine;
+mod handwriting_model;
 mod hub;
 mod intent;
 mod lexicon;
@@ -23,6 +26,16 @@ pub use context::{
     BufferContext, CommitId, Edit, ImeContext, Rect, SURROUNDING_CAP, Surrounding, TextRange,
 };
 pub use engine::{EngineManifest, Feedback, InputEngine};
+pub use handwriting::{
+    HandwritingManifest, INK_LIMIT, InkCandidate, InkOff, InkPoint, InkResult, InkStroke,
+    LocalHandwriting, NoLocalHandwriting, ink_state, recognize_ink,
+};
+pub use handwriting_engine::PaddleHandwriting;
+pub use handwriting_model::{
+    DICT_FILE, DICT_LEN, DICT_SHA256, DICT_URL, INK_MODEL_FILE, INK_MODEL_LEN, INK_MODEL_SHA256,
+    INK_MODEL_URL, InkModelError, default_handwriting_dir, download_handwriting_model,
+    handwriting_model_ready,
+};
 pub use hub::{ImeHub, l2_from_value};
 pub use intent::{
     InputIntent, IntentHint, IntentPayload, Modality, Proposal, Purpose, Scope, Session,
