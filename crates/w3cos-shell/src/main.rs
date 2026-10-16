@@ -178,7 +178,11 @@ const OP_LEXICON_CLEAR: u8 = 103;
 const OP_SETTINGS_LANGUAGE: u8 = 104;
 const OP_SETTINGS_BACK: u8 = 105;
 const OP_NOTIFY_OPEN: u8 = 106;
-const OP_PAIR_IMPORT: u8 = 107;
+const OP_IME_VOICE: u8 = 107;
+const OP_IME_INK: u8 = 108;
+const OP_IME_CLIPBOARD: u8 = 109;
+const OP_IME_SCREEN: u8 = 110;
+const OP_PAIR_IMPORT: u8 = 111;
 
 fn main() {
     shell_main();
@@ -221,6 +225,7 @@ pub(crate) fn shell_main() {
     state::set_shell_swipe_hook(on_shell_swipe);
     state::set_shell_key_hook(on_shell_key);
     state::set_agent_poll_hook(on_agent_poll);
+    install_ime_hooks();
     ensure_clock_timer();
     handoff::ensure_listener();
     agent_host::install_wake();
@@ -1976,6 +1981,21 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_IME_PAGE_NEXT => {
             ime_bar::page_by(1);
         }
+        OP_IME_VOICE => push_toast(&locale::t(ime_bar::voice_tap_key())),
+        OP_IME_INK => push_toast(&locale::t("ime-toast-ink")),
+        OP_IME_SCREEN => push_toast(&locale::t("ime-toast-screen")),
+        OP_IME_CLIPBOARD => {
+            let text = match ime_bar::local_clipboard_gate() {
+                ime_bar::ClipboardGate::Read => read_clipboard(),
+                ime_bar::ClipboardGate::Secure | ime_bar::ClipboardGate::Closed => None,
+            };
+            let tap = ime_bar::accept_local_clipboard(text.as_deref());
+            let wrote = tap.wrote();
+            push_toast(&locale::t(tap.toast_key()));
+            if wrote {
+                apply_ime_field();
+            }
+        }
         OP_SOFTKEY => match ime_bar::on_soft_key(draft) {
             ime_bar::SoftOutcome::Edit => apply_ime_field(),
             ime_bar::SoftOutcome::Submit { role, text } => {
@@ -2238,12 +2258,69 @@ fn apply_screen_override() {
             push_toast(&locale::t("toast-browser-min"));
         }
         Some("tasks") => state::set_signal(TASKS_SIGNAL, 1),
+        Some("ime-smart") | Some("ime-voice") => {
+            focus_app(0);
+            state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+                index: 4,
+                value: String::new(),
+                role: "intent".into(),
+                secure: false,
+                x: 80.0,
+                y: 180.0,
+                width: 280.0,
+                height: 36.0,
+            });
+            if std::env::var("W3COS_SCREEN").ok().as_deref() == Some("ime-voice") {
+                push_toast(&locale::t("ime-toast-voice"));
+            }
+        }
         _ => {}
+    }
+}
+
+fn install_ime_hooks() {
+    state::set_shell_hold_hook(on_shell_hold);
+    state::set_shell_poll_hook(on_shell_poll);
+}
+
+fn on_shell_hold(code: u8, phase: u8) {
+    if code != OP_IME_VOICE {
+        return;
+    }
+    match phase {
+        0 => match ime_bar::voice_press() {
+            w3cos_ime::SpeechStart::Listening => {
+                push_toast(&locale::t("ime-toast-voice-live"));
+                apply_ime_field();
+            }
+            w3cos_ime::SpeechStart::Off(reason) => {
+                push_toast(&locale::t(ime_bar::voice_off_key(reason)));
+            }
+        },
+        2 => match ime_bar::voice_release() {
+            ime_bar::VoiceRelease::Wrote => {
+                push_toast(&locale::t("ime-toast-voice-ok"));
+                apply_ime_field();
+            }
+            ime_bar::VoiceRelease::Empty => {
+                push_toast(&locale::t("ime-toast-voice-empty"));
+                apply_ime_field();
+            }
+            ime_bar::VoiceRelease::Idle => {}
+        },
+        _ => {}
+    }
+}
+
+fn on_shell_poll() {
+    if ime_bar::poll_voice() {
+        apply_ime_field();
     }
 }
 
 fn build_shell() -> Component {
     ensure_shell_signals();
+    install_ime_hooks();
     let _ = handoff::poll_transport();
     if let Some(session) = windows::load_once() {
         let agent = app_bit(4);
@@ -2316,6 +2393,9 @@ fn build_shell() -> Component {
     let toast = state::get_signal_text(TOAST_SIGNAL);
     if !toast.is_empty() && state::get_signal(NOTIFY_SIGNAL) == 0 {
         column.push(chrome_layer(build_toast(&toast)));
+    }
+    if let Some(bar) = ime_bar::modality_layer() {
+        column.push(bar);
     }
     if let Some(bar) = ime_bar::candidate_layer() {
         column.push(bar);
@@ -3623,6 +3703,9 @@ fn build_phone_stack() -> Component {
         },
         vec![build_intent_panel()],
     ));
+    if let Some(bar) = ime_bar::phone_smart_bar() {
+        children.push(bar);
+    }
     if let Some(strip) = ime_bar::phone_candidate_strip() {
         children.push(strip);
     }
@@ -8707,6 +8790,91 @@ mod shell_ux_tests {
         assert_eq!(state::get_signal(APP_SIGNAL), app_before);
         ime_bar::reset_for_tests();
         state::clear_ime_field();
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn smart_bar_explains_blocked_capture_and_stays_off_the_network() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::note_shell_viewport(390.0, 760.0);
+        ime_bar::reset_for_tests();
+        state::note_ime_field(state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 24.0,
+            y: 480.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        let root = build_shell();
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        let labels = button_labels(&root);
+        for key in ["ime-voice", "ime-ink", "ime-clip", "ime-screen"] {
+            let label = locale::t(key);
+            assert!(labels.iter().any(|item| item == &label), "{labels:?}");
+        }
+        on_shell_intent(OP_IME_VOICE, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-voice")
+        );
+        let root_dump = format!("{root:?}");
+        assert_eq!(root_dump.matches("--w3cos-hold").count(), 1, "{root_dump}");
+        state::set_text_signal(DRAFT_SIGNAL, "");
+        on_shell_hold(OP_IME_VOICE, 0);
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-voice")
+        );
+        assert!(!ime_bar::voice_recording());
+        on_shell_hold(OP_IME_VOICE, 2);
+        assert!(!ime_bar::voice_recording());
+        assert_eq!(state::get_signal_text(DRAFT_SIGNAL), "");
+        on_shell_intent(OP_IME_INK, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-ink")
+        );
+        on_shell_intent(OP_IME_SCREEN, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-screen")
+        );
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert!(!handoff::clipboard_sync_enabled());
+
+        state::note_shell_viewport(1200.0, 800.0);
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        state::note_ime_field(state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 80.0,
+            y: 180.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        let root = build_shell();
+        let labels = button_labels(&root);
+        assert!(labels.iter().any(|item| item == &locale::t("ime-clip")));
+        assert!(candidate_bar(&root).is_none());
+
+        state::note_shell_viewport(1200.0, 800.0);
+        state::clear_ime_field();
+        ime_bar::reset_for_tests();
+        state::set_text_signal(TOAST_SIGNAL, "");
         locale::set_locale("en");
     }
 

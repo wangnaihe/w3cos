@@ -11,7 +11,9 @@ mod engine;
 mod hub;
 mod intent;
 mod lexicon;
+mod modality;
 mod pinyin;
+mod speech;
 
 pub use commands::command_utterance;
 pub use context::{
@@ -26,6 +28,14 @@ pub use lexicon::{
     Entry, EntryKind, Lexicon, derive_lexicon_key, learn, open_lexicon, rank_candidates,
     seal_lexicon, seal_with_key,
 };
+pub use modality::{
+    CLIPBOARD_LIMIT, ClipboardDecision, ModalityBlock, ModalityState, ModalitySurface,
+    clipboard_decision, modality_state, p3_surface, route_p3,
+};
 pub use pinyin::{
     PinyinEngine, candidates as pinyin_candidates, preedit_display, segment as pinyin_segment,
+};
+pub use speech::{
+    LocalSpeech, NoLocalSpeech, SpeechChunk, SpeechManifest, SpeechOff, SpeechStart, VOICE_LIMIT,
+    poll_speech, press_speech, release_speech, voice_state,
 };

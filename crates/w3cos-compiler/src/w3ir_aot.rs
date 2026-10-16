@@ -4493,6 +4493,594 @@ fn emit_guarded_block(
     Ok(Some((prelude, fast)))
 }
 
+struct TextAppend {
+    document_binding: u32,
+    parent_binding: u32,
+    element_reg: u32,
+    text_reg: u32,
+    tag: String,
+    text_expr_at: usize,
+    text_expr_end: usize,
+    store_at: usize,
+    tail_at: usize,
+}
+
+/// `createElement` + `textContent` + `appendChild`, with no inline style.
+///
+/// A following `style.*` assignment returns `None` so the styled-block matcher
+/// keeps height, flex, and every other declaration.
+fn match_text_append(body: &[Instruction]) -> Option<TextAppend> {
+    let mut i = 0usize;
+    let (document_reg, document_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (create_key_reg, create_key) = load_string_inst(pull(body, &mut i)?)?;
+    if create_key != "createElement" {
+        return None;
+    }
+    let (tag_reg, tag) = load_string_inst(pull(body, &mut i)?)?;
+    if tag.is_empty() {
+        return None;
+    }
+    let Instruction::CallMethod {
+        dst,
+        object,
+        key,
+        arguments,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != document_reg
+        || key.0 != create_key_reg
+        || arguments.len() != 1
+        || arguments[0].0 != tag_reg
+    {
+        return None;
+    }
+    let element_reg = dst.0;
+    let store_at = i;
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != element_reg {
+        return None;
+    }
+    let element_binding = binding.0;
+
+    let (text_object, text_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_bind != element_binding {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let text_expr_at = i;
+    let mut text_reg = None;
+    while i < body.len() {
+        if let Instruction::SetProperty {
+            object,
+            key,
+            value,
+            strict: _,
+        } = &body[i]
+        {
+            if object.0 == text_object && key.0 == text_key_reg {
+                text_reg = Some(value.0);
+                break;
+            }
+        }
+        if !pure_value_inst(&body[i]) {
+            return None;
+        }
+        i += 1;
+    }
+    let text_reg = text_reg?;
+    let text_expr_end = i;
+    i += 1;
+
+    let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
+    if append_key != "appendChild" {
+        return None;
+    }
+    let (_, append_child_bind) = load_binding_inst(pull(body, &mut i)?)?;
+    if append_child_bind != element_binding {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != parent_reg || key.0 != append_key_reg || arguments.len() != 1 {
+        return None;
+    }
+    let tail_at = i;
+    let tail_is_arithmetic = !body[tail_at..].is_empty()
+        && body[tail_at..].iter().all(|inst| {
+            matches!(
+                inst,
+                Instruction::LoadConstant { .. }
+                    | Instruction::LoadBinding { .. }
+                    | Instruction::Add { .. }
+                    | Instruction::Binary { .. }
+                    | Instruction::Unary { .. }
+                    | Instruction::StoreBinding { .. }
+                    | Instruction::Move { .. }
+            )
+        });
+    if !tail_is_arithmetic {
+        return None;
+    }
+    Some(TextAppend {
+        document_binding,
+        parent_binding,
+        element_reg,
+        text_reg,
+        tag,
+        text_expr_at,
+        text_expr_end,
+        store_at,
+        tail_at,
+    })
+}
+
+fn emit_guarded_text(
+    body: &[Instruction],
+    slow: &str,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
+) -> Result<Option<(String, String)>> {
+    let Some(shape) = match_text_append(body) else {
+        return Ok(None);
+    };
+    let Some(element_slot) = val_slot(plan, shape.element_reg) else {
+        return Ok(None);
+    };
+    let Some(text_slot) = val_slot(plan, shape.text_reg) else {
+        return Ok(None);
+    };
+    let text_expr = emit_block_instructions(
+        &body[shape.text_expr_at..shape.text_expr_end],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let store = emit_block_instructions(
+        &body[shape.store_at..shape.store_at + 1],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tail = emit_block_instructions(
+        &body[shape.tail_at..],
+        None,
+        function,
+        factories,
+        EmissionMode::Sync,
+        module_specifier,
+        type_name,
+        storage,
+        plan,
+        back_edges,
+    )?;
+    let tag_atom = qualified_atom_expr(&shape.tag);
+    let suffix = format!("t{}_{}", shape.document_binding, shape.parent_binding);
+    let prelude = fusion_latch_prelude(
+        &suffix,
+        &format!("let __w3cos_tag_atom_{suffix}: u32 = {tag_atom};\n"),
+        &["doc", "parent"],
+    );
+    let open = fusion_latch_open(
+        &suffix,
+        &[
+            ("doc", shape.document_binding),
+            ("parent", shape.parent_binding),
+        ],
+        &fusion_surface_expr(&suffix, false, &shape.tag),
+    );
+    let fast = format!(
+        "{open}{text_expr}let __w3cos_built = w3cos_core::intrinsics::dom_build_text_guarded(&__w3cos_doc_{suffix}, &__w3cos_parent_{suffix}, {tag:?}, __w3cos_tag_atom_{suffix}, &self.registers[{text_slot}], __w3cos_dom_epoch_{suffix});\nif !__w3cos_built.is_undefined() {{\nself.registers[{element_slot}] = __w3cos_built;\n{store}{tail}}} else {{\n{slow}}}\n}} else {{\n{slow}}}\n",
+        tag = shape.tag,
+    );
+    Ok(Some((prelude, fast)))
+}
+
+fn load_number_inst(inst: &Instruction) -> Option<(u32, f64)> {
+    match inst {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::Number(number),
+        } if number.is_finite() => Some((dst.0, *number)),
+        _ => None,
+    }
+}
+
+struct IndexedRewrite {
+    k_binding: u32,
+    limit_binding: u32,
+    modulus_binding: u32,
+    nodes_binding: u32,
+    parent_binding: u32,
+    text_sum_binding: u32,
+    stride: f64,
+    prefix: String,
+}
+
+/// One strict `nodes[(k * stride) % modulus].textContent = prefix + k` move.
+///
+/// The header is `k < limit` and the body ends with `k = k * 1 + 1`. Anything
+/// else, including an extra property write, stays on the ordinary path.
+fn match_indexed_text_rewrite(
+    header: &[Instruction],
+    body: &[Instruction],
+) -> Option<IndexedRewrite> {
+    let header = match header.last() {
+        Some(Instruction::Branch { .. }) => &header[..header.len() - 1],
+        _ => return None,
+    };
+    let mut i = 0usize;
+    let (k_reg, k_binding) = load_binding_inst(pull(header, &mut i)?)?;
+    let (limit_reg, limit_binding) = load_binding_inst(pull(header, &mut i)?)?;
+    let Instruction::Binary {
+        operator: BinaryOperator::LessThan,
+        lhs,
+        rhs,
+        ..
+    } = pull(header, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != k_reg || rhs.0 != limit_reg || i != header.len() {
+        return None;
+    }
+
+    i = 0;
+    let (k_body, k_body_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if k_body_binding != k_binding {
+        return None;
+    }
+    let (stride_reg, stride) = load_number_inst(pull(body, &mut i)?)?;
+    if stride.fract() != 0.0 || !(1.0..1_000_001.0).contains(&stride) {
+        return None;
+    }
+    let Instruction::Binary {
+        dst: product,
+        operator: BinaryOperator::Multiply,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != k_body || rhs.0 != stride_reg {
+        return None;
+    }
+    let (modulus_reg, modulus_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let Instruction::Binary {
+        dst: remainder,
+        operator: BinaryOperator::Remainder,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != product.0 || rhs.0 != modulus_reg {
+        return None;
+    }
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != remainder.0 {
+        return None;
+    }
+    let index_binding = binding.0;
+
+    let (nodes_reg, nodes_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (index_reg, index_check) = load_binding_inst(pull(body, &mut i)?)?;
+    if index_check != index_binding {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: element,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_reg || key.0 != index_reg {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let (prefix_reg, prefix) = load_string_inst(pull(body, &mut i)?)?;
+    if !prefix.is_ascii() {
+        return None;
+    }
+    let (k_text, k_text_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if k_text_binding != k_binding {
+        return None;
+    }
+    let Instruction::Add {
+        dst: text_value,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != prefix_reg || rhs.0 != k_text {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if !strict || object.0 != element.0 || key.0 != text_key_reg || value.0 != text_value.0 {
+        return None;
+    }
+
+    let (parent_reg, parent_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (append_key_reg, append_key) = load_string_inst(pull(body, &mut i)?)?;
+    if append_key != "appendChild" {
+        return None;
+    }
+    let (nodes_again, nodes_again_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if nodes_again_binding != nodes_binding {
+        return None;
+    }
+    let (index_again, index_again_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if index_again_binding != index_binding {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: moved,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_again || key.0 != index_again {
+        return None;
+    }
+    let Instruction::CallMethod {
+        object,
+        key,
+        arguments,
+        ..
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != parent_reg
+        || key.0 != append_key_reg
+        || arguments.len() != 1
+        || arguments[0].0 != moved.0
+    {
+        return None;
+    }
+
+    let (sum_reg, text_sum_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (nodes_len, nodes_len_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if nodes_len_binding != nodes_binding {
+        return None;
+    }
+    let (index_len, index_len_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if index_len_binding != index_binding {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: length_element,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_len || key.0 != index_len {
+        return None;
+    }
+    let (length_key_reg, length_key) = load_string_inst(pull(body, &mut i)?)?;
+    if length_key != "textContent" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: length_text,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != length_element.0 || key.0 != length_key_reg {
+        return None;
+    }
+    let (length_name_reg, length_name) = load_string_inst(pull(body, &mut i)?)?;
+    if length_name != "length" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: length_value,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != length_text.0 || key.0 != length_name_reg {
+        return None;
+    }
+    let Instruction::Add {
+        dst: summed,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != sum_reg || rhs.0 != length_value.0 {
+        return None;
+    }
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if binding.0 != text_sum_binding || value.0 != summed.0 {
+        return None;
+    }
+
+    let (one_reg, one) = load_number_inst(pull(body, &mut i)?)?;
+    if one != 1.0 {
+        return None;
+    }
+    let (k_inc, k_inc_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if k_inc_binding != k_binding {
+        return None;
+    }
+    let Instruction::Binary {
+        dst: scaled,
+        operator: BinaryOperator::Multiply,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != k_inc || rhs.0 != one_reg {
+        return None;
+    }
+    let Instruction::Add {
+        dst: next_k,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != scaled.0 || rhs.0 != one_reg {
+        return None;
+    }
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if binding.0 != k_binding || value.0 != next_k.0 || i != body.len() {
+        return None;
+    }
+    Some(IndexedRewrite {
+        k_binding,
+        limit_binding,
+        modulus_binding,
+        nodes_binding,
+        parent_binding,
+        text_sum_binding,
+        stride,
+        prefix,
+    })
+}
+
+fn binding_number_expr(plan: &EscapePlan, binding: u32) -> String {
+    if let Some(number) = plan.constants.get(&binding) {
+        return format!("{number:?}");
+    }
+    if let Some(slot) = num_binding_slot(plan, binding) {
+        format!("self.num_bindings[{slot}]")
+    } else if is_shared_number(binding) {
+        format!("self.num_cells.get(&{binding}).and_then(|cell| cell.get()).unwrap_or(f64::NAN)")
+    } else {
+        format!("({}).to_number()", stable_binding_expr(binding))
+    }
+}
+
+fn emit_store_number_binding(plan: &EscapePlan, binding: u32, number_expr: &str) -> String {
+    if let Some(slot) = num_binding_slot(plan, binding) {
+        return format!("self.num_bindings[{slot}] = {number_expr};");
+    }
+    if is_shared_number(binding) {
+        return format!(
+            "if let Some(cell) = self.num_cells.get(&{binding}) {{ cell.set(Some({number_expr})); }}"
+        );
+    }
+    format!(
+        "if let Some(setter) = self.capture_setters.get(&{binding}) {{ let __w3cos_stored = w3cos_core::Value::Number({number_expr}); setter.call_slice(w3cos_core::Value::Undefined, std::slice::from_ref(&__w3cos_stored)); }} else if let Some(cell) = self.bindings.get(&{binding}) {{ let mut binding = cell.borrow_mut(); if binding.1 {{ binding.0 = w3cos_core::Value::Number({number_expr}); }} }}"
+    )
+}
+
+fn emit_add_number_binding(plan: &EscapePlan, binding: u32, addend: &str) -> String {
+    if let Some(slot) = num_binding_slot(plan, binding) {
+        return format!("self.num_bindings[{slot}] += {addend};");
+    }
+    if is_shared_number(binding) {
+        return format!(
+            "if let Some(cell) = self.num_cells.get(&{binding}) {{ cell.set(Some(cell.get().unwrap_or(0.0_f64) + ({addend}))); }}"
+        );
+    }
+    format!(
+        "if let Some(setter) = self.capture_setters.get(&{binding}) {{ let __w3cos_current = if let Some(getter) = self.capture_getters.get(&{binding}) {{ getter.call_slice(w3cos_core::Value::Undefined, &[]).to_number() }} else {{ 0.0_f64 }}; let __w3cos_stored = w3cos_core::Value::Number(__w3cos_current + ({addend})); setter.call_slice(w3cos_core::Value::Undefined, std::slice::from_ref(&__w3cos_stored)); }} else if let Some(cell) = self.bindings.get(&{binding}) {{ let mut binding = cell.borrow_mut(); if binding.1 {{ binding.0 = w3cos_core::Value::Number(binding.0.to_number() + ({addend})); }} }}"
+    )
+}
+
+/// One call for the whole loop, after the gate proves the body runs.
+///
+/// `Undefined` means the runtime refused before the first write, so the
+/// ordinary property path still observes every check.
+fn emit_indexed_text_rewrite(
+    header: &[Instruction],
+    body: &[Instruction],
+    slow: &str,
+    plan: &EscapePlan,
+) -> Option<(String, String)> {
+    let shape = match_indexed_text_rewrite(header, body)?;
+    let suffix = format!(
+        "w{}_{}_{}",
+        shape.k_binding, shape.nodes_binding, shape.parent_binding
+    );
+    let modulus = binding_number_expr(plan, shape.modulus_binding);
+    let start = binding_number_expr(plan, shape.k_binding);
+    let limit = binding_number_expr(plan, shape.limit_binding);
+    let add_sum =
+        emit_add_number_binding(plan, shape.text_sum_binding, "__w3cos_rewrite.to_number()");
+    let set_k = emit_store_number_binding(plan, shape.k_binding, &limit);
+    let prelude = format!("let mut __w3cos_rewrite_tried_{suffix} = false;\n");
+    let fast = format!(
+        "if !__w3cos_rewrite_tried_{suffix} {{\n__w3cos_rewrite_tried_{suffix} = true;\nlet __w3cos_rewrite_nodes_{suffix} = {};\nlet __w3cos_rewrite_parent_{suffix} = {};\nlet __w3cos_rewrite_epoch_{suffix} = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_rewrite = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(&__w3cos_rewrite_nodes_{suffix}, &__w3cos_rewrite_parent_{suffix}, {prefix:?}, {stride:?}, {modulus}, {start}, {limit}, __w3cos_rewrite_epoch_{suffix});\nif !__w3cos_rewrite.is_undefined() {{\n{add_sum}\n{set_k}\nbreak;\n}}\n}}\n{slow}",
+        stable_binding_expr(shape.nodes_binding),
+        stable_binding_expr(shape.parent_binding),
+        prefix = shape.prefix,
+        stride = shape.stride,
+    );
+    Some((prelude, fast))
+}
+
 fn emit_native_sync_loop(
     header: &[Instruction],
     blocks: &[(w3cos_ir::BlockId, Vec<Instruction>)],
@@ -4549,20 +5137,13 @@ fn emit_native_sync_loop(
     // match the sealed builtins. Binding reads stay in the body so a zero-trip
     // loop does not observe them. A failed surface check or a bumped epoch
     // falls through to `body_code`.
-    let guarded = match emit_guarded_append(
-        &body[..body.len() - 1],
-        &body_code,
-        function,
-        factories,
-        module_specifier,
-        type_name,
-        storage,
-        plan,
-        back_edges,
-    )? {
-        some @ Some(_) => some,
-        None => emit_guarded_block(
-            &body[..body.len() - 1],
+    let body_insts = &body[..body.len() - 1];
+    let rewrite = emit_indexed_text_rewrite(header, body_insts, &body_code, plan);
+    let guarded = if rewrite.is_some() {
+        None
+    } else {
+        match emit_guarded_append(
+            body_insts,
             &body_code,
             function,
             factories,
@@ -4571,9 +5152,36 @@ fn emit_native_sync_loop(
             storage,
             plan,
             back_edges,
-        )?,
+        )? {
+            some @ Some(_) => some,
+            None => match emit_guarded_block(
+                body_insts,
+                &body_code,
+                function,
+                factories,
+                module_specifier,
+                type_name,
+                storage,
+                plan,
+                back_edges,
+            )? {
+                some @ Some(_) => some,
+                None => emit_guarded_text(
+                    body_insts,
+                    &body_code,
+                    function,
+                    factories,
+                    module_specifier,
+                    type_name,
+                    storage,
+                    plan,
+                    back_edges,
+                )?,
+            },
+        }
     };
-    let loop_body = if let Some((_, fast)) = &guarded {
+    let fused = rewrite.as_ref().or(guarded.as_ref());
+    let loop_body = if let Some((_, fast)) = fused {
         format!("{header_code}{gate}\n{fast}")
     } else {
         format!("{header_code}{gate}\n{body_code}")
@@ -4594,7 +5202,7 @@ fn emit_native_sync_loop(
         })
         .collect::<HashSet<_>>();
     let (mut hoisted, loop_body) = tighten_native_loop(&loop_body, &replaced_bindings);
-    if let Some((prelude, _)) = &guarded {
+    if let Some((prelude, _)) = fused {
         hoisted.push_str(prelude);
     }
     let (mut prologue, loop_body, epilogue) = promote_unboxed_locals(&loop_body)
@@ -8043,6 +8651,149 @@ fn main() {{
     }
 
     #[test]
+    fn native_dom_update_loop_is_rewritten() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                var DOM_NODES = 1000;
+                var DOM_UPDATES = 8000;
+                function domOnce() {
+                    var root = document.createElement("div");
+                    document.body.appendChild(root);
+                    var nodes = [];
+                    for (var i = 0; i < DOM_NODES; i++) {
+                        var el = document.createElement("div");
+                        el.id = "row-" + i;
+                        el.className = "row";
+                        el.textContent = "item " + i;
+                        root.appendChild(el);
+                        nodes.push(el);
+                    }
+                    var textSum = 0;
+                    for (var k = 0; k < DOM_UPDATES; k++) {
+                        var index = (k * 17) % DOM_NODES;
+                        nodes[index].textContent = "upd " + k;
+                        root.appendChild(nodes[index]);
+                        textSum = textSum + nodes[index].textContent.length;
+                    }
+                    return textSum;
+                }
+            "#,
+            "app:///dom-update.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("domOnce"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "dom_update_aot").unwrap();
+        assert_fused_after_gate(&generated, "dom_build_guarded");
+        let rewrite_at = generated
+            .find("dom_rewrite_indexed_text_guarded")
+            .unwrap_or_else(|| panic!("indexed rewrite missing: {generated}"));
+        let loop_at = generated[..rewrite_at].rfind("loop {").unwrap_or(0);
+        let gate_at = generated[loop_at..rewrite_at]
+            .find("break;")
+            .unwrap_or_else(|| panic!("rewrite must follow the loop gate: {generated}"));
+        assert!(loop_at + gate_at < rewrite_at);
+        assert!(
+            generated.contains("__w3cos_rewrite_tried_")
+                && generated.contains("is_undefined()")
+                && generated.contains("\"upd \"")
+                && generated.contains("17.0, 1000.0,")
+                && generated.contains(", 8000.0,"),
+            "the whole update loop is one guarded call with folded limits: {generated}"
+        );
+        let fallback = &generated[rewrite_at..];
+        assert!(
+            fallback.contains("set_property_strict(")
+                && fallback.contains("\"textContent\"")
+                && fallback.contains(".call_method_slice(\"appendChild\""),
+            "a refused rewrite keeps the ordinary property path: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_dom_update_with_extra_write_stays_unfused() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                var DOM_NODES = 1000;
+                var DOM_UPDATES = 8000;
+                function domOnce(root, nodes) {
+                    var textSum = 0;
+                    for (var k = 0; k < DOM_UPDATES; k++) {
+                        var index = (k * 17) % DOM_NODES;
+                        nodes[index].textContent = "upd " + k;
+                        nodes[index].id = "x";
+                        root.appendChild(nodes[index]);
+                        textSum = textSum + nodes[index].textContent.length;
+                    }
+                    return textSum;
+                }
+            "#,
+            "app:///dom-update-extra.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("domOnce"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "dom_update_extra_aot").unwrap();
+        assert!(
+            !generated.contains("dom_rewrite_indexed_text_guarded"),
+            "an extra property write stays on the ordinary path: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_text_append_loop_is_guarded() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                var CSS_LIST_NODES = 1000;
+                function runCssList() {
+                    var root = document.createElement("div");
+                    root.id = "css-list";
+                    document.body.appendChild(root);
+                    for (var i = 0; i < CSS_LIST_NODES; i++) {
+                        var el = document.createElement("div");
+                        el.textContent = "row " + (i % 40);
+                        root.appendChild(el);
+                    }
+                    return root.offsetHeight;
+                }
+            "#,
+            "app:///css-list.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("runCssList"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "css_list_aot").unwrap();
+        assert_fused_after_gate(&generated, "dom_build_text_guarded");
+        assert!(
+            !generated.contains("dom_build_block_guarded")
+                && !generated.contains("dom_build_flex_row_guarded"),
+            "text-only rows are not the styled block path: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method_slice(\"createElement\"")
+                && generated.contains("set_property_strict(")
+                && generated.contains("\"textContent\"")
+                && generated.contains(".call_method_slice(\"appendChild\""),
+            "ordinary lookup stays on the text-append fallback: {generated}"
+        );
+    }
+
+    #[test]
     fn native_dom_loop_with_binding_limit_is_guarded() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
@@ -8339,7 +9090,8 @@ fn main() {{
         assert!(
             !generated.contains("dom_build_flex_row_guarded")
                 && !generated.contains("dom_build_block_guarded")
-                && !generated.contains("dom_build_guarded"),
+                && !generated.contains("dom_build_guarded")
+                && !generated.contains("dom_build_text_guarded"),
             "height plus width stays on the ordinary lookup: {generated}"
         );
     }

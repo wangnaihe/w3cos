@@ -773,16 +773,21 @@ impl Document {
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
 
+        let parent_changed = old_parent != Some(parent);
         if let Some(old_parent) = old_parent
-            && old_parent != parent
+            && parent_changed
         {
             self.mark_dirty(old_parent);
         }
         self.mark_dirty(parent);
-        // Used values such as flex item blockification depend on the new
-        // ancestor chain. Restyle the moved subtree without walking the
-        // parent's existing siblings.
-        self.invalidate_style_subtree(child);
+        // A new ancestor chain can change used values such as flex item
+        // blockification. Positional selectors are covered by `mark_dirty`:
+        // it restyles the parent when a sibling or structural rule exists.
+        // Reordering inside the same parent does not change that chain, so
+        // walking the moved subtree again is wasted work.
+        if parent_changed {
+            self.invalidate_style_subtree(child);
+        }
         self.note_structure_change();
     }
 
@@ -1166,6 +1171,32 @@ impl Document {
         self.touch_style_revision(parent);
         self.record_layout_dirty(parent);
         self.note_structure_change();
+        Some(element)
+    }
+
+    /// Create an element with one text child and append it.
+    ///
+    /// Author rules stay active. Layout resolves them later, so a stylesheet
+    /// height on the new child still applies. Returns `None` for an invalid
+    /// tag or a parent that cannot accept an element.
+    pub fn append_text_element(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        tag_atom: u32,
+        text: &str,
+    ) -> Option<NodeId> {
+        if parent.0 as usize >= self.nodes.len() || tag.is_empty() {
+            return None;
+        }
+        self.reserve_build_slots(2);
+        let tag_atom = resolve_name_atom(tag, tag_atom);
+        let element = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag_atom));
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element, text_id);
+        }
+        self.append_child(parent, element);
         Some(element)
     }
 

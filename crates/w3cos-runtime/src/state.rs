@@ -556,6 +556,71 @@ pub fn shell_gesture_at(root: &Component, index: usize) -> Option<(i64, u8)> {
     Some((id, mode))
 }
 
+thread_local! {
+    static HOLD_HOOK: Cell<Option<fn(u8, u8)>> = const { Cell::new(None) };
+    static HOLD_CODE: Cell<Option<u8>> = const { Cell::new(None) };
+    static POLL_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    static POLL_SOON: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Opcode stored on `--w3cos-hold`. The shell treats pointer down/up as a hold.
+pub fn shell_hold_code(root: &Component, index: usize) -> Option<u8> {
+    node_at(root, index)?
+        .style
+        .custom_properties
+        .as_ref()?
+        .get("--w3cos-hold")?
+        .parse()
+        .ok()
+}
+
+pub fn set_shell_hold_hook(hook: fn(u8, u8)) {
+    HOLD_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+/// `phase` 0 is press, 2 is release. A second press releases the previous hold.
+pub fn shell_hold_begin(code: u8) {
+    let previous = HOLD_CODE.with(|slot| slot.replace(Some(code)));
+    if let Some(previous) = previous
+        && let Some(hook) = HOLD_HOOK.with(Cell::get)
+    {
+        hook(previous, 2);
+    }
+    if let Some(hook) = HOLD_HOOK.with(Cell::get) {
+        hook(code, 0);
+    }
+}
+
+/// End the hold from pointer up. True when the following click must not run.
+pub fn shell_hold_end() -> bool {
+    let Some(code) = HOLD_CODE.with(|slot| slot.take()) else {
+        return false;
+    };
+    if let Some(hook) = HOLD_HOOK.with(Cell::get) {
+        hook(code, 2);
+    }
+    true
+}
+
+pub fn set_shell_poll_hook(hook: fn()) {
+    POLL_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+pub fn run_shell_poll_hook() {
+    if let Some(hook) = POLL_HOOK.with(Cell::get) {
+        hook();
+    }
+}
+
+/// While true, the window keeps a short deadline so a local speech hold can poll.
+pub fn note_shell_poll_soon(soon: bool) {
+    POLL_SOON.with(|slot| slot.set(soon));
+}
+
+pub fn shell_poll_soon() -> bool {
+    POLL_SOON.with(Cell::get)
+}
+
 /// Drop a hook installed by [`set_invoke_hook`]. Tests use this so a plugin
 /// callback does not stay registered for later cases on the same thread.
 pub fn clear_invoke_hook() {

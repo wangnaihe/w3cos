@@ -622,6 +622,46 @@ fn expand_rect(rect: LayoutRect, amount: f32) -> LayoutRect {
     }
 }
 
+/// Transform, filter, and backdrop blur can paint outside the border box.
+fn paint_escapes_clip(style: &Style) -> bool {
+    !style.transform.is_identity() || style.filter.is_some() || style.backdrop_blur.is_some()
+}
+
+/// Bounds that can change pixels, including shadows and overflowing text.
+fn paint_influence_bounds(rect: LayoutRect, style: &Style) -> LayoutRect {
+    let mut bounds = chrome_bounds(rect, style);
+    let mut pad = style.outline_width.max(0.0);
+    for shadow in &style.text_shadows {
+        let reach = shadow.blur_radius.abs() + shadow.offset_x.abs().max(shadow.offset_y.abs());
+        pad = pad.max(reach);
+    }
+    let overflow_visible = matches!(
+        style.resolved_overflow_x(),
+        w3cos_std::style::Overflow::Visible
+    ) || matches!(
+        style.resolved_overflow_y(),
+        w3cos_std::style::Overflow::Visible
+    );
+    if overflow_visible {
+        pad += style.font_size.max(1.0);
+    }
+    pad += 2.0;
+    if pad > 0.0 {
+        bounds = expand_rect(bounds, pad);
+    }
+    bounds
+}
+
+#[cfg(test)]
+thread_local! {
+    static RENDER_NODE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn note_painted_node() {
+    #[cfg(test)]
+    RENDER_NODE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+}
+
 fn paint_nodes(
     pixmap: &mut Pixmap,
     nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
@@ -674,6 +714,12 @@ fn paint_nodes(
             (None, Some(damage)) => Some(damage),
             (None, None) => None,
         };
+        if let Some(clip_rect) = effective_clip
+            && !paint_escapes_clip(style)
+            && !rects_intersect(paint_influence_bounds(offset_rect, style), clip_rect)
+        {
+            continue;
+        }
         let clip_mask = effective_clip.and_then(|rect| clip_masks.get_or_create(pixmap, rect));
         let text_value = match kind {
             ComponentKind::TextInput { value, .. } => Some(
@@ -807,6 +853,7 @@ fn render_node(
     in_layer: bool,
     damage: Option<LayoutRect>,
 ) {
+    note_painted_node();
     if style.opacity <= 0.0 {
         return;
     }
@@ -3523,5 +3570,146 @@ mod font_cjk_tests {
             crate::blur::cache_hit_count()
         );
         eprintln!("dock+intent 1200x800 cold {cold_ms:.2}ms warm {warm_ms:.2}ms");
+    }
+
+    fn paint_count() -> u32 {
+        super::RENDER_NODE_CALLS.with(|calls| calls.get())
+    }
+
+    fn reset_paint_count() {
+        super::RENDER_NODE_CALLS.with(|calls| calls.set(0));
+    }
+
+    #[test]
+    fn offscreen_scroll_rows_are_not_painted() {
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let kind = ComponentKind::Column;
+        let mut inside = Style::default();
+        inside.background = Color::rgb(255, 0, 0);
+        let mut outside = Style::default();
+        outside.background = Color::rgb(0, 0, 255);
+        let mut shadow = Style::default();
+        shadow.background = Color::rgb(0, 255, 0);
+        shadow.box_shadow = Some(w3cos_std::style::BoxShadow::new(
+            0.0,
+            -30.0,
+            0.0,
+            0.0,
+            Color::rgb(0, 255, 0),
+        ));
+        let mut filtered = Style::default();
+        filtered.background = Color::rgb(255, 255, 0);
+        filtered.filter = Some("blur(4px)".to_string());
+        let clip = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 40.0,
+        };
+        let inside_rect = LayoutRect {
+            x: 4.0,
+            y: 4.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        let outside_rect = LayoutRect {
+            x: 4.0,
+            y: 200.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        let filter_rect = LayoutRect {
+            x: 4.0,
+            y: 90.0,
+            width: 16.0,
+            height: 12.0,
+        };
+        let shadow_rect = LayoutRect {
+            x: 4.0,
+            y: 50.0,
+            width: 16.0,
+            height: 10.0,
+        };
+        let scroll = [
+            Some((0.0, 0.0, clip)),
+            Some((0.0, 0.0, clip)),
+            Some((0.0, 0.0, clip)),
+            Some((0.0, 0.0, clip)),
+        ];
+        let values = HashMap::new();
+        let mut masks = ClipMaskCache::default();
+
+        reset_paint_count();
+        let mut only_inside = Pixmap::new(80, 80).unwrap();
+        render_frame(
+            &mut only_inside,
+            &[(0, inside_rect, &kind, &inside)],
+            &font,
+            &scroll,
+            &values,
+            None,
+            &mut masks,
+        );
+        assert_eq!(paint_count(), 1, "a node inside the clip is painted");
+        assert!(
+            only_inside.pixel(8, 8).unwrap().red() > 200,
+            "inside node must change pixels"
+        );
+
+        reset_paint_count();
+        let mut with_outside = Pixmap::new(80, 80).unwrap();
+        render_frame(
+            &mut with_outside,
+            &[
+                (0, inside_rect, &kind, &inside),
+                (1, outside_rect, &kind, &outside),
+            ],
+            &font,
+            &scroll,
+            &values,
+            None,
+            &mut masks,
+        );
+        assert_eq!(paint_count(), 1, "a fully offscreen row is not painted");
+        assert_eq!(with_outside.data(), only_inside.data());
+
+        reset_paint_count();
+        let mut with_shadow = Pixmap::new(80, 80).unwrap();
+        render_frame(
+            &mut with_shadow,
+            &[(2, shadow_rect, &kind, &shadow)],
+            &font,
+            &scroll,
+            &values,
+            None,
+            &mut masks,
+        );
+        assert_eq!(
+            paint_count(),
+            1,
+            "a shadow that reaches into the clip is not culled"
+        );
+
+        assert!(
+            super::paint_escapes_clip(&filtered),
+            "a filter can paint outside its box"
+        );
+        assert!(!super::paint_escapes_clip(&outside));
+        assert!(super::rects_intersect(
+            super::paint_influence_bounds(shadow_rect, &shadow),
+            clip
+        ));
+        assert!(!super::rects_intersect(
+            super::paint_influence_bounds(outside_rect, &outside),
+            clip
+        ));
+        assert!(
+            !super::rects_intersect(super::paint_influence_bounds(filter_rect, &filtered), clip),
+            "the filter box itself is outside the clip; the escape check keeps it"
+        );
     }
 }
