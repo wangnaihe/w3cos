@@ -1376,13 +1376,15 @@ fn stage_bounds() -> (f32, f32) {
     if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
         width -= 320.0;
     }
-    let reserved = match posture() {
-        Posture::Desktop => 96.0,
-        Posture::WideTablet => 84.0,
-        Posture::Tablet => 84.0,
-        Posture::Phone => 72.0,
+    // Desktop windows sit in the stage. Maximize fills that stage and stops
+    // above the intent bar. Phone and tablet are full-bleed surfaces, so they
+    // do not use this height for a floating frame.
+    let height = if posture() == Posture::Desktop {
+        (intent_block_top(viewport_h) - 8.0).max(200.0)
+    } else {
+        (viewport_h - 84.0).max(200.0)
     };
-    (width.max(320.0), (viewport_h - reserved).max(200.0))
+    (width.max(320.0), height)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1940,6 +1942,10 @@ fn apply_screen_override() {
         Some("settings-bridge") | Some("settings-agent") => present_settings(2, 0),
         Some("settings-language") => present_settings(6, 0),
         Some("files") => focus_app(1),
+        Some("closed") => {
+            focus_app(1);
+            close_window(1);
+        }
         Some("files-docs") => {
             focus_app(1);
             state::set_signal(FILES_FOLDER_SIGNAL, 1);
@@ -6780,11 +6786,37 @@ fn window_button(
 
 fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Component {
     let title = title.into();
+    let floating = posture() == Posture::Desktop;
     let (max_glyph, max_label) = if windows::is_maximized(app_id) {
         ("restore", locale::t("win-restore"))
     } else {
         ("maximize", locale::t("win-maximize"))
     };
+    let mut controls = vec![window_button(
+        "minus",
+        locale::t("win-minimize"),
+        OP_MINIMIZE,
+        "#c5d0d8",
+        app_id,
+    )];
+    // Phone and tablet already fill the surface. A maximize control there
+    // would only flip stored geometry and leave the screen unchanged.
+    if floating {
+        controls.push(window_button(
+            max_glyph,
+            max_label,
+            OP_MAXIMIZE,
+            "#c5d0d8",
+            app_id,
+        ));
+    }
+    controls.push(window_button(
+        "close",
+        locale::t("win-close"),
+        OP_CLOSE,
+        "#e94560",
+        app_id,
+    ));
     let bar_height = if state::pointer_is_coarse() {
         56.0
     } else {
@@ -6831,20 +6863,10 @@ fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Componen
             ),
             Component::row(
                 Style {
-                    gap: 6.0,
+                    gap: 4.0,
                     ..Style::default()
                 },
-                vec![
-                    window_button(
-                        "minus",
-                        locale::t("win-minimize"),
-                        OP_MINIMIZE,
-                        "#c5d0d8",
-                        app_id,
-                    ),
-                    window_button(max_glyph, max_label, OP_MAXIMIZE, "#c5d0d8", app_id),
-                    window_button("close", locale::t("win-close"), OP_CLOSE, "#e94560", app_id),
-                ],
+                controls,
             ),
         ],
     );
@@ -7696,7 +7718,9 @@ mod shell_ux_tests {
 
     #[test]
     fn window_controls_are_icons_not_a_missing_glyph() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
         locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
         assert_ne!(locale::t("win-maximize"), "[]");
         assert_eq!(locale::t("win-minimize"), "最小化");
         assert_eq!(locale::t("win-maximize"), "最大化");
@@ -7720,7 +7744,101 @@ mod shell_ux_tests {
                 icon.label
             );
         }
-        locale::set_locale("en");
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn closing_a_window_returns_home_and_full_bleed_hides_maximize() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        focus_app(1);
+
+        let open = build_stage();
+        assert_eq!(codes_for(&open, "关闭"), vec![OP_CLOSE]);
+        assert_eq!(codes_for(&open, "最小化"), vec![OP_MINIMIZE]);
+        assert_eq!(codes_for(&open, "最大化"), vec![OP_MAXIMIZE]);
+        assert!(!codes_for(&open, "关闭").contains(&OP_CONFIRM));
+        for icon in icon_buttons(&app_titlebar("文件", "#3498db", 1)) {
+            assert_eq!(
+                icon.width, 28.0,
+                "{} left the 28px title target",
+                icon.label
+            );
+        }
+
+        on_shell_intent(OP_MAXIMIZE, "1");
+        assert!(windows::is_maximized(1));
+        let frame = windows::frame(1);
+        let intent_top = intent_block_top(800.0);
+        assert!(
+            frame.y + frame.h <= intent_top - 7.5,
+            "maximized window covers the intent bar: {} + {}",
+            frame.y,
+            frame.h
+        );
+        assert_eq!(codes_for(&build_stage(), "还原"), vec![OP_MAXIMIZE]);
+        assert!(codes_for(&build_stage(), "最大化").is_empty());
+        on_shell_intent(OP_MAXIMIZE, "1");
+        assert!(!windows::is_maximized(1));
+
+        on_shell_intent(OP_MINIMIZE, "1");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_ne!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(1), 0);
+        assert_ne!(state::get_signal(MINIMIZED_MASK_SIGNAL) & app_bit(1), 0);
+        assert!(codes_for(&build_stage(), "关闭").is_empty());
+        assert!(text_blob(&build_stage()).contains("终端"));
+
+        focus_app(1);
+        on_shell_intent(OP_CLOSE, "1");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_eq!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(1), 0);
+        assert_eq!(state::get_signal(MINIMIZED_MASK_SIGNAL) & app_bit(1), 0);
+        let home = text_blob(&build_stage());
+        assert!(home.contains("文件"), "{home}");
+        assert!(home.contains("终端"), "{home}");
+        assert!(codes_for(&build_stage(), "关闭").is_empty());
+        assert!(!home.contains("stub-passkey"));
+        assert!(state::get_signal_text(TOAST_SIGNAL).contains("已关闭"));
+
+        state::note_shell_viewport(390.0, 760.0);
+        focus_app(2);
+        let phone = build_phone_stack();
+        assert_eq!(codes_for(&phone, "关闭"), vec![OP_CLOSE]);
+        assert_eq!(codes_for(&phone, "最小化"), vec![OP_MINIMIZE]);
+        assert!(
+            codes_for(&phone, "最大化").is_empty(),
+            "phone maximize would not change the full-bleed surface"
+        );
+        assert!(codes_for(&phone, "还原").is_empty());
+        on_shell_intent(OP_CLOSE, "2");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_eq!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(2), 0);
+        let phone_home = build_phone_stack();
+        assert!(codes_for(&phone_home, "关闭").is_empty());
+        assert!(text_blob(&phone_home).contains("设置"));
+
+        state::note_shell_viewport(800.0, 700.0);
+        focus_app(1);
+        let tablet = build_tablet_content();
+        assert!(codes_for(&tablet, "最大化").is_empty());
+        assert_eq!(codes_for(&tablet, "关闭"), vec![OP_CLOSE]);
+        on_shell_intent(OP_CLOSE, "1");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert!(text_blob(&build_tablet_content()).contains("浏览器"));
+
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_text_signal(TOAST_SIGNAL, "");
+        state::note_shell_viewport(1200.0, 800.0);
+        locale::set_locale("zh-CN");
     }
 
     #[test]
