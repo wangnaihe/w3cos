@@ -8,7 +8,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use w3cos_ime::{
-    ImeHub, InputIntent, IntentHint, IntentPayload, Modality, PinyinEngine, Proposal, Purpose,
+    ClipboardDecision, ImeHub, InputIntent, IntentHint, IntentPayload, Modality, ModalityBlock,
+    PinyinEngine, Proposal, Purpose, clipboard_decision,
 };
 use w3cos_runtime::state::{self, ImeFieldNote};
 use w3cos_std::Component;
@@ -16,8 +17,8 @@ use w3cos_std::color::Color;
 use w3cos_std::style::*;
 
 use super::{
-    CHROME_Z, OP_IME_1, OP_IME_ACTION, OP_IME_MODE, OP_IME_PAGE_NEXT, OP_IME_PAGE_PREV, OP_SOFTKEY,
-    ink_token, invoke, line_strong,
+    CHROME_Z, OP_IME_1, OP_IME_ACTION, OP_IME_CLIPBOARD, OP_IME_INK, OP_IME_MODE, OP_IME_PAGE_NEXT,
+    OP_IME_PAGE_PREV, OP_IME_SCREEN, OP_IME_VOICE, OP_SOFTKEY, ink_token, invoke, line_strong,
 };
 use crate::locale;
 
@@ -283,6 +284,7 @@ fn commit_at(session: &mut Session, index: usize) -> bool {
     session.undo.push(chunk);
     session.spelling.clear();
     session.page = 0;
+    sync_note_value(session);
     refresh(session);
     queue(session, session.base.clone());
     true
@@ -300,6 +302,7 @@ fn undo(session: &mut Session) -> bool {
     }
     session.undo.pop();
     session.base.truncate(session.base.len() - chunk.len());
+    sync_note_value(session);
     refresh(session);
     queue(session, session.base.clone());
     true
@@ -561,6 +564,123 @@ pub(crate) fn sync_field_presence() {
     });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardGate {
+    Read,
+    Secure,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardTap {
+    Wrote,
+    Empty,
+    TooLong,
+    Secure,
+    Closed,
+}
+
+impl ClipboardTap {
+    pub(crate) fn toast_key(self) -> &'static str {
+        match self {
+            ClipboardTap::Wrote => "ime-toast-clip-ok",
+            ClipboardTap::Empty => "ime-toast-clip-empty",
+            ClipboardTap::TooLong => "ime-toast-clip-long",
+            ClipboardTap::Secure => "ime-toast-clip-secure",
+            ClipboardTap::Closed => "ime-toast-clip-closed",
+        }
+    }
+
+    pub(crate) fn wrote(self) -> bool {
+        matches!(self, ClipboardTap::Wrote)
+    }
+}
+
+/// Whether a clipboard tap may read this device. Secure and closed sessions
+/// return before the shell touches the clipboard.
+pub(crate) fn local_clipboard_gate() -> ClipboardGate {
+    with_session(|session| {
+        adopt_for_capture(session);
+        gate_of(session)
+    })
+}
+
+/// Insert clipboard text the shell already read. This does not read, does not
+/// learn a personal word, and does not send the text to another device.
+pub(crate) fn accept_local_clipboard(text: Option<&str>) -> ClipboardTap {
+    with_session(|session| {
+        adopt_for_capture(session);
+        let Some(ime) = session.ime.clone() else {
+            return ClipboardTap::Closed;
+        };
+        match clipboard_decision(&ime, text.unwrap_or("")) {
+            ClipboardDecision::Insert(chunk) => {
+                session.spelling.clear();
+                session.preedit.clear();
+                session.page = 0;
+                session.base.push_str(&chunk);
+                session.undo.push(chunk);
+                sync_note_value(session);
+                refresh(session);
+                queue(session, session.base.clone());
+                ClipboardTap::Wrote
+            }
+            ClipboardDecision::Empty => ClipboardTap::Empty,
+            ClipboardDecision::TooLong => ClipboardTap::TooLong,
+            ClipboardDecision::Refused(ModalityBlock::SecureField) => ClipboardTap::Secure,
+            ClipboardDecision::Refused(_) => ClipboardTap::Closed,
+        }
+    })
+}
+
+/// Keep text the session already holds for this field. A later note can still
+/// be the empty string from focus, and replacing `base` would drop a commit.
+fn adopt_for_capture(session: &mut Session) {
+    let Some(note) = state::current_ime_field() else {
+        return;
+    };
+    let same = session.has_field
+        && note.index == session.index
+        && note.role == session.role
+        && note.secure == session.secure;
+    if !same || Purpose::for_field(&note.role, note.secure).is_secure() {
+        adopt(session, &note);
+        return;
+    }
+    let base = session.base.clone();
+    let undo = session.undo.clone();
+    let spelling = session.spelling.clone();
+    adopt(session, &note);
+    session.base = base;
+    session.undo = undo;
+    session.spelling = spelling;
+}
+
+fn sync_note_value(session: &Session) {
+    let Some(mut note) = state::current_ime_field() else {
+        return;
+    };
+    if note.index != session.index || note.role != session.role {
+        return;
+    }
+    note.value = session.base.clone();
+    state::note_ime_field(note);
+}
+
+fn gate_of(session: &Session) -> ClipboardGate {
+    let Some(ime) = session.ime.as_ref() else {
+        return ClipboardGate::Closed;
+    };
+    if ime.id.is_empty() {
+        return ClipboardGate::Closed;
+    }
+    if ime.purpose.is_secure() {
+        ClipboardGate::Secure
+    } else {
+        ClipboardGate::Read
+    }
+}
+
 /// Utterance for the visible command chip. The shell proposes it; it does not run it.
 pub(crate) fn command_utterance() -> Option<String> {
     with_session(|session| session.actions.first().map(|offer| offer.utterance.clone()))
@@ -744,6 +864,98 @@ pub(crate) fn candidate_layer() -> Option<Component> {
     );
     bar.style.z_index = CHROME_Z + 5;
     Some(bar)
+}
+
+fn field_blocks_capture() -> bool {
+    let Some(note) = state::current_ime_field() else {
+        return true;
+    };
+    Purpose::for_field(&note.role, note.secure).is_secure()
+}
+
+/// Phone row above the keyboard: voice, handwriting, and screen stay off.
+/// Clipboard is the one control that can read, and only after a tap.
+pub(crate) fn phone_smart_bar() -> Option<Component> {
+    if !keyboard_open() || field_blocks_capture() {
+        return None;
+    }
+    Some(Component::row(smart_bar_style(false), modality_children()))
+}
+
+/// Desktop row near the caret when a field is focused and no candidates are open.
+pub(crate) fn modality_layer() -> Option<Component> {
+    let (width, height) = state::shell_viewport();
+    if width < 600.0 || field_blocks_capture() || with_session(candidates_visible) {
+        return None;
+    }
+    let (x, y) = candidate_origin(width, height);
+    let mut bar = Component::row(
+        Style {
+            position: Position::Absolute,
+            left: Dimension::Px(x),
+            top: Dimension::Px(y),
+            width: Dimension::Px(bar_width(width)),
+            z_index: CHROME_Z + 4,
+            ..smart_bar_style(true)
+        },
+        modality_children(),
+    );
+    bar.style.z_index = CHROME_Z + 4;
+    Some(bar)
+}
+
+fn smart_bar_style(desktop: bool) -> Style {
+    Style {
+        flex_shrink: 0.0,
+        height: Dimension::Px(BAR_H),
+        gap: 4.0,
+        margin: if desktop {
+            Edges::ZERO
+        } else {
+            Edges::xy(8.0, 4.0)
+        },
+        padding: Edges::xy(6.0, 0.0),
+        flex_wrap: FlexWrap::NoWrap,
+        overflow: Overflow::Hidden,
+        align_items: AlignItems::Center,
+        background: Color::from_hex("#162433"),
+        border_width: 1.0,
+        border_color: line_strong(),
+        border_radius: 12.0,
+        box_sizing: BoxSizing::BorderBox,
+        ..Style::default()
+    }
+}
+
+fn modality_children() -> Vec<Component> {
+    vec![
+        modality_button("ime-voice", OP_IME_VOICE, false),
+        modality_button("ime-ink", OP_IME_INK, false),
+        modality_button("ime-clip", OP_IME_CLIPBOARD, true),
+        modality_button("ime-screen", OP_IME_SCREEN, false),
+    ]
+}
+
+fn modality_button(key: &str, code: u8, ready: bool) -> Component {
+    let mut style = Style {
+        background: Color::from_hex(if ready { "#14362c" } else { "#243444" }),
+        border_width: 1.0,
+        border_color: Color::from_hex(if ready { "#1c8f62" } else { "#3d5570" }),
+        border_radius: 8.0,
+        font_size: 13.0,
+        font_weight: 650,
+        color: Color::from_hex(if ready { "#e9fff5" } else { "#c5d0dc" }),
+        padding: Edges::xy(8.0, 0.0),
+        height: Dimension::Px(CHIP_H),
+        min_height: Dimension::Px(CHIP_H),
+        flex_shrink: 0.0,
+        flex_grow: 0.0,
+        box_sizing: BoxSizing::BorderBox,
+        white_space: WhiteSpace::NoWrap,
+        ..Style::default()
+    };
+    keep_ime(&mut style);
+    Component::button_with_click(locale::t(key), style, invoke(code))
 }
 
 /// In-flow candidate row for the phone stack, just above the keyboard.
@@ -1339,6 +1551,101 @@ mod tests {
         let backspace = &board.children[2].children[8];
         assert!(px(backspace.style.width) >= 64.0);
         state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn smart_bar_keeps_models_off_and_clipboard_text_undoes() {
+        reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        note("intent", "", false, 4, 640.0);
+        let bar = phone_smart_bar().expect("phone smart bar");
+        let dumped = format!("{bar:?}");
+        assert!(dumped.contains(&locale::t("ime-voice")), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-ink")), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-clip")), "{dumped}");
+        assert!(dumped.contains(&locale::t("ime-screen")), "{dumped}");
+        assert_eq!(bar.style.flex_wrap, FlexWrap::NoWrap);
+        assert!(modality_layer().is_none());
+        assert!(matches!(local_clipboard_gate(), ClipboardGate::Read));
+        assert!(!crate::handoff::clipboard_sync_enabled());
+
+        assert!(matches!(
+            accept_local_clipboard(Some("  周五的评审  ")),
+            ClipboardTap::Wrote
+        ));
+        assert_eq!(composed_text(), "周五的评审");
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "");
+        assert!(matches!(
+            accept_local_clipboard(Some("   ")),
+            ClipboardTap::Empty
+        ));
+        assert_eq!(composed_text(), "");
+        let huge = "字".repeat(w3cos_ime::CLIPBOARD_LIMIT + 1);
+        assert!(matches!(
+            accept_local_clipboard(Some(&huge)),
+            ClipboardTap::TooLong
+        ));
+        assert_eq!(composed_text(), "");
+
+        type_spelling("ni");
+        assert!(matches!(
+            accept_local_clipboard(Some("评审")),
+            ClipboardTap::Wrote
+        ));
+        assert_eq!(composed_text(), "评审");
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "");
+
+        assert!(matches!(
+            accept_local_clipboard(Some("打开文件")),
+            ClipboardTap::Wrote
+        ));
+        assert_eq!(composed_text(), "打开文件");
+        assert_eq!(command_utterance().as_deref(), Some("open files"));
+        assert!(on_key("Mod+Z"));
+        assert_eq!(composed_text(), "");
+        assert!(command_utterance().is_none());
+        assert!(!crate::handoff::clipboard_sync_enabled());
+
+        note("secure", "保持", true, 2, 400.0);
+        assert!(phone_smart_bar().is_none());
+        assert!(phone_candidate_strip().is_none());
+        assert!(matches!(local_clipboard_gate(), ClipboardGate::Secure));
+        assert!(matches!(
+            accept_local_clipboard(Some("泄露")),
+            ClipboardTap::Secure
+        ));
+        assert_eq!(composed_text(), "保持");
+
+        state::clear_ime_field();
+        reset_for_tests();
+        assert!(matches!(
+            accept_local_clipboard(Some("无人")),
+            ClipboardTap::Closed
+        ));
+
+        state::note_shell_viewport(1200.0, 800.0);
+        note("intent", "", false, 4, 200.0);
+        let layer = modality_layer().expect("desktop row");
+        assert!(format!("{layer:?}").contains(&locale::t("ime-clip")));
+        assert!(candidate_layer().is_none());
+        type_spelling("ni");
+        assert!(modality_layer().is_none());
+        assert!(candidate_layer().is_some());
+        assert!(on_key("Escape"));
+        locale::set_locale("en");
+        let dumped = format!("{:?}", modality_layer().expect("english row"));
+        assert!(dumped.contains("Voice off"));
+        assert!(dumped.contains("Ink off"));
+        assert!(dumped.contains("Clipboard"));
+        assert!(dumped.contains("Screen off"));
+
+        state::note_shell_viewport(1200.0, 800.0);
+        state::clear_ime_field();
+        reset_for_tests();
+        locale::set_locale("zh-CN");
     }
 
     fn px(dim: Dimension) -> f32 {

@@ -1,5 +1,6 @@
 use crate::{
     InputEngine, InputIntent, IntentPayload, Proposal, Purpose, Scope, Session, command_utterance,
+    route_p3,
 };
 
 /// `W3COS_L2=1`, `true`, or `script` turns L2 on. Anything else, including
@@ -84,6 +85,16 @@ impl ImeHub {
         if session.purpose.is_secure() || session.id.is_empty() {
             return Vec::new();
         }
+        if let Some(mut routed) = route_p3(session, intent.modality, &intent.payload) {
+            if routed
+                .iter()
+                .any(|proposal| matches!(proposal, Proposal::Candidate { .. }))
+            {
+                append_command_actions(session.purpose, intent, &mut routed);
+                force_confirm(&mut routed);
+            }
+            return routed;
+        }
         let mut out = Vec::new();
         for engine in engines {
             if engine.manifest().uses_l2 && !self.l2 {
@@ -91,16 +102,20 @@ impl ImeHub {
             }
             out.extend(engine.on_intent(session, intent));
         }
-        for proposal in &mut out {
-            if let Proposal::Action {
-                requires_confirm, ..
-            } = proposal
-            {
-                *requires_confirm = true;
-            }
-        }
+        force_confirm(&mut out);
         append_command_actions(session.purpose, intent, &mut out);
         out
+    }
+}
+
+fn force_confirm(proposals: &mut [Proposal]) {
+    for proposal in proposals {
+        if let Proposal::Action {
+            requires_confirm, ..
+        } = proposal
+        {
+            *requires_confirm = true;
+        }
     }
 }
 
@@ -469,5 +484,179 @@ mod tests {
         engine.on_feedback(Feedback::Rejected {
             proposal_id: "c1".into(),
         });
+    }
+
+    #[test]
+    fn p3_surface_blocks_models_and_screen_and_readies_clipboard() {
+        let hub = ImeHub::with_l2(false);
+        let mut session = hub.begin_session("s", Purpose::Text, vec!["zh-Hans".into()]);
+        let surface = crate::p3_surface(&session);
+        assert_eq!(
+            surface.map(|item| item.modality),
+            [
+                Modality::Voice,
+                Modality::Handwriting,
+                Modality::Clipboard,
+                Modality::Camera,
+            ]
+        );
+        assert_eq!(
+            surface[0].state,
+            crate::ModalityState::Blocked(crate::ModalityBlock::NoLocalModel)
+        );
+        assert_eq!(
+            surface[1].state,
+            crate::ModalityState::Blocked(crate::ModalityBlock::NoLocalModel)
+        );
+        assert_eq!(surface[2].state, crate::ModalityState::Ready);
+        assert!(surface[2].scope.is_none());
+        assert_eq!(
+            surface[3].state,
+            crate::ModalityState::Blocked(crate::ModalityBlock::ScreenRefused)
+        );
+        assert_eq!(surface[3].scope, Some(Scope::Screen));
+        assert!(!ImeHub::grant(&mut session, Scope::Screen));
+        assert!(!session.allows(Scope::Screen));
+    }
+
+    #[test]
+    fn secure_and_ended_sessions_block_clipboard_capture() {
+        let hub = ImeHub::with_l2(false);
+        let secure = hub.begin_session("lock", Purpose::Password, vec!["zh-Hans".into()]);
+        assert!(crate::p3_surface(&secure).iter().all(|item| {
+            item.state == crate::ModalityState::Blocked(crate::ModalityBlock::SecureField)
+        }));
+        assert_eq!(
+            crate::clipboard_decision(&secure, "secret"),
+            crate::ClipboardDecision::Refused(crate::ModalityBlock::SecureField)
+        );
+        let mut ended = hub.begin_session("s", Purpose::Text, vec!["zh-Hans".into()]);
+        ended.end();
+        assert!(crate::p3_surface(&ended).iter().all(|item| {
+            item.state == crate::ModalityState::Blocked(crate::ModalityBlock::NoSession)
+        }));
+        assert_eq!(
+            crate::clipboard_decision(&ended, "周五"),
+            crate::ClipboardDecision::Refused(crate::ModalityBlock::NoSession)
+        );
+    }
+
+    #[test]
+    fn clipboard_text_is_one_candidate_and_engines_do_not_see_it() {
+        let hub = ImeHub::with_l2(false);
+        let session = hub.begin_session("s", Purpose::Chat, vec!["zh-Hans".into()]);
+        let mut engine = CountingEngine {
+            calls: 0,
+            l2: false,
+            proposals: vec![Proposal::candidate("no", "不应出现", 1.0, "L0")],
+        };
+        let intent = InputIntent::text(Modality::Clipboard, "  周五的评审  ", &["zh-Hans"]);
+        let proposals = hub.handle_intent(&session, &intent, &mut [&mut engine]);
+        assert_eq!(engine.calls, 0);
+        assert_eq!(proposals.len(), 1);
+        match &proposals[0] {
+            Proposal::Candidate {
+                id, text, source, ..
+            } => {
+                assert_eq!(id, "clip");
+                assert_eq!(text, "周五的评审");
+                assert_eq!(source, "clipboard");
+            }
+            other => panic!("expected a clipboard candidate, got {other:?}"),
+        }
+        assert_eq!(
+            crate::clipboard_decision(&session, "   "),
+            crate::ClipboardDecision::Empty
+        );
+        let huge = "字".repeat(crate::CLIPBOARD_LIMIT + 1);
+        assert_eq!(
+            crate::clipboard_decision(&session, &huge),
+            crate::ClipboardDecision::TooLong
+        );
+        let refused = hub.handle_intent(
+            &session,
+            &InputIntent::text(Modality::Clipboard, &huge, &["zh-Hans"]),
+            &mut [&mut engine],
+        );
+        assert!(refused.is_empty());
+        assert_eq!(engine.calls, 0);
+    }
+
+    #[test]
+    fn clipboard_on_a_command_field_still_needs_confirm() {
+        let hub = ImeHub::with_l2(false);
+        let session = hub.begin_session("intent", Purpose::Command, vec!["zh-Hans".into()]);
+        let mut engine = CountingEngine {
+            calls: 0,
+            l2: false,
+            proposals: vec![],
+        };
+        let intent = InputIntent::text(Modality::Clipboard, "打开文件", &["zh-Hans"]);
+        let proposals = hub.handle_intent(&session, &intent, &mut [&mut engine]);
+        assert_eq!(engine.calls, 0);
+        assert!(proposals.iter().any(|proposal| {
+            matches!(proposal, Proposal::Candidate { text, source, .. } if text == "打开文件" && source == "clipboard")
+        }));
+        match proposals
+            .iter()
+            .find(|proposal| matches!(proposal, Proposal::Action { .. }))
+        {
+            Some(Proposal::Action {
+                kind,
+                requires_confirm,
+                ..
+            }) => {
+                assert_eq!(kind, "open files");
+                assert!(*requires_confirm);
+            }
+            other => panic!("expected a confirmable action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_ink_and_camera_never_become_text() {
+        let hub = ImeHub::with_l2(false);
+        let session = hub.begin_session("s", Purpose::Text, vec!["zh-Hans".into()]);
+        let mut engine = CountingEngine {
+            calls: 0,
+            l2: false,
+            proposals: vec![Proposal::candidate("fake", "识别结果", 1.0, "L2")],
+        };
+        let audio = InputIntent {
+            modality: Modality::Voice,
+            payload: IntentPayload::Audio {
+                reference: "mic://session".into(),
+            },
+            interim: true,
+            locale: vec!["zh-Hans".into()],
+            hint: None,
+        };
+        let ink = InputIntent {
+            modality: Modality::Handwriting,
+            payload: IntentPayload::Ink { strokes: 4 },
+            interim: false,
+            locale: vec!["zh-Hans".into()],
+            hint: None,
+        };
+        let ink_text = InputIntent::text(Modality::Handwriting, "永", &["zh-Hans"]);
+        let camera = InputIntent::text(Modality::Camera, "屏幕上的字", &["zh-Hans"]);
+        for intent in [&audio, &ink, &ink_text, &camera] {
+            let proposals = hub.handle_intent(&session, intent, &mut [&mut engine]);
+            assert!(proposals.is_empty(), "{intent:?} -> {proposals:?}");
+        }
+        assert_eq!(engine.calls, 0);
+
+        let transcript = InputIntent {
+            modality: Modality::Voice,
+            payload: IntentPayload::Text {
+                text: "改到下周一上午".into(),
+            },
+            interim: true,
+            locale: vec!["zh-Hans".into()],
+            hint: None,
+        };
+        let proposals = hub.handle_intent(&session, &transcript, &mut [&mut engine]);
+        assert_eq!(engine.calls, 1);
+        assert_eq!(proposals.len(), 1);
     }
 }
