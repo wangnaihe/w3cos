@@ -444,8 +444,12 @@ fn on_shell_intent(code: u8, draft: &str) {
                 let update = agent_host::cancel();
                 apply_host_update(session, update);
             } else {
+                let closing_confirm = state::get_signal(PHASE_SIGNAL) == 1;
                 session.cancel();
                 sync_session(session, 0, "");
+                if closing_confirm {
+                    restore_after_dialog();
+                }
             }
         }
         OP_REVOKE => {
@@ -558,11 +562,13 @@ fn on_shell_intent(code: u8, draft: &str) {
             } else {
                 state::set_signal(PERM_SIGNAL, 0);
                 run_terminal_from_button(session);
+                restore_after_dialog();
             }
         }
         OP_PERM_DENY => {
             if session.identity_unlocked() {
                 deny_process_permission(session);
+                restore_after_dialog();
             } else {
                 sync_session(
                     session,
@@ -644,14 +650,17 @@ fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
     }
     if w3cos_ai_bridge::agent_loop::has_pending() {
         confirm_agent_step(session);
+        restore_after_dialog();
         return;
     }
     let Some(effect) = session.confirm(ctx, now_ms()) else {
         sync_session(session, 0, "");
+        restore_after_dialog();
         return;
     };
     apply_effect(&effect);
     sync_session(session, 2, &effect.receipt.outcome);
+    restore_after_dialog();
 }
 
 fn tier_name(tier: IntentTier) -> &'static str {
@@ -1550,6 +1559,7 @@ fn dismiss_top_layer() -> bool {
     }
     if state::get_signal(PERM_SIGNAL) != 0 {
         state::set_signal(PERM_SIGNAL, 0);
+        restore_after_dialog();
         return true;
     }
     if state::get_signal(PHASE_SIGNAL) == 1 {
@@ -1573,6 +1583,27 @@ fn dismiss_top_layer() -> bool {
         return true;
     }
     false
+}
+
+/// After the top dialog closes, focus the control that is actually left.
+/// Permission still open keeps its own focus. A confirm card underneath
+/// gets 「确认」 or 「取消」. Otherwise the intent submit button, which the
+/// next layout pass can focus. The intent field itself is a text input;
+/// label focus only matches buttons.
+fn restore_after_dialog() {
+    if state::get_signal(PERM_SIGNAL) != 0 {
+        return;
+    }
+    if state::get_signal(PHASE_SIGNAL) == 1 {
+        let key = if state::get_signal_text(CONFIRM_FOCUS_SIGNAL) == "cancel" {
+            "cancel"
+        } else {
+            "confirm"
+        };
+        state::request_focus_label(&locale::t(key));
+        return;
+    }
+    state::request_focus_label(&locale::t("propose"));
 }
 
 fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
@@ -2289,7 +2320,7 @@ fn build_shell() -> Component {
         column.push(keyboard);
     }
 
-    Component::column(
+    let mut shell = Component::column(
         Style {
             width: Dimension::Vw(100.0),
             height: Dimension::Vh(100.0),
@@ -2301,7 +2332,106 @@ fn build_shell() -> Component {
             ..Style::default()
         },
         column,
-    )
+    );
+    trap_modal_focus(&mut shell);
+    shell
+}
+
+/// Tab only reaches buttons and text inputs. While a confirm card or
+/// permission sheet is up, every other control becomes a plain container
+/// so focus stays inside that surface. Clicks on those controls are kept.
+/// The lock screen stays as-is: it is the surface in front.
+fn trap_modal_focus(root: &mut Component) {
+    if state::get_signal(UNLOCKED_SIGNAL) == 0 && !screenshot_shows_locked_permission() {
+        return;
+    }
+    let role = if state::get_signal(PERM_SIGNAL) != 0 {
+        "permission"
+    } else if state::get_signal(PHASE_SIGNAL) == 1 {
+        "confirm"
+    } else {
+        return;
+    };
+    defocus_outside(root, role);
+}
+
+fn dialog_role(node: &Component) -> Option<&str> {
+    node.style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get("--w3cos-dialog"))
+        .map(String::as_str)
+}
+
+fn defocus_outside(node: &mut Component, role: &str) {
+    if dialog_role(node) == Some(role) {
+        return;
+    }
+    defocus_node(node);
+    for child in &mut node.children {
+        defocus_outside(child, role);
+    }
+}
+
+fn defocus_node(node: &mut Component) {
+    let painted = match &node.kind {
+        ComponentKind::Button { label } if node.style.color.a > 0 && !label.trim().is_empty() => {
+            Some(Component::text(
+                label.clone(),
+                Style {
+                    font_size: node.style.font_size,
+                    font_weight: node.style.font_weight,
+                    color: node.style.color,
+                    text_align: TextAlign::Center,
+                    ..Style::default()
+                },
+            ))
+        }
+        ComponentKind::Button { .. } => None,
+        ComponentKind::TextInput {
+            value,
+            placeholder,
+            secure,
+        } => {
+            let empty = value.is_empty();
+            let content = if *secure {
+                "•".repeat(value.chars().count())
+            } else if empty {
+                placeholder.clone()
+            } else {
+                value.clone()
+            };
+            let color = if empty && !*secure {
+                Color::rgb(107, 114, 128)
+            } else {
+                node.style.color
+            };
+            Some(Component::text(
+                content,
+                Style {
+                    font_size: node.style.font_size,
+                    font_weight: node.style.font_weight,
+                    color,
+                    flex_grow: 1.0,
+                    ..Style::default()
+                },
+            ))
+        }
+        _ => return,
+    };
+    node.kind = ComponentKind::Column;
+    if let Some(text) = painted {
+        node.style.justify_content = JustifyContent::Center;
+        node.style.align_items = AlignItems::Center;
+        node.children.insert(0, text);
+    }
+}
+
+fn mark_dialog(card: &mut Component, role: &str) {
+    card.style
+        .custom_properties
+        .get_or_insert_with(HashMap::new)
+        .insert("--w3cos-dialog".to_string(), role.to_string());
 }
 
 fn modal_layer(card: Component) -> Component {
@@ -2319,8 +2449,9 @@ fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
     } else {
         (height - 68.0).max(0.0)
     };
-    let scrim = Component::button_with_click(
-        "",
+    // A column, not a button. It swallows clicks outside the card, and it
+    // must not join the tab order or paint a ring around the desktop.
+    let mut scrim = Component::column(
         Style {
             position: Position::Absolute,
             left: Dimension::Px(0.0),
@@ -2331,8 +2462,9 @@ fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
             z_index: CHROME_Z + 2,
             ..Style::default()
         },
-        invoke(OP_SCRIM),
+        vec![],
     );
+    scrim.on_click = invoke(OP_SCRIM);
     card.style.position = Position::Absolute;
     card.style.z_index = CHROME_Z + 3;
     if fill {
@@ -2476,11 +2608,14 @@ fn resident(id: i64) -> bool {
 
 const WALLPAPER: &str = "radial-gradient(980px 560px at 12% -8%, rgba(120, 168, 186, 0.22), transparent 62%), radial-gradient(820px 520px at 100% 110%, rgba(20, 90, 72, 0.28), transparent 58%), linear-gradient(180deg, #1b3344 0%, #13202c 48%, #101820 100%)";
 
+/// Labeled chrome (confirm, permission, propose, settings links).
+/// Coarse pointers use 48px. Fine pointers use 44px.
+/// Tray icons stay 40px and desktop title buttons stay 28px.
 fn touch_min() -> f32 {
     if state::pointer_is_coarse() {
         48.0
     } else {
-        36.0
+        44.0
     }
 }
 
@@ -2610,6 +2745,8 @@ fn dock_icon(
     fill: Color,
     active: bool,
 ) -> Component {
+    // Fine-pointer tray icons stay 40px. Launcher and keyboard reach the same
+    // actions. Coarse pointers use 48px.
     let size = if state::pointer_is_coarse() {
         48.0
     } else {
@@ -3055,11 +3192,7 @@ fn present_receipt(line: &str) -> String {
 }
 
 fn build_intent_panel() -> Component {
-    let go = if state::pointer_is_coarse() {
-        44.0
-    } else {
-        36.0
-    };
+    let go = touch_min();
     let mut input_style = Style {
         flex_grow: 1.0,
         font_size: 16.0,
@@ -3227,11 +3360,7 @@ fn build_floating_taskbar() -> Component {
                 color: faint_token(),
                 font_size: 12.0,
                 padding: Edges::xy(8.0, 0.0),
-                min_height: Dimension::Px(if state::pointer_is_coarse() {
-                    48.0
-                } else {
-                    32.0
-                }),
+                min_height: Dimension::Px(touch_min()),
                 border_radius: 8.0,
                 ..Style::default()
             },
@@ -3320,6 +3449,8 @@ fn floating_taskbar() -> Component {
 fn build_phone_home() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut status_right = vec![
+        // The status row is 36px tall, so these glyphs stay 28px.
+        // Home tiles are 64px and sheet actions use the coarse 48px target.
         glyph_face(
             "tasks",
             locale::t("tasks"),
@@ -3782,7 +3913,9 @@ fn build_confirm_dialog() -> Component {
             ..Style::default()
         },
     ));
-    dialog_shell(rows)
+    let mut card = dialog_shell(rows);
+    mark_dialog(&mut card, "confirm");
+    card
 }
 
 fn disabled_choice(label: impl Into<String>) -> Component {
@@ -3873,7 +4006,9 @@ fn build_permission_sheet() -> Component {
             ..Style::default()
         },
     ));
-    permission_shell(rows)
+    let mut card = permission_shell(rows);
+    mark_dialog(&mut card, "permission");
+    card
 }
 
 fn permission_shell(children: Vec<Component>) -> Component {
@@ -6888,6 +7023,7 @@ fn window_button(
     stroke: &str,
     app_id: i64,
 ) -> Component {
+    // Desktop title buttons stay 28px. Phone and tablet use 48px.
     let side = gesture::coarse_target(state::pointer_is_coarse());
     let mut button = glyph_face(
         glyph,
@@ -10031,5 +10167,179 @@ mod shell_ux_tests {
         state::set_text_signal(TERMINAL_SIGNAL, "");
         state::note_shell_viewport(1200.0, 800.0);
         drop(isolated);
+    }
+
+    fn button_extent(root: &Component, label: &str) -> (f32, f32) {
+        let mut found = None;
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label: button } = &node.kind
+                && button == label
+            {
+                let width = match node.style.width {
+                    Dimension::Px(value) => value,
+                    _ => match node.style.min_width {
+                        Dimension::Px(value) => value,
+                        _ => 0.0,
+                    },
+                };
+                let height = match node.style.height {
+                    Dimension::Px(value) => value,
+                    _ => 0.0,
+                };
+                let min_height = match node.style.min_height {
+                    Dimension::Px(value) => value,
+                    _ => 0.0,
+                };
+                found = Some((width, height.max(min_height)));
+            }
+        });
+        found.unwrap_or_else(|| panic!("missing button {label}"))
+    }
+
+    fn focusable_names(root: &Component) -> Vec<String> {
+        let mut names = Vec::new();
+        walk(root, &mut |node| match &node.kind {
+            ComponentKind::Button { label } if !label.trim().is_empty() => {
+                names.push(label.clone());
+            }
+            ComponentKind::TextInput { placeholder, .. } => names.push(placeholder.clone()),
+            _ => {}
+        });
+        names
+    }
+
+    #[test]
+    fn dialogs_trap_focus_and_chrome_meets_the_touch_minimum() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        handoff::reset_for_tests();
+        ime_bar::reset_for_tests();
+        let _ = build_shell();
+
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(1));
+        state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 1);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        state::set_signal(SWITCHER_SIGNAL, 0);
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        state::set_text_signal(TOAST_SIGNAL, "");
+        state::set_text_signal(SUMMARY_SIGNAL, "打开文件");
+        state::set_text_signal(IMPACT_SIGNAL, "会打开文件窗口。");
+        state::set_text_signal(TIER_SIGNAL, "L0");
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
+
+        let cancel = locale::t("cancel");
+        let confirm = locale::t("confirm");
+        let dialog = build_confirm_dialog();
+        assert!(button_extent(&dialog, &cancel).1 >= 44.0, "{}", cancel);
+        assert!(button_extent(&dialog, &confirm).1 >= 44.0, "{}", confirm);
+        let propose = locale::t("propose");
+        let intent = build_intent_panel();
+        let (propose_w, propose_h) = button_extent(&intent, &propose);
+        assert!(
+            propose_w >= 44.0 && propose_h >= 44.0,
+            "{propose_w}x{propose_h}"
+        );
+        let nav = nav_button(
+            &locale::t("settings-language-nav"),
+            false,
+            OP_SETTINGS_LANGUAGE,
+        );
+        assert!(button_extent(&nav, &locale::t("settings-language-nav")).1 >= 48.0);
+        let notice = notice_row(&ShellNotice {
+            title: "已关闭 文件。".into(),
+            detail: String::new(),
+            draft: "receipt:#1".into(),
+        });
+        assert!(button_extent(&notice, "已关闭 文件。").1 >= 48.0);
+        let bar = build_floating_taskbar();
+        let icons = icon_buttons(&bar);
+        assert!(!icons.is_empty());
+        assert!(
+            icons.iter().all(|icon| icon.width == 40.0),
+            "fine-pointer tray icons stay 40px"
+        );
+        for icon in icon_buttons(&app_titlebar("文件", "#3498db", 1)) {
+            assert_eq!(
+                icon.width, 28.0,
+                "{} left the title-bar exception",
+                icon.label
+            );
+        }
+
+        let shell = build_shell();
+        assert_eq!(
+            focusable_names(&shell),
+            vec![cancel.clone(), confirm.clone()]
+        );
+        assert_eq!(initial_focus(&shell), vec![confirm.clone()]);
+        assert!(
+            !focusable_names(&shell).iter().any(|name| name == &propose),
+            "propose stays outside the confirm trap"
+        );
+
+        state::set_text_signal(TERMINAL_SIGNAL, "echo hi");
+        state::set_signal(PERM_SIGNAL, 1);
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+        let perm = build_shell();
+        let deny = locale::t("perm-deny");
+        let once = locale::t("perm-once");
+        assert_eq!(focusable_names(&perm), vec![deny.clone(), once]);
+        assert_eq!(initial_focus(&perm), vec![deny]);
+
+        locale::set_locale("en");
+        let english = build_shell();
+        assert_eq!(
+            focusable_names(&english),
+            vec![locale::t("perm-deny"), locale::t("perm-once")]
+        );
+        locale::set_locale("zh-CN");
+
+        state::set_signal(PHASE_SIGNAL, 0);
+        let _ = state::take_focus_label();
+        assert!(dismiss_top_layer());
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert_eq!(
+            state::take_focus_label().as_deref(),
+            Some(locale::t("propose").as_str())
+        );
+
+        state::set_signal(PHASE_SIGNAL, 1);
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
+        let _ = state::take_focus_label();
+        assert!(dismiss_top_layer());
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+        assert_eq!(
+            state::take_focus_label().as_deref(),
+            Some(locale::t("propose").as_str())
+        );
+
+        state::note_pointer_coarse(true);
+        state::note_shell_viewport(390.0, 760.0);
+        state::set_signal(PHASE_SIGNAL, 1);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let phone = build_confirm_dialog();
+        assert!(button_extent(&phone, &locale::t("confirm")).1 >= 48.0);
+        assert!(button_extent(&phone, &locale::t("cancel")).1 >= 48.0);
+        let phone_go = button_extent(&build_intent_panel(), &locale::t("propose"));
+        assert!(phone_go.0 >= 48.0 && phone_go.1 >= 48.0);
+
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        locale::set_locale("zh-CN");
     }
 }

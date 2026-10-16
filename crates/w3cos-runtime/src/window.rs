@@ -646,6 +646,13 @@ struct HitNode {
     on_click: EventAction,
 }
 
+/// Hover and focus rings belong on a button or text field. A container that
+/// only catches clicks — the modal scrim, the desktop, a window surface —
+/// stays interactive, but it must not stroke a ring around the screen.
+fn hover_outline_for(hit: &HitNode) -> bool {
+    hit.is_focusable
+}
+
 fn physical_column_hit_nodes(nodes: Vec<HitNode>, artifact: &PaintArtifact) -> Vec<HitNode> {
     let mut seen = HashSet::new();
     nodes
@@ -3866,7 +3873,7 @@ impl App {
             if let Some(hit) = self
                 .hit_nodes
                 .iter()
-                .find(|h| h.index == hover_idx && h.is_interactive)
+                .find(|h| h.index == hover_idx && hover_outline_for(h))
             {
                 render_gpu::draw_hover_outline(&mut self.scene, hit.rect, scale);
             }
@@ -4038,11 +4045,33 @@ impl App {
         if DUMPED.swap(true, Ordering::Relaxed) {
             return false;
         }
-        match pixmap.save_png(&path) {
+        match Self::pixmap_opaque_png(pixmap).and_then(|bytes| {
+            std::fs::write(&path, bytes).map_err(|error| format!("png write failed: {error}"))
+        }) {
             Ok(()) => eprintln!("[W3C OS] frame dumped to {path}"),
             Err(error) => eprintln!("[W3C OS] frame dump failed: {error}"),
         }
         std::env::var_os("W3COS_FRAME_DUMP_EXIT").is_some()
+    }
+
+    /// Screenshot PNG for `W3COS_FRAME_DUMP` / `W3COS_SCREEN` captures.
+    ///
+    /// Opaque pixels pass through. A zero alpha byte keeps its RGB and is
+    /// written as 255, so the file is not a fully transparent PNG.
+    #[cfg(feature = "cpu-render")]
+    fn pixmap_opaque_png(pixmap: &Pixmap) -> Result<Vec<u8>, String> {
+        let mut rgba = Vec::with_capacity(pixmap.data().len());
+        for pixel in pixmap.pixels() {
+            let alpha = pixel.alpha();
+            let (red, green, blue) = if alpha == 0 || alpha == 255 {
+                (pixel.red(), pixel.green(), pixel.blue())
+            } else {
+                let straight = pixel.demultiply();
+                (straight.red(), straight.green(), straight.blue())
+            };
+            rgba.extend_from_slice(&[red, green, blue, 255]);
+        }
+        crate::frame_cache::encode_rgba_png(pixmap.width(), pixmap.height(), &rgba)
     }
 
     #[cfg(feature = "cpu-render")]
@@ -4553,7 +4582,7 @@ impl App {
             if let Some(hit) = self
                 .hit_nodes
                 .iter()
-                .find(|h| h.index == hover_idx && h.is_interactive)
+                .find(|h| h.index == hover_idx && hover_outline_for(h))
             {
                 draw_hover_outline_cpu(&mut pixmap, hit.rect);
                 softbuffer_damage.union_layout_rect(hit.rect, w, h);
@@ -7804,6 +7833,15 @@ mod cpu_present_swizzle_tests {
     use crate::layout::LayoutRect;
 
     #[test]
+    fn frame_dump_png_is_opaque_when_alpha_byte_is_zero() {
+        let mut pixmap = tiny_skia::Pixmap::new(1, 1).unwrap();
+        pixmap.data_mut().copy_from_slice(&[10, 20, 30, 0]);
+        let png = super::App::pixmap_opaque_png(&pixmap).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
     fn packs_rgba_bytes_as_xrgb() {
         let src = [0x11u8, 0x22, 0x33, 0x44, 0xAA, 0xBB, 0xCC, 0xDD];
         let mut dst = [0u32; 2];
@@ -7850,6 +7888,35 @@ mod cpu_present_swizzle_tests {
         )
         .unwrap();
         assert_eq!(px, [0, 10, 16, 6]);
+    }
+
+    #[test]
+    fn hover_ring_skips_a_click_catching_container() {
+        let scrim = super::HitNode {
+            rect: LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1200.0,
+                height: 732.0,
+            },
+            index: 3,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: false,
+            on_click: w3cos_std::component::EventAction::Invoke {
+                code: 57,
+                input_placeholder: String::new(),
+            },
+        };
+        let confirm = super::HitNode {
+            is_focusable: true,
+            ..scrim.clone()
+        };
+        assert!(
+            !super::hover_outline_for(&scrim),
+            "a desktop scrim must not paint a ring"
+        );
+        assert!(super::hover_outline_for(&confirm));
     }
 
     #[test]
