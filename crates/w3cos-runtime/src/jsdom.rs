@@ -1505,12 +1505,14 @@ fn ensure_dom_fast() {
         build_appended: fast_build_appended,
         build_guarded: fast_build_guarded,
         build_block: fast_build_block_guarded,
+        build_flex_row: fast_build_flex_row_guarded,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
     w3cos_core::intrinsics::install_atom_prehash(|text, hash| {
         w3cos_dom::atom::Atom::intern_prehashed(text, hash).as_u32()
     });
+    w3cos_core::intrinsics::install_dom_fusion_surface(fusion_surface_installed);
     w3cos_core::intrinsics::install_dom_imm(w3cos_core::intrinsics::DomImmOps {
         generation: realm_generation,
         get: dom_imm_get,
@@ -1772,6 +1774,66 @@ fn fast_build_block_guarded(
     }) else {
         return Value::Undefined;
     };
+    dom::mark_dom_dirty();
+    dom_handle(child)
+}
+
+fn fast_build_flex_row_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    height: &str,
+    flex_value: &str,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !is_document_value(document)
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::has_rules()
+        || node_id_of(parent).is_none()
+        || !valid_element_name(tag)
+    {
+        return Value::Undefined;
+    }
+    let parent_id = node_id_of(parent).expect("parent checked");
+    let lowered;
+    let mut tag_atom = tag_atom;
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
+    let text = text.to_js_string();
+    let Some(child) = dom::with_document_mut(|doc| {
+        doc.append_column_flex_row(
+            w3cos_dom::NodeId::from_u32(parent_id),
+            tag,
+            tag_atom,
+            &text,
+            height,
+            flex_value,
+        )
+        .map(|id| id.as_u32())
+    }) else {
+        return Value::Undefined;
+    };
+    // `el.style.flex` is read from this cache. The declaration stores the
+    // same strings; height also serializes from the typed length.
+    let height_cache = height.trim().to_string();
+    let flex_cache = flex_value.trim().to_string();
+    STYLE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.insert_value(child, "height", height_cache);
+        cache.insert_value(child, "flex", flex_cache);
+    });
     dom::mark_dom_dirty();
     dom_handle(child)
 }
@@ -21317,6 +21379,264 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
     }
 }
 
+#[derive(Clone)]
+struct FusionSnapshot {
+    create_element: Value,
+    array_proto: Value,
+    array_push: Value,
+}
+
+thread_local! {
+    static FUSION_SNAPSHOT: RefCell<Option<FusionSnapshot>> = const { RefCell::new(None) };
+}
+
+enum SilentLookup {
+    Data(Value),
+    Blocked,
+    Missing,
+}
+
+/// Property read that never calls a getter or a proxy get trap.
+fn silent_lookup(value: &Value, key: &str) -> SilentLookup {
+    if let Some(node) = node_id_of(value) {
+        return silent_node(node, key);
+    }
+    if let Some(function) = value.as_function() {
+        return silent_function(&function, key);
+    }
+    silent_object(value, key, &mut HashSet::new())
+}
+
+fn silent_function(function: &w3cos_core::JsFunction, key: &str) -> SilentLookup {
+    if !function.has_own_property(key) {
+        return SilentLookup::Missing;
+    }
+    let data = function.get_property(key);
+    if data.is_undefined() {
+        SilentLookup::Missing
+    } else {
+        SilentLookup::Data(data)
+    }
+}
+
+fn silent_node(node: u32, key: &str) -> SilentLookup {
+    if let Some(wrapper) = memoized_element(node) {
+        return silent_builtin_wrapper(&wrapper, key);
+    }
+    let setter = format!("__w3cos_setter_{key}");
+    let getter = format!("__w3cos_getter_{key}");
+    if get_expando(node, key).is_some()
+        || get_expando(node, &setter).is_some()
+        || get_expando(node, &getter).is_some()
+    {
+        return SilentLookup::Blocked;
+    }
+    silent_object(&cached_node_prototype(node), key, &mut HashSet::new())
+}
+
+/// The memoized element wrapper's get trap is the DOM bridge. Own data and
+/// accessors on that wrapper are still user overrides.
+fn silent_builtin_wrapper(wrapper: &Value, key: &str) -> SilentLookup {
+    let Some(object) = wrapper.object_ref_raw() else {
+        return SilentLookup::Blocked;
+    };
+    let prototype = {
+        let object = object.borrow();
+        let setter = format!("__w3cos_setter_{key}");
+        if object.own_getter(key).is_some() || object.own_data(&setter).is_some() {
+            return SilentLookup::Blocked;
+        }
+        if let Some(data) = object.own_data(key)
+            && !data.is_undefined()
+        {
+            return SilentLookup::Blocked;
+        }
+        match object.untrapped_prototype() {
+            Some(prototype) => prototype,
+            None => return SilentLookup::Blocked,
+        }
+    };
+    silent_object(&prototype, key, &mut HashSet::new())
+}
+
+fn silent_object(value: &Value, key: &str, seen: &mut HashSet<usize>) -> SilentLookup {
+    let mut current = value.clone();
+    let setter = format!("__w3cos_setter_{key}");
+    loop {
+        let Some(object) = current.object_ref_raw() else {
+            return SilentLookup::Missing;
+        };
+        if !seen.insert(object.identity()) {
+            return SilentLookup::Blocked;
+        }
+        let next = {
+            let object = object.borrow();
+            if object.has_get_trap() || object.own_getter(key).is_some() {
+                return SilentLookup::Blocked;
+            }
+            if object.own_data(&setter).is_some() {
+                return SilentLookup::Blocked;
+            }
+            if let Some(data) = object.own_data(key)
+                && !data.is_undefined()
+            {
+                return SilentLookup::Data(data);
+            }
+            match object.untrapped_prototype() {
+                Some(prototype) => prototype,
+                None => return SilentLookup::Blocked,
+            }
+        };
+        if next.is_nullish() {
+            return SilentLookup::Missing;
+        }
+        current = next;
+    }
+}
+
+fn chain_has_accessor(value: &Value) -> bool {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    loop {
+        let Some(object) = current.object_ref_raw() else {
+            return false;
+        };
+        if !seen.insert(object.identity()) {
+            return true;
+        }
+        let next =
+            {
+                let object = object.borrow();
+                if object.has_get_trap() {
+                    return true;
+                }
+                if object.keys().iter().any(|key| {
+                    key.starts_with("__w3cos_getter_") || key.starts_with("__w3cos_setter_")
+                }) {
+                    return true;
+                }
+                match object.untrapped_prototype() {
+                    Some(prototype) => prototype,
+                    None => return true,
+                }
+            };
+        if next.is_nullish() {
+            return false;
+        }
+        current = next;
+    }
+}
+
+fn tag_prototype(tag: &str) -> SilentLookup {
+    let constructor = crate::dom_constructors::constructor(
+        crate::dom_constructors::html_constructor_for_tag(tag),
+    );
+    silent_lookup(&constructor, "prototype")
+}
+
+fn computed_properties_clear(tag: &str, keys: &[&str]) -> bool {
+    let SilentLookup::Data(prototype) = tag_prototype(tag) else {
+        return false;
+    };
+    keys.iter()
+        .all(|key| matches!(silent_lookup(&prototype, key), SilentLookup::Missing))
+}
+
+fn array_push_is_builtin(nodes: &Value, snapshot: &FusionSnapshot) -> bool {
+    if nodes.as_array().is_none() {
+        return false;
+    }
+    let SilentLookup::Data(prototype) = silent_lookup(&w3cos_core::array_value(), "prototype")
+    else {
+        return false;
+    };
+    if !prototype.strict_eq(&snapshot.array_proto) {
+        return false;
+    }
+    match silent_lookup(&prototype, "push") {
+        SilentLookup::Data(push) => push.strict_eq(&snapshot.array_push),
+        _ => false,
+    }
+}
+
+fn style_prototype_is_builtin() -> bool {
+    let SilentLookup::Data(prototype) = silent_lookup(&css_style_declaration_class(), "prototype")
+    else {
+        return false;
+    };
+    !chain_has_accessor(&prototype)
+}
+
+fn fusion_surface_installed(
+    document: &Value,
+    parent: &Value,
+    nodes: Option<&Value>,
+    tag: &str,
+) -> bool {
+    let Some(snapshot) = FUSION_SNAPSHOT.with(|slot| slot.borrow().clone()) else {
+        return false;
+    };
+    if !is_document_value(document) || node_id_of(parent).is_none() || tag.is_empty() {
+        return false;
+    }
+    match silent_lookup(document, "createElement") {
+        SilentLookup::Data(method) if method.strict_eq(&snapshot.create_element) => {}
+        _ => return false,
+    }
+    if !matches!(silent_lookup(parent, "appendChild"), SilentLookup::Missing) {
+        return false;
+    }
+    let properties: &[&str] = if nodes.is_some() {
+        &["id", "className", "textContent"]
+    } else {
+        &["textContent", "style"]
+    };
+    if !computed_properties_clear(tag, properties) {
+        return false;
+    }
+    if let Some(nodes) = nodes {
+        array_push_is_builtin(nodes, &snapshot)
+    } else {
+        style_prototype_is_builtin()
+    }
+}
+
+/// Touch the builtin DOM and array surface, then snapshot the methods the
+/// fused create path is allowed to skip.
+///
+/// Generated heads call this after the bootstrap node exists and before user
+/// script. The shape epoch is not the proof: the first `element.style` access
+/// installs a prototype and moves the epoch. [`fusion_surface_installed`]
+/// compares the sealed methods without invoking getters.
+pub fn seal_dom_shape_baseline() {
+    ensure_dom_fast();
+    let document = document_value();
+    let _ = document.get_property("createElement");
+    let element = document.call_method("createElement", vec![Value::string("div")]);
+    let _ = element.get_property("appendChild");
+    let _ = window_value()
+        .get_property("Element")
+        .get_property("prototype")
+        .get_property("id");
+    let array_push = Value::array(Vec::new()).get_property("push");
+    let create_element = match silent_lookup(&document, "createElement") {
+        SilentLookup::Data(method) => method,
+        _ => Value::Undefined,
+    };
+    let array_proto = match silent_lookup(&w3cos_core::array_value(), "prototype") {
+        SilentLookup::Data(prototype) => prototype,
+        _ => Value::Undefined,
+    };
+    FUSION_SNAPSHOT.with(|slot| {
+        *slot.borrow_mut() = Some(FusionSnapshot {
+            create_element,
+            array_proto,
+            array_push,
+        });
+    });
+    w3cos_core::intrinsics::note_dom_shape_baseline();
+}
+
 /// Install benchmark controls before the generated bundle runs.
 ///
 /// Unset environment variables leave the document untouched, so ordinary
@@ -21607,6 +21927,7 @@ pub fn reset_bridge() {
     STYLE_CACHE.with(|c| c.borrow_mut().clear_entries());
     STYLE_OBJECT_NODES.with(|nodes| nodes.borrow_mut().clear());
     HTML_CREATE_ELEMENT_FOLD.with(|fold| fold.set(None));
+    FUSION_SNAPSHOT.with(|slot| slot.borrow_mut().take());
     CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
     DISCRETE_CSS_TRANSITIONS.with(|motions| motions.borrow_mut().clear());
     LISTENERS.with(|l| l.borrow_mut().clear());
@@ -21749,6 +22070,7 @@ pub fn reset_bridge() {
         value.borrow_mut().take();
     });
     w3cos_core::web::reset_realm();
+    w3cos_core::reset_constructors();
     w3cos_core::page_arena::reset();
 }
 
@@ -21757,6 +22079,121 @@ pub fn reset_bridge() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
+        w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn dom_list_prologue_takes_fused_create() {
+        setup();
+        seal_dom_shape_baseline();
+        let document = document_value();
+        let body = document.get_property("body");
+        let style = body.get_property("style");
+        style.set_property("margin", Value::string("0"));
+        style.set_property("background", Value::string("#ffffff"));
+        let root = document.call_method("createElement", vec![Value::string("div")]);
+        let _ = body.call_method("appendChild", vec![root.clone()]);
+        let nodes = Value::array(Vec::new());
+        assert!(
+            surface_ok(&document, &root, Some(&nodes)),
+            "style.margin must not hide the builtin create surface"
+        );
+        assert!(
+            surface_ok(&document, &root, None),
+            "styled-block fusion stays available after the same prologue"
+        );
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let built = w3cos_core::intrinsics::dom_build_guarded(
+            &document,
+            &root,
+            "div",
+            u32::MAX,
+            "row-",
+            0.0,
+            "row",
+            u32::MAX,
+            "item ",
+            0.0,
+            epoch,
+        );
+        assert!(
+            !built.is_undefined(),
+            "the benchmark shape must take dom_build_guarded after the prologue"
+        );
+        assert_eq!(built.get_property("id").to_js_string(), "row-0");
+        assert_eq!(built.get_property("className").to_js_string(), "row");
+        assert_eq!(built.get_property("textContent").to_js_string(), "item 0");
+        assert_eq!(
+            root.get_property("childNodes").get_property("length"),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn fused_create_surface_rejects_observable_overrides() {
+        let reject = |mutate: fn(&Value, &Value, &Value)| {
+            setup();
+            seal_dom_shape_baseline();
+            let document = document_value();
+            let root = document.call_method("createElement", vec![Value::string("div")]);
+            let nodes = Value::array(Vec::new());
+            assert!(surface_ok(&document, &root, Some(&nodes)));
+            mutate(&document, &root, &nodes);
+            assert!(
+                !surface_ok(&document, &root, Some(&nodes)),
+                "override must leave the fused path"
+            );
+        };
+        reject(|document, _, _| {
+            document.set_property("createElement", Value::function(|_, _| Value::Undefined));
+        });
+        reject(|document, _, _| {
+            w3cos_core::class::define_property(
+                document,
+                "createElement",
+                &Value::object(HashMap::from([
+                    ("configurable".into(), Value::Bool(true)),
+                    ("get".into(), Value::function(|_, _| Value::Undefined)),
+                ])),
+            );
+        });
+        reject(|_, root, _| {
+            root.set_property(
+                "appendChild",
+                Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined)),
+            );
+        });
+        reject(|_, root, _| {
+            w3cos_core::class::define_property(
+                root,
+                "appendChild",
+                &Value::object(HashMap::from([
+                    ("configurable".into(), Value::Bool(true)),
+                    ("get".into(), Value::function(|_, _| Value::Undefined)),
+                ])),
+            );
+        });
+        reject(|_, _, _| {
+            let prototype = window_value()
+                .get_property("Element")
+                .get_property("prototype");
+            w3cos_core::class::define_property(
+                &prototype,
+                "id",
+                &Value::object(HashMap::from([
+                    ("configurable".into(), Value::Bool(true)),
+                    ("set".into(), Value::function(|_, _| Value::Undefined)),
+                ])),
+            );
+        });
+        reject(|_, _, _| {
+            w3cos_core::array_value()
+                .get_property("prototype")
+                .set_property("push", Value::function(|_, _| Value::Number(0.0)));
+        });
+    }
 
     #[test]
     fn immediate_inherited_getters_keep_receiver_undefined_and_throw() {
@@ -26794,6 +27231,143 @@ try {
             8.0
         );
         assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+    }
+
+    #[test]
+    fn column_flex_uniform_rows_take_fused_create() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        ensure_dom_fast();
+        seal_dom_shape_baseline();
+        let document = document_value();
+        document
+            .get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("display", Value::string("flex"));
+        root_style.set_property("flexDirection", Value::string("column"));
+        assert!(
+            surface_ok(&document, &root, None),
+            "column flex setup must leave the style surface builtin"
+        );
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        for i in 0..8 {
+            let built = w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string(&format!("f {i}")),
+                "18px",
+                "0 0 auto",
+                epoch,
+            );
+            assert!(
+                !built.is_undefined(),
+                "column flex uniform rows must take the fused path"
+            );
+        }
+        let built = root.get_property("childNodes").get_property("0");
+        let built_style = built.get_property("style");
+        let ordinary = document.call_method("createElement", vec![Value::string("div")]);
+        ordinary.set_property("textContent", Value::string("f 0"));
+        let ordinary_style = ordinary.get_property("style");
+        ordinary_style.set_property("height", Value::string("18px"));
+        ordinary_style.set_property("flex", Value::string("0 0 auto"));
+        assert_eq!(built.get_property("textContent").to_js_string(), "f 0");
+        assert_eq!(
+            built_style.get_property("height").to_js_string(),
+            ordinary_style.get_property("height").to_js_string()
+        );
+        assert_eq!(
+            built_style.get_property("flex").to_js_string(),
+            ordinary_style.get_property("flex").to_js_string()
+        );
+        assert_eq!(
+            built_style.get_property("cssText").to_js_string(),
+            ordinary_style.get_property("cssText").to_js_string()
+        );
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            8.0
+        );
+        assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+
+        let block = create_in_body("div");
+        let block_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &block,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "18px",
+                "0 0 auto",
+                block_epoch,
+            )
+            .is_undefined(),
+            "a block parent stays on the ordinary path"
+        );
+        let row_flex = create_in_body("div");
+        row_flex
+            .get_property("style")
+            .set_property("display", Value::string("flex"));
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &row_flex,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "18px",
+                "0 0 auto",
+                w3cos_core::intrinsics::dom_shape_epoch(),
+            )
+            .is_undefined(),
+            "a row flex parent stays on the ordinary path"
+        );
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "18px",
+                "1 0 auto",
+                shape_epoch,
+            )
+            .is_undefined(),
+            "a growing flex item stays on the ordinary path"
+        );
+        assert!(
+            w3cos_core::intrinsics::dom_build_flex_row_guarded(
+                &document,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string("f 0"),
+                "auto",
+                "0 0 auto",
+                shape_epoch,
+            )
+            .is_undefined(),
+            "an automatic height stays on the ordinary path"
+        );
+        assert_eq!(
+            block
+                .get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            0.0
+        );
     }
 
     #[test]

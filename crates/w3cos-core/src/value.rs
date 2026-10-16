@@ -2280,6 +2280,9 @@ impl Value {
 
     /// Delete an own property and return the JavaScript-style success value.
     pub fn delete_property(&self, key: &str) -> Value {
+        if dom_shape_method_key(key) || dom_shape_data_key(key) {
+            crate::intrinsics::bump_dom_shape();
+        }
         let deleted = match self {
             _ if self.as_object().is_some() => {
                 self.as_object().expect("object").borrow_mut().delete(key)

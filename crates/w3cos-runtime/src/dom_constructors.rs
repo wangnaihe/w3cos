@@ -1929,7 +1929,7 @@ pub fn prototype(name: &str) -> Value {
     constructor(name).get_property("prototype")
 }
 
-fn html_constructor_for_tag(tag: &str) -> &'static str {
+pub(crate) fn html_constructor_for_tag(tag: &str) -> &'static str {
     match tag {
         "a" => "HTMLAnchorElement",
         "div" => "HTMLDivElement",

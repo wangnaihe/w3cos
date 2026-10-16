@@ -601,6 +601,11 @@ pub struct DomFast {
     /// when `epoch` is stale or the runtime refuses, so the caller runs the
     /// ordinary lookup. `tag_atom == u32::MAX` resolves the name.
     pub build_block: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
+    /// Fused create + text + `height` + `flex` + append for a column-flex
+    /// parent of definite uniform rows. `Value::Undefined` when `epoch` is
+    /// stale or the parent/row shape is not that flex list, so the caller
+    /// runs the ordinary lookup.
+    pub build_flex_row: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -611,6 +616,9 @@ thread_local! {
     /// Bumped by `defineProperty`, `setPrototypeOf`, and assignments that
     /// override the element/document/array surface the fused create path uses.
     static DOM_SHAPE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// Epoch after builtins are installed and before user script. Zero means
+    /// the runtime has not sealed a baseline, so fusion stays off.
+    static DOM_SHAPE_BASELINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Stamp sampled once per fused create loop. The fast path compares it on
@@ -623,8 +631,52 @@ pub fn bump_dom_shape() {
     DOM_SHAPE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
 }
 
+/// Record the epoch once builtins exist and before user script runs.
+///
+/// This stamp is not the fusion proof. Unrelated `setPrototypeOf` calls, such
+/// as the first `element.style` access, move the epoch before the timed loop.
+/// Fusion uses [`dom_fusion_surface_ok`] and then samples the epoch so a later
+/// override still falls back.
+pub fn note_dom_shape_baseline() {
+    let epoch = dom_shape_epoch();
+    DOM_SHAPE_BASELINE.with(|cell| cell.set(epoch));
+}
+
+/// True when no watched method or accessor has changed since [`note_dom_shape_baseline`].
+pub fn dom_shape_is_pristine() -> bool {
+    let epoch = dom_shape_epoch();
+    DOM_SHAPE_BASELINE.with(|cell| {
+        let baseline = cell.get();
+        baseline != 0 && baseline == epoch
+    })
+}
+
 pub fn install_dom_fast(fast: DomFast) {
     let _ = DOM_FAST.set(fast);
+}
+
+static DOM_FUSION_SURFACE: std::sync::OnceLock<fn(&Value, &Value, Option<&Value>, &str) -> bool> =
+    std::sync::OnceLock::new();
+
+pub fn install_dom_fusion_surface(check: fn(&Value, &Value, Option<&Value>, &str) -> bool) {
+    let _ = DOM_FUSION_SURFACE.set(check);
+}
+
+/// True when the fused create surface is still the builtins recorded at seal.
+///
+/// `nodes` is `Some` for create + id/class/text + append + push, and `None`
+/// for a styled block. The check does not invoke getters or proxy get traps.
+/// Callers that see `true` sample [`dom_shape_epoch`] for [`dom_build_guarded`].
+/// An unset checker stays false so fusion cannot run before the runtime installs it.
+pub fn dom_fusion_surface_ok(
+    document: &Value,
+    parent: &Value,
+    nodes: Option<&Value>,
+    tag: &str,
+) -> bool {
+    DOM_FUSION_SURFACE
+        .get()
+        .is_some_and(|check| check(document, parent, nodes, tag))
 }
 
 pub fn dom_create_element(object: &Value, tag: &str) -> Value {
@@ -810,6 +862,29 @@ pub fn dom_build_block_guarded(
     )
 }
 
+/// Fused create + textContent + height + flex + appendChild for a column flex
+/// list, or [`Value::Undefined`] when `epoch` is stale or the runtime refuses.
+pub fn dom_build_flex_row_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    height: &str,
+    flex_value: &str,
+    epoch: u64,
+) -> Value {
+    if dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    let Some(fast) = DOM_FAST.get() else {
+        return Value::Undefined;
+    };
+    (fast.build_flex_row)(
+        document, parent, tag, tag_atom, text, height, flex_value, epoch,
+    )
+}
+
 static ATOM_PREHASH: std::sync::OnceLock<fn(&str, u64) -> u32> = std::sync::OnceLock::new();
 
 pub fn install_atom_prehash(prehash: fn(&str, u64) -> u32) {
@@ -863,6 +938,18 @@ pub fn await_value(value: &Value) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn dom_shape_baseline_is_the_pristine_stamp() {
+        note_dom_shape_baseline();
+        assert!(dom_shape_is_pristine());
+        let stamped = dom_shape_epoch();
+        bump_dom_shape();
+        assert!(!dom_shape_is_pristine());
+        assert_ne!(dom_shape_epoch(), stamped);
+        note_dom_shape_baseline();
+        assert!(dom_shape_is_pristine());
+    }
 
     #[test]
     fn addition_uses_ecmascript_coercion() {

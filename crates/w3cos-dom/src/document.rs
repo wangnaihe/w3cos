@@ -240,6 +240,120 @@ fn shared_declared_style(
     })
 }
 
+/// Shared row style for `height` plus `flex: 0 0 auto` on a column-flex child.
+///
+/// The declaration strings are the ones the assignment wrote. A value that
+/// does not stay a definite px height with zero grow, zero shrink, and an
+/// automatic basis is refused so the ordinary setters run.
+fn shared_column_flex_row_style(
+    tag: &str,
+    height: &str,
+    flex_value: &str,
+) -> Option<Arc<CSSStyleDeclaration>> {
+    thread_local! {
+        static DECLARED: RefCell<HashMap<(u32, String, String), Arc<CSSStyleDeclaration>>> =
+            RefCell::new(HashMap::new());
+    }
+    let tag_atom = Atom::intern(tag);
+    let key = (
+        tag_atom.as_u32(),
+        height.to_string(),
+        flex_value.to_string(),
+    );
+    DECLARED.with(|cache| {
+        if let Some(style) = cache.borrow().get(&key) {
+            return uniform_definite_flex_row(&style.inner).then(|| Arc::clone(style));
+        }
+        let mut style = tag_atom
+            .with_str(|name| CSSStyleDeclaration::from_style(user_agent::html_default_style(name)));
+        style.set_property("height", height);
+        style.set_property("flex", flex_value);
+        let recorded = |name: &str, value: &str| {
+            style
+                .inline_declarations
+                .iter()
+                .any(|(declared, stored)| declared == name && stored == value)
+        };
+        if !recorded("height", height) || !recorded("flex", flex_value) {
+            return None;
+        }
+        if !uniform_definite_flex_row(&style.inner) {
+            return None;
+        }
+        let style = Arc::new(style);
+        cache.borrow_mut().insert(key, Arc::clone(&style));
+        Some(style)
+    })
+}
+
+fn uniform_definite_flex_row(style: &w3cos_std::style::Style) -> bool {
+    use w3cos_std::style::{
+        AlignSelf, Dimension, Display, Float, Overflow, Position, Spacing, TextDirection,
+    };
+    let px = |dimension: Dimension| matches!(dimension, Dimension::Px(value) if value.is_finite() && value >= 0.0);
+    let zero = |spacing: Spacing| matches!(spacing, Spacing::Px(value) if value == 0.0);
+    let visible = |overflow: Overflow| matches!(overflow, Overflow::Visible);
+    matches!(style.display, Display::Block | Display::FlowRoot)
+        && px(style.height)
+        && style.flex_grow == 0.0
+        && style.flex_shrink == 0.0
+        && matches!(style.flex_basis, Dimension::Auto)
+        && style.order == 0
+        && style.align_self == AlignSelf::Auto
+        && (matches!(style.width, Dimension::Auto) || px(style.width))
+        && matches!(style.position, Position::Static)
+        && style.float == Float::None
+        && style.direction == TextDirection::Ltr
+        && style.column_count.is_none()
+        && style.gap == 0.0
+        && style.row_gap.unwrap_or(0.0) == 0.0
+        && style.column_gap.unwrap_or(0.0) == 0.0
+        && visible(style.overflow)
+        && style.overflow_x.is_none_or(visible)
+        && style.overflow_y.is_none_or(visible)
+        && zero(style.margin.top)
+        && zero(style.margin.right)
+        && zero(style.margin.bottom)
+        && zero(style.margin.left)
+        && zero(style.padding.top)
+        && zero(style.padding.right)
+        && zero(style.padding.bottom)
+        && zero(style.padding.left)
+        && style.border_width == 0.0
+        && style.border_top_width.unwrap_or(0.0) == 0.0
+        && style.border_right_width.unwrap_or(0.0) == 0.0
+        && style.border_bottom_width.unwrap_or(0.0) == 0.0
+        && style.border_left_width.unwrap_or(0.0) == 0.0
+        && matches!(style.min_width, Dimension::Auto)
+        && matches!(style.min_height, Dimension::Auto)
+        && matches!(style.max_width, Dimension::Auto)
+        && matches!(style.max_height, Dimension::Auto)
+}
+
+fn column_flex_parent(style: &w3cos_std::style::Style) -> bool {
+    use w3cos_std::style::{
+        AlignItems, Dimension, Display, FlexDirection, FlexWrap, JustifyContent,
+    };
+    if style.display != Display::Flex
+        || style.flex_direction != FlexDirection::Column
+        || style.flex_wrap != FlexWrap::NoWrap
+        || style.justify_content != JustifyContent::FlexStart
+        || !matches!(
+            style.align_items,
+            AlignItems::Stretch | AlignItems::FlexStart
+        )
+    {
+        return false;
+    }
+    match style.height {
+        Dimension::Auto => true,
+        other => {
+            matches!(other, Dimension::Px(value) if value.is_finite() && value >= 0.0)
+                && style.align_content == w3cos_std::style::AlignContent::FlexStart
+        }
+    }
+}
+
 /// Preallocated node page. Create loops of a few thousand elements must not
 /// grow the slab, the dirty stamps, or the string arena.
 const PAGE_SLOTS: usize = 32768;
@@ -1040,6 +1154,45 @@ impl Document {
             return None;
         }
         let style = shared_declared_style(tag, style_name, style_value)?;
+        self.reserve_build_slots(2);
+        let tag_atom = resolve_name_atom(tag, tag_atom);
+        let element = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag_atom));
+        self.styles[element.0 as usize] = style;
+        if !text.is_empty() {
+            let text_id = self.alloc_node(DomNode::new_text(NodeId(0), text));
+            self.link_fresh_child(element, text_id);
+        }
+        self.link_fresh_child(parent, element);
+        self.touch_style_revision(parent);
+        self.record_layout_dirty(parent);
+        self.note_structure_change();
+        Some(element)
+    }
+
+    /// Create one text row and append it to a column flex parent.
+    ///
+    /// The row is `height` plus `flex`. Both have to stay a definite px height
+    /// and `0 0 auto` (zero grow, zero shrink, automatic basis), and the parent
+    /// has to be a nowrap column flex container, or this returns `None` and the
+    /// caller runs the ordinary setters. Author stylesheets also refuse.
+    /// Identical rows share one style record.
+    pub fn append_column_flex_row(
+        &mut self,
+        parent: NodeId,
+        tag: &str,
+        tag_atom: u32,
+        text: &str,
+        height: &str,
+        flex_value: &str,
+    ) -> Option<NodeId> {
+        if stylesheet::has_rules() || parent.0 as usize >= self.nodes.len() || tag.is_empty() {
+            return None;
+        }
+        let parent_style = self.styles.get(parent.0 as usize)?;
+        if !column_flex_parent(&parent_style.inner) {
+            return None;
+        }
+        let style = shared_column_flex_row_style(tag, height, flex_value)?;
         self.reserve_build_slots(2);
         let tag_atom = resolve_name_atom(tag, tag_atom);
         let element = self.alloc_node(DomNode::new_element_atom(NodeId(0), tag_atom));
