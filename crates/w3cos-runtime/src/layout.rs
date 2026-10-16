@@ -75,7 +75,7 @@ thread_local! {
 pub(crate) fn layout_font() -> &'static fontdue::Font {
     // The host font is already immutable and process-static. Borrow it rather
     // than retaining a second deep copy of its glyph vectors and lookup maps.
-    &crate::font_face::host_ui_font().font
+    crate::font_face::host_ui_font().font.as_ref()
 }
 
 pub(crate) fn inline_font_height(style: &w3cos_std::style::Style) -> f32 {
@@ -25390,7 +25390,10 @@ mod tests {
     #[test]
     fn layout_font_reuses_immutable_host_font() {
         let font = layout_font();
-        assert!(std::ptr::eq(font, &crate::font_face::host_ui_font().font));
+        assert!(std::ptr::eq(
+            font,
+            crate::font_face::host_ui_font().font.as_ref()
+        ));
         assert!(std::ptr::eq(font, layout_font()));
     }
 

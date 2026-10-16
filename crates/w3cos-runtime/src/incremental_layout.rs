@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
-use w3cos_std::style::{Dimension, Display, Float, Position, TextDirection};
+use w3cos_std::style::{Dimension, Display, Float, Overflow, Position, TextDirection};
 use w3cos_std::{Component, ComponentKind};
 
 use crate::layout::{LayoutEngine, pre_flatten};
@@ -39,6 +39,8 @@ thread_local! {
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     PAINT.with(|cache| *cache.borrow_mut() = None);
+    PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
+    crate::headless::invalidate_retained_frame();
 }
 
 /// Flush pending layout into stored DOM rects. Returns false when Taffy fails.
@@ -455,16 +457,40 @@ struct PaintCache {
     viewport_h_bits: u32,
     node_ids: Vec<u32>,
     results: crate::layout::LayoutResults,
+    /// Preorder child lists captured with the retained tree.
+    children: Vec<Vec<usize>>,
+    /// Absolute or fixed leaves whose used position is a px inset delta.
+    shift_ok: Vec<bool>,
+}
+
+/// Why the next headless paint can keep its artifact and only move rects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaintReuse {
+    None,
+    /// Scroll offset changed. Layout rects are the ones already painted.
+    Scroll,
+    /// Only px insets changed, so paint order and styles stay valid.
+    Insets,
 }
 
 thread_local! {
     static PAINT: RefCell<Option<PaintCache>> = const { RefCell::new(None) };
+    static PAINT_REUSE: Cell<PaintReuse> = const { Cell::new(PaintReuse::None) };
+}
+
+pub(crate) fn take_paint_reuse() -> PaintReuse {
+    PAINT_REUSE.with(|kind| kind.replace(PaintReuse::None))
+}
+
+fn note_paint_reuse(kind: PaintReuse) {
+    PAINT_REUSE.with(|slot| slot.set(kind));
 }
 
 #[cfg(test)]
 thread_local! {
     static PAINT_REBUILDS: Cell<u32> = const { Cell::new(0) };
     static PAINT_PATCHES: Cell<u32> = const { Cell::new(0) };
+    static PAINT_SHIFTS: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -473,6 +499,11 @@ pub(crate) fn paint_layout_stats() -> (u32, u32) {
         PAINT_REBUILDS.with(Cell::get),
         PAINT_PATCHES.with(Cell::get),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn paint_shift_count() -> u32 {
+    PAINT_SHIFTS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -485,11 +516,19 @@ fn note_paint_patch() {
     PAINT_PATCHES.with(|count| count.set(count.get().saturating_add(1)));
 }
 
+#[cfg(test)]
+fn note_paint_shift() {
+    PAINT_SHIFTS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 #[cfg(not(test))]
 fn note_paint_rebuild() {}
 
 #[cfg(not(test))]
 fn note_paint_patch() {}
+
+#[cfg(not(test))]
+fn note_paint_shift() {}
 
 /// Layout for a headless frame.
 ///
@@ -509,6 +548,9 @@ pub fn with_paint_layout<R>(
         )
     });
     let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+    // A geometry read can set this and never paint. The paint that follows
+    // records its own reason.
+    note_paint_reuse(PaintReuse::None);
     PAINT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let reusable = slot.as_ref().is_some_and(|cache| {
@@ -547,6 +589,8 @@ fn rebuild_paint_cache(
     engine.set_measure_text(true);
     let results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
     write_rects(&flat, &results.layout_cache);
+    let children = child_lists(&flat);
+    let shift_ok = absolute_shift_ok(&flat);
     *slot = Some(PaintCache {
         component,
         engine,
@@ -556,6 +600,8 @@ fn rebuild_paint_cache(
         viewport_h_bits: viewport_h.to_bits(),
         node_ids,
         results,
+        children,
+        shift_ok,
     });
     note_paint_rebuild();
     Ok(())
@@ -573,7 +619,12 @@ fn sync_paint_cache(
             return false;
         }
         note_paint_patch();
+        note_paint_reuse(PaintReuse::Scroll);
         return true;
+    }
+    if let Some(applied) = try_shift_absolute_insets(cache, dirty, cascade, viewport_w, viewport_h)
+    {
+        return applied;
     }
     let mut styles = Vec::with_capacity(dirty.len());
     let mut insets_only = true;
@@ -626,7 +677,243 @@ fn sync_paint_cache(
     cache.results = results;
     cache.cascade = cascade;
     note_paint_patch();
+    if insets_only {
+        note_paint_reuse(PaintReuse::Insets);
+    }
     true
+}
+
+/// `Some(true)` applied a px shift. `Some(false)` mutated the cache and the
+/// caller must rebuild. `None` left the cache untouched.
+fn try_shift_absolute_insets(
+    cache: &mut PaintCache,
+    dirty: &[NodeId],
+    cascade: u64,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<bool> {
+    let mut plan = Vec::with_capacity(dirty.len());
+    for id in dirty {
+        let style = crate::dom::with_document(|document| document.computed_style_for(*id));
+        let Some(old) = component_style(&cache.component, id.as_u32()) else {
+            return None;
+        };
+        let Some((dx, dy)) = absolute_px_delta(old, &style) else {
+            return None;
+        };
+        if !style_patch_is_safe(&style) {
+            return None;
+        }
+        let Some(flat_index) = cache.node_ids.iter().position(|node| *node == id.as_u32()) else {
+            return None;
+        };
+        if !cache.shift_ok.get(flat_index).copied().unwrap_or(false) {
+            return None;
+        }
+        if cache
+            .results
+            .scroll_ancestor
+            .get(flat_index)
+            .copied()
+            .flatten()
+            .is_some()
+        {
+            return None;
+        }
+        plan.push((id.as_u32(), style, flat_index, dx, dy));
+    }
+    if plan.is_empty() {
+        return None;
+    }
+    for (id, style, index, _, _) in &plan {
+        if !assign_insets(&mut cache.component, *id, style.top, style.left) {
+            return Some(false);
+        }
+        if !cache
+            .engine
+            .patch_style(*index, style, viewport_w, viewport_h)
+        {
+            return Some(false);
+        }
+    }
+    for (_, _, index, dx, dy) in &plan {
+        if !shift_descendants(
+            &mut cache.results.layout_cache,
+            &cache.children,
+            *index,
+            *dx,
+            *dy,
+        ) {
+            return Some(false);
+        }
+    }
+    write_host_rects(&cache.node_ids, &cache.results.layout_cache);
+    cache.cascade = cascade;
+    note_paint_patch();
+    note_paint_shift();
+    note_paint_reuse(PaintReuse::Insets);
+    Some(true)
+}
+
+fn child_lists(flat: &[crate::layout::FlatNodeInfo<'_>]) -> Vec<Vec<usize>> {
+    let mut children = vec![Vec::new(); flat.len()];
+    for (index, info) in flat.iter().enumerate() {
+        if let Some(parent) = info.parent {
+            children[parent].push(index);
+        }
+    }
+    children
+}
+
+fn clips_overflow(style: &w3cos_std::style::Style) -> bool {
+    fn clips(overflow: Overflow) -> bool {
+        !matches!(overflow, Overflow::Visible)
+    }
+    clips(style.overflow)
+        || style.overflow_x.is_some_and(clips)
+        || style.overflow_y.is_some_and(clips)
+}
+
+/// Absolute and fixed boxes can be moved by a px inset delta when their
+/// subtree has no scrollport, transform, float, table, or nested fixed box.
+fn absolute_shift_ok(flat: &[crate::layout::FlatNodeInfo<'_>]) -> Vec<bool> {
+    let mut ok = vec![true; flat.len()];
+    for (index, info) in flat.iter().enumerate() {
+        let style = info.style;
+        let blocks_subtree = !style.transform.is_identity()
+            || style.filter.is_some()
+            || clips_overflow(style)
+            || is_table(style.display)
+            || style.float != Float::None
+            || style.position == Position::Sticky
+            || style.column_count.is_some();
+        if blocks_subtree {
+            let mut cursor = Some(index);
+            while let Some(node) = cursor {
+                ok[node] = false;
+                cursor = flat[node].parent;
+            }
+        }
+        if style.position == Position::Fixed {
+            let mut cursor = info.parent;
+            while let Some(node) = cursor {
+                ok[node] = false;
+                cursor = flat[node].parent;
+            }
+        }
+    }
+    for (index, info) in flat.iter().enumerate() {
+        if !matches!(info.style.position, Position::Absolute | Position::Fixed) {
+            ok[index] = false;
+        }
+    }
+    ok
+}
+
+fn absolute_px_delta(
+    old: &w3cos_std::style::Style,
+    new: &w3cos_std::style::Style,
+) -> Option<(f32, f32)> {
+    if !matches!(old.position, Position::Absolute | Position::Fixed) || old.position != new.position
+    {
+        return None;
+    }
+    if old.right != new.right
+        || old.bottom != new.bottom
+        || old.width != new.width
+        || old.height != new.height
+    {
+        return None;
+    }
+    if !matches!(old.right, Dimension::Auto) || !matches!(old.bottom, Dimension::Auto) {
+        return None;
+    }
+    let Dimension::Px(old_width) = old.width else {
+        return None;
+    };
+    let Dimension::Px(old_height) = old.height else {
+        return None;
+    };
+    if !old_width.is_finite() || !old_height.is_finite() {
+        return None;
+    }
+    let (Dimension::Px(old_top), Dimension::Px(new_top)) = (old.top, new.top) else {
+        return None;
+    };
+    let (Dimension::Px(old_left), Dimension::Px(new_left)) = (old.left, new.left) else {
+        return None;
+    };
+    if ![old_top, new_top, old_left, new_left]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let mut adjusted = old.clone();
+    adjusted.top = new.top;
+    adjusted.left = new.left;
+    (adjusted == *new).then_some((new_left - old_left, new_top - old_top))
+}
+
+fn assign_insets(component: &mut Component, id: u32, top: Dimension, left: Dimension) -> bool {
+    if host_id(component) == Some(id) {
+        component.style.top = top;
+        component.style.left = left;
+        return true;
+    }
+    component
+        .children
+        .iter_mut()
+        .any(|child| assign_insets(child, id, top, left))
+}
+
+fn shift_descendants(
+    layouts: &mut [(crate::layout::LayoutRect, usize)],
+    children: &[Vec<usize>],
+    index: usize,
+    dx: f32,
+    dy: f32,
+) -> bool {
+    let mut stack = vec![index];
+    let mut seen = vec![false; children.len()];
+    while let Some(node) = stack.pop() {
+        if node >= seen.len() || seen[node] {
+            continue;
+        }
+        seen[node] = true;
+        let mut found = false;
+        for (rect, layout_index) in layouts.iter_mut() {
+            if *layout_index == node {
+                rect.x += dx;
+                rect.y += dy;
+                found = true;
+            }
+        }
+        if !found {
+            return false;
+        }
+        if let Some(kids) = children.get(node) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    true
+}
+
+fn write_host_rects(node_ids: &[u32], layouts: &[(crate::layout::LayoutRect, usize)]) {
+    crate::dom::with_document_mut(|document| {
+        for (rect, index) in layouts {
+            let Some(node_id) = node_ids.get(*index).copied() else {
+                continue;
+            };
+            if node_id == u32::MAX {
+                continue;
+            }
+            document.set_layout_rect(
+                NodeId::from_u32(node_id),
+                w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
+            );
+        }
+    });
 }
 
 fn flat_host_id(info: &crate::layout::FlatNodeInfo<'_>) -> u32 {
@@ -754,6 +1041,7 @@ mod paint_layout_tests {
         crate::dom::append_child(crate::dom::body_id(), layer);
 
         let (rebuilds, patches) = paint_layout_stats();
+        let shifts = paint_shift_count();
         let first = paint_rect(box_node);
         let first_fresh = fresh_rect(box_node);
         assert!(
@@ -772,6 +1060,11 @@ mod paint_layout_tests {
             1,
             "absolute top must patch, not rebuild"
         );
+        assert_eq!(
+            paint_shift_count() - shifts,
+            1,
+            "a px absolute top skips another Taffy solve"
+        );
         assert!(
             second.y > first.y + 30.0,
             "top 40px must move the box, {first:?} -> {second:?}"
@@ -783,6 +1076,109 @@ mod paint_layout_tests {
                 && (second.width - fresh.width).abs() < 0.05
                 && (second.height - fresh.height).abs() < 0.05,
             "retained rect {second:?} diverges from full layout {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_shift_moves_the_static_child_with_the_parent() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        for (name, value) in [
+            ("position", "absolute"),
+            ("width", "100px"),
+            ("height", "80px"),
+            ("left", "4px"),
+            ("top", "0px"),
+        ] {
+            crate::dom::set_style_property(parent, name, value);
+        }
+        let child = crate::dom::create_element("div");
+        crate::dom::set_style_property(child, "width", "10px");
+        crate::dom::set_style_property(child, "height", "12px");
+        crate::dom::append_child(parent, child);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let before = paint_rect(child);
+        let shifts = paint_shift_count();
+        crate::dom::set_style_property(parent, "top", "50px");
+        let after = paint_rect(child);
+        let fresh = fresh_rect(child);
+        assert_eq!(paint_shift_count() - shifts, 1);
+        assert!(
+            after.y > before.y + 40.0,
+            "child must move with the absolute parent, {before:?} -> {after:?}"
+        );
+        assert!(
+            (after.x - fresh.x).abs() < 0.05
+                && (after.y - fresh.y).abs() < 0.05
+                && (after.width - fresh.width).abs() < 0.05
+                && (after.height - fresh.height).abs() < 0.05,
+            "shifted child {after:?} diverges from full layout {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn relative_top_does_not_use_the_absolute_shift() {
+        crate::dom::reset_document();
+        let first = crate::dom::create_element("div");
+        crate::dom::set_style_property(first, "position", "relative");
+        crate::dom::set_style_property(first, "width", "40px");
+        crate::dom::set_style_property(first, "height", "20px");
+        let second = crate::dom::create_element("div");
+        crate::dom::set_style_property(second, "width", "40px");
+        crate::dom::set_style_property(second, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), first);
+        crate::dom::append_child(crate::dom::body_id(), second);
+        let _ = paint_rect(second);
+        let shifts = paint_shift_count();
+        crate::dom::set_style_property(first, "top", "30px");
+        let moved = paint_rect(second);
+        let fresh = fresh_rect(second);
+        assert_eq!(
+            paint_shift_count(),
+            shifts,
+            "relative top still reflows following siblings"
+        );
+        assert!(
+            (moved.x - fresh.x).abs() < 0.05
+                && (moved.y - fresh.y).abs() < 0.05
+                && (moved.width - fresh.width).abs() < 0.05
+                && (moved.height - fresh.height).abs() < 0.05,
+            "relative top {moved:?} diverges from full layout {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn width_after_an_absolute_shift_matches_full_layout() {
+        crate::dom::reset_document();
+        let box_node = crate::dom::create_element("div");
+        for (name, value) in [
+            ("position", "absolute"),
+            ("width", "16px"),
+            ("height", "16px"),
+            ("left", "8px"),
+            ("top", "0px"),
+        ] {
+            crate::dom::set_style_property(box_node, name, value);
+        }
+        crate::dom::append_child(crate::dom::body_id(), box_node);
+        let _ = paint_rect(box_node);
+        crate::dom::set_style_property(box_node, "top", "40px");
+        let _ = paint_rect(box_node);
+        let shifts = paint_shift_count();
+        crate::dom::set_style_property(box_node, "width", "40px");
+        let rect = paint_rect(box_node);
+        let fresh = fresh_rect(box_node);
+        assert_eq!(
+            paint_shift_count(),
+            shifts,
+            "a width edit is not an inset shift"
+        );
+        assert!(
+            (rect.x - fresh.x).abs() < 0.05
+                && (rect.y - fresh.y).abs() < 0.05
+                && (rect.width - fresh.width).abs() < 0.05
+                && (rect.height - fresh.height).abs() < 0.05,
+            "width after shift {rect:?} diverges from full layout {fresh:?}"
         );
     }
 
