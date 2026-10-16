@@ -1,6 +1,7 @@
 pub mod a11y_api;
 pub mod agent;
 pub mod agent_loop;
+pub mod chain;
 mod copy;
 pub mod dom_access;
 pub mod identity;
