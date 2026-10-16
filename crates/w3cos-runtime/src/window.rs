@@ -646,6 +646,13 @@ struct HitNode {
     on_click: EventAction,
 }
 
+/// Hover and focus rings belong on a button or text field. A container that
+/// only catches clicks — the modal scrim, the desktop, a window surface —
+/// stays interactive, but it must not stroke a ring around the screen.
+fn hover_outline_for(hit: &HitNode) -> bool {
+    hit.is_focusable
+}
+
 fn physical_column_hit_nodes(nodes: Vec<HitNode>, artifact: &PaintArtifact) -> Vec<HitNode> {
     let mut seen = HashSet::new();
     nodes
@@ -3866,7 +3873,7 @@ impl App {
             if let Some(hit) = self
                 .hit_nodes
                 .iter()
-                .find(|h| h.index == hover_idx && h.is_interactive)
+                .find(|h| h.index == hover_idx && hover_outline_for(h))
             {
                 render_gpu::draw_hover_outline(&mut self.scene, hit.rect, scale);
             }
@@ -4575,7 +4582,7 @@ impl App {
             if let Some(hit) = self
                 .hit_nodes
                 .iter()
-                .find(|h| h.index == hover_idx && h.is_interactive)
+                .find(|h| h.index == hover_idx && hover_outline_for(h))
             {
                 draw_hover_outline_cpu(&mut pixmap, hit.rect);
                 softbuffer_damage.union_layout_rect(hit.rect, w, h);
@@ -7881,6 +7888,35 @@ mod cpu_present_swizzle_tests {
         )
         .unwrap();
         assert_eq!(px, [0, 10, 16, 6]);
+    }
+
+    #[test]
+    fn hover_ring_skips_a_click_catching_container() {
+        let scrim = super::HitNode {
+            rect: LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1200.0,
+                height: 732.0,
+            },
+            index: 3,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: false,
+            on_click: w3cos_std::component::EventAction::Invoke {
+                code: 57,
+                input_placeholder: String::new(),
+            },
+        };
+        let confirm = super::HitNode {
+            is_focusable: true,
+            ..scrim.clone()
+        };
+        assert!(
+            !super::hover_outline_for(&scrim),
+            "a desktop scrim must not paint a ring"
+        );
+        assert!(super::hover_outline_for(&confirm));
     }
 
     #[test]

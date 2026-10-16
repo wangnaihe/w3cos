@@ -2449,8 +2449,9 @@ fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
     } else {
         (height - 68.0).max(0.0)
     };
-    let scrim = Component::button_with_click(
-        "",
+    // A column, not a button. It swallows clicks outside the card, and it
+    // must not join the tab order or paint a ring around the desktop.
+    let mut scrim = Component::column(
         Style {
             position: Position::Absolute,
             left: Dimension::Px(0.0),
@@ -2461,8 +2462,9 @@ fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
             z_index: CHROME_Z + 2,
             ..Style::default()
         },
-        invoke(OP_SCRIM),
+        vec![],
     );
+    scrim.on_click = invoke(OP_SCRIM);
     card.style.position = Position::Absolute;
     card.style.z_index = CHROME_Z + 3;
     if fill {
