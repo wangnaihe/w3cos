@@ -154,15 +154,33 @@ pub fn encode_png() -> Option<Vec<u8>> {
         }
         (frame.width, frame.height, frame.rgba.clone())
     };
-    encode_rgba_to_png(width, height, &rgba).ok()
+    encode_rgba_png(width, height, &rgba).ok()
 }
 
-fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+/// Encode straight RGBA as a PNG. Alpha is written as 255.
+///
+/// A framebuffer can carry real RGB in a pixel whose alpha byte is 0 (the
+/// X11 present format keeps that byte unused). Viewers then treat the whole
+/// image as blank. Screenshot PNGs stay opaque and keep the RGB bytes.
+pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
-    let mut out = Vec::with_capacity(rgba.len() / 4);
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if rgba.len() != expected {
+        return Err(format!(
+            "png encode failed: expected {expected} bytes, got {}",
+            rgba.len()
+        ));
+    }
+    let mut opaque = Vec::with_capacity(expected);
+    for pixel in rgba.chunks_exact(4) {
+        opaque.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+    }
+    let mut out = Vec::with_capacity(expected / 2);
     let mut cursor = std::io::Cursor::new(&mut out);
     image::codecs::png::PngEncoder::new(&mut cursor)
-        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+        .write_image(&opaque, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("png encode failed: {e}"))?;
     Ok(out)
 }
@@ -226,6 +244,16 @@ mod tests {
         let png = encode_png().unwrap();
         // PNG magic number = 89 50 4E 47
         assert_eq!(&png[..4], &[0x89, 0x50, 0x4E, 0x47]);
+    }
+
+    #[test]
+    fn encode_png_keeps_rgb_and_writes_opaque_alpha() {
+        let _g = FC_TEST_LOCK.lock().unwrap();
+        reset();
+        store(1, 1, vec![10, 20, 30, 0]);
+        let png = encode_png().unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.get_pixel(0, 0).0, [10, 20, 30, 255]);
     }
 
     #[test]

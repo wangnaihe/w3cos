@@ -4038,11 +4038,33 @@ impl App {
         if DUMPED.swap(true, Ordering::Relaxed) {
             return false;
         }
-        match pixmap.save_png(&path) {
+        match Self::pixmap_opaque_png(pixmap).and_then(|bytes| {
+            std::fs::write(&path, bytes).map_err(|error| format!("png write failed: {error}"))
+        }) {
             Ok(()) => eprintln!("[W3C OS] frame dumped to {path}"),
             Err(error) => eprintln!("[W3C OS] frame dump failed: {error}"),
         }
         std::env::var_os("W3COS_FRAME_DUMP_EXIT").is_some()
+    }
+
+    /// Screenshot PNG for `W3COS_FRAME_DUMP` / `W3COS_SCREEN` captures.
+    ///
+    /// Opaque pixels pass through. A zero alpha byte keeps its RGB and is
+    /// written as 255, so the file is not a fully transparent PNG.
+    #[cfg(feature = "cpu-render")]
+    fn pixmap_opaque_png(pixmap: &Pixmap) -> Result<Vec<u8>, String> {
+        let mut rgba = Vec::with_capacity(pixmap.data().len());
+        for pixel in pixmap.pixels() {
+            let alpha = pixel.alpha();
+            let (red, green, blue) = if alpha == 0 || alpha == 255 {
+                (pixel.red(), pixel.green(), pixel.blue())
+            } else {
+                let straight = pixel.demultiply();
+                (straight.red(), straight.green(), straight.blue())
+            };
+            rgba.extend_from_slice(&[red, green, blue, 255]);
+        }
+        crate::frame_cache::encode_rgba_png(pixmap.width(), pixmap.height(), &rgba)
     }
 
     #[cfg(feature = "cpu-render")]
@@ -7802,6 +7824,15 @@ mod cpu_present_swizzle_tests {
         layout_rect_to_pixel_damage, rgba8_to_softbuffer_xrgb, rgba8_to_softbuffer_xrgb_rects,
     };
     use crate::layout::LayoutRect;
+
+    #[test]
+    fn frame_dump_png_is_opaque_when_alpha_byte_is_zero() {
+        let mut pixmap = tiny_skia::Pixmap::new(1, 1).unwrap();
+        pixmap.data_mut().copy_from_slice(&[10, 20, 30, 0]);
+        let png = super::App::pixmap_opaque_png(&pixmap).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
 
     #[test]
     fn packs_rgba_bytes_as_xrgb() {
