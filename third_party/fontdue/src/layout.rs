@@ -124,7 +124,9 @@ impl Hash for GlyphRasterConfig {
 
 impl PartialEq for GlyphRasterConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.glyph_index == other.glyph_index && self.px == other.px && self.font_hash == other.font_hash
+        self.glyph_index == other.glyph_index
+            && self.px == other.px
+            && self.font_hash == other.font_hash
     }
 }
 
@@ -185,7 +187,12 @@ impl<'a> TextStyle<'a> {
 }
 
 impl<'a, U: Copy + Clone> TextStyle<'a, U> {
-    pub fn with_user_data(text: &'a str, px: f32, font_index: usize, user_data: U) -> TextStyle<'a, U> {
+    pub fn with_user_data(
+        text: &'a str,
+        px: f32,
+        font_index: usize,
+        user_data: U,
+    ) -> TextStyle<'a, U> {
         TextStyle {
             text,
             px,
@@ -467,7 +474,8 @@ impl<'a, U: Copy + Clone> Layout<U> {
             }
 
             // Perform a linebreak
-            if linebreak.is_hard() || (self.current_pos - self.start_pos + advance > self.max_width) {
+            if linebreak.is_hard() || (self.current_pos - self.start_pos + advance > self.max_width)
+            {
                 self.linebreak_prev = LINEBREAK_NONE;
                 let mut next_glyph_start = self.glyphs().len();
                 if let Some(line) = self.line_metrics.last_mut() {
@@ -538,7 +546,8 @@ impl<'a, U: Copy + Clone> Layout<U> {
             1.0 // PositiveYUp
         };
 
-        let mut baseline_y = self.y - dir * floor((self.max_height - self.height()) * self.vertical_align);
+        let mut baseline_y =
+            self.y - dir * floor((self.max_height - self.height()) * self.vertical_align);
         let mut idx = 0;
         for line in &mut self.line_metrics {
             let x_padding = self.x - line.tracking_x + floor(line.padding * self.horizontal_align);

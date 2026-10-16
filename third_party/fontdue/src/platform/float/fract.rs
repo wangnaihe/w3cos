@@ -14,6 +14,9 @@ pub fn fract(value: f32) -> f32 {
 
     unsafe {
         let packed = _mm_set_ss(value);
-        _mm_cvtss_f32(_mm_sub_ps(packed, _mm_cvtepi32_ps(_mm_cvttps_epi32(packed))))
+        _mm_cvtss_f32(_mm_sub_ps(
+            packed,
+            _mm_cvtepi32_ps(_mm_cvttps_epi32(packed)),
+        ))
     }
 }

@@ -25,7 +25,14 @@ impl Raster {
         }
     }
 
-    pub(crate) fn draw(&mut self, glyph: &Glyph, scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32) {
+    pub(crate) fn draw(
+        &mut self,
+        glyph: &Glyph,
+        scale_x: f32,
+        scale_y: f32,
+        offset_x: f32,
+        offset_y: f32,
+    ) {
         let params = f32x4::new(1.0 / scale_x, 1.0 / scale_y, scale_x, scale_y);
         let scale = f32x4::new(scale_x, scale_y, scale_x, scale_y);
         let offset = f32x4::new(offset_x, offset_y, offset_x, offset_y);
@@ -71,7 +78,11 @@ impl Raster {
             y_prev = target_y;
             target_y += sy;
         }
-        self.add(as_i32(end_x + end_y * self.w as f32) as usize, y_prev - y1, mid_x);
+        self.add(
+            as_i32(end_x + end_y * self.w as f32) as usize,
+            y_prev - y1,
+            mid_x,
+        );
     }
 
     #[inline(always)]
@@ -111,11 +122,19 @@ impl Raster {
                 target_y += sy;
                 index += index_y_inc;
             }
-            self.add(prev_index as usize, y_prev - y_next, fract((x_prev + x_next) / 2.0));
+            self.add(
+                prev_index as usize,
+                y_prev - y_next,
+                fract((x_prev + x_next) / 2.0),
+            );
             x_prev = x_next;
             y_prev = y_next;
         }
-        self.add(as_i32(end_x + end_y * self.w as f32) as usize, y_prev - y1, fract((x_prev + x1) / 2.0));
+        self.add(
+            as_i32(end_x + end_y * self.w as f32) as usize,
+            y_prev - y1,
+            fract((x_prev + x1) / 2.0),
+        );
     }
 
     #[inline(always)]

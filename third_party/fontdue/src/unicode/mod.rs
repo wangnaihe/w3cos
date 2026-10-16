@@ -73,12 +73,14 @@ impl LinebreakData {
     const HARD: u8 = 0b0000_0010;
 
     const fn new(bits: u8) -> LinebreakData {
-        LinebreakData {
-            bits,
-        }
+        LinebreakData { bits }
     }
 
-    pub fn from_mask(wrap_soft_breaks: bool, wrap_hard_breaks: bool, has_width: bool) -> LinebreakData {
+    pub fn from_mask(
+        wrap_soft_breaks: bool,
+        wrap_hard_breaks: bool,
+        has_width: bool,
+    ) -> LinebreakData {
         let mut mask = 0;
         if wrap_hard_breaks {
             mask |= LinebreakData::HARD;
@@ -86,9 +88,7 @@ impl LinebreakData {
         if wrap_soft_breaks && has_width {
             mask |= LinebreakData::SOFT;
         }
-        LinebreakData {
-            bits: mask,
-        }
+        LinebreakData { bits: mask }
     }
 
     pub fn is_hard(&self) -> bool {
@@ -111,9 +111,7 @@ pub struct Linebreaker {
 
 impl Linebreaker {
     pub fn new() -> Linebreaker {
-        Linebreaker {
-            state: 0,
-        }
+        Linebreaker { state: 0 }
     }
 
     pub fn reset(&mut self) {
@@ -174,9 +172,7 @@ impl CharacterData {
             '\0'..='\x1F' | '\x7F' => class |= CharacterData::CONTROL,
             _ => {}
         }
-        CharacterData {
-            bits: class,
-        }
+        CharacterData { bits: class }
     }
 
     /// A heuristic for if the glpyh this was classified from should be rasterized. Missing glyphs,

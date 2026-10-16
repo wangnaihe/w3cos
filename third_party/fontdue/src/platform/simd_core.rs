@@ -15,12 +15,7 @@ pub struct f32x4 {
 impl f32x4 {
     #[inline(always)]
     pub const fn new(x0: f32, x1: f32, x2: f32, x3: f32) -> Self {
-        f32x4 {
-            x0,
-            x1,
-            x2,
-            x3,
-        }
+        f32x4 { x0, x1, x2, x3 }
     }
 
     #[inline(always)]
@@ -39,10 +34,18 @@ impl f32x4 {
     pub fn sub_integer(&self, other: f32x4) -> f32x4 {
         unsafe {
             Self::new(
-                transmute::<u32, f32>(transmute::<f32, u32>(self.x0) - transmute::<f32, u32>(other.x0)),
-                transmute::<u32, f32>(transmute::<f32, u32>(self.x1) - transmute::<f32, u32>(other.x1)),
-                transmute::<u32, f32>(transmute::<f32, u32>(self.x2) - transmute::<f32, u32>(other.x2)),
-                transmute::<u32, f32>(transmute::<f32, u32>(self.x3) - transmute::<f32, u32>(other.x3)),
+                transmute::<u32, f32>(
+                    transmute::<f32, u32>(self.x0) - transmute::<f32, u32>(other.x0),
+                ),
+                transmute::<u32, f32>(
+                    transmute::<f32, u32>(self.x1) - transmute::<f32, u32>(other.x1),
+                ),
+                transmute::<u32, f32>(
+                    transmute::<f32, u32>(self.x2) - transmute::<f32, u32>(other.x2),
+                ),
+                transmute::<u32, f32>(
+                    transmute::<f32, u32>(self.x3) - transmute::<f32, u32>(other.x3),
+                ),
             )
         }
     }
@@ -65,7 +68,12 @@ impl f32x4 {
     #[inline(always)]
     pub fn trunc(self) -> Self {
         use super::trunc;
-        Self::new(trunc(self.x0), trunc(self.x1), trunc(self.x2), trunc(self.x3))
+        Self::new(
+            trunc(self.x0),
+            trunc(self.x1),
+            trunc(self.x2),
+            trunc(self.x3),
+        )
     }
 
     #[inline(always)]
@@ -79,7 +87,12 @@ impl Add for f32x4 {
     type Output = f32x4;
     #[inline(always)]
     fn add(self, other: f32x4) -> f32x4 {
-        Self::new(self.x0 + other.x0, self.x1 + other.x1, self.x2 + other.x2, self.x3 + other.x3)
+        Self::new(
+            self.x0 + other.x0,
+            self.x1 + other.x1,
+            self.x2 + other.x2,
+            self.x3 + other.x3,
+        )
     }
 }
 
@@ -97,7 +110,12 @@ impl Sub for f32x4 {
     type Output = f32x4;
     #[inline(always)]
     fn sub(self, other: f32x4) -> f32x4 {
-        Self::new(self.x0 - other.x0, self.x1 - other.x1, self.x2 - other.x2, self.x3 - other.x3)
+        Self::new(
+            self.x0 - other.x0,
+            self.x1 - other.x1,
+            self.x2 - other.x2,
+            self.x3 - other.x3,
+        )
     }
 }
 
@@ -115,7 +133,12 @@ impl Mul for f32x4 {
     type Output = f32x4;
     #[inline(always)]
     fn mul(self, other: f32x4) -> f32x4 {
-        Self::new(self.x0 * other.x0, self.x1 * other.x1, self.x2 * other.x2, self.x3 * other.x3)
+        Self::new(
+            self.x0 * other.x0,
+            self.x1 * other.x1,
+            self.x2 * other.x2,
+            self.x3 * other.x3,
+        )
     }
 }
 
@@ -133,7 +156,12 @@ impl Div for f32x4 {
     type Output = f32x4;
     #[inline(always)]
     fn div(self, other: f32x4) -> f32x4 {
-        Self::new(self.x0 / other.x0, self.x1 / other.x1, self.x2 / other.x2, self.x3 / other.x3)
+        Self::new(
+            self.x0 / other.x0,
+            self.x1 / other.x1,
+            self.x2 / other.x2,
+            self.x3 / other.x3,
+        )
     }
 }
 

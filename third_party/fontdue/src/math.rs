@@ -36,12 +36,7 @@ struct CubeCurve {
 
 impl CubeCurve {
     const fn new(a: Point, b: Point, c: Point, d: Point) -> CubeCurve {
-        CubeCurve {
-            a,
-            b,
-            c,
-            d,
-        }
+        CubeCurve { a, b, c, d }
     }
 
     fn scale(&self, scale: f32) -> CubeCurve {
@@ -72,7 +67,10 @@ impl CubeCurve {
         let r0 = q0.midpoint(q1);
         let r1 = q1.midpoint(q2);
         let s0 = r0.midpoint(r1);
-        (CubeCurve::new(self.a, q0, r0, s0), CubeCurve::new(s0, r1, q2, self.d))
+        (
+            CubeCurve::new(self.a, q0, r0, s0),
+            CubeCurve::new(s0, r1, q2, self.d),
+        )
     }
 
     /// The point at time t in the curve.
@@ -116,11 +114,7 @@ struct QuadCurve {
 
 impl QuadCurve {
     fn new(a: Point, b: Point, c: Point) -> QuadCurve {
-        QuadCurve {
-            a,
-            b,
-            c,
-        }
+        QuadCurve { a, b, c }
     }
 
     fn scale(&self, scale: f32) -> QuadCurve {
@@ -147,7 +141,10 @@ impl QuadCurve {
         let q0 = self.a.midpoint(self.b);
         let q1 = self.b.midpoint(self.c);
         let r0 = q0.midpoint(q1);
-        (QuadCurve::new(self.a, q0, r0), QuadCurve::new(r0, q1, self.c))
+        (
+            QuadCurve::new(self.a, q0, r0),
+            QuadCurve::new(r0, q1, self.c),
+        )
     }
 
     /// The point at time t in the curve.
@@ -190,19 +187,13 @@ pub struct Point {
 
 impl Default for Point {
     fn default() -> Self {
-        Point {
-            x: 0.0,
-            y: 0.0,
-        }
+        Point { x: 0.0, y: 0.0 }
     }
 }
 
 impl Point {
     pub const fn new(x: f32, y: f32) -> Point {
-        Point {
-            x,
-            y,
-        }
+        Point { x, y }
     }
 
     pub fn scale(&self, scale: f32) -> Point {
@@ -275,11 +266,7 @@ impl Line {
 
         let dx = end.x - start.x;
         let dy = end.y - start.y;
-        let tdx = if dx == 0.0 {
-            core::f32::MAX
-        } else {
-            1.0 / dx
-        };
+        let tdx = if dx == 0.0 { core::f32::MAX } else { 1.0 / dx };
         let tdy = 1.0 / dy;
 
         Line {
@@ -331,12 +318,7 @@ struct Segment {
 
 impl Segment {
     const fn new(a: Point, at: f32, c: Point, ct: f32) -> Segment {
-        Segment {
-            a,
-            at,
-            c,
-            ct,
-        }
+        Segment { a, at, c, ct }
     }
 }
 
@@ -363,7 +345,8 @@ impl ttf_parser::OutlineBuilder for Geometry {
             let bt = (seg.at + seg.ct) * 0.5;
             let b = curve.point(bt);
             // This is twice the triangle area
-            let area = (b.x - seg.a.x) * (seg.c.y - seg.a.y) - (seg.c.x - seg.a.x) * (b.y - seg.a.y);
+            let area =
+                (b.x - seg.a.x) * (seg.c.y - seg.a.y) - (seg.c.x - seg.a.x) * (b.y - seg.a.y);
             if platform::abs(area) > self.max_area {
                 stack.push(Segment::new(seg.a, seg.at, b, bt));
                 stack.push(Segment::new(b, bt, seg.c, seg.ct));
@@ -380,13 +363,19 @@ impl ttf_parser::OutlineBuilder for Geometry {
         let second_control = Point::new(x1, y1);
         let next_point = Point::new(x2, y2);
 
-        let curve = CubeCurve::new(self.previous_point, first_control, second_control, next_point);
+        let curve = CubeCurve::new(
+            self.previous_point,
+            first_control,
+            second_control,
+            next_point,
+        );
         let mut stack = vec![Segment::new(self.previous_point, 0.0, next_point, 1.0)];
         while let Some(seg) = stack.pop() {
             let bt = (seg.at + seg.ct) * 0.5;
             let b = curve.point(bt);
             // This is twice the triangle area
-            let area = (b.x - seg.a.x) * (seg.c.y - seg.a.y) - (seg.c.x - seg.a.x) * (b.y - seg.a.y);
+            let area =
+                (b.x - seg.a.x) * (seg.c.y - seg.a.y) - (seg.c.x - seg.a.x) * (b.y - seg.a.y);
             if platform::abs(area) > self.max_area {
                 stack.push(Segment::new(seg.a, seg.at, b, bt));
                 stack.push(Segment::new(b, bt, seg.c, seg.ct));

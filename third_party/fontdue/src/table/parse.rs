@@ -60,10 +60,7 @@ pub struct Stream<'a> {
 
 impl<'a> Stream<'a> {
     pub const fn new(bytes: &'a [u8]) -> Stream<'a> {
-        Stream {
-            bytes,
-            offset: 0,
-        }
+        Stream { bytes, offset: 0 }
     }
 
     // UTILITY

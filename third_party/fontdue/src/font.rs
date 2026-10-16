@@ -247,7 +247,9 @@ fn convert_error(error: FaceParsingError) -> &'static str {
     use FaceParsingError::*;
     match error {
         MalformedFont => "An attempt to read out of bounds detected.",
-        UnknownMagic => "Face data must start with 0x00010000, 0x74727565, 0x4F54544F or 0x74746366.",
+        UnknownMagic => {
+            "Face data must start with 0x00010000, 0x74727565, 0x4F54544F or 0x74746366."
+        }
         FaceIndexOutOfBounds => "The face index is larger than the number of faces in the font.",
         NoHeadTable => "The head table is missing or malformed.",
         NoHheaTable => "The hhea table is missing or malformed.",
@@ -255,7 +257,12 @@ fn convert_error(error: FaceParsingError) -> &'static str {
     }
 }
 
-fn build_glyph(face: &Face, index: u16, scale: f32, units_per_em: f32) -> Result<Glyph, &'static str> {
+fn build_glyph(
+    face: &Face,
+    index: u16,
+    scale: f32,
+    units_per_em: f32,
+) -> Result<Glyph, &'static str> {
     if index >= face.number_of_glyphs() {
         return Err("Attempted to map a codepoint out of bounds.");
     }
@@ -284,7 +291,10 @@ fn convert_name(face: &Face) -> Option<String> {
 
 impl Font {
     /// Constructs a font from an array of bytes.
-    pub fn from_bytes<Data: Deref<Target = [u8]>>(data: Data, settings: FontSettings) -> FontResult<Font> {
+    pub fn from_bytes<Data: Deref<Target = [u8]>>(
+        data: Data,
+        settings: FontSettings,
+    ) -> FontResult<Font> {
         let hash = crate::hash::hash(&data);
 
         let face = match Face::parse(&data, settings.collection_index) {
@@ -329,8 +339,11 @@ impl Font {
         let bytes: Box<[u8]> = data.to_vec().into_boxed_slice();
 
         // New line metrics.
-        let horizontal_line_metrics =
-            Some(LineMetrics::new(face.ascender(), face.descender(), face.line_gap()));
+        let horizontal_line_metrics = Some(LineMetrics::new(
+            face.ascender(),
+            face.descender(),
+            face.line_gap(),
+        ));
         let vertical_line_metrics = if let Some(ascender) = face.vertical_ascender() {
             Some(LineMetrics::new(
                 ascender,
@@ -433,7 +446,11 @@ impl Font {
     /// given left and right pair, None otherwise.
     #[inline(always)]
     pub fn horizontal_kern(&self, left: char, right: char, px: f32) -> Option<f32> {
-        self.horizontal_kern_indexed(self.lookup_glyph_index(left), self.lookup_glyph_index(right), px)
+        self.horizontal_kern_indexed(
+            self.lookup_glyph_index(left),
+            self.lookup_glyph_index(right),
+            px,
+        )
     }
 
     /// Retrieves the horizontal scaled kerning value for two adjacent glyph indicies.
@@ -653,7 +670,9 @@ impl Font {
     #[inline]
     pub fn lookup_glyph_index(&self, character: char) -> u16 {
         // This is safe, Option<NonZeroU16> is documented to have the same layout as u16.
-        unsafe { mem::transmute::<Option<NonZeroU16>, u16>(self.char_to_glyph.get(&character).copied()) }
+        unsafe {
+            mem::transmute::<Option<NonZeroU16>, u16>(self.char_to_glyph.get(&character).copied())
+        }
     }
 
     /// Gets the total glyphs in the font.

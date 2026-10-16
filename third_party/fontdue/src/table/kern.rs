@@ -115,7 +115,8 @@ impl TableKern {
         let left_hand_classes_count = stream.read_u8()?;
         let right_hand_classes_count = stream.read_u8()?;
         stream.skip(1); // flags - reserved
-        let indices_count = u16::from(left_hand_classes_count) * u16::from(right_hand_classes_count);
+        let indices_count =
+            u16::from(left_hand_classes_count) * u16::from(right_hand_classes_count);
 
         let kerning_values = stream.read_i16_slice(usize::from(kerning_values_count))?;
         let left_hand_classes = stream.read_u8_slice(usize::from(glyph_count))?;
@@ -129,12 +130,14 @@ impl TableKern {
                     let left_class = left_hand_classes.get(usize::from(left))?;
                     let right_class = right_hand_classes.get(usize::from(right))?;
 
-                    if left_class > left_hand_classes_count || right_class > right_hand_classes_count {
+                    if left_class > left_hand_classes_count
+                        || right_class > right_hand_classes_count
+                    {
                         continue;
                     }
 
-                    let index =
-                        u16::from(left_class) * u16::from(right_hand_classes_count) + u16::from(right_class);
+                    let index = u16::from(left_class) * u16::from(right_hand_classes_count)
+                        + u16::from(right_class);
                     let index = indices.get(usize::from(index))?;
                     let id = u32::from(left) << 16 | u32::from(right);
                     let value = kerning_values.get(usize::from(index))?;

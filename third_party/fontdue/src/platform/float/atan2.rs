@@ -41,11 +41,7 @@ pub fn atan2f(y: f32, x: f32) -> f32 {
     }
     /* when x = 0 */
     if ix == 0 {
-        return if m & 1 != 0 {
-            -PI / 2.
-        } else {
-            PI / 2.
-        };
+        return if m & 1 != 0 { -PI / 2. } else { PI / 2. };
     }
     /* when x is INF */
     if ix == 0x7f800000 {
@@ -67,11 +63,7 @@ pub fn atan2f(y: f32, x: f32) -> f32 {
     }
     /* |y/x| > 0x1p26 */
     if (ix + (26 << 23) < iy) || (iy == 0x7f800000) {
-        return if m & 1 != 0 {
-            -PI / 2.
-        } else {
-            PI / 2.
-        };
+        return if m & 1 != 0 { -PI / 2. } else { PI / 2. };
     }
 
     /* z = atan(|y/x|) with correct underflow */
