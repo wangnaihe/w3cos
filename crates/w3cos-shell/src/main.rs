@@ -5,7 +5,7 @@
 //! Drag the title bar to move it; drag an edge or corner to resize.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod agent_host;
 mod gesture;
@@ -177,6 +177,7 @@ const OP_LEXICON_EXPORT: u8 = 102;
 const OP_LEXICON_CLEAR: u8 = 103;
 const OP_SETTINGS_LANGUAGE: u8 = 104;
 const OP_SETTINGS_BACK: u8 = 105;
+const OP_NOTIFY_OPEN: u8 = 106;
 
 fn main() {
     shell_main();
@@ -248,10 +249,21 @@ fn bridge_confirm() -> String {
     state::get_signal_text(SUMMARY_SIGNAL)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellNotice {
+    title: String,
+    detail: String,
+    /// Passed back as the click draft: `receipt:#N`, `devices`, `incoming`, or empty.
+    draft: String,
+}
+
 thread_local! {
     static SESSION: RefCell<Option<IntentSession>> = const { RefCell::new(None) };
     static SESSION_BOOTED: Cell<bool> = const { Cell::new(false) };
-    static NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static NOTICES: RefCell<Vec<ShellNotice>> = const { RefCell::new(Vec::new()) };
+    static SEEN_RECEIPTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static RECEIPT_NOTICES_BASELINED: Cell<bool> = const { Cell::new(false) };
+    static NOTICE_FOCUS: RefCell<String> = const { RefCell::new(String::new()) };
     static LAST_CLOCK: RefCell<String> = const { RefCell::new(String::new()) };
     static COPIED_SUBJECT: RefCell<String> = const { RefCell::new(String::new()) };
     static CLOCK_ARMED: Cell<bool> = const { Cell::new(false) };
@@ -913,7 +925,23 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
         state::set_text_signal(TOAST_SIGNAL, notice);
     }
     state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(48));
-    if !notice.is_empty() {
+    let added = absorb_new_receipts();
+    let localized = notice
+        .chars()
+        .any(|ch| ('\u{2E80}'..='\u{9FFF}').contains(&ch));
+    if !notice.is_empty() && localized && (added == 0 || notice != locale::t("perm-denied-notice"))
+    {
+        state::set_text_signal(TOAST_SIGNAL, notice);
+        state::set_text_signal(NOTICE_SIGNAL, notice);
+        remember_notice(notice);
+    } else if added > 0 {
+        if let Some(title) = latest_notice_title() {
+            state::set_text_signal(TOAST_SIGNAL, &title);
+            state::set_text_signal(NOTICE_SIGNAL, &title);
+        }
+    } else if !notice.is_empty() {
+        state::set_text_signal(TOAST_SIGNAL, notice);
+        state::set_text_signal(NOTICE_SIGNAL, notice);
         remember_notice(notice);
     }
     state::set_text_signal(STORAGE_SIGNAL, session.receipt_storage());
@@ -997,22 +1025,218 @@ fn remember_notice(text: &str) {
     if text.is_empty() {
         return;
     }
+    post_notice(text, "", "");
+}
+
+fn latest_notice_title() -> Option<String> {
+    NOTICES.with(|slot| slot.borrow().last().map(|notice| notice.title.clone()))
+}
+
+fn post_notice(title: &str, detail: &str, draft: &str) {
+    let title = title.trim();
+    if title.is_empty() {
+        return;
+    }
+    let notice = ShellNotice {
+        title: title.to_string(),
+        detail: detail.trim().to_string(),
+        draft: draft.to_string(),
+    };
     let added = NOTICES.with(|slot| {
         let mut notices = slot.borrow_mut();
-        if notices.last().is_some_and(|last| last == text) {
+        if notices.last().is_some_and(|last| last == &notice) {
             return false;
         }
-        notices.push(text.to_string());
+        if notices.iter().any(|item| item == &notice) {
+            return false;
+        }
+        notices.push(notice);
         if notices.len() > 12 {
             notices.remove(0);
         }
         true
     });
-    if added {
+    if added && state::get_signal(NOTIFY_SIGNAL) == 0 {
         state::set_signal(
             NOTIFY_UNREAD_SIGNAL,
             state::get_signal(NOTIFY_UNREAD_SIGNAL) + 1,
         );
+    }
+}
+
+fn receipt_notice_sub(parts: &ReceiptParts) -> String {
+    let when = notice_when(&parts.recorded_at);
+    let tier = if parts.tier.is_empty() {
+        "L0".to_string()
+    } else {
+        parts.tier.clone()
+    };
+    locale::t_args(
+        "notify-receipt-sub",
+        &[("id", &parts.id), ("tier", &tier), ("when", &when)],
+    )
+}
+
+fn notice_when(recorded_at: &str) -> String {
+    let Ok(millis) = recorded_at.parse::<i64>() else {
+        return locale::t("notify-just-now");
+    };
+    let now = now_ms() as i64;
+    if (now - millis).abs() <= 120_000 {
+        return locale::t("notify-just-now");
+    }
+    let clock = format_receipt_clock(recorded_at);
+    if clock.is_empty() {
+        locale::t("notify-just-now")
+    } else {
+        clock
+    }
+}
+
+fn app_name_for_slug(slug: &str) -> String {
+    match slug {
+        "files" => locale::t("app-files"),
+        "terminal" => locale::t("app-terminal"),
+        "settings" => locale::t("app-settings"),
+        "browser" => locale::t("app-browser"),
+        "editor" => locale::t("app-editor"),
+        "desktop" => locale::t("app-desktop"),
+        "agent" => locale::t("tasks-title"),
+        other => other.to_string(),
+    }
+}
+
+fn notice_from_receipt(line: &str) -> Option<ShellNotice> {
+    let parts = parse_receipt(line);
+    if !parts.id.starts_with('#') || parts.id == "#" {
+        return None;
+    }
+    let draft = format!("receipt:{}", parts.id);
+    let (title, detail) = match parts.decision.as_str() {
+        "allowed" => {
+            let title = if let Some(slug) = parts.command.strip_prefix("open:") {
+                locale::t_args("notify-opened", &[("name", &app_name_for_slug(slug))])
+            } else if parts.command == "night" {
+                if parts.detail.to_ascii_lowercase().contains("off") {
+                    locale::t("notify-night-off")
+                } else {
+                    locale::t("notify-night-on")
+                }
+            } else if parts.command == "set-locale" {
+                locale::t("notify-locale")
+            } else if parts.detail.chars().any(|ch| !ch.is_ascii()) {
+                parts.detail.clone()
+            } else {
+                locale::t("notify-recorded")
+            };
+            (title, receipt_notice_sub(&parts))
+        }
+        "denied" => {
+            let command = if parts.command == "l2:run" {
+                parts
+                    .utterance
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                parts.command.clone()
+            };
+            let title = if command.is_empty() {
+                locale::t("notify-denied-plain")
+            } else {
+                locale::t_args("notify-denied", &[("command", &command)])
+            };
+            let lowered = parts.detail.to_ascii_lowercase();
+            let detail = if lowered.contains("locked") || parts.detail.contains("锁") {
+                locale::t("notify-denied-locked")
+            } else if lowered.contains("refused") || lowered.contains("denied") {
+                locale::t("notify-denied-refused")
+            } else {
+                locale::t("notify-denied-generic")
+            };
+            (title, detail)
+        }
+        "cancelled" => (locale::t("notify-cancelled"), receipt_notice_sub(&parts)),
+        "unrecognized" => (locale::t("notify-unrecognized"), receipt_notice_sub(&parts)),
+        _ => (locale::t("notify-recorded"), receipt_notice_sub(&parts)),
+    };
+    Some(ShellNotice {
+        title,
+        detail,
+        draft,
+    })
+}
+
+/// Receipts already on the ledger at boot are history, not a fresh feed.
+fn absorb_new_receipts() -> usize {
+    let first = !RECEIPT_NOTICES_BASELINED.with(|flag| flag.replace(true));
+    let mut added = 0;
+    for line in receipt_entries() {
+        let Some(notice) = notice_from_receipt(&line) else {
+            continue;
+        };
+        let id = notice
+            .draft
+            .strip_prefix("receipt:")
+            .unwrap_or("")
+            .to_string();
+        let seen = SEEN_RECEIPTS.with(|slot| {
+            let mut seen = slot.borrow_mut();
+            !seen.insert(id)
+        });
+        if seen || first {
+            continue;
+        }
+        let before = NOTICES.with(|slot| slot.borrow().len());
+        post_notice(&notice.title, &notice.detail, &notice.draft);
+        if NOTICES.with(|slot| slot.borrow().len()) > before {
+            added += 1;
+        }
+    }
+    added
+}
+
+fn observe_live_notices() {
+    if let Some(peer) = handoff::pending_peer() {
+        post_notice(
+            &locale::t_args("notify-peer", &[("name", &peer.name)]),
+            &locale::t("notify-peer-detail"),
+            "devices",
+        );
+    }
+    if let Some((name, _, _)) = handoff::incoming() {
+        post_notice(
+            &locale::t_args("handoff-incoming", &[("name", &name)]),
+            "",
+            "incoming",
+        );
+    }
+    let id = handoff::notice();
+    if matches!(id.as_str(), "handoff-no-answer" | "handoff-sending") {
+        post_notice(&handoff_notice_text(&id), "", "");
+    }
+}
+
+fn open_notice_target(draft: &str) {
+    state::set_signal(NOTIFY_SIGNAL, 0);
+    if let Some(id) = draft.strip_prefix("receipt:") {
+        state::set_signal(RECEIPT_FILTER_SIGNAL, 0);
+        state::set_text_signal(RECEIPT_QUERY_SIGNAL, "");
+        let entries = visible_receipts();
+        let page = entries
+            .iter()
+            .position(|line| parse_receipt(line).id == id)
+            .map(|index| (index / RECEIPT_PAGE_SIZE) as i64)
+            .unwrap_or(0);
+        state::set_signal(RECEIPT_PAGE_SIGNAL, page);
+        NOTICE_FOCUS.with(|slot| *slot.borrow_mut() = id.to_string());
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+    } else if draft == "devices" {
+        focus_app(3);
+        show_settings_pane(4);
+    } else if draft == "incoming" {
+        handoff::reveal_incoming();
     }
 }
 
@@ -1417,6 +1641,7 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
                 state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
             }
         }
+        OP_NOTIFY_OPEN => open_notice_target(draft),
         OP_RECEIPT_PREV => {
             let page = state::get_signal(RECEIPT_PAGE_SIGNAL).saturating_sub(1);
             state::set_signal(RECEIPT_PAGE_SIGNAL, page);
@@ -1766,7 +1991,39 @@ fn apply_screen_override() {
             focus_app(1);
             state::set_signal(SWITCHER_SIGNAL, 1);
         }
-        Some("notify") => state::set_signal(NOTIFY_SIGNAL, 1),
+        Some("notify") => {
+            state::set_signal(NOTIFY_SIGNAL, 1);
+            state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
+        }
+        Some("notify-files") => {
+            let ctx = ShellContext {
+                app: ShellApp::Desktop,
+                night: state::get_signal(NIGHT_SIGNAL) != 0,
+            };
+            with_session(|session| {
+                if session.identity_unlocked() {
+                    apply_propose(session, "打开文件", &ctx);
+                    apply_confirm(session, &ctx);
+                }
+            });
+            state::set_signal(NOTIFY_SIGNAL, 1);
+            state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
+            state::set_signal(PHASE_SIGNAL, 0);
+        }
+        Some("notify-badge") => {
+            let ctx = ShellContext {
+                app: ShellApp::Desktop,
+                night: state::get_signal(NIGHT_SIGNAL) != 0,
+            };
+            with_session(|session| {
+                if session.identity_unlocked() {
+                    apply_propose(session, "打开文件", &ctx);
+                    apply_confirm(session, &ctx);
+                }
+            });
+            state::set_signal(NOTIFY_SIGNAL, 0);
+            state::set_signal(PHASE_SIGNAL, 0);
+        }
         Some("devices") => {
             present_settings(4, 0);
             handoff::demo_pending();
@@ -1842,6 +2099,7 @@ fn build_shell() -> Component {
         }
     }
     boot_session_once();
+    observe_live_notices();
     apply_screen_override();
     ime_bar::sync_field_presence();
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
@@ -2463,6 +2721,62 @@ fn live_battery() -> Option<String> {
     Some(format!("{pct}%"))
 }
 
+fn tray_bell() -> Component {
+    let icon = dock_icon(
+        "bell",
+        locale::t("tray-notify"),
+        OP_NOTIFY_TOGGLE,
+        Color::TRANSPARENT,
+        state::get_signal(NOTIFY_SIGNAL) != 0,
+    );
+    let unread = state::get_signal(NOTIFY_UNREAD_SIGNAL);
+    if unread <= 0 {
+        return icon;
+    }
+    let size = if state::pointer_is_coarse() {
+        48.0
+    } else {
+        40.0
+    };
+    let count = if unread > 9 {
+        "9+".to_string()
+    } else {
+        unread.to_string()
+    };
+    Component::column(
+        Style {
+            position: Position::Relative,
+            width: Dimension::Px(size),
+            height: Dimension::Px(size),
+            flex_shrink: 0.0,
+            overflow: Overflow::Visible,
+            ..Style::default()
+        },
+        vec![
+            icon,
+            Component::text(
+                count,
+                Style {
+                    position: Position::Absolute,
+                    right: Dimension::Px(-2.0),
+                    top: Dimension::Px(-2.0),
+                    min_width: Dimension::Px(16.0),
+                    height: Dimension::Px(16.0),
+                    padding: Edges::xy(3.0, 0.0),
+                    border_radius: 99.0,
+                    background: Color::from_hex("#9a3412"),
+                    color: Color::WHITE,
+                    font_size: 10.0,
+                    font_weight: 700,
+                    text_align: TextAlign::Center,
+                    z_index: 2,
+                    ..Style::default()
+                },
+            ),
+        ],
+    )
+}
+
 fn l2_badge() -> String {
     if session_l2_on() {
         locale::t("l2-badge-on")
@@ -2780,13 +3094,7 @@ fn build_floating_taskbar() -> Component {
             Color::TRANSPARENT,
             false,
         ),
-        dock_icon(
-            "bell",
-            locale::t("tray-notify"),
-            OP_NOTIFY_TOGGLE,
-            Color::TRANSPARENT,
-            false,
-        ),
+        tray_bell(),
         Component::button_with_click(
             l2_badge(),
             Style {
@@ -3597,22 +3905,81 @@ fn build_lock_screen() -> Component {
     )
 }
 
-fn build_notify_panel() -> Component {
-    let (width, height) = state::shell_viewport();
-    let panel_w = 320.0_f32.min(width - 24.0);
-    let notices = NOTICES.with(|slot| slot.borrow().clone());
-    let mut body = vec![
-        Component::text(
-            locale::t("notify-title"),
+fn notice_row(notice: &ShellNotice) -> Component {
+    let min_h = 48.0;
+    let mut lines = vec![Component::text(
+        notice.title.clone(),
+        Style {
+            font_size: 14.0,
+            font_weight: 650,
+            color: ink(),
+            ..Style::default()
+        },
+    )];
+    if !notice.detail.is_empty() {
+        lines.push(Component::text(
+            notice.detail.clone(),
             Style {
-                font_size: 16.0,
-                font_weight: 700,
-                color: ink(),
+                font_size: 12.0,
+                color: muted_ink(),
                 ..Style::default()
             },
-        ),
-        chrome_button(locale::t("close"), OP_NOTIFY_TOGGLE, "#3d5570"),
-    ];
+        ));
+    }
+    let mut row = Component::column(
+        Style {
+            gap: 2.0,
+            padding: Edges::xy(10.0, 8.0),
+            width: Dimension::Percent(100.0),
+            min_height: Dimension::Px(min_h),
+            background: Color::rgba(244, 241, 234, 10),
+            border_radius: 12.0,
+            align_items: AlignItems::FlexStart,
+            justify_content: JustifyContent::Center,
+            ..Style::default()
+        },
+        lines,
+    );
+    if !notice.draft.is_empty() {
+        row.style.custom_properties = Some(HashMap::from([(
+            "--w3cos-draft".to_string(),
+            notice.draft.clone(),
+        )]));
+        row.style.color = Color::TRANSPARENT;
+        row.style.overflow = Overflow::Hidden;
+        row.kind = ComponentKind::Button {
+            label: notice.title.clone(),
+        };
+        row.on_click = invoke(OP_NOTIFY_OPEN);
+    }
+    row
+}
+
+fn build_notify_panel() -> Component {
+    let (width, height) = state::shell_viewport();
+    let phone = posture() == Posture::Phone;
+    let notices = NOTICES.with(|slot| slot.borrow().clone());
+    let mut body = vec![Component::row(
+        Style {
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            gap: 8.0,
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                locale::t("notify-title"),
+                Style {
+                    font_size: 16.0,
+                    font_weight: 700,
+                    color: ink(),
+                    flex_grow: 1.0,
+                    ..Style::default()
+                },
+            ),
+            chrome_button(locale::t("close"), OP_NOTIFY_TOGGLE, "#3d5570"),
+        ],
+    )];
     if notices.is_empty() {
         body.push(Component::text(
             locale::t("notify-empty"),
@@ -3624,25 +3991,54 @@ fn build_notify_panel() -> Component {
         ));
     } else {
         for notice in notices.iter().rev().take(8) {
-            body.push(Component::text(
-                notice.clone(),
-                Style {
-                    font_size: 13.0,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ));
+            body.push(notice_row(notice));
         }
     }
-    let bottom = intent_block_top(height) - 12.0;
-    let top = (bottom - 240.0).max(16.0);
+    if phone {
+        let panel_h = (height * 0.46).clamp(160.0, 420.0);
+        return Component::column(
+            Style {
+                position: Position::Absolute,
+                left: Dimension::Px(0.0),
+                top: Dimension::Px(0.0),
+                width: Dimension::Px(width),
+                height: Dimension::Px(panel_h),
+                overflow: Overflow::Auto,
+                padding: Edges::all(16.0),
+                gap: 8.0,
+                background: Color::from_hex("#1b2c3e"),
+                border_bottom_left_radius: Some(22.0),
+                border_bottom_right_radius: Some(22.0),
+                z_index: CHROME_Z + 1,
+                ..Style::default()
+            },
+            body,
+        );
+    }
+    let panel_w = 320.0_f32.min((width - 32.0).max(220.0));
+    let floor = intent_block_top(height) - 12.0;
+    let rows = if notices.is_empty() {
+        1
+    } else {
+        notices.len().min(6)
+    };
+    let desired = 56.0
+        + rows as f32
+            * (if state::pointer_is_coarse() {
+                56.0
+            } else {
+                52.0
+            });
+    let panel_h = desired.min((floor - 16.0).max(96.0));
+    let top = (floor - panel_h).max(8.0);
     Component::column(
         Style {
             position: Position::Absolute,
             left: Dimension::Px((width - panel_w - 16.0).max(8.0)),
             top: Dimension::Px(top),
             width: Dimension::Px(panel_w),
-            max_height: Dimension::Px((bottom - top).max(0.0)),
+            height: Dimension::Px(panel_h),
+            max_height: Dimension::Px(panel_h),
             overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
@@ -6881,12 +7277,15 @@ fn receipt_row(line: &str) -> Component {
             ..Style::default()
         },
     ));
+    let focused = NOTICE_FOCUS.with(|slot| slot.borrow().clone()) == parts.id;
     Component::column(
         Style {
             gap: 4.0,
             padding: Edges::xy(10.0, 10.0),
             background: Color::rgba(244, 241, 234, 10),
             border_radius: 12.0,
+            border_width: if focused { 2.0 } else { 0.0 },
+            border_color: Color::from_hex("#14966a"),
             ..Style::default()
         },
         lines,
@@ -8890,6 +9289,7 @@ mod shell_ux_tests {
         let mut cells = String::new();
         walk(root, &mut |node| {
             if let ComponentKind::Text { content } = &node.kind
+                && node.style.position != Position::Absolute
                 && content.chars().count() == 1
                 && (content == ":" || content.chars().all(|ch| ch.is_ascii_digit()))
             {
@@ -9116,6 +9516,174 @@ mod shell_ux_tests {
         state::set_signal(OPEN_MASK_SIGNAL, 0);
         state::set_signal(UNLOCKED_SIGNAL, 0);
         state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn reset_notices() {
+        NOTICES.with(|slot| slot.borrow_mut().clear());
+        SEEN_RECEIPTS.with(|slot| slot.borrow_mut().clear());
+        RECEIPT_NOTICES_BASELINED.with(|flag| flag.set(false));
+        NOTICE_FOCUS.with(|slot| slot.borrow_mut().clear());
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+    }
+
+    #[test]
+    fn notifications_start_empty_and_record_a_real_receipt() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        reset_notices();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(NOTIFY_SIGNAL, 1);
+        let empty = build_notify_panel();
+        let empty_blob = text_blob(&empty);
+        assert!(empty_blob.contains("通知"), "{empty_blob}");
+        assert!(empty_blob.contains("没有新通知。"), "{empty_blob}");
+        assert!(!empty_blob.contains("已打开"), "{empty_blob}");
+        assert!(!empty_blob.contains("23%"), "{empty_blob}");
+        let top = px(empty.style.top);
+        let panel_h = px(empty.style.height);
+        let floor = intent_block_top(800.0) - 12.0;
+        assert!(
+            top + panel_h <= floor + 0.5,
+            "panel covers the intent bar: {top} + {panel_h} > {floor}"
+        );
+        assert!(px(empty.style.left) > 600.0, "panel is not on the right");
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        assert_eq!(
+            codes_for(&build_floating_taskbar(), "通知"),
+            vec![OP_NOTIFY_TOGGLE]
+        );
+        assert!(!text_blob(&build_floating_taskbar()).contains("9+"));
+
+        state::note_shell_viewport(390.0, 760.0);
+        assert!(on_shell_swipe(180.0, 12.0, 2.0, 80.0));
+        assert_eq!(state::get_signal(NOTIFY_SIGNAL), 1);
+        let phone = build_notify_panel();
+        assert_eq!(px(phone.style.top), 0.0);
+        assert_eq!(px(phone.style.width), 390.0);
+        assert!(px(phone.style.height) < 760.0 * 0.7);
+        assert!(text_blob(&phone).contains("没有新通知。"));
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-notify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        reset_notices();
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        on_shell_intent(OP_PROPOSE, "打开文件");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        let pending = text_blob(&build_notify_panel());
+        assert!(
+            !pending.contains("已打开文件"),
+            "confirm must not arrive as a notification: {pending}"
+        );
+        assert!(
+            !button_labels(&build_confirm_dialog())
+                .iter()
+                .any(|label| label == "通知")
+        );
+        state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 2);
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        let fed = text_blob(&build_notify_panel());
+        assert!(fed.contains("已打开文件。"), "{fed}");
+        assert!(fed.contains("收据 #"), "{fed}");
+        assert!(fed.contains("L0"), "{fed}");
+        assert!(fed.contains("刚刚"), "{fed}");
+        assert_eq!(state::get_signal(NOTIFY_UNREAD_SIGNAL), 1);
+        let open_code = codes_for(&build_notify_panel(), "已打开文件。");
+        assert_eq!(open_code, vec![OP_NOTIFY_OPEN]);
+        assert!(!open_code.contains(&OP_CONFIRM));
+        assert!(!open_code.contains(&OP_PERM_ONCE));
+        state::set_signal(NOTIFY_SIGNAL, 1);
+        state::set_signal(NOTIFY_UNREAD_SIGNAL, 0);
+        let open_title = text_blob(&build_notify_panel());
+        assert!(open_title.contains("通知"), "{open_title}");
+        on_shell_intent(OP_NOTIFY_OPEN, "receipt:#1");
+        assert_eq!(state::get_signal(RECEIPTS_OPEN_SIGNAL), 1);
+        assert_eq!(state::get_signal(NOTIFY_SIGNAL), 0);
+        assert_eq!(state::get_signal(RECEIPT_PAGE_SIGNAL), 0);
+        let drawer = text_blob(&build_receipts_viewer());
+        assert!(
+            drawer.contains("#1") || drawer.contains("打开文件"),
+            "{drawer}"
+        );
+
+        let mut lines = Vec::new();
+        for id in 1..=7 {
+            lines.push(format!(
+                "#{id} allowed open:files tier=L0 actor=me confirmed=true ts=1 — Switched to Files. @@ 打开文件"
+            ));
+        }
+        state::set_text_signal(RECEIPT_SIGNAL, &lines.join("\n"));
+        on_shell_intent(OP_NOTIFY_OPEN, "receipt:#7");
+        assert_eq!(state::get_signal(RECEIPT_PAGE_SIGNAL), 1);
+        assert_eq!(state::get_signal(RECEIPTS_OPEN_SIGNAL), 1);
+
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        on_shell_intent(OP_LOCK, "");
+        let locked = text_blob(&build_notify_panel());
+        assert!(locked.contains("身份已锁定。"), "{locked}");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        state::set_text_signal(TERMINAL_SIGNAL, "echo hi");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        let asking = text_blob(&build_notify_panel());
+        assert!(
+            !asking.contains("允许运行"),
+            "permission stays on its sheet: {asking}"
+        );
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        let denied = text_blob(&build_notify_panel());
+        assert!(denied.contains("没有运行 echo。"), "{denied}");
+        assert!(denied.contains("收据已记下拒绝。"), "{denied}");
+
+        let locked_line = "#9 denied l2:run tier=L0 actor=me confirmed=true ts=1 — Denied: local identity is locked. Nothing was changed. @@ echo";
+        let locked_notice = notice_from_receipt(locked_line).unwrap();
+        assert_eq!(locked_notice.title, "没有运行 echo。");
+        assert!(locked_notice.detail.contains("当时还锁着"));
+
+        locale::set_locale("en");
+        assert_eq!(locale::t("notify-empty"), "No new notifications.");
+        assert_eq!(
+            locale::t_args("notify-opened", &[("name", "Files")]),
+            "Opened Files."
+        );
+        assert_eq!(locale::t("notify-title"), "Notifications");
+
+        reset_notices();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(TERMINAL_SIGNAL, "");
         state::note_shell_viewport(1200.0, 800.0);
         drop(isolated);
     }
