@@ -337,6 +337,12 @@ pub fn local_fingerprint() -> String {
     STORE.with(|slot| slot.borrow().local.fingerprint())
 }
 
+/// The 32-byte device seed. Pairing still spells the X25519 key; this does
+/// not change [`fingerprint`].
+pub fn device_seed() -> [u8; 32] {
+    STORE.with(|slot| slot.borrow().local.secret)
+}
+
 pub fn notice() -> String {
     STORE.with(|slot| slot.borrow().notice.clone())
 }

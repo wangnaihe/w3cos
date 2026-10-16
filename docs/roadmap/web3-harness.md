@@ -53,7 +53,7 @@ L2 stays off in a normal boot. Confirm does not travel with handoff (#94). Unloc
 5. Passkey enrollment does not produce a `did:key` and does not verify an assertion.
 6. The model cannot be kept in-process without pulling an inference stack into the shell. That split is deliberate and should stay.
 7. Tool execution beyond the terminal allowlist has no sandbox.
-8. The new host's receipts are in memory. The encrypted ledger and the receipts drawer do not show them yet.
+8. Host receipts used to live only in memory. The shell sheet now writes them beside the older action rows, and the drawer shows the decision, the `did:key`, and that the device key signed the row. Action receipts written earlier stay unsigned.
 
 ## Crate choice
 
@@ -88,8 +88,8 @@ The DOM bridge (`w3cos-ai-mcp`) is unchanged. Moving those tools onto this host 
 Each slice is one review. Later slices do not start inside this one.
 
 1. **Gated tool host, device-signed receipts, local sign tool.** This change.
-2. **Shell sheet.** A permission sheet for `wallet_sign`, separate from navigation confirm. The receipts drawer shows the decision, the `did:key`, and that the receipt was signed. Strings stay in the Fluent packs. Screenshots are opaque PNG.
-3. **Persist host receipts.** Append them through `ReceiptLedger`. Do not rewrite receipts that were written before the signature field existed.
+2. **Shell sheet.** Done. A permission sheet for `wallet_sign`, separate from navigation confirm and from the process sheet. The receipts drawer shows the decision, the `did:key`, and that the receipt was signed. Strings stay in the Fluent packs. Screenshots are opaque PNG.
+3. **Persist host receipts.** Done, in the same change as the sheet. `signed_receipts` is a sibling of `receipts` and defaults to empty on older files. Appending a host receipt does not rewrite action rows.
 4. **Move shell tools onto the host.** `observe`, `click`, `type`, and `propose_intent` propose first. Reads stop running before confirm. L2 stays off unless `W3COS_L2` is set.
 5. **stdio for external agents.** Serve the host on stdio. The process that owns the window is still the only caller of `confirm`. The model does not get that method.
 6. **Passkey enrollment.** Verify `clientDataJSON` and the assertion before `IdentityMethod::Passkey`. Installing a `did:key` from that key must not rewrite old receipts. The P2P seed remains the device key until a person replaces it.

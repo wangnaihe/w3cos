@@ -240,6 +240,10 @@ struct LedgerSnapshot {
     /// Unverified public-key bytes, base64url. Missing on older files.
     #[serde(default)]
     passkey_public_key: Option<String>,
+    /// Device-signed tool receipts. Missing on files written before the host
+    /// ledger. Loading them does not rewrite `receipts`.
+    #[serde(default)]
+    signed_receipts: Vec<crate::tool_host::SignedReceipt>,
 }
 
 pub struct IntentSession {
@@ -249,6 +253,7 @@ pub struct IntentSession {
     context_shared: bool,
     proposal: Option<Proposal>,
     receipts: Vec<ActionReceipt>,
+    signed_receipts: Vec<crate::tool_host::SignedReceipt>,
     next_id: u64,
     ledger: Option<ReceiptLedger>,
     l1_enabled: bool,
@@ -264,6 +269,7 @@ impl IntentSession {
             context_shared: true,
             proposal: None,
             receipts: Vec::new(),
+            signed_receipts: Vec::new(),
             next_id: 1,
             ledger: None,
             l1_enabled: false,
@@ -355,6 +361,7 @@ impl IntentSession {
                         self.next_id = next.saturating_add(1);
                     }
                     self.receipts = snapshot.receipts;
+                    self.signed_receipts = snapshot.signed_receipts;
                 }
                 Err(err) => {
                     eprintln!("[intent] receipt ledger JSON unreadable ({err})");
@@ -386,6 +393,26 @@ impl IntentSession {
 
     pub fn receipts(&self) -> &[ActionReceipt] {
         &self.receipts
+    }
+
+    pub fn signed_receipts(&self) -> &[crate::tool_host::SignedReceipt] {
+        &self.signed_receipts
+    }
+
+    /// Append one host receipt and seal the ledger again.
+    /// `receipts` is left as it was, including ids already signed into those rows.
+    pub fn record_signed(&mut self, receipt: crate::tool_host::SignedReceipt) {
+        self.signed_receipts.push(receipt);
+        self.persist();
+    }
+
+    /// Highest host operation id already stored, or 0 when there are none.
+    pub fn signed_high_water(&self) -> u64 {
+        self.signed_receipts
+            .iter()
+            .map(|receipt| receipt.operation_id)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn proposal(&self) -> Option<&Proposal> {
@@ -586,6 +613,23 @@ impl IntentSession {
         lines.join("\n")
     }
 
+    /// Action receipts, then device-signed host receipts. An empty ledger
+    /// still says `No receipts yet.`. Action rows keep [`format_receipt_line`].
+    pub fn ledger_log_tail(&self, limit: usize) -> String {
+        let mut combined: Vec<String> = self.receipts.iter().map(format_receipt_line).collect();
+        combined.extend(self.signed_receipts.iter().map(format_signed_receipt_line));
+        if combined.is_empty() {
+            return "No receipts yet.".to_string();
+        }
+        let skip = combined.len().saturating_sub(limit);
+        let mut lines = Vec::new();
+        if skip > 0 {
+            lines.push(format!("… {skip} earlier"));
+        }
+        lines.extend(combined.into_iter().skip(skip));
+        lines.join("\n")
+    }
+
     fn denied(&mut self, proposal: Proposal, reason: &str) -> ExecuteResult {
         let receipt = self.push(
             &proposal.utterance,
@@ -669,6 +713,7 @@ impl IntentSession {
             enrollment: self.identity.enrollment(),
             passkey_challenge: self.identity.passkey_challenge().map(str::to_string),
             passkey_public_key: self.identity.passkey_public_key().map(str::to_string),
+            signed_receipts: self.signed_receipts.clone(),
         };
         let Ok(bytes) = serde_json::to_vec(&snapshot) else {
             eprintln!("[intent] receipt ledger skipped a write: snapshot did not encode");
@@ -711,6 +756,56 @@ pub fn format_receipt_line(receipt: &ActionReceipt) -> String {
         line.push_str(&receipt.utterance);
     }
     line
+}
+
+/// Drawer line for a device-signed host receipt.
+///
+/// The display id is `s#` plus the operation id. That id stays inside the
+/// signed body; this function does not change it. The wallet signature and
+/// the device signature stay out of the line.
+pub fn format_signed_receipt_line(receipt: &crate::tool_host::SignedReceipt) -> String {
+    let mut line = format!(
+        "s#{} {} {} tier={} actor={} confirmed={} ts={} signed=1 — {}",
+        receipt.operation_id,
+        receipt.decision.as_str(),
+        receipt.command,
+        tier_label(receipt.tier),
+        receipt.actor,
+        receipt.confirmed,
+        receipt.recorded_at_ms,
+        signed_outcome_text(&receipt.outcome)
+    );
+    let message = signed_argument_message(&receipt.arguments);
+    if !message.is_empty() {
+        line.push_str(" @@ ");
+        line.push_str(&message);
+    }
+    line
+}
+
+fn signed_outcome_text(outcome: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(outcome)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("text")
+                .and_then(|text| text.as_str())
+                .map(str::to_string)
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+}
+
+fn signed_argument_message(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|text| text.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn bridge_op(command: &ShellCommand) -> BridgeOp {
@@ -1243,6 +1338,64 @@ mod tests {
         std::fs::write(dir.join("receipts.key"), [9u8; 32]).expect("replace key");
         let foreign = ReceiptLedger::open(&dir).expect("foreign key file");
         assert!(foreign.load().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signed_host_receipt_appends_without_rewriting_older_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-receipts-{}-{}",
+            std::process::id(),
+            "signed-append"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = r#"{"pin":null,"receipts":[{"operation_id":7,"actor":"did:key:stub","utterance":"open files","command":"open-files","decision":"Allowed","confirmed":true,"outcome":"opened","tier":"l0","recorded_at_ms":5}],"subject":"did:key:stub"}"#;
+        ReceiptLedger::open(&dir)
+            .expect("ledger")
+            .store(old.as_bytes())
+            .expect("store old snapshot");
+        let mut session =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("reopen"));
+        assert!(session.signed_receipts().is_empty());
+        let before = session.receipts().to_vec();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].operation_id, 7);
+        assert_eq!(before[0].outcome, "opened");
+        let signed = crate::tool_host::SignedReceipt {
+            operation_id: 4,
+            actor: "did:key:z6Mkexample".to_string(),
+            command: "wallet_sign".to_string(),
+            arguments: r#"{"message":"hello"}"#.to_string(),
+            decision: Decision::Allowed,
+            confirmed: true,
+            outcome: r#"{"text":"signed here","signature":"0xdeadbeef"}"#.to_string(),
+            tier: IntentTier::L2,
+            recorded_at_ms: 9,
+            signature: "cafebabe".to_string(),
+        };
+        let signed_id = signed.operation_id;
+        session.record_signed(signed);
+        assert_eq!(session.receipts(), before.as_slice());
+        assert_eq!(session.signed_high_water(), signed_id);
+        let line = session.ledger_log_tail(48);
+        assert!(line.contains("#7 allowed open-files"), "{line}");
+        assert!(line.contains("s#4 allowed wallet_sign"), "{line}");
+        assert!(line.contains("signed=1"), "{line}");
+        assert!(line.contains("did:key:z6Mkexample"), "{line}");
+        assert!(!line.contains("0xdeadbeef"), "{line}");
+        assert!(!line.contains("cafebabe"), "{line}");
+        assert!(line.contains("@@ hello"), "{line}");
+
+        let reloaded =
+            IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
+                .with_ledger(ReceiptLedger::open(&dir).expect("reopen after append"));
+        assert_eq!(reloaded.receipts(), before.as_slice());
+        assert_eq!(reloaded.signed_receipts().len(), 1);
+        assert_eq!(reloaded.signed_receipts()[0].operation_id, 4);
+        assert_eq!(reloaded.signed_receipts()[0].signature, "cafebabe");
+        assert_eq!(reloaded.receipts()[0].utterance, "open files");
+        assert_eq!(reloaded.receipts()[0].recorded_at_ms, 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
