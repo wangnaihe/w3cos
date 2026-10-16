@@ -1508,6 +1508,7 @@ fn ensure_dom_fast() {
         build_flex_row: fast_build_flex_row_guarded,
         build_text: fast_build_text_guarded,
         rewrite_indexed_text: fast_rewrite_indexed_text,
+        fill_sequential_text: fast_fill_sequential_text,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -1954,6 +1955,111 @@ fn fast_rewrite_indexed_text(
     assert!(
         applied,
         "indexed text rewrite preconditions passed but a node refused the batch"
+    );
+    dom::mark_dom_dirty();
+    Value::Number(sum as f64)
+}
+
+/// `nodes[i].textContent = prefix + left + mid + i` for a dense element list.
+///
+/// Refuses before the first write when any index is not a single text child
+/// or `textContent` is no longer the builtin. Each write still goes through
+/// `mark_text_dirty`, so a fixed clipped cell stays a repaint and a
+/// shrink-to-fit cell still invalidates layout.
+fn fast_fill_sequential_text(
+    nodes: &Value,
+    prefix: &str,
+    left: f64,
+    mid: &str,
+    start: f64,
+    limit: f64,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !prefix.is_ascii()
+        || !mid.is_ascii()
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::tree_order_affects_matching()
+    {
+        return Value::Undefined;
+    }
+    let Some(left) = integer_in_range(left, 0, 1_000_000_000) else {
+        return Value::Undefined;
+    };
+    let Some(start) = integer_in_range(start, 0, 1_000_000) else {
+        return Value::Undefined;
+    };
+    let Some(limit) = integer_in_range(limit, 0, 1_000_000) else {
+        return Value::Undefined;
+    };
+    if limit < start {
+        return Value::Undefined;
+    }
+    if start == limit {
+        return Value::Number(0.0);
+    }
+    let Some(array) = nodes.as_array() else {
+        return Value::Undefined;
+    };
+    let stored = array.borrow();
+    if stored.len() < limit as usize {
+        return Value::Undefined;
+    }
+    let mut ids = Vec::with_capacity((limit - start) as usize);
+    for index in start..limit {
+        let Some(value) = stored.get(index as usize) else {
+            return Value::Undefined;
+        };
+        let Some(id) = node_id_of(value) else {
+            return Value::Undefined;
+        };
+        if !matches!(silent_lookup(value, "textContent"), SilentLookup::Missing) {
+            return Value::Undefined;
+        }
+        ids.push(id);
+    }
+    drop(stored);
+    let ready = dom::with_document(|doc| {
+        ids.iter().all(|id| {
+            let node = doc.get_node(w3cos_dom::NodeId::from_u32(*id));
+            node.node_type == w3cos_dom::node::NodeType::Element
+                && node.first_child.is_some_and(|text| {
+                    let text = doc.get_node(text);
+                    text.node_type == w3cos_dom::node::NodeType::Text && text.next_sibling == 0
+                })
+        })
+    });
+    if !ready {
+        return Value::Undefined;
+    }
+    let mut sum = 0usize;
+    let mut buf = [0u8; 96];
+    let mut applied = true;
+    dom::with_document_mut(|doc| {
+        for (offset, id) in ids.iter().enumerate() {
+            let index = start + offset as i64;
+            let text = w3cos_core::intrinsics::format_prefix_pair(
+                prefix,
+                left as f64,
+                mid,
+                index as f64,
+                &mut buf,
+            )
+            .expect("sequential text format");
+            let child = w3cos_dom::NodeId::from_u32(*id);
+            if doc.set_inline_text_child(child, text).is_none() {
+                applied = false;
+                break;
+            }
+            sum += text.len();
+        }
+    });
+    assert!(
+        applied,
+        "sequential text fill preconditions passed but a node refused the write"
     );
     dom::mark_dom_dirty();
     Value::Number(sum as f64)
@@ -22638,6 +22744,44 @@ mod tests {
                 .get_property("length")
                 .to_u32(),
             4
+        );
+    }
+
+    #[test]
+    fn sequential_text_fill_matches_prefix_pair_lengths() {
+        setup();
+        ensure_dom_fast();
+        w3cos_dom::stylesheet::clear_rules();
+        let doc = document_value();
+        let root = doc.call_method("createElement", vec![Value::string("div")]);
+        doc.get_property("body")
+            .call_method("appendChild", vec![root.clone()]);
+        let nodes = Value::array(Vec::new());
+        for i in 0..3 {
+            let el = doc.call_method("createElement", vec![Value::string("div")]);
+            el.set_property("textContent", Value::string(&format!("c {i}")));
+            root.call_method("appendChild", vec![el.clone()]);
+            nodes.call_method("push", vec![el]);
+        }
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let filled = w3cos_core::intrinsics::dom_fill_sequential_text_guarded(
+            &nodes, "v ", 2.0, "-", 0.0, 3.0, epoch,
+        );
+        assert!(!filled.is_undefined(), "dense text cells take the fill");
+        let expected = ["v 2-0", "v 2-1", "v 2-2"];
+        let sum: usize = expected.iter().map(|text| text.len()).sum();
+        assert_eq!(filled.to_number(), sum as f64);
+        assert_eq!(
+            child_texts(&root),
+            expected.map(str::to_string).to_vec()
+        );
+        let refused = w3cos_core::intrinsics::dom_fill_sequential_text_guarded(
+            &nodes, "v ", 2.0, "-", 0.0, 3.0, epoch.wrapping_add(1),
+        );
+        assert!(refused.is_undefined(), "a stale epoch refuses before writing");
+        assert_eq!(
+            child_texts(&root),
+            expected.map(str::to_string).to_vec()
         );
     }
 

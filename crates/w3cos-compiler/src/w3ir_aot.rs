@@ -5081,6 +5081,271 @@ fn emit_indexed_text_rewrite(
     Some((prelude, fast))
 }
 
+struct SequentialFill {
+    index_binding: u32,
+    nodes_binding: u32,
+    left_binding: u32,
+    text_sum_binding: u32,
+    length_reg: u32,
+    prefix: String,
+    mid: String,
+}
+
+/// `nodes[i].textContent = prefix + left + mid + i` plus a length sum.
+///
+/// The header is `i < nodes.length` and the body ends with `i = i * 1 + 1`.
+/// The pieces must be ASCII so the fused length matches the JS string length.
+fn match_sequential_text_fill(
+    header: &[Instruction],
+    body: &[Instruction],
+) -> Option<SequentialFill> {
+    let header = match header.last() {
+        Some(Instruction::Branch { .. }) => &header[..header.len() - 1],
+        _ => return None,
+    };
+    let mut i = 0usize;
+    let (index_reg, index_binding) = load_binding_inst(pull(header, &mut i)?)?;
+    let (nodes_reg, nodes_binding) = load_binding_inst(pull(header, &mut i)?)?;
+    let (length_key_reg, length_key) = load_string_inst(pull(header, &mut i)?)?;
+    if length_key != "length" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: length_value,
+        object,
+        key,
+    } = pull(header, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_reg || key.0 != length_key_reg {
+        return None;
+    }
+    let Instruction::Binary {
+        operator: BinaryOperator::LessThan,
+        lhs,
+        rhs,
+        ..
+    } = pull(header, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != index_reg || rhs.0 != length_value.0 || i != header.len() {
+        return None;
+    }
+
+    i = 0;
+    let (prefix_reg, prefix) = load_string_inst(pull(body, &mut i)?)?;
+    if !prefix.is_ascii() {
+        return None;
+    }
+    let (left_reg, left_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let Instruction::Add {
+        dst: left_text,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != prefix_reg || rhs.0 != left_reg {
+        return None;
+    }
+    let (mid_reg, mid) = load_string_inst(pull(body, &mut i)?)?;
+    if !mid.is_ascii() {
+        return None;
+    }
+    let Instruction::Add {
+        dst: mid_text,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != left_text.0 || rhs.0 != mid_reg {
+        return None;
+    }
+    let (index_text, index_text_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if index_text_binding != index_binding {
+        return None;
+    }
+    let Instruction::Add {
+        dst: text_value,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != mid_text.0 || rhs.0 != index_text {
+        return None;
+    }
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if value.0 != text_value.0 {
+        return None;
+    }
+    let text_binding = binding.0;
+
+    let (nodes_body, nodes_body_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if nodes_body_binding != nodes_binding {
+        return None;
+    }
+    let (index_get, index_get_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if index_get_binding != index_binding {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: element,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != nodes_body || key.0 != index_get {
+        return None;
+    }
+    let (text_key_reg, text_key) = load_string_inst(pull(body, &mut i)?)?;
+    if text_key != "textContent" {
+        return None;
+    }
+    let (text_reg, text_check) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_check != text_binding {
+        return None;
+    }
+    let Instruction::SetProperty {
+        object,
+        key,
+        value,
+        strict,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if !strict || object.0 != element.0 || key.0 != text_key_reg || value.0 != text_reg {
+        return None;
+    }
+
+    let (sum_reg, text_sum_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    let (text_len, text_len_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if text_len_binding != text_binding {
+        return None;
+    }
+    let (length_name_reg, length_name) = load_string_inst(pull(body, &mut i)?)?;
+    if length_name != "length" {
+        return None;
+    }
+    let Instruction::GetProperty {
+        dst: length_chars,
+        object,
+        key,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if object.0 != text_len || key.0 != length_name_reg {
+        return None;
+    }
+    let Instruction::Add {
+        dst: summed,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != sum_reg || rhs.0 != length_chars.0 {
+        return None;
+    }
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if binding.0 != text_sum_binding || value.0 != summed.0 {
+        return None;
+    }
+
+    let (one_reg, one) = load_number_inst(pull(body, &mut i)?)?;
+    if one != 1.0 {
+        return None;
+    }
+    let (index_inc, index_inc_binding) = load_binding_inst(pull(body, &mut i)?)?;
+    if index_inc_binding != index_binding {
+        return None;
+    }
+    let Instruction::Binary {
+        dst: scaled,
+        operator: BinaryOperator::Multiply,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != index_inc || rhs.0 != one_reg {
+        return None;
+    }
+    let Instruction::Add {
+        dst: next_index,
+        lhs,
+        rhs,
+    } = pull(body, &mut i)?
+    else {
+        return None;
+    };
+    if lhs.0 != scaled.0 || rhs.0 != one_reg {
+        return None;
+    }
+    let Instruction::StoreBinding { binding, value } = pull(body, &mut i)? else {
+        return None;
+    };
+    if binding.0 != index_binding || value.0 != next_index.0 || i != body.len() {
+        return None;
+    }
+    Some(SequentialFill {
+        index_binding,
+        nodes_binding,
+        left_binding,
+        text_sum_binding,
+        length_reg: length_value.0,
+        prefix,
+        mid,
+    })
+}
+
+fn emit_f64_expr(plan: &EscapePlan, register: u32) -> String {
+    if let Some(slot) = num_slot(plan, register) {
+        format!("self.num_regs[{slot}]")
+    } else {
+        format!("{}.to_number()", emit_boxed_value(plan, register))
+    }
+}
+
+fn emit_sequential_text_fill(
+    header: &[Instruction],
+    body: &[Instruction],
+    slow: &str,
+    plan: &EscapePlan,
+) -> Option<(String, String)> {
+    let shape = match_sequential_text_fill(header, body)?;
+    let suffix = format!("f{}_{}", shape.index_binding, shape.nodes_binding);
+    let start = binding_number_expr(plan, shape.index_binding);
+    let left = binding_number_expr(plan, shape.left_binding);
+    let limit = emit_f64_expr(plan, shape.length_reg);
+    let add_sum = emit_add_number_binding(plan, shape.text_sum_binding, "__w3cos_fill.to_number()");
+    let set_index = emit_store_number_binding(plan, shape.index_binding, &limit);
+    let prelude = format!("let mut __w3cos_fill_tried_{suffix} = false;\n");
+    let fast = format!(
+        "if !__w3cos_fill_tried_{suffix} {{\n__w3cos_fill_tried_{suffix} = true;\nlet __w3cos_fill_nodes_{suffix} = {};\nlet __w3cos_fill_epoch_{suffix} = w3cos_core::intrinsics::dom_shape_epoch();\nlet __w3cos_fill = w3cos_core::intrinsics::dom_fill_sequential_text_guarded(&__w3cos_fill_nodes_{suffix}, {prefix:?}, {left}, {mid:?}, {start}, {limit}, __w3cos_fill_epoch_{suffix});\nif !__w3cos_fill.is_undefined() {{\n{add_sum}\n{set_index}\nbreak;\n}}\n}}\n{slow}",
+        stable_binding_expr(shape.nodes_binding),
+        prefix = shape.prefix,
+        mid = shape.mid,
+    );
+    Some((prelude, fast))
+}
+
 fn emit_native_sync_loop(
     header: &[Instruction],
     blocks: &[(w3cos_ir::BlockId, Vec<Instruction>)],
@@ -5138,7 +5403,8 @@ fn emit_native_sync_loop(
     // loop does not observe them. A failed surface check or a bumped epoch
     // falls through to `body_code`.
     let body_insts = &body[..body.len() - 1];
-    let rewrite = emit_indexed_text_rewrite(header, body_insts, &body_code, plan);
+    let rewrite = emit_indexed_text_rewrite(header, body_insts, &body_code, plan)
+        .or_else(|| emit_sequential_text_fill(header, body_insts, &body_code, plan));
     let guarded = if rewrite.is_some() {
         None
     } else {
@@ -8746,6 +9012,89 @@ fn main() {{
             generate_sync_function_from_module(&module, function, "dom_update_extra_aot").unwrap();
         assert!(
             !generated.contains("dom_rewrite_indexed_text_guarded"),
+            "an extra property write stays on the ordinary path: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_sequential_text_fill_loop_is_rewritten() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                var TABLE_PASSES = 4;
+                function tableOnce(cells, table) {
+                    var checksum = 0;
+                    var textSum = 0;
+                    for (var pass = 0; pass < TABLE_PASSES; pass++) {
+                        for (var i = 0; i < cells.length; i++) {
+                            var text = "v " + pass + "-" + i;
+                            cells[i].textContent = text;
+                            textSum = textSum + text.length;
+                        }
+                        checksum = checksum + table.offsetHeight;
+                    }
+                    return checksum + textSum;
+                }
+            "#,
+            "app:///table-repaint.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("tableOnce"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "table_repaint_aot").unwrap();
+        let fill_at = generated
+            .find("dom_fill_sequential_text_guarded")
+            .unwrap_or_else(|| panic!("sequential fill missing: {generated}"));
+        let loop_at = generated[..fill_at].rfind("loop {").unwrap_or(0);
+        let gate_at = generated[loop_at..fill_at]
+            .find("break;")
+            .unwrap_or_else(|| panic!("fill must follow the loop gate: {generated}"));
+        assert!(loop_at + gate_at < fill_at);
+        assert!(
+            generated.contains("__w3cos_fill_tried_")
+                && generated.contains("is_undefined()")
+                && generated.contains("\"v \"")
+                && generated.contains("\"-\""),
+            "the cell rewrite is one guarded call: {generated}"
+        );
+        assert!(
+            generated.contains("offsetHeight"),
+            "the height read stays outside the fused write: {generated}"
+        );
+    }
+
+    #[test]
+    fn native_sequential_text_fill_with_extra_write_stays_unfused() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export {};
+                function tableOnce(cells, pass) {
+                    var textSum = 0;
+                    for (var i = 0; i < cells.length; i++) {
+                        var text = "v " + pass + "-" + i;
+                        cells[i].textContent = text;
+                        cells[i].id = text;
+                        textSum = textSum + text.length;
+                    }
+                    return textSum;
+                }
+            "#,
+            "app:///table-extra.mjs",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("tableOnce"))
+            .unwrap();
+        let generated =
+            generate_sync_function_from_module(&module, function, "table_extra_aot").unwrap();
+        assert!(
+            !generated.contains("dom_fill_sequential_text_guarded"),
             "an extra property write stays on the ordinary path: {generated}"
         );
     }

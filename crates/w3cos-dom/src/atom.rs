@@ -255,9 +255,9 @@ impl std::fmt::Display for Atom {
 }
 
 const CHUNK: usize = 8192;
-const SLOT_CAP: usize = 32768;
+const SLOT_CAP: usize = 8192;
 /// Spare chunk boxes so interning unique ids does not malloc on the create path.
-const SPARE_CHUNKS: usize = 48;
+const SPARE_CHUNKS: usize = 8;
 
 struct InternTable {
     chunks: Vec<Box<[u8; CHUNK]>>,

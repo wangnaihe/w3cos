@@ -354,10 +354,11 @@ fn column_flex_parent(style: &w3cos_std::style::Style) -> bool {
     }
 }
 
-/// Preallocated node page. Create loops of a few thousand elements must not
-/// grow the slab, the dirty stamps, or the string arena.
-const PAGE_SLOTS: usize = 32768;
-const PAGE_STRING_BYTES: usize = 1 << 20;
+/// Preallocated node page. Create loops of a few thousand elements (4k rows
+/// plus their text nodes) must not grow the slab, the dirty stamps, or the
+/// string arena. The page is not tens of thousands of empty slots.
+const PAGE_SLOTS: usize = 16384;
+const PAGE_STRING_BYTES: usize = 1 << 18;
 
 fn remember_dirty(stamp: &mut Vec<u32>, epoch: u32, list: &mut Vec<NodeId>, id: NodeId) {
     let idx = id.0 as usize;
@@ -577,7 +578,7 @@ impl Document {
             computed_style_cache_misses: Cell::new(0),
             events: EventRegistry::new(),
             body_id: NodeId(0),
-            id_index: RefCell::new(HashMap::with_capacity_and_hasher(32768, AtomBuildHasher)),
+            id_index: RefCell::new(HashMap::with_capacity_and_hasher(2048, AtomBuildHasher)),
             class_index: RefCell::new(HashMap::with_hasher(AtomBuildHasher)),
             id_index_ready: Cell::new(true),
             class_index_ready: Cell::new(true),
@@ -1306,7 +1307,7 @@ impl Document {
         Some(element)
     }
 
-    /// Reserve element and text slots together. The initial page is 32768;
+    /// Reserve element and text slots together. The initial page is 16384;
     /// past that, growth doubles instead of copying the slab 128 nodes at a time.
     fn reserve_build_slots(&mut self, count: usize) {
         self.ensure_page();
@@ -28190,5 +28191,22 @@ mod tree_mutation_tests {
                 .map(|element| element.id),
             Some(first)
         );
+    }
+
+    #[test]
+    fn four_thousand_text_rows_stay_inside_the_first_page() {
+        let mut document = Document::new();
+        let parent = document.body().id;
+        let _ = document.append_labeled_element(parent, "div", "", "", "seed");
+        let capacity = document.nodes.capacity();
+        assert!(
+            (8_000..20_000).contains(&capacity),
+            "page capacity {capacity} should cover 4000 rows without a 32768-slot slab"
+        );
+        for index in 0..4000 {
+            document.append_labeled_element(parent, "div", "", "", &format!("row {index}"));
+        }
+        assert_eq!(document.nodes.capacity(), capacity);
+        assert!(document.nodes.len() <= capacity);
     }
 }
