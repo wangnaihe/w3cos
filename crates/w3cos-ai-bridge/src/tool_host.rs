@@ -8,6 +8,8 @@
 //! `wallet_sign` is tier L2. A caller cannot lower that tier. The wallet is
 //! not asked to sign until confirm, and only when the identity is unlocked.
 
+use std::sync::{Mutex, OnceLock};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -176,6 +178,16 @@ where
         self.propose("wallet_sign", &json!({ "message": message }))
     }
 
+    /// Propose one host tool. `message` is used only for `wallet_sign`.
+    /// Does not read the wallet and does not sign.
+    pub fn propose_tool(&mut self, name: &str, message: &str) -> Result<ToolProposal, HostError> {
+        match name {
+            "device_did" | "wallet_address" => self.propose(name, &json!({})),
+            "wallet_sign" => self.propose_sign(message),
+            _ => Err(self.err_args("host-unknown-tool", &[("name", name)])),
+        }
+    }
+
     /// Record a proposal. Does not sign, and does not read the wallet.
     pub fn propose(&mut self, name: &str, arguments: &Value) -> Result<ToolProposal, HostError> {
         if self.pending.is_some() {
@@ -308,21 +320,7 @@ where
     }
 
     fn tool_list(&self) -> Value {
-        json!({
-            "tools": [
-                tool("device_did", &copy::line(&self.locale, "tool-device-did", &[]), json!({})),
-                tool("wallet_address", &copy::line(&self.locale, "tool-wallet-address", &[]), json!({})),
-                tool(
-                    "wallet_sign",
-                    &copy::line(&self.locale, "tool-wallet-sign", &[]),
-                    json!({
-                        "type": "object",
-                        "properties": { "message": { "type": "string" } },
-                        "required": ["message"]
-                    })
-                ),
-            ]
-        })
+        host_catalog(&self.locale)
     }
 
     fn kind(&self, name: &str) -> Result<ToolKind, HostError> {
@@ -493,6 +491,321 @@ fn tier_token(tier: IntentTier) -> &'static str {
         IntentTier::L2 => "l2",
         IntentTier::Unspecified => "unspecified",
     }
+}
+
+/// Descriptions the stdio process can list without a device key.
+pub fn host_catalog(locale: &str) -> Value {
+    json!({
+        "tools": [
+            tool("device_did", &copy::line(locale, "tool-device-did", &[]), json!({})),
+            tool("wallet_address", &copy::line(locale, "tool-wallet-address", &[]), json!({})),
+            tool(
+                "wallet_sign",
+                &copy::line(locale, "tool-wallet-sign", &[]),
+                json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"]
+                })
+            ),
+        ]
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct HostTicket {
+    pub name: String,
+    pub summary: String,
+    pub impact: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostSubmitError {
+    pub pending: bool,
+    pub message: String,
+}
+
+struct HostMail {
+    request: Option<HostTicket>,
+    applied: bool,
+    receipt: Option<SignedReceipt>,
+    failure: Option<String>,
+}
+
+impl Default for HostMail {
+    fn default() -> Self {
+        Self {
+            request: None,
+            applied: false,
+            receipt: None,
+            failure: None,
+        }
+    }
+}
+
+fn host_mail() -> &'static Mutex<HostMail> {
+    static MAIL: OnceLock<Mutex<HostMail>> = OnceLock::new();
+    MAIL.get_or_init(|| Mutex::new(HostMail::default()))
+}
+
+fn lock_mail() -> std::sync::MutexGuard<'static, HostMail> {
+    host_mail().lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub fn reset_host_mail() {
+    *lock_mail() = HostMail::default();
+}
+
+/// Store one host proposal. Does not read the wallet and does not sign.
+pub fn submit_host(body: &str) -> Result<HostTicket, HostSubmitError> {
+    let value: Value = serde_json::from_str(body).map_err(|_| HostSubmitError {
+        pending: false,
+        message: "invalid json".into(),
+    })?;
+    let name = value
+        .get("name")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim();
+    let arguments = value.get("arguments").cloned().unwrap_or(Value::Null);
+    let message = arguments
+        .get("message")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
+    if !matches!(name, "device_did" | "wallet_address" | "wallet_sign") {
+        return Err(HostSubmitError {
+            pending: false,
+            message: copy::line(&locale, "host-unknown-tool", &[("name", name)]),
+        });
+    }
+    if name == "wallet_sign" && (message.is_empty() || message.len() > MAX_MESSAGE_BYTES) {
+        let key = if message.is_empty() {
+            "host-missing-message"
+        } else {
+            "host-message-long"
+        };
+        return Err(HostSubmitError {
+            pending: false,
+            message: copy::line(&locale, key, &[]),
+        });
+    }
+    let (summary_key, impact_key) = match name {
+        "wallet_address" => ("wallet-address-summary", "wallet-address-impact"),
+        "wallet_sign" => ("wallet-sign-summary", "wallet-sign-impact"),
+        _ => ("device-did-summary", "device-did-impact"),
+    };
+    let preview = preview_message(&message);
+    let ticket = HostTicket {
+        name: name.to_string(),
+        summary: copy::line(&locale, summary_key, &[("preview", preview.as_str())]),
+        impact: copy::line(&locale, impact_key, &[]),
+        message,
+    };
+    let mut mail = lock_mail();
+    if mail.request.is_some() {
+        return Err(HostSubmitError {
+            pending: true,
+            message: copy::line(&locale, "host-pending", &[]),
+        });
+    }
+    mail.receipt = None;
+    mail.failure = None;
+    mail.applied = false;
+    mail.request = Some(ticket.clone());
+    Ok(ticket)
+}
+
+/// One proposal the UI thread has not given to [`ToolHost`] yet.
+pub fn take_unapplied() -> Option<HostTicket> {
+    let mut mail = lock_mail();
+    if mail.applied {
+        return None;
+    }
+    let ticket = mail.request.clone()?;
+    mail.applied = true;
+    Some(ticket)
+}
+
+pub fn fail_host(message: &str) {
+    let mut mail = lock_mail();
+    mail.request = None;
+    mail.applied = false;
+    mail.failure = Some(message.to_string());
+}
+
+pub fn publish_host_receipt(receipt: &SignedReceipt) {
+    let mut mail = lock_mail();
+    if mail.request.is_none() {
+        return;
+    }
+    mail.receipt = Some(receipt.clone());
+    mail.request = None;
+    mail.applied = false;
+}
+
+pub fn host_result_json() -> Value {
+    let mail = lock_mail();
+    if let Some(request) = &mail.request {
+        return json!({
+            "pending": true,
+            "name": request.name,
+            "summary": request.summary
+        });
+    }
+    if let Some(receipt) = &mail.receipt {
+        return json!({
+            "pending": false,
+            "receipt": receipt
+        });
+    }
+    if let Some(failure) = &mail.failure {
+        return json!({
+            "pending": false,
+            "status": 400,
+            "body": failure
+        });
+    }
+    let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
+    json!({
+        "pending": false,
+        "summary": copy::line(&locale, "host-nothing-pending", &[])
+    })
+}
+
+/// stdio `tools/call` posts `/host/propose` and polls `/host/result`.
+/// It never sends a confirm method.
+pub fn drive_host_call(
+    params: &Value,
+    http: &mut dyn FnMut(&crate::mcp::BridgeCall) -> (u16, String),
+    pause: &mut dyn FnMut(),
+    max_polls: u32,
+) -> Result<String, String> {
+    let name = params
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
+    if !matches!(name, "device_did" | "wallet_address" | "wallet_sign") {
+        return Err(copy::line(&locale, "host-unknown-tool", &[("name", name)]));
+    }
+    let propose = crate::mcp::BridgeCall {
+        method: "POST",
+        path: "/host/propose".into(),
+        body: Some(json!({ "name": name, "arguments": arguments }).to_string()),
+    };
+    let (status, body) = http(&propose);
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}\n{body}"));
+    }
+    let result_call = crate::mcp::BridgeCall {
+        method: "GET",
+        path: "/host/result".into(),
+        body: None,
+    };
+    let mut polls = max_polls.max(1);
+    loop {
+        let (status, body) = http(&result_call);
+        if host_result_ready(&body) {
+            if (200..300).contains(&status) && !host_result_failed(&body) {
+                return Ok(format!("HTTP {status}\n{body}"));
+            }
+            return Err(format!("HTTP {status}\n{body}"));
+        }
+        polls = polls.saturating_sub(1);
+        if polls == 0 {
+            let summary = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("summary")
+                        .and_then(|item| item.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            return Ok(copy::line(
+                &locale,
+                "host-awaiting",
+                &[("summary", summary.as_str())],
+            ));
+        }
+        pause();
+    }
+}
+
+fn host_result_ready(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value.get("pending").and_then(|item| item.as_bool()) == Some(false)
+        && (value.get("receipt").is_some() || value.get("status").is_some())
+}
+
+fn host_result_failed(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("status").and_then(|item| item.as_u64()))
+        .is_some_and(|status| !(200..300).contains(&status))
+}
+
+/// One stdio JSON-RPC message for the external host. There is no confirm method.
+pub fn stdio_respond(
+    message: &Value,
+    http: &mut dyn FnMut(&crate::mcp::BridgeCall) -> (u16, String),
+    pause: &mut dyn FnMut(),
+    max_polls: u32,
+) -> Option<Value> {
+    let id = message.get("id").cloned();
+    id.as_ref()?;
+    let method = message
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "w3cos-tool-host", "version": "0.1.0" }
+        })),
+        "tools/list" => Ok(host_catalog(&locale)),
+        "tools/call" => match drive_host_call(&params, http, pause, max_polls) {
+            Ok(text) => Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false
+            })),
+            Err(text) => Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": true
+            })),
+        },
+        "w3cos/result" => {
+            let (status, body) = http(&crate::mcp::BridgeCall {
+                method: "GET",
+                path: "/host/result".into(),
+                body: None,
+            });
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("HTTP {status}\n{body}") }],
+                "isError": !(200..300).contains(&status)
+            }))
+        }
+        "ping" => Ok(json!({})),
+        other => Err(copy::line(&locale, "host-unknown-tool", &[("name", other)])),
+    };
+    Some(match result {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(message) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": message }
+        }),
+    })
 }
 
 fn preview_message(message: &str) -> String {
@@ -748,5 +1061,53 @@ mod tests {
             host.propose("wallet_sign", &json!({"message": "x".repeat(4097)}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stdio_propose_does_not_confirm_or_sign() {
+        reset_host_mail();
+        let first = submit_host(r#"{"name":"device_did","arguments":{}}"#).unwrap();
+        assert!(first.summary.contains("did:key") || first.summary.contains("设备"));
+        let second = submit_host(r#"{"name":"wallet_address","arguments":{}}"#).unwrap_err();
+        assert!(second.pending);
+        let ticket = take_unapplied().unwrap();
+        assert_eq!(ticket.name, "device_did");
+        assert!(take_unapplied().is_none());
+        assert_eq!(host_result_json()["pending"], true);
+
+        let mut paths = Vec::new();
+        let text = drive_host_call(
+            &json!({"name": "wallet_sign", "arguments": {"message": "hello"}}),
+            &mut |call| {
+                paths.push(call.path.clone());
+                if call.path == "/host/propose" {
+                    assert!(call.body.as_deref().unwrap_or("").contains("hello"));
+                    (200, "{\"pending\":true,\"summary\":\"sign\"}".into())
+                } else if paths.len() < 3 {
+                    (200, "{\"pending\":true,\"summary\":\"sign\"}".into())
+                } else {
+                    (
+                        200,
+                        "{\"pending\":false,\"receipt\":{\"command\":\"wallet_sign\"}}".into(),
+                    )
+                }
+            },
+            &mut || {},
+            4,
+        )
+        .unwrap();
+        assert_eq!(paths, vec!["/host/propose", "/host/result", "/host/result"]);
+        assert!(text.contains("wallet_sign"), "{text}");
+
+        let confirm = json!({"jsonrpc": "2.0", "id": 9, "method": "w3cos/confirm"});
+        let response = stdio_respond(
+            &confirm,
+            &mut |_| panic!("confirm must not call the bridge"),
+            &mut || {},
+            1,
+        )
+        .unwrap();
+        assert!(response.get("error").is_some(), "{response}");
+        reset_host_mail();
     }
 }

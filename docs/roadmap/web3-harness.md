@@ -33,7 +33,7 @@ local signing tool that cannot sign on its own.
 | L0 | `intent` | Fixed command table. Propose, confirm, execute, receipt. |
 | L1 | `l1`, feature-gated | Synonyms. Still not a model. `W3COS_L1=0` turns it off. |
 | L2 | `agent_loop`, `planner`, `agent_host` | Off unless `W3COS_L2` is set. A worker thread calls an OpenAI-compatible HTTP planner (llama.cpp or Ollama, out of process). Every shell tool, including a read, stops for confirm. |
-| MCP for the DOM | `mcp`, `w3cos-ai-mcp` | `tools/call` posts `/mcp/propose` and polls `/mcp/result`. The window confirms. The model has no confirm method. Direct HTTP routes still run when the token allows them. |
+| MCP for the DOM | `mcp`, `w3cos-ai-mcp` | `tools/call` posts `/mcp/propose` and polls `/mcp/result`. Direct HTTP routes do the same: they store one call and wait for the window. |
 | In-process tools | `shell_tools` | Same tool names against shell state. The UI thread runs a tool, including a read, only after confirm. |
 | Permissions | `permissions`, shell permission sheet | Separate from the confirm card. `w3cos-agent-act` and `w3cos-process` are one-shot. The process allowlist is `echo`, `pwd`, and `help`. |
 | Shell receipts | `ActionReceipt`, `ReceiptLedger` | Encrypted file (`W3R1`, ChaCha20-Poly1305). The drawer pages them. They record actor, tier, decision, and time. The device key does not sign these. |
@@ -48,7 +48,7 @@ L2 stays off in a normal boot. Confirm does not travel with handoff (#94). Unloc
 
 1. The pairing string looks like a DID and is not one. Agents that verify a receipt need the spec identifier of the signing key.
 2. Shell receipts name an actor and are encrypted at rest. They are not signed, so a copied file does not prove which device wrote it.
-3. Direct HTTP on the bridge still runs when the token allows it. The DOM MCP adapter and the in-process shell tools do not: `tools/call` only proposes, and a read does not touch the view until the window confirms. `confirm_intent` is not a tool the model can call.
+3. Direct HTTP, the DOM MCP, and the in-process shell tools all propose first. A read does not touch the view until the window confirms. `POST /intent/confirm` is refused. `confirm_intent` is not a tool and `w3cos/confirm` is not a method.
 4. There is no local account and no signing tool. There is also no chain client, which should stay true until a later slice asks for one.
 5. Passkey enrollment does not produce a `did:key` and does not verify an assertion.
 6. The model cannot be kept in-process without pulling an inference stack into the shell. That split is deliberate and should stay.
@@ -81,7 +81,7 @@ A `did:key` for this profile is `did:key:z` plus base58btc of the multicodec pre
 - The wallet key is HKDF-SHA256 of the device seed, info `w3cos-wallet-secp256k1-v1`. It is not the Ed25519 seed. `chain_id` is `None`.
 - Sentences are keys in `locales/zh-CN.ftl` and `locales/en.ftl`.
 
-The DOM bridge proposes first as well. `w3cos-ai-mcp` posts the proposal and does not perform the bridge call until the window confirms. A stdio server for this wallet host is still a later slice.
+Direct HTTP routes propose first too. `POST /intent/confirm` does not run. `w3cos-tool-host` serves this host on stdio: `tools/call` posts `/host/propose` and polls `/host/result`. The window process is the only caller of confirm.
 
 ## Ordered plan
 
@@ -90,8 +90,8 @@ Each slice is one review. Later slices do not start inside this one.
 1. **Gated tool host, device-signed receipts, local sign tool.** This change.
 2. **Shell sheet.** Done. A permission sheet for `wallet_sign`, separate from navigation confirm and from the process sheet. The receipts drawer shows the decision, the `did:key`, and that the receipt was signed. Strings stay in the Fluent packs. Screenshots are opaque PNG.
 3. **Persist host receipts.** Done, in the same change as the sheet. `signed_receipts` is a sibling of `receipts` and defaults to empty on older files. Appending a host receipt does not rewrite action rows.
-4. **Move shell tools onto propose-first.** Done. `observe`, `click`, `type`, and `propose_intent` wait for confirm. Reads do not run before that. The existing `w3cos-ai-mcp` `tools/call` proposes into the shell and does not perform the bridge call until the window confirms. L2 stays off unless `W3COS_L2` is set. Direct HTTP routes are unchanged. A stdio server for the wallet host is still slice 5.
-5. **stdio for external agents.** Serve the host on stdio. The process that owns the window is still the only caller of `confirm`. The model does not get that method.
+4. **Move shell tools onto propose-first.** Done. `observe`, `click`, `type`, and `propose_intent` wait for confirm. Reads do not run before that. The existing `w3cos-ai-mcp` `tools/call` proposes into the shell and does not perform the bridge call until the window confirms. Direct HTTP routes do the same. `POST /intent/confirm` is refused. L2 stays off unless `W3COS_L2` is set.
+5. **stdio for external agents.** Done. `w3cos-tool-host` speaks MCP on stdio and forwards `tools/call` to `/host/propose`. The process that owns the window is still the only caller of `confirm`. The model does not get that method.
 6. **Passkey enrollment.** Verify `clientDataJSON` and the assertion before `IdentityMethod::Passkey`. Installing a `did:key` from that key must not rewrite old receipts. The P2P seed remains the device key until a person replaces it.
 7. **Read a chain, still no broadcast.** A tool that reads a balance or a nonce from an RPC the person typed in. No default Infura, Alchemy, or other hosted endpoint. The call goes through the host and a permission sheet.
 8. **Sign a transaction.** Propose the fields, L2 confirm, sign on device, and only then offer broadcast to the RPC from the previous slice. No custodian and no hosted signer.

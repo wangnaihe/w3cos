@@ -146,6 +146,21 @@ fn mcp_hook_slot() -> &'static Mutex<Option<McpHook>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
+type HostHook = fn(&str, &str, &str, &str);
+
+fn host_hook_slot() -> &'static Mutex<Option<HostHook>> {
+    static SLOT: OnceLock<Mutex<Option<HostHook>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Shell hook for `POST /host/propose`. Arguments are name, summary, impact,
+/// and the sign message (empty for reads). The hook only opens a card.
+pub fn set_host_hook(hook: fn(&str, &str, &str, &str)) {
+    if let Ok(mut slot) = host_hook_slot().lock() {
+        *slot = Some(hook);
+    }
+}
+
 /// Shell hook for `POST /mcp/propose`. The proposal is stored before this runs.
 /// The hook only opens the confirm card. It does not execute the tool.
 pub fn set_mcp_hook(hook: fn(&str)) {
@@ -201,10 +216,10 @@ impl AiBridgeHandle {
             match bridge_call_to_request(&call) {
                 Ok(request) => {
                     let response = self.handle_request(request, doc);
-                    let (status, note) = outcome_parts(&response);
-                    crate::mcp::store_bridge_response(status, &note);
+                    let (status, note, body) = outcome_parts(&response);
+                    crate::mcp::store_bridge_outcome(status, &note, &body);
                 }
-                Err(message) => crate::mcp::store_bridge_response(400, &message),
+                Err(message) => crate::mcp::store_bridge_outcome(400, &message, &message),
             }
         }
         while let Ok((request, reply_tx)) = self.rx.try_recv() {
@@ -744,7 +759,44 @@ fn handle_connection(
                 return Ok(());
             }
         },
-        ("POST", "/intent/confirm") => Some(AiBridgeRequest::ConfirmIntent),
+        ("POST", "/intent/confirm") => {
+            let locale = std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into());
+            let message = crate::copy::line(&locale, "mcp-not-a-tool", &[]);
+            send_json_error(&mut stream, 400, &message)?;
+            return Ok(());
+        }
+        ("POST", "/host/propose") => {
+            match crate::tool_host::submit_host(&body_str) {
+                Ok(ticket) => {
+                    if let Ok(slot) = host_hook_slot().lock()
+                        && let Some(hook) = *slot
+                    {
+                        hook(
+                            &ticket.name,
+                            &ticket.summary,
+                            &ticket.impact,
+                            &ticket.message,
+                        );
+                    }
+                    let body = serde_json::json!({
+                        "pending": true,
+                        "summary": ticket.summary
+                    })
+                    .to_string();
+                    send_response(&mut stream, 200, "application/json", body.as_bytes())?;
+                }
+                Err(err) => {
+                    let status = if err.pending { 409 } else { 400 };
+                    send_json_error(&mut stream, status, &err.message)?;
+                }
+            }
+            return Ok(());
+        }
+        ("GET", "/host/result") => {
+            let body = crate::tool_host::host_result_json().to_string();
+            send_response(&mut stream, 200, "application/json", body.as_bytes())?;
+            return Ok(());
+        }
         ("POST", "/mcp/propose") => {
             match crate::mcp::submit_propose(&body_str) {
                 Ok(view) => {
@@ -796,16 +848,18 @@ fn handle_connection(
                 "auth": "bearer",
                 "cors": "disabled",
                 "endpoints": [
-                    {"method": "GET", "path": "/a11y", "description": "Accessibility tree (text summary)"},
-                    {"method": "GET", "path": "/a11y/json", "description": "Accessibility tree (full JSON)"},
-                    {"method": "GET", "path": "/a11y/index", "description": "Numbered a11y index (no screenshot)"},
-                    {"method": "GET", "path": "/screenshot", "description": "PNG screenshot"},
-                    {"method": "GET", "path": "/screenshot/annotated", "description": "Annotated PNG plus index map, or 503 when bounds are missing"},
-                    {"method": "POST", "path": "/click", "description": "Click element by selector or a11y index"},
-                    {"method": "POST", "path": "/type", "description": "Type text into element by selector or a11y index"},
-                    {"method": "POST", "path": "/act", "description": "Run a DOM action"},
+                    {"method": "GET", "path": "/a11y", "description": "Propose an accessibility summary. Nothing is read until the window confirms."},
+                    {"method": "GET", "path": "/a11y/json", "description": "Propose the accessibility tree. Nothing is read until the window confirms."},
+                    {"method": "GET", "path": "/a11y/index", "description": "Propose the numbered index. Nothing is read until the window confirms."},
+                    {"method": "GET", "path": "/screenshot", "description": "Propose a PNG capture. Nothing is captured until the window confirms."},
+                    {"method": "GET", "path": "/screenshot/annotated", "description": "Propose an annotated capture. Nothing is captured until the window confirms."},
+                    {"method": "POST", "path": "/click", "description": "Propose a click. Nothing is clicked until the window confirms."},
+                    {"method": "POST", "path": "/type", "description": "Propose typing. Nothing is typed until the window confirms."},
+                    {"method": "POST", "path": "/act", "description": "Propose a DOM action. Nothing runs until the window confirms."},
                     {"method": "POST", "path": "/intent", "description": "Propose an L0 intent utterance"},
-                    {"method": "POST", "path": "/intent/confirm", "description": "Confirm the pending intent"},
+                    {"method": "POST", "path": "/intent/confirm", "description": "Rejected. Confirm stays on the window."},
+                    {"method": "POST", "path": "/host/propose", "description": "Propose a device or wallet tool. Does not sign."},
+                    {"method": "GET", "path": "/host/result", "description": "Read the host proposal or the signed receipt."},
                     {"method": "POST", "path": "/mcp/propose", "description": "Store one MCP tool proposal. Does not execute it."},
                     {"method": "GET", "path": "/mcp/result", "description": "Read the proposal or the stored outcome."},
                     {"method": "GET", "path": "/query?selector=...", "description": "Query element info"},
@@ -822,14 +876,33 @@ fn handle_connection(
     };
 
     if let Some(req) = request {
-        match &req {
-            AiBridgeRequest::GetA11yTree
-            | AiBridgeRequest::GetA11yJson
-            | AiBridgeRequest::GetA11yIndex => note_bridge_prep(true, false),
-            AiBridgeRequest::Screenshot | AiBridgeRequest::AnnotatedScreenshot => {
-                note_bridge_prep(true, true)
+        if !matches!(req, AiBridgeRequest::Propose { .. }) {
+            let name = bridge_tool_name(&req);
+            let call = crate::mcp::BridgeCall {
+                method: bridge_method(&req),
+                path: bridge_path(&req, path),
+                body: bridge_body(&req, &body_str),
+            };
+            match crate::mcp::propose_call(name, call) {
+                Ok(view) => {
+                    if let Ok(slot) = mcp_hook_slot().lock()
+                        && let Some(hook) = *slot
+                    {
+                        hook(&view.name);
+                    }
+                    let body = serde_json::json!({
+                        "pending": true,
+                        "summary": view.summary
+                    })
+                    .to_string();
+                    send_response(&mut stream, 200, "application/json", body.as_bytes())?;
+                }
+                Err(err) => {
+                    let status = if err.pending { 409 } else { 400 };
+                    send_json_error(&mut stream, status, &err.message)?;
+                }
             }
-            _ => {}
+            return Ok(());
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send((req, reply_tx))?;
@@ -929,8 +1002,8 @@ fn tokens_match(expected: &str, presented: &str) -> bool {
     diff == 0
 }
 
-fn outcome_parts(response: &AiBridgeResponse) -> (u16, String) {
-    let (status, note) = match response {
+fn outcome_parts(response: &AiBridgeResponse) -> (u16, String, String) {
+    let (status, full) = match response {
         AiBridgeResponse::Text(text) => (200, text.clone()),
         AiBridgeResponse::Json(json) => (200, json.clone()),
         AiBridgeResponse::Png(data) => (200, format!("png {} bytes", data.len())),
@@ -940,8 +1013,63 @@ fn outcome_parts(response: &AiBridgeResponse) -> (u16, String) {
         AiBridgeResponse::Unavailable(message) => (503, message.clone()),
         AiBridgeResponse::RateLimited(message) => (429, message.clone()),
     };
-    let note: String = note.chars().take(240).collect();
-    (status, note)
+    let note: String = full.chars().take(240).collect();
+    (status, note, full)
+}
+
+fn bridge_tool_name(request: &AiBridgeRequest) -> &'static str {
+    match request {
+        AiBridgeRequest::GetA11yTree | AiBridgeRequest::GetA11yJson => "observe",
+        AiBridgeRequest::GetA11yIndex => "a11y_index",
+        AiBridgeRequest::Screenshot => "screenshot",
+        AiBridgeRequest::AnnotatedScreenshot => "screenshot_annotated",
+        AiBridgeRequest::Click { .. } => "click",
+        AiBridgeRequest::Type { .. } => "type",
+        AiBridgeRequest::Query { .. } => "query",
+        AiBridgeRequest::Act { .. } => "act",
+        AiBridgeRequest::Propose { .. } => "propose_intent",
+        AiBridgeRequest::ConfirmIntent => "confirm_intent",
+    }
+}
+
+fn bridge_method(request: &AiBridgeRequest) -> &'static str {
+    match request {
+        AiBridgeRequest::GetA11yTree
+        | AiBridgeRequest::GetA11yJson
+        | AiBridgeRequest::GetA11yIndex
+        | AiBridgeRequest::Screenshot
+        | AiBridgeRequest::AnnotatedScreenshot
+        | AiBridgeRequest::Query { .. } => "GET",
+        _ => "POST",
+    }
+}
+
+fn bridge_path(request: &AiBridgeRequest, _path: &str) -> String {
+    match request {
+        AiBridgeRequest::Query { selector } => {
+            format!("/query?selector={}", crate::mcp::url_encode(selector))
+        }
+        AiBridgeRequest::GetA11yTree => "/a11y".into(),
+        AiBridgeRequest::GetA11yJson => "/a11y/json".into(),
+        AiBridgeRequest::GetA11yIndex => "/a11y/index".into(),
+        AiBridgeRequest::Screenshot => "/screenshot".into(),
+        AiBridgeRequest::AnnotatedScreenshot => "/screenshot/annotated".into(),
+        AiBridgeRequest::Click { .. } => "/click".into(),
+        AiBridgeRequest::Type { .. } => "/type".into(),
+        AiBridgeRequest::Act { .. } => "/act".into(),
+        AiBridgeRequest::Propose { .. } => "/intent".into(),
+        AiBridgeRequest::ConfirmIntent => "/intent/confirm".into(),
+    }
+}
+
+fn bridge_body(request: &AiBridgeRequest, body: &str) -> Option<String> {
+    match request {
+        AiBridgeRequest::Click { .. }
+        | AiBridgeRequest::Type { .. }
+        | AiBridgeRequest::Act { .. }
+        | AiBridgeRequest::Propose { .. } => Some(body.to_string()),
+        _ => None,
+    }
 }
 
 fn bridge_call_to_request(call: &crate::mcp::BridgeCall) -> Result<AiBridgeRequest, String> {
@@ -970,6 +1098,7 @@ fn bridge_call_to_request(call: &crate::mcp::BridgeCall) -> Result<AiBridgeReque
         ("POST", "/intent") => json_utterance(call.body.as_deref().unwrap_or(""))
             .map(|utterance| AiBridgeRequest::Propose { utterance })
             .map_err(str::to_string),
+        ("POST", "/act") => parse_act(call.body.as_deref().unwrap_or("")).map_err(str::to_string),
         ("POST", "/intent/confirm") => Ok(AiBridgeRequest::ConfirmIntent),
         _ => Err(format!("unknown bridge call {} {}", call.method, call.path)),
     }
