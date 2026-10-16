@@ -34,6 +34,7 @@ use w3cos_std::style::*;
 use w3cos_std::{Component, ComponentKind, EventAction, Style};
 
 mod shared_launch;
+mod sign_host;
 
 const APP_SIGNAL: usize = 0;
 const NIGHT_SIGNAL: usize = 1;
@@ -74,6 +75,10 @@ const LEXICON_DRAFT_SIGNAL: usize = 35;
 const CONFIRM_FOCUS_SIGNAL: usize = 36;
 const SETTINGS_MENU_SIGNAL: usize = 37;
 const PENDING_LOCALE_SIGNAL: usize = 38;
+const SIGN_SIGNAL: usize = 39;
+const SIGN_MESSAGE_SIGNAL: usize = 40;
+const SIGN_SUMMARY_SIGNAL: usize = 41;
+const SIGN_IMPACT_SIGNAL: usize = 42;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -190,6 +195,9 @@ const OP_IME_INK_MODEL: u8 = 114;
 const OP_IME_SCREEN_YES: u8 = 115;
 const OP_IME_SCREEN_NO: u8 = 116;
 const OP_IME_SCREEN_MODEL: u8 = 117;
+const OP_SIGN_PROPOSE: u8 = 118;
+const OP_SIGN_ONCE: u8 = 119;
+const OP_SIGN_DENY: u8 = 120;
 
 fn main() {
     shell_main();
@@ -323,6 +331,10 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_signal(1);
         let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -373,6 +385,7 @@ fn ime_role_for_submit(code: u8) -> Option<&'static str> {
         OP_RUN_TERMINAL => Some("terminal"),
         OP_LAUNCHER_SEARCH => Some("launcher"),
         OP_RECEIPT_QUERY => Some("text"),
+        OP_SIGN_PROPOSE => Some("sign"),
         _ => None,
     }
 }
@@ -385,6 +398,7 @@ fn apply_ime_field() {
             "launcher" => state::set_text_signal(LAUNCHER_QUERY_SIGNAL, update.text),
             "text" => state::set_text_signal(RECEIPT_QUERY_SIGNAL, update.text),
             "secure" => state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, update.text),
+            "sign" => state::set_text_signal(SIGN_MESSAGE_SIGNAL, update.text),
             _ => {}
         }
     }
@@ -590,6 +604,9 @@ fn on_shell_intent(code: u8, draft: &str) {
                 );
             }
         }
+        OP_SIGN_PROPOSE => open_sign_permission(session, draft),
+        OP_SIGN_ONCE => accept_sign_permission(session),
+        OP_SIGN_DENY => deny_sign_permission(session),
         OP_L2_TOGGLE => toggle_l2(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
@@ -1045,7 +1062,7 @@ fn sync_session(session: &IntentSession, phase: i64, notice: &str) {
     if !notice.is_empty() {
         state::set_text_signal(TOAST_SIGNAL, notice);
     }
-    state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(48));
+    state::set_text_signal(RECEIPT_SIGNAL, session.ledger_log_tail(48));
     let added = absorb_new_receipts();
     let localized = notice
         .chars()
@@ -1375,6 +1392,104 @@ fn open_process_permission(session: &mut IntentSession) {
     }
 }
 
+fn sign_message_from(draft: &str) -> String {
+    let typed = draft.trim();
+    if !typed.is_empty() {
+        return typed.to_string();
+    }
+    state::get_signal_text(SIGN_MESSAGE_SIGNAL)
+        .trim()
+        .to_string()
+}
+
+fn open_sign_permission(session: &mut IntentSession, draft: &str) {
+    let message = sign_message_from(draft);
+    if message.is_empty() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("host-missing-message"),
+        );
+        return;
+    }
+    state::set_text_signal(SIGN_MESSAGE_SIGNAL, &message);
+    let unlocked = session.identity_unlocked();
+    match sign_host::propose_wallet_sign(
+        &message,
+        unlocked,
+        &locale::current(),
+        now_ms(),
+        session.signed_high_water().saturating_add(1),
+    ) {
+        Ok(proposal) => {
+            state::set_text_signal(SIGN_SUMMARY_SIGNAL, &proposal.summary);
+            state::set_text_signal(SIGN_IMPACT_SIGNAL, &proposal.impact);
+            state::set_signal(SIGN_SIGNAL, 1);
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+            if unlocked {
+                state::request_focus_label(&locale::t("sign-deny"));
+            }
+        }
+        Err(text) => {
+            sync_session(session, state::get_signal(PHASE_SIGNAL), &text);
+        }
+    }
+}
+
+fn accept_sign_permission(session: &mut IntentSession) {
+    if state::get_signal(SIGN_SIGNAL) == 0 {
+        return;
+    }
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("sign-locked"),
+        );
+        return;
+    }
+    match sign_host::confirm(true, &locale::current(), now_ms()) {
+        Ok(receipt) => {
+            session.record_signed(receipt);
+            state::set_signal(SIGN_SIGNAL, 0);
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                &locale::t("sign-allowed-notice"),
+            );
+            restore_after_dialog();
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
+fn deny_sign_permission(session: &mut IntentSession) {
+    if state::get_signal(SIGN_SIGNAL) == 0 {
+        return;
+    }
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("sign-locked"),
+        );
+        return;
+    }
+    match sign_host::cancel(&locale::current(), now_ms()) {
+        Ok(receipt) => {
+            session.record_signed(receipt);
+            state::set_signal(SIGN_SIGNAL, 0);
+            sync_session(
+                session,
+                state::get_signal(PHASE_SIGNAL),
+                &locale::t("sign-denied-notice"),
+            );
+            restore_after_dialog();
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
 fn deny_process_permission(session: &mut IntentSession) {
     state::set_signal(PERM_SIGNAL, 0);
     let line = state::get_signal_text(TERMINAL_SIGNAL);
@@ -1573,6 +1688,10 @@ fn dismiss_top_layer() -> bool {
     if state::get_signal(UNLOCKED_SIGNAL) == 0 {
         return false;
     }
+    if state::get_signal(SIGN_SIGNAL) != 0 {
+        with_session(deny_sign_permission);
+        return true;
+    }
     if state::get_signal(PERM_SIGNAL) != 0 {
         state::set_signal(PERM_SIGNAL, 0);
         restore_after_dialog();
@@ -1607,7 +1726,7 @@ fn dismiss_top_layer() -> bool {
 /// next layout pass can focus. The intent field itself is a text input;
 /// label focus only matches buttons.
 fn restore_after_dialog() {
-    if state::get_signal(PERM_SIGNAL) != 0 {
+    if state::get_signal(SIGN_SIGNAL) != 0 || state::get_signal(PERM_SIGNAL) != 0 {
         return;
     }
     if state::get_signal(PHASE_SIGNAL) == 1 {
@@ -1634,7 +1753,7 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
         height,
         matches!(posture(), Posture::Phone),
         state::get_signal(PHASE_SIGNAL) == 1,
-        state::get_signal(PERM_SIGNAL) != 0,
+        state::get_signal(PERM_SIGNAL) != 0 || state::get_signal(SIGN_SIGNAL) != 0,
         state::get_signal(SWITCHER_SIGNAL) != 0,
     );
     match action {
@@ -1662,7 +1781,10 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
 }
 
 fn edge_back() -> bool {
-    if state::get_signal(PERM_SIGNAL) != 0 || state::get_signal(PHASE_SIGNAL) == 1 {
+    if state::get_signal(PERM_SIGNAL) != 0
+        || state::get_signal(SIGN_SIGNAL) != 0
+        || state::get_signal(PHASE_SIGNAL) == 1
+    {
         return false;
     }
     if state::get_signal(SWITCHER_SIGNAL) != 0 {
@@ -2130,7 +2252,10 @@ fn present_settings(tab: i64, menu: i64) {
 }
 
 fn screenshot_shows_locked_permission() -> bool {
-    std::env::var("W3COS_SCREEN").ok().as_deref() == Some("permission-locked")
+    matches!(
+        std::env::var("W3COS_SCREEN").ok().as_deref(),
+        Some("permission-locked") | Some("sign-permission-locked")
+    )
 }
 
 fn apply_screen_override() {
@@ -2224,6 +2349,27 @@ fn apply_screen_override() {
             state::set_signal(PERM_SIGNAL, 1);
             state::set_signal(UNLOCKED_SIGNAL, 0);
             state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "");
+        }
+        Some("sign-permission") => {
+            present_settings(1, 0);
+            with_session(|session| open_sign_permission(session, "hello from this device"));
+        }
+        Some("sign-permission-locked") => {
+            present_settings(1, 0);
+            with_session(|session| open_sign_permission(session, "hello from this device"));
+            state::set_signal(UNLOCKED_SIGNAL, 0);
+        }
+        Some("receipts-signed") => {
+            with_session(|session| {
+                if session.identity_unlocked() {
+                    open_sign_permission(session, "hello from this device");
+                    accept_sign_permission(session);
+                }
+            });
+            state::set_signal(SIGN_SIGNAL, 0);
+            state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+            state::set_text_signal(TOAST_SIGNAL, "");
+            state::set_text_signal(NOTICE_SIGNAL, "");
         }
         Some("lock") => state::set_signal(UNLOCKED_SIGNAL, 0),
         Some("switcher") => {
@@ -2446,7 +2592,7 @@ fn record_screen_receipt(decision: Decision, outcome: &str) {
             outcome,
             IntentTier::L0,
         );
-        state::set_text_signal(RECEIPT_SIGNAL, session.receipt_log_tail(48));
+        state::set_text_signal(RECEIPT_SIGNAL, session.ledger_log_tail(48));
     });
     let _ = absorb_new_receipts();
 }
@@ -2514,6 +2660,9 @@ fn build_shell() -> Component {
     if state::get_signal(PERM_SIGNAL) != 0 {
         column.push(permission_layer(build_permission_sheet()));
     }
+    if state::get_signal(SIGN_SIGNAL) != 0 {
+        column.push(place_modal(build_sign_sheet(), false, 520.0));
+    }
     if state::get_signal(NOTIFY_SIGNAL) != 0 {
         column.push(chrome_layer(build_notify_panel()));
     }
@@ -2571,7 +2720,9 @@ fn trap_modal_focus(root: &mut Component) {
     if state::get_signal(UNLOCKED_SIGNAL) == 0 && !screenshot_shows_locked_permission() {
         return;
     }
-    let role = if state::get_signal(PERM_SIGNAL) != 0 {
+    let role = if state::get_signal(SIGN_SIGNAL) != 0 {
+        "sign"
+    } else if state::get_signal(PERM_SIGNAL) != 0 {
         "permission"
     } else if state::get_signal(PHASE_SIGNAL) == 1 {
         "confirm"
@@ -3353,6 +3504,7 @@ struct ReceiptParts {
     detail: String,
     recorded_at: String,
     utterance: String,
+    signed: bool,
 }
 
 fn parse_receipt(line: &str) -> ReceiptParts {
@@ -3365,6 +3517,7 @@ fn parse_receipt(line: &str) -> ReceiptParts {
     let mut tier = String::new();
     let mut actor = String::new();
     let mut recorded_at = String::new();
+    let mut signed = false;
     for token in tokens {
         if let Some(value) = token.strip_prefix("tier=") {
             tier = value.to_string();
@@ -3372,6 +3525,8 @@ fn parse_receipt(line: &str) -> ReceiptParts {
             actor = value.to_string();
         } else if let Some(value) = token.strip_prefix("ts=") {
             recorded_at = value.to_string();
+        } else if let Some(value) = token.strip_prefix("signed=") {
+            signed = value == "1";
         }
     }
     ReceiptParts {
@@ -3383,6 +3538,7 @@ fn parse_receipt(line: &str) -> ReceiptParts {
         detail: detail.to_string(),
         recorded_at,
         utterance: utterance.to_string(),
+        signed,
     }
 }
 
@@ -4272,6 +4428,123 @@ fn build_permission_sheet() -> Component {
     ));
     let mut card = permission_shell(rows);
     mark_dialog(&mut card, "permission");
+    card
+}
+
+fn build_sign_sheet() -> Component {
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let summary = state::get_signal_text(SIGN_SUMMARY_SIGNAL);
+    let impact = state::get_signal_text(SIGN_IMPACT_SIGNAL);
+    let message = state::get_signal_text(SIGN_MESSAGE_SIGNAL);
+    let mut rows = vec![
+        Component::text(
+            locale::t("sign-cap-title"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#e2a45c"),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t("sign-sheet-title"),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+    ];
+    if let Some(mark) = layer_mark("L2") {
+        rows.push(mark);
+    }
+    rows.push(Component::text(
+        if unlocked {
+            locale::t("sign-sheet-detail")
+        } else {
+            locale::t("sign-locked")
+        },
+        Style {
+            font_size: 14.0,
+            font_weight: if unlocked { 400 } else { 700 },
+            color: if unlocked {
+                Color::from_hex("#f0d7b4")
+            } else {
+                Color::from_hex("#ffe08a")
+            },
+            ..Style::default()
+        },
+    ));
+    if !summary.is_empty() {
+        rows.push(Component::text(
+            summary,
+            Style {
+                font_size: 15.0,
+                font_weight: 650,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ));
+    }
+    rows.push(Component::text(
+        if impact.is_empty() {
+            locale::t("sign-sheet-scope")
+        } else {
+            impact
+        },
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#fff4e5"),
+            background: Color::rgba(226, 164, 92, 28),
+            border_radius: 12.0,
+            padding: Edges::all(12.0),
+            ..Style::default()
+        },
+    ));
+    if !message.is_empty() {
+        rows.push(Component::text(
+            message,
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#f0d7b4"),
+                font_family: Some("ui-monospace, monospace".to_string()),
+                ..Style::default()
+            },
+        ));
+    }
+    let mut deny = if unlocked {
+        sheet_button(locale::t("sign-deny"), OP_SIGN_DENY, SheetKind::Danger)
+    } else {
+        disabled_choice(locale::t("sign-deny"))
+    };
+    let once = if unlocked {
+        sheet_button(locale::t("sign-once"), OP_SIGN_ONCE, SheetKind::Warm)
+    } else {
+        disabled_choice(locale::t("sign-once"))
+    };
+    if unlocked && focus_kind("deny") == "deny" {
+        mark_initial_focus(&mut deny);
+    }
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![deny, once],
+    ));
+    rows.push(Component::text(
+        locale::t("sign-footnote"),
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#e2a45c"),
+            ..Style::default()
+        },
+    ));
+    let mut card = permission_shell(rows);
+    mark_dialog(&mut card, "sign");
     card
 }
 
@@ -6291,12 +6564,46 @@ fn settings_identity_page() -> Vec<Component> {
         rows.push(chrome_button(locale::t("lock"), OP_LOCK, "#3d5570"));
     }
     rows.push(settings_row(&locale::t("settings-storage"), &storage_label));
+    rows.push(sign_message_field());
+    let mut sign = chrome_button(locale::t("sign-open"), OP_SIGN_PROPOSE, "#9a5410");
+    sign.on_click = EventAction::Invoke {
+        code: OP_SIGN_PROPOSE,
+        input_placeholder: locale::t("sign-message-placeholder"),
+    };
+    rows.push(sign);
     rows.push(chrome_button(
         locale::t("open-ledger"),
         OP_TOGGLE_RECEIPTS,
         "#3d5570",
     ));
     rows
+}
+
+fn sign_message_field() -> Component {
+    let coarse = state::pointer_is_coarse();
+    let mut style = Style {
+        width: Dimension::Percent(100.0),
+        font_size: 15.0,
+        color: Color::from_hex("#1a2836"),
+        background: Color::from_hex("#f4f7fb"),
+        border_radius: 10.0,
+        padding: Edges::xy(12.0, if coarse { 12.0 } else { 8.0 }),
+        min_height: Dimension::Px(if coarse { 48.0 } else { 36.0 }),
+        ..Style::default()
+    };
+    style.custom_properties = Some(HashMap::from([
+        (
+            "--w3cos-intent-submit".to_string(),
+            OP_SIGN_PROPOSE.to_string(),
+        ),
+        ("--w3cos-ime".to_string(), "sign".to_string()),
+    ]));
+    note_preedit(&mut style, "sign");
+    Component::text_input(
+        state::get_signal_text(SIGN_MESSAGE_SIGNAL),
+        locale::t("sign-message-placeholder"),
+        style,
+    )
 }
 
 fn settings_agent_page() -> Vec<Component> {
@@ -7887,6 +8194,21 @@ fn receipt_row(line: &str) -> Component {
             },
         ));
     }
+    if parts.signed {
+        lines.push(Component::text(
+            locale::t("receipt-signed"),
+            Style {
+                font_size: 12.0,
+                font_weight: 650,
+                color: Color::from_hex("#e9fff5"),
+                background: Color::from_hex("#0c6d4c"),
+                border_radius: 999.0,
+                padding: Edges::xy(8.0, 2.0),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ));
+    }
     lines.push(Component::text(
         meta,
         Style {
@@ -8181,7 +8503,17 @@ mod shell_ux_tests {
         assert_eq!(stamped.recorded_at, "1760518800000");
         assert_eq!(stamped.detail, "已切换到文件");
         assert_eq!(stamped.utterance, "打开文件");
+        assert!(!stamped.signed);
         assert_eq!(format_receipt_clock("0"), "");
+        let signed = parse_receipt(
+            "s#4 allowed wallet_sign tier=L2 actor=did:key:z6Mkexample confirmed=true ts=9 signed=1 — 已在本机签名 @@ hello",
+        );
+        assert!(signed.signed);
+        assert_eq!(signed.id, "s#4");
+        assert_eq!(signed.decision, "allowed");
+        assert_eq!(signed.actor, "did:key:z6Mkexample");
+        assert_eq!(signed.tier, "L2");
+        assert_eq!(signed.utterance, "hello");
     }
 
     #[test]
@@ -8229,6 +8561,133 @@ mod shell_ux_tests {
         assert!(on_shell_swipe(8.0, 300.0, 90.0, 2.0));
         assert_eq!(state::get_signal(PERM_SIGNAL), 1);
         state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(SIGN_SIGNAL, 1);
+        assert!(!edge_back());
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 1);
+        assert!(on_shell_swipe(8.0, 300.0, 90.0, 2.0));
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 1);
+        state::set_signal(SIGN_SIGNAL, 0);
+    }
+
+    #[test]
+    fn sign_sheet_confirms_once_and_stores_a_signed_receipt() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        sign_host::reset();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-sign-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(SIGN_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+        on_shell_intent(OP_SIGN_PROPOSE, "hello from this device");
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 1);
+        let pending = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(
+            !pending.contains("signed=1"),
+            "propose must not write a receipt: {pending}"
+        );
+        let sheet = build_sign_sheet();
+        let blob = text_blob(&sheet);
+        assert!(blob.contains("用本机钥匙签名"), "{blob}");
+        assert!(blob.contains("hello from this device"), "{blob}");
+        assert!(blob.contains("不签也会写收据"), "{blob}");
+        assert_eq!(
+            button_labels(&sheet)
+                .into_iter()
+                .filter(|label| label == "不签" || label == "签这一次")
+                .collect::<Vec<_>>(),
+            vec!["不签".to_string(), "签这一次".to_string()]
+        );
+        assert!(
+            !button_labels(&sheet).iter().any(|label| label == "确认"),
+            "{blob}"
+        );
+        let role = sheet
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get("--w3cos-dialog"))
+            .map(String::as_str);
+        assert_eq!(role, Some("sign"));
+        let confirm = build_confirm_dialog();
+        assert_ne!(confirm.style.background, sheet.style.background);
+
+        on_shell_intent(OP_SIGN_DENY, "");
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 0);
+        let denied = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(denied.contains("s#"), "{denied}");
+        assert!(denied.contains("cancelled"), "{denied}");
+        assert!(denied.contains("wallet_sign"), "{denied}");
+        assert!(denied.contains("signed=1"), "{denied}");
+        assert!(denied.contains("did:key:z"), "{denied}");
+        assert!(!denied.contains("0x"), "{denied}");
+
+        on_shell_intent(OP_SIGN_PROPOSE, "hello from this device");
+        on_shell_intent(OP_SIGN_ONCE, "");
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 0);
+        let allowed = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(allowed.contains("allowed"), "{allowed}");
+        assert!(allowed.contains("signed=1"), "{allowed}");
+        assert!(!allowed.contains("0x"), "{allowed}");
+        with_session(|session| {
+            assert!(session.receipts().is_empty());
+            assert_eq!(session.signed_receipts().len(), 2);
+            let stored = &session.signed_receipts()[1];
+            assert_eq!(stored.decision, Decision::Allowed);
+            assert!(stored.outcome.contains("signature"), "{}", stored.outcome);
+            assert!(stored.actor.starts_with("did:key:z"), "{}", stored.actor);
+            assert!(!stored.signature.is_empty());
+        });
+
+        SESSION_BOOTED.with(|flag| flag.set(false));
+        SESSION.with(|slot| *slot.borrow_mut() = None);
+        with_session(|session| {
+            assert_eq!(session.signed_receipts().len(), 2);
+            assert!(session.receipts().is_empty());
+            let line = session.ledger_log_tail(48);
+            assert!(line.contains("cancelled"), "{line}");
+            assert!(line.contains("allowed"), "{line}");
+        });
+
+        on_shell_intent(OP_LOCK, "");
+        state::set_signal(SIGN_SIGNAL, 1);
+        state::set_text_signal(SIGN_SUMMARY_SIGNAL, "用本机钥匙为「hello」签名");
+        state::set_text_signal(SIGN_MESSAGE_SIGNAL, "hello from this device");
+        let locked = build_sign_sheet();
+        let locked_blob = text_blob(&locked);
+        assert!(
+            locked_blob.contains("先解锁。这次不会签名。"),
+            "{locked_blob}"
+        );
+        assert!(clicks_disabled(&locked, "不签"));
+        assert!(clicks_disabled(&locked, "签这一次"));
+        state::set_signal(SIGN_SIGNAL, 0);
+        sign_host::reset();
+        drop(isolated);
     }
 
     #[test]

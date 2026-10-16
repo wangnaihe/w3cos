@@ -156,12 +156,24 @@ where
         self.now_ms = now_ms;
     }
 
+    /// Raise the next operation id. Reloaded receipts keep the ids they were signed with.
+    pub fn set_next_id(&mut self, next_id: u64) {
+        if next_id > self.next_id {
+            self.next_id = next_id;
+        }
+    }
+
     pub fn pending_id(&self) -> Option<u64> {
         self.pending.as_ref().map(|pending| pending.id)
     }
 
     pub fn receipts(&self) -> &[SignedReceipt] {
         &self.receipts
+    }
+
+    /// Propose `wallet_sign` for `message`. Does not sign.
+    pub fn propose_sign(&mut self, message: &str) -> Result<ToolProposal, HostError> {
+        self.propose("wallet_sign", &json!({ "message": message }))
     }
 
     /// Record a proposal. Does not sign, and does not read the wallet.
