@@ -1,9 +1,11 @@
 //! Local streaming speech.
 //!
 //! A [`LocalSpeech`] engine turns a microphone hold into text on this device.
-//! The bundled engine has no model: [`press_speech`] does not call `begin`,
-//! nothing is captured, and a manifest that asks for the network is refused
-//! the same way. Audio bytes are never stored or uploaded.
+//! [`NoLocalSpeech`] has no model. [`crate::WhisperSpeech`] is the on-device
+//! whisper.cpp engine; it stays unavailable until a verified model file is
+//! present. [`press_speech`] does not call `begin` when the model is missing,
+//! the manifest asks for the network, the field is secure, or the session has
+//! ended. Audio bytes are never stored or uploaded.
 
 use crate::{ModalityBlock, ModalityState, Session};
 
@@ -15,6 +17,8 @@ pub const VOICE_LIMIT: usize = 1024;
 pub enum SpeechOff {
     /// No on-device recognizer. `begin` is not called.
     NoLocalModel,
+    /// The model is present, but no microphone or fixture opened.
+    NoMicrophone,
     /// The engine asked to upload audio. `begin` is not called.
     NetworkRefused,
     SecureField,
@@ -50,6 +54,10 @@ pub trait LocalSpeech: Send {
     /// Open the microphone. Called only for a local, available manifest.
     fn begin(&mut self, locales: &[String]) -> SpeechStart;
     fn poll(&mut self) -> Option<SpeechChunk>;
+    /// One last decode before the hold ends. The default is another [`poll`](Self::poll).
+    fn flush(&mut self) -> Option<SpeechChunk> {
+        self.poll()
+    }
     /// Close the microphone. Safe to call when it is already closed.
     fn end(&mut self);
     /// True only while this engine is capturing audio.
@@ -120,12 +128,17 @@ pub fn press_speech(engine: &mut dyn LocalSpeech, session: &Session) -> SpeechSt
     if !manifest.available {
         return SpeechStart::Off(SpeechOff::NoLocalModel);
     }
-    let started = engine.begin(&session.locales);
-    if matches!(started, SpeechStart::Listening) && engine.capturing() {
-        return SpeechStart::Listening;
+    match engine.begin(&session.locales) {
+        SpeechStart::Listening if engine.capturing() => SpeechStart::Listening,
+        SpeechStart::Off(reason) => {
+            engine.end();
+            SpeechStart::Off(reason)
+        }
+        SpeechStart::Listening => {
+            engine.end();
+            SpeechStart::Off(SpeechOff::NoLocalModel)
+        }
     }
-    engine.end();
-    SpeechStart::Off(SpeechOff::NoLocalModel)
 }
 
 /// Next transcript while a hold is recording. Empty and over-long chunks drop.
@@ -134,6 +147,22 @@ pub fn poll_speech(engine: &mut dyn LocalSpeech, recording: bool) -> Option<Spee
         return None;
     }
     let chunk = engine.poll()?;
+    let text = chunk.text.trim();
+    if text.is_empty() || text.chars().count() > VOICE_LIMIT {
+        return None;
+    }
+    Some(SpeechChunk {
+        text: text.to_string(),
+        interim: chunk.interim,
+    })
+}
+
+/// Last transcript before release. Empty and over-long chunks drop.
+pub fn flush_speech(engine: &mut dyn LocalSpeech, recording: bool) -> Option<SpeechChunk> {
+    if !recording || !engine.capturing() {
+        return None;
+    }
+    let chunk = engine.flush()?;
     let text = chunk.text.trim();
     if text.is_empty() || text.chars().count() > VOICE_LIMIT {
         return None;
@@ -167,6 +196,8 @@ mod tests {
         locales: Vec<String>,
         /// `begin` returns off but leaves the mic flag set, to check `end`.
         leak: bool,
+        /// `begin` returns this reason and still sets the capture flag.
+        fail: Option<SpeechOff>,
     }
 
     impl LocalSpeech for Probe {
@@ -185,6 +216,10 @@ mod tests {
             if self.leak {
                 self.capturing = true;
                 return SpeechStart::Off(SpeechOff::NoLocalModel);
+            }
+            if let Some(reason) = self.fail {
+                self.capturing = true;
+                return SpeechStart::Off(reason);
             }
             self.capturing = true;
             SpeechStart::Listening
@@ -217,6 +252,7 @@ mod tests {
             chunks: VecDeque::new(),
             locales: Vec::new(),
             leak: false,
+            fail: None,
         }
     }
 
@@ -290,6 +326,15 @@ mod tests {
         assert!(engine.ends >= 1);
         assert!(!engine.capturing());
         assert!(poll_speech(&mut engine, true).is_none());
+
+        let mut mic = probe(true, false);
+        mic.fail = Some(SpeechOff::NoMicrophone);
+        assert_eq!(
+            press_speech(&mut mic, &session),
+            SpeechStart::Off(SpeechOff::NoMicrophone)
+        );
+        assert!(mic.ends >= 1);
+        assert!(!mic.capturing());
     }
 
     #[test]
@@ -342,6 +387,17 @@ mod tests {
             })
         );
         assert!(engine.capturing());
+        engine.chunks.push_back(SpeechChunk {
+            text: "尾".into(),
+            interim: false,
+        });
+        assert_eq!(
+            flush_speech(&mut engine, true),
+            Some(SpeechChunk {
+                text: "尾".into(),
+                interim: false,
+            })
+        );
         release_speech(&mut engine, true);
         assert_eq!(engine.ends, 1);
         assert!(!engine.capturing());

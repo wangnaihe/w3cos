@@ -276,7 +276,7 @@ C ABI 1.1 插件接口增加 `w3cos_ime_engine_v1` 入口，与共享运行时�
 - P0：`spec/ime/w3cos-ime-1.schema.json` 已在仓库中。
 - P1：Hub、捆绑拼音词典、preedit / candidate / commit / undo、安全字段旁路已在 `w3cos-ime` 与 shell 中。未链接 librime。
 - P2：意图栏与 ActionProposal 确认（#77）；加密个人词库（#79）。
-- P3：剪贴板与长按麦克风已落地，见下。手写识别与 OCR 未做。本机没有捆绑语音模型。
+- P3：剪贴板与长按麦克风已落地，见下。手写识别与 OCR 未做。语音模型不随仓库分发，须经确认后下载到本机。
 - P4–P7：未开始。
 
 P3 已落地（本机，无网络，无账号服务）：
@@ -285,7 +285,10 @@ P3 已落地（本机，无网络，无账号服务）：
 - 剪贴板只在用户点按后读一次本机文字，变成 Candidate 写入当前输入框，可撤销。不进个人词库，不发到另一台设备。空白或超过 1024 个字符则不写入。
 - 音频引用、笔迹、以及任何摄像头载荷在到达引擎之前被丢掉，不会变成文字。安全字段旁路：不显示智能条，不读剪贴板，不打开麦克风。
 - 手机在键盘上方显示这一行。桌面在字段聚焦且没有候选条时，在光标旁显示同一行。
-- 麦克风是长按。`LocalSpeech` 是可替换的本机流式接口。捆绑实现 `NoLocalSpeech` 的 manifest 为不可用且 `network: false`。`press_speech` 在没有模型、要求网络、安全字段或会话已结束时不调用 `begin`，因此不录音、不上传。点按只说明原因。
-- 接上 `available` 且不要求网络的本地引擎后，按住开始听写，轮询得到 interim / final 文本（超过 1024 个字符的片段丢掉），松开把最后一段写入输入框，可撤销，不进个人词库。`end` 关闭采集。引擎若在 `begin` 里没有真正开始采集，也会被 `end` 关掉。
+- 麦克风是长按。`LocalSpeech` 是可替换的本机流式接口。捆绑的 `NoLocalSpeech` 与还没有模型的 `WhisperSpeech` manifest 都是不可用且 `network: false`。`press_speech` 在没有模型、要求网络、安全字段或会话已结束时不调用 `begin`，因此不录音、不上传。点按只说明原因。
+- 接上 `available` 且不要求网络的本地引擎后，按住开始听写，轮询得到 interim / final 文本（超过 1024 个字符的片段丢掉），松开前再取一次 final，写入输入框，可撤销，不进个人词库。`end` 关闭采集并丢掉缓冲的音频。引擎若在 `begin` 里没有真正开始采集，也会被 `end` 关掉。
+- 本机引擎是 whisper.cpp（crate `whisper-rs` 0.16，CPU，不启用 CUDA / Metal / Vulkan）。比较过的另外两个是：sherpa-onnx（官方 Rust crate，流式 Zipformer，中英双语包的 int8 编码器约 180MB，构建还要带 ONNX Runtime）和 Vosk（`vosk` crate 依赖各平台预编译的 libvosk，中文和英文是两个模型）。whisper.cpp 已有开源绑定，一个多语言模型同时覆盖中文和英文，权重可选下载。它不是逐帧 transducer：按住期间对不断变长的 16 kHz 窗口做贪心解码，得到 interim，松开时再解码一次作为 final。
+- 权重是 `ggml-tiny-q5_1.bin`（多语言 tiny 的 q5_1，32 152 673 字节，SHA-256 `818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7`），来自 whisper.cpp 发布的 GGML 文件。语言设置里第一次点按只确认，第二次才下载。校验不符就丢弃，不留下模型文件。识别路径不发起连接。没有这份文件时，麦克风芯片仍是「语音关」。界面见 `docs/ime/voice-off-desktop.png`、`docs/ime/voice-off-phone.png`、`docs/ime/speech-model-desktop.png`（英文对照：`docs/ime/voice-off-desktop-en.png`、`docs/ime/speech-model-desktop-en.png`，手机设置：`docs/ime/speech-model-phone.png`）。
+- 测试夹具 `crates/w3cos-ime/fixtures/jfk-excerpt.wav` 是肯尼迪就职演说的前五秒（美国政府作品，公有领域）。仓库里没有中文录音。中文走同一个多语言模型，语言标签为 `zh`。
 
-仍属 P3、本段不做：捆绑的 whisper.cpp / sherpa-onnx 模型、手写识别入框、OCR（[#51](https://github.com/wangnaihe/w3cos/issues/51)）。
+仍属 P3、本段不做：手写识别入框、OCR（[#51](https://github.com/wangnaihe/w3cos/issues/51)）。模型不打进仓库。

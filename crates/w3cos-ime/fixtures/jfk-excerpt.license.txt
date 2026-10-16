@@ -1,0 +1,11 @@
+Public-domain audio fixture.
+
+This file is the first five seconds of the inaugural address of John F. Kennedy,
+delivered on 20 January 1961. The address and the contemporaneous United States
+government recording are not subject to copyright (17 USC 105).
+
+The excerpt is trimmed from samples/jfk.wav as published by whisper.cpp
+(https://github.com/ggml-org/whisper.cpp, MIT). No model weights are included.
+A Chinese clip is not bundled: a short recording with a license this tree can
+redistribute was not available. The recognizer still accepts Chinese and
+English through the multilingual model.

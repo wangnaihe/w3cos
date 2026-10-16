@@ -183,6 +183,7 @@ const OP_IME_INK: u8 = 108;
 const OP_IME_CLIPBOARD: u8 = 109;
 const OP_IME_SCREEN: u8 = 110;
 const OP_PAIR_IMPORT: u8 = 111;
+const OP_IME_MODEL: u8 = 112;
 
 fn main() {
     shell_main();
@@ -1982,6 +1983,10 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             ime_bar::page_by(1);
         }
         OP_IME_VOICE => push_toast(&locale::t(ime_bar::voice_tap_key())),
+        OP_IME_MODEL => {
+            push_toast(&locale::t(ime_bar::confirm_speech_model()));
+            state::mark_dirty();
+        }
         OP_IME_INK => push_toast(&locale::t("ime-toast-ink")),
         OP_IME_SCREEN => push_toast(&locale::t("ime-toast-screen")),
         OP_IME_CLIPBOARD => {
@@ -6008,6 +6013,13 @@ fn settings_language_page() -> Vec<Component> {
     let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
     rows.push(locale_choice("zh-CN", &pending));
     rows.push(locale_choice("en", &pending));
+    rows.push(settings_row(
+        &locale::t("ime-voice-model"),
+        &locale::t(ime_bar::speech_model_status_key()),
+    ));
+    if let Some(key) = ime_bar::speech_model_button_key() {
+        rows.push(settings_link(locale::t(key), OP_IME_MODEL));
+    }
     rows
 }
 
@@ -8825,7 +8837,7 @@ mod shell_ux_tests {
         on_shell_intent(OP_IME_VOICE, "");
         assert_eq!(
             state::get_signal_text(TOAST_SIGNAL),
-            locale::t("ime-toast-voice")
+            locale::t("ime-toast-voice-offer")
         );
         let root_dump = format!("{root:?}");
         assert_eq!(root_dump.matches("--w3cos-hold").count(), 1, "{root_dump}");
@@ -8875,6 +8887,45 @@ mod shell_ux_tests {
         state::clear_ime_field();
         ime_bar::reset_for_tests();
         state::set_text_signal(TOAST_SIGNAL, "");
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn speech_model_stays_off_until_a_second_confirmation() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        let dir = std::env::temp_dir().join(format!("w3cos-speech-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ime_bar::set_speech_dir_for_tests(Some(dir.clone()));
+        ime_bar::reset_for_tests();
+        ime_bar::set_speech_dir_for_tests(Some(dir.clone()));
+        present_settings(6, 0);
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(blob.contains(&locale::t("ime-voice-model")), "{blob}");
+        assert!(blob.contains(&locale::t("ime-voice-model-off")), "{blob}");
+        assert!(blob.contains(&locale::t("ime-voice-model-get")), "{blob}");
+        on_shell_intent(OP_IME_MODEL, "");
+        assert_eq!(
+            state::get_signal_text(TOAST_SIGNAL),
+            locale::t("ime-toast-voice-confirm")
+        );
+        assert!(!dir.join(w3cos_ime::MODEL_FILE).exists());
+        let root = build_shell();
+        let blob = text_blob(&root);
+        assert!(
+            blob.contains(&locale::t("ime-voice-model-confirm")),
+            "{blob}"
+        );
+        assert!(!blob.contains(&locale::t("ime-voice-model-get")), "{blob}");
+        ime_bar::reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
         locale::set_locale("en");
     }
 
