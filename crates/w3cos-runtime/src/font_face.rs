@@ -595,9 +595,7 @@ impl FontRegistry {
         let parsed = if data.is_empty() {
             None
         } else {
-            fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
-                .ok()
-                .map(Arc::new)
+            cached_parsed_font(data.as_slice())
         };
         let mut cache_hasher = DefaultHasher::new();
         data.hash(&mut cache_hasher);
@@ -656,8 +654,9 @@ impl FontRegistry {
         let bytes = resolve_system_font(local_name)
             .ok_or_else(|| format!("local font {local_name:?} is unavailable"))?;
         let bytes = normalize_font_bytes(&bytes)?;
-        fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
-            .map_err(|error| format!("local font {local_name:?} cannot be decoded: {error}"))?;
+        if cached_parsed_font(bytes.as_slice()).is_none() {
+            return Err(format!("local font {local_name:?} cannot be decoded"));
+        }
         face.src = FontSource::Bytes(bytes);
         self.register_for_owner(owner, face)
     }
@@ -1186,6 +1185,25 @@ fn resolve_family_with_eligibility(
 
 // ── System font resolution ─────────────────────────────────────────────────
 
+fn cached_parsed_font(data: &[u8]) -> Option<Arc<fontdue::Font>> {
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<u64, Arc<fontdue::Font>>>> = Mutex::new(None);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.len().hash(&mut hasher);
+    data.hash(&mut hasher);
+    let key = hasher.finish();
+    let mut guard = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(font) = map.get(&key) {
+        return Some(Arc::clone(font));
+    }
+    let font = Arc::new(fontdue::Font::from_bytes(data, fontdue::FontSettings::default()).ok()?);
+    map.insert(key, Arc::clone(&font));
+    Some(font)
+}
+
 fn read_font_path(path: &std::path::Path) -> Option<Vec<u8>> {
     if let Ok(bytes) = std::fs::read(path)
         && !bytes.is_empty()
@@ -1202,6 +1220,25 @@ fn read_font_path(path: &std::path::Path) -> Option<Vec<u8>> {
 /// Try to load a system font by name from the installed font database, then
 /// common OS font directories.
 fn resolve_system_font(name: &str) -> Option<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None);
+    let key = name.to_ascii_lowercase();
+    {
+        let guard = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(hit) = guard.as_ref().and_then(|map| map.get(&key)) {
+            return Some(hit.as_ref().clone());
+        }
+    }
+    let bytes = resolve_system_font_uncached(name)?;
+    let mut guard = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(key, Arc::new(bytes.clone()));
+    Some(bytes)
+}
+
+fn resolve_system_font_uncached(name: &str) -> Option<Vec<u8>> {
     {
         let database = system_fonts::database();
         if let Some(id) = database.query(&fontdb::Query {

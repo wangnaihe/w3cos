@@ -1506,6 +1506,8 @@ fn ensure_dom_fast() {
         build_guarded: fast_build_guarded,
         build_block: fast_build_block_guarded,
         build_flex_row: fast_build_flex_row_guarded,
+        build_text: fast_build_text_guarded,
+        rewrite_indexed_text: fast_rewrite_indexed_text,
         set_style: fast_set_style,
         set_element_style: fast_set_element_style,
     });
@@ -1776,6 +1778,171 @@ fn fast_build_block_guarded(
     };
     dom::mark_dom_dirty();
     dom_handle(child)
+}
+
+fn fast_build_text_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !is_document_value(document)
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || node_id_of(parent).is_none()
+        || !valid_element_name(tag)
+    {
+        return Value::Undefined;
+    }
+    let parent_id = node_id_of(parent).expect("parent checked");
+    let lowered;
+    let mut tag_atom = tag_atom;
+    let tag =
+        if html_create_element_folds_case() && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            tag_atom = u32::MAX;
+            lowered.as_str()
+        } else {
+            tag
+        };
+    let text = text.to_js_string();
+    let Some(child) = dom::with_document_mut(|doc| {
+        doc.append_text_element(w3cos_dom::NodeId::from_u32(parent_id), tag, tag_atom, &text)
+            .map(|id| id.as_u32())
+    }) else {
+        return Value::Undefined;
+    };
+    dom::mark_dom_dirty();
+    dom_handle(child)
+}
+
+fn integer_in_range(value: f64, min: i64, max: i64) -> Option<i64> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    let value = value as i64;
+    (value >= min && value <= max).then_some(value)
+}
+
+fn js_positive_mod(value: i64, modulus: i64) -> i64 {
+    let remainder = value % modulus;
+    if remainder < 0 {
+        remainder + modulus
+    } else {
+        remainder
+    }
+}
+
+/// Rewrite indexed text and move those nodes to the end of `parent`.
+///
+/// The whole loop runs in one call. A refusal happens before the first write,
+/// so the caller can run the ordinary property path unchanged.
+fn fast_rewrite_indexed_text(
+    nodes: &Value,
+    parent: &Value,
+    prefix: &str,
+    stride: f64,
+    modulus: f64,
+    start: f64,
+    limit: f64,
+    epoch: u64,
+) -> Value {
+    if w3cos_core::intrinsics::dom_shape_epoch() != epoch {
+        return Value::Undefined;
+    }
+    if !prefix.is_ascii()
+        || !crate::observers_web::mutation_observers_empty()
+        || crate::custom_elements_web::has_definitions()
+        || w3cos_dom::stylesheet::tree_order_affects_matching()
+    {
+        return Value::Undefined;
+    }
+    if !matches!(silent_lookup(parent, "appendChild"), SilentLookup::Missing) {
+        return Value::Undefined;
+    }
+    let Some(parent_id) = node_id_of(parent) else {
+        return Value::Undefined;
+    };
+    let Some(stride) = integer_in_range(stride, 1, 1_000_000) else {
+        return Value::Undefined;
+    };
+    let Some(modulus) = integer_in_range(modulus, 1, 100_000) else {
+        return Value::Undefined;
+    };
+    let Some(start) = integer_in_range(start, 0, 100_000) else {
+        return Value::Undefined;
+    };
+    let Some(limit) = integer_in_range(limit, 0, 100_000) else {
+        return Value::Undefined;
+    };
+    if limit < start {
+        return Value::Undefined;
+    }
+    if start == limit {
+        return Value::Number(0.0);
+    }
+    let Some(array) = nodes.as_array() else {
+        return Value::Undefined;
+    };
+    let stored = array.borrow();
+    if stored.len() < modulus as usize {
+        return Value::Undefined;
+    }
+    let mut ids = vec![u32::MAX; modulus as usize];
+    for k in start..limit {
+        let index = js_positive_mod(k.wrapping_mul(stride), modulus) as usize;
+        if ids[index] != u32::MAX {
+            continue;
+        }
+        let Some(value) = stored.get(index) else {
+            return Value::Undefined;
+        };
+        let Some(id) = node_id_of(value) else {
+            return Value::Undefined;
+        };
+        if !matches!(silent_lookup(value, "textContent"), SilentLookup::Missing) {
+            return Value::Undefined;
+        }
+        ids[index] = id;
+    }
+    drop(stored);
+    let ready = dom::with_document(|doc| {
+        ids.iter().filter(|id| **id != u32::MAX).all(|id| {
+            let child = w3cos_dom::NodeId::from_u32(*id);
+            let node = doc.get_node(child);
+            node.parent == Some(w3cos_dom::NodeId::from_u32(parent_id))
+                && node.node_type == w3cos_dom::node::NodeType::Element
+                && node.first_child.is_some_and(|text| {
+                    let text = doc.get_node(text);
+                    text.node_type == w3cos_dom::node::NodeType::Text && text.next_sibling == 0
+                })
+        })
+    });
+    if !ready {
+        return Value::Undefined;
+    }
+    let mut sum = 0usize;
+    let mut buf = [0u8; 96];
+    dom::with_document_mut(|doc| {
+        let parent = w3cos_dom::NodeId::from_u32(parent_id);
+        for k in start..limit {
+            let index = js_positive_mod(k.wrapping_mul(stride), modulus) as usize;
+            let child = w3cos_dom::NodeId::from_u32(ids[index]);
+            // Prefix length and the integer range were checked above.
+            let text = w3cos_core::intrinsics::format_prefix_index(prefix, k as f64, &mut buf)
+                .expect("indexed text format");
+            sum += text.encode_utf16().count();
+            let _ = doc.set_inline_text_child(child, text);
+            doc.append_child(parent, child);
+        }
+    });
+    dom::mark_dom_dirty();
+    Value::Number(sum as f64)
 }
 
 fn fast_build_flex_row_guarded(
@@ -22331,6 +22498,256 @@ mod tests {
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
+    }
+
+    fn child_texts(root: &Value) -> Vec<String> {
+        let root_id = node_id_of(root).expect("root");
+        dom::with_document(|doc| {
+            let mut texts = Vec::new();
+            let mut child = doc
+                .get_node(w3cos_dom::NodeId::from_u32(root_id))
+                .first_child;
+            while let Some(id) = child {
+                let node = doc.get_node(id);
+                let text = node
+                    .first_child
+                    .and_then(|text| doc.get_node(text).text_content.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                texts.push(text);
+                child = (node.next_sibling != 0)
+                    .then(|| w3cos_dom::NodeId::from_u32(node.next_sibling));
+            }
+            texts
+        })
+    }
+
+    fn simulate_indexed_rewrite(
+        count: usize,
+        stride: i64,
+        start: i64,
+        limit: i64,
+    ) -> (f64, Vec<String>) {
+        let mut texts: Vec<String> = (0..count).map(|index| format!("item {index}")).collect();
+        let mut order: Vec<usize> = (0..count).collect();
+        let mut sum = 0.0_f64;
+        for k in start..limit {
+            let index = ((k * stride).rem_euclid(count as i64)) as usize;
+            let text = format!("upd {k}");
+            sum += text.encode_utf16().count() as f64;
+            texts[index] = text;
+            let position = order.iter().position(|slot| *slot == index).unwrap();
+            let moved = order.remove(position);
+            order.push(moved);
+        }
+        let ordered = order
+            .into_iter()
+            .map(|index| texts[index].clone())
+            .collect();
+        (sum, ordered)
+    }
+
+    #[test]
+    fn indexed_text_rewrite_matches_the_ordinary_move() {
+        setup();
+        ensure_dom_fast();
+        w3cos_dom::stylesheet::clear_rules();
+        let doc = document_value();
+        let root = doc.call_method("createElement", vec![Value::string("div")]);
+        doc.get_property("body")
+            .call_method("appendChild", vec![root.clone()]);
+        let nodes = Value::array(Vec::new());
+        for i in 0..4 {
+            let el = doc.call_method("createElement", vec![Value::string("div")]);
+            el.set_property("textContent", Value::string(&format!("item {i}")));
+            root.call_method("appendChild", vec![el.clone()]);
+            nodes.call_method("push", vec![el]);
+        }
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let rewritten = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
+            &nodes, &root, "upd ", 17.0, 4.0, 0.0, 6.0, epoch,
+        );
+        assert!(!rewritten.is_undefined(), "pristine nodes take the rewrite");
+        let (sum, texts) = simulate_indexed_rewrite(4, 17, 0, 6);
+        assert_eq!(rewritten.to_number(), sum);
+        assert_eq!(child_texts(&root), texts);
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            4
+        );
+    }
+
+    fn indexed_rewrite_fixture() -> (Value, Value, Vec<u32>) {
+        setup();
+        ensure_dom_fast();
+        w3cos_dom::stylesheet::clear_rules();
+        let doc = document_value();
+        let root = doc.call_method("createElement", vec![Value::string("div")]);
+        doc.get_property("body")
+            .call_method("appendChild", vec![root.clone()]);
+        let nodes = Value::array(Vec::new());
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let el = doc.call_method("createElement", vec![Value::string("div")]);
+            el.set_property("textContent", Value::string(&format!("item {i}")));
+            root.call_method("appendChild", vec![el.clone()]);
+            ids.push(node_id_of(&el).unwrap());
+            nodes.call_method("push", vec![el]);
+        }
+        (root, nodes, ids)
+    }
+
+    #[test]
+    fn indexed_text_rewrite_refuses_without_mutating() {
+        let (root, nodes, ids) = indexed_rewrite_fixture();
+        let before = child_texts(&root);
+        super::set_expando(ids[1], "textContent", Value::string("own"));
+        let refused = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
+            &nodes,
+            &root,
+            "upd ",
+            17.0,
+            4.0,
+            0.0,
+            6.0,
+            w3cos_core::intrinsics::dom_shape_epoch(),
+        );
+        assert!(refused.is_undefined(), "an own textContent stays ordinary");
+        assert_eq!(child_texts(&root), before);
+
+        let (root, nodes, _) = indexed_rewrite_fixture();
+        let before = child_texts(&root);
+        super::set_expando(
+            node_id_of(&root).unwrap(),
+            "appendChild",
+            Value::string("own"),
+        );
+        let refused = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
+            &nodes,
+            &root,
+            "upd ",
+            17.0,
+            4.0,
+            0.0,
+            6.0,
+            w3cos_core::intrinsics::dom_shape_epoch(),
+        );
+        assert!(refused.is_undefined(), "an own appendChild stays ordinary");
+        assert_eq!(child_texts(&root), before);
+
+        let (root, nodes, _) = indexed_rewrite_fixture();
+        let before = child_texts(&root);
+        w3cos_dom::stylesheet::register_rule("div:nth-child(1)", &[("height", "10px")]);
+        let refused = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
+            &nodes,
+            &root,
+            "upd ",
+            17.0,
+            4.0,
+            0.0,
+            6.0,
+            w3cos_core::intrinsics::dom_shape_epoch(),
+        );
+        assert!(
+            refused.is_undefined(),
+            "a structural selector stays on the ordinary path"
+        );
+        assert_eq!(child_texts(&root), before);
+
+        let (root, nodes, _) = indexed_rewrite_fixture();
+        let before = child_texts(&root);
+        let non_ascii = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
+            &nodes,
+            &root,
+            "ü",
+            17.0,
+            4.0,
+            0.0,
+            6.0,
+            w3cos_core::intrinsics::dom_shape_epoch(),
+        );
+        assert!(
+            non_ascii.is_undefined(),
+            "a non-ascii prefix stays ordinary"
+        );
+        assert_eq!(child_texts(&root), before);
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn same_parent_move_still_honors_nth_child() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule("div:nth-child(1)", &[("height", "10px")]);
+        w3cos_dom::stylesheet::register_rule("div:nth-child(2)", &[("height", "40px")]);
+        let doc = document_value();
+        doc.get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        let first = doc.call_method("createElement", vec![Value::string("div")]);
+        let second = doc.call_method("createElement", vec![Value::string("div")]);
+        root.call_method("appendChild", vec![first.clone()]);
+        root.call_method("appendChild", vec![second.clone()]);
+        assert_eq!(first.get_property("offsetHeight").to_number(), 10.0);
+        assert_eq!(second.get_property("offsetHeight").to_number(), 40.0);
+        root.call_method("appendChild", vec![first.clone()]);
+        assert_eq!(second.get_property("offsetHeight").to_number(), 10.0);
+        assert_eq!(first.get_property("offsetHeight").to_number(), 40.0);
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn author_rule_text_rows_keep_stylesheet_height() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        ensure_dom_fast();
+        seal_dom_shape_baseline();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "#css-list > div",
+            &[
+                ("height", "18px"),
+                ("font-size", "14px"),
+                ("line-height", "18px"),
+            ],
+        );
+        let doc = document_value();
+        doc.get_property("body")
+            .get_property("style")
+            .set_property("margin", Value::string("0"));
+        let root = create_in_body("div");
+        root.set_property("id", Value::string("css-list"));
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        for i in 0..8 {
+            let built = w3cos_core::intrinsics::dom_build_text_guarded(
+                &doc,
+                &root,
+                "div",
+                u32::MAX,
+                &Value::string(&format!("row {}", i % 40)),
+                epoch,
+            );
+            assert!(!built.is_undefined(), "author-rule rows take the text path");
+        }
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("length")
+                .to_number(),
+            8.0
+        );
+        assert_eq!(root.get_property("offsetHeight").to_number(), 144.0);
+        assert_eq!(
+            root.get_property("childNodes")
+                .get_property("0")
+                .get_property("textContent")
+                .to_js_string(),
+            "row 0"
+        );
+        w3cos_dom::stylesheet::clear_rules();
     }
 
     #[test]

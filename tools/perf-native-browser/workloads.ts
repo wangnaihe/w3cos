@@ -3,7 +3,7 @@
 // globalThis.W3COS_PERF_WORKLOAD before this module runs.
 export {};
 var DOM_NODES = 1000;
-var DOM_UPDATES = 40;
+var DOM_UPDATES = 8000;
 var FLEX_ITEMS = 240;
 var GRID_ITEMS = 240;
 var REFLOWS = 12;

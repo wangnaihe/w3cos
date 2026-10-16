@@ -102,7 +102,7 @@ PGO_TRAIN_SEED = "13"
 # keeps the published constants so AOT fusion still sees them.
 PGO_TRAIN_SUBSTITUTIONS = (
     ("var DOM_NODES = 1000;", "var DOM_NODES = 500;"),
-    ("var DOM_UPDATES = 40;", "var DOM_UPDATES = 20;"),
+    ("var DOM_UPDATES = 8000;", "var DOM_UPDATES = 4000;"),
     ("var FLEX_ITEMS = 240;", "var FLEX_ITEMS = 120;"),
     ("var GRID_ITEMS = 240;", "var GRID_ITEMS = 120;"),
     ("var SCROLL_ROWS = 100;", "var SCROLL_ROWS = 50;"),

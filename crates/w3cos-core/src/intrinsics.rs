@@ -606,6 +606,14 @@ pub struct DomFast {
     /// stale or the parent/row shape is not that flex list, so the caller
     /// runs the ordinary lookup.
     pub build_flex_row: fn(&Value, &Value, &str, u32, &Value, &str, &str, u64) -> Value,
+    /// Fused create + text + append. Author rules stay in force; `Undefined`
+    /// means the ordinary lookup must run.
+    pub build_text: fn(&Value, &Value, &str, u32, &Value, u64) -> Value,
+    /// One-shot rewrite of `nodes[(k * stride) % modulus].textContent = prefix + k`
+    /// followed by `parent.appendChild(nodes[index])` for `k` in `start..limit`.
+    /// Returns the sum of the assigned string lengths, or `Undefined` when the
+    /// fast path refuses before any mutation.
+    pub rewrite_indexed_text: fn(&Value, &Value, &str, f64, f64, f64, f64, u64) -> Value,
     pub set_style: fn(&Value, &str, &Value) -> bool,
     pub set_element_style: fn(&Value, &str, &Value) -> bool,
 }
@@ -864,6 +872,38 @@ pub fn dom_build_block_guarded(
 
 /// Fused create + textContent + height + flex + appendChild for a column flex
 /// list, or [`Value::Undefined`] when `epoch` is stale or the runtime refuses.
+pub fn dom_build_text_guarded(
+    document: &Value,
+    parent: &Value,
+    tag: &str,
+    tag_atom: u32,
+    text: &Value,
+    epoch: u64,
+) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.build_text)(document, parent, tag, tag_atom, text, epoch)
+    } else {
+        Value::Undefined
+    }
+}
+
+pub fn dom_rewrite_indexed_text_guarded(
+    nodes: &Value,
+    parent: &Value,
+    prefix: &str,
+    stride: f64,
+    modulus: f64,
+    start: f64,
+    limit: f64,
+    epoch: u64,
+) -> Value {
+    if let Some(fast) = DOM_FAST.get() {
+        (fast.rewrite_indexed_text)(nodes, parent, prefix, stride, modulus, start, limit, epoch)
+    } else {
+        Value::Undefined
+    }
+}
+
 pub fn dom_build_flex_row_guarded(
     document: &Value,
     parent: &Value,
