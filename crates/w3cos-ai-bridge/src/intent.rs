@@ -1561,7 +1561,11 @@ mod tests {
         let legacy = IntentSession::new(AgentPermissions::interactive(), LocalIdentityStub::new())
             .with_ledger(ReceiptLedger::open(&legacy_dir).expect("reopen"));
         assert_eq!(legacy.actor(), LocalIdentityStub::SUBJECT);
-        assert!(legacy.enrollment_copy().contains("No assertion was checked"));
+        assert!(
+            legacy
+                .enrollment_copy()
+                .contains("No assertion was checked")
+        );
         let _ = std::fs::remove_dir_all(&legacy_dir);
     }
 
