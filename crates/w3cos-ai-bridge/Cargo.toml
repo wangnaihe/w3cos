@@ -30,3 +30,6 @@ png = { workspace = true }
 tiny-skia = { workspace = true }
 fontdue = { workspace = true }
 ureq = { workspace = true }
+
+[dev-dependencies]
+w3cos-p2p = { path = "../w3cos-p2p" }

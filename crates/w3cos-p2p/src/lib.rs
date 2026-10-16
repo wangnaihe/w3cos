@@ -12,16 +12,20 @@ mod nostr;
 mod presence;
 mod reconnect;
 mod stun;
+mod wallet;
 
 pub mod hpke;
 
 pub use config::NetConfig;
-pub use identity::{DeviceIdentity, fingerprint};
+pub use identity::{
+    DeviceIdentity, did_key_ed25519, ed25519_public_from_did, fingerprint, verify_ed25519,
+};
 pub use node::Endpoint;
 pub use nostr::{Kind as NostrKind, fetch_latest, publish_presence};
 pub use presence::{Presence, SignedPresence};
 pub use reconnect::{ResolveStep, plan_reconnect, prefer_paths};
 pub use stun::{binding_request, parse_binding_response};
+pub use wallet::LocalWallet;
 
 /// How a paired device is reachable right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

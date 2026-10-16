@@ -2,11 +2,13 @@
 //!
 //! This is the interface a later passkey-backed `did:key` would satisfy.
 //! It does not generate a key, speak to a chain, hold a wallet, or verify a
-//! WebAuthn assertion. The subject string is intentionally not a real DID.
+//! WebAuthn assertion. [`LocalIdentityStub::install_subject`] accepts a real
+//! `did:key` from the device Ed25519 key. Receipts already written keep the
+//! actor they recorded.
 //!
 //! The unlock string is not stored. The stub keeps a PBKDF2-HMAC-SHA256
 //! verifier (salt + hash). The subject is a `did:key:` string that can be
-//! replaced later. Receipts already written keep the actor they recorded.
+//! replaced later.
 //!
 //! Passkey enrollment can mint a challenge and store public-key bytes.
 //! It does not speak to an authenticator and does not check an assertion.
