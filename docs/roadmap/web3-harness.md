@@ -22,8 +22,8 @@ local signing tool that cannot sign on its own.
 | Spec `did:key` | `did_key_ed25519` | Ed25519 public key as `did:key:z` + base58btc(`0xed 0x01 \|\| key`). Receipts use this. Pairing still uses the letter fingerprint, so existing pairs do not move. |
 | Receipt signatures | `DeviceIdentity::sign` | The same Ed25519 key that signs presence cards. |
 | Local identity in the shell | `w3cos-ai-bridge::identity` | Lock screen still stores a PBKDF2 verifier. A passkey is installed only after `clientDataJSON` and the Ed25519 assertion verify, and the subject becomes the canonical `did:key` of the device key. Pairing still uses the letter fingerprint. |
-| Chain account | `w3cos-p2p::LocalWallet` | secp256k1 key from HKDF of the device seed. EIP-191 `personal_sign` only. No chain id. |
-| Chain reads | `w3cos-ai-bridge::chain` | Balance, nonce, and transaction status from an `http` or `https` endpoint the person saved. No built-in endpoint. A permission sheet gates the call. No broadcast. |
+| Chain account | `w3cos-p2p::LocalWallet` | secp256k1 key from HKDF of the device seed. EIP-191 `personal_sign` and a legacy transaction. The signer has no chain id and does not broadcast. |
+| Chain reads | `w3cos-ai-bridge::chain` | Balance, nonce, and transaction status from an `http` or `https` endpoint the person saved. No built-in endpoint. A permission sheet gates the call. |
 | Page credentials | `w3cos-runtime` credentials | Web Credential Management types. The module says wallet and consent flows need a host adapter. They are not wired to the device key. |
 
 ### Agent harness
@@ -94,7 +94,7 @@ Each slice is one review. Later slices do not start inside this one.
 5. **stdio for external agents.** Done. `w3cos-tool-host` speaks MCP on stdio and forwards `tools/call` to `/host/propose`. The process that owns the window is still the only caller of `confirm`. The model does not get that method.
 6. **Passkey enrollment.** Done. The window verifies `clientDataJSON` and the Ed25519 assertion before `IdentityMethod::Passkey`, then installs the canonical `did:key` of the device key. Old receipt actors stay as written. The P2P seed and the pairing fingerprint are not replaced.
 7. **Read a chain, still no broadcast.** Done. `chain_balance`, `chain_nonce`, and `chain_tx` propose first. The window shows a permission sheet and calls only the `http` or `https` endpoint the person saved. There is no built-in endpoint. Nothing signs or broadcasts.
-8. **Sign a transaction.** Propose the fields, L2 confirm, sign on device, and only then offer broadcast to the RPC from the previous slice. No custodian and no hosted signer.
+8. **Sign a transaction.** Done. `wallet_sign_tx` proposes decoded fields. Confirm signs a legacy transaction on the device and writes a receipt that does not contain the signed bytes. A second sheet is the only path to `eth_sendRawTransaction`, and only for that signed transaction, and only to the endpoint the person saved. No custodian and no hosted signer.
 9. **Show the spec `did:key` next to the pairing fingerprint.** Keep the letter fingerprint until paired devices can match the new identifier. Do not silently replace stored peer records.
 10. **Sandbox untrusted tools.** Anything beyond the `echo` / `pwd` / `help` allowlist runs where it cannot read the device seed. The wallet stays in the host process and is still only reached from confirm.
 11. **Inference stays out of process.** Keep `w3cos-inferd`. Revisit `mistral.rs`, `candle`, or `llama-cpp-2` only when a GPU or NPU backend is actually linked.

@@ -35,6 +35,18 @@ pub trait ChainWallet {
     fn address(&self) -> &str;
     /// EIP-191 signature of `message`. Called only after confirm, while unlocked.
     fn sign_personal(&self, message: &str) -> Result<String, String>;
+    /// Signed legacy transaction, `0x` plus RLP. Called only after confirm.
+    /// The returned bytes stay in this process until a separate broadcast.
+    fn sign_legacy(
+        &self,
+        chain_id: u64,
+        nonce: u64,
+        gas_price: u128,
+        gas_limit: u64,
+        to: &[u8; 20],
+        value: &[u8; 32],
+        data: &[u8],
+    ) -> Result<String, String>;
 }
 
 /// What the human is being asked to confirm.
@@ -105,9 +117,18 @@ enum ToolKind {
     DeviceDid,
     WalletAddress,
     WalletSign,
+    WalletSignTx,
     ChainBalance,
     ChainNonce,
     ChainTx,
+    /// Not a model tool. The window asks to send the transaction it just signed.
+    Broadcast,
+}
+
+#[derive(Clone)]
+struct HeldTx {
+    raw: String,
+    arguments: String,
 }
 
 #[derive(Clone)]
@@ -130,6 +151,9 @@ pub struct ToolHost<D, W> {
     receipts: Vec<SignedReceipt>,
     chain_endpoint: String,
     chain_transport: ChainTransport,
+    /// Signed payload waiting for the broadcast sheet. Not a model argument.
+    held: Option<HeldTx>,
+    staged_raw: Option<String>,
 }
 
 impl<D, W> ToolHost<D, W>
@@ -150,6 +174,8 @@ where
             receipts: Vec::new(),
             chain_endpoint: String::new(),
             chain_transport: crate::chain::post_json,
+            held: None,
+            staged_raw: None,
         }
     }
 
@@ -206,6 +232,11 @@ where
                 self.propose(name, &json!({}))
             }
             "wallet_sign" => self.propose_sign(message),
+            "wallet_sign_tx" => {
+                let value = serde_json::from_str::<Value>(message)
+                    .map_err(|_| self.err("host-tx-fields"))?;
+                self.propose(name, &value)
+            }
             "chain_tx" => self.propose(name, &json!({ "hash": message })),
             _ => Err(self.err_args("host-unknown-tool", &[("name", name)])),
         }
@@ -213,7 +244,7 @@ where
 
     /// Record a proposal. Does not sign, and does not read the wallet.
     pub fn propose(&mut self, name: &str, arguments: &Value) -> Result<ToolProposal, HostError> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.held.is_some() {
             return Err(self.err("host-pending"));
         }
         let kind = self.kind(name)?;
@@ -236,15 +267,111 @@ where
             return Err(self.err("host-nothing-pending"));
         };
         let (decision, outcome) = if !self.unlocked {
+            self.staged_raw = None;
             (Decision::Denied, self.outcome_text("host-locked"))
         } else {
             match self.execute(&pending) {
                 Ok(outcome) => (Decision::Allowed, outcome),
-                Err(outcome) => (Decision::Denied, outcome),
+                Err(outcome) => {
+                    self.staged_raw = None;
+                    (Decision::Denied, outcome)
+                }
             }
         };
-        let receipt = self.seal(&pending, decision, true, outcome)?;
+        let receipt = match self.seal(&pending, decision, true, outcome) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.staged_raw = None;
+                return Err(error);
+            }
+        };
+        if decision == Decision::Allowed && pending.kind == ToolKind::WalletSignTx {
+            if let Some(raw) = self.staged_raw.take() {
+                self.held = Some(HeldTx {
+                    raw,
+                    arguments: pending.arguments.clone(),
+                });
+            }
+        } else {
+            self.staged_raw = None;
+        }
         self.pending = None;
+        self.receipts.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    /// Send the transaction this window just signed. Not a model tool.
+    /// An empty endpoint does not open a socket.
+    pub fn broadcast(&mut self) -> Result<SignedReceipt, HostError> {
+        if self.held.is_none() {
+            return Err(self.err("host-nothing-pending"));
+        }
+        if !self.unlocked {
+            return self.finish_broadcast(
+                Decision::Denied,
+                true,
+                self.outcome_text("host-broadcast-locked"),
+            );
+        }
+        let raw = self
+            .held
+            .as_ref()
+            .map(|held| held.raw.clone())
+            .unwrap_or_default();
+        let Some(endpoint) = crate::chain::parse_endpoint(&self.chain_endpoint) else {
+            return self.finish_broadcast(Decision::Denied, true, self.outcome_text("host-no-rpc"));
+        };
+        let body = crate::tx::send_body(&raw).map_err(|_| self.err("host-tx-raw"))?;
+        match (self.chain_transport)(&endpoint.url, &body) {
+            Ok(response) => match crate::tx::interpret_send(&response) {
+                Ok(hash) => {
+                    let text = self.outcome_text_args("host-broadcast", &[("hash", hash.as_str())]);
+                    self.finish_broadcast(Decision::Allowed, true, text)
+                }
+                Err(_) => self.finish_broadcast(
+                    Decision::Denied,
+                    true,
+                    self.outcome_text("host-broadcast-failed"),
+                ),
+            },
+            Err(_) => self.finish_broadcast(
+                Decision::Denied,
+                true,
+                self.outcome_text("host-broadcast-failed"),
+            ),
+        }
+    }
+
+    /// Keep the signed transaction on this device. Does not open a socket.
+    pub fn decline_broadcast(&mut self) -> Result<SignedReceipt, HostError> {
+        if self.held.is_none() {
+            return Err(self.err("host-nothing-pending"));
+        }
+        self.finish_broadcast(
+            Decision::Cancelled,
+            false,
+            self.outcome_text("host-broadcast-held"),
+        )
+    }
+
+    fn finish_broadcast(
+        &mut self,
+        decision: Decision,
+        confirmed: bool,
+        outcome: String,
+    ) -> Result<SignedReceipt, HostError> {
+        let Some(held) = self.held.clone() else {
+            return Err(self.err("host-nothing-pending"));
+        };
+        let pending = Pending {
+            id: self.next_id,
+            kind: ToolKind::Broadcast,
+            arguments: held.arguments,
+            message: None,
+        };
+        let receipt = self.seal(&pending, decision, confirmed, outcome)?;
+        self.next_id += 1;
+        self.held = None;
         self.receipts.push(receipt.clone());
         Ok(receipt)
     }
@@ -351,6 +478,7 @@ where
             "device_did" => Ok(ToolKind::DeviceDid),
             "wallet_address" => Ok(ToolKind::WalletAddress),
             "wallet_sign" => Ok(ToolKind::WalletSign),
+            "wallet_sign_tx" => Ok(ToolKind::WalletSignTx),
             "chain_balance" => Ok(ToolKind::ChainBalance),
             "chain_nonce" => Ok(ToolKind::ChainNonce),
             "chain_tx" => Ok(ToolKind::ChainTx),
@@ -379,6 +507,17 @@ where
                 }
                 Ok((json!({ "hash": raw }).to_string(), Some(raw.to_string())))
             }
+            ToolKind::WalletSignTx => {
+                let tx = crate::tx::parse_unsigned(arguments).map_err(|code| {
+                    if code == "raw" {
+                        self.err("host-tx-raw")
+                    } else {
+                        self.err("host-tx-fields")
+                    }
+                })?;
+                Ok((crate::tx::canonical(&tx), Some(tx.to_hex)))
+            }
+            ToolKind::Broadcast => Err(self.err("host-tx-raw")),
             ToolKind::WalletSign => {
                 let raw = arguments
                     .get("message")
@@ -417,6 +556,18 @@ where
                 "wallet-sign-summary",
                 "wallet-sign-impact",
             ),
+            ToolKind::WalletSignTx => (
+                "wallet_sign_tx",
+                IntentTier::L2,
+                "tx-sign-summary",
+                "tx-sign-impact",
+            ),
+            ToolKind::Broadcast => (
+                "chain_broadcast",
+                IntentTier::L2,
+                "broadcast-sheet-title",
+                "broadcast-sheet-detail",
+            ),
             ToolKind::ChainBalance => (
                 "chain_balance",
                 IntentTier::L0,
@@ -446,7 +597,7 @@ where
         }
     }
 
-    fn execute(&self, pending: &Pending) -> Result<String, String> {
+    fn execute(&mut self, pending: &Pending) -> Result<String, String> {
         match pending.kind {
             ToolKind::DeviceDid => {
                 Ok(self.outcome_text_args("host-did", &[("did", self.device.did())]))
@@ -466,6 +617,29 @@ where
                     Err(_) => Err(self.outcome_text("host-wallet-failed")),
                 }
             }
+            ToolKind::WalletSignTx => {
+                let tx = crate::tx::parse_stored(&pending.arguments)
+                    .map_err(|_| self.outcome_text("host-tx-fields"))?;
+                match self.wallet.sign_legacy(
+                    tx.chain_id,
+                    tx.nonce,
+                    tx.gas_price,
+                    tx.gas_limit,
+                    &tx.to,
+                    &tx.value,
+                    &tx.data,
+                ) {
+                    Ok(raw) => {
+                        self.staged_raw = Some(raw);
+                        Ok(self.outcome_text_args(
+                            "host-tx-signed",
+                            &[("to", tx.to_hex.as_str()), ("value", tx.value_dec.as_str())],
+                        ))
+                    }
+                    Err(_) => Err(self.outcome_text("host-wallet-failed")),
+                }
+            }
+            ToolKind::Broadcast => Err(self.outcome_text("host-broadcast-held")),
             ToolKind::ChainBalance | ToolKind::ChainNonce | ToolKind::ChainTx => {
                 self.execute_chain(pending)
             }
@@ -564,6 +738,7 @@ fn is_host_tool(name: &str) -> bool {
         "device_did"
             | "wallet_address"
             | "wallet_sign"
+            | "wallet_sign_tx"
             | "chain_balance"
             | "chain_nonce"
             | "chain_tx"
@@ -583,15 +758,17 @@ fn tool_name(kind: ToolKind) -> &'static str {
         ToolKind::DeviceDid => "device_did",
         ToolKind::WalletAddress => "wallet_address",
         ToolKind::WalletSign => "wallet_sign",
+        ToolKind::WalletSignTx => "wallet_sign_tx",
         ToolKind::ChainBalance => "chain_balance",
         ToolKind::ChainNonce => "chain_nonce",
         ToolKind::ChainTx => "chain_tx",
+        ToolKind::Broadcast => "chain_broadcast",
     }
 }
 
 fn tool_tier(kind: ToolKind) -> IntentTier {
     match kind {
-        ToolKind::WalletSign => IntentTier::L2,
+        ToolKind::WalletSign | ToolKind::WalletSignTx | ToolKind::Broadcast => IntentTier::L2,
         ToolKind::DeviceDid
         | ToolKind::WalletAddress
         | ToolKind::ChainBalance
@@ -622,6 +799,23 @@ pub fn host_catalog(locale: &str) -> Value {
                     "type": "object",
                     "properties": { "message": { "type": "string" } },
                     "required": ["message"]
+                })
+            ),
+            tool(
+                "wallet_sign_tx",
+                &copy::line(locale, "tool-wallet-sign-tx", &[]),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "chain_id": { "type": "integer" },
+                        "nonce": { "type": "integer" },
+                        "gas_price": { "type": "string" },
+                        "gas_limit": { "type": "integer" },
+                        "to": { "type": "string" },
+                        "value": { "type": "string" },
+                        "data": { "type": "string" }
+                    },
+                    "required": ["chain_id", "nonce", "gas_price", "gas_limit", "to", "value"]
                 })
             ),
             tool("chain_balance", &copy::line(locale, "tool-chain-balance", &[]), json!({})),
@@ -725,6 +919,31 @@ pub fn submit_host(body: &str) -> Result<HostTicket, HostSubmitError> {
             message: copy::line(&locale, "host-bad-hash", &[]),
         });
     }
+    if name == "wallet_sign_tx" {
+        let tx = match crate::tx::parse_unsigned(&arguments) {
+            Ok(tx) => tx,
+            Err(code) => {
+                let key = if code == "raw" {
+                    "host-tx-raw"
+                } else {
+                    "host-tx-fields"
+                };
+                return Err(HostSubmitError {
+                    pending: false,
+                    message: copy::line(&locale, key, &[]),
+                });
+            }
+        };
+        let preview = tx.to_hex.clone();
+        let message = crate::tx::canonical(&tx);
+        let ticket = HostTicket {
+            name: name.to_string(),
+            summary: copy::line(&locale, "tx-sign-summary", &[("preview", preview.as_str())]),
+            impact: copy::line(&locale, "tx-sign-impact", &[]),
+            message,
+        };
+        return store_ticket(&locale, ticket);
+    }
     if name == "wallet_sign" && (message.is_empty() || message.len() > MAX_MESSAGE_BYTES) {
         let key = if message.is_empty() {
             "host-missing-message"
@@ -751,11 +970,15 @@ pub fn submit_host(body: &str) -> Result<HostTicket, HostSubmitError> {
         impact: copy::line(&locale, impact_key, &[]),
         message,
     };
+    store_ticket(&locale, ticket)
+}
+
+fn store_ticket(locale: &str, ticket: HostTicket) -> Result<HostTicket, HostSubmitError> {
     let mut mail = lock_mail();
     if mail.request.is_some() {
         return Err(HostSubmitError {
             pending: true,
-            message: copy::line(&locale, "host-pending", &[]),
+            message: copy::line(locale, "host-pending", &[]),
         });
     }
     mail.receipt = None;
@@ -1040,6 +1263,24 @@ mod tests {
             }
             Ok(format!("0xsig:{message}"))
         }
+
+        fn sign_legacy(
+            &self,
+            chain_id: u64,
+            _nonce: u64,
+            _gas_price: u128,
+            _gas_limit: u64,
+            _to: &[u8; 20],
+            _value: &[u8; 32],
+            _data: &[u8],
+        ) -> Result<String, String> {
+            self.signs.set(self.signs.get() + 1);
+            if self.fail {
+                return Err("no".into());
+            }
+            let _ = chain_id;
+            Ok(format!("0x{}", "ab".repeat(80)))
+        }
     }
 
     fn harness(fail: bool) -> ToolHost<FakeDevice, FakeWallet> {
@@ -1090,6 +1331,7 @@ mod tests {
                 "device_did",
                 "wallet_address",
                 "wallet_sign",
+                "wallet_sign_tx",
                 "chain_balance",
                 "chain_nonce",
                 "chain_tx"
@@ -1280,6 +1522,9 @@ mod tests {
             Ok(r#"{"jsonrpc":"2.0","id":1,"result":"0xa"}"#.into())
         } else if body.contains("eth_getTransactionReceipt") {
             Ok(r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into())
+        } else if body.contains("eth_sendRawTransaction") {
+            let hash = format!("0x{}", "cd".repeat(32));
+            Ok(format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{hash}"}}"#))
         } else {
             Err("unexpected method".into())
         }
@@ -1332,5 +1577,100 @@ mod tests {
                 .is_err()
         );
         assert_eq!(host.wallet.signs.get(), 0);
+    }
+
+    fn sample_tx() -> Value {
+        json!({
+            "chain_id": 1,
+            "nonce": 7,
+            "gas_price": "1000000000",
+            "gas_limit": 21000,
+            "to": "0x1111111111111111111111111111111111111111",
+            "value": "1",
+            "data": "0x"
+        })
+    }
+
+    #[test]
+    fn signing_a_transaction_does_not_broadcast_until_a_second_confirm() {
+        CHAIN_CALLS.with(|slot| slot.borrow_mut().clear());
+        let mut host = harness(false);
+        host.set_chain_transport(record_chain);
+        host.set_locale("zh-CN");
+        host.set_unlocked(true);
+        let proposal = host.propose("wallet_sign_tx", &sample_tx()).unwrap();
+        assert_eq!(proposal.tier, IntentTier::L2);
+        assert!(proposal.summary.contains("1111"));
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        assert_eq!(host.wallet.signs.get(), 0);
+        host.cancel().unwrap();
+        let mut smuggled = sample_tx();
+        smuggled
+            .as_object_mut()
+            .unwrap()
+            .insert("raw".into(), json!("0xabcd"));
+        assert!(host.propose("wallet_sign_tx", &smuggled).is_err());
+
+        host.set_unlocked(false);
+        host.propose("wallet_sign_tx", &sample_tx()).unwrap();
+        let locked = host.confirm().unwrap();
+        assert_eq!(locked.decision, Decision::Denied);
+        assert_eq!(locked.tier, IntentTier::L2);
+        assert_eq!(host.wallet.signs.get(), 0);
+        assert!(host.broadcast().is_err());
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+
+        host.set_unlocked(true);
+        host.propose("wallet_sign_tx", &sample_tx()).unwrap();
+        let signed = host.confirm().unwrap();
+        assert_eq!(signed.operation_id, 3);
+        assert_eq!(signed.decision, Decision::Allowed);
+        assert_eq!(signed.command, "wallet_sign_tx");
+        assert!(signed.outcome.contains("还没有广播"));
+        assert!(!signed.outcome.contains("abab"));
+        assert!(!signed.arguments.contains("abab"));
+        assert!(!signed.arguments.contains("eth_send"));
+        let line = crate::intent::format_signed_receipt_line(&signed);
+        assert!(!line.contains(&signed.signature));
+        assert!(!line.contains("abab"));
+        assert_eq!(host.wallet.signs.get(), 1);
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        assert!(host.propose("wallet_sign_tx", &sample_tx()).is_err());
+
+        let refused = host.broadcast().unwrap();
+        assert_eq!(refused.decision, Decision::Denied);
+        assert_eq!(refused.command, "chain_broadcast");
+        assert_eq!(refused.operation_id, 4);
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        assert!(!refused.outcome.contains("abab"));
+
+        host.propose("wallet_sign_tx", &sample_tx()).unwrap();
+        host.confirm().unwrap();
+        let held = host.decline_broadcast().unwrap();
+        assert_eq!(held.decision, Decision::Cancelled);
+        assert!(!held.confirmed);
+        assert!(CHAIN_CALLS.with(|slot| slot.borrow().is_empty()));
+        assert!(!held.outcome.contains("abab"));
+
+        host.propose("wallet_sign_tx", &sample_tx()).unwrap();
+        let signed = host.confirm().unwrap();
+        let raw = format!("0x{}", "ab".repeat(80));
+        assert!(!signed.outcome.contains(&raw));
+        host.set_chain_endpoint("http://127.0.0.1:8545");
+        let sent = host.broadcast().unwrap();
+        assert_eq!(sent.decision, Decision::Allowed);
+        assert!(sent.outcome.contains("0x"));
+        assert!(!sent.outcome.contains(&raw));
+        assert!(!sent.arguments.contains(&raw));
+        let calls = CHAIN_CALLS.with(|slot| slot.borrow().clone());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "http://127.0.0.1:8545");
+        assert!(calls[0].1.contains("eth_sendRawTransaction"));
+        assert!(calls[0].1.contains(&raw));
+        assert!(!calls[0].1.contains("eth_getBalance"));
+        assert!(
+            host.propose("chain_broadcast", &json!({"raw": raw}))
+                .is_err()
+        );
     }
 }

@@ -40,6 +40,21 @@ impl ChainWallet for Wallet {
         self.signs.set(self.signs.get() + 1);
         self.inner.sign_personal(message)
     }
+
+    fn sign_legacy(
+        &self,
+        chain_id: u64,
+        nonce: u64,
+        gas_price: u128,
+        gas_limit: u64,
+        to: &[u8; 20],
+        value: &[u8; 32],
+        data: &[u8],
+    ) -> Result<String, String> {
+        self.signs.set(self.signs.get() + 1);
+        self.inner
+            .sign_legacy(chain_id, nonce, gas_price, gas_limit, to, value, data)
+    }
 }
 
 #[test]

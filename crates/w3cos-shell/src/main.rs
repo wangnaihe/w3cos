@@ -83,6 +83,7 @@ const TOOL_SIGNAL: usize = 43;
 const HOST_SIGNAL: usize = 44;
 const CHAIN_RPC_SIGNAL: usize = 45;
 const CHAIN_SIGNAL: usize = 46;
+const BROADCAST_SIGNAL: usize = 47;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -205,6 +206,8 @@ const OP_SIGN_DENY: u8 = 120;
 const OP_CHAIN_ONCE: u8 = 121;
 const OP_CHAIN_DENY: u8 = 122;
 const OP_CHAIN_SAVE: u8 = 123;
+const OP_TX_SEND: u8 = 124;
+const OP_TX_HOLD: u8 = 125;
 
 fn main() {
     shell_main();
@@ -288,8 +291,14 @@ fn bridge_mcp_propose(name: &str) {
 
 fn bridge_host_propose(name: &str, summary: &str, impact: &str, message: &str) {
     ensure_shell_signals();
-    if name == "wallet_sign" {
-        state::set_text_signal(SIGN_MESSAGE_SIGNAL, message);
+    if name == "wallet_sign" || name == "wallet_sign_tx" {
+        let shown = if name == "wallet_sign_tx" {
+            w3cos_ai_bridge::tx::preview_from_json(&locale::current(), message)
+                .unwrap_or_else(|| message.to_string())
+        } else {
+            message.to_string()
+        };
+        state::set_text_signal(SIGN_MESSAGE_SIGNAL, &shown);
         state::set_text_signal(SIGN_SUMMARY_SIGNAL, summary);
         state::set_text_signal(SIGN_IMPACT_SIGNAL, impact);
         state::set_signal(SIGN_SIGNAL, 1);
@@ -447,6 +456,7 @@ fn ensure_shell_signals() {
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
         let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
         let _ = state::create_signal(0);
     });
 }
@@ -730,6 +740,8 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_SIGN_PROPOSE => open_sign_permission(session, draft),
         OP_SIGN_ONCE => accept_sign_permission(session),
         OP_SIGN_DENY => deny_sign_permission(session),
+        OP_TX_SEND => accept_broadcast(session),
+        OP_TX_HOLD => deny_broadcast(session),
         OP_CHAIN_ONCE => accept_chain_read(session),
         OP_CHAIN_DENY => deny_chain_read(session),
         OP_CHAIN_SAVE => save_chain_endpoint(session, draft),
@@ -1694,13 +1706,118 @@ fn accept_sign_permission(session: &mut IntentSession) {
     apply_host_mail(session);
     match sign_host::confirm(true, &locale::current(), now_ms()) {
         Ok(receipt) => {
+            let offer_broadcast =
+                receipt.command == "wallet_sign_tx" && receipt.decision == Decision::Allowed;
             publish_host_receipt(&receipt);
             session.record_signed(receipt);
             state::set_signal(SIGN_SIGNAL, 0);
+            if offer_broadcast {
+                state::set_signal(BROADCAST_SIGNAL, 1);
+                state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+                state::request_focus_label(&locale::t("broadcast-deny"));
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("sign-allowed-notice"),
+                );
+            } else {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("sign-allowed-notice"),
+                );
+                restore_after_dialog();
+            }
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
+fn sample_tx_json() -> String {
+    r#"{"chain_id":1,"nonce":7,"gas_price":"1000000000","gas_limit":21000,"to":"0x1111111111111111111111111111111111111111","value":"1","data":"0x"}"#
+        .to_string()
+}
+
+fn open_tx_permission(session: &mut IntentSession) {
+    let raw = sample_tx_json();
+    let unlocked = session.identity_unlocked();
+    match sign_host::propose_tool(
+        "wallet_sign_tx",
+        &raw,
+        unlocked,
+        &locale::current(),
+        now_ms(),
+        session.signed_high_water().saturating_add(1),
+    ) {
+        Ok(proposal) => {
+            let shown = w3cos_ai_bridge::tx::preview_from_json(&locale::current(), &raw)
+                .unwrap_or_default();
+            state::set_text_signal(SIGN_MESSAGE_SIGNAL, &shown);
+            state::set_text_signal(SIGN_SUMMARY_SIGNAL, &proposal.summary);
+            state::set_text_signal(SIGN_IMPACT_SIGNAL, &proposal.impact);
+            state::set_signal(SIGN_SIGNAL, 1);
+            state::set_signal(BROADCAST_SIGNAL, 0);
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+            if unlocked {
+                state::request_focus_label(&locale::t("sign-deny"));
+            }
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
+fn accept_broadcast(session: &mut IntentSession) {
+    if state::get_signal(BROADCAST_SIGNAL) == 0 {
+        return;
+    }
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("broadcast-locked"),
+        );
+        return;
+    }
+    sign_host::set_chain_endpoint(&state::get_signal_text(CHAIN_RPC_SIGNAL));
+    match sign_host::broadcast(true, &locale::current(), now_ms()) {
+        Ok(receipt) => {
+            let sent = receipt.decision == Decision::Allowed;
+            publish_host_receipt(&receipt);
+            session.record_signed(receipt);
+            state::set_signal(BROADCAST_SIGNAL, 0);
+            let key = if sent {
+                "broadcast-sent-notice"
+            } else {
+                "broadcast-held-notice"
+            };
+            sync_session(session, state::get_signal(PHASE_SIGNAL), &locale::t(key));
+            restore_after_dialog();
+        }
+        Err(text) => sync_session(session, state::get_signal(PHASE_SIGNAL), &text),
+    }
+}
+
+fn deny_broadcast(session: &mut IntentSession) {
+    if state::get_signal(BROADCAST_SIGNAL) == 0 {
+        return;
+    }
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("broadcast-locked"),
+        );
+        return;
+    }
+    match sign_host::decline_broadcast(&locale::current(), now_ms()) {
+        Ok(receipt) => {
+            publish_host_receipt(&receipt);
+            session.record_signed(receipt);
+            state::set_signal(BROADCAST_SIGNAL, 0);
             sync_session(
                 session,
                 state::get_signal(PHASE_SIGNAL),
-                &locale::t("sign-allowed-notice"),
+                &locale::t("broadcast-held-notice"),
             );
             restore_after_dialog();
         }
@@ -2021,6 +2138,10 @@ fn dismiss_top_layer() -> bool {
     if state::get_signal(UNLOCKED_SIGNAL) == 0 {
         return false;
     }
+    if state::get_signal(BROADCAST_SIGNAL) != 0 {
+        with_session(deny_broadcast);
+        return true;
+    }
     if state::get_signal(SIGN_SIGNAL) != 0 {
         with_session(deny_sign_permission);
         return true;
@@ -2064,6 +2185,7 @@ fn dismiss_top_layer() -> bool {
 /// label focus only matches buttons.
 fn restore_after_dialog() {
     if state::get_signal(SIGN_SIGNAL) != 0
+        || state::get_signal(BROADCAST_SIGNAL) != 0
         || state::get_signal(PERM_SIGNAL) != 0
         || state::get_signal(CHAIN_SIGNAL) != 0
     {
@@ -2095,6 +2217,7 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
         state::get_signal(PHASE_SIGNAL) == 1,
         state::get_signal(PERM_SIGNAL) != 0
             || state::get_signal(SIGN_SIGNAL) != 0
+            || state::get_signal(BROADCAST_SIGNAL) != 0
             || state::get_signal(CHAIN_SIGNAL) != 0,
         state::get_signal(SWITCHER_SIGNAL) != 0,
     );
@@ -2125,6 +2248,7 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
 fn edge_back() -> bool {
     if state::get_signal(PERM_SIGNAL) != 0
         || state::get_signal(SIGN_SIGNAL) != 0
+        || state::get_signal(BROADCAST_SIGNAL) != 0
         || state::get_signal(CHAIN_SIGNAL) != 0
         || state::get_signal(PHASE_SIGNAL) == 1
     {
@@ -2671,6 +2795,21 @@ fn apply_screen_override() {
         Some("http-confirm") => show_tool_confirm("click"),
         Some("host-confirm") => show_host_confirm(),
         Some("chain-read") => show_chain_read(),
+        Some("tx-sign") => {
+            present_settings(1, 0);
+            state::set_text_signal(CHAIN_RPC_SIGNAL, "http://127.0.0.1:8545");
+            with_session(open_tx_permission);
+        }
+        Some("tx-broadcast") => {
+            present_settings(1, 0);
+            state::set_text_signal(CHAIN_RPC_SIGNAL, "http://127.0.0.1:8545");
+            with_session(|session| {
+                if session.identity_unlocked() {
+                    open_tx_permission(session);
+                    accept_sign_permission(session);
+                }
+            });
+        }
         Some("passkey") => {
             present_settings(1, 0);
             with_session(|session| {
@@ -3018,7 +3157,15 @@ fn build_shell() -> Component {
         column.push(permission_layer(build_permission_sheet()));
     }
     if state::get_signal(SIGN_SIGNAL) != 0 {
-        column.push(place_modal(build_sign_sheet(), false, 520.0));
+        let tall = state::get_signal_text(SIGN_MESSAGE_SIGNAL).contains('\n');
+        column.push(place_modal(
+            build_sign_sheet(),
+            false,
+            if tall { 680.0 } else { 520.0 },
+        ));
+    }
+    if state::get_signal(BROADCAST_SIGNAL) != 0 {
+        column.push(place_modal(build_broadcast_sheet(), false, 680.0));
     }
     if state::get_signal(CHAIN_SIGNAL) != 0 {
         column.push(place_modal(build_chain_sheet(), false, 480.0));
@@ -3080,7 +3227,9 @@ fn trap_modal_focus(root: &mut Component) {
     if state::get_signal(UNLOCKED_SIGNAL) == 0 && !screenshot_shows_locked_permission() {
         return;
     }
-    let role = if state::get_signal(SIGN_SIGNAL) != 0 {
+    let role = if state::get_signal(BROADCAST_SIGNAL) != 0 {
+        "broadcast"
+    } else if state::get_signal(SIGN_SIGNAL) != 0 {
         "sign"
     } else if state::get_signal(CHAIN_SIGNAL) != 0 {
         "chain"
@@ -4971,17 +5120,7 @@ fn build_sign_sheet() -> Component {
             ..Style::default()
         },
     ));
-    if !message.is_empty() {
-        rows.push(Component::text(
-            message,
-            Style {
-                font_size: 13.0,
-                color: Color::from_hex("#f0d7b4"),
-                font_family: Some("ui-monospace, monospace".to_string()),
-                ..Style::default()
-            },
-        ));
-    }
+    rows.extend(message_rows(&message));
     let mut deny = if unlocked {
         sheet_button(locale::t("sign-deny"), OP_SIGN_DENY, SheetKind::Danger)
     } else {
@@ -5013,6 +5152,118 @@ fn build_sign_sheet() -> Component {
     ));
     let mut card = permission_shell(rows);
     mark_dialog(&mut card, "sign");
+    card
+}
+
+fn message_rows(message: &str) -> Vec<Component> {
+    message
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            Component::text(
+                line.to_string(),
+                Style {
+                    font_size: 13.0,
+                    color: Color::from_hex("#f0d7b4"),
+                    font_family: Some("ui-monospace, monospace".to_string()),
+                    ..Style::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn build_broadcast_sheet() -> Component {
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let endpoint = state::get_signal_text(CHAIN_RPC_SIGNAL);
+    let origin = w3cos_ai_bridge::chain::parse_endpoint(&endpoint)
+        .map(|parsed| parsed.origin)
+        .unwrap_or_default();
+    let mut rows = vec![
+        Component::text(
+            locale::t("broadcast-cap-title"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#e2a45c"),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t("broadcast-sheet-title"),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+    ];
+    if let Some(mark) = layer_mark("L2") {
+        rows.push(mark);
+    }
+    rows.push(Component::text(
+        if unlocked {
+            locale::t("broadcast-sheet-detail")
+        } else {
+            locale::t("broadcast-locked")
+        },
+        Style {
+            font_size: 14.0,
+            color: Color::from_hex("#f0d7b4"),
+            ..Style::default()
+        },
+    ));
+    rows.extend(message_rows(&state::get_signal_text(SIGN_MESSAGE_SIGNAL)));
+    let scope = if origin.is_empty() {
+        locale::t("broadcast-sheet-empty")
+    } else {
+        locale::t_args("broadcast-sheet-scope", &[("origin", &origin)])
+    };
+    rows.push(Component::text(
+        scope,
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#fff4e5"),
+            background: Color::rgba(226, 164, 92, 28),
+            border_radius: 12.0,
+            padding: Edges::all(12.0),
+            ..Style::default()
+        },
+    ));
+    let mut deny = if unlocked {
+        sheet_button(locale::t("broadcast-deny"), OP_TX_HOLD, SheetKind::Danger)
+    } else {
+        disabled_choice(locale::t("broadcast-deny"))
+    };
+    let once = if unlocked {
+        sheet_button(locale::t("broadcast-once"), OP_TX_SEND, SheetKind::Warm)
+    } else {
+        disabled_choice(locale::t("broadcast-once"))
+    };
+    if unlocked {
+        mark_initial_focus(&mut deny);
+    }
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![deny, once],
+    ));
+    rows.push(Component::text(
+        locale::t("broadcast-footnote"),
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#e2a45c"),
+            ..Style::default()
+        },
+    ));
+    let mut card = permission_shell(rows);
+    mark_dialog(&mut card, "broadcast");
     card
 }
 
@@ -10866,6 +11117,188 @@ mod shell_ux_tests {
         state::note_pointer_coarse(false);
         state::note_shell_viewport(1200.0, 800.0);
         state::set_signal(CHAIN_SIGNAL, 0);
+    }
+
+    #[test]
+    fn tx_sheet_decodes_fields_and_broadcast_is_a_second_confirm() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        sign_host::reset();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-tx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::note_pointer_coarse(false);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(SIGN_SIGNAL, 0);
+        state::set_signal(BROADCAST_SIGNAL, 0);
+        state::set_signal(CHAIN_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_text_signal(CHAIN_RPC_SIGNAL, "http://127.0.0.1:8545");
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        with_session(open_tx_permission);
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 1);
+        assert_eq!(state::get_signal(BROADCAST_SIGNAL), 0);
+        let sheet = build_sign_sheet();
+        let blob = text_blob(&sheet);
+        assert!(blob.contains("签署这笔交易"), "{blob}");
+        assert!(
+            blob.contains("收款 0x1111111111111111111111111111111111111111"),
+            "{blob}"
+        );
+        assert!(blob.contains("金额 1 wei"), "{blob}");
+        assert!(blob.contains("nonce 7"), "{blob}");
+        assert!(blob.contains("这一步不会广播"), "{blob}");
+        assert!(!blob.contains("广播这一次"), "{blob}");
+        assert!(!long_hex(&blob), "{blob}");
+        assert_eq!(codes_for(&sheet, "签这一次"), vec![OP_SIGN_ONCE]);
+        assert_eq!(codes_for(&sheet, "不签"), vec![OP_SIGN_DENY]);
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        let phone = build_sign_sheet();
+        let (_, _, _, height) = button_face(&phone, "签这一次");
+        assert!(height >= 48.0, "{height}");
+
+        on_shell_intent(OP_SIGN_DENY, "");
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::note_pointer_coarse(false);
+        with_session(open_tx_permission);
+        let english = text_blob(&build_sign_sheet());
+        assert!(english.contains("Sign this transaction"), "{english}");
+        assert!(
+            english.contains("To 0x1111111111111111111111111111111111111111"),
+            "{english}"
+        );
+        assert!(english.contains("Amount 1 wei"), "{english}");
+        assert!(
+            english.contains("This step does not broadcast"),
+            "{english}"
+        );
+        assert_eq!(
+            codes_for(&build_sign_sheet(), "Sign once"),
+            vec![OP_SIGN_ONCE]
+        );
+        on_shell_intent(OP_SIGN_DENY, "");
+
+        locale::set_locale("zh-CN");
+        with_session(open_tx_permission);
+        on_shell_intent(OP_SIGN_ONCE, "");
+        assert_eq!(state::get_signal(SIGN_SIGNAL), 0);
+        assert_eq!(state::get_signal(BROADCAST_SIGNAL), 1);
+        let signed = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(signed.contains("wallet_sign_tx"), "{signed}");
+        assert!(signed.contains("allowed"), "{signed}");
+        assert!(signed.contains("signed=1"), "{signed}");
+        assert!(signed.contains("还没有广播"), "{signed}");
+        assert!(!long_hex(&signed), "{signed}");
+        let broadcast = text_blob(&build_broadcast_sheet());
+        assert!(broadcast.contains("把刚签的这笔发出去"), "{broadcast}");
+        assert!(
+            broadcast.contains("收款 0x1111111111111111111111111111111111111111"),
+            "{broadcast}"
+        );
+        assert!(broadcast.contains("http://127.0.0.1:8545"), "{broadcast}");
+        assert!(broadcast.contains("另一次确认"), "{broadcast}");
+        assert!(!long_hex(&broadcast), "{broadcast}");
+        assert_eq!(
+            codes_for(&build_broadcast_sheet(), "不广播"),
+            vec![OP_TX_HOLD]
+        );
+        assert_eq!(
+            codes_for(&build_broadcast_sheet(), "广播这一次"),
+            vec![OP_TX_SEND]
+        );
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        let phone_send = build_broadcast_sheet();
+        let (_, _, _, send_h) = button_face(&phone_send, "广播这一次");
+        assert!(send_h >= 48.0, "{send_h}");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+
+        state::set_text_signal(CHAIN_RPC_SIGNAL, "");
+        on_shell_intent(OP_TX_SEND, "");
+        assert_eq!(state::get_signal(BROADCAST_SIGNAL), 0);
+        let missed = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(missed.contains("chain_broadcast"), "{missed}");
+        assert!(missed.contains("denied"), "{missed}");
+        assert!(missed.contains("还没有节点"), "{missed}");
+        assert!(!long_hex(&missed), "{missed}");
+
+        state::set_text_signal(CHAIN_RPC_SIGNAL, "http://127.0.0.1:8545");
+        with_session(open_tx_permission);
+        on_shell_intent(OP_SIGN_ONCE, "");
+        assert_eq!(state::get_signal(BROADCAST_SIGNAL), 1);
+        on_shell_intent(OP_TX_HOLD, "");
+        assert_eq!(state::get_signal(BROADCAST_SIGNAL), 0);
+        let held = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(held.contains("cancelled"), "{held}");
+        assert!(held.contains("没有广播"), "{held}");
+        assert!(!long_hex(&held), "{held}");
+
+        locale::set_locale("en");
+        with_session(open_tx_permission);
+        on_shell_intent(OP_SIGN_ONCE, "");
+        let english_send = text_blob(&build_broadcast_sheet());
+        assert!(
+            english_send.contains("Send the transaction just signed"),
+            "{english_send}"
+        );
+        assert!(
+            english_send.contains("Endpoint http://127.0.0.1:8545"),
+            "{english_send}"
+        );
+        assert!(english_send.contains("separate confirm"), "{english_send}");
+        assert_eq!(
+            codes_for(&build_broadcast_sheet(), "Don't broadcast"),
+            vec![OP_TX_HOLD]
+        );
+        on_shell_intent(OP_TX_HOLD, "");
+
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(SIGN_SIGNAL, 0);
+        state::set_signal(BROADCAST_SIGNAL, 0);
+        sign_host::reset();
+        drop(isolated);
+    }
+
+    fn long_hex(text: &str) -> bool {
+        let mut run = 0;
+        for byte in text.bytes() {
+            if byte.is_ascii_hexdigit() {
+                run += 1;
+                if run >= 70 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
     }
 
     fn passkey_binds_the_device_did_and_keeps_the_pairing_fingerprint() {

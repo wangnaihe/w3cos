@@ -6,6 +6,10 @@ license.workspace = true
 description = "Decentralized transport for w3cos multi-device handoff"
 
 [dependencies]
+alloy-consensus = { version = "2.5", default-features = false, features = ["std", "k256"] }
+alloy-eips = { version = "2.5", default-features = false, features = ["std"] }
+alloy-network = { version = "2.5", default-features = false }
+alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
 alloy-signer = "2.5"
 alloy-signer-local = "2.5"
 bs58 = "0.5.1"
