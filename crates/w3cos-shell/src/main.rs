@@ -178,6 +178,7 @@ const OP_LEXICON_CLEAR: u8 = 103;
 const OP_SETTINGS_LANGUAGE: u8 = 104;
 const OP_SETTINGS_BACK: u8 = 105;
 const OP_NOTIFY_OPEN: u8 = 106;
+const OP_PAIR_IMPORT: u8 = 107;
 
 fn main() {
     shell_main();
@@ -1788,7 +1789,7 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::set_signal(RECEIPT_PAGE_SIGNAL, page);
         }
         OP_CLOCK => {
-            if handoff::note_clock() {
+            if handoff::note_clock() || handoff::poll_transport() {
                 state::mark_dirty();
             }
             let now = live_clock();
@@ -1885,6 +1886,11 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_PAIR_YES => {
             let _ = handoff::codes_match();
             state::mark_dirty();
+        }
+        OP_PAIR_IMPORT => {
+            if handoff::import_pairing_payload(draft) {
+                state::mark_dirty();
+            }
         }
         OP_SYNC_RECEIPTS => {
             handoff::allow_receipt_sync();
@@ -2238,6 +2244,7 @@ fn apply_screen_override() {
 
 fn build_shell() -> Component {
     ensure_shell_signals();
+    let _ = handoff::poll_transport();
     if let Some(session) = windows::load_once() {
         let agent = app_bit(4);
         let retired =
@@ -5171,33 +5178,61 @@ fn settings_page(tab: i64) -> Vec<Component> {
     }
 }
 
+fn device_line(label: String, color: Color) -> Component {
+    let text = Component::text(
+        label,
+        Style {
+            font_size: 14.0,
+            color,
+            ..Style::default()
+        },
+    );
+    if state::pointer_is_coarse() {
+        Component::row(
+            Style {
+                min_height: Dimension::Px(48.0),
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![text],
+        )
+    } else {
+        text
+    }
+}
+
 fn settings_devices_page() -> Vec<Component> {
     let mut page = settings_heading(
         &locale::t("settings-devices-nav"),
         &locale::t("settings-devices-detail"),
     );
     let fingerprint = truncate_middle(&handoff::local_fingerprint(), 28);
-    page.push(Component::text(
+    page.push(device_line(
         format!("{} · {fingerprint}", handoff::local_name()),
-        Style {
-            font_size: 14.0,
-            color: ink(),
-            ..Style::default()
-        },
+        ink(),
     ));
+    let qr = handoff::pairing_qr_svg();
+    if qr.contains("<svg") {
+        page.push(Component::svg_document(
+            qr,
+            132,
+            132,
+            Style {
+                width: Dimension::Px(132.0),
+                height: Dimension::Px(132.0),
+                ..Style::default()
+            },
+        ));
+    }
     if let Some(peer) = handoff::pending_peer() {
         let (grouped, spaced) = handoff::short_code(
             &handoff::local_fingerprint(),
             &peer.fingerprint,
             &peer.nonce,
         );
-        page.push(Component::text(
+        page.push(device_line(
             format!("{} · {}", peer.name, locale::t("pair-pending")),
-            Style {
-                font_size: 14.0,
-                color: Color::from_hex("#f0d7b4"),
-                ..Style::default()
-            },
+            Color::from_hex("#f0d7b4"),
         ));
         page.push(Component::text(
             grouped,
@@ -5238,20 +5273,37 @@ fn settings_devices_page() -> Vec<Component> {
     } else {
         for peer in handoff::peers() {
             let state = if peer.trusted {
-                locale::t("pair-trusted-short")
+                format!(
+                    "{} · {}",
+                    locale::t("pair-trusted-short"),
+                    locale::t(peer.link.message_id())
+                )
             } else {
-                locale::t("pair-pending")
+                locale::t("pair-pending").to_string()
             };
-            page.push(Component::text(
-                format!("{} · {state}", peer.name),
-                Style {
-                    font_size: 14.0,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ));
+            page.push(device_line(format!("{} · {state}", peer.name), ink()));
         }
     }
+    let placeholder = locale::t("pair-paste-placeholder");
+    page.push(Component::text_input(
+        "",
+        placeholder.clone(),
+        Style {
+            min_height: Dimension::Px(touch_min()),
+            font_size: 14.0,
+            color: ink(),
+            background: Color::from_hex("#101820"),
+            border_radius: 10.0,
+            padding: Edges::xy(12.0, 8.0),
+            ..Style::default()
+        },
+    ));
+    let mut import = chrome_button(locale::t("pair-paste-button"), OP_PAIR_IMPORT, "#3d5570");
+    import.on_click = EventAction::Invoke {
+        code: OP_PAIR_IMPORT,
+        input_placeholder: placeholder,
+    };
+    page.push(import);
     if let Some(kind) = handoff::banner_kind() {
         let copy = match kind {
             handoff::BannerKind::Sending => locale::t("handoff-sending"),
@@ -5339,6 +5391,15 @@ fn build_handoff_banner() -> Component {
                     Style {
                         font_size: 12.0,
                         color: muted_ink(),
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    locale::t(handoff::offer_link().message_id()),
+                    Style {
+                        font_size: 12.0,
+                        font_weight: 650,
+                        color: Color::from_hex("#f0d7b4"),
                         ..Style::default()
                     },
                 ),

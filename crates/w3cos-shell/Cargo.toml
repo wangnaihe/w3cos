@@ -17,6 +17,8 @@ ai-bridge = ["w3cos-runtime/ai-bridge"]
 
 [dependencies]
 chrono = { workspace = true, features = ["clock"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+w3cos-p2p = { path = "../w3cos-p2p" }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 getrandom = "0.2"
 sha2 = "0.10"

@@ -1,0 +1,42 @@
+[package]
+name = "w3cos-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decentralized transport for w3cos multi-device handoff"
+
+[dependencies]
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+futures = "0.3"
+getrandom = "0.2"
+k256 = { version = "0.13", features = ["schnorr"] }
+libp2p = { version = "0.57.1", default-features = false, features = [
+    "autonat",
+    "cbor",
+    "dcutr",
+    "dns",
+    "ed25519",
+    "identify",
+    "kad",
+    "macros",
+    "mdns",
+    "noise",
+    "ping",
+    "quic",
+    "relay",
+    "request-response",
+    "tokio",
+    "yamux",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tungstenite = { version = "0.26", default-features = false, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
+
+[dev-dependencies]
+libp2p-quic = { version = "0.14", default-features = false, features = ["tokio"] }
