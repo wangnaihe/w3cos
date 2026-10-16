@@ -11,6 +11,8 @@ mod agent_host;
 mod gesture;
 mod handoff;
 mod hpke;
+mod ime_bar;
+mod lexicon;
 mod locale;
 mod windows;
 
@@ -19,7 +21,7 @@ use crate::state;
 use w3cos_ai_bridge::dom_access::ActionType;
 use w3cos_ai_bridge::identity::LocalIdentityStub;
 use w3cos_ai_bridge::intent::{
-    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellContext,
+    ExecuteResult, IntentSession, IntentTier, ProposeResult, ShellApp, ShellCommand, ShellContext,
 };
 use w3cos_ai_bridge::permissions::{AgentPermissions, BridgeOp};
 use w3cos_ai_bridge::shell_tools::{self, ShellView};
@@ -67,6 +69,10 @@ const SWITCHER_SIGNAL: usize = 31;
 const FILE_PREVIEW_SIGNAL: usize = 32;
 const RECEIPT_QUERY_SIGNAL: usize = 33;
 const LOCK_PASSPHRASE_SIGNAL: usize = 34;
+const LEXICON_DRAFT_SIGNAL: usize = 35;
+const CONFIRM_FOCUS_SIGNAL: usize = 36;
+const SETTINGS_MENU_SIGNAL: usize = 37;
+const PENDING_LOCALE_SIGNAL: usize = 38;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -142,6 +148,35 @@ const OP_SYNC_RECEIPTS: u8 = 73;
 const OP_SYNC_DRAFTS: u8 = 74;
 const OP_RECEIPT_QUERY: u8 = 75;
 const OP_SYNC_CLIPBOARD: u8 = 76;
+const OP_IME_1: u8 = 77;
+const OP_IME_2: u8 = 78;
+const OP_IME_3: u8 = 79;
+const OP_IME_4: u8 = 80;
+const OP_IME_5: u8 = 81;
+const OP_IME_6: u8 = 82;
+const OP_IME_7: u8 = 83;
+const OP_IME_8: u8 = 84;
+const OP_IME_9: u8 = 85;
+const OP_IME_MODE: u8 = 86;
+const OP_SOFTKEY: u8 = 87;
+const OP_IME_PAGE_PREV: u8 = 88;
+const OP_IME_PAGE_NEXT: u8 = 89;
+const OP_IME_ACTION: u8 = 90;
+const OP_SYNC_ALLOW: u8 = 91;
+const OP_SYNC_SKIP: u8 = 92;
+const OP_HANDOFF_CANCEL: u8 = 93;
+const OP_HANDOFF_REVEAL: u8 = 94;
+const OP_CLIP_MINE: u8 = 95;
+const OP_CLIP_THEIRS: u8 = 96;
+const OP_SETTINGS_LEXICON: u8 = 97;
+const OP_LEXICON_STEALTH: u8 = 98;
+const OP_LEXICON_APP: u8 = 99;
+const OP_LEXICON_SAVE: u8 = 100;
+const OP_LEXICON_DROP: u8 = 101;
+const OP_LEXICON_EXPORT: u8 = 102;
+const OP_LEXICON_CLEAR: u8 = 103;
+const OP_SETTINGS_LANGUAGE: u8 = 104;
+const OP_SETTINGS_BACK: u8 = 105;
 
 fn main() {
     shell_main();
@@ -259,6 +294,10 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_text_signal("");
+        let _ = state::create_signal(1);
+        let _ = state::create_text_signal("");
     });
 }
 
@@ -297,9 +336,33 @@ fn boot_session_once() {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "w3cos-local".to_string());
             session.unlock_with_passphrase(&passphrase);
+            lexicon::unlock(&passphrase);
         }
         sync_session(session, 0, "");
     });
+}
+
+fn ime_role_for_submit(code: u8) -> Option<&'static str> {
+    match code {
+        OP_PROPOSE => Some("intent"),
+        OP_RUN_TERMINAL => Some("terminal"),
+        OP_LAUNCHER_SEARCH => Some("launcher"),
+        OP_RECEIPT_QUERY => Some("text"),
+        _ => None,
+    }
+}
+
+fn apply_ime_field() {
+    for update in ime_bar::take_field_updates() {
+        match update.role.as_str() {
+            "intent" => state::set_text_signal(DRAFT_SIGNAL, update.text),
+            "terminal" => state::set_text_signal(TERMINAL_SIGNAL, update.text),
+            "launcher" => state::set_text_signal(LAUNCHER_QUERY_SIGNAL, update.text),
+            "text" => state::set_text_signal(RECEIPT_QUERY_SIGNAL, update.text),
+            "secure" => state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, update.text),
+            _ => {}
+        }
+    }
 }
 
 fn on_shell_intent(code: u8, draft: &str) {
@@ -307,6 +370,25 @@ fn on_shell_intent(code: u8, draft: &str) {
         eprintln!("[W3C OS][INTENT] code={code} draft={draft:?}");
     }
     ensure_shell_signals();
+    if code == OP_IME_ACTION {
+        let Some(utterance) = ime_bar::command_utterance() else {
+            return;
+        };
+        let ctx = ShellContext {
+            app: ShellApp::from_signal(state::get_signal(APP_SIGNAL)),
+            night: state::get_signal(NIGHT_SIGNAL) != 0,
+        };
+        with_session(|session| apply_propose(session, &utterance, &ctx));
+        return;
+    }
+    let mut draft_owned = draft.to_string();
+    if let Some(role) = ime_role_for_submit(code)
+        && let Some(text) = ime_bar::commit_active(role)
+    {
+        apply_ime_field();
+        draft_owned = text;
+    }
+    let draft = draft_owned.as_str();
     if code == OP_TOGGLE_TASKS {
         let next = i64::from(state::get_signal(TASKS_SIGNAL) == 0);
         state::set_signal(TASKS_SIGNAL, next);
@@ -327,9 +409,26 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_CHIP_CONTEXT => apply_propose(session, "where am i", &ctx),
         OP_CHIP_TERMINAL => apply_propose(session, "打开终端", &ctx),
         OP_CHIP_SETTINGS => apply_propose(session, "打开设置", &ctx),
-        OP_CONFIRM => apply_confirm(session, &ctx),
+        OP_CONFIRM => {
+            let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+            if !pending.is_empty() && state::get_signal(PHASE_SIGNAL) != 1 {
+                apply_locale_confirm(session, &pending);
+            } else {
+                apply_confirm(session, &ctx);
+            }
+        }
         OP_CANCEL => {
-            if state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending() {
+            let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+            if !pending.is_empty()
+                && state::get_signal(PHASE_SIGNAL) != 1
+                && state::get_signal(PHASE_SIGNAL) != 3
+                && !w3cos_ai_bridge::agent_loop::has_pending()
+            {
+                state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+                sync_session(session, state::get_signal(PHASE_SIGNAL), "");
+            } else if state::get_signal(PHASE_SIGNAL) == 3
+                || w3cos_ai_bridge::agent_loop::has_pending()
+            {
                 let update = agent_host::cancel();
                 apply_host_update(session, update);
             } else {
@@ -354,17 +453,39 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
         }
         OP_LOCK => {
+            let keep_card = state::get_signal(PHASE_SIGNAL) == 1;
+            let summary = state::get_signal_text(SUMMARY_SIGNAL);
+            let impact = state::get_signal_text(IMPACT_SIGNAL);
+            let tier = state::get_signal_text(TIER_SIGNAL);
+            let planning =
+                state::get_signal(PHASE_SIGNAL) == 3 || w3cos_ai_bridge::agent_loop::has_pending();
             session.lock_identity();
-            sync_session(
-                session,
-                state::get_signal(PHASE_SIGNAL),
-                &locale::t("toast-identity-locked"),
-            );
+            lexicon::lock();
+            if planning {
+                let update = agent_host::cancel();
+                apply_host_update(session, update);
+            }
+            if session.proposal().is_some() {
+                session.cancel();
+            }
+            if keep_card {
+                state::set_text_signal(SUMMARY_SIGNAL, &summary);
+                state::set_text_signal(IMPACT_SIGNAL, &impact);
+                state::set_text_signal(TIER_SIGNAL, &tier);
+                sync_session(session, 1, &locale::t("toast-identity-locked"));
+            } else {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("toast-identity-locked"),
+                );
+            }
         }
         OP_UNLOCK => {
             let passphrase = draft.trim();
             if session.unlock_with_passphrase(passphrase) {
                 state::set_text_signal(LOCK_PASSPHRASE_SIGNAL, "");
+                lexicon::unlock(passphrase);
                 sync_session(
                     session,
                     state::get_signal(PHASE_SIGNAL),
@@ -409,9 +530,20 @@ fn on_shell_intent(code: u8, draft: &str) {
         }
         OP_RUN_TERMINAL => open_process_permission(session),
         OP_PERM_ONCE => {
-            state::set_signal(PERM_SIGNAL, 0);
-            if session.identity_unlocked() {
+            if !session.identity_unlocked() {
+                sync_session(
+                    session,
+                    state::get_signal(PHASE_SIGNAL),
+                    &locale::t("perm-locked"),
+                );
+            } else {
+                state::set_signal(PERM_SIGNAL, 0);
                 run_terminal_from_button(session);
+            }
+        }
+        OP_PERM_DENY => {
+            if session.identity_unlocked() {
+                deny_process_permission(session);
             } else {
                 sync_session(
                     session,
@@ -420,7 +552,6 @@ fn on_shell_intent(code: u8, draft: &str) {
                 );
             }
         }
-        OP_PERM_DENY => deny_process_permission(session),
         OP_L2_TOGGLE => toggle_l2(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
@@ -440,10 +571,22 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
     state::set_text_signal(DRAFT_SIGNAL, utterance);
     match session.propose(utterance, ctx) {
         ProposeResult::Confirm(proposal) => {
-            state::set_text_signal(SUMMARY_SIGNAL, proposal.summary);
-            state::set_text_signal(IMPACT_SIGNAL, proposal.impact);
+            let focus = if matches!(proposal.command, ShellCommand::ToggleNight) {
+                "cancel"
+            } else {
+                "confirm"
+            };
+            state::set_text_signal(SUMMARY_SIGNAL, confirm_title(&proposal.command, ctx));
+            state::set_text_signal(
+                IMPACT_SIGNAL,
+                confirm_impact(&proposal.command, session.context_shared()),
+            );
             state::set_text_signal(TIER_SIGNAL, tier_name(proposal.tier));
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, focus);
             sync_session(session, 1, "");
+            if session.identity_unlocked() {
+                state::request_focus_label(&locale::t(focus));
+            }
         }
         ProposeResult::Plan { utterance } => match agent_host::begin(&utterance) {
             Ok(update) => apply_host_update(session, update),
@@ -472,6 +615,14 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
 }
 
 fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("locked-hint"),
+        );
+        return;
+    }
     if w3cos_ai_bridge::agent_loop::has_pending() {
         confirm_agent_step(session);
         return;
@@ -490,6 +641,38 @@ fn tier_name(tier: IntentTier) -> &'static str {
         IntentTier::L1 => "L1",
         IntentTier::L0 => "L0",
         IntentTier::Unspecified => "",
+    }
+}
+
+fn confirm_title(command: &ShellCommand, ctx: &ShellContext) -> String {
+    match command {
+        ShellCommand::OpenApp(ShellApp::Files) => locale::t("chip-files"),
+        ShellCommand::OpenApp(ShellApp::Terminal) => locale::t("chip-terminal"),
+        ShellCommand::OpenApp(ShellApp::Settings) => locale::t("chip-settings"),
+        ShellCommand::OpenApp(ShellApp::Browser) => locale::t("confirm-open-browser"),
+        ShellCommand::OpenApp(ShellApp::Editor) => locale::t("confirm-open-editor"),
+        ShellCommand::OpenApp(ShellApp::Agent) => locale::t("confirm-open-agent"),
+        ShellCommand::OpenApp(ShellApp::Desktop) => locale::t("confirm-open-desktop"),
+        ShellCommand::ToggleNight if ctx.night => locale::t("confirm-night-off"),
+        ShellCommand::ToggleNight => locale::t("confirm-night-on"),
+        ShellCommand::ListApps => locale::t("chip-apps"),
+        ShellCommand::ShowContext => locale::t("confirm-context"),
+        ShellCommand::Help => locale::t("confirm-help"),
+    }
+}
+
+fn confirm_impact(command: &ShellCommand, shared: bool) -> String {
+    match command {
+        ShellCommand::OpenApp(ShellApp::Agent) => locale::t("impact-tasks"),
+        ShellCommand::OpenApp(app) => {
+            let name = app_label(app.signal_value());
+            locale::t_args("impact-navigate", &[("name", &name)])
+        }
+        ShellCommand::ToggleNight => locale::t("impact-night"),
+        ShellCommand::ListApps => locale::t("impact-list"),
+        ShellCommand::ShowContext if shared => locale::t("impact-context"),
+        ShellCommand::ShowContext => locale::t("impact-context-hidden"),
+        ShellCommand::Help => locale::t("impact-help"),
     }
 }
 
@@ -594,6 +777,12 @@ fn apply_host_update(session: &mut IntentSession, update: agent_host::HostUpdate
     state::set_text_signal(IMPACT_SIGNAL, update.impact);
     state::set_text_signal(TIER_SIGNAL, update.tier);
     state::set_text_signal(STEPS_SIGNAL, update.steps);
+    if update.phase == 1 {
+        state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "cancel");
+        if session.identity_unlocked() {
+            state::request_focus_label(&locale::t("cancel"));
+        }
+    }
     sync_session(session, update.phase, &update.notice);
     if let Ok(path) = std::env::var("W3COS_AGENT_TRACE") {
         let line = format!(
@@ -649,8 +838,65 @@ fn run_terminal_from_button(session: &mut IntentSession) {
     sync_session(session, 2, &outcome);
 }
 
+fn show_settings_pane(tab: i64) {
+    state::set_signal(SETTINGS_TAB_SIGNAL, tab);
+    state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+}
+
+fn stage_locale(tag: &str) {
+    if locale::current() == tag || state::get_signal(PHASE_SIGNAL) == 1 {
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        return;
+    }
+    state::set_text_signal(PENDING_LOCALE_SIGNAL, tag);
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "cancel");
+    if state::get_signal(UNLOCKED_SIGNAL) != 0 {
+        state::request_focus_label(&locale::t("cancel"));
+    }
+    state::mark_dirty();
+}
+
+fn locale_self_name(tag: &str) -> String {
+    if tag == "en" {
+        locale::t("locale-name-en")
+    } else {
+        locale::t("locale-name-zh")
+    }
+}
+
+fn apply_locale_confirm(session: &mut IntentSession, tag: &str) {
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("lock-first"),
+        );
+        return;
+    }
+    let name = locale_self_name(tag);
+    let utterance = locale::t_args("locale-confirm-title", &[("name", &name)]);
+    locale::set_locale(tag);
+    state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+    let applied = locale_self_name(tag);
+    let outcome = format!("Interface language is now {tag}.");
+    session.record_external(
+        &utterance,
+        "set-locale",
+        w3cos_ai_bridge::intent::Decision::Allowed,
+        true,
+        &outcome,
+        IntentTier::L0,
+    );
+    sync_session(
+        session,
+        state::get_signal(PHASE_SIGNAL),
+        &locale::t_args("locale-applied", &[("name", &applied)]),
+    );
+}
+
 fn apply_effect(effect: &ExecuteResult) {
     if let Some(app) = effect.navigate {
+        // The agent is not a window. Confirming it opens the tray task center.
         focus_app(app.signal_value());
     }
     if let Some(night) = effect.night {
@@ -772,7 +1018,10 @@ fn remember_notice(text: &str) {
 
 fn open_process_permission(session: &mut IntentSession) {
     state::set_signal(PERM_SIGNAL, 1);
-    if !session.identity_unlocked() {
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+    if session.identity_unlocked() {
+        state::request_focus_label(&locale::t("perm-deny"));
+    } else {
         sync_session(
             session,
             state::get_signal(PHASE_SIGNAL),
@@ -795,8 +1044,32 @@ fn deny_process_permission(session: &mut IntentSession) {
     sync_session(session, 2, &locale::t("perm-denied-notice"));
 }
 
+fn scrub_agent_window() {
+    let bit = app_bit(4);
+    state::set_signal(OPEN_MASK_SIGNAL, state::get_signal(OPEN_MASK_SIGNAL) & !bit);
+    state::set_signal(
+        MINIMIZED_MASK_SIGNAL,
+        state::get_signal(MINIMIZED_MASK_SIGNAL) & !bit,
+    );
+    if state::get_signal(APP_SIGNAL) == 4 {
+        state::set_signal(APP_SIGNAL, 0);
+    }
+}
+
+/// Planning, receipts, and steps live in the tray task center, not an app window.
+fn open_task_center() {
+    ensure_shell_signals();
+    scrub_agent_window();
+    state::set_signal(TASKS_SIGNAL, 1);
+    state::set_signal(LAUNCHER_SIGNAL, 0);
+}
+
 fn focus_app(id: i64) {
     ensure_shell_signals();
+    if id == 4 {
+        open_task_center();
+        return;
+    }
     let id = id.clamp(0, 6);
     state::set_signal(APP_SIGNAL, id);
     state::set_signal(LAUNCHER_SIGNAL, 0);
@@ -932,6 +1205,10 @@ fn ensure_clock_timer() {
 
 fn on_shell_key(name: &str) -> bool {
     ensure_shell_signals();
+    if ime_bar::on_key(name) {
+        apply_ime_field();
+        return true;
+    }
     match name {
         "Escape" => dismiss_top_layer(),
         "Mod+K" => {
@@ -1077,7 +1354,7 @@ fn cycle_windows() {
     let mut found = None;
     for step in 1..=6 {
         let id = (start + step - 1) % 6 + 1;
-        if open & app_bit(id) != 0 {
+        if resident(id) && open & app_bit(id) != 0 {
             found = Some(id);
             break;
         }
@@ -1107,10 +1384,12 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::set_signal(LAUNCHER_SIGNAL, 1);
         }
         OP_DISMISS_TOAST => state::set_text_signal(TOAST_SIGNAL, ""),
-        OP_SETTINGS_LOCAL => state::set_signal(SETTINGS_TAB_SIGNAL, 0),
-        OP_SETTINGS_IDENTITY => state::set_signal(SETTINGS_TAB_SIGNAL, 1),
-        OP_SETTINGS_BRIDGE => state::set_signal(SETTINGS_TAB_SIGNAL, 2),
-        OP_SETTINGS_L2 => state::set_signal(SETTINGS_TAB_SIGNAL, 3),
+        OP_SETTINGS_LOCAL => show_settings_pane(0),
+        OP_SETTINGS_IDENTITY => show_settings_pane(1),
+        OP_SETTINGS_BRIDGE => show_settings_pane(2),
+        OP_SETTINGS_L2 => show_settings_pane(3),
+        OP_SETTINGS_LANGUAGE => show_settings_pane(6),
+        OP_SETTINGS_BACK => state::set_signal(SETTINGS_MENU_SIGNAL, 1),
         OP_FILES_HOME => state::set_signal(FILES_FOLDER_SIGNAL, 0),
         OP_FILES_DOCS => state::set_signal(FILES_FOLDER_SIGNAL, 1),
         OP_FILES_PICS => state::set_signal(FILES_FOLDER_SIGNAL, 2),
@@ -1126,17 +1405,11 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_FOCUS_FILES => focus_app(1),
         OP_FOCUS_TERMINAL => focus_app(2),
         OP_FOCUS_SETTINGS => focus_app(3),
-        OP_FOCUS_AGENT => focus_app(4),
+        OP_FOCUS_AGENT => open_task_center(),
         OP_FOCUS_BROWSER => focus_app(5),
         OP_FOCUS_EDITOR => focus_app(6),
-        OP_LOCALE_ZH => {
-            locale::set_locale("zh-CN");
-            state::mark_dirty();
-        }
-        OP_LOCALE_EN => {
-            locale::set_locale("en");
-            state::mark_dirty();
-        }
+        OP_LOCALE_ZH => stage_locale("zh-CN"),
+        OP_LOCALE_EN => stage_locale("en"),
         OP_NOTIFY_TOGGLE => {
             let next = i64::from(state::get_signal(NOTIFY_SIGNAL) == 0);
             state::set_signal(NOTIFY_SIGNAL, next);
@@ -1150,7 +1423,7 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         }
         OP_TRAY_L2 => {
             focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+            show_settings_pane(3);
         }
         OP_RECEIPT_NEXT => {
             let pages = receipt_page_count(visible_receipts().len());
@@ -1158,6 +1431,9 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::set_signal(RECEIPT_PAGE_SIGNAL, page);
         }
         OP_CLOCK => {
+            if handoff::note_clock() {
+                state::mark_dirty();
+            }
             let now = live_clock();
             let changed = LAST_CLOCK.with(|slot| {
                 let mut shown = slot.borrow_mut();
@@ -1190,7 +1466,60 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         }
         OP_SETTINGS_DEVICES => {
             focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            show_settings_pane(4);
+        }
+        OP_SETTINGS_LEXICON => {
+            focus_app(3);
+            show_settings_pane(5);
+        }
+        OP_LEXICON_STEALTH => {
+            if lexicon::unlocked() {
+                lexicon::toggle_stealth();
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_APP => {
+            if lexicon::unlocked() {
+                lexicon::toggle_app(app_key(state::get_signal(APP_SIGNAL)));
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_SAVE => {
+            state::set_text_signal(LEXICON_DRAFT_SIGNAL, draft.trim());
+            if lexicon::save_line(draft) {
+                push_toast(&locale::t("lexicon-saved"));
+            } else if !lexicon::unlocked() {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_DROP => {
+            if lexicon::remove_line(draft) {
+                push_toast(&locale::t("lexicon-removed"));
+            } else if !lexicon::unlocked() {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
+        }
+        OP_LEXICON_EXPORT => {
+            if let Some(json) = lexicon::export_json() {
+                handoff::publish_clipboard(&json);
+                push_toast(&locale::t("lexicon-exported"));
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+        }
+        OP_LEXICON_CLEAR => {
+            if lexicon::clear() {
+                push_toast(&locale::t("lexicon-cleared"));
+            } else {
+                push_toast(&locale::t("lexicon-locked"));
+            }
+            state::mark_dirty();
         }
         OP_PAIR_NO => {
             handoff::codes_differ();
@@ -1213,25 +1542,49 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             push_toast(&locale::t("toast-clipboard-sync"));
             state::mark_dirty();
         }
+        OP_SYNC_ALLOW => {
+            let gating = handoff::scene_gate_open();
+            handoff::allow_current();
+            if gating {
+                send_handoff();
+            }
+            state::mark_dirty();
+        }
+        OP_SYNC_SKIP => {
+            let gating = handoff::scene_gate_open();
+            handoff::skip_current();
+            if gating {
+                send_handoff();
+            }
+            state::mark_dirty();
+        }
         OP_HANDOFF_LATER => {
             handoff::hide_banner();
             state::mark_dirty();
         }
         OP_HANDOFF_GO => {
-            let clipboard = if handoff::clipboard_sync_enabled() {
-                read_clipboard()
-            } else {
-                None
-            };
-            let sealed = handoff::begin_send(
-                receipt_entries(),
-                &state::get_signal_text(DRAFT_SIGNAL),
-                &state::get_signal_text(FILE_PREVIEW_SIGNAL),
-                false,
-                clipboard.as_deref(),
-            );
-            if sealed.is_none() {
-                push_toast(&locale::t("handoff-no-peer"));
+            if handoff::request_continue() {
+                send_handoff();
+            }
+            state::mark_dirty();
+        }
+        OP_HANDOFF_CANCEL => {
+            handoff::cancel_send();
+            state::mark_dirty();
+        }
+        OP_HANDOFF_REVEAL => {
+            handoff::reveal_incoming();
+            state::mark_dirty();
+        }
+        OP_CLIP_MINE => {
+            if let Some(text) = handoff::choose_clipboard(false) {
+                handoff::publish_clipboard(&text);
+            }
+            state::mark_dirty();
+        }
+        OP_CLIP_THEIRS => {
+            if let Some(text) = handoff::choose_clipboard(true) {
+                handoff::publish_clipboard(&text);
             }
             state::mark_dirty();
         }
@@ -1245,6 +1598,37 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
             state::mark_dirty();
         }
         OP_SCRIM => {}
+        OP_IME_1 | OP_IME_2 | OP_IME_3 | OP_IME_4 | OP_IME_5 | OP_IME_6 | OP_IME_7 | OP_IME_8
+        | OP_IME_9 => {
+            ime_bar::commit_candidate((code - OP_IME_1) as usize);
+            apply_ime_field();
+        }
+        OP_IME_MODE => {
+            ime_bar::toggle_mode();
+            apply_ime_field();
+        }
+        OP_IME_PAGE_PREV => {
+            ime_bar::page_by(-1);
+        }
+        OP_IME_PAGE_NEXT => {
+            ime_bar::page_by(1);
+        }
+        OP_SOFTKEY => match ime_bar::on_soft_key(draft) {
+            ime_bar::SoftOutcome::Edit => apply_ime_field(),
+            ime_bar::SoftOutcome::Submit { role, text } => {
+                apply_ime_field();
+                let code = match role.as_str() {
+                    "intent" => OP_PROPOSE,
+                    "terminal" => OP_RUN_TERMINAL,
+                    "launcher" => OP_LAUNCHER_SEARCH,
+                    "text" => OP_RECEIPT_QUERY,
+                    "secure" => OP_UNLOCK,
+                    _ => return true,
+                };
+                on_shell_intent(code, &text);
+            }
+            ime_bar::SoftOutcome::None => {}
+        },
         _ => return false,
     }
     true
@@ -1295,6 +1679,20 @@ fn session_l2_on() -> bool {
     })
 }
 
+fn present_settings(tab: i64, menu: i64) {
+    focus_app(3);
+    show_settings_pane(tab);
+    state::set_signal(SETTINGS_MENU_SIGNAL, menu);
+    let (width, height) = stage_bounds();
+    if !windows::is_maximized(3) {
+        let _ = windows::toggle_maximize(3, width, height);
+    }
+}
+
+fn screenshot_shows_locked_permission() -> bool {
+    std::env::var("W3COS_SCREEN").ok().as_deref() == Some("permission-locked")
+}
+
 fn apply_screen_override() {
     // Screenshot hook. Set once so a later click can still change the screen.
     thread_local! {
@@ -1307,19 +1705,15 @@ fn apply_screen_override() {
         state::set_text_signal(LAUNCHER_QUERY_SIGNAL, query.trim());
     }
     match std::env::var("W3COS_SCREEN").ok().as_deref() {
-        Some("settings") => focus_app(3),
-        Some("settings-l2") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+        Some("settings") => present_settings(0, 1),
+        Some("settings-night") => {
+            present_settings(0, 0);
+            state::set_signal(NIGHT_SIGNAL, 1);
         }
-        Some("settings-identity") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 1);
-        }
-        Some("settings-bridge") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 2);
-        }
+        Some("settings-l2") => present_settings(3, 0),
+        Some("settings-identity") => present_settings(1, 0),
+        Some("settings-bridge") | Some("settings-agent") => present_settings(2, 0),
+        Some("settings-language") => present_settings(6, 0),
         Some("files") => focus_app(1),
         Some("files-docs") => {
             focus_app(1);
@@ -1331,26 +1725,41 @@ fn apply_screen_override() {
             state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
             state::set_text_signal(
                 RECEIPT_SIGNAL,
-                "#4 allowed open-files tier=L0 actor=local confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
-                 #3 cancelled night-mode tier=L1 actor=local confirmed=false ts=1760515200000 — 你取消了，没有执行 @@ 夜间模式\n\
-                 #2 denied echo tier=L0 actor=local confirmed=true ts=1760511600000 — 当时还锁着 @@ 在终端运行 echo\n\
-                 #1 unrecognized summarize tier=L0 actor=local confirmed=false ts=1760508000000 — 没有对应命令 @@ 把这段总结一下",
+                "#4 allowed open-files tier=L0 actor=did:key:z6MkhaXgExample confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
+                 #3 unrecognized summarize tier=L2 actor=did:key:z6MkOLD confirmed=false ts=1760515200000 — 没有对应命令 @@ 把这段总结一下\n\
+                 #2 cancelled night-mode tier=L1 actor=did:key:z6MkhaXgExample confirmed=false ts=1760511600000 — 你取消了，没有执行 @@ 夜间模式\n\
+                 #1 denied echo tier=L0 actor=did:key:z6MkhaXgExample confirmed=true ts=1760508000000 — 当时还锁着 @@ 在终端运行 echo",
             );
+        }
+        Some("receipts-empty") => {
+            state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+            state::set_text_signal(RECEIPT_SIGNAL, "");
         }
         Some("confirm") => {
             focus_app(1);
             state::set_signal(PHASE_SIGNAL, 1);
             state::set_text_signal(TIER_SIGNAL, "L0");
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
             state::set_text_signal(SUMMARY_SIGNAL, "打开文件");
             state::set_text_signal(
                 IMPACT_SIGNAL,
                 "切换到文件窗口。不读取、不修改磁盘上的内容。",
             );
+            state::request_focus_label(&locale::t("confirm"));
         }
         Some("permission") => {
             focus_app(2);
             state::set_text_signal(TERMINAL_SIGNAL, "echo");
             state::set_signal(PERM_SIGNAL, 1);
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
+            state::request_focus_label(&locale::t("perm-deny"));
+        }
+        Some("permission-locked") => {
+            focus_app(2);
+            state::set_text_signal(TERMINAL_SIGNAL, "echo");
+            state::set_signal(PERM_SIGNAL, 1);
+            state::set_signal(UNLOCKED_SIGNAL, 0);
+            state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "");
         }
         Some("lock") => state::set_signal(UNLOCKED_SIGNAL, 0),
         Some("switcher") => {
@@ -1359,13 +1768,11 @@ fn apply_screen_override() {
         }
         Some("notify") => state::set_signal(NOTIFY_SIGNAL, 1),
         Some("devices") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            present_settings(4, 0);
             handoff::demo_pending();
         }
         Some("devices-sync") => {
-            focus_app(3);
-            state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+            present_settings(4, 0);
             handoff::demo_pending();
             let _ = handoff::codes_match();
         }
@@ -1373,9 +1780,37 @@ fn apply_screen_override() {
             focus_app(1);
             handoff::demo_banner();
         }
+        Some("handoff-sending") => {
+            focus_app(1);
+            handoff::demo_sending();
+        }
+        Some("handoff-no-answer") => {
+            focus_app(1);
+            handoff::demo_no_answer();
+        }
         Some("handoff-phone") => {
             focus_app(0);
             handoff::demo_incoming();
+        }
+        Some("lexicon") => {
+            focus_app(3);
+            show_settings_pane(5);
+            lexicon::seed_demo();
+        }
+        Some("lexicon-rank") => {
+            focus_app(0);
+            lexicon::seed_demo();
+            state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+                index: 4,
+                value: String::new(),
+                role: "intent".to_string(),
+                secure: false,
+                x: 280.0,
+                y: 700.0,
+                width: 640.0,
+                height: 36.0,
+            });
+            ime_bar::demo_compose("nihao");
         }
         Some("windows") => {
             state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2) | app_bit(5));
@@ -1391,12 +1826,24 @@ fn apply_screen_override() {
 fn build_shell() -> Component {
     ensure_shell_signals();
     if let Some(session) = windows::load_once() {
-        state::set_signal(OPEN_MASK_SIGNAL, session.open);
-        state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized);
-        state::set_signal(APP_SIGNAL, session.focused.clamp(0, 6));
+        let agent = app_bit(4);
+        let retired =
+            session.open & agent != 0 || session.minimized & agent != 0 || session.focused == 4;
+        state::set_signal(OPEN_MASK_SIGNAL, session.open & !agent);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized & !agent);
+        let focused = if session.focused == 4 {
+            0
+        } else {
+            session.focused.clamp(0, 6)
+        };
+        state::set_signal(APP_SIGNAL, focused);
+        if retired {
+            remember_windows();
+        }
     }
     boot_session_once();
     apply_screen_override();
+    ime_bar::sync_field_presence();
     let night = state::get_signal(NIGHT_SIGNAL) != 0;
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut column = match posture() {
@@ -1407,31 +1854,40 @@ fn build_shell() -> Component {
     if state::get_signal(SWITCHER_SIGNAL) != 0 && matches!(posture(), Posture::Phone) {
         column.push(chrome_layer(build_switcher()));
     }
-    if handoff::show_banner() && matches!(posture(), Posture::Desktop | Posture::WideTablet) {
+    if handoff::show_banner() && posture() != Posture::Phone {
         column.push(chrome_layer(build_handoff_banner()));
     }
     if handoff::incoming().is_some() {
         column.push(chrome_layer(build_handoff_incoming()));
     }
-    if state::get_signal(TASKS_SIGNAL) != 0 && posture() == Posture::Desktop {
-        column.push(dock_right(build_task_center()));
+    if handoff::sync_prompt().is_some() {
+        column.push(modal_layer(build_sync_sheet()));
+    }
+    if handoff::clip_conflict().is_some() && !clip_sheet_inside_incoming() {
+        column.push(chrome_layer(build_clip_dock()));
+    }
+    if state::get_signal(TASKS_SIGNAL) != 0 {
+        let panel = build_task_center();
+        if posture() == Posture::Phone {
+            column.push(chrome_layer(place_receipts(panel)));
+        } else {
+            column.push(dock_right(panel));
+        }
+    }
+    if !state::get_signal_text(PENDING_LOCALE_SIGNAL).is_empty() {
+        column.push(modal_layer(build_locale_confirm()));
     }
     if state::get_signal(PHASE_SIGNAL) == 1 {
         column.push(modal_layer(build_confirm_dialog()));
     }
     if state::get_signal(PERM_SIGNAL) != 0 {
-        column.push(modal_layer(build_permission_sheet()));
+        column.push(permission_layer(build_permission_sheet()));
     }
     if state::get_signal(NOTIFY_SIGNAL) != 0 {
         column.push(chrome_layer(build_notify_panel()));
     }
     if state::get_signal(RECEIPTS_OPEN_SIGNAL) != 0 {
-        let viewer = build_receipts_viewer();
-        column.push(if posture() == Posture::Phone {
-            dock_right(viewer)
-        } else {
-            place_receipts(viewer)
-        });
+        column.push(place_receipts(build_receipts_viewer()));
     }
     if state::get_signal(LAUNCHER_SIGNAL) != 0 && posture() != Posture::Phone {
         column.push(chrome_layer(build_launcher()));
@@ -1440,8 +1896,14 @@ fn build_shell() -> Component {
     if !toast.is_empty() && state::get_signal(NOTIFY_SIGNAL) == 0 {
         column.push(chrome_layer(build_toast(&toast)));
     }
-    if !unlocked {
+    if let Some(bar) = ime_bar::candidate_layer() {
+        column.push(bar);
+    }
+    if !unlocked && !screenshot_shows_locked_permission() {
         column.push(place_overlay(build_lock_screen()));
+    }
+    if let Some(keyboard) = ime_bar::phone_keyboard() {
+        column.push(keyboard);
     }
 
     Component::column(
@@ -1460,10 +1922,14 @@ fn build_shell() -> Component {
 }
 
 fn modal_layer(card: Component) -> Component {
-    place_modal(card, false)
+    place_modal(card, false, 320.0)
 }
 
-fn place_modal(mut card: Component, fill: bool) -> Component {
+fn permission_layer(card: Component) -> Component {
+    place_modal(card, false, 420.0)
+}
+
+fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
     let (width, height) = state::shell_viewport();
     let scrim_h = if fill || posture() == Posture::Phone {
         height
@@ -1492,7 +1958,7 @@ fn place_modal(mut card: Component, fill: bool) -> Component {
         card.style.width = Dimension::Px(width);
         card.style.height = Dimension::Px(height);
     } else if posture() == Posture::Phone {
-        let sheet_h = 280.0_f32.min(height - 24.0);
+        let sheet_h = phone_sheet.min(height - 24.0);
         card.style.left = Dimension::Px(0.0);
         card.style.width = Dimension::Px(width);
         card.style.height = Dimension::Px(sheet_h);
@@ -1528,15 +1994,37 @@ fn place_overlay(mut node: Component) -> Component {
     node
 }
 
+/// Top of the floating intent block. Drawers stop above this so they leave the
+/// submit control uncovered.
+fn intent_block_top(height: f32) -> f32 {
+    (height - 84.0 - 78.0).max(8.0)
+}
+
 fn place_receipts(mut panel: Component) -> Component {
     let (width, height) = state::shell_viewport();
-    let panel_w = 400.0_f32.min((width - 48.0).max(280.0));
     panel.style.position = Position::Absolute;
-    panel.style.left = Dimension::Px((width - panel_w - 24.0).max(8.0));
-    panel.style.top = Dimension::Px(24.0);
-    panel.style.width = Dimension::Px(panel_w);
-    panel.style.height = Dimension::Px((height - 132.0).max(240.0));
     panel.style.z_index = CHROME_Z + 1;
+    if posture() == Posture::Phone {
+        let top = 56.0_f32.min((height * 0.22).max(48.0));
+        panel.style.left = Dimension::Px(0.0);
+        panel.style.top = Dimension::Px(top);
+        panel.style.width = Dimension::Px(width);
+        panel.style.height = Dimension::Px((height - top).max(240.0));
+        panel.style.border_radius = 22.0;
+        panel.style.border_top_left_radius = Some(22.0);
+        panel.style.border_top_right_radius = Some(22.0);
+        panel.style.border_bottom_left_radius = Some(0.0);
+        panel.style.border_bottom_right_radius = Some(0.0);
+        return panel;
+    }
+    let panel_w = 400.0_f32.min((width - 48.0).max(280.0));
+    let top = 24.0;
+    let bottom = (intent_block_top(height) - 12.0).max(top);
+    panel.style.left = Dimension::Px((width - panel_w - 24.0).max(8.0));
+    panel.style.top = Dimension::Px(top);
+    panel.style.width = Dimension::Px(panel_w);
+    panel.style.height = Dimension::Px(bottom - top);
+    panel.style.border_radius = 16.0;
     panel
 }
 
@@ -1585,7 +2073,7 @@ const RESIDENT_APPS: [ResidentApp; 5] = [
     ResidentApp {
         id: 3,
         glyph: "settings",
-        color: "#9b59b6",
+        color: "#d4a017",
     },
     ResidentApp {
         id: 5,
@@ -1674,15 +2162,27 @@ fn glyph_svg(name: &str, stroke: &str) -> String {
         "lock" => {
             r#"<rect x="6" y="10.5" width="12" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>"#
         }
+        "lock-open" => {
+            r#"<rect x="6" y="10.5" width="12" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 6.4-1.9"/>"#
+        }
         "bell" => {
             r#"<path d="M6 16.5h12l-1.2-2V10.2a4.8 4.8 0 0 0-9.6 0v4.3L6 16.5Z"/><path d="M10 16.5a2 2 0 0 0 4 0"/>"#
         }
         "devices" => {
             r#"<rect x="3" y="6" width="12" height="8" rx="1.4"/><path d="M7 17.5h6M10 14v3.5"/><rect x="16" y="8" width="5" height="9" rx="1.2"/>"#
         }
+        "tasks" => {
+            r#"<path d="M9 7h10M9 12h10M9 17h10"/><path d="m4.5 7.2 1.2 1.2 2.1-2.2M4.5 12.2l1.2 1.2 2.1-2.2M4.5 17.2l1.2 1.2 2.1-2.2"/>"#
+        }
         "arrow" => {
             r#"<path d="M19 7v5.2A2.8 2.8 0 0 1 16.2 15H6"/><path d="M9.5 11.5 6 15l3.5 3.5"/>"#
         }
+        "minus" => r#"<path d="M6 12h12"/>"#,
+        "maximize" => r#"<rect x="6" y="6" width="12" height="12" rx="1.4"/>"#,
+        "restore" => {
+            r#"<rect x="8" y="5" width="10" height="10" rx="1.2"/><path d="M6 9.5V17.5A1.5 1.5 0 0 0 7.5 19H15"/>"#
+        }
+        "close" => r#"<path d="M7 7l10 10M17 7 7 17"/>"#,
         _ => {
             r#"<rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/>"#
         }
@@ -1784,6 +2284,11 @@ fn glyph_face(
             border_radius: radius,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
+            // The name stays on the button for accessibility. Icon buttons must
+            // not paint it: a CJK label is wider than the 40px face and draws
+            // across the neighboring dock icons.
+            color: Color::TRANSPARENT,
+            overflow: Overflow::Hidden,
             ..Style::default()
         },
         children,
@@ -1797,9 +2302,100 @@ fn live_clock() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
+/// One fixed cell per character so digits stay evenly spaced and the colon
+/// does not pick up proportional side bearings.
+fn tabular_clock(font_size: f32, weight: u16, color: Color) -> Component {
+    let digit_w = (font_size * 0.62).round();
+    let colon_w = (font_size * 0.36).round();
+    let cells = live_clock()
+        .chars()
+        .map(|ch| {
+            let width = if ch == ':' { colon_w } else { digit_w };
+            Component::text(
+                ch.to_string(),
+                Style {
+                    width: Dimension::Px(width),
+                    min_width: Dimension::Px(width),
+                    font_size,
+                    font_weight: weight,
+                    font_kerning: false,
+                    text_align: TextAlign::Center,
+                    color,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+            )
+        })
+        .collect();
+    Component::row(
+        Style {
+            gap: 0.0,
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+        cells,
+    )
+}
+
+fn note_preedit(style: &mut Style, role: &str) {
+    let Some(suffix) = ime_bar::preedit_suffix(role) else {
+        return;
+    };
+    let mut props = style.custom_properties.take().unwrap_or_default();
+    props.insert("--w3cos-ime-preedit".to_string(), suffix);
+    style.custom_properties = Some(props);
+}
+
 fn set_receipt_filter(kind: i64) {
     state::set_signal(RECEIPT_FILTER_SIGNAL, kind);
     state::set_signal(RECEIPT_PAGE_SIGNAL, 0);
+}
+
+fn send_handoff() {
+    let clipboard = if handoff::clipboard_sync_enabled() {
+        read_clipboard()
+    } else {
+        None
+    };
+    let sealed = handoff::begin_send(
+        receipt_entries(),
+        &state::get_signal_text(DRAFT_SIGNAL),
+        &state::get_signal_text(FILE_PREVIEW_SIGNAL),
+        false,
+        clipboard.as_deref(),
+    );
+    if sealed.is_none() {
+        push_toast(&locale::t("handoff-no-peer"));
+    }
+}
+
+fn handoff_notice_text(id: &str) -> String {
+    match id {
+        "handoff-no-answer" => locale::t_args(
+            "handoff-no-answer",
+            &[
+                ("peer", &handoff::handoff_target_name()),
+                ("here", &handoff::local_name()),
+            ],
+        ),
+        "handoff-incoming" => {
+            let from = handoff::incoming()
+                .map(|(name, _, _)| name)
+                .unwrap_or_default();
+            locale::t_args("handoff-incoming", &[("name", &from)])
+        }
+        other => locale::t(other),
+    }
+}
+
+fn clip_clock(unix: u64) -> String {
+    let day = unix % 86_400;
+    format!("{:02}:{:02}", day / 3600, (day % 3600) / 60)
+}
+
+fn clip_sheet_inside_incoming() -> bool {
+    handoff::incoming().is_some() && (handoff::incoming_revealed() || posture() != Posture::Phone)
 }
 
 fn read_clipboard() -> Option<String> {
@@ -1926,6 +2522,7 @@ struct ReceiptParts {
     decision: String,
     command: String,
     tier: String,
+    actor: String,
     detail: String,
     recorded_at: String,
     utterance: String,
@@ -1939,10 +2536,13 @@ fn parse_receipt(line: &str) -> ReceiptParts {
     let decision = tokens.next().unwrap_or("").to_string();
     let command = tokens.next().unwrap_or("").to_string();
     let mut tier = String::new();
+    let mut actor = String::new();
     let mut recorded_at = String::new();
     for token in tokens {
         if let Some(value) = token.strip_prefix("tier=") {
             tier = value.to_string();
+        } else if let Some(value) = token.strip_prefix("actor=") {
+            actor = value.to_string();
         } else if let Some(value) = token.strip_prefix("ts=") {
             recorded_at = value.to_string();
         }
@@ -1952,6 +2552,7 @@ fn parse_receipt(line: &str) -> ReceiptParts {
         decision,
         command,
         tier,
+        actor,
         detail: detail.to_string(),
         recorded_at,
         utterance: utterance.to_string(),
@@ -1984,6 +2585,26 @@ fn decision_label(decision: &str) -> String {
     }
 }
 
+fn decision_colors(decision: &str) -> (Color, Color) {
+    match decision {
+        "allowed" => (Color::from_hex("#0c6d4c"), Color::from_hex("#e9fff5")),
+        "denied" => (Color::from_hex("#9a3412"), Color::from_hex("#ffe8e4")),
+        "cancelled" => (Color::from_hex("#b45309"), Color::from_hex("#fff4d6")),
+        "unrecognized" => (Color::from_hex("#1d4e89"), Color::from_hex("#e7f1ff")),
+        _ => (Color::from_hex("#31475e"), Color::from_hex("#f4f7fb")),
+    }
+}
+
+fn layer_label(tier: &str) -> String {
+    match tier {
+        "L0" => locale::t("layer-l0"),
+        "L1" => locale::t("layer-l1"),
+        "L2" => locale::t("layer-l2"),
+        "" => String::new(),
+        other => other.to_string(),
+    }
+}
+
 fn present_receipt(line: &str) -> String {
     let parts = parse_receipt(line);
     let word = decision_label(&parts.decision);
@@ -2009,10 +2630,11 @@ fn build_intent_panel() -> Component {
         min_height: Dimension::Px(go),
         ..Style::default()
     };
-    input_style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_PROPOSE.to_string(),
-    )]));
+    input_style.custom_properties = Some(HashMap::from([
+        ("--w3cos-intent-submit".to_string(), OP_PROPOSE.to_string()),
+        ("--w3cos-ime".to_string(), "intent".to_string()),
+    ]));
+    note_preedit(&mut input_style, "intent");
     let mut go_button = glyph_face(
         "arrow",
         locale::t("propose"),
@@ -2100,7 +2722,7 @@ fn floating_intent() -> Component {
     bar.style.position = Position::Absolute;
     bar.style.width = Dimension::Px(bar_w);
     bar.style.left = Dimension::Px(((width - bar_w) / 2.0).max(8.0));
-    bar.style.top = Dimension::Px((height - 84.0 - 78.0).max(8.0));
+    bar.style.top = Dimension::Px(intent_block_top(height));
     bar.style.z_index = CHROME_Z;
     bar
 }
@@ -2134,13 +2756,20 @@ fn build_floating_taskbar() -> Component {
     }
     let mut tray = vec![
         dock_icon(
-            "lock",
+            "tasks",
+            locale::t("tasks"),
+            OP_TOGGLE_TASKS,
+            Color::TRANSPARENT,
+            state::get_signal(TASKS_SIGNAL) != 0,
+        ),
+        dock_icon(
+            if unlocked { "lock-open" } else { "lock" },
             if unlocked {
-                locale::t("lock")
+                locale::t("unlocked")
             } else {
-                locale::t("unlock")
+                locale::t("locked")
             },
-            if unlocked { OP_LOCK } else { OP_UNLOCK },
+            OP_LOCK,
             Color::TRANSPARENT,
             false,
         ),
@@ -2186,16 +2815,7 @@ fn build_floating_taskbar() -> Component {
             },
         ));
     }
-    tray.push(Component::text(
-        live_clock(),
-        Style {
-            font_size: 13.0,
-            font_weight: 600,
-            color: ink_token(),
-            padding: Edges::xy(10.0, 0.0),
-            ..Style::default()
-        },
-    ));
+    tray.push(tabular_clock(13.0, 600, ink_token()));
     let bar_h = if state::pointer_is_coarse() {
         64.0
     } else {
@@ -2265,16 +2885,33 @@ fn floating_taskbar() -> Component {
 }
 
 fn build_phone_home() -> Component {
-    let mut status_right = vec![Component::svg_document(
-        glyph_svg("lock", "#f4f1ea"),
-        24,
-        24,
-        Style {
-            width: Dimension::Px(14.0),
-            height: Dimension::Px(14.0),
-            ..Style::default()
-        },
-    )];
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let mut status_right = vec![
+        glyph_face(
+            "tasks",
+            locale::t("tasks"),
+            OP_TOGGLE_TASKS,
+            Color::TRANSPARENT,
+            "#f4f1ea",
+            28.0,
+            8.0,
+            state::get_signal(TASKS_SIGNAL) != 0,
+        ),
+        glyph_face(
+            if unlocked { "lock-open" } else { "lock" },
+            if unlocked {
+                locale::t("unlocked")
+            } else {
+                locale::t("locked")
+            },
+            OP_LOCK,
+            Color::TRANSPARENT,
+            "#f4f1ea",
+            28.0,
+            8.0,
+            false,
+        ),
+    ];
     if let Some(battery) = live_battery() {
         status_right.push(Component::text(
             battery,
@@ -2295,15 +2932,7 @@ fn build_phone_home() -> Component {
                 ..Style::default()
             },
             vec![
-                Component::text(
-                    live_clock(),
-                    Style {
-                        font_size: 14.0,
-                        font_weight: 650,
-                        color: ink_token(),
-                        ..Style::default()
-                    },
-                ),
+                tabular_clock(14.0, 650, ink_token()),
                 Component::row(
                     Style {
                         gap: 6.0,
@@ -2394,6 +3023,9 @@ fn build_phone_stack() -> Component {
         },
         vec![build_intent_panel()],
     ));
+    if let Some(strip) = ime_bar::phone_candidate_strip() {
+        children.push(strip);
+    }
     children.push(Component::row(
         Style {
             height: Dimension::Px(20.0),
@@ -2413,6 +3045,16 @@ fn build_phone_stack() -> Component {
             vec![],
         )],
     ));
+    if ime_bar::keyboard_open() {
+        children.push(Component::column(
+            Style {
+                height: Dimension::Px(ime_bar::KEYBOARD_HEIGHT),
+                flex_shrink: 0.0,
+                ..Style::default()
+            },
+            vec![],
+        ));
+    }
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -2430,7 +3072,7 @@ fn build_tablet_rail() -> Component {
         "grid",
         String::new(),
         OP_LAUNCHER,
-        "#5b4fe0",
+        "#1c8f62",
         48.0,
     )];
     for app in RESIDENT_APPS {
@@ -2447,6 +3089,13 @@ fn build_tablet_rail() -> Component {
         }
         icons.push(button);
     }
+    icons.push(icon_button(
+        "tasks",
+        locale::t("tasks"),
+        OP_TOGGLE_TASKS,
+        "#31475e",
+        48.0,
+    ));
     Component::column(
         Style {
             width: Dimension::Px(72.0),
@@ -2540,76 +3189,92 @@ fn sheet_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Componen
     button
 }
 
-fn build_confirm_dialog() -> Component {
+fn layer_mark(tier: &str) -> Option<Component> {
+    let (key, bg, fg) = match tier {
+        "L2" => (
+            "layer-l2",
+            Color::from_hex("#14362c"),
+            Color::from_hex("#d7f6e8"),
+        ),
+        "L1" => (
+            "layer-l1",
+            Color::from_hex("#f0d7b4"),
+            Color::from_hex("#2a1c0c"),
+        ),
+        "L0" => ("layer-l0", Color::rgba(244, 241, 234, 20), ink_token()),
+        _ => return None,
+    };
+    Some(Component::text(
+        locale::t(key),
+        Style {
+            font_size: 12.0,
+            font_weight: 650,
+            color: fg,
+            background: bg,
+            border_radius: 999.0,
+            padding: Edges::xy(8.0, 2.0),
+            align_self: AlignSelf::FlexStart,
+            ..Style::default()
+        },
+    ))
+}
+
+fn mark_initial_focus(button: &mut Component) {
+    let props = button
+        .style
+        .custom_properties
+        .get_or_insert_with(HashMap::new);
+    props.insert("--w3cos-initial-focus".to_string(), "1".to_string());
+}
+
+fn focus_kind(default: &str) -> String {
+    let set = state::get_signal_text(CONFIRM_FOCUS_SIGNAL);
+    if set.is_empty() {
+        default.to_string()
+    } else {
+        set
+    }
+}
+
+fn build_locale_confirm() -> Component {
+    let tag = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+    let name = locale_self_name(&tag);
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
-    let tier = state::get_signal_text(TIER_SIGNAL);
     let mut rows = Vec::new();
-    if tier == "L0" || tier == "L1" || tier == "L2" {
-        let (label, bg, fg) = if tier == "L2" {
-            (
-                locale::t("tier-l2"),
-                Color::from_hex("#2a315c"),
-                Color::from_hex("#b7c0ff"),
-            )
-        } else if tier == "L1" {
-            (
-                locale::t("tier-l1"),
-                Color::from_hex("#f0d7b4"),
-                Color::from_hex("#2a1c0c"),
-            )
-        } else {
-            (
-                locale::t("tier-l0"),
-                Color::rgba(244, 241, 234, 20),
-                ink_token(),
-            )
-        };
-        rows.push(Component::text(
-            label,
-            Style {
-                font_size: 12.0,
-                font_weight: 650,
-                color: fg,
-                background: bg,
-                border_radius: 999.0,
-                padding: Edges::xy(8.0, 2.0),
-                align_self: AlignSelf::FlexStart,
-                ..Style::default()
-            },
-        ));
+    if let Some(mark) = layer_mark("L0") {
+        rows.push(mark);
     }
     rows.push(Component::text(
-        state::get_signal_text(SUMMARY_SIGNAL),
+        locale::t_args("locale-confirm-title", &[("name", &name)]),
         Style {
-            font_size: 18.0,
+            font_size: 22.0,
             font_weight: 700,
             color: ink(),
             ..Style::default()
         },
     ));
     rows.push(Component::text(
-        state::get_signal_text(IMPACT_SIGNAL),
+        locale::t_args("locale-confirm-impact", &[("name", &name)]),
         Style {
-            font_size: 13.0,
+            font_size: 14.0,
             color: muted_ink(),
             ..Style::default()
         },
     ));
+    let mut cancel = sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost);
     let accept = if unlocked {
         sheet_button(locale::t("confirm"), OP_CONFIRM, SheetKind::Primary)
     } else {
         sheet_button(locale::t("lock-first"), OP_UNLOCK, SheetKind::Primary)
     };
+    mark_initial_focus(&mut cancel);
     rows.push(Component::row(
         Style {
             gap: 8.0,
             justify_content: JustifyContent::FlexEnd,
             ..Style::default()
         },
-        vec![
-            sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost),
-            accept,
-        ],
+        vec![cancel, accept],
     ));
     rows.push(Component::text(
         locale::t("confirm-footnote"),
@@ -2622,117 +3287,177 @@ fn build_confirm_dialog() -> Component {
     dialog_shell(rows)
 }
 
-fn build_permission_sheet() -> Component {
+fn build_confirm_dialog() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
-    let command = process_command();
-    let mut rows = vec![Component::text(
-        locale::t_args("perm-sheet-title", &[("command", &command)]),
+    let tier = state::get_signal_text(TIER_SIGNAL);
+    let focus = focus_kind("confirm");
+    let mut rows = Vec::new();
+    if let Some(mark) = layer_mark(&tier) {
+        rows.push(mark);
+    }
+    rows.push(Component::text(
+        state::get_signal_text(SUMMARY_SIGNAL),
         Style {
-            font_size: 18.0,
+            font_size: 22.0,
             font_weight: 700,
             color: ink(),
             ..Style::default()
         },
-    )];
-    if unlocked {
+    ));
+    if tier == "L1" {
         rows.push(Component::text(
-            locale::t("perm-sheet-detail"),
+            locale::t("l1-same"),
             Style {
                 font_size: 13.0,
-                color: muted_ink(),
+                color: Color::from_hex("#f0d7b4"),
                 ..Style::default()
             },
-        ));
-        rows.push(Component::row(
-            Style {
-                gap: 12.0,
-                padding: Edges::all(12.0),
-                border_radius: 12.0,
-                border_width: 1.0,
-                border_color: Color::rgba(244, 241, 234, 31),
-                background: Color::rgba(244, 241, 234, 10),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                ..Style::default()
-            },
-            vec![
-                Component::column(
-                    Style {
-                        gap: 4.0,
-                        flex_grow: 1.0,
-                        ..Style::default()
-                    },
-                    vec![
-                        Component::text(
-                            locale::t("perm-cap-title"),
-                            Style {
-                                font_size: 13.0,
-                                font_weight: 650,
-                                color: ink_token(),
-                                ..Style::default()
-                            },
-                        ),
-                        Component::text(
-                            locale::t("perm-sheet-scope"),
-                            Style {
-                                font_size: 12.0,
-                                color: faint_token(),
-                                ..Style::default()
-                            },
-                        ),
-                    ],
-                ),
-                Component::text(
-                    locale::t("perm-cap-id"),
-                    Style {
-                        font_size: 12.0,
-                        color: faint_token(),
-                        ..Style::default()
-                    },
-                ),
-            ],
-        ));
-        rows.push(Component::row(
-            Style {
-                gap: 8.0,
-                justify_content: JustifyContent::FlexEnd,
-                ..Style::default()
-            },
-            vec![
-                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
-                sheet_button(locale::t("perm-once"), OP_PERM_ONCE, SheetKind::Primary),
-            ],
-        ));
-    } else {
-        rows.push(Component::text(
-            locale::t("perm-locked"),
-            Style {
-                font_size: 14.0,
-                font_weight: 700,
-                color: Color::from_hex("#ffe08a"),
-                ..Style::default()
-            },
-        ));
-        rows.push(Component::row(
-            Style {
-                gap: 8.0,
-                ..Style::default()
-            },
-            vec![
-                sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger),
-                {
-                    let mut unlock =
-                        sheet_button(locale::t("lock-action"), OP_UNLOCK, SheetKind::Primary);
-                    unlock.on_click = EventAction::Invoke {
-                        code: OP_UNLOCK,
-                        input_placeholder: locale::t("lock-passphrase"),
-                    };
-                    unlock
-                },
-            ],
         ));
     }
+    rows.push(Component::text(
+        state::get_signal_text(IMPACT_SIGNAL),
+        Style {
+            font_size: 14.0,
+            color: muted_ink(),
+            ..Style::default()
+        },
+    ));
+    let mut cancel = sheet_button(locale::t("cancel"), OP_CANCEL, SheetKind::Ghost);
+    let mut accept = if unlocked {
+        sheet_button(locale::t("confirm"), OP_CONFIRM, SheetKind::Primary)
+    } else {
+        sheet_button(locale::t("lock-first"), OP_UNLOCK, SheetKind::Primary)
+    };
+    if focus == "cancel" {
+        mark_initial_focus(&mut cancel);
+    } else if unlocked {
+        mark_initial_focus(&mut accept);
+    }
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![cancel, accept],
+    ));
+    rows.push(Component::text(
+        locale::t("confirm-footnote"),
+        Style {
+            font_size: 12.0,
+            color: faint_token(),
+            ..Style::default()
+        },
+    ));
     dialog_shell(rows)
+}
+
+fn disabled_choice(label: impl Into<String>) -> Component {
+    let mut button = sheet_button(label, OP_PERM_DENY, SheetKind::Ghost);
+    button.on_click = EventAction::None;
+    button.style.opacity = 0.4;
+    button
+}
+
+fn build_permission_sheet() -> Component {
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let command = process_command();
+    let mut rows = vec![
+        Component::text(
+            locale::t("perm-cap-title"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#e2a45c"),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t_args("perm-sheet-title", &[("command", &command)]),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+    ];
+    rows.push(Component::text(
+        if unlocked {
+            locale::t("perm-sheet-detail")
+        } else {
+            locale::t("perm-locked")
+        },
+        Style {
+            font_size: 14.0,
+            font_weight: if unlocked { 400 } else { 700 },
+            color: if unlocked {
+                Color::from_hex("#f0d7b4")
+            } else {
+                Color::from_hex("#ffe08a")
+            },
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        locale::t("perm-sheet-scope"),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#fff4e5"),
+            background: Color::rgba(226, 164, 92, 28),
+            border_radius: 12.0,
+            padding: Edges::all(12.0),
+            ..Style::default()
+        },
+    ));
+    let mut deny = if unlocked {
+        sheet_button(locale::t("perm-deny"), OP_PERM_DENY, SheetKind::Danger)
+    } else {
+        disabled_choice(locale::t("perm-deny"))
+    };
+    let once = if unlocked {
+        sheet_button(locale::t("perm-once"), OP_PERM_ONCE, SheetKind::Warm)
+    } else {
+        disabled_choice(locale::t("perm-once"))
+    };
+    if unlocked && focus_kind("deny") == "deny" {
+        mark_initial_focus(&mut deny);
+    }
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![deny, once],
+    ));
+    rows.push(Component::text(
+        locale::t("perm-footnote"),
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#e2a45c"),
+            ..Style::default()
+        },
+    ));
+    permission_shell(rows)
+}
+
+fn permission_shell(children: Vec<Component>) -> Component {
+    let phone = posture() == Posture::Phone;
+    Component::column(
+        Style {
+            gap: 10.0,
+            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            background: Color::from_hex("#241c14"),
+            border_width: 1.0,
+            border_color: Color::from_hex("#e2a45c"),
+            border_radius: if phone { 22.0 } else { 16.0 },
+            box_shadow: Some(shadow_lg()),
+            ..Style::default()
+        },
+        children,
+    )
 }
 
 fn build_lock_screen() -> Component {
@@ -2748,10 +3473,10 @@ fn build_lock_screen() -> Component {
         padding: Edges::xy(12.0, 10.0),
         ..Style::default()
     };
-    field_style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_UNLOCK.to_string(),
-    )]));
+    field_style.custom_properties = Some(HashMap::from([
+        ("--w3cos-intent-submit".to_string(), OP_UNLOCK.to_string()),
+        ("--w3cos-ime".to_string(), "secure".to_string()),
+    ]));
     let passphrase = Component::secure_text_input(
         state::get_signal_text(LOCK_PASSPHRASE_SIGNAL),
         locale::t("lock-passphrase"),
@@ -2769,6 +3494,11 @@ fn build_lock_screen() -> Component {
         44.0
     });
     unlock.style.border_radius = 12.0;
+    let keyboard_pad = if ime_bar::keyboard_open() {
+        ime_bar::KEYBOARD_HEIGHT
+    } else {
+        0.0
+    };
     Component::column(
         Style {
             width: Dimension::Vw(100.0),
@@ -2777,6 +3507,12 @@ fn build_lock_screen() -> Component {
             background_image: Some(WALLPAPER.to_string()),
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(keyboard_pad),
+                left: Spacing::Px(0.0),
+            },
             ..Style::default()
         },
         vec![Component::column(
@@ -2898,13 +3634,15 @@ fn build_notify_panel() -> Component {
             ));
         }
     }
+    let bottom = intent_block_top(height) - 12.0;
+    let top = (bottom - 240.0).max(16.0);
     Component::column(
         Style {
             position: Position::Absolute,
             left: Dimension::Px((width - panel_w - 16.0).max(8.0)),
-            top: Dimension::Px((height - 80.0 - 16.0 - 260.0).max(16.0)),
+            top: Dimension::Px(top),
             width: Dimension::Px(panel_w),
-            max_height: Dimension::Px(280.0),
+            max_height: Dimension::Px((bottom - top).max(0.0)),
             overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
@@ -2948,13 +3686,13 @@ fn app_body(id: i64) -> Component {
         1 => build_files_app(),
         2 => build_terminal_app(),
         3 => build_settings_app(),
-        4 => build_ai_agent_app(),
         5 => build_browser_app(),
-        _ => build_editor_app(),
+        6 => build_editor_app(),
+        _ => Component::column(Style::default(), vec![]),
     }
 }
 
-fn build_window_frame(id: i64, _focused: bool) -> Component {
+fn build_window_frame(id: i64, focused: bool) -> Component {
     let frame = windows::frame(id);
     let mut window = Component::column(
         Style {
@@ -2967,7 +3705,11 @@ fn build_window_frame(id: i64, _focused: bool) -> Component {
             overflow: Overflow::Hidden,
             box_sizing: BoxSizing::BorderBox,
             border_width: 1.0,
-            border_color: line_strong(),
+            border_color: if focused {
+                Color::rgba(20, 150, 106, 210)
+            } else {
+                line_strong()
+            },
             border_radius: 14.0,
             box_shadow: Some(shadow_lg()),
             box_shadows: vec![inset_highlight(15)],
@@ -3044,7 +3786,8 @@ fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) ->
             flex_shrink: 0.0,
             padding: Edges::ZERO,
             font_size: 1.0,
-            background: Color::from_hex("#2a3e52"),
+            color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
             ..Style::default()
         },
         invoke(focus_code(id)),
@@ -3062,7 +3805,8 @@ fn resize_corner(id: i64) -> Component {
             flex_shrink: 0.0,
             padding: Edges::ZERO,
             font_size: 1.0,
-            background: Color::from_hex("#d5dee8"),
+            color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
             ..Style::default()
         },
         invoke(focus_code(id)),
@@ -3415,21 +4159,66 @@ fn file_preview_pane() -> Component {
 }
 
 fn nav_button(name: &str, active: bool, code: u8) -> Component {
-    let bg = if active { "#3d5570" } else { "#243447" };
-    let color = if active { "#f4f7fb" } else { "#d5dee8" };
-    Component::button_with_click(
+    let mut button = Component::button_with_click(
         name,
         Style {
-            font_size: 13.0,
-            color: Color::from_hex(color),
-            background: Color::from_hex(bg),
+            font_size: 14.0,
+            font_weight: if active { 700 } else { 500 },
+            color: Color::from_hex(if active { "#d7f6e8" } else { "#d5dee8" }),
+            background: Color::from_hex(if active { "#14362c" } else { "#243447" }),
+            border_width: if active { 1.0 } else { 0.0 },
+            border_color: Color::from_hex("#1c8f62"),
             border_radius: 10.0,
-            padding: Edges::xy(12.0, 12.0),
+            padding: Edges::xy(12.0, 0.0),
             min_height: Dimension::Px(48.0),
+            width: Dimension::Percent(100.0),
             ..Style::default()
         },
         invoke(code),
-    )
+    );
+    if active {
+        let props = button
+            .style
+            .custom_properties
+            .get_or_insert_with(HashMap::new);
+        props.insert("--w3cos-selected".to_string(), "1".to_string());
+    }
+    button
+}
+
+fn settings_switch(label: &str, on: bool, code: u8) -> Component {
+    let mut button = Component::button_with_click(
+        label,
+        Style {
+            font_size: 15.0,
+            font_weight: 650,
+            color: Color::from_hex(if on { "#e9fff5" } else { "#f4f7fb" }),
+            background: Color::from_hex(if on { "#0c6d4c" } else { "#31475e" }),
+            border_radius: 12.0,
+            padding: Edges::xy(14.0, 0.0),
+            min_height: Dimension::Px(48.0),
+            width: Dimension::Percent(100.0),
+            ..Style::default()
+        },
+        invoke(code),
+    );
+    let props = button
+        .style
+        .custom_properties
+        .get_or_insert_with(HashMap::new);
+    props.insert(
+        "--w3cos-switch".to_string(),
+        if on { "1" } else { "0" }.to_string(),
+    );
+    button
+}
+
+fn settings_link(label: String, code: u8) -> Component {
+    let mut button = chrome_button(label, code, "#31475e");
+    button.style.min_height = Dimension::Px(48.0);
+    button.style.height = Dimension::Px(48.0);
+    button.style.width = Dimension::Percent(100.0);
+    button
 }
 
 fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
@@ -3463,7 +4252,7 @@ fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
                 icon,
                 Style {
                     font_size: 12.0,
-                    color: Color::from_hex("#6c5ce7"),
+                    color: Color::from_hex("#1c8f62"),
                     ..Style::default()
                 },
             ),
@@ -3511,15 +4300,6 @@ fn build_terminal_app() -> Component {
                 },
                 vec![
                     Component::text(
-                        locale::t("terminal-allow"),
-                        Style {
-                            font_size: 16.0,
-                            font_weight: 700,
-                            color: Color::from_hex("#f4f7fb"),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
                         locale::t("terminal-ready"),
                         Style {
                             font_size: 13.0,
@@ -3545,17 +4325,25 @@ fn build_terminal_app() -> Component {
                                     ..Style::default()
                                 },
                             ),
-                            Component::text_input(
-                                state::get_signal_text(TERMINAL_SIGNAL),
-                                "help",
-                                Style {
+                            {
+                                let mut term_style = Style {
                                     font_size: 14.0,
                                     color: Color::from_hex("#f4f7fb"),
                                     background: Color::from_hex("#1b2c3e"),
                                     flex_grow: 1.0,
                                     ..Style::default()
-                                },
-                            ),
+                                };
+                                term_style.custom_properties = Some(HashMap::from([(
+                                    "--w3cos-ime".to_string(),
+                                    "terminal".to_string(),
+                                )]));
+                                note_preedit(&mut term_style, "terminal");
+                                Component::text_input(
+                                    state::get_signal_text(TERMINAL_SIGNAL),
+                                    "help",
+                                    term_style,
+                                )
+                            },
                             chrome_button(locale::t("terminal-run"), OP_RUN_TERMINAL, "#1c8f62"),
                         ],
                     ),
@@ -3584,8 +4372,67 @@ fn build_terminal_app() -> Component {
 // Settings App
 // ==========================================================================
 
+fn settings_nav(tab: i64, mark_current: bool) -> Vec<Component> {
+    let on = |value: i64| mark_current && tab == value;
+    vec![
+        nav_button(&locale::t("settings-local"), on(0), OP_SETTINGS_LOCAL),
+        nav_button(&locale::t("settings-identity"), on(1), OP_SETTINGS_IDENTITY),
+        nav_button(
+            &locale::t("settings-language-nav"),
+            on(6),
+            OP_SETTINGS_LANGUAGE,
+        ),
+        nav_button(&locale::t("settings-agent"), on(2), OP_SETTINGS_BRIDGE),
+        nav_button(
+            &locale::t("settings-devices-nav"),
+            on(4),
+            OP_SETTINGS_DEVICES,
+        ),
+    ]
+}
+
 fn build_settings_app() -> Component {
     let tab = state::get_signal(SETTINGS_TAB_SIGNAL);
+    let phone = posture() == Posture::Phone;
+    let menu = state::get_signal(SETTINGS_MENU_SIGNAL) != 0;
+    if phone && menu {
+        return Component::column(
+            Style {
+                flex_grow: 1.0,
+                background: Color::from_hex("#24384a"),
+                padding: Edges::all(12.0),
+                gap: 8.0,
+                ..Style::default()
+            },
+            settings_nav(tab, false),
+        );
+    }
+    let pane = Component::column(
+        Style {
+            flex_grow: 1.0,
+            min_width: Dimension::Px(0.0),
+            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            gap: 12.0,
+            overflow: Overflow::Auto,
+            ..Style::default()
+        },
+        settings_page(tab),
+    );
+    if phone {
+        let mut back = chrome_button(locale::t("back"), OP_SETTINGS_BACK, "#31475e");
+        back.style.min_height = Dimension::Px(48.0);
+        back.style.width = Dimension::Percent(100.0);
+        return Component::column(
+            Style {
+                flex_grow: 1.0,
+                background: Color::from_hex("#24384a"),
+                padding: Edges::all(12.0),
+                gap: 12.0,
+                ..Style::default()
+            },
+            vec![back, pane],
+        );
+    }
     Component::column(
         Style {
             flex_grow: 1.0,
@@ -3594,10 +4441,11 @@ fn build_settings_app() -> Component {
             ..Style::default()
         },
         vec![
-            app_titlebar(locale::t("app-settings"), "#5b4fe0", 3),
+            app_titlebar(locale::t("app-settings"), "#d4a017", 3),
             Component::row(
                 Style {
                     flex_grow: 1.0,
+                    min_height: Dimension::Px(0.0),
                     gap: 0.0,
                     ..Style::default()
                 },
@@ -3605,40 +4453,15 @@ fn build_settings_app() -> Component {
                     Component::column(
                         Style {
                             width: Dimension::Px(200.0),
+                            flex_shrink: 0.0,
                             background: Color::from_hex("#1b2c3e"),
                             padding: Edges::all(12.0),
                             gap: 4.0,
                             ..Style::default()
                         },
-                        vec![
-                            nav_button(&locale::t("settings-local"), tab == 0, OP_SETTINGS_LOCAL),
-                            nav_button(
-                                &locale::t("settings-identity"),
-                                tab == 1,
-                                OP_SETTINGS_IDENTITY,
-                            ),
-                            nav_button(
-                                &locale::t("settings-permissions"),
-                                tab == 2,
-                                OP_SETTINGS_BRIDGE,
-                            ),
-                            nav_button(&locale::t("settings-l2"), tab == 3, OP_SETTINGS_L2),
-                            nav_button(
-                                &locale::t("settings-devices"),
-                                tab == 4,
-                                OP_SETTINGS_DEVICES,
-                            ),
-                        ],
+                        settings_nav(tab, true),
                     ),
-                    Component::column(
-                        Style {
-                            flex_grow: 1.0,
-                            padding: Edges::all(20.0),
-                            gap: 12.0,
-                            ..Style::default()
-                        },
-                        settings_page(tab),
-                    ),
+                    pane,
                 ],
             ),
         ],
@@ -3648,16 +4471,18 @@ fn build_settings_app() -> Component {
 fn settings_page(tab: i64) -> Vec<Component> {
     match tab {
         1 => settings_identity_page(),
-        2 => settings_permissions_page(),
+        2 => settings_agent_page(),
         3 => settings_l2_page(),
         4 => settings_devices_page(),
+        5 => settings_lexicon_page(),
+        6 => settings_language_page(),
         _ => settings_local_page(),
     }
 }
 
 fn settings_devices_page() -> Vec<Component> {
     let mut page = settings_heading(
-        &locale::t("settings-devices-title"),
+        &locale::t("settings-devices-nav"),
         &locale::t("settings-devices-detail"),
     );
     let fingerprint = truncate_middle(&handoff::local_fingerprint(), 28);
@@ -3710,30 +4535,6 @@ fn settings_devices_page() -> Vec<Component> {
             OP_PAIR_YES,
             "#0c6d4c",
         ));
-    } else if handoff::choosing_sync() {
-        page.push(Component::text(
-            locale::t("pair-trusted"),
-            Style {
-                font_size: 14.0,
-                color: ink(),
-                ..Style::default()
-            },
-        ));
-        page.push(chrome_button(
-            locale::t("sync-receipts"),
-            OP_SYNC_RECEIPTS,
-            "#0c6d4c",
-        ));
-        page.push(chrome_button(
-            locale::t("sync-drafts"),
-            OP_SYNC_DRAFTS,
-            "#0c6d4c",
-        ));
-        page.push(chrome_button(
-            locale::t("sync-clipboard"),
-            OP_SYNC_CLIPBOARD,
-            "#0c6d4c",
-        ));
     } else if handoff::peers().is_empty() {
         page.push(Component::text(
             locale::t("devices-empty"),
@@ -3746,7 +4547,7 @@ fn settings_devices_page() -> Vec<Component> {
     } else {
         for peer in handoff::peers() {
             let state = if peer.trusted {
-                locale::t("pair-trusted")
+                locale::t("pair-trusted-short")
             } else {
                 locale::t("pair-pending")
             };
@@ -3760,20 +4561,27 @@ fn settings_devices_page() -> Vec<Component> {
             ));
         }
     }
-    if handoff::sending() {
-        page.push(Component::text(
-            locale::t("handoff-sending"),
-            Style {
-                font_size: 14.0,
-                color: ink(),
-                ..Style::default()
-            },
-        ));
+    if let Some(kind) = handoff::banner_kind() {
+        let copy = match kind {
+            handoff::BannerKind::Sending => locale::t("handoff-sending"),
+            handoff::BannerKind::NoAnswer => handoff_notice_text("handoff-no-answer"),
+            handoff::BannerKind::Offer => String::new(),
+        };
+        if !copy.is_empty() {
+            page.push(Component::text(
+                copy,
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            ));
+        }
     }
     let notice = handoff::notice();
-    if !notice.is_empty() {
+    if !notice.is_empty() && notice != "handoff-sending" && notice != "handoff-no-answer" {
         page.push(Component::text(
-            locale::t(&notice),
+            handoff_notice_text(&notice),
             Style {
                 font_size: 13.0,
                 color: muted_ink(),
@@ -3784,101 +4592,396 @@ fn settings_devices_page() -> Vec<Component> {
     page
 }
 
+fn banner_anchor() -> (f32, f32, f32) {
+    let (width, _) = state::shell_viewport();
+    let title_h = if state::pointer_is_coarse() {
+        56.0
+    } else {
+        40.0
+    };
+    if posture() == Posture::Desktop {
+        let id = state::get_signal(APP_SIGNAL).clamp(1, 6);
+        let frame = windows::frame(id);
+        let top = frame.y + 6.0 + title_h;
+        let banner_w = (frame.w - 12.0).max(280.0);
+        (frame.x + 6.0, top, banner_w)
+    } else {
+        let left = 80.0;
+        ((left), title_h, (width - left - 16.0).max(280.0))
+    }
+}
+
+fn handoff_strip(children: Vec<Component>, width: f32) -> Component {
+    Component::row(
+        Style {
+            width: Dimension::Px(width),
+            padding: Edges::xy(14.0, 10.0),
+            gap: 12.0,
+            align_items: AlignItems::Center,
+            background: Color::from_hex("#1c2631"),
+            border_radius: 12.0,
+            border_width: 1.0,
+            border_color: Color::rgba(244, 241, 234, 31),
+            ..Style::default()
+        },
+        children,
+    )
+}
+
 fn build_handoff_banner() -> Component {
+    let (left, top, width) = banner_anchor();
+    let kind = handoff::banner_kind().unwrap_or(handoff::BannerKind::Offer);
+    let (copy, buttons) = match kind {
+        handoff::BannerKind::Offer => (
+            vec![
+                Component::text(
+                    locale::t("handoff-title"),
+                    Style {
+                        font_size: 15.0,
+                        font_weight: 700,
+                        color: ink(),
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    locale::t("handoff-detail"),
+                    Style {
+                        font_size: 12.0,
+                        color: muted_ink(),
+                        ..Style::default()
+                    },
+                ),
+            ],
+            vec![
+                chrome_button(locale::t("handoff-later"), OP_HANDOFF_LATER, "#3d5570"),
+                chrome_button(locale::t("handoff-go"), OP_HANDOFF_GO, "#0c6d4c"),
+            ],
+        ),
+        handoff::BannerKind::Sending => (
+            vec![Component::text(
+                locale::t("handoff-sending"),
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            )],
+            vec![chrome_button(
+                locale::t("handoff-cancel"),
+                OP_HANDOFF_CANCEL,
+                "#9a3412",
+            )],
+        ),
+        handoff::BannerKind::NoAnswer => (
+            vec![Component::text(
+                handoff_notice_text("handoff-no-answer"),
+                Style {
+                    font_size: 14.0,
+                    color: ink(),
+                    ..Style::default()
+                },
+            )],
+            vec![chrome_button(
+                locale::t("handoff-later"),
+                OP_HANDOFF_LATER,
+                "#3d5570",
+            )],
+        ),
+    };
+    let mut strip = handoff_strip(
+        vec![
+            Component::column(
+                Style {
+                    flex_grow: 1.0,
+                    gap: 2.0,
+                    min_width: Dimension::Px(0.0),
+                    ..Style::default()
+                },
+                copy,
+            ),
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    flex_shrink: 0.0,
+                    align_items: AlignItems::Center,
+                    ..Style::default()
+                },
+                buttons,
+            ),
+        ],
+        width,
+    );
+    strip.style.position = Position::Absolute;
+    strip.style.left = Dimension::Px(left);
+    strip.style.top = Dimension::Px(top);
+    strip.style.z_index = CHROME_Z + 1;
+    strip
+}
+
+fn build_sync_sheet() -> Component {
+    let surface = handoff::sync_prompt().unwrap_or(handoff::SyncSurface::Receipts);
+    let (title, detail) = match surface {
+        handoff::SyncSurface::Receipts => ("sync-receipts-title", "sync-receipts-detail"),
+        handoff::SyncSurface::Drafts => ("sync-drafts-title", "sync-drafts-detail"),
+        handoff::SyncSurface::Scene => ("sync-scene-title", "sync-scene-detail"),
+        handoff::SyncSurface::Clipboard => ("sync-clipboard-title", "sync-clipboard-detail"),
+    };
+    dialog_shell(vec![
+        Component::text(
+            locale::t(title),
+            Style {
+                font_size: 18.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t(detail),
+            Style {
+                font_size: 13.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                justify_content: JustifyContent::FlexEnd,
+                ..Style::default()
+            },
+            vec![
+                sheet_button(locale::t("sync-ask-skip"), OP_SYNC_SKIP, SheetKind::Danger),
+                sheet_button(
+                    locale::t("sync-ask-allow"),
+                    OP_SYNC_ALLOW,
+                    SheetKind::Primary,
+                ),
+            ],
+        ),
+    ])
+}
+
+fn clip_sheet_rows() -> Vec<Component> {
+    let Some((local, remote)) = handoff::clip_conflict() else {
+        return Vec::new();
+    };
+    let row = |side: &handoff::ClipSide, code: u8| {
+        Component::column(
+            Style {
+                gap: 4.0,
+                padding: Edges::all(10.0),
+                border_radius: 12.0,
+                background: Color::rgba(244, 241, 234, 10),
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    locale::t_args(
+                        "clip-conflict-row",
+                        &[("device", &side.device), ("when", &clip_clock(side.unix))],
+                    ),
+                    Style {
+                        font_size: 13.0,
+                        font_weight: 650,
+                        color: ink(),
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    side.text.clone(),
+                    Style {
+                        font_size: 13.0,
+                        color: muted_ink(),
+                        ..Style::default()
+                    },
+                ),
+                chrome_button(locale::t("clip-use"), code, "#0c6d4c"),
+            ],
+        )
+    };
+    vec![
+        Component::text(
+            locale::t("clip-conflict-title"),
+            Style {
+                font_size: 16.0,
+                font_weight: 700,
+                color: Color::from_hex("#f0d7b4"),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t("clip-conflict-detail"),
+            Style {
+                font_size: 12.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        row(&local, OP_CLIP_MINE),
+        row(&remote, OP_CLIP_THEIRS),
+    ]
+}
+
+fn build_clip_dock() -> Component {
+    let (width, height) = state::shell_viewport();
+    let dock_w = 420.0_f32.min((width - 24.0).max(280.0));
     let mut card = Component::column(
         Style {
-            width: Dimension::Px(420.0),
-            padding: Edges::all(16.0),
+            width: Dimension::Px(dock_w),
+            padding: Edges::all(14.0),
             gap: 8.0,
             background: Color::from_hex("#1c2631"),
             border_radius: 16.0,
+            border_width: 1.0,
+            border_color: Color::rgba(244, 241, 234, 31),
+            ..Style::default()
+        },
+        clip_sheet_rows(),
+    );
+    card.style.position = Position::Absolute;
+    card.style.left = Dimension::Px(((width - dock_w) / 2.0).max(12.0));
+    card.style.bottom = Dimension::Px(24.0);
+    card.style.top = Dimension::Auto;
+    card.style.z_index = CHROME_Z + 1;
+    card.style.max_height = Dimension::Px((height * 0.42).max(160.0));
+    card
+}
+
+fn build_handoff_notice() -> Component {
+    let (from, _, _) = handoff::incoming().unwrap_or_default();
+    let (width, _) = state::shell_viewport();
+    let card_w = 420.0_f32.min((width - 24.0).max(240.0));
+    let mut card = Component::row(
+        Style {
+            width: Dimension::Px(card_w),
+            padding: Edges::xy(14.0, 12.0),
+            gap: 12.0,
+            align_items: AlignItems::Center,
+            background: Color::from_hex("#1c2631"),
+            border_radius: 16.0,
+            border_width: 1.0,
+            border_color: Color::rgba(240, 215, 180, 90),
             ..Style::default()
         },
         vec![
             Component::text(
-                locale::t("handoff-title"),
+                locale::t_args("handoff-incoming", &[("name", &from)]),
                 Style {
-                    font_size: 16.0,
-                    font_weight: 700,
+                    flex_grow: 1.0,
+                    font_size: 14.0,
+                    font_weight: 650,
                     color: ink(),
                     ..Style::default()
                 },
             ),
-            Component::text(
-                locale::t("handoff-detail"),
-                Style {
-                    font_size: 13.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            chrome_button(locale::t("handoff-later"), OP_HANDOFF_LATER, "#3d5570"),
-            chrome_button(locale::t("handoff-go"), OP_HANDOFF_GO, "#0c6d4c"),
+            chrome_button(locale::t("handoff-reveal"), OP_HANDOFF_REVEAL, "#0c6d4c"),
         ],
     );
-    let (width, _) = state::shell_viewport();
     card.style.position = Position::Absolute;
-    card.style.left = Dimension::Px(((width - 420.0) / 2.0).max(16.0));
-    card.style.top = Dimension::Px(24.0);
+    card.style.left = Dimension::Px(12.0);
+    card.style.top = Dimension::Px(12.0);
     card.style.z_index = CHROME_Z + 1;
     card
 }
 
+fn handoff_page_body(from: &str, path: &str, draft: &str) -> Vec<Component> {
+    let mut rows = vec![
+        Component::text(
+            locale::t_args("handoff-from", &[("name", from)]),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            path.to_string(),
+            Style {
+                font_size: 14.0,
+                color: ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            draft.to_string(),
+            Style {
+                font_size: 14.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t_args(
+                "handoff-l2-still-off",
+                &[("here", &handoff::local_name()), ("there", from)],
+            ),
+            Style {
+                font_size: 13.0,
+                color: muted_ink(),
+                ..Style::default()
+            },
+        ),
+        Component::row(
+            Style {
+                gap: 8.0,
+                ..Style::default()
+            },
+            vec![
+                chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
+                chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
+            ],
+        ),
+    ];
+    if handoff::clip_conflict().is_some() {
+        rows.push(Component::column(
+            Style {
+                gap: 8.0,
+                margin: Edges {
+                    top: Spacing::Px(8.0),
+                    ..Edges::ZERO
+                },
+                ..Style::default()
+            },
+            clip_sheet_rows(),
+        ));
+    }
+    rows
+}
+
 fn build_handoff_incoming() -> Component {
+    if posture() == Posture::Phone && !handoff::incoming_revealed() {
+        return build_handoff_notice();
+    }
     let (from, path, draft) = handoff::incoming().unwrap_or_default();
     let (width, height) = state::shell_viewport();
+    let phone = posture() == Posture::Phone;
     let mut card = Component::column(
         Style {
-            padding: Edges::all(20.0),
+            padding: Edges::all(if phone { 20.0 } else { 16.0 }),
             gap: 12.0,
             background: Color::from_hex("#1c2631"),
-            border_radius: 22.0,
+            border_radius: if phone { 0.0 } else { 16.0 },
+            overflow: Overflow::Auto,
             ..Style::default()
         },
-        vec![
-            Component::text(
-                locale::t_args("handoff-from", &[("name", &from)]),
-                Style {
-                    font_size: 20.0,
-                    font_weight: 700,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                path,
-                Style {
-                    font_size: 14.0,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                draft,
-                Style {
-                    font_size: 14.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                locale::t("handoff-l2-still-off"),
-                Style {
-                    font_size: 13.0,
-                    color: muted_ink(),
-                    ..Style::default()
-                },
-            ),
-            chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
-            chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
-        ],
+        handoff_page_body(&from, &path, &draft),
     );
     card.style.position = Position::Absolute;
-    card.style.left = Dimension::Px(16.0);
-    card.style.top = Dimension::Px(24.0);
-    card.style.width = Dimension::Px((width - 32.0).max(200.0));
-    card.style.max_height = Dimension::Px((height - 120.0).max(240.0));
     card.style.z_index = CHROME_Z + 1;
+    if phone {
+        card.style.left = Dimension::Px(0.0);
+        card.style.top = Dimension::Px(0.0);
+        card.style.width = Dimension::Px(width);
+        card.style.height = Dimension::Px(height);
+    } else {
+        let card_w = 440.0_f32.min((width - 32.0).max(280.0));
+        card.style.left = Dimension::Px(((width - card_w) / 2.0).max(16.0));
+        card.style.top = Dimension::Px(72.0);
+        card.style.width = Dimension::Px(card_w);
+        card.style.max_height = Dimension::Px((height - 120.0).max(280.0));
+    }
     card
 }
 
@@ -3904,29 +5007,233 @@ fn settings_heading(title: &str, detail: &str) -> Vec<Component> {
     ]
 }
 
-fn settings_local_page() -> Vec<Component> {
-    let night = if state::get_signal(NIGHT_SIGNAL) != 0 {
+fn settings_lexicon_page() -> Vec<Component> {
+    let mut rows = settings_heading(
+        &locale::t("settings-lexicon-title"),
+        &locale::t("settings-lexicon-detail"),
+    );
+    if !lexicon::unlocked() {
+        rows.push(Component::text(
+            locale::t("lexicon-locked"),
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        ));
+        return rows;
+    }
+    rows.extend(lexicon_entry_rows());
+    let stealth_label = if lexicon::stealth_on() {
+        locale::t("lexicon-stealth-on")
+    } else {
+        locale::t("lexicon-stealth-off")
+    };
+    let app = state::get_signal(APP_SIGNAL);
+    let hidden = if lexicon::app_hidden(app_key(app)) {
         locale::t("on")
     } else {
         locale::t("off")
     };
+    rows.push(lexicon_pair(
+        chrome_button(stealth_label, OP_LEXICON_STEALTH, "#3d5570"),
+        chrome_button(
+            format!("{} · {hidden}", locale::t("lexicon-stealth-app")),
+            OP_LEXICON_APP,
+            "#3d5570",
+        ),
+    ));
+    rows.push(lexicon_draft_field());
+    let placeholder = locale::t("lexicon-entry-placeholder");
+    let mut save = chrome_button(locale::t("lexicon-save"), OP_LEXICON_SAVE, "#0c6d4c");
+    save.on_click = EventAction::Invoke {
+        code: OP_LEXICON_SAVE,
+        input_placeholder: placeholder.clone(),
+    };
+    let mut drop = chrome_button(locale::t("lexicon-drop"), OP_LEXICON_DROP, "#3d5570");
+    drop.on_click = EventAction::Invoke {
+        code: OP_LEXICON_DROP,
+        input_placeholder: placeholder,
+    };
+    rows.push(lexicon_pair(save, drop));
+    rows.push(lexicon_pair(
+        chrome_button(locale::t("lexicon-export"), OP_LEXICON_EXPORT, "#3d5570"),
+        chrome_button(locale::t("lexicon-clear"), OP_LEXICON_CLEAR, "#9a3412"),
+    ));
+    rows
+}
+
+fn lexicon_pair(mut left: Component, mut right: Component) -> Component {
+    left.style.flex_grow = 1.0;
+    right.style.flex_grow = 1.0;
+    Component::row(
+        Style {
+            gap: 8.0,
+            align_items: AlignItems::Center,
+            ..Style::default()
+        },
+        vec![left, right],
+    )
+}
+
+fn lexicon_entry_rows() -> Vec<Component> {
+    let entries = lexicon::entries();
+    if entries.is_empty() {
+        return vec![Component::text(
+            locale::t("lexicon-empty"),
+            Style {
+                font_size: 14.0,
+                color: Color::from_hex("#d5dee8"),
+                ..Style::default()
+            },
+        )];
+    }
+    entries
+        .iter()
+        .take(8)
+        .map(|entry| {
+            let line = if entry.kind == w3cos_ime::EntryKind::Alias {
+                locale::t_args(
+                    "lexicon-alias",
+                    &[("alias", &entry.text), ("target", &entry.extra)],
+                )
+            } else {
+                let freq = entry.freq.to_string();
+                locale::t_args(
+                    "lexicon-row",
+                    &[
+                        ("text", &entry.text),
+                        ("extra", &entry.extra),
+                        ("freq", &freq),
+                    ],
+                )
+            };
+            Component::text(
+                line,
+                Style {
+                    font_size: 14.0,
+                    color: Color::from_hex("#f4f7fb"),
+                    ..Style::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn lexicon_draft_field() -> Component {
+    let mut style = Style {
+        font_size: 13.0,
+        color: ink_token(),
+        background: Color::rgba(244, 241, 234, 18),
+        border_radius: 10.0,
+        border_width: 1.0,
+        border_color: Color::rgba(244, 241, 234, 31),
+        padding: Edges::xy(10.0, 6.0),
+        min_height: Dimension::Px(if state::pointer_is_coarse() {
+            48.0
+        } else {
+            32.0
+        }),
+        ..Style::default()
+    };
+    style.custom_properties = Some(HashMap::from([(
+        "--w3cos-ime".to_string(),
+        "text".to_string(),
+    )]));
+    note_preedit(&mut style, "text");
+    Component::text_input(
+        state::get_signal_text(LEXICON_DRAFT_SIGNAL),
+        locale::t("lexicon-entry-placeholder"),
+        style,
+    )
+}
+
+fn settings_local_page() -> Vec<Component> {
     let mut rows = settings_heading(
         &locale::t("settings-local-title"),
         &locale::t("settings-local-detail"),
     );
-    rows.push(settings_row(&locale::t("settings-night"), &night));
-    rows.push(chrome_button(
-        locale::t("settings-night-toggle"),
+    rows.push(settings_switch(
+        &locale::t("settings-night"),
+        state::get_signal(NIGHT_SIGNAL) != 0,
         OP_CHIP_NIGHT,
-        "#3d5570",
     ));
-    rows.push(settings_row(
-        &locale::t("settings-language"),
-        &locale::current(),
+    rows.push(settings_link(
+        locale::t("settings-lexicon-open"),
+        OP_SETTINGS_LEXICON,
     ));
-    rows.push(chrome_button(locale::t("lang-zh"), OP_LOCALE_ZH, "#3d5570"));
-    rows.push(chrome_button(locale::t("lang-en"), OP_LOCALE_EN, "#3d5570"));
     rows
+}
+
+fn settings_language_page() -> Vec<Component> {
+    let mut rows = settings_heading(
+        &locale::t("settings-language-title"),
+        &locale::t("settings-language-detail"),
+    );
+    let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
+    rows.push(locale_choice("zh-CN", &pending));
+    rows.push(locale_choice("en", &pending));
+    rows
+}
+
+fn locale_choice(tag: &str, pending: &str) -> Component {
+    let current = locale::current() == tag;
+    let name = locale_self_name(tag);
+    let code = if tag == "en" {
+        OP_LOCALE_EN
+    } else {
+        OP_LOCALE_ZH
+    };
+    let mut name_button = nav_button(&name, current, code);
+    name_button.style.flex_grow = 1.0;
+    name_button.style.width = Dimension::Auto;
+    let tag_label = if tag == "en" {
+        locale::t("locale-tag-en")
+    } else {
+        locale::t("locale-tag-zh")
+    };
+    let mut side = vec![Component::text(
+        tag_label,
+        Style {
+            font_size: 12.0,
+            color: muted_ink(),
+            flex_shrink: 0.0,
+            ..Style::default()
+        },
+    )];
+    if pending == tag {
+        side.push(Component::text(
+            locale::t("locale-pending"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#f0d7b4"),
+                flex_shrink: 0.0,
+                ..Style::default()
+            },
+        ));
+    }
+    Component::row(
+        Style {
+            min_height: Dimension::Px(48.0),
+            gap: 8.0,
+            align_items: AlignItems::Center,
+            width: Dimension::Percent(100.0),
+            ..Style::default()
+        },
+        vec![
+            name_button,
+            Component::row(
+                Style {
+                    gap: 8.0,
+                    align_items: AlignItems::Center,
+                    flex_shrink: 0.0,
+                    ..Style::default()
+                },
+                side,
+            ),
+        ],
+    )
 }
 
 fn settings_identity_page() -> Vec<Component> {
@@ -3942,28 +5249,36 @@ fn settings_identity_page() -> Vec<Component> {
     } else {
         subject_owned
     };
-    let enroll_owned = state::get_signal_text(ENROLL_SIGNAL);
-    let enroll_label = if enroll_owned.is_empty() {
-        locale::t("enroll-fallback")
-    } else {
-        enroll_owned
-    };
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
     let mut rows = settings_heading(
         &locale::t("settings-identity-title"),
         &locale::t("settings-identity-detail"),
     );
-    rows.push(settings_row(&locale::t("settings-subject"), &subject_label));
     rows.push(Component::text(
-        enroll_label,
+        truncate_middle(&subject_label, 28),
         Style {
-            font_size: 13.0,
-            color: Color::from_hex("#d5dee8"),
+            font_size: 16.0,
+            font_weight: 650,
+            color: Color::from_hex("#f4f7fb"),
             ..Style::default()
         },
     ));
     rows.push(chrome_button(
-        locale::t("enroll-challenge"),
+        locale::t("settings-copy"),
+        OP_COPY_SUBJECT,
+        "#31475e",
+    ));
+    rows.push(Component::text(
+        locale::t("passkey-unregistered"),
+        Style {
+            font_size: 14.0,
+            font_weight: 650,
+            color: Color::from_hex("#ffe08a"),
+            ..Style::default()
+        },
+    ));
+    rows.push(chrome_button(
+        locale::t("passkey-enroll"),
         OP_ENROLL,
         "#3d5570",
     ));
@@ -3977,15 +5292,9 @@ fn settings_identity_page() -> Vec<Component> {
         locale::t("locked")
     };
     rows.push(settings_row(&locale::t("settings-status"), &status));
-    rows.push(chrome_button(
-        if unlocked {
-            locale::t("lock")
-        } else {
-            locale::t("unlock")
-        },
-        if unlocked { OP_LOCK } else { OP_UNLOCK },
-        if unlocked { "#3d5570" } else { "#9a3412" },
-    ));
+    if unlocked {
+        rows.push(chrome_button(locale::t("lock"), OP_LOCK, "#3d5570"));
+    }
     rows.push(settings_row(&locale::t("settings-storage"), &storage_label));
     rows.push(chrome_button(
         locale::t("open-ledger"),
@@ -3995,7 +5304,7 @@ fn settings_identity_page() -> Vec<Component> {
     rows
 }
 
-fn settings_permissions_page() -> Vec<Component> {
+fn settings_agent_page() -> Vec<Component> {
     let bridge = std::env::var("W3COS_AI_PERMISSIONS").unwrap_or_default();
     let bridge = match bridge.trim() {
         "" | "observer" => locale::t("perm-observer"),
@@ -4003,7 +5312,24 @@ fn settings_permissions_page() -> Vec<Component> {
         "system" => locale::t("perm-system"),
         _ => locale::t("perm-unknown"),
     };
-    let mut rows = settings_heading(&locale::t("perm-title"), &locale::t("perm-detail"));
+    let shared = state::get_signal(CONTEXT_SIGNAL) != 0;
+    let mut rows = settings_heading(
+        &locale::t("settings-agent-title"),
+        &locale::t("settings-agent-detail"),
+    );
+    rows.push(settings_switch(
+        &locale::t("settings-context-switch"),
+        shared,
+        if shared { OP_REVOKE } else { OP_RESTORE },
+    ));
+    rows.push(Component::text(
+        locale::t("settings-context-note"),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#d5dee8"),
+            ..Style::default()
+        },
+    ));
     rows.push(settings_row(&locale::t("perm-bridge"), &bridge));
     rows.push(settings_row(
         &locale::t("perm-shell"),
@@ -4017,6 +5343,7 @@ fn settings_permissions_page() -> Vec<Component> {
         &locale::t("perm-standing"),
         &locale::t("perm-standing-value"),
     ));
+    rows.push(settings_link(locale::t("settings-l2-open"), OP_SETTINGS_L2));
     rows
 }
 
@@ -4116,14 +5443,26 @@ fn build_task_center() -> Component {
         _ => (locale::t("phase-idle"), "#d5dee8"),
     };
     let mut body = vec![
-        Component::text(
-            locale::t("tasks-title"),
+        Component::row(
             Style {
-                font_size: 16.0,
-                font_weight: 700,
-                color: ink(),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                gap: 8.0,
                 ..Style::default()
             },
+            vec![
+                Component::text(
+                    locale::t("tasks-title"),
+                    Style {
+                        font_size: 16.0,
+                        font_weight: 700,
+                        color: ink(),
+                        flex_grow: 1.0,
+                        ..Style::default()
+                    },
+                ),
+                chrome_button(locale::t("tasks-hide"), OP_TOGGLE_TASKS, "#3d5570"),
+            ],
         ),
         Component::text(
             planner_subtitle(),
@@ -4152,9 +5491,9 @@ fn build_task_center() -> Component {
                 };
                 {
                     let state_label = if unlocked {
-                        locale::t("state-stub-unlocked")
+                        locale::t("unlocked")
                     } else {
-                        locale::t("state-locked")
+                        locale::t("locked")
                     };
                     locale::t_args(
                         "identity-line",
@@ -4180,15 +5519,9 @@ fn build_task_center() -> Component {
             },
         ));
     }
-    body.push(chrome_button(
-        if unlocked {
-            locale::t("lock")
-        } else {
-            locale::t("unlock-to-run")
-        },
-        if unlocked { OP_LOCK } else { OP_UNLOCK },
-        if unlocked { "#3d5570" } else { "#9a3412" },
-    ));
+    if unlocked {
+        body.push(chrome_button(locale::t("lock"), OP_LOCK, "#3d5570"));
+    }
     let steps = state::get_signal_text(STEPS_SIGNAL);
     if !steps.is_empty() {
         body.push(Component::text(
@@ -4294,12 +5627,14 @@ enum SheetKind {
     Ghost,
     Primary,
     Danger,
+    Warm,
 }
 
 fn action_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Component {
     let (background, color, border) = match kind {
         SheetKind::Ghost => (Color::TRANSPARENT, ink_token(), Some(line_strong())),
         SheetKind::Primary => (Color::from_hex("#0c6d4c"), Color::from_hex("#e9fff5"), None),
+        SheetKind::Warm => (Color::from_hex("#9a5410"), Color::from_hex("#fff4e5"), None),
         SheetKind::Danger => (
             Color::TRANSPARENT,
             Color::from_hex("#ffd5d4"),
@@ -4352,51 +5687,6 @@ fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Compon
             ..Style::default()
         },
         action,
-    )
-}
-
-// ==========================================================================
-// AI Agent window — the task center stays beside whatever page is open.
-// ==========================================================================
-
-fn build_ai_agent_app() -> Component {
-    Component::column(
-        Style {
-            flex_grow: 1.0,
-            background: Color::from_hex("#24506e"),
-            gap: 0.0,
-            ..Style::default()
-        },
-        vec![
-            app_titlebar(locale::t("app-agent"), "#e07a5f", 4),
-            Component::column(
-                Style {
-                    flex_grow: 1.0,
-                    padding: Edges::all(24.0),
-                    gap: 12.0,
-                    ..Style::default()
-                },
-                vec![
-                    Component::text(
-                        locale::t("agent-body"),
-                        Style {
-                            font_size: 16.0,
-                            font_weight: 700,
-                            color: ink(),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        state::get_signal_text(RECEIPT_SIGNAL),
-                        Style {
-                            font_size: 13.0,
-                            color: ink(),
-                            ..Style::default()
-                        },
-                    ),
-                ],
-            ),
-        ],
     )
 }
 
@@ -4522,7 +5812,7 @@ fn build_browser_app() -> Component {
                         "W3C OS",
                         Style {
                             font_size: 48.0,
-                            color: Color::from_hex("#6c5ce7"),
+                            color: Color::from_hex("#1c8f62"),
                             font_weight: 700,
                             ..Style::default()
                         },
@@ -4571,7 +5861,7 @@ fn build_browser_app() -> Component {
                                     Component::button(
                                         locale::t("browser-start"),
                                         Style {
-                                            background: Color::from_hex("#6c5ce7"),
+                                            background: Color::from_hex("#1c8f62"),
                                             border_radius: 8.0,
                                             font_size: 14.0,
                                             color: Color::WHITE,
@@ -4900,7 +6190,7 @@ fn build_editor_app() -> Component {
             Component::row(
                 Style {
                     height: Dimension::Px(24.0),
-                    background: Color::from_hex("#6c5ce7"),
+                    background: Color::from_hex("#1c8f62"),
                     padding: Edges::xy(12.0, 4.0),
                     gap: 16.0,
                     align_items: AlignItems::Center,
@@ -4957,7 +6247,7 @@ fn build_editor_app() -> Component {
 fn editor_tab(name: &str, active: bool) -> Component {
     let bg = if active { "#1e1e2e" } else { "#14142a" };
     let color = if active { "#e0e0f0" } else { "#606080" };
-    let border_color = if active { "#6c5ce7" } else { "#14142a" };
+    let border_color = if active { "#1c8f62" } else { "#14142a" };
     Component::column(
         Style {
             padding: Edges::xy(14.0, 8.0),
@@ -4999,7 +6289,7 @@ fn explorer_item(name: &str, indent: u8, is_dir: bool) -> Component {
                 icon,
                 Style {
                     font_size: 12.0,
-                    color: Color::from_hex("#6c5ce7"),
+                    color: Color::from_hex("#1c8f62"),
                     ..Style::default()
                 },
             ),
@@ -5070,23 +6360,23 @@ fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
 // Shared: title bar + taskbar
 // ==========================================================================
 
-fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -> Component {
+fn window_button(
+    glyph: &str,
+    name: impl Into<String>,
+    code: u8,
+    stroke: &str,
+    app_id: i64,
+) -> Component {
     let side = gesture::coarse_target(state::pointer_is_coarse());
-    let mut button = Component::button_with_click(
-        label,
-        Style {
-            font_size: 12.0,
-            color: Color::from_hex(color),
-            background: Color::from_hex("#2a2a3e"),
-            border_radius: 10.0,
-            padding: Edges::all(4.0),
-            width: Dimension::Px(side),
-            height: Dimension::Px(side),
-            min_width: Dimension::Px(side),
-            min_height: Dimension::Px(side),
-            ..Style::default()
-        },
-        invoke(code),
+    let mut button = glyph_face(
+        glyph,
+        name,
+        code,
+        Color::TRANSPARENT,
+        stroke,
+        side,
+        8.0,
+        false,
     );
     button.style.custom_properties = Some(win_props(app_id, None));
     button
@@ -5094,10 +6384,10 @@ fn window_button(label: impl Into<String>, code: u8, color: &str, app_id: i64) -
 
 fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Component {
     let title = title.into();
-    let max_label = if windows::is_maximized(app_id) {
-        locale::t("win-restore")
+    let (max_glyph, max_label) = if windows::is_maximized(app_id) {
+        ("restore", locale::t("win-restore"))
     } else {
-        locale::t("win-maximize")
+        ("maximize", locale::t("win-maximize"))
     };
     let bar_height = if state::pointer_is_coarse() {
         56.0
@@ -5149,9 +6439,15 @@ fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Componen
                     ..Style::default()
                 },
                 vec![
-                    window_button("--", OP_MINIMIZE, "#808090", app_id),
-                    window_button(max_label, OP_MAXIMIZE, "#808090", app_id),
-                    window_button("X", OP_CLOSE, "#e94560", app_id),
+                    window_button(
+                        "minus",
+                        locale::t("win-minimize"),
+                        OP_MINIMIZE,
+                        "#c5d0d8",
+                        app_id,
+                    ),
+                    window_button(max_glyph, max_label, OP_MAXIMIZE, "#c5d0d8", app_id),
+                    window_button("close", locale::t("win-close"), OP_CLOSE, "#e94560", app_id),
                 ],
             ),
         ],
@@ -5176,7 +6472,7 @@ const LAUNCH_APPS: [LaunchApp; 6] = [
         id: 0,
         letter: "D",
         glyph: "grid",
-        color: "#6c5ce7",
+        color: "#1c8f62",
     },
     LaunchApp {
         id: 1,
@@ -5194,7 +6490,7 @@ const LAUNCH_APPS: [LaunchApp; 6] = [
         id: 3,
         letter: "S",
         glyph: "settings",
-        color: "#9b59b6",
+        color: "#d4a017",
     },
     LaunchApp {
         id: 5,
@@ -5221,10 +6517,14 @@ fn build_launcher() -> Component {
         padding: Edges::xy(12.0, 8.0),
         ..Style::default()
     };
-    search_style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_LAUNCHER_SEARCH.to_string(),
-    )]));
+    search_style.custom_properties = Some(HashMap::from([
+        (
+            "--w3cos-intent-submit".to_string(),
+            OP_LAUNCHER_SEARCH.to_string(),
+        ),
+        ("--w3cos-ime".to_string(), "launcher".to_string()),
+    ]));
+    note_preedit(&mut search_style, "launcher");
     let needle = query.trim().to_lowercase();
     let mut tiles = Vec::new();
     for app in LAUNCH_APPS {
@@ -5272,7 +6572,7 @@ fn build_launcher() -> Component {
                 Component::button_with_click(
                     locale::t("launcher-search"),
                     Style {
-                        background: Color::from_hex("#5b4fe0"),
+                        background: Color::from_hex("#1c8f62"),
                         border_radius: 8.0,
                         font_size: 13.0,
                         font_weight: 700,
@@ -5444,10 +6744,14 @@ fn receipt_query_field() -> Component {
         }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([(
-        "--w3cos-intent-submit".to_string(),
-        OP_RECEIPT_QUERY.to_string(),
-    )]));
+    style.custom_properties = Some(HashMap::from([
+        (
+            "--w3cos-intent-submit".to_string(),
+            OP_RECEIPT_QUERY.to_string(),
+        ),
+        ("--w3cos-ime".to_string(), "text".to_string()),
+    ]));
+    note_preedit(&mut style, "text");
     Component::text_input(
         state::get_signal_text(RECEIPT_QUERY_SIGNAL),
         locale::t("receipt-query"),
@@ -5486,96 +6790,114 @@ fn filter_chip(key: &str, code: u8, selected: bool) -> Component {
 
 fn receipt_row(line: &str) -> Component {
     let parts = parse_receipt(line);
-    let (pill_bg, pill_fg) = match parts.decision.as_str() {
-        "allowed" => (Color::rgba(20, 150, 106, 46), Color::from_hex("#c9ffe4")),
-        "denied" => (Color::rgba(224, 122, 120, 41), Color::from_hex("#ffd0cf")),
-        "cancelled" => (Color::rgba(226, 164, 92, 41), Color::from_hex("#ffe1b5")),
-        _ => (Color::rgba(244, 241, 234, 20), muted_token()),
-    };
+    let (pill_bg, pill_fg) = decision_colors(&parts.decision);
     let clock = format_receipt_clock(&parts.recorded_at);
-    let said = if parts.utterance.is_empty() {
+    let clock = if clock.is_empty() {
+        "—".to_string()
+    } else {
+        clock
+    };
+    let summary = if !parts.utterance.is_empty() {
+        parts.utterance.clone()
+    } else if !parts.detail.is_empty() {
         parts.detail.clone()
     } else {
-        parts.utterance.clone()
+        parts.command.clone()
     };
-    let mut subtitle_bits = Vec::new();
-    if !clock.is_empty() {
-        subtitle_bits.push(clock);
+    let layer = layer_label(&parts.tier);
+    let actor = if parts.actor.is_empty() {
+        String::new()
+    } else {
+        truncate_middle(&parts.actor, 22)
+    };
+    let meta = if actor.is_empty() {
+        locale::t_args("receipt-meta", &[("layer", &layer), ("id", &parts.id)])
+    } else {
+        locale::t_args(
+            "receipt-meta-actor",
+            &[("layer", &layer), ("id", &parts.id), ("actor", &actor)],
+        )
+    };
+    let show_result = !parts.detail.is_empty() && parts.detail != summary;
+    let mut lines = vec![
+        Component::row(
+            Style {
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                gap: 8.0,
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    clock,
+                    Style {
+                        font_size: 12.0,
+                        color: faint_token(),
+                        flex_shrink: 0.0,
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    decision_label(&parts.decision),
+                    Style {
+                        font_size: 12.0,
+                        font_weight: 650,
+                        color: pill_fg,
+                        background: pill_bg,
+                        border_radius: 999.0,
+                        padding: Edges::xy(8.0, 2.0),
+                        flex_shrink: 0.0,
+                        ..Style::default()
+                    },
+                ),
+            ],
+        ),
+        Component::text(
+            summary,
+            Style {
+                font_size: 14.0,
+                font_weight: 650,
+                color: ink_token(),
+                ..Style::default()
+            },
+        ),
+    ];
+    if show_result {
+        lines.push(Component::text(
+            locale::t_args("receipt-result", &[("text", &parts.detail)]),
+            Style {
+                font_size: 12.0,
+                color: muted_token(),
+                ..Style::default()
+            },
+        ));
     }
-    if !parts.tier.is_empty() {
-        subtitle_bits.push(parts.tier.clone());
-    }
-    if !said.is_empty() {
-        subtitle_bits.push(said);
-    }
-    let subtitle = subtitle_bits.join(" · ");
-    Component::row(
+    lines.push(Component::text(
+        meta,
         Style {
-            gap: 8.0,
-            align_items: AlignItems::Center,
-            padding: Edges::xy(8.0, 10.0),
-            border_width: 0.0,
-            border_color: Color::rgba(244, 241, 234, 31),
+            font_size: 12.0,
+            color: faint_token(),
+            font_family: Some("ui-monospace, monospace".to_string()),
             ..Style::default()
         },
-        vec![
-            Component::text(
-                parts.id,
-                Style {
-                    width: Dimension::Px(52.0),
-                    font_size: 12.0,
-                    color: faint_token(),
-                    flex_shrink: 0.0,
-                    ..Style::default()
-                },
-            ),
-            Component::column(
-                Style {
-                    flex_grow: 1.0,
-                    min_width: Dimension::Px(0.0),
-                    gap: 2.0,
-                    ..Style::default()
-                },
-                vec![
-                    Component::text(
-                        parts.command,
-                        Style {
-                            font_size: 13.0,
-                            font_weight: 650,
-                            color: ink_token(),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        subtitle,
-                        Style {
-                            font_size: 12.0,
-                            color: faint_token(),
-                            ..Style::default()
-                        },
-                    ),
-                ],
-            ),
-            Component::text(
-                decision_label(&parts.decision),
-                Style {
-                    font_size: 12.0,
-                    font_weight: 650,
-                    color: pill_fg,
-                    background: pill_bg,
-                    border_radius: 999.0,
-                    padding: Edges::xy(8.0, 2.0),
-                    flex_shrink: 0.0,
-                    ..Style::default()
-                },
-            ),
-        ],
+    ));
+    Component::column(
+        Style {
+            gap: 4.0,
+            padding: Edges::xy(10.0, 10.0),
+            background: Color::rgba(244, 241, 234, 10),
+            border_radius: 12.0,
+            ..Style::default()
+        },
+        lines,
     )
 }
 
 fn open_app_ids() -> Vec<i64> {
     let mask = state::get_signal(OPEN_MASK_SIGNAL);
-    (1..=6).filter(|id| mask & app_bit(*id) != 0).collect()
+    (1..=6)
+        .filter(|id| resident(*id) && mask & app_bit(*id) != 0)
+        .collect()
 }
 
 fn build_switcher() -> Component {
@@ -5613,7 +6935,13 @@ fn build_switcher() -> Component {
                 },
                 vec![
                     chrome_button(app_label(id), focus_code(id), app_accent(id)),
-                    window_button(locale::t("switcher-close"), OP_CLOSE, "#e07a78", id),
+                    window_button(
+                        "close",
+                        locale::t("switcher-close"),
+                        OP_CLOSE,
+                        "#e07a78",
+                        id,
+                    ),
                 ],
             ));
         }
@@ -5640,13 +6968,7 @@ fn build_switcher() -> Component {
 }
 
 fn build_receipts_viewer() -> Component {
-    let storage_owned = state::get_signal_text(STORAGE_SIGNAL);
-    let storage_label = if storage_owned.is_empty() {
-        "memory".to_string()
-    } else {
-        storage_owned
-    };
-    let subject_label = truncate_middle(&current_subject(), 22);
+    let subject_label = truncate_middle(&current_subject(), 24);
     let entries = visible_receipts();
     let pages = receipt_page_count(entries.len());
     let page = state::get_signal(RECEIPT_PAGE_SIGNAL).clamp(0, pages - 1);
@@ -5684,7 +7006,7 @@ fn build_receipts_viewer() -> Component {
             ],
         ),
         Component::button_with_click(
-            format!("{subject_label} · {storage_label}"),
+            subject_label,
             Style {
                 background: Color::TRANSPARENT,
                 color: muted_token(),
@@ -5714,7 +7036,9 @@ fn build_receipts_viewer() -> Component {
                 filter_chip("filter-cancelled", OP_FILTER_CANCELLED, filter == 3),
             ],
         ),
-        Component::row(
+    ];
+    if pages > 1 {
+        body.push(Component::row(
             Style {
                 gap: 8.0,
                 align_items: AlignItems::Center,
@@ -5735,8 +7059,8 @@ fn build_receipts_viewer() -> Component {
                 ),
                 action_button(locale::t("receipt-next"), OP_RECEIPT_NEXT, SheetKind::Ghost),
             ],
-        ),
-    ];
+        ));
+    }
     if entries.is_empty() {
         let empty_key = if filter == 0 {
             "receipt-empty-long"
@@ -5830,6 +7154,7 @@ mod shell_ux_tests {
         assert_eq!(parts.command, "open-files");
         assert_eq!(parts.tier, "L0");
         assert_eq!(parts.detail, "opened");
+        assert_eq!(parts.actor, "me");
         assert!(parts.recorded_at.is_empty());
         assert!(parts.utterance.is_empty());
         let stamped = parse_receipt(
@@ -5895,5 +7220,1903 @@ mod shell_ux_tests {
         copy_subject();
         let copied = COPIED_SUBJECT.with(|slot| slot.borrow().clone());
         assert_eq!(copied, "did:key:z6MkhaXgexample");
+    }
+
+    fn px(dim: Dimension) -> f32 {
+        match dim {
+            Dimension::Px(value) => value,
+            other => panic!("expected px, got {other:?}"),
+        }
+    }
+
+    fn walk(node: &Component, visit: &mut dyn FnMut(&Component)) {
+        visit(node);
+        for child in &node.children {
+            walk(child, visit);
+        }
+    }
+
+    struct IconFace {
+        label: String,
+        color_a: u8,
+        background: Color,
+        overflow: Overflow,
+        width: f32,
+        svg: String,
+    }
+
+    fn icon_buttons(root: &Component) -> Vec<IconFace> {
+        let mut found = Vec::new();
+        walk(root, &mut |node| {
+            let ComponentKind::Button { label } = &node.kind else {
+                return;
+            };
+            if label.is_empty() {
+                return;
+            }
+            let Some(svg) = node.children.iter().find_map(|child| match &child.kind {
+                ComponentKind::SvgDocument { source, .. } => Some(source.clone()),
+                _ => None,
+            }) else {
+                return;
+            };
+            found.push(IconFace {
+                label: label.clone(),
+                color_a: node.style.color.a,
+                background: node.style.background,
+                overflow: node.style.overflow,
+                width: px(node.style.width),
+                svg,
+            });
+        });
+        found
+    }
+
+    #[test]
+    fn dock_icons_keep_names_without_painting_them() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(1) | app_bit(2));
+        let bar = build_floating_taskbar();
+        let icons = icon_buttons(&bar);
+        assert!(icons.len() >= 5, "expected launcher, apps, and tray icons");
+        for icon in &icons {
+            assert_eq!(icon.color_a, 0, "{} paints across the dock", icon.label);
+            assert_eq!(icon.overflow, Overflow::Hidden);
+            assert!(
+                icon.width <= 48.0,
+                "{} is {}px wide",
+                icon.label,
+                icon.width
+            );
+        }
+        assert!(bar.style.gap >= 8.0);
+    }
+
+    #[test]
+    fn window_controls_are_icons_not_a_missing_glyph() {
+        locale::set_locale("zh-CN");
+        assert_ne!(locale::t("win-maximize"), "[]");
+        assert_eq!(locale::t("win-minimize"), "最小化");
+        assert_eq!(locale::t("win-maximize"), "最大化");
+        assert_eq!(locale::t("win-restore"), "还原");
+        assert_eq!(locale::t("win-close"), "关闭");
+        locale::set_locale("en");
+        assert_eq!(locale::t("win-maximize"), "Maximize");
+        assert_ne!(locale::t("win-maximize"), "[]");
+        locale::set_locale("zh-CN");
+        let bar = app_titlebar("终端", "#1c8f62", 2);
+        let icons = icon_buttons(&bar);
+        let labels: Vec<&str> = icons.iter().map(|icon| icon.label.as_str()).collect();
+        assert_eq!(labels, ["最小化", "最大化", "关闭"]);
+        for icon in &icons {
+            assert_eq!(icon.color_a, 0, "{}", icon.label);
+            assert_eq!(icon.background.a, 0, "{} still fills a square", icon.label);
+            assert_ne!(icon.background, Color::from_hex("#2a2a3e"));
+            assert!(
+                !icon.svg.contains('['),
+                "{} still uses a tofu glyph",
+                icon.label
+            );
+        }
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn resize_grip_is_not_a_white_square() {
+        let corner = resize_corner(2);
+        assert_eq!(corner.style.background.a, 0);
+        assert_ne!(corner.style.background, Color::from_hex("#d5dee8"));
+        let edge = resize_handle(2, "e", Dimension::Px(16.0), Dimension::Auto);
+        assert_eq!(edge.style.background.a, 0);
+        assert_ne!(edge.style.background, Color::from_hex("#2a3e52"));
+    }
+
+    #[test]
+    fn receipts_drawer_stops_above_the_intent_bar() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        state::note_shell_viewport(1200.0, 800.0);
+        let panel = place_receipts(Component::column(Style::default(), vec![]));
+        let bottom = px(panel.style.top) + px(panel.style.height);
+        let intent_top = px(floating_intent().style.top);
+        assert!(
+            bottom <= intent_top - 8.0,
+            "drawer ends at {bottom}, intent starts at {intent_top}"
+        );
+        assert!(
+            px(panel.style.left) > 400.0,
+            "desktop drawer stays on the right"
+        );
+        assert!(px(panel.style.width) <= 420.0);
+        state::note_shell_viewport(390.0, 760.0);
+        let sheet = place_receipts(Component::column(Style::default(), vec![]));
+        assert_eq!(px(sheet.style.left), 0.0);
+        assert!(
+            px(sheet.style.top) >= 48.0,
+            "phone sheet leaves the status area"
+        );
+        assert_eq!(px(sheet.style.width), 390.0);
+        assert_eq!(sheet.style.border_top_left_radius, Some(22.0));
+        assert_eq!(sheet.style.border_bottom_left_radius, Some(0.0));
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn notify_panel_stops_above_the_intent_bar() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        state::note_shell_viewport(1200.0, 800.0);
+        let panel = build_notify_panel();
+        let bottom = px(panel.style.top) + px(panel.style.max_height);
+        let intent_top = px(floating_intent().style.top);
+        assert!(
+            bottom <= intent_top - 8.0,
+            "notify ends at {bottom}, intent starts at {intent_top}"
+        );
+    }
+
+    #[test]
+    fn phone_keyboard_is_in_the_phone_shell_only_while_a_field_is_focused() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        ime_bar::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".to_string(),
+            secure: false,
+            x: 16.0,
+            y: 640.0,
+            width: 300.0,
+            height: 36.0,
+        });
+        let phone = format!("{:?}", build_shell());
+        assert!(
+            phone.contains("--w3cos-softkey"),
+            "phone shell is missing the keyboard"
+        );
+        assert!(phone.contains(&locale::t("kbd-backspace")));
+        state::clear_ime_field();
+        let hidden = format!("{:?}", build_shell());
+        assert!(
+            !hidden.contains("--w3cos-softkey"),
+            "keyboard stayed up without a field"
+        );
+        state::note_shell_viewport(1200.0, 800.0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".to_string(),
+            secure: false,
+            x: 16.0,
+            y: 640.0,
+            width: 300.0,
+            height: 36.0,
+        });
+        let desktop = format!("{:?}", build_shell());
+        assert!(!desktop.contains("--w3cos-softkey"));
+        state::clear_ime_field();
+        ime_bar::sync_field_presence();
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn chrome_accents_are_not_indigo() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        state::note_shell_viewport(768.0, 1024.0);
+        let rail = format!("{:?}", build_tablet_rail());
+        let launcher = format!("{:?}", build_launcher());
+        let settings = format!("{:?}", build_settings_app());
+        for (name, dumped) in [
+            ("rail", rail),
+            ("launcher", launcher),
+            ("settings", settings),
+        ] {
+            for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+                assert!(!dumped.contains(hex), "{name} still uses {hex}");
+            }
+        }
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn focused_window_border_is_jade() {
+        let frame = build_window_frame(2, true);
+        assert!(frame.style.border_color.g > frame.style.border_color.r + 40);
+        assert!(frame.style.border_color.b < 180);
+        assert_ne!(
+            (
+                frame.style.border_color.r,
+                frame.style.border_color.g,
+                frame.style.border_color.b
+            ),
+            (108, 92, 231)
+        );
+    }
+
+    #[test]
+    fn terminal_states_the_process_grant_once() {
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        let app = build_terminal_app();
+        let mut texts = Vec::new();
+        walk(&app, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind {
+                texts.push(content.clone());
+            }
+        });
+        let grants = texts
+            .iter()
+            .filter(|text| text.contains("echo") || text.contains("w3cos-process"))
+            .count();
+        assert_eq!(grants, 1, "{texts:?}");
+        assert!(texts.iter().any(|text| text.contains("终端已就绪")));
+        locale::set_locale("en");
+    }
+
+    fn ime_role(root: &Component, role: &str) -> bool {
+        let mut found = false;
+        walk(root, &mut |node| {
+            let marked =
+                node.style.custom_properties.as_ref().is_some_and(|props| {
+                    props.get("--w3cos-ime").is_some_and(|value| value == role)
+                });
+            if marked {
+                found = true;
+            }
+        });
+        found
+    }
+
+    #[test]
+    fn text_fields_declare_an_ime_role() {
+        ensure_shell_signals();
+        assert!(ime_role(&build_intent_panel(), "intent"));
+        assert!(ime_role(&build_terminal_app(), "terminal"));
+        assert!(ime_role(&build_launcher(), "launcher"));
+        assert!(ime_role(&build_lock_screen(), "secure"));
+        assert!(ime_role(&receipt_query_field(), "text"));
+        let lock = build_lock_screen();
+        let mut secure = false;
+        walk(&lock, &mut |node| {
+            if let ComponentKind::TextInput { secure: hidden, .. } = &node.kind
+                && *hidden
+            {
+                secure = true;
+            }
+        });
+        assert!(secure);
+    }
+
+    fn absolute_boxes_fit(
+        node: &Component,
+        cb_x: f32,
+        cb_y: f32,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) {
+        let left = match node.style.left {
+            Dimension::Px(value) => value,
+            _ => 0.0,
+        };
+        let top = match node.style.top {
+            Dimension::Px(value) => value,
+            _ => 0.0,
+        };
+        let width = match node.style.width {
+            Dimension::Px(value) => Some(value),
+            _ => None,
+        };
+        let height = match node.style.height {
+            Dimension::Px(value) if value > 0.0 => Some(value),
+            _ => None,
+        };
+        let (x, y) = if node.style.position == Position::Absolute {
+            (cb_x + left, cb_y + top)
+        } else {
+            (cb_x, cb_y)
+        };
+        if node.style.position == Position::Absolute {
+            if let Some(w) = width {
+                assert!(
+                    x >= -0.5 && x + w <= viewport_w + 0.5,
+                    "x={x} w={w} viewport={viewport_w} kind={:?}",
+                    node.kind
+                );
+            }
+            if let Some(h) = height {
+                assert!(
+                    y >= -0.5 && y + h <= viewport_h + 0.5,
+                    "y={y} h={h} viewport={viewport_h} kind={:?}",
+                    node.kind
+                );
+            }
+        }
+        let positioned = matches!(node.style.position, Position::Absolute | Position::Relative);
+        let (next_x, next_y) = if positioned { (x, y) } else { (cb_x, cb_y) };
+        for child in &node.children {
+            absolute_boxes_fit(child, next_x, next_y, viewport_w, viewport_h);
+        }
+    }
+
+    fn candidate_bar(node: &Component) -> Option<&Component> {
+        if node.style.position == Position::Absolute && node.style.z_index == CHROME_Z + 5 {
+            return Some(node);
+        }
+        for child in &node.children {
+            if let Some(found) = candidate_bar(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn chrome_stays_inside_the_viewport_and_candidates_clear_the_intent() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        // The first build restores saved windows. Later builds keep the mask.
+        let _ = build_shell();
+        for (width, height) in [(1200.0, 800.0), (768.0, 1024.0), (390.0, 760.0)] {
+            state::set_signal(OPEN_MASK_SIGNAL, 0);
+            state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+            state::set_signal(APP_SIGNAL, 0);
+            state::note_shell_viewport(width, height);
+            ime_bar::reset_for_tests();
+            state::note_ime_field(state::ImeFieldNote {
+                index: 4,
+                value: String::new(),
+                role: "intent".into(),
+                secure: false,
+                x: 24.0,
+                y: intent_block_top(height) + 28.0,
+                width: 280.0,
+                height: 36.0,
+            });
+            for ch in "nihao".chars() {
+                assert!(ime_bar::on_key(&ch.to_string()));
+            }
+            apply_ime_field();
+            let root = build_shell();
+            absolute_boxes_fit(&root, 0.0, 0.0, width, height);
+            if width >= 1024.0 || width < 600.0 {
+                let shown = live_clock();
+                let mut digit_widths = Vec::new();
+                let mut colon_width = None;
+                walk(&root, &mut |node| {
+                    if node.children.len() != shown.chars().count() {
+                        return;
+                    }
+                    let matches_clock =
+                        node.children.iter().zip(shown.chars()).all(|(child, ch)| {
+                            matches!(&child.kind, ComponentKind::Text { content } if content.chars().next() == Some(ch))
+                                && !child.style.font_kerning
+                        });
+                    if !matches_clock {
+                        return;
+                    }
+                    digit_widths = node
+                        .children
+                        .iter()
+                        .filter(|child| {
+                            matches!(&child.kind, ComponentKind::Text { content } if content != ":")
+                        })
+                        .map(|child| px(child.style.width))
+                        .collect();
+                    colon_width = node.children.iter().find_map(|child| match &child.kind {
+                        ComponentKind::Text { content } if content == ":" => {
+                            Some(px(child.style.width))
+                        }
+                        _ => None,
+                    });
+                });
+                assert!(digit_widths.len() >= 4, "{digit_widths:?}");
+                assert!(
+                    digit_widths
+                        .windows(2)
+                        .all(|pair| (pair[0] - pair[1]).abs() < 0.1)
+                );
+                let colon_width = colon_width.expect("colon");
+                assert!(colon_width < digit_widths[0]);
+            }
+            let preedit = {
+                let mut found = None;
+                walk(&root, &mut |node| {
+                    if let ComponentKind::TextInput { value, secure, .. } = &node.kind
+                        && !*secure
+                        && let Some(props) = &node.style.custom_properties
+                        && let Some(suffix) = props.get("--w3cos-ime-preedit")
+                    {
+                        found = Some((value.clone(), suffix.clone()));
+                    }
+                });
+                found
+            };
+            let (value, suffix) = preedit.expect("underlined preedit");
+            assert_eq!(suffix, "ni hao");
+            assert!(value.ends_with("ni hao"), "{value}");
+            assert!(!value.ends_with("nihao"));
+            if width >= 600.0 {
+                let bar = candidate_bar(&root).expect("candidate bar");
+                let bar_top = px(bar.style.top);
+                let bar_h = px(bar.style.height);
+                let bar_left = px(bar.style.left);
+                let bar_w = px(bar.style.width);
+                let intent_top = intent_block_top(height);
+                assert!(
+                    bar_top + bar_h <= intent_top - 8.0 + 0.5,
+                    "bar {bar_top}+{bar_h} intersects intent {intent_top}"
+                );
+                assert!(bar_left >= -0.5 && bar_left + bar_w <= width + 0.5);
+                assert_eq!(bar.style.flex_wrap, FlexWrap::NoWrap);
+            } else {
+                assert!(candidate_bar(&root).is_none());
+            }
+        }
+        state::note_shell_viewport(1200.0, 800.0);
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn command_action_opens_confirm_without_executing() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        ime_bar::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 120.0,
+            y: 700.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        for ch in "wenjian".chars() {
+            assert!(ime_bar::on_key(&ch.to_string()));
+        }
+        assert_eq!(ime_bar::command_utterance().as_deref(), Some("open files"));
+        let app_before = state::get_signal(APP_SIGNAL);
+        on_shell_intent(OP_IME_ACTION, "");
+        assert_eq!(
+            state::get_signal(PHASE_SIGNAL),
+            1,
+            "the action opens the confirm card"
+        );
+        assert_eq!(state::get_signal(APP_SIGNAL), app_before);
+        assert!(!state::get_signal_text(SUMMARY_SIGNAL).is_empty());
+        on_shell_intent(OP_CANCEL, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+        assert_eq!(state::get_signal(APP_SIGNAL), app_before);
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        locale::set_locale("en");
+    }
+
+    fn button_labels(root: &Component) -> Vec<String> {
+        let mut labels = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label } = &node.kind
+                && !label.is_empty()
+            {
+                labels.push(label.clone());
+            }
+        });
+        labels
+    }
+
+    fn text_blob(root: &Component) -> String {
+        let mut parts = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind {
+                parts.push(content.clone());
+            }
+            if let ComponentKind::Button { label } = &node.kind {
+                parts.push(label.clone());
+            }
+        });
+        parts.join("\n")
+    }
+
+    #[test]
+    fn strangers_show_a_grouped_code_and_are_not_connected() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        handoff::demo_pending();
+        let page = Component::column(Style::default(), settings_devices_page());
+        let blob = text_blob(&page);
+        assert!(blob.contains("待核对"), "{blob}");
+        assert!(!blob.contains("已连接"), "{blob}");
+        assert!(blob.contains("数字不同"));
+        assert!(blob.contains("数字一致，信任这台"));
+        assert!(
+            blob.contains(' ') && blob.chars().filter(|ch| ch.is_ascii_digit()).count() >= 6,
+            "{blob}"
+        );
+        let peer = handoff::pending_peer().expect("pending");
+        let (grouped, _) = handoff::short_code(
+            &handoff::local_fingerprint(),
+            &peer.fingerprint,
+            &peer.nonce,
+        );
+        assert!(blob.contains(&grouped), "{grouped} missing from {blob}");
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn sync_sheet_asks_one_surface_and_does_not_enable_the_rest() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        handoff::demo_pending();
+        assert!(handoff::codes_match());
+        let sheet = build_sync_sheet();
+        let blob = text_blob(&sheet);
+        assert!(blob.contains("同步收据？"), "{blob}");
+        assert!(blob.contains("不允许"));
+        assert!(blob.contains("允许这一面"));
+        assert!(!blob.contains("同步场景？"));
+        assert!(!handoff::sync_receipts_enabled());
+        assert!(!handoff::sync_scene_enabled());
+        assert!(!handoff::clipboard_sync_enabled());
+        on_shell_intent(OP_SYNC_SKIP, "");
+        let next = text_blob(&build_sync_sheet());
+        assert!(next.contains("同步未执行的草稿？"), "{next}");
+        locale::set_locale("en");
+    }
+
+    #[test]
+    fn continue_banner_sits_under_the_title_bar_and_is_not_a_scrim() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        ensure_shell_signals();
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 1);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        handoff::demo_banner();
+        let banner = build_handoff_banner();
+        let frame = windows::frame(1);
+        let title_h = if state::pointer_is_coarse() {
+            56.0
+        } else {
+            40.0
+        };
+        assert_eq!(px(banner.style.top), frame.y + 6.0 + title_h);
+        assert!(px(banner.style.width) < 1200.0 - 40.0);
+        assert_eq!(banner.kind, ComponentKind::Row);
+        let labels = button_labels(&banner);
+        assert!(labels.iter().any(|label| label == "不是现在"));
+        assert!(labels.iter().any(|label| label == "继续"));
+        let blob = text_blob(&banner);
+        assert!(blob.contains("在手机上继续"), "{blob}");
+        assert!(!blob.contains("已连接"));
+        let shell = format!("{:?}", build_shell());
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!shell.contains(hex), "{hex}");
+        }
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn phone_receive_page_opens_the_file_without_confirming() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _name = EnvFlag::set("W3COS_DEVICE_NAME", "手机");
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        ensure_shell_signals();
+        state::note_shell_viewport(390.0, 760.0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_text_signal(DRAFT_SIGNAL, "把这段改成夜间模式");
+        handoff::demo_incoming();
+        let hidden = build_handoff_incoming();
+        assert_eq!(px(hidden.style.height), 760.0);
+        let labels = button_labels(&hidden);
+        let open_at = labels
+            .iter()
+            .position(|label| label == "打开文件")
+            .expect("open");
+        let clip_at = labels
+            .iter()
+            .position(|label| label == "用这份")
+            .expect("clip");
+        assert!(open_at < clip_at, "{labels:?}");
+        let blob = text_blob(&hidden);
+        assert!(blob.contains("从书桌继续"), "{blob}");
+        assert!(blob.contains("/docs/notes.txt"));
+        assert!(blob.contains("把这段改成夜间模式"));
+        assert!(blob.contains("L2 在这台手机上仍然关闭"));
+        assert!(blob.contains("书桌上的确认不会自动生效"));
+        assert!(blob.contains("剪贴板有两份"));
+        on_shell_intent(OP_HANDOFF_OPEN, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 0);
+        assert_eq!(state::get_signal_text(DRAFT_SIGNAL), "把这段改成夜间模式");
+        assert_eq!(state::get_signal(APP_SIGNAL), 1);
+        assert!(handoff::incoming().is_none());
+        assert!(handoff::clip_conflict().is_some());
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    #[test]
+    fn an_unrevealed_phone_handoff_is_a_notification() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        locale::set_locale("zh-CN");
+        ensure_shell_signals();
+        state::note_shell_viewport(390.0, 760.0);
+        let peer = handoff::DeviceKey::from_seed([8; 32]);
+        let payload = handoff::SyncPayload {
+            receipts: Vec::new(),
+            draft: "把这段改成夜间模式".to_string(),
+            path: "/docs/notes.txt".to_string(),
+            clipboard: None,
+        };
+        let sealed = handoff::seal(&peer, &handoff::local_public(), &payload).unwrap();
+        assert!(handoff::receive_sealed(
+            &peer.public_bytes(),
+            "书桌",
+            &sealed,
+            None,
+        ));
+        let notice = build_handoff_incoming();
+        let blob = text_blob(&notice);
+        assert!(blob.contains("书桌想把文件交过来。"), "{blob}");
+        assert!(blob.contains("查看"));
+        assert!(!blob.contains("打开文件"), "{blob}");
+        on_shell_intent(OP_HANDOFF_REVEAL, "");
+        let page = text_blob(&build_handoff_incoming());
+        assert!(page.contains("打开文件"), "{page}");
+        assert!(page.contains("从书桌继续"));
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    fn type_spelling(spelling: &str) {
+        for ch in spelling.chars() {
+            assert!(ime_bar::on_key(&ch.to_string()));
+        }
+    }
+
+    #[test]
+    fn personal_lexicon_learns_on_accept_and_skips_secure_fields() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        lexicon::reset_for_tests();
+        ime_bar::reset_for_tests();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 120.0,
+            y: 700.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        type_spelling("nihao");
+        assert_eq!(
+            ime_bar::candidate_texts().first().map(String::as_str),
+            Some("你好"),
+            "an empty store keeps the dictionary head"
+        );
+        for step in 0..3 {
+            let texts = ime_bar::candidate_texts();
+            if step == 1 {
+                assert_eq!(
+                    texts.first().map(String::as_str),
+                    Some("你好"),
+                    "one accept stays under the dictionary head"
+                );
+            }
+            let at = texts.iter().position(|text| text == "您好").expect("您好");
+            assert!(ime_bar::commit_candidate(at));
+            if step < 2 {
+                type_spelling("nihao");
+            }
+        }
+        assert_eq!(lexicon::freq_of("您好"), Some(3));
+        assert!(lexicon::neg_of("你好").unwrap_or(0) >= 1);
+        type_spelling("nihao");
+        assert_eq!(
+            ime_bar::candidate_texts().first().map(String::as_str),
+            Some("您好")
+        );
+
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 8,
+            value: String::new(),
+            role: "password".into(),
+            secure: true,
+            x: 120.0,
+            y: 400.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        for ch in "mima".chars() {
+            assert!(!ime_bar::on_key(&ch.to_string()));
+        }
+        lexicon::note_commit("app-desktop", true, "mima", "密码词", &["另一词".into()]);
+        assert!(lexicon::freq_of("密码词").is_none());
+        assert_eq!(lexicon::freq_of("您好"), Some(3));
+
+        lexicon::reset_for_tests();
+        lexicon::seed_demo();
+        state::set_signal(SETTINGS_TAB_SIGNAL, 5);
+        let page = Component::column(Style::default(), settings_lexicon_page());
+        let blob = text_blob(&page);
+        assert!(blob.contains("您好"), "{blob}");
+        assert!(blob.contains("nihao"), "{blob}");
+        assert!(blob.contains("老王"), "{blob}");
+        assert!(blob.contains("王明"), "{blob}");
+        assert!(blob.contains("导出"), "{blob}");
+        assert!(blob.contains("清空词库"), "{blob}");
+        assert!(blob.contains("隐身输入"), "{blob}");
+        assert!(!blob.contains("已连接"), "{blob}");
+        let dumped = format!("{page:?}");
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!dumped.contains(hex), "{hex}");
+        }
+        on_shell_intent(OP_LEXICON_SAVE, "词库乙 ceshi");
+        assert_eq!(lexicon::freq_of("词库乙"), Some(1));
+        on_shell_intent(OP_LEXICON_STEALTH, "");
+        assert!(lexicon::stealth_on());
+        ime_bar::reset_for_tests();
+        state::note_ime_field(w3cos_runtime::state::ImeFieldNote {
+            index: 4,
+            value: String::new(),
+            role: "intent".into(),
+            secure: false,
+            x: 120.0,
+            y: 700.0,
+            width: 280.0,
+            height: 36.0,
+        });
+        type_spelling("nihao");
+        let at = ime_bar::candidate_texts()
+            .iter()
+            .position(|text| text == "您好")
+            .expect("您好");
+        assert!(ime_bar::commit_candidate(at));
+        assert_eq!(lexicon::freq_of("您好"), Some(3));
+        on_shell_intent(OP_LEXICON_CLEAR, "");
+        assert!(lexicon::entries().is_empty());
+        assert!(lexicon::stealth_on());
+
+        lexicon::reset_for_tests();
+        ime_bar::reset_for_tests();
+        state::clear_ime_field();
+        locale::set_locale("en");
+    }
+
+    fn decision_face(decision: &str) -> (Color, Color) {
+        let line = format!(
+            "#9 {decision} open-files tier=L0 actor=did:key:z6MkOLD confirmed=true ts=1760518800000 — 已记下 @@ 打开文件"
+        );
+        let row = receipt_row(&line);
+        let word = decision_label(decision);
+        let mut found = None;
+        walk(&row, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind
+                && content == &word
+            {
+                found = Some((node.style.background, node.style.color));
+            }
+        });
+        found.expect("decision pill")
+    }
+
+    #[test]
+    fn receipts_show_four_decisions_and_keep_the_written_subject() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
+        state::set_signal(RECEIPT_FILTER_SIGNAL, 0);
+        state::set_text_signal(RECEIPT_QUERY_SIGNAL, "");
+        state::set_text_signal(
+            RECEIPT_SIGNAL,
+            "#4 allowed open-files tier=L0 actor=did:key:z6MkOLD confirmed=true ts=1760518800000 — 已切换到文件 @@ 打开文件\n\
+             #3 cancelled night-mode tier=L1 actor=did:key:z6MkOLD confirmed=false ts=1760515200000 — 你取消了，没有执行 @@ 夜间模式\n\
+             #2 denied echo tier=L0 actor=did:key:z6MkOLD confirmed=true ts=1760511600000 — 当时还锁着 @@ 在终端运行 echo\n\
+             #1 unrecognized summarize tier=L2 actor=did:key:z6MkOLD confirmed=false ts=1760508000000 — 没有对应命令 @@ 把这段总结一下",
+        );
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkNEWCURRENTSUBJECT");
+        let viewer = build_receipts_viewer();
+        let blob = text_blob(&viewer);
+        for word in [
+            "允许",
+            "拒绝",
+            "取消",
+            "未识别",
+            "打开文件",
+            "夜间模式",
+            "在终端运行 echo",
+            "把这段总结一下",
+        ] {
+            assert!(blob.contains(word), "{word} missing from {blob}");
+        }
+        assert!(blob.contains("L0 规则"), "{blob}");
+        assert!(blob.contains("L1 同义"), "{blob}");
+        assert!(blob.contains("L2 规划"), "{blob}");
+        assert!(blob.contains("结果 · 已切换到文件"), "{blob}");
+        assert!(blob.contains("did:key:z6MkOLD"), "{blob}");
+        assert!(blob.contains(':'));
+        let labels = button_labels(&viewer);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("did:key:z6Mk") && label.contains("SUBJECT")),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|label| label.contains("z6MkOLD")));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("删除") || label == "Delete")
+        );
+        assert_eq!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("did:key:z6MkOLD"),
+            true
+        );
+        copy_subject();
+        let copied = COPIED_SUBJECT.with(|slot| slot.borrow().clone());
+        assert_eq!(copied, "did:key:z6MkNEWCURRENTSUBJECT");
+
+        let allowed = decision_face("allowed");
+        let denied = decision_face("denied");
+        let cancelled = decision_face("cancelled");
+        let unrecognized = decision_face("unrecognized");
+        let faces = [allowed, denied, cancelled, unrecognized];
+        for (index, face) in faces.iter().enumerate() {
+            assert!(faces.iter().skip(index + 1).all(|other| other.0 != face.0));
+            assert!(face.0.g > 20 || face.0.r > 20 || face.0.b > 20);
+        }
+        assert!(allowed.0.g > allowed.0.r);
+        assert!(denied.0.r > denied.0.g);
+        assert!(cancelled.0.r > cancelled.0.b);
+        assert!(unrecognized.0.b > unrecognized.0.r);
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{viewer:?}").contains(hex), "{hex}");
+        }
+
+        on_shell_intent(OP_FILTER_DENIED, "");
+        let filtered = text_blob(&build_receipts_viewer());
+        assert!(filtered.contains("当时还锁着"), "{filtered}");
+        assert!(filtered.contains("拒绝"), "{filtered}");
+        assert!(!filtered.contains("打开文件"), "{filtered}");
+        assert!(!filtered.contains("未识别"), "{filtered}");
+
+        state::set_text_signal(RECEIPT_SIGNAL, "");
+        state::set_signal(RECEIPT_FILTER_SIGNAL, 0);
+        let empty = text_blob(&build_receipts_viewer());
+        assert!(
+            empty
+                .contains("还没有收据。你确认并执行之后，每一条会出现在这里。取消和拒绝也会留下。"),
+            "{empty}"
+        );
+        locale::set_locale("en");
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    fn invoke_code(node: &Component) -> Option<u8> {
+        match &node.on_click {
+            EventAction::Invoke { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    fn codes_for(root: &Component, label: &str) -> Vec<u8> {
+        let mut codes = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label: button } = &node.kind
+                && button == label
+                && let Some(code) = invoke_code(node)
+            {
+                codes.push(code);
+            }
+        });
+        codes
+    }
+
+    #[test]
+    fn lock_screen_covers_the_shell_and_the_open_lock_locks() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkhaXgExampleSubjectValue");
+        let screen = build_lock_screen();
+        let blob = text_blob(&screen);
+        assert!(blob.contains("已锁定"), "{blob}");
+        assert!(
+            blob.contains("没有账号，也不走链。钥匙留在这台设备上。"),
+            "{blob}"
+        );
+        assert!(blob.contains("用本机口令解锁"), "{blob}");
+        assert!(
+            blob.contains("解锁只影响这台设备。口令经 PBKDF2 校验后留在本机。"),
+            "{blob}"
+        );
+        assert!(blob.contains('…'), "subject should be truncated: {blob}");
+        assert!(
+            !blob.contains("did:key:z6MkhaXgExampleSubjectValue"),
+            "{blob}"
+        );
+        let mut placeholder = String::new();
+        walk(&screen, &mut |node| {
+            if let ComponentKind::TextInput {
+                placeholder: hint,
+                secure,
+                ..
+            } = &node.kind
+            {
+                assert!(*secure);
+                placeholder = hint.clone();
+            }
+        });
+        assert_eq!(placeholder, "本机口令");
+        assert_eq!(codes_for(&screen, "用本机口令解锁"), vec![OP_UNLOCK]);
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{screen:?}").contains(hex), "{hex}");
+        }
+
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let bar = build_floating_taskbar();
+        let icons = icon_buttons(&bar);
+        let open = icons
+            .iter()
+            .find(|icon| icon.label == "已解锁")
+            .expect("unlocked tray control");
+        assert!(
+            open.svg.contains("6.4-1.9"),
+            "tray should show an open lock: {}",
+            open.svg
+        );
+        assert_eq!(codes_for(&bar, "已解锁"), vec![OP_LOCK]);
+        assert!(icons.iter().all(|icon| icon.label != "解锁"));
+        assert!(!text_blob(&bar).contains("占位已解锁"));
+
+        state::note_shell_viewport(390.0, 760.0);
+        let phone = build_phone_home();
+        assert!(
+            icon_buttons(&phone)
+                .iter()
+                .any(|icon| icon.label == "已解锁" && icon.svg.contains("6.4-1.9"))
+        );
+        assert_eq!(codes_for(&phone, "已解锁"), vec![OP_LOCK]);
+
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        let locked_bar = build_floating_taskbar();
+        assert_eq!(codes_for(&locked_bar, "已锁定"), vec![OP_LOCK]);
+        assert!(codes_for(&locked_bar, "解锁").is_empty());
+
+        let identity = Component::column(Style::default(), settings_identity_page());
+        let identity_blob = text_blob(&identity);
+        assert!(
+            identity_blob.contains("通行证：尚未注册"),
+            "{identity_blob}"
+        );
+        assert!(identity_blob.contains("注册本机通行证"), "{identity_blob}");
+        assert!(identity_blob.contains("还不是 passkey"), "{identity_blob}");
+        assert!(
+            !identity_blob.contains("WebAuthn 仪式还没做"),
+            "{identity_blob}"
+        );
+        assert!(!identity_blob.contains("占位已解锁"), "{identity_blob}");
+        assert_eq!(codes_for(&identity, "注册本机通行证"), vec![OP_ENROLL]);
+        assert!(codes_for(&identity, "解锁").is_empty());
+
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let unlocked_identity = Component::column(Style::default(), settings_identity_page());
+        assert_eq!(codes_for(&unlocked_identity, "锁定"), vec![OP_LOCK]);
+        assert!(text_blob(&unlocked_identity).contains("通行证：尚未注册"));
+        let tasks = text_blob(&build_task_center());
+        assert!(tasks.contains("已解锁"), "{tasks}");
+        assert!(!tasks.contains("占位已解锁"), "{tasks}");
+        assert!(!tasks.contains("解锁才能执行"), "{tasks}");
+
+        let _ = build_shell();
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        let root = build_shell();
+        let mut covered = false;
+        walk(&root, &mut |node| {
+            if node.style.z_index == CHROME_Z + 4
+                && px(node.style.width) == 1200.0
+                && px(node.style.height) == 800.0
+            {
+                covered = true;
+            }
+        });
+        assert!(covered, "lock screen should cover the viewport");
+        assert!(text_blob(&root).contains("已锁定"));
+
+        locale::set_locale("en");
+        assert_eq!(locale::t("passkey-unregistered"), "Passkey: not registered");
+        assert_eq!(locale::t("passkey-enroll"), "Register a device passkey");
+        assert_eq!(
+            locale::t("lock-body"),
+            "No account and no chain. The key stays on this device."
+        );
+        assert_eq!(
+            locale::t("lock-footnote"),
+            "Unlock only affects this device. The passphrase is checked with PBKDF2 and stays on this device."
+        );
+        assert_eq!(locale::t("lock-first"), "Unlock first");
+        assert_eq!(locale::t("unlocked"), "Unlocked");
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    struct IsolatedSession {
+        session: Option<IntentSession>,
+        booted: bool,
+        receipt_dir: Option<std::ffi::OsString>,
+        lexicon_path: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for IsolatedSession {
+        fn drop(&mut self) {
+            SESSION.with(|slot| {
+                *slot.borrow_mut() = self.session.take();
+            });
+            let booted = self.booted;
+            SESSION_BOOTED.with(|flag| flag.set(booted));
+            restore_env("W3COS_RECEIPT_DIR", self.receipt_dir.take());
+            restore_env("W3COS_LEXICON_PATH", self.lexicon_path.take());
+            let _ = std::fs::remove_dir_all(&self.dir);
+            lexicon::lock();
+        }
+    }
+
+    fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn passphrase_refuses_empty_and_wrong_and_lock_blocks_confirm() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+
+        on_shell_intent(OP_UNLOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        assert!(
+            state::get_signal_text(TOAST_SIGNAL).contains("口令为空或不匹配"),
+            "{}",
+            state::get_signal_text(TOAST_SIGNAL)
+        );
+        on_shell_intent(OP_UNLOCK, "   ");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+        on_shell_intent(OP_LOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "wrong-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        assert!(
+            state::get_signal_text(TOAST_SIGNAL).contains("口令为空或不匹配"),
+            "{}",
+            state::get_signal_text(TOAST_SIGNAL)
+        );
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        on_shell_intent(OP_PROPOSE, "打开文件");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        let app_before = state::get_signal(APP_SIGNAL);
+        let summary = state::get_signal_text(SUMMARY_SIGNAL);
+        assert!(!summary.is_empty(), "confirm card keeps its summary");
+        on_shell_intent(OP_LOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), summary);
+        let dialog = build_confirm_dialog();
+        let labels = button_labels(&dialog);
+        assert!(labels.iter().any(|label| label == "先解锁"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "确认"), "{labels:?}");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), app_before);
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 0);
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(
+            state::get_signal(APP_SIGNAL),
+            app_before,
+            "a voided proposal does not run after unlock"
+        );
+
+        locale::set_locale("en");
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn initial_focus(root: &Component) -> Vec<String> {
+        let mut labels = Vec::new();
+        walk(root, &mut |node| {
+            let marked = node.style.custom_properties.as_ref().is_some_and(|props| {
+                props
+                    .get("--w3cos-initial-focus")
+                    .is_some_and(|value| value == "1")
+            });
+            if marked && let ComponentKind::Button { label } = &node.kind {
+                labels.push(label.clone());
+            }
+        });
+        labels
+    }
+
+    fn clicks_disabled(root: &Component, label: &str) -> bool {
+        let mut disabled = false;
+        walk(root, &mut |node| {
+            if let ComponentKind::Button { label: button } = &node.kind
+                && button == label
+                && matches!(node.on_click, EventAction::None)
+            {
+                disabled = true;
+            }
+        });
+        disabled
+    }
+
+    #[test]
+    fn confirm_does_not_grant_process_and_permission_is_once() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_text_signal(TERMINAL_SIGNAL, "");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        capability_gate::deny(shell_tools::CAP_PROCESS);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        on_shell_intent(OP_PROPOSE, "打开终端");
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开终端");
+        assert!(
+            state::get_signal_text(IMPACT_SIGNAL).contains("切换到终端窗口"),
+            "{}",
+            state::get_signal_text(IMPACT_SIGNAL)
+        );
+        let dialog = build_confirm_dialog();
+        let blob = text_blob(&dialog);
+        assert!(blob.contains("L0 规则"), "{blob}");
+        assert!(blob.contains("打开终端"), "{blob}");
+        assert!(blob.contains("确认后才会执行，并写下一张收据。"), "{blob}");
+        assert!(!blob.contains("请确认"), "{blob}");
+        assert_eq!(
+            button_labels(&dialog)
+                .into_iter()
+                .filter(|label| label == "取消" || label == "确认")
+                .collect::<Vec<_>>(),
+            vec!["取消".to_string(), "确认".to_string()]
+        );
+        assert_eq!(initial_focus(&dialog), vec!["确认".to_string()]);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), 2);
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).is_empty());
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+
+        state::set_text_signal(TERMINAL_SIGNAL, "echo w3cos-once");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).is_empty());
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        let sheet = build_permission_sheet();
+        let perm = text_blob(&sheet);
+        assert!(perm.contains("允许运行这一次 echo"), "{perm}");
+        assert!(
+            perm.contains("这不是刚才那个确认。打开终端已经完成。现在要单独授权进程，用完即收回。"),
+            "{perm}"
+        );
+        assert!(
+            perm.contains("只放行 echo、pwd、help。没有系统 shell。"),
+            "{perm}"
+        );
+        assert!(perm.contains("拒绝也会写收据。身份必须已解锁。"), "{perm}");
+        assert_eq!(
+            button_labels(&sheet)
+                .into_iter()
+                .filter(|label| label == "拒绝" || label == "仅此一次")
+                .collect::<Vec<_>>(),
+            vec!["拒绝".to_string(), "仅此一次".to_string()]
+        );
+        assert!(
+            !button_labels(&sheet).iter().any(|label| label == "确认"),
+            "{perm}"
+        );
+        assert_eq!(initial_focus(&sheet), vec!["拒绝".to_string()]);
+        assert_ne!(
+            dialog.style.background, sheet.style.background,
+            "the permission sheet should not reuse the confirm card"
+        );
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{dialog:?}").contains(hex), "{hex}");
+            assert!(!format!("{sheet:?}").contains(hex), "{hex}");
+        }
+
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(state::get_signal_text(TERM_OUT_SIGNAL).is_empty());
+        let denied = state::get_signal_text(RECEIPT_SIGNAL);
+        assert!(
+            denied.contains("Denied") && denied.contains("refused"),
+            "{denied}"
+        );
+
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        on_shell_intent(OP_PERM_ONCE, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        let ran = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(ran.contains("w3cos-once"), "{ran}");
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("allowed"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), ran);
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+
+        on_shell_intent(OP_LOCK, "");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 0);
+        let locked = build_permission_sheet();
+        let locked_blob = text_blob(&locked);
+        assert!(
+            locked_blob.contains("先解锁。这次不会运行。"),
+            "{locked_blob}"
+        );
+        assert!(
+            locked_blob.contains("拒绝也会写收据。身份必须已解锁。"),
+            "{locked_blob}"
+        );
+        assert!(clicks_disabled(&locked, "拒绝"));
+        assert!(clicks_disabled(&locked, "仅此一次"));
+        on_shell_intent(OP_PERM_ONCE, "");
+        assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), ran);
+        assert!(!capability_gate::is_granted(shell_tools::CAP_PROCESS));
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        on_shell_intent(OP_PROPOSE, "夜间模式");
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开夜间模式");
+        assert_eq!(
+            initial_focus(&build_confirm_dialog()),
+            vec!["取消".to_string()]
+        );
+        on_shell_intent(OP_CANCEL, "");
+        on_shell_intent(OP_PROPOSE, "file manager");
+        assert_eq!(state::get_signal_text(TIER_SIGNAL), "L1");
+        assert_eq!(state::get_signal_text(SUMMARY_SIGNAL), "打开文件");
+        let synonym = text_blob(&build_confirm_dialog());
+        assert!(synonym.contains("L1 同义"), "{synonym}");
+        assert!(
+            synonym.contains("这句话没有对上规则表，本机把它当成同一件事。"),
+            "{synonym}"
+        );
+        assert_eq!(
+            initial_focus(&build_confirm_dialog()),
+            vec!["确认".to_string()]
+        );
+
+        state::note_shell_viewport(390.0, 760.0);
+        let phone = build_confirm_dialog();
+        walk(&phone, &mut |node| {
+            if let ComponentKind::Button { label } = &node.kind
+                && (label == "取消" || label == "确认")
+            {
+                assert_eq!(px(node.style.height), 48.0, "{label}");
+            }
+        });
+        let phone_perm = build_permission_sheet();
+        walk(&phone_perm, &mut |node| {
+            if let ComponentKind::Button { label } = &node.kind
+                && (label == "拒绝" || label == "仅此一次")
+            {
+                assert_eq!(px(node.style.height), 48.0, "{label}");
+            }
+        });
+
+        locale::set_locale("en");
+        assert_eq!(locale::t("perm-deny"), "Deny");
+        assert_eq!(
+            locale::t("perm-footnote"),
+            "A denial is written on the receipt too. Identity has to be unlocked."
+        );
+        assert_eq!(
+            locale::t("l1-same"),
+            "That sentence missed the rule table. This device treated it as the same action."
+        );
+        capability_gate::deny(shell_tools::CAP_PROCESS);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn prop(node: &Component, key: &str) -> Option<String> {
+        node.style
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(key).cloned())
+    }
+
+    fn button_face(
+        root: &Component,
+        label: &str,
+    ) -> (Option<u8>, Option<String>, Option<String>, f32) {
+        let mut found = None;
+        walk(root, &mut |node| {
+            if found.is_some() {
+                return;
+            }
+            if let ComponentKind::Button { label: current } = &node.kind
+                && current == label
+            {
+                found = Some((
+                    invoke_code(node),
+                    prop(node, "--w3cos-selected"),
+                    prop(node, "--w3cos-switch"),
+                    match node.style.min_height {
+                        Dimension::Px(value) => value,
+                        _ => 0.0,
+                    },
+                ));
+            }
+        });
+        found.unwrap_or_else(|| panic!("missing button {label}"))
+    }
+
+    #[test]
+    fn settings_sidebar_switches_panes_and_toggles_night_and_context() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        assert_eq!(state::get_signal(UNLOCKED_SIGNAL), 1);
+
+        on_shell_intent(OP_SETTINGS_LOCAL, "");
+        let desktop = build_settings_app();
+        let nav = ["本机", "身份", "语言", "代理能力", "设备与接续"];
+        for label in nav {
+            assert!(
+                button_labels(&desktop).iter().any(|item| item == label),
+                "{label} missing from {}",
+                text_blob(&desktop)
+            );
+        }
+        assert!(!button_labels(&desktop).iter().any(|item| item == "权限"));
+        assert!(!button_labels(&desktop).iter().any(|item| item == "L2 模型"));
+        let (local_code, local_selected, _, _) = button_face(&desktop, "本机");
+        assert_eq!(local_selected.as_deref(), Some("1"));
+        assert_eq!(local_code, Some(OP_SETTINGS_LOCAL));
+        let (night_code, _, night_switch, _) = button_face(&desktop, "夜间模式");
+        assert_eq!(night_switch.as_deref(), Some("0"));
+        assert_eq!(night_code, Some(OP_CHIP_NIGHT));
+        let local_blob = text_blob(&desktop);
+        assert!(!local_blob.lines().any(|line| line == "开" || line == "关"));
+
+        on_shell_intent(OP_CHIP_NIGHT, "");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 0);
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 1);
+        on_shell_intent(OP_CHIP_NIGHT, "");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(NIGHT_SIGNAL), 0);
+        state::set_signal(NIGHT_SIGNAL, 1);
+        let (_, _, night_on, _) = button_face(&build_settings_app(), "夜间模式");
+        assert_eq!(night_on.as_deref(), Some("1"));
+        state::set_signal(NIGHT_SIGNAL, 0);
+
+        state::set_text_signal(SUBJECT_SIGNAL, "did:key:z6MkhaXgExampleSubjectValue");
+        on_shell_intent(OP_SETTINGS_IDENTITY, "");
+        let identity = build_settings_app();
+        let (_, identity_selected, _, _) = button_face(&identity, "身份");
+        assert_eq!(identity_selected.as_deref(), Some("1"));
+        let (_, local_selected, _, _) = button_face(&identity, "本机");
+        assert_eq!(local_selected, None);
+        let identity_blob = text_blob(&identity);
+        assert!(
+            identity_blob.contains("通行证：尚未注册"),
+            "{identity_blob}"
+        );
+        assert!(identity_blob.contains("注册本机通行证"), "{identity_blob}");
+        assert!(identity_blob.contains('…'), "{identity_blob}");
+        assert!(
+            !identity_blob.contains("did:key:z6MkhaXgExampleSubjectValue"),
+            "{identity_blob}"
+        );
+        assert!(
+            !identity_blob.contains("WebAuthn 仪式还没做"),
+            "{identity_blob}"
+        );
+        assert_eq!(codes_for(&identity, "复制"), vec![OP_COPY_SUBJECT]);
+        assert_eq!(codes_for(&identity, "注册本机通行证"), vec![OP_ENROLL]);
+
+        on_shell_intent(OP_SETTINGS_LANGUAGE, "");
+        let language = text_blob(&build_settings_app());
+        assert!(language.contains("简体中文"), "{language}");
+        assert!(language.contains("English"), "{language}");
+        assert!(language.contains("zh-CN"), "{language}");
+        assert!(language.contains("en"), "{language}");
+        on_shell_intent(OP_LOCALE_EN, "");
+        assert_eq!(locale::current(), "zh-CN");
+        assert_eq!(state::get_signal_text(PENDING_LOCALE_SIGNAL), "en");
+        let pending = text_blob(&build_settings_app());
+        assert!(pending.contains("待确认"), "{pending}");
+        let card = build_locale_confirm();
+        let card_blob = text_blob(&card);
+        assert!(card_blob.contains("L0 规则"), "{card_blob}");
+        assert!(card_blob.contains("把界面改成 English"), "{card_blob}");
+        assert!(
+            card_blob
+                .contains("只换界面上的句子。已经写下的收据保持原样，路径和时间格式跟 English。"),
+            "{card_blob}"
+        );
+        on_shell_intent(OP_CANCEL, "");
+        assert_eq!(locale::current(), "zh-CN");
+        assert!(state::get_signal_text(PENDING_LOCALE_SIGNAL).is_empty());
+        on_shell_intent(OP_LOCALE_EN, "");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(locale::current(), "en");
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("set-locale"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+        on_shell_intent(OP_LOCALE_ZH, "");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(locale::current(), "zh-CN");
+
+        on_shell_intent(OP_RESTORE, "");
+        on_shell_intent(OP_SETTINGS_BRIDGE, "");
+        let agent = build_settings_app();
+        let agent_blob = text_blob(&agent);
+        assert!(agent_blob.contains("看见当前窗口"), "{agent_blob}");
+        assert!(
+            agent_blob.contains("这和跨设备同步是两件事。"),
+            "{agent_blob}"
+        );
+        assert!(!agent_blob.contains('×'), "{agent_blob}");
+        assert!(!text_blob(&build_intent_panel()).contains('×'));
+        assert!(!text_blob(&build_floating_taskbar()).contains('×'));
+        let (share_code, _, share_on, _) = button_face(&agent, "看见当前窗口");
+        assert_eq!(share_on.as_deref(), Some("1"));
+        assert_eq!(share_code, Some(OP_REVOKE));
+        on_shell_intent(OP_REVOKE, "");
+        assert_eq!(state::get_signal(CONTEXT_SIGNAL), 0);
+        let hidden = build_settings_app();
+        let (hidden_code, _, hidden_on, _) = button_face(&hidden, "看见当前窗口");
+        assert_eq!(hidden_on.as_deref(), Some("0"));
+        assert_eq!(hidden_code, Some(OP_RESTORE));
+        on_shell_intent(OP_RESTORE, "");
+        assert_eq!(state::get_signal(CONTEXT_SIGNAL), 1);
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 1);
+        let stack = build_settings_app();
+        for label in nav {
+            let (_, _, _, height) = button_face(&stack, label);
+            assert!(height >= 48.0, "{label}");
+        }
+        let mut narrow_sidebar = false;
+        walk(&stack, &mut |node| {
+            if matches!(node.style.width, Dimension::Px(width) if (width - 108.0).abs() < 0.5) {
+                narrow_sidebar = true;
+            }
+        });
+        assert!(!narrow_sidebar);
+        on_shell_intent(OP_SETTINGS_IDENTITY, "");
+        assert_eq!(state::get_signal(SETTINGS_MENU_SIGNAL), 0);
+        let pane = build_settings_app();
+        assert!(text_blob(&pane).contains("通行证：尚未注册"));
+        assert_eq!(codes_for(&pane, "返回"), vec![OP_SETTINGS_BACK]);
+        on_shell_intent(OP_SETTINGS_BACK, "");
+        assert_eq!(state::get_signal(SETTINGS_MENU_SIGNAL), 1);
+
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(
+                !format!("{:?}", build_settings_app()).contains(hex),
+                "{hex}"
+            );
+        }
+        locale::set_locale("en");
+        assert_eq!(locale::t("settings-agent"), "Agent");
+        assert_eq!(
+            locale::t("settings-context-switch"),
+            "See the current window"
+        );
+        assert_eq!(
+            locale::t_args("locale-confirm-title", &[("name", "English")]),
+            "Change the interface to English"
+        );
+        locale::set_locale("zh-CN");
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(NIGHT_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 1);
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn clock_cells(root: &Component) -> String {
+        let mut cells = String::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind
+                && content.chars().count() == 1
+                && (content == ":" || content.chars().all(|ch| ch.is_ascii_digit()))
+            {
+                cells.push_str(content);
+            }
+        });
+        cells
+    }
+
+    fn percent_texts(root: &Component) -> Vec<String> {
+        let mut found = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind
+                && content.ends_with('%')
+            {
+                found.push(content.clone());
+            }
+        });
+        found
+    }
+
+    fn assert_no_fake_desktop(name: &str, root: &Component) {
+        let blob = text_blob(root);
+        for banned in [
+            "助手",
+            "处理器",
+            "内存",
+            "存储",
+            "网络",
+            "在线",
+            "Online",
+            "CPU",
+            "Memory",
+            "Storage",
+            "Network",
+            "23%",
+            "5.4",
+            "8 GB",
+            "14:32",
+            "W3C Apps",
+            "会话在旁边的任务中心",
+            "The live session stays",
+        ] {
+            assert!(
+                !blob.contains(banned),
+                "{name} still shows {banned}: {blob}"
+            );
+        }
+        let labels = button_labels(root);
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label == "助手" || label == "Agent" || label == "打开助手"),
+            "{name} still has an assistant entry: {labels:?}"
+        );
+        let percents = percent_texts(root);
+        match live_battery() {
+            Some(reading) => assert_eq!(percents, vec![reading], "{name}"),
+            None => assert!(percents.is_empty(), "{name} invented {percents:?}"),
+        }
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{root:?}").contains(hex), "{name} uses {hex}");
+        }
+    }
+
+    #[test]
+    fn desktop_has_no_assistant_app_and_no_fake_metrics() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-honesty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
+        state::set_signal(SETTINGS_TAB_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+
+        let desktop = build_desktop();
+        assert_eq!(desktop.children.len(), 1);
+        assert_no_fake_desktop("desktop", &desktop);
+        let icons = text_blob(&desktop);
+        for name in ["文件", "终端", "设置", "浏览器", "编辑器"] {
+            assert!(icons.contains(name), "{name} missing from {icons}");
+        }
+
+        let bar = build_floating_taskbar();
+        assert_no_fake_desktop("taskbar", &bar);
+        assert_eq!(codes_for(&bar, "任务"), vec![OP_TOGGLE_TASKS]);
+        assert_eq!(clock_cells(&bar), live_clock());
+
+        state::set_signal(LAUNCHER_SIGNAL, 1);
+        let launcher = build_launcher();
+        assert_no_fake_desktop("launcher", &launcher);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "助手");
+        let missed = build_launcher();
+        assert!(text_blob(&missed).contains("没有匹配的应用"));
+        assert!(
+            !button_labels(&missed)
+                .iter()
+                .any(|label| label.contains("助手"))
+        );
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+
+        state::note_shell_viewport(800.0, 600.0);
+        assert_no_fake_desktop("tablet rail", &build_tablet_rail());
+        assert_eq!(
+            codes_for(&build_tablet_rail(), "任务"),
+            vec![OP_TOGGLE_TASKS]
+        );
+
+        state::note_shell_viewport(390.0, 760.0);
+        let phone = build_phone_home();
+        assert_eq!(phone.children.len(), 2);
+        assert_no_fake_desktop("phone", &phone);
+        assert_eq!(codes_for(&phone, "任务"), vec![OP_TOGGLE_TASKS]);
+        assert_eq!(clock_cells(&phone), live_clock());
+        for name in ["文件", "终端", "设置", "浏览器", "编辑器"] {
+            assert!(text_blob(&phone).contains(name), "{name}");
+        }
+
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(4) | app_bit(1));
+        state::set_signal(APP_SIGNAL, 4);
+        let switcher = text_blob(&build_switcher());
+        assert!(!switcher.contains("助手"), "{switcher}");
+        assert!(switcher.contains("文件"), "{switcher}");
+        cycle_windows();
+        assert_eq!(state::get_signal(APP_SIGNAL), 1);
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 0);
+
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(4));
+        state::set_signal(APP_SIGNAL, 4);
+        on_shell_intent(OP_FOCUS_AGENT, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_eq!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(4), 0);
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 1);
+        let tasks = text_blob(&build_task_center());
+        assert!(tasks.contains("任务中心"), "{tasks}");
+        assert!(tasks.contains("收据"), "{tasks}");
+        assert!(tasks.contains("收起任务"), "{tasks}");
+        assert!(!tasks.contains("会话在旁边的任务中心"), "{tasks}");
+        assert!(!text_blob(&build_stage()).contains("助手"));
+        on_shell_intent(OP_TOGGLE_TASKS, "");
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        on_shell_intent(OP_PROPOSE, "打开助手");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        let confirm = text_blob(&build_confirm_dialog());
+        assert!(confirm.contains("打开任务中心"), "{confirm}");
+        assert!(confirm.contains("不新开应用窗口"), "{confirm}");
+        assert!(!confirm.contains("助手"), "{confirm}");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_eq!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(4), 0);
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 1);
+        assert!(!text_blob(&build_desktop()).contains("助手"));
+
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(SETTINGS_TAB_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+        let local = text_blob(&build_settings_app());
+        for banned in ["处理器", "23%", "5.4", "8 GB", "在线", "92%"] {
+            assert!(!local.contains(banned), "本机 shows {banned}: {local}");
+        }
+
+        locale::set_locale("en");
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "agent");
+        let english = build_desktop();
+        assert_no_fake_desktop("english desktop", &english);
+        for name in ["Files", "Terminal", "Settings", "Browser", "Editor"] {
+            assert!(text_blob(&english).contains(name), "{name}");
+        }
+        let english_launcher = build_launcher();
+        assert!(text_blob(&english_launcher).contains("No matching app."));
+        assert!(
+            !button_labels(&english_launcher)
+                .iter()
+                .any(|label| label == "Agent" || label.contains("Agent"))
+        );
+        assert_eq!(
+            codes_for(&build_floating_taskbar(), "Tasks"),
+            vec![OP_TOGGLE_TASKS]
+        );
+        state::note_shell_viewport(390.0, 760.0);
+        assert_no_fake_desktop("english phone", &build_phone_home());
+        assert_eq!(
+            locale::t("impact-tasks").contains("No application window"),
+            true
+        );
+
+        locale::set_locale("zh-CN");
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
     }
 }

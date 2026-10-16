@@ -75,6 +75,27 @@ impl Purpose {
     pub fn is_secure(self) -> bool {
         matches!(self, Purpose::Password | Purpose::Secure)
     }
+
+    /// Shell field role (`--w3cos-ime`) plus the secure-input flag.
+    ///
+    /// A secure flag always bypasses, even when the role string is ordinary.
+    pub fn for_field(role: &str, secure: bool) -> Self {
+        if secure {
+            return if role == "password" {
+                Purpose::Password
+            } else {
+                Purpose::Secure
+            };
+        }
+        match role {
+            "intent" | "command" => Purpose::Command,
+            "terminal" | "editor" | "code" => Purpose::Code,
+            "launcher" | "search" => Purpose::Search,
+            "password" => Purpose::Password,
+            "secure" => Purpose::Secure,
+            _ => Purpose::Text,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,10 +135,18 @@ impl Session {
     pub fn allows(&self, scope: Scope) -> bool {
         self.granted.contains(&scope)
     }
+
+    /// Drop everything the session was holding. The shell calls this on blur.
+    pub fn end(&mut self) {
+        self.id.clear();
+        self.locales.clear();
+        self.granted.clear();
+    }
 }
 
 /// What an engine may offer. Action proposals always need a shell confirmation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Proposal {
     Preedit {
         text: String,
@@ -140,9 +169,14 @@ pub enum Proposal {
     },
     Action {
         id: String,
+        /// Existing shell utterance, such as `open files` or `打开终端`.
+        #[serde(rename = "action")]
         kind: String,
         requires_confirm: bool,
         source: String,
+        /// Surface text for the chip, such as `文件`.
+        #[serde(default)]
+        summary: String,
     },
 }
 
@@ -166,11 +200,29 @@ impl Proposal {
         kind: impl Into<String>,
         source: impl Into<String>,
     ) -> Self {
+        let kind = kind.into();
         Self::Action {
             id: id.into(),
-            kind: kind.into(),
+            summary: kind.clone(),
+            kind,
             requires_confirm: true,
             source: source.into(),
+        }
+    }
+
+    /// A shell command the person still has to confirm. `utterance` is an
+    /// existing intent phrase, not a new action.
+    pub fn command(
+        id: impl Into<String>,
+        utterance: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self::Action {
+            id: id.into(),
+            kind: utterance.into(),
+            summary: summary.into(),
+            requires_confirm: true,
+            source: "L0".into(),
         }
     }
 }

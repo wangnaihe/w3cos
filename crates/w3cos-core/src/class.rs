@@ -498,8 +498,18 @@ fn set_with_receiver(target: &Value, receiver: &Value, name: &str, value: Value)
 /// Used for class field initializers and private-brand installation, which
 /// in JS semantics use `[[Define]]` rather than `[[Set]]`.
 pub fn define_field(this: &Value, key: &str, value: Value) {
+    let dom_node = crate::intrinsics::dom_node_id(this);
+    if dom_node.is_some() {
+        crate::intrinsics::bump_dom_shape();
+    }
     if let Some(object) = this.as_object() {
         object.borrow_mut().set_direct(key, value);
+        // Keep the materialized wrapper alive until `pin_dom` upgrades the
+        // cache entry. A fresh orphan is initially memoized weakly; dropping
+        // `object` first would rebuild an empty wrapper and lose the field.
+        if let Some(node) = dom_node {
+            crate::intrinsics::pin_dom(node);
+        }
     }
 }
 
@@ -508,7 +518,7 @@ pub fn set_prototype_of(obj: &Value, proto: &Value) {
     crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
-        if let Some(node) = obj.live_dom_node() {
+        if let Some(node) = crate::intrinsics::dom_node_id(obj) {
             crate::intrinsics::pin_dom(node);
         }
     }
@@ -554,7 +564,7 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
         } else {
             object.borrow_mut().define_property(key, descriptor);
         }
-        if let Some(node) = obj.live_dom_node() {
+        if let Some(node) = crate::intrinsics::dom_node_id(obj) {
             crate::intrinsics::pin_dom(node);
         }
     }

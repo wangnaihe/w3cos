@@ -2744,7 +2744,9 @@ fn render_node_with_applied_decorations(
             }
         }
         ComponentKind::Button { label } => {
-            draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
+            if style.color.a > 0 {
+                draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
+            }
         }
         ComponentKind::TextInput {
             value,
@@ -2787,6 +2789,29 @@ fn render_node_with_applied_decorations(
                 typeface,
                 style,
             );
+            if !secure && !value.is_empty() {
+                if let Some(suffix) = style
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|props| props.get("--w3cos-ime-preedit"))
+                    .map(String::as_str)
+                    .filter(|suffix| !suffix.is_empty())
+                    && let Some((prefix, suffix)) = text_layout::split_preedit_suffix(text, suffix)
+                {
+                    let prefix_w = measure_skia_text_advance(prefix, typeface, style);
+                    let suffix_w = measure_skia_text_advance(suffix, typeface, style);
+                    if suffix_w > 0.0 {
+                        let underline = LayoutRect {
+                            x: content.x + prefix_w,
+                            y: y + ink.height.max(style.font_size * 0.85) + 1.0,
+                            width: suffix_w,
+                            height: 1.5,
+                        };
+                        canvas
+                            .draw_rect(to_rect(underline), &text_color_paint(style, style.opacity));
+                    }
+                }
+            }
             if focused {
                 let cursor_x = content.x + if value.is_empty() { 0.0 } else { text_width };
                 let cursor_width = (style.font_size * 0.1).max(2.0);

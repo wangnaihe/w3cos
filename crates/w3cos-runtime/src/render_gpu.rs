@@ -800,18 +800,20 @@ fn render_node(
             );
         }
         ComponentKind::Button { label } => {
-            draw_text_centered_in_rect(
-                scene,
-                rect,
-                label,
-                style.font_size,
-                text_color,
-                font_data,
-                font,
-                style,
-                glyph_cache,
-                dpi,
-            );
+            if text_color.a > 0 {
+                draw_text_centered_in_rect(
+                    scene,
+                    rect,
+                    label,
+                    style.font_size,
+                    text_color,
+                    font_data,
+                    font,
+                    style,
+                    glyph_cache,
+                    dpi,
+                );
+            }
         }
         ComponentKind::Image { src } => {
             if crate::image_loader::get_or_load(src).is_some() {
@@ -895,6 +897,18 @@ fn render_node(
                 glyph_cache,
                 dpi,
             );
+            if !secure && !display_value.is_empty() {
+                draw_ime_preedit_underline(
+                    scene,
+                    text_x,
+                    text_y + ink.height.max(style.font_size * 0.85) + 1.0,
+                    display_text,
+                    style,
+                    font,
+                    text_color_final,
+                    dpi,
+                );
+            }
             if is_focused {
                 draw_blinking_cursor(
                     scene,
@@ -1174,6 +1188,55 @@ fn draw_backdrop_blur(
     let transform = Affine::translate((device_x as f64, device_y as f64));
     scene.draw_image(&ImageBrush::new(layer.image), transform);
     scene.pop_layer();
+}
+
+fn draw_ime_preedit_underline(
+    scene: &mut Scene,
+    text_x: f32,
+    underline_y: f32,
+    display_text: &str,
+    style: &Style,
+    font: &fontdue::Font,
+    color: AppColor,
+    dpi: Affine,
+) {
+    let Some(suffix) = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get("--w3cos-ime-preedit"))
+        .map(String::as_str)
+        .filter(|suffix| !suffix.is_empty())
+    else {
+        return;
+    };
+    let Some((prefix, suffix)) = crate::text_layout::split_preedit_suffix(display_text, suffix)
+    else {
+        return;
+    };
+    let registry = crate::font_face::FontRegistry::global();
+    let prefix_w: f32 = prefix
+        .chars()
+        .map(|ch| registry.style_char_advance(style, ch, style.font_size, font))
+        .sum();
+    let suffix_w: f32 = suffix
+        .chars()
+        .map(|ch| registry.style_char_advance(style, ch, style.font_size, font))
+        .sum();
+    if suffix_w <= 0.0 {
+        return;
+    }
+    draw_rect(
+        scene,
+        LayoutRect {
+            x: text_x + prefix_w,
+            y: underline_y,
+            width: suffix_w,
+            height: 1.5,
+        },
+        color,
+        0.0,
+        dpi,
+    );
 }
 
 fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32, dpi: Affine) {
@@ -1714,7 +1777,13 @@ fn draw_blinking_cursor(
 
 pub fn draw_hover_outline(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
     let dpi = Affine::scale(scale_factor as f64);
-    let color = Color::new([108.0 / 255.0, 92.0 / 255.0, 231.0 / 255.0, 100.0 / 255.0]);
+    let [r, g, b, a] = crate::HOVER_OUTLINE_RGBA;
+    let color = Color::new([
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ]);
     let stroke = Stroke::new(2.0);
     let r = Rect::new(
         rect.x as f64,
@@ -1847,6 +1916,17 @@ pub fn composite_retained_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_outline_color_is_jade() {
+        let [r, g, b, a] = crate::HOVER_OUTLINE_RGBA;
+        assert!(a > 0);
+        assert!(
+            g > r + 40 && g > b,
+            "hover outline should be jade, got {r},{g},{b}"
+        );
+        assert!(r < 80 && b < 160, "indigo hover leaked back: {r},{g},{b}");
+    }
 
     #[test]
     fn gpu_font_lookup_uses_the_selected_collection_face() {

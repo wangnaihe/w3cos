@@ -3,8 +3,10 @@ name = "w3cos-ime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "IME Hub message types. Routes input intents; no recognition engine yet."
+description = "IME Hub and the bundled on-device pinyin engine."
 
 [dependencies]
+getrandom = "0.2"
+ring = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }

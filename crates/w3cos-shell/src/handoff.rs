@@ -14,6 +14,9 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 const CODE_TTL_SECS: u64 = 90;
 const DISCOVERY_PORT: u16 = 47623;
+const CLIP_HOLD_SECS: u64 = 600;
+/// How long a send waits for the other device's ack before the no-answer copy.
+const NO_ANSWER_AFTER: u64 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceKey {
@@ -199,8 +202,41 @@ enum Phase {
     Pending,
     ChooseSync,
     Sending,
+    NoAnswer,
     Incoming,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncStep {
+    Receipts,
+    Drafts,
+    Scene,
+    Clipboard,
+    Done,
+}
+
+/// One sync surface, asked on its own. None of them start enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncSurface {
+    Receipts,
+    Drafts,
+    Scene,
+    Clipboard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BannerKind {
+    Offer,
+    Sending,
+    NoAnswer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipSide {
+    pub device: String,
+    pub unix: u64,
+    pub text: String,
 }
 
 struct Store {
@@ -212,10 +248,19 @@ struct Store {
     incoming_path: String,
     incoming_draft: String,
     incoming_from: String,
-    incoming_clipboard: Option<String>,
+    incoming_revealed: bool,
     sync_receipts: bool,
     sync_drafts: bool,
+    sync_scene: bool,
     sync_clipboard: bool,
+    scene_decided: bool,
+    scene_gate: bool,
+    sync_step: SyncStep,
+    send_started: u64,
+    clip_local: Option<ClipSide>,
+    clip_remote: Option<ClipSide>,
+    clip_until: u64,
+    pending_clip_write: Option<String>,
     listener: bool,
 }
 
@@ -231,10 +276,19 @@ impl Store {
             incoming_path: String::new(),
             incoming_draft: String::new(),
             incoming_from: String::new(),
-            incoming_clipboard: None,
+            incoming_revealed: false,
             sync_receipts: false,
             sync_drafts: false,
+            sync_scene: false,
             sync_clipboard: false,
+            scene_decided: false,
+            scene_gate: false,
+            sync_step: SyncStep::Done,
+            send_started: 0,
+            clip_local: None,
+            clip_remote: None,
+            clip_until: 0,
+            pending_clip_write: None,
             listener: false,
         }
     }
@@ -297,19 +351,134 @@ pub fn pending_peer() -> Option<Peer> {
     })
 }
 
-pub fn choosing_sync() -> bool {
-    STORE.with(|slot| slot.borrow().phase == Phase::ChooseSync)
-}
-
 pub fn sending() -> bool {
     STORE.with(|slot| slot.borrow().phase == Phase::Sending)
 }
 
-pub fn show_banner() -> bool {
+pub fn banner_kind() -> Option<BannerKind> {
     STORE.with(|slot| {
         let store = slot.borrow();
-        store.peers.iter().any(|peer| peer.trusted) && store.phase == Phase::Idle
+        if !store.peers.iter().any(|peer| peer.trusted) {
+            return None;
+        }
+        match store.phase {
+            Phase::Idle => Some(BannerKind::Offer),
+            Phase::Sending => Some(BannerKind::Sending),
+            Phase::NoAnswer => Some(BannerKind::NoAnswer),
+            _ => None,
+        }
     })
+}
+
+pub fn show_banner() -> bool {
+    banner_kind().is_some()
+}
+
+pub fn handoff_target_name() -> String {
+    peers()
+        .into_iter()
+        .find(|peer| peer.trusted)
+        .map(|peer| peer.name)
+        .unwrap_or_default()
+}
+
+pub fn sync_prompt() -> Option<SyncSurface> {
+    STORE.with(|slot| {
+        let store = slot.borrow();
+        if store.scene_gate && !store.scene_decided {
+            return Some(SyncSurface::Scene);
+        }
+        if store.phase != Phase::ChooseSync {
+            return None;
+        }
+        match store.sync_step {
+            SyncStep::Receipts => Some(SyncSurface::Receipts),
+            SyncStep::Drafts => Some(SyncSurface::Drafts),
+            SyncStep::Scene => Some(SyncSurface::Scene),
+            SyncStep::Clipboard => Some(SyncSurface::Clipboard),
+            SyncStep::Done => None,
+        }
+    })
+}
+
+pub fn scene_gate_open() -> bool {
+    STORE.with(|slot| {
+        let store = slot.borrow();
+        store.scene_gate && !store.scene_decided
+    })
+}
+
+pub fn sync_scene_enabled() -> bool {
+    STORE.with(|slot| slot.borrow().sync_scene)
+}
+
+pub fn scene_was_decided() -> bool {
+    STORE.with(|slot| slot.borrow().scene_decided)
+}
+
+pub fn sync_receipts_enabled() -> bool {
+    STORE.with(|slot| slot.borrow().sync_receipts)
+}
+
+pub fn sync_drafts_enabled() -> bool {
+    STORE.with(|slot| slot.borrow().sync_drafts)
+}
+
+/// Continue may send when this returns true. Otherwise the scene sheet is up.
+pub fn request_continue() -> bool {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        if store.scene_decided {
+            return true;
+        }
+        store.scene_gate = true;
+        false
+    })
+}
+
+pub fn allow_current() {
+    advance_sync(true);
+}
+
+pub fn skip_current() {
+    advance_sync(false);
+}
+
+fn advance_sync(allow: bool) {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        if store.scene_gate && !store.scene_decided {
+            store.sync_scene = allow;
+            store.scene_decided = true;
+            store.scene_gate = false;
+            return;
+        }
+        if store.phase != Phase::ChooseSync {
+            return;
+        }
+        match store.sync_step {
+            SyncStep::Receipts => {
+                store.sync_receipts = allow;
+                store.sync_step = SyncStep::Drafts;
+            }
+            SyncStep::Drafts => {
+                store.sync_drafts = allow;
+                store.sync_step = SyncStep::Scene;
+            }
+            SyncStep::Scene => {
+                store.sync_scene = allow;
+                store.scene_decided = true;
+                store.sync_step = SyncStep::Clipboard;
+            }
+            SyncStep::Clipboard => {
+                store.sync_clipboard = allow;
+                store.sync_step = SyncStep::Done;
+                store.phase = Phase::Idle;
+                store.notice.clear();
+            }
+            SyncStep::Done => {}
+        }
+    });
 }
 
 pub fn incoming() -> Option<(String, String, String)> {
@@ -323,6 +492,78 @@ pub fn incoming() -> Option<(String, String, String)> {
             store.incoming_path.clone(),
             store.incoming_draft.clone(),
         ))
+    })
+}
+
+pub fn incoming_revealed() -> bool {
+    STORE.with(|slot| {
+        let store = slot.borrow();
+        store.phase == Phase::Incoming && store.incoming_revealed
+    })
+}
+
+pub fn reveal_incoming() {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        if store.phase == Phase::Incoming {
+            store.incoming_revealed = true;
+        }
+    });
+}
+
+pub fn clip_conflict() -> Option<(ClipSide, ClipSide)> {
+    STORE.with(|slot| {
+        let store = slot.borrow();
+        if store.clip_until == 0 || now_unix() > store.clip_until {
+            return None;
+        }
+        Some((store.clip_local.clone()?, store.clip_remote.clone()?))
+    })
+}
+
+pub fn clip_deadline() -> u64 {
+    STORE.with(|slot| slot.borrow().clip_until)
+}
+
+/// Records the choice and returns its text. The two copies stay until the deadline.
+pub fn choose_clipboard(remote: bool) -> Option<String> {
+    STORE.with(|slot| {
+        let store = slot.borrow();
+        if store.clip_until == 0 || now_unix() > store.clip_until {
+            return None;
+        }
+        let side = if remote {
+            store.clip_remote.as_ref()
+        } else {
+            store.clip_local.as_ref()
+        };
+        side.map(|side| side.text.clone())
+    })
+}
+
+pub fn note_clock() -> bool {
+    note_clock_at(now_unix())
+}
+
+pub fn note_clock_at(now: u64) -> bool {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        let mut changed = false;
+        if store.phase == Phase::Sending
+            && store.send_started > 0
+            && now.saturating_sub(store.send_started) >= NO_ANSWER_AFTER
+        {
+            store.phase = Phase::NoAnswer;
+            store.notice = "handoff-no-answer".to_string();
+            changed = true;
+        }
+        if store.clip_until > 0 && now > store.clip_until {
+            store.clip_local = None;
+            store.clip_remote = None;
+            store.clip_until = 0;
+            changed = true;
+        }
+        changed
     })
 }
 
@@ -357,7 +598,7 @@ pub fn note_announcement(packet: &str, now: u64) -> bool {
             expiry_unix,
             trusted: false,
         });
-        if store.phase == Phase::Idle {
+        if matches!(store.phase, Phase::Idle | Phase::Failed | Phase::NoAnswer) {
             store.phase = Phase::Pending;
         }
         true
@@ -398,10 +639,14 @@ pub fn codes_match() -> bool {
         }
         peer.trusted = true;
         store.phase = Phase::ChooseSync;
+        store.sync_step = SyncStep::Receipts;
         store.sync_receipts = false;
         store.sync_drafts = false;
+        store.sync_scene = false;
         store.sync_clipboard = false;
-        store.notice = "pair-trusted".to_string();
+        store.scene_decided = false;
+        store.scene_gate = false;
+        store.notice.clear();
         true
     })
 }
@@ -426,11 +671,48 @@ pub fn clipboard_sync_enabled() -> bool {
 pub fn hide_banner() {
     STORE.with(|slot| {
         let mut store = slot.borrow_mut();
-        if store.phase == Phase::Idle || store.phase == Phase::Sending {
+        if matches!(store.phase, Phase::Idle | Phase::NoAnswer | Phase::Failed) {
             store.phase = Phase::Failed;
             store.notice.clear();
         }
     });
+}
+
+pub fn cancel_send() {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        if store.phase == Phase::Sending {
+            store.phase = Phase::Idle;
+            store.send_started = 0;
+            store.notice.clear();
+        }
+    });
+}
+
+fn compose_payload(
+    store: &Store,
+    receipts: Vec<String>,
+    draft: &str,
+    path: &str,
+    executed: bool,
+    clipboard: Option<&str>,
+) -> SyncPayload {
+    // Geometry, pixels, locale, and the confirmation itself are not fields.
+    SyncPayload::from_local(
+        if store.sync_receipts {
+            receipts
+        } else {
+            Vec::new()
+        },
+        if store.sync_drafts { draft } else { "" },
+        if store.sync_scene { path } else { "" },
+        executed,
+        if store.sync_clipboard {
+            clipboard
+        } else {
+            None
+        },
+    )
 }
 
 pub fn begin_send(
@@ -443,43 +725,60 @@ pub fn begin_send(
     STORE.with(|slot| {
         let mut store = slot.borrow_mut();
         let peer = store.peers.iter().find(|peer| peer.trusted)?.clone();
-        let payload = SyncPayload::from_local(
-            if store.sync_receipts {
-                receipts
-            } else {
-                Vec::new()
-            },
-            if store.sync_drafts { draft } else { "" },
-            path,
-            executed,
-            if store.sync_clipboard {
-                clipboard
-            } else {
-                None
-            },
-        );
+        let payload = compose_payload(&store, receipts, draft, path, executed, clipboard);
         let sealed = seal(&store.local, &peer.public, &payload)?;
-        store.phase = Phase::Sending;
-        store.notice = "handoff-sending".to_string();
-        let _ = send_sealed(&sealed);
+        store.send_started = now_unix();
+        if send_sealed(&sealed) {
+            store.phase = Phase::Sending;
+            store.notice = "handoff-sending".to_string();
+        } else {
+            store.phase = Phase::NoAnswer;
+            store.notice = "handoff-no-answer".to_string();
+        }
         Some(sealed)
     })
 }
 
 fn accept_sealed(sealed: &[u8]) -> bool {
+    let local_clip = read_system_clipboard();
     let peers = peers()
         .into_iter()
         .filter(|peer| peer.trusted)
         .collect::<Vec<_>>();
     for peer in peers {
-        if receive_sealed(&peer.public, &peer.name, sealed) {
+        if receive_sealed(&peer.public, &peer.name, sealed, local_clip.as_deref()) {
             return true;
         }
     }
     false
 }
 
-pub fn receive_sealed(peer_public: &[u8; 32], from: &str, sealed: &[u8]) -> bool {
+pub fn note_ack(fingerprint: &str) -> bool {
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        if store.phase != Phase::Sending {
+            return false;
+        }
+        let known = store
+            .peers
+            .iter()
+            .any(|peer| peer.trusted && peer.fingerprint == fingerprint);
+        if !known {
+            return false;
+        }
+        store.phase = Phase::Failed;
+        store.send_started = 0;
+        store.notice.clear();
+        true
+    })
+}
+
+pub fn receive_sealed(
+    peer_public: &[u8; 32],
+    from: &str,
+    sealed: &[u8],
+    local_clipboard: Option<&str>,
+) -> bool {
     let Some(payload) = STORE.with(|slot| {
         let store = slot.borrow();
         open_sealed(&store.local, peer_public, sealed)
@@ -491,11 +790,46 @@ pub fn receive_sealed(peer_public: &[u8; 32], from: &str, sealed: &[u8]) -> bool
         store.incoming_from = from.to_string();
         store.incoming_path = payload.path;
         store.incoming_draft = payload.draft;
-        store.incoming_clipboard = payload.clipboard;
+        store.incoming_revealed = false;
         store.phase = Phase::Incoming;
         store.notice = "handoff-incoming".to_string();
+        settle_clipboard(&mut store, payload.clipboard, local_clipboard);
     });
     true
+}
+
+fn settle_clipboard(store: &mut Store, remote: Option<String>, local: Option<&str>) {
+    let remote = remote.and_then(|text| nonempty_clipboard(&text));
+    let local = local.and_then(nonempty_clipboard);
+    match (local, remote) {
+        (Some(local_text), Some(remote_text)) => {
+            let now = now_unix();
+            store.clip_local = Some(ClipSide {
+                device: store.name.clone(),
+                unix: now,
+                text: local_text,
+            });
+            store.clip_remote = Some(ClipSide {
+                device: store.incoming_from.clone(),
+                unix: now,
+                text: remote_text,
+            });
+            store.clip_until = now + CLIP_HOLD_SECS;
+            store.pending_clip_write = None;
+        }
+        (None, Some(remote_text)) => {
+            store.pending_clip_write = Some(remote_text);
+        }
+        _ => {}
+    }
+}
+
+pub fn take_auto_clipboard() -> Option<String> {
+    STORE.with(|slot| slot.borrow_mut().pending_clip_write.take())
+}
+
+pub fn local_public() -> [u8; 32] {
+    STORE.with(|slot| slot.borrow().local.public_bytes())
 }
 
 pub fn demo_pending() {
@@ -504,7 +838,7 @@ pub fn demo_pending() {
         "W3COS1\t手机\t{}\t{}\tdemo\t{}",
         peer.fingerprint(),
         hex_key(&peer.public_bytes()),
-        now_unix() + 60
+        now_unix() + CODE_TTL_SECS
     );
     let _ = note_announcement(&packet, now_unix());
 }
@@ -512,16 +846,54 @@ pub fn demo_pending() {
 pub fn demo_banner() {
     demo_pending();
     let _ = codes_match();
-    STORE.with(|slot| slot.borrow_mut().phase = Phase::Idle);
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        store.phase = Phase::Idle;
+        store.sync_step = SyncStep::Done;
+        store.scene_gate = false;
+        store.notice.clear();
+    });
+}
+
+pub fn demo_sending() {
+    demo_banner();
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        store.phase = Phase::Sending;
+        store.send_started = now_unix();
+        store.notice = "handoff-sending".to_string();
+    });
+}
+
+pub fn demo_no_answer() {
+    demo_banner();
+    STORE.with(|slot| {
+        let mut store = slot.borrow_mut();
+        store.phase = Phase::NoAnswer;
+        store.notice = "handoff-no-answer".to_string();
+    });
 }
 
 pub fn demo_incoming() {
     STORE.with(|slot| {
         let mut store = slot.borrow_mut();
+        let now = now_unix();
         store.incoming_from = "书桌".to_string();
         store.incoming_path = "/docs/notes.txt".to_string();
         store.incoming_draft = "把这段改成夜间模式".to_string();
+        store.incoming_revealed = true;
         store.phase = Phase::Incoming;
+        store.clip_local = Some(ClipSide {
+            device: store.name.clone(),
+            unix: now.saturating_sub(120),
+            text: "手机上的一句".to_string(),
+        });
+        store.clip_remote = Some(ClipSide {
+            device: "书桌".to_string(),
+            unix: now.saturating_sub(30),
+            text: "书桌上的一句".to_string(),
+        });
+        store.clip_until = now + CLIP_HOLD_SECS;
     });
 }
 
@@ -567,9 +939,14 @@ pub fn ensure_listener() {
                 } else if let Some(sealed) = bytes.strip_prefix(b"W3COS2") {
                     let accepted = accept_sealed(sealed);
                     if accepted {
-                        publish_incoming_clipboard();
+                        if let Some(text) = take_auto_clipboard() {
+                            write_system_clipboard(&text);
+                        }
+                        send_ack();
                     }
                     accepted
+                } else if let Some(rest) = bytes.strip_prefix(b"W3COS3\t") {
+                    std::str::from_utf8(rest).is_ok_and(|fingerprint| note_ack(fingerprint.trim()))
                 } else {
                     false
                 };
@@ -752,11 +1129,19 @@ fn read_dns_name(packet: &[u8], offset: &mut usize) -> Option<String> {
     None
 }
 
-fn publish_incoming_clipboard() {
-    let Some(text) = STORE.with(|slot| slot.borrow_mut().incoming_clipboard.take()) else {
-        return;
-    };
-    write_system_clipboard(&text);
+fn read_system_clipboard() -> Option<String> {
+    let output = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-o"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    nonempty_clipboard(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub fn publish_clipboard(text: &str) {
+    write_system_clipboard(text);
 }
 
 fn write_system_clipboard(text: &str) {
@@ -772,6 +1157,17 @@ fn write_system_clipboard(text: &str) {
 }
 
 fn send_sealed(bytes: &[u8]) -> bool {
+    let mut packet = b"W3COS2".to_vec();
+    packet.extend_from_slice(bytes);
+    broadcast_packet(&packet)
+}
+
+fn send_ack() {
+    let packet = format!("W3COS3\t{}", local_fingerprint());
+    let _ = broadcast_packet(packet.as_bytes());
+}
+
+fn broadcast_packet(bytes: &[u8]) -> bool {
     let port = std::env::var("W3COS_DEVICE_PORT")
         .ok()
         .and_then(|raw| raw.parse().ok())
@@ -780,9 +1176,7 @@ fn send_sealed(bytes: &[u8]) -> bool {
         return false;
     };
     let _ = socket.set_broadcast(true);
-    let mut packet = b"W3COS2".to_vec();
-    packet.extend_from_slice(bytes);
-    socket.send_to(&packet, ("255.255.255.255", port)).is_ok()
+    socket.send_to(bytes, ("255.255.255.255", port)).is_ok()
 }
 
 fn parse_announcement(packet: &str) -> Option<(String, String, [u8; 32], String, u64)> {
@@ -820,6 +1214,11 @@ fn hex_key(bytes: &[u8; 32]) -> String {
 }
 
 #[cfg(test)]
+pub fn reset_for_tests() {
+    STORE.with(|slot| *slot.borrow_mut() = Store::new());
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -836,6 +1235,7 @@ mod tests {
 
     #[test]
     fn mismatch_does_not_trust_and_a_match_does() {
+        reset_for_tests();
         let local = DeviceKey::from_seed([7; 32]);
         let peer = DeviceKey::from_seed([9; 32]);
         let packet = format!(
@@ -934,6 +1334,7 @@ mod tests {
                 .unwrap()
                 .starts_with("w3sync1\n")
         );
+        reset_for_tests();
         assert!(!clipboard_sync_enabled());
         allow_clipboard_sync();
         assert!(clipboard_sync_enabled());
@@ -941,6 +1342,7 @@ mod tests {
 
     #[test]
     fn mdns_txt_roundtrips_the_udp_announcement() {
+        reset_for_tests();
         let peer = DeviceKey::from_seed([6; 32]);
         let text = format!(
             "W3COS1\t手机\t{}\t{}\tnonce\t{}",
@@ -953,5 +1355,206 @@ mod tests {
         assert_eq!(recovered, text);
         assert!(note_announcement(&recovered, now_unix()));
         assert!(peers().iter().any(|item| item.name == "手机"));
+    }
+
+    #[test]
+    fn a_code_expires_after_ninety_seconds() {
+        let now = now_unix();
+        assert!(!code_expired(now + CODE_TTL_SECS, now));
+        assert!(!code_expired(now + CODE_TTL_SECS, now + CODE_TTL_SECS));
+        assert!(code_expired(now + CODE_TTL_SECS, now + CODE_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn trust_asks_each_surface_and_leaves_scene_and_clipboard_off() {
+        reset_for_tests();
+        demo_pending();
+        assert!(codes_match());
+        assert!(!sync_receipts_enabled());
+        assert!(!sync_drafts_enabled());
+        assert!(!sync_scene_enabled());
+        assert!(!clipboard_sync_enabled());
+        assert_eq!(sync_prompt(), Some(SyncSurface::Receipts));
+        allow_current();
+        assert!(sync_receipts_enabled());
+        assert_eq!(sync_prompt(), Some(SyncSurface::Drafts));
+        skip_current();
+        assert!(!sync_drafts_enabled());
+        assert_eq!(sync_prompt(), Some(SyncSurface::Scene));
+        skip_current();
+        assert!(!sync_scene_enabled());
+        assert!(scene_was_decided());
+        assert_eq!(sync_prompt(), Some(SyncSurface::Clipboard));
+        skip_current();
+        assert!(!clipboard_sync_enabled());
+        assert!(sync_prompt().is_none());
+        assert_eq!(banner_kind(), Some(BannerKind::Offer));
+    }
+
+    #[test]
+    fn scene_off_omits_the_path_and_the_payload_has_no_foreign_state() {
+        reset_for_tests();
+        demo_pending();
+        assert!(codes_match());
+        for _ in 0..4 {
+            skip_current();
+        }
+        let store = STORE.with(|slot| {
+            let store = slot.borrow();
+            compose_payload(
+                &store,
+                vec!["#1 allowed".to_string()],
+                "打开文件",
+                "/docs/notes.txt",
+                false,
+                Some("clip-secret"),
+            )
+        });
+        assert!(store.path.is_empty());
+        assert!(store.draft.is_empty());
+        assert!(store.clipboard.is_none());
+        assert!(store.receipts.is_empty());
+        let encoded = String::from_utf8(store.encode()).unwrap();
+        for forbidden in [
+            "window",
+            "maximize",
+            "locale",
+            "zh-CN",
+            "confirmed",
+            "geometry",
+            "clip-secret",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "{forbidden} leaked into {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_scene_sends_the_path_and_an_executed_draft_stays_home() {
+        reset_for_tests();
+        demo_pending();
+        assert!(codes_match());
+        allow_current();
+        allow_current();
+        allow_current();
+        skip_current();
+        assert!(sync_scene_enabled());
+        assert!(sync_drafts_enabled());
+        assert!(!clipboard_sync_enabled());
+        let open = STORE.with(|slot| {
+            let store = slot.borrow();
+            compose_payload(
+                &store,
+                Vec::new(),
+                "把这段改成夜间模式",
+                "/docs/notes.txt",
+                false,
+                Some("clip"),
+            )
+        });
+        assert_eq!(open.path, "/docs/notes.txt");
+        assert_eq!(open.draft, "把这段改成夜间模式");
+        assert!(open.clipboard.is_none());
+        let executed = STORE.with(|slot| {
+            let store = slot.borrow();
+            compose_payload(
+                &store,
+                Vec::new(),
+                "把这段改成夜间模式",
+                "/docs/notes.txt",
+                true,
+                None,
+            )
+        });
+        assert!(executed.draft.is_empty());
+        let encoded = String::from_utf8(executed.encode()).unwrap();
+        assert!(!encoded.contains("confirmed"));
+        assert!(!encoded.contains("把这段改成夜间模式"));
+    }
+
+    #[test]
+    fn both_clipboards_stay_choosable_for_ten_minutes() {
+        reset_for_tests();
+        let peer = DeviceKey::from_seed([8; 32]);
+        let payload = SyncPayload {
+            receipts: Vec::new(),
+            draft: "把这段改成夜间模式".to_string(),
+            path: "/docs/notes.txt".to_string(),
+            clipboard: Some("书桌上的一句".to_string()),
+        };
+        let sealed = seal(&peer, &local_public(), &payload).unwrap();
+        assert!(receive_sealed(
+            &peer.public_bytes(),
+            "书桌",
+            &sealed,
+            Some("手机上的一句"),
+        ));
+        assert!(!incoming_revealed());
+        let (local, remote) = clip_conflict().expect("both copies");
+        assert_eq!(local.text, "手机上的一句");
+        assert_eq!(remote.device, "书桌");
+        assert_eq!(remote.text, "书桌上的一句");
+        let until = clip_deadline();
+        assert!(until >= now_unix() + CLIP_HOLD_SECS - 1);
+        assert_eq!(choose_clipboard(false).as_deref(), Some("手机上的一句"));
+        assert!(
+            clip_conflict().is_some(),
+            "choosing does not drop the other copy"
+        );
+        assert!(!note_clock_at(until));
+        assert!(clip_conflict().is_some());
+        assert!(note_clock_at(until + 1));
+        assert!(clip_conflict().is_none());
+    }
+
+    #[test]
+    fn a_remote_clipboard_alone_does_not_open_the_conflict_sheet() {
+        reset_for_tests();
+        let peer = DeviceKey::from_seed([8; 32]);
+        let payload = SyncPayload {
+            receipts: Vec::new(),
+            draft: "d".to_string(),
+            path: "/p".to_string(),
+            clipboard: Some("only-remote".to_string()),
+        };
+        let sealed = seal(&peer, &local_public(), &payload).unwrap();
+        assert!(receive_sealed(&peer.public_bytes(), "书桌", &sealed, None));
+        assert!(clip_conflict().is_none());
+        assert_eq!(take_auto_clipboard().as_deref(), Some("only-remote"));
+    }
+
+    #[test]
+    fn continue_asks_for_scene_once_and_a_missed_ack_is_no_answer() {
+        reset_for_tests();
+        demo_banner();
+        assert!(!scene_was_decided());
+        assert!(!request_continue());
+        assert_eq!(sync_prompt(), Some(SyncSurface::Scene));
+        skip_current();
+        assert!(scene_was_decided());
+        assert!(!sync_scene_enabled());
+        assert!(request_continue());
+        demo_sending();
+        let started = STORE.with(|slot| slot.borrow().send_started);
+        assert!(sending());
+        assert!(!note_clock_at(started + NO_ANSWER_AFTER - 1));
+        assert!(note_clock_at(started + NO_ANSWER_AFTER));
+        assert_eq!(banner_kind(), Some(BannerKind::NoAnswer));
+        cancel_send();
+        assert!(sending() || banner_kind() == Some(BannerKind::NoAnswer));
+        hide_banner();
+        assert!(banner_kind().is_none());
+    }
+
+    #[test]
+    fn cancel_during_send_returns_to_the_offer() {
+        reset_for_tests();
+        demo_sending();
+        assert_eq!(banner_kind(), Some(BannerKind::Sending));
+        cancel_send();
+        assert!(!sending());
+        assert_eq!(banner_kind(), Some(BannerKind::Offer));
     }
 }

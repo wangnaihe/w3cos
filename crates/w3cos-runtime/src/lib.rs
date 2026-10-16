@@ -217,6 +217,10 @@ pub use w3cos_ffi as ffi;
 // Runtime stylesheet registry (ESM CSS imports baked into the bundle).
 pub use w3cos_dom::stylesheet;
 
+/// Hover outline for interactive controls. Jade, same family as the focus ring.
+/// The previous indigo `(108, 92, 231)` read as a debug frame around whole windows.
+pub(crate) const HOVER_OUTLINE_RGBA: [u8; 4] = [20, 150, 106, 200];
+
 #[cfg(feature = "gpu")]
 #[path = "render_gpu.rs"]
 pub mod render_gpu;

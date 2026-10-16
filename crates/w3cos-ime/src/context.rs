@@ -25,7 +25,7 @@ impl Default for Rect {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextRange {
     pub start: usize,
     pub end: usize,
@@ -37,7 +37,8 @@ pub struct Surrounding {
     pub after: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
 pub enum Edit {
     Insert { text: String },
     Replace { range: TextRange, text: String },

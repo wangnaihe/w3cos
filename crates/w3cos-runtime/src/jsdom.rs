@@ -395,6 +395,9 @@ struct ShadowRootInfo {
 /// not pin them after the last JS handle drops.
 enum ElementMemo {
     Strong(Value),
+    /// Authored own state or a custom prototype lives on this wrapper and
+    /// must survive detach/reconnect even when the native node is parentless.
+    Pinned(Value),
     Weak(WeakJsObject),
 }
 
@@ -1341,7 +1344,7 @@ fn pin_dom_wrapper(node: u32) {
         set_expando(node, "__w3cos_custom_prototype", proto);
     }
     ELEMENT_VALUES.with(|cache| {
-        cache.borrow_mut().insert(node, ElementMemo::Strong(value));
+        cache.borrow_mut().insert(node, ElementMemo::Pinned(value));
     });
 }
 
@@ -3164,7 +3167,7 @@ fn memoized_element(node: u32) -> Option<Value> {
     ELEMENT_VALUES.with(|cache| {
         let map = cache.borrow();
         match map.get(&node) {
-            Some(ElementMemo::Strong(value)) => Some(value.clone()),
+            Some(ElementMemo::Strong(value) | ElementMemo::Pinned(value)) => Some(value.clone()),
             Some(ElementMemo::Weak(weak)) => upgrade_realm_object(weak),
             None => None,
         }
@@ -3175,7 +3178,7 @@ pub fn element_value(node: u32) -> Value {
     let cached = ELEMENT_VALUES.with(|c| {
         let mut map = c.borrow_mut();
         match map.get(&node) {
-            Some(ElementMemo::Strong(value)) => Some(value.clone()),
+            Some(ElementMemo::Strong(value) | ElementMemo::Pinned(value)) => Some(value.clone()),
             Some(ElementMemo::Weak(weak)) => match upgrade_realm_object(weak) {
                 Some(value) => {
                     if js_wrapper_should_pin(node) {
@@ -3296,6 +3299,9 @@ fn release_element_wrapper(node: u32) {
     ELEMENT_VALUES.with(|c| {
         let mut map = c.borrow_mut();
         match map.remove(&node) {
+            Some(ElementMemo::Pinned(value)) => {
+                map.insert(node, ElementMemo::Pinned(value));
+            }
             Some(ElementMemo::Strong(value)) => {
                 map.insert(node, ElementMemo::Weak(weak_realm_object(&value)));
             }
@@ -4213,6 +4219,14 @@ fn element_prototype(node: u32) -> Value {
     }
 }
 
+fn set_built_element_prototype(value: &Value, prototype: &Value) {
+    value
+        .as_object()
+        .expect("element wrapper")
+        .borrow_mut()
+        .set_prototype_of(prototype);
+}
+
 fn build_element_value(node: u32) -> Value {
     let generation = realm_generation();
     let value = Value::proxied_host_object(
@@ -4230,16 +4244,13 @@ fn build_element_value(node: u32) -> Value {
         .map(|name| name.to_js_string())
         .unwrap_or_else(|| dom::tag_name(node));
     if namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML") {
-        w3cos_core::class::set_prototype_of(
-            &value,
-            &math_ml_element_class().get_property("prototype"),
-        );
+        set_built_element_prototype(&value, &math_ml_element_class().get_property("prototype"));
     } else if namespace.as_deref() == Some(crate::html_parser_state::HTML_NAMESPACE)
         && local_name.bytes().any(|byte| byte.is_ascii_uppercase())
     {
         // Namespace-aware creation preserves ASCII case. An upper-case local
         // name therefore does not identify the lower-case built-in HTML tag.
-        w3cos_core::class::set_prototype_of(
+        set_built_element_prototype(
             &value,
             &crate::dom_constructors::prototype("HTMLUnknownElement"),
         );
@@ -4247,9 +4258,9 @@ fn build_element_value(node: u32) -> Value {
         && namespace.as_deref() != Some(crate::html_parser_state::HTML_NAMESPACE)
         && namespace.as_deref() != Some("http://www.w3.org/2000/svg")
     {
-        w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Element"));
+        set_built_element_prototype(&value, &crate::dom_constructors::prototype("Element"));
     } else {
-        w3cos_core::class::set_prototype_of(
+        set_built_element_prototype(
             &value,
             &crate::dom_constructors::prototype_for_node(
                 dom::node_type(node),
@@ -4259,7 +4270,7 @@ fn build_element_value(node: u32) -> Value {
         );
     }
     if let Some(proto) = get_expando(node, "__w3cos_custom_prototype") {
-        w3cos_core::class::set_prototype_of(&value, &proto);
+        set_built_element_prototype(&value, &proto);
     }
     value
 }
@@ -4311,11 +4322,12 @@ fn remove_indexed_table_row(rows: Vec<u32>, requested_index: Value) {
     let Some(parent) = dom::parent_node(row) else {
         return;
     };
-    let value = element_value(row);
     let was_connected = dom::is_connected(row);
+    let notify_disconnected = was_connected && disconnected_lifecycle_may_be_observable(row);
+    let value = notify_disconnected.then(|| element_value(row));
     dom::remove_child(parent, row);
     release_element_subtree(row);
-    if was_connected {
+    if let Some(value) = value {
         crate::custom_elements_web::disconnected_subtree(&value);
     }
 }
@@ -4433,6 +4445,70 @@ fn subtree_has_element_memo(root: u32) -> bool {
         }
     });
     found
+}
+
+fn prototype_chain_has_authored_lifecycle(mut prototype: Value) -> bool {
+    for _ in 0..64 {
+        let Some(object) = prototype.as_object() else {
+            return false;
+        };
+        let next = {
+            let object = object.borrow();
+            // Do not run an authored Proxy trap before the DOM mutation. The
+            // normal lifecycle walk will perform the authoritative lookup
+            // with the real wrapper as receiver after detach.
+            if object.is_proxy()
+                || object.has_own_property("__w3cos_custom_element_upgraded")
+                || object.has_own_property("disconnectedCallback")
+            {
+                return true;
+            }
+            object.get_prototype_of()
+        };
+        if next.is_null() || next.is_undefined() {
+            return false;
+        }
+        prototype = next;
+    }
+    // A cyclic or unusually deep authored chain must take the safe path.
+    true
+}
+
+fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
+    let mut found = false;
+    let mut prototype_cache = HashMap::<u64, bool>::new();
+    walk_subtree(root, &mut |node| {
+        if found {
+            return;
+        }
+        let direct = ELEMENT_PROPS.with(|props| {
+            let props = props.borrow();
+            props.contains_key(&(node, "__w3cos_custom_element_upgraded".to_string()))
+                || props.contains_key(&(node, "disconnectedCallback".to_string()))
+        });
+        if direct {
+            found = true;
+            return;
+        }
+        let prototype = element_prototype(node);
+        let identity = prototype.identity_hash();
+        found = *prototype_cache
+            .entry(identity)
+            .or_insert_with(|| prototype_chain_has_authored_lifecycle(prototype));
+    });
+    found
+}
+
+/// Custom-element definitions make lifecycle callbacks observable for any
+/// matching node. With an empty registry, an authored/materialized wrapper is
+/// still observable: it may carry the upgraded marker and an authored
+/// disconnectedCallback on its prototype. Fresh immediate-only subtrees have
+/// neither, so removal can avoid materializing every node just to discover
+/// that there is no callback to run.
+fn disconnected_lifecycle_may_be_observable(root: u32) -> bool {
+    crate::custom_elements_web::has_definitions()
+        || subtree_has_element_memo(root)
+        || subtree_has_authored_lifecycle_state(root)
 }
 
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
@@ -9972,9 +10048,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 dom_exception("The node is not a child of this parent", "NotFoundError");
             }
             let was_connected = dom::is_connected(cid);
+            let notify_disconnected =
+                was_connected && disconnected_lifecycle_may_be_observable(cid);
             dom::remove_child(node, cid);
             release_element_subtree(cid);
-            if was_connected {
+            if notify_disconnected {
                 crate::custom_elements_web::disconnected_subtree(&child);
             }
             child
@@ -10146,9 +10224,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             };
             ensure_tree_child_type_and_adopt(node, inserted_node);
             let old_was_connected = dom::is_connected(old_node);
+            let notify_disconnected =
+                old_was_connected && disconnected_lifecycle_may_be_observable(old_node);
             replace_child_or_fragment(node, inserted_node, old_node);
             release_element_subtree(old_node);
-            if old_was_connected {
+            if notify_disconnected {
                 crate::custom_elements_web::disconnected_subtree(&old_child);
             }
             if dom::node_type(inserted_node) != 11 && dom::is_connected(inserted_node) {
@@ -10164,11 +10244,13 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "remove" => func(move |_, _| {
             if let Some(parent) = dom::parent_node(node) {
-                let element = element_value(node);
                 let was_connected = dom::is_connected(node);
+                let notify_disconnected =
+                    was_connected && disconnected_lifecycle_may_be_observable(node);
+                let element = notify_disconnected.then(|| element_value(node));
                 dom::remove_child(parent, node);
                 release_element_subtree(node);
-                if was_connected {
+                if let Some(element) = element {
                     crate::custom_elements_web::disconnected_subtree(&element);
                 }
             } else if let Some(parent_document) = get_expando(node, "parentNode")
@@ -22300,6 +22382,347 @@ mod tests {
         );
         assert_eq!(el.get_property("ready").to_js_string(), "yes");
         assert_eq!(calls.get(), 1, "disconnectedCallback should run");
+    }
+
+    #[test]
+    fn empty_custom_element_registry_removes_fresh_immediate_without_materializing() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let parent = doc.call_method("createElement", vec![Value::string("div")]);
+        let middle = doc.call_method("createElement", vec![Value::string("section")]);
+        let leaf = doc.call_method("createElement", vec![Value::string("span")]);
+        let nodes = [&parent, &middle, &leaf]
+            .map(|element| node_id_of(element).expect("fresh DOM immediate"));
+        middle.call_method("appendChild", vec![leaf]);
+        parent.call_method("appendChild", vec![middle]);
+        body.call_method("appendChild", vec![parent.clone()]);
+        assert!(nodes.iter().all(|node| memoized_element(*node).is_none()));
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+
+        body.call_method("removeChild", vec![parent]);
+
+        assert_eq!(
+            w3cos_core::intrinsics::dom_shape_epoch(),
+            shape_epoch,
+            "removing an unmaterialized subtree must not change the authored shape epoch"
+        );
+        assert!(
+            nodes.iter().all(|node| memoized_element(*node).is_none()),
+            "an empty registry must not materialize any node in a fresh removed subtree"
+        );
+    }
+
+    #[test]
+    fn lifecycle_proxy_get_runs_only_after_detach_with_exact_receiver() {
+        setup();
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let observations = Rc::new(RefCell::new(Vec::<(String, u32, bool)>::new()));
+        let observations_cb = Rc::clone(&observations);
+        let callback = Value::function(move |_, _| {
+            calls_cb.set(calls_cb.get() + 1);
+            Value::Undefined
+        });
+        let callback_cb = callback.clone();
+        let second = doc.call_method("createElement", vec![Value::string("span")]);
+        let expected_node = node_id_of(&second).unwrap();
+        body.call_method("appendChild", vec![second.clone()]);
+        let handler = ProxyBuilder::new()
+            .get(move |_, key, receiver| {
+                let receiver_node =
+                    node_id_of(receiver).expect("receiver must be the target DOM node");
+                observations_cb.borrow_mut().push((
+                    key.to_string(),
+                    receiver_node,
+                    dom::is_connected(receiver_node),
+                ));
+                match key {
+                    "__w3cos_custom_element_upgraded" => Value::Bool(true),
+                    "disconnectedCallback" => callback_cb.clone(),
+                    _ => Value::Undefined,
+                }
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        w3cos_core::class::set_prototype_of(&second, &proxy);
+        body.call_method("removeChild", vec![second]);
+        assert_eq!(calls.get(), 1, "observations={:?}", observations.borrow());
+        assert!(
+            !observations.borrow().is_empty(),
+            "authoritative lookup must reach Proxy"
+        );
+        assert!(
+            observations
+                .borrow()
+                .iter()
+                .all(|(_, node, connected)| *node == expected_node && !connected),
+            "all get traps must run after detach with the exact removed node receiver"
+        );
+    }
+
+    #[test]
+    fn lifecycle_guard_never_runs_proxy_get_prototype_of_trap() {
+        struct PrototypeRestore {
+            object: Value,
+            prototype: Value,
+        }
+
+        impl Drop for PrototypeRestore {
+            fn drop(&mut self) {
+                w3cos_core::class::set_prototype_of(&self.object, &self.prototype);
+            }
+        }
+
+        setup();
+        let node = dom::create_element("span");
+        dom::append_child(dom::body_id(), node);
+        assert!(
+            memoized_element(node).is_none(),
+            "test must exercise the prototype scan"
+        );
+        let traps = Rc::new(Cell::new(0u32));
+        let traps_cb = Rc::clone(&traps);
+        let handler = ProxyBuilder::new()
+            .get_prototype_of(move |_| {
+                traps_cb.set(traps_cb.get() + 1);
+                Value::Null
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        let shared = crate::dom_constructors::prototype("HTMLElement");
+        let old_parent = w3cos_core::class::get_prototype_of(&shared);
+        w3cos_core::class::set_prototype_of(&shared, &proxy);
+        let _restore = PrototypeRestore {
+            object: shared.clone(),
+            prototype: old_parent,
+        };
+        assert!(disconnected_lifecycle_may_be_observable(node));
+        assert_eq!(
+            traps.get(),
+            0,
+            "detach guard must not run authored Proxy traps"
+        );
+        dom::remove_child(dom::body_id(), node);
+    }
+
+    #[test]
+    fn empty_registry_keeps_materialized_descendant_disconnected_callback() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let doc = document_value();
+        let parent = doc.call_method("createElement", vec![Value::string("div")]);
+        let middle = doc.call_method("createElement", vec![Value::string("section")]);
+        let descendant = doc.call_method("createElement", vec![Value::string("span")]);
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        w3cos_core::class::set_prototype_of(&descendant, &prototype);
+        descendant.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        middle.call_method("appendChild", vec![descendant]);
+        parent.call_method("appendChild", vec![middle]);
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![parent.clone()]);
+
+        body.call_method("removeChild", vec![parent]);
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a materialized descendant callback must survive the empty-registry fast path"
+        );
+    }
+
+    #[test]
+    fn empty_registry_keeps_expando_only_disconnected_callback() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let doc = document_value();
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        let node = node_id_of(&element).expect("fresh DOM immediate");
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        element.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        element.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        assert!(
+            memoized_element(node).is_none(),
+            "direct expandos must not materialize the wrapper"
+        );
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![element.clone()]);
+
+        body.call_method("removeChild", vec![element]);
+
+        assert_eq!(calls.get(), 1, "expando-only callback must not be skipped");
+    }
+
+    #[test]
+    fn empty_registry_keeps_shared_prototype_disconnected_callback() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let prototype = crate::dom_constructors::prototype("HTMLElement");
+        prototype.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        prototype.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        let doc = document_value();
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        let node = node_id_of(&element).expect("fresh DOM immediate");
+        assert!(
+            memoized_element(node).is_none(),
+            "shared prototype authoring must not materialize a fresh node"
+        );
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![element.clone()]);
+
+        body.call_method("removeChild", vec![element]);
+
+        prototype.delete_property("disconnectedCallback");
+        prototype.delete_property("__w3cos_custom_element_upgraded");
+        assert_eq!(
+            calls.get(),
+            1,
+            "shared prototype callback must not be skipped"
+        );
+    }
+
+    #[test]
+    fn define_field_pins_dom_immediate_and_invalidates_guarded_shape() {
+        setup();
+        let doc = document_value();
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        let node = node_id_of(&element).expect("fresh DOM immediate");
+        assert!(memoized_element(node).is_none());
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+
+        w3cos_core::class::define_field(&element, "authored", Value::string("kept"));
+
+        assert_ne!(w3cos_core::intrinsics::dom_shape_epoch(), shape_epoch);
+        assert!(
+            memoized_element(node).is_some(),
+            "defined field must pin its wrapper"
+        );
+        assert_eq!(element.get_property("authored").to_js_string(), "kept");
+        let body = doc.get_property("body");
+        body.call_method("appendChild", vec![element.clone()]);
+        body.call_method("removeChild", vec![element.clone()]);
+        assert_eq!(
+            element.get_property("authored").to_js_string(),
+            "kept",
+            "defined field must survive detach"
+        );
+        body.call_method("appendChild", vec![element.clone()]);
+        assert_eq!(
+            element.get_property("authored").to_js_string(),
+            "kept",
+            "defined field must survive reconnect"
+        );
+    }
+
+    #[test]
+    fn materialized_authored_prototype_and_descriptor_survive_detach() {
+        setup();
+        let doc = document_value();
+        let body = doc.get_property("body");
+
+        let prototype_element = doc.call_method("createElement", vec![Value::string("div")]);
+        let prototype_node = node_id_of(&prototype_element).expect("DOM immediate");
+        let prototype_element = element_value(prototype_node);
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("authoredPrototype", Value::Bool(true));
+        w3cos_core::class::set_prototype_of(&prototype_element, &prototype);
+        body.call_method("appendChild", vec![prototype_element.clone()]);
+        body.call_method("removeChild", vec![prototype_element.clone()]);
+        assert!(
+            prototype_element
+                .get_property("authoredPrototype")
+                .to_bool(),
+            "materialized authored prototype must survive detach"
+        );
+
+        let descriptor_element = doc.call_method("createElement", vec![Value::string("div")]);
+        let descriptor_node = node_id_of(&descriptor_element).expect("DOM immediate");
+        let descriptor_element = element_value(descriptor_node);
+        let descriptor = Value::object(HashMap::from([("value".into(), Value::string("kept"))]));
+        w3cos_core::class::define_property(&descriptor_element, "authored", &descriptor);
+        body.call_method("appendChild", vec![descriptor_element.clone()]);
+        body.call_method("removeChild", vec![descriptor_element.clone()]);
+        assert_eq!(
+            descriptor_element.get_property("authored").to_js_string(),
+            "kept",
+            "materialized authored descriptor must survive detach"
+        );
+    }
+
+    #[test]
+    fn registered_custom_element_remove_then_reconnect_preserves_callback_order() {
+        setup();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let connected_events = Rc::clone(&events);
+        let disconnected_events = Rc::clone(&events);
+        let prototype = Value::object(HashMap::from([
+            (
+                "connectedCallback".into(),
+                Value::function(move |_, _| {
+                    connected_events.borrow_mut().push("connected");
+                    Value::Undefined
+                }),
+            ),
+            (
+                "disconnectedCallback".into(),
+                Value::function(move |_, _| {
+                    disconnected_events.borrow_mut().push("disconnected");
+                    Value::Undefined
+                }),
+            ),
+        ]));
+        let constructor = Value::function(|_, _| Value::Undefined);
+        constructor.set_property("prototype", prototype);
+        crate::custom_elements_web::custom_elements_value().call_method(
+            "define",
+            vec![Value::string("x-air-lifecycle"), constructor],
+        );
+        assert!(crate::custom_elements_web::has_definitions());
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let element = doc.call_method("createElement", vec![Value::string("x-air-lifecycle")]);
+
+        body.call_method("appendChild", vec![element.clone()]);
+        body.call_method("removeChild", vec![element.clone()]);
+        body.call_method("appendChild", vec![element]);
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["connected", "disconnected", "connected"]
+        );
     }
 
     #[test]
