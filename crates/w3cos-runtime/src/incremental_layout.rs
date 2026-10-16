@@ -40,6 +40,7 @@ pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     PAINT.with(|cache| *cache.borrow_mut() = None);
     PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
     crate::headless::invalidate_retained_frame();
 }
 
