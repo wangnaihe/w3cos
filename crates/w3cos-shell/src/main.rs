@@ -663,6 +663,7 @@ fn confirm_title(command: &ShellCommand, ctx: &ShellContext) -> String {
 
 fn confirm_impact(command: &ShellCommand, shared: bool) -> String {
     match command {
+        ShellCommand::OpenApp(ShellApp::Agent) => locale::t("impact-tasks"),
         ShellCommand::OpenApp(app) => {
             let name = app_label(app.signal_value());
             locale::t_args("impact-navigate", &[("name", &name)])
@@ -895,6 +896,7 @@ fn apply_locale_confirm(session: &mut IntentSession, tag: &str) {
 
 fn apply_effect(effect: &ExecuteResult) {
     if let Some(app) = effect.navigate {
+        // The agent is not a window. Confirming it opens the tray task center.
         focus_app(app.signal_value());
     }
     if let Some(night) = effect.night {
@@ -1042,8 +1044,32 @@ fn deny_process_permission(session: &mut IntentSession) {
     sync_session(session, 2, &locale::t("perm-denied-notice"));
 }
 
+fn scrub_agent_window() {
+    let bit = app_bit(4);
+    state::set_signal(OPEN_MASK_SIGNAL, state::get_signal(OPEN_MASK_SIGNAL) & !bit);
+    state::set_signal(
+        MINIMIZED_MASK_SIGNAL,
+        state::get_signal(MINIMIZED_MASK_SIGNAL) & !bit,
+    );
+    if state::get_signal(APP_SIGNAL) == 4 {
+        state::set_signal(APP_SIGNAL, 0);
+    }
+}
+
+/// Planning, receipts, and steps live in the tray task center, not an app window.
+fn open_task_center() {
+    ensure_shell_signals();
+    scrub_agent_window();
+    state::set_signal(TASKS_SIGNAL, 1);
+    state::set_signal(LAUNCHER_SIGNAL, 0);
+}
+
 fn focus_app(id: i64) {
     ensure_shell_signals();
+    if id == 4 {
+        open_task_center();
+        return;
+    }
     let id = id.clamp(0, 6);
     state::set_signal(APP_SIGNAL, id);
     state::set_signal(LAUNCHER_SIGNAL, 0);
@@ -1328,7 +1354,7 @@ fn cycle_windows() {
     let mut found = None;
     for step in 1..=6 {
         let id = (start + step - 1) % 6 + 1;
-        if open & app_bit(id) != 0 {
+        if resident(id) && open & app_bit(id) != 0 {
             found = Some(id);
             break;
         }
@@ -1379,7 +1405,7 @@ fn handle_chrome_op(code: u8, draft: &str) -> bool {
         OP_FOCUS_FILES => focus_app(1),
         OP_FOCUS_TERMINAL => focus_app(2),
         OP_FOCUS_SETTINGS => focus_app(3),
-        OP_FOCUS_AGENT => focus_app(4),
+        OP_FOCUS_AGENT => open_task_center(),
         OP_FOCUS_BROWSER => focus_app(5),
         OP_FOCUS_EDITOR => focus_app(6),
         OP_LOCALE_ZH => stage_locale("zh-CN"),
@@ -1800,9 +1826,20 @@ fn apply_screen_override() {
 fn build_shell() -> Component {
     ensure_shell_signals();
     if let Some(session) = windows::load_once() {
-        state::set_signal(OPEN_MASK_SIGNAL, session.open);
-        state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized);
-        state::set_signal(APP_SIGNAL, session.focused.clamp(0, 6));
+        let agent = app_bit(4);
+        let retired =
+            session.open & agent != 0 || session.minimized & agent != 0 || session.focused == 4;
+        state::set_signal(OPEN_MASK_SIGNAL, session.open & !agent);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, session.minimized & !agent);
+        let focused = if session.focused == 4 {
+            0
+        } else {
+            session.focused.clamp(0, 6)
+        };
+        state::set_signal(APP_SIGNAL, focused);
+        if retired {
+            remember_windows();
+        }
     }
     boot_session_once();
     apply_screen_override();
@@ -1829,8 +1866,13 @@ fn build_shell() -> Component {
     if handoff::clip_conflict().is_some() && !clip_sheet_inside_incoming() {
         column.push(chrome_layer(build_clip_dock()));
     }
-    if state::get_signal(TASKS_SIGNAL) != 0 && posture() == Posture::Desktop {
-        column.push(dock_right(build_task_center()));
+    if state::get_signal(TASKS_SIGNAL) != 0 {
+        let panel = build_task_center();
+        if posture() == Posture::Phone {
+            column.push(chrome_layer(place_receipts(panel)));
+        } else {
+            column.push(dock_right(panel));
+        }
     }
     if !state::get_signal_text(PENDING_LOCALE_SIGNAL).is_empty() {
         column.push(modal_layer(build_locale_confirm()));
@@ -2128,6 +2170,9 @@ fn glyph_svg(name: &str, stroke: &str) -> String {
         }
         "devices" => {
             r#"<rect x="3" y="6" width="12" height="8" rx="1.4"/><path d="M7 17.5h6M10 14v3.5"/><rect x="16" y="8" width="5" height="9" rx="1.2"/>"#
+        }
+        "tasks" => {
+            r#"<path d="M9 7h10M9 12h10M9 17h10"/><path d="m4.5 7.2 1.2 1.2 2.1-2.2M4.5 12.2l1.2 1.2 2.1-2.2M4.5 17.2l1.2 1.2 2.1-2.2"/>"#
         }
         "arrow" => {
             r#"<path d="M19 7v5.2A2.8 2.8 0 0 1 16.2 15H6"/><path d="M9.5 11.5 6 15l3.5 3.5"/>"#
@@ -2711,6 +2756,13 @@ fn build_floating_taskbar() -> Component {
     }
     let mut tray = vec![
         dock_icon(
+            "tasks",
+            locale::t("tasks"),
+            OP_TOGGLE_TASKS,
+            Color::TRANSPARENT,
+            state::get_signal(TASKS_SIGNAL) != 0,
+        ),
+        dock_icon(
             if unlocked { "lock-open" } else { "lock" },
             if unlocked {
                 locale::t("unlocked")
@@ -2834,20 +2886,32 @@ fn floating_taskbar() -> Component {
 
 fn build_phone_home() -> Component {
     let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
-    let mut status_right = vec![glyph_face(
-        if unlocked { "lock-open" } else { "lock" },
-        if unlocked {
-            locale::t("unlocked")
-        } else {
-            locale::t("locked")
-        },
-        OP_LOCK,
-        Color::TRANSPARENT,
-        "#f4f1ea",
-        28.0,
-        8.0,
-        false,
-    )];
+    let mut status_right = vec![
+        glyph_face(
+            "tasks",
+            locale::t("tasks"),
+            OP_TOGGLE_TASKS,
+            Color::TRANSPARENT,
+            "#f4f1ea",
+            28.0,
+            8.0,
+            state::get_signal(TASKS_SIGNAL) != 0,
+        ),
+        glyph_face(
+            if unlocked { "lock-open" } else { "lock" },
+            if unlocked {
+                locale::t("unlocked")
+            } else {
+                locale::t("locked")
+            },
+            OP_LOCK,
+            Color::TRANSPARENT,
+            "#f4f1ea",
+            28.0,
+            8.0,
+            false,
+        ),
+    ];
     if let Some(battery) = live_battery() {
         status_right.push(Component::text(
             battery,
@@ -3025,6 +3089,13 @@ fn build_tablet_rail() -> Component {
         }
         icons.push(button);
     }
+    icons.push(icon_button(
+        "tasks",
+        locale::t("tasks"),
+        OP_TOGGLE_TASKS,
+        "#31475e",
+        48.0,
+    ));
     Component::column(
         Style {
             width: Dimension::Px(72.0),
@@ -3615,9 +3686,9 @@ fn app_body(id: i64) -> Component {
         1 => build_files_app(),
         2 => build_terminal_app(),
         3 => build_settings_app(),
-        4 => build_ai_agent_app(),
         5 => build_browser_app(),
-        _ => build_editor_app(),
+        6 => build_editor_app(),
+        _ => Component::column(Style::default(), vec![]),
     }
 }
 
@@ -5372,14 +5443,26 @@ fn build_task_center() -> Component {
         _ => (locale::t("phase-idle"), "#d5dee8"),
     };
     let mut body = vec![
-        Component::text(
-            locale::t("tasks-title"),
+        Component::row(
             Style {
-                font_size: 16.0,
-                font_weight: 700,
-                color: ink(),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                gap: 8.0,
                 ..Style::default()
             },
+            vec![
+                Component::text(
+                    locale::t("tasks-title"),
+                    Style {
+                        font_size: 16.0,
+                        font_weight: 700,
+                        color: ink(),
+                        flex_grow: 1.0,
+                        ..Style::default()
+                    },
+                ),
+                chrome_button(locale::t("tasks-hide"), OP_TOGGLE_TASKS, "#3d5570"),
+            ],
         ),
         Component::text(
             planner_subtitle(),
@@ -5604,51 +5687,6 @@ fn chrome_button(label: impl Into<String>, code: u8, background: &str) -> Compon
             ..Style::default()
         },
         action,
-    )
-}
-
-// ==========================================================================
-// AI Agent window — the task center stays beside whatever page is open.
-// ==========================================================================
-
-fn build_ai_agent_app() -> Component {
-    Component::column(
-        Style {
-            flex_grow: 1.0,
-            background: Color::from_hex("#24506e"),
-            gap: 0.0,
-            ..Style::default()
-        },
-        vec![
-            app_titlebar(locale::t("app-agent"), "#e07a5f", 4),
-            Component::column(
-                Style {
-                    flex_grow: 1.0,
-                    padding: Edges::all(24.0),
-                    gap: 12.0,
-                    ..Style::default()
-                },
-                vec![
-                    Component::text(
-                        locale::t("agent-body"),
-                        Style {
-                            font_size: 16.0,
-                            font_weight: 700,
-                            color: ink(),
-                            ..Style::default()
-                        },
-                    ),
-                    Component::text(
-                        state::get_signal_text(RECEIPT_SIGNAL),
-                        Style {
-                            font_size: 13.0,
-                            color: ink(),
-                            ..Style::default()
-                        },
-                    ),
-                ],
-            ),
-        ],
     )
 }
 
@@ -6857,7 +6895,9 @@ fn receipt_row(line: &str) -> Component {
 
 fn open_app_ids() -> Vec<i64> {
     let mask = state::get_signal(OPEN_MASK_SIGNAL);
-    (1..=6).filter(|id| mask & app_bit(*id) != 0).collect()
+    (1..=6)
+        .filter(|id| resident(*id) && mask & app_bit(*id) != 0)
+        .collect()
 }
 
 fn build_switcher() -> Component {
@@ -8842,6 +8882,240 @@ mod shell_ux_tests {
         state::set_signal(NIGHT_SIGNAL, 0);
         state::set_signal(SETTINGS_MENU_SIGNAL, 1);
         state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        state::note_shell_viewport(1200.0, 800.0);
+        drop(isolated);
+    }
+
+    fn clock_cells(root: &Component) -> String {
+        let mut cells = String::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind
+                && content.chars().count() == 1
+                && (content == ":" || content.chars().all(|ch| ch.is_ascii_digit()))
+            {
+                cells.push_str(content);
+            }
+        });
+        cells
+    }
+
+    fn percent_texts(root: &Component) -> Vec<String> {
+        let mut found = Vec::new();
+        walk(root, &mut |node| {
+            if let ComponentKind::Text { content } = &node.kind
+                && content.ends_with('%')
+            {
+                found.push(content.clone());
+            }
+        });
+        found
+    }
+
+    fn assert_no_fake_desktop(name: &str, root: &Component) {
+        let blob = text_blob(root);
+        for banned in [
+            "助手",
+            "处理器",
+            "内存",
+            "存储",
+            "网络",
+            "在线",
+            "Online",
+            "CPU",
+            "Memory",
+            "Storage",
+            "Network",
+            "23%",
+            "5.4",
+            "8 GB",
+            "14:32",
+            "W3C Apps",
+            "会话在旁边的任务中心",
+            "The live session stays",
+        ] {
+            assert!(
+                !blob.contains(banned),
+                "{name} still shows {banned}: {blob}"
+            );
+        }
+        let labels = button_labels(root);
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label == "助手" || label == "Agent" || label == "打开助手"),
+            "{name} still has an assistant entry: {labels:?}"
+        );
+        let percents = percent_texts(root);
+        match live_battery() {
+            Some(reading) => assert_eq!(percents, vec![reading], "{name}"),
+            None => assert!(percents.is_empty(), "{name} invented {percents:?}"),
+        }
+        for hex in ["5b4fe0", "6c5ce7", "9b59b6"] {
+            assert!(!format!("{root:?}").contains(hex), "{name} uses {hex}");
+        }
+    }
+
+    #[test]
+    fn desktop_has_no_assistant_app_and_no_fake_metrics() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-honesty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(MINIMIZED_MASK_SIGNAL, 0);
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
+        state::set_signal(SETTINGS_TAB_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+
+        let desktop = build_desktop();
+        assert_eq!(desktop.children.len(), 1);
+        assert_no_fake_desktop("desktop", &desktop);
+        let icons = text_blob(&desktop);
+        for name in ["文件", "终端", "设置", "浏览器", "编辑器"] {
+            assert!(icons.contains(name), "{name} missing from {icons}");
+        }
+
+        let bar = build_floating_taskbar();
+        assert_no_fake_desktop("taskbar", &bar);
+        assert_eq!(codes_for(&bar, "任务"), vec![OP_TOGGLE_TASKS]);
+        assert_eq!(clock_cells(&bar), live_clock());
+
+        state::set_signal(LAUNCHER_SIGNAL, 1);
+        let launcher = build_launcher();
+        assert_no_fake_desktop("launcher", &launcher);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "助手");
+        let missed = build_launcher();
+        assert!(text_blob(&missed).contains("没有匹配的应用"));
+        assert!(
+            !button_labels(&missed)
+                .iter()
+                .any(|label| label.contains("助手"))
+        );
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
+        state::set_signal(LAUNCHER_SIGNAL, 0);
+
+        state::note_shell_viewport(800.0, 600.0);
+        assert_no_fake_desktop("tablet rail", &build_tablet_rail());
+        assert_eq!(
+            codes_for(&build_tablet_rail(), "任务"),
+            vec![OP_TOGGLE_TASKS]
+        );
+
+        state::note_shell_viewport(390.0, 760.0);
+        let phone = build_phone_home();
+        assert_eq!(phone.children.len(), 2);
+        assert_no_fake_desktop("phone", &phone);
+        assert_eq!(codes_for(&phone, "任务"), vec![OP_TOGGLE_TASKS]);
+        assert_eq!(clock_cells(&phone), live_clock());
+        for name in ["文件", "终端", "设置", "浏览器", "编辑器"] {
+            assert!(text_blob(&phone).contains(name), "{name}");
+        }
+
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(4) | app_bit(1));
+        state::set_signal(APP_SIGNAL, 4);
+        let switcher = text_blob(&build_switcher());
+        assert!(!switcher.contains("助手"), "{switcher}");
+        assert!(switcher.contains("文件"), "{switcher}");
+        cycle_windows();
+        assert_eq!(state::get_signal(APP_SIGNAL), 1);
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 0);
+
+        state::set_signal(OPEN_MASK_SIGNAL, app_bit(4));
+        state::set_signal(APP_SIGNAL, 4);
+        on_shell_intent(OP_FOCUS_AGENT, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_eq!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(4), 0);
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 1);
+        let tasks = text_blob(&build_task_center());
+        assert!(tasks.contains("任务中心"), "{tasks}");
+        assert!(tasks.contains("收据"), "{tasks}");
+        assert!(tasks.contains("收起任务"), "{tasks}");
+        assert!(!tasks.contains("会话在旁边的任务中心"), "{tasks}");
+        assert!(!text_blob(&build_stage()).contains("助手"));
+        on_shell_intent(OP_TOGGLE_TASKS, "");
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 0);
+
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        on_shell_intent(OP_PROPOSE, "打开助手");
+        assert_eq!(state::get_signal(PHASE_SIGNAL), 1);
+        let confirm = text_blob(&build_confirm_dialog());
+        assert!(confirm.contains("打开任务中心"), "{confirm}");
+        assert!(confirm.contains("不新开应用窗口"), "{confirm}");
+        assert!(!confirm.contains("助手"), "{confirm}");
+        on_shell_intent(OP_CONFIRM, "");
+        assert_eq!(state::get_signal(APP_SIGNAL), 0);
+        assert_eq!(state::get_signal(OPEN_MASK_SIGNAL) & app_bit(4), 0);
+        assert_eq!(state::get_signal(TASKS_SIGNAL), 1);
+        assert!(!text_blob(&build_desktop()).contains("助手"));
+
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(SETTINGS_TAB_SIGNAL, 0);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+        let local = text_blob(&build_settings_app());
+        for banned in ["处理器", "23%", "5.4", "8 GB", "在线", "92%"] {
+            assert!(!local.contains(banned), "本机 shows {banned}: {local}");
+        }
+
+        locale::set_locale("en");
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "agent");
+        let english = build_desktop();
+        assert_no_fake_desktop("english desktop", &english);
+        for name in ["Files", "Terminal", "Settings", "Browser", "Editor"] {
+            assert!(text_blob(&english).contains(name), "{name}");
+        }
+        let english_launcher = build_launcher();
+        assert!(text_blob(&english_launcher).contains("No matching app."));
+        assert!(
+            !button_labels(&english_launcher)
+                .iter()
+                .any(|label| label == "Agent" || label.contains("Agent"))
+        );
+        assert_eq!(
+            codes_for(&build_floating_taskbar(), "Tasks"),
+            vec![OP_TOGGLE_TASKS]
+        );
+        state::note_shell_viewport(390.0, 760.0);
+        assert_no_fake_desktop("english phone", &build_phone_home());
+        assert_eq!(
+            locale::t("impact-tasks").contains("No application window"),
+            true
+        );
+
+        locale::set_locale("zh-CN");
+        state::set_signal(TASKS_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(APP_SIGNAL, 0);
+        state::set_signal(OPEN_MASK_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_text_signal(LAUNCHER_QUERY_SIGNAL, "");
         state::note_shell_viewport(1200.0, 800.0);
         drop(isolated);
     }
