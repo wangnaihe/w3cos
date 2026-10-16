@@ -11,6 +11,7 @@ mod engine;
 mod hub;
 mod intent;
 mod lexicon;
+mod modality;
 mod pinyin;
 
 pub use commands::command_utterance;
@@ -25,6 +26,10 @@ pub use intent::{
 pub use lexicon::{
     Entry, EntryKind, Lexicon, derive_lexicon_key, learn, open_lexicon, rank_candidates,
     seal_lexicon, seal_with_key,
+};
+pub use modality::{
+    CLIPBOARD_LIMIT, ClipboardDecision, ModalityBlock, ModalityState, ModalitySurface,
+    clipboard_decision, modality_state, p3_surface, route_p3,
 };
 pub use pinyin::{
     PinyinEngine, candidates as pinyin_candidates, preedit_display, segment as pinyin_segment,
