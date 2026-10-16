@@ -24,8 +24,15 @@ struct WidthMemo {
 struct Cache {
     component: Component,
     engine: LayoutEngine,
+    /// `Document::layout_generation`. Repaint-only text does not bump it.
     structure: u64,
+    /// `Document::structure_generation` at the last build. A later text edit
+    /// can leave these rects valid while the component text is stale, so the
+    /// next geometry edit rebuilds from the DOM.
+    source_structure: u64,
     cascade: u64,
+    viewport_w_bits: u32,
+    viewport_h_bits: u32,
     node_ids: Vec<u32>,
     /// Full rect snapshots keyed by one node's px width. Repeat flushes of
     /// the same width restore the rects instead of solving Taffy again.
@@ -55,8 +62,9 @@ pub fn flush() -> bool {
     let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
     let viewport_w = viewport_w as f32;
     let viewport_h = viewport_h as f32;
-    let (structure, cascade) = crate::dom::with_document(|document| {
+    let (layout_gen, structure, cascade) = crate::dom::with_document(|document| {
         (
+            document.layout_generation(),
             document.structure_generation(),
             document.cascade_generation(),
         )
@@ -67,17 +75,29 @@ pub fn flush() -> bool {
         let mut slot = slot.borrow_mut();
         let structure_matches = slot
             .as_ref()
-            .is_some_and(|cache| cache.structure == structure);
+            .is_some_and(|cache| cache.structure == layout_gen);
         if structure_matches {
             let cache = slot.as_mut().unwrap();
+            // Glyphs changed and a used box may now depend on them. Rebuild
+            // from the DOM instead of patching the stale component tree.
+            let text_stale = cache.source_structure != structure && !dirty.is_empty();
             let geometry_only = cache.cascade != cascade;
-            if patch_and_compute(cache, &dirty, viewport_w, viewport_h, geometry_only) {
+            if !text_stale
+                && patch_and_compute(cache, &dirty, viewport_w, viewport_h, geometry_only)
+            {
                 cache.cascade = cascade;
                 ok = true;
                 return;
             }
         }
-        ok = rebuild(&mut slot, structure, cascade, viewport_w, viewport_h);
+        ok = rebuild(
+            &mut slot,
+            layout_gen,
+            structure,
+            cascade,
+            viewport_w,
+            viewport_h,
+        );
     });
     if ok {
         crate::dom::clear_document_dirty();
@@ -87,6 +107,7 @@ pub fn flush() -> bool {
 
 fn rebuild(
     slot: &mut Option<Cache>,
+    layout_gen: u64,
     structure: u64,
     cascade: u64,
     viewport_w: f32,
@@ -107,14 +128,17 @@ fn rebuild(
         return false;
     };
     let snaps = write_rects(&flat, &results.layout_cache);
-    let width_memos = memos_for_tree(&component, structure, viewport_w, viewport_h, snaps);
+    let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     *slot = Some(Cache {
         component,
         engine,
-        structure,
+        structure: layout_gen,
+        source_structure: structure,
         cascade,
         node_ids,
         width_memos,
+        viewport_w_bits: viewport_w.to_bits(),
+        viewport_h_bits: viewport_h.to_bits(),
     });
     true
 }
@@ -131,7 +155,18 @@ fn patch_and_compute(
         if geometry_only {
             return false;
         }
-        return recompute(cache, viewport_w, viewport_h);
+        if cache.viewport_w_bits == viewport_w.to_bits()
+            && cache.viewport_h_bits == viewport_h.to_bits()
+        {
+            // Scroll and repaint-only text leave the used boxes in place.
+            return true;
+        }
+        let ok = recompute(cache, viewport_w, viewport_h);
+        if ok {
+            cache.viewport_w_bits = viewport_w.to_bits();
+            cache.viewport_h_bits = viewport_h.to_bits();
+        }
+        return ok;
     }
     let mut styles = Vec::with_capacity(dirty.len());
     for id in dirty {
@@ -171,6 +206,8 @@ fn patch_and_compute(
     }
     if let Some(rects) = memo_hit {
         restore_rects(&rects);
+        cache.viewport_w_bits = viewport_w.to_bits();
+        cache.viewport_h_bits = viewport_h.to_bits();
         return true;
     }
     let flat = pre_flatten(&cache.component);
@@ -196,6 +233,8 @@ fn patch_and_compute(
         return false;
     };
     let snaps = write_rects(&flat, &results.layout_cache);
+    cache.viewport_w_bits = viewport_w.to_bits();
+    cache.viewport_h_bits = viewport_h.to_bits();
     if let Some((node, bits)) = single_px_width(&styles) {
         remember_width(cache, node, bits, viewport_w, viewport_h, snaps);
     }
@@ -1227,5 +1266,165 @@ mod paint_layout_tests {
         let (rebuilds_after, _) = paint_layout_stats();
         assert!(rect.width > 10.0 && rect.height > 12.0, "{rect:?}");
         assert_eq!(rebuilds_after - rebuilds, 1, "tree shape must rebuild");
+    }
+
+    fn write_text(id: u32, text: &str) {
+        crate::dom::with_document_mut(|document| {
+            assert!(
+                document
+                    .set_inline_text_child(NodeId::from_u32(id), text)
+                    .is_some(),
+                "inline text"
+            );
+        });
+    }
+
+    fn layout_gen() -> u64 {
+        crate::dom::with_document(|document| document.layout_generation())
+    }
+
+    fn assert_stored_matches_fresh(id: u32) {
+        assert!(flush(), "layout flush");
+        let stored = crate::dom::bounding_rect(id);
+        let fresh = fresh_rect(id);
+        assert!(
+            (stored.x - fresh.x).abs() < 0.05
+                && (stored.y - fresh.y).abs() < 0.05
+                && (stored.width - fresh.width).abs() < 0.05
+                && (stored.height - fresh.height).abs() < 0.05,
+            "stored ({}, {}, {}, {}) diverges from full layout {fresh:?}",
+            stored.x,
+            stored.y,
+            stored.width,
+            stored.height
+        );
+    }
+
+    #[test]
+    fn definite_px_text_keeps_the_border_box() {
+        crate::dom::reset_document();
+        let node = crate::dom::create_element("div");
+        crate::dom::set_style_property(node, "width", "160px");
+        crate::dom::set_style_property(node, "height", "40px");
+        crate::dom::append_child(crate::dom::body_id(), node);
+        write_text(node, "short");
+        assert_stored_matches_fresh(node);
+        let before = crate::dom::bounding_rect(node).height;
+        let generation = layout_gen();
+        write_text(
+            node,
+            "a much longer sentence that would wrap onto extra lines if this box were auto sized",
+        );
+        assert_eq!(layout_gen(), generation, "definite text must not relayout");
+        assert_stored_matches_fresh(node);
+        let after = crate::dom::bounding_rect(node).height;
+        assert!((after - before).abs() < 0.05, "height {before} -> {after}");
+        assert!((after - 40.0).abs() < 1.0, "used height {after}");
+    }
+
+    #[test]
+    fn auto_height_text_still_grows() {
+        crate::dom::reset_document();
+        let node = crate::dom::create_element("div");
+        crate::dom::set_style_property(node, "width", "80px");
+        crate::dom::append_child(crate::dom::body_id(), node);
+        write_text(node, "hi");
+        assert_stored_matches_fresh(node);
+        let before = crate::dom::bounding_rect(node).height;
+        let generation = layout_gen();
+        write_text(
+            node,
+            "one two three four five six seven eight nine ten eleven twelve thirteen",
+        );
+        assert!(layout_gen() > generation, "auto height text must relayout");
+        assert_stored_matches_fresh(node);
+        let after = crate::dom::bounding_rect(node).height;
+        assert!(after > before + 8.0, "text must grow the box, {before} -> {after}");
+    }
+
+    #[test]
+    fn clipped_table_cell_text_keeps_the_specified_height() {
+        crate::dom::reset_document();
+        let table = crate::dom::create_element("table");
+        crate::dom::set_style_property(table, "border-collapse", "collapse");
+        crate::dom::set_style_property(table, "border-spacing", "0");
+        crate::dom::set_style_property(table, "table-layout", "fixed");
+        crate::dom::set_style_property(table, "width", "240px");
+        let row = crate::dom::create_element("tr");
+        crate::dom::set_style_property(row, "height", "22px");
+        let cell = crate::dom::create_element("td");
+        for (name, value) in [
+            ("width", "120px"),
+            ("height", "22px"),
+            ("padding", "0"),
+            ("border", "0"),
+            ("overflow", "hidden"),
+            ("white-space", "nowrap"),
+        ] {
+            crate::dom::set_style_property(cell, name, value);
+        }
+        crate::dom::append_child(row, cell);
+        crate::dom::append_child(table, row);
+        crate::dom::append_child(crate::dom::body_id(), table);
+        write_text(cell, "c 0-0");
+        assert_stored_matches_fresh(cell);
+        let generation = layout_gen();
+        write_text(cell, "v 3-143 a much longer cell label");
+        assert_eq!(layout_gen(), generation, "clipped cell text must not relayout");
+        assert_stored_matches_fresh(cell);
+        let height = crate::dom::bounding_rect(cell).height;
+        assert!((height - 22.0).abs() < 1.0, "cell height {height}");
+        assert_stored_matches_fresh(table);
+    }
+
+    #[test]
+    fn second_unchanged_flush_keeps_the_same_height() {
+        crate::dom::reset_document();
+        let node = crate::dom::create_element("div");
+        crate::dom::set_style_property(node, "width", "100px");
+        crate::dom::set_style_property(node, "height", "28px");
+        crate::dom::append_child(crate::dom::body_id(), node);
+        write_text(node, "stable");
+        assert_stored_matches_fresh(node);
+        let first = crate::dom::bounding_rect(node);
+        let generation = layout_gen();
+        assert_stored_matches_fresh(node);
+        let second = crate::dom::bounding_rect(node);
+        assert_eq!(layout_gen(), generation);
+        assert!(
+            (first.x - second.x).abs() < 0.05
+                && (first.y - second.y).abs() < 0.05
+                && (first.width - second.width).abs() < 0.05
+                && (first.height - second.height).abs() < 0.05,
+            "second flush moved the box"
+        );
+    }
+
+    #[test]
+    fn height_auto_after_repaint_only_text_matches_full_layout() {
+        crate::dom::reset_document();
+        let node = crate::dom::create_element("div");
+        crate::dom::set_style_property(node, "width", "80px");
+        crate::dom::set_style_property(node, "height", "40px");
+        crate::dom::append_child(crate::dom::body_id(), node);
+        write_text(node, "a");
+        assert_stored_matches_fresh(node);
+        write_text(
+            node,
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+        );
+        let clipped = layout_gen();
+        crate::dom::set_style_property(node, "height", "auto");
+        assert_eq!(
+            layout_gen(),
+            clipped,
+            "the style edit is applied by the next flush"
+        );
+        assert_stored_matches_fresh(node);
+        let height = crate::dom::bounding_rect(node).height;
+        assert!(
+            height > 40.0,
+            "the new text must wrap once height is auto, got {height}"
+        );
     }
 }

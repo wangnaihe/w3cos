@@ -9162,28 +9162,66 @@ fn scroll_element_into_view(node: u32, options: Value) {
     }
 }
 
+struct ScrollSizeEntry {
+    node: u32,
+    epoch: u64,
+    size: (f64, f64),
+}
+
+thread_local! {
+    static SCROLL_SIZES: RefCell<Vec<ScrollSizeEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn invalidate_scroll_size_cache() {
+    SCROLL_SIZES.with(|cache| cache.borrow_mut().clear());
+}
+
 fn forced_scroll_size(node: u32) -> (f64, f64) {
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
             (
+                document.geometry_epoch(),
                 element.scroll_width(document) as f64,
                 element.scroll_height(document) as f64,
             )
         })
     };
-    let live = read();
-    if live.0 > 0.0 || live.1 > 0.0 {
-        return live;
+    let epoch_now = dom::with_document(|document| document.geometry_epoch());
+    if let Some(hit) = SCROLL_SIZES.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|entry| entry.node == node && entry.epoch == epoch_now)
+            .map(|entry| entry.size)
+    }) {
+        return hit;
     }
-
-    // CSSOM layout reads are synchronous in browsers. React relies on that
-    // when it reads scrollHeight in an effect that can run before our first
-    // native paint, so flush the persistent tree rather than exposing zero.
-    if !crate::incremental_layout::flush() {
-        return live;
+    let mut live = read();
+    if live.1 == 0.0 && live.2 == 0.0 && crate::incremental_layout::flush() {
+        // A layout pass before the first paint publishes the scrollport.
+        live = read();
     }
-    read()
+    SCROLL_SIZES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.iter_mut().find(|entry| entry.node == node) {
+            *entry = ScrollSizeEntry {
+                node,
+                epoch: live.0,
+                size: (live.1, live.2),
+            };
+        } else {
+            if cache.len() == 8 {
+                cache.remove(0);
+            }
+            cache.push(ScrollSizeEntry {
+                node,
+                epoch: live.0,
+                size: (live.1, live.2),
+            });
+        }
+    });
+    (live.1, live.2)
 }
 
 fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
@@ -9368,9 +9406,17 @@ fn definite_independent_border_box(
     ))
 }
 
+fn element_position(node: u32) -> w3cos_std::style::Position {
+    dom::with_document(|document| {
+        let id = NodeId::from_u32(node);
+        document
+            .cached_position(id)
+            .unwrap_or_else(|| document.computed_style_for(id).position)
+    })
+}
+
 fn offset_parent_node(node: u32) -> Option<u32> {
-    let position =
-        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)).position);
+    let position = element_position(node);
     if matches!(position, w3cos_std::style::Position::Fixed)
         || matches!(dom::tag_name(node).as_str(), "html" | "body")
     {
@@ -9381,14 +9427,7 @@ fn offset_parent_node(node: u32) -> Option<u32> {
     while let Some(candidate) = ancestor {
         if dom::node_type(candidate) == 1 {
             let tag = dom::tag_name(candidate);
-            let positioned = dom::with_document(|document| {
-                !matches!(
-                    document
-                        .computed_style_for(NodeId::from_u32(candidate))
-                        .position,
-                    w3cos_std::style::Position::Static
-                )
-            });
+            let positioned = !matches!(element_position(candidate), w3cos_std::style::Position::Static);
             if positioned || matches!(tag.as_str(), "body" | "table" | "td" | "th") {
                 return Some(candidate);
             }
@@ -9404,14 +9443,20 @@ fn offset_position(node: u32) -> (f32, f32) {
         return (rect.x, rect.y);
     };
     let parent_rect = forced_bounding_rect(parent);
-    let parent_style =
-        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(parent)));
-    let border_left = parent_style
-        .border_left_width
-        .unwrap_or(parent_style.border_width);
-    let border_top = parent_style
-        .border_top_width
-        .unwrap_or(parent_style.border_width);
+    let (border_left, border_top) = dom::with_document(|document| {
+        let id = NodeId::from_u32(parent);
+        document.cached_border_left_top(id).unwrap_or_else(|| {
+            let parent_style = document.computed_style_for(id);
+            (
+                parent_style
+                    .border_left_width
+                    .unwrap_or(parent_style.border_width),
+                parent_style
+                    .border_top_width
+                    .unwrap_or(parent_style.border_width),
+            )
+        })
+    });
     (
         rect.x - parent_rect.x - border_left,
         rect.y - parent_rect.y - border_top,
@@ -31261,6 +31306,15 @@ try {
         assert_eq!(container.get_property("clientHeight").to_number(), 100.0);
         assert_eq!(container.get_property("scrollWidth").to_number(), 180.0);
         assert_eq!(container.get_property("scrollHeight").to_number(), 270.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 270.0);
+        dom::with_document_mut(|document| {
+            document.set_layout_rect(
+                NodeId::from_u32(target_id),
+                w3cos_dom::DOMRect::new(10.0, 250.0, 180.0, 80.0),
+            );
+        });
+        assert_eq!(container.get_property("scrollHeight").to_number(), 310.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 310.0);
     }
 
     #[test]

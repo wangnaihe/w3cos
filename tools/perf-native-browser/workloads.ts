@@ -374,6 +374,7 @@ function runTableRepaint() {
     resetPage();
     var table = document.createElement("table");
     table.style.borderCollapse = "collapse";
+    table.style.borderSpacing = "0";
     table.style.tableLayout = "fixed";
     table.style.width = "720px";
     document.body.appendChild(table);
@@ -385,12 +386,18 @@ function runTableRepaint() {
             var cell = document.createElement("td");
             cell.style.width = "120px";
             cell.style.height = "22px";
+            cell.style.padding = "0";
+            cell.style.border = "0";
+            cell.style.overflow = "hidden";
+            cell.style.whiteSpace = "nowrap";
             cell.textContent = "c " + r + "-" + c;
             row.appendChild(cell);
             cells.push(cell);
         }
         table.appendChild(row);
     }
+    var warmHeight = table.offsetHeight;
+    check(warmHeight > 0, "table warmup");
     var t0 = performance.now();
     var checksum = 0;
     var textSum = 0;
@@ -447,14 +454,18 @@ function runStyledScroll() {
 }
 function runTextLayout() {
     resetPage();
+    var style = document.createElement("style");
+    style.textContent = "@font-face{font-family:w3perf;src:local(\"Noto Sans Regular\"),local(\"Noto Sans\"),url(\"/NotoSans-Regular.ttf\")}";
+    document.head.appendChild(style);
     var wrap = document.createElement("div");
     document.body.appendChild(wrap);
     for (var i = 0; i < TEXT_PARAS; i++) {
         var para = document.createElement("p");
         para.style.margin = "0";
+        para.style.fontFamily = "w3perf, sans-serif";
         para.style.fontSize = "16px";
         para.style.lineHeight = "22px";
-        para.style.width = "640px";
+        para.style.width = "100%";
         var sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
         var copies = (i % 4) + 1;
         var text = "";
@@ -462,6 +473,11 @@ function runTextLayout() {
         para.textContent = text + i;
         wrap.appendChild(para);
     }
+    wrap.style.width = "640px";
+    var warmWide = wrap.offsetHeight;
+    wrap.style.width = "360px";
+    var warmNarrow = wrap.offsetHeight;
+    check(warmWide > 0 && warmNarrow > 0 && warmWide !== warmNarrow, "text warmup");
     var t0 = performance.now();
     var checksum = 0;
     for (var pass = 0; pass < TEXT_PASSES; pass++) {
