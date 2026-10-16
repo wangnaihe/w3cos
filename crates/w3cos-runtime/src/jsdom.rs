@@ -24468,6 +24468,51 @@ mod tests {
             2,
             "even simple selectors must retain observable property reads"
         );
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&order);
+        document.set_property(
+            "location",
+            Value::object(HashMap::from([(
+                "__w3cos_getter_hash".into(),
+                func(move |_, _| {
+                    observed.borrow_mut().push("hash");
+                    Value::string("")
+                }),
+            )])),
+        );
+        let observed = Rc::clone(&order);
+        let selector = Value::object(HashMap::from([(
+            "toString".into(),
+            func(move |_, _| {
+                observed.borrow_mut().push("selector");
+                Value::string(".active")
+            }),
+        )]));
+        assert_eq!(
+            element.call_method("matches", vec![selector]),
+            Value::Bool(true)
+        );
+        assert_eq!(&*order.borrow(), &["selector", "hash"]);
+
+        order.borrow_mut().clear();
+        let observed = Rc::clone(&order);
+        let throwing_selector = Value::object(HashMap::from([(
+            "toString".into(),
+            func(move |_, _| {
+                observed.borrow_mut().push("selector");
+                w3cos_core::throw_value(Value::string("selector conversion"))
+            }),
+        )]));
+        let error =
+            w3cos_core::catch_js(|| element.call_method("matches", vec![throwing_selector]))
+                .unwrap_err();
+        assert_eq!(error, Value::string("selector conversion"));
+        assert_eq!(
+            &*order.borrow(),
+            &["selector"],
+            "a throwing selector conversion must precede location/hash access"
+        );
     }
 
     #[test]
