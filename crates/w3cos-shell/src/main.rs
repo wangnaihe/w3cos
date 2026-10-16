@@ -84,6 +84,9 @@ const HOST_SIGNAL: usize = 44;
 const CHAIN_RPC_SIGNAL: usize = 45;
 const CHAIN_SIGNAL: usize = 46;
 const BROADCAST_SIGNAL: usize = 47;
+const SANDBOX_SIGNAL: usize = 48;
+const SANDBOX_FS_SIGNAL: usize = 49;
+const SANDBOX_NET_SIGNAL: usize = 50;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -208,6 +211,8 @@ const OP_CHAIN_DENY: u8 = 122;
 const OP_CHAIN_SAVE: u8 = 123;
 const OP_TX_SEND: u8 = 124;
 const OP_TX_HOLD: u8 = 125;
+const OP_SANDBOX_FS: u8 = 127;
+const OP_SANDBOX_NET: u8 = 128;
 
 fn main() {
     shell_main();
@@ -458,6 +463,9 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_signal(0);
         let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
+        let _ = state::create_signal(0);
     });
 }
 
@@ -704,16 +712,18 @@ fn on_shell_intent(code: u8, draft: &str) {
             );
             state::set_text_signal(NOTICE_SIGNAL, locale::t("toast-shared-page"));
         }
-        OP_RUN_TERMINAL => {
-            let line = state::get_signal_text(TERMINAL_SIGNAL);
-            if let Some(shown) = explain_terminal_block(&line) {
+        OP_RUN_TERMINAL => match terminal_plan(&state::get_signal_text(TERMINAL_SIGNAL)) {
+            TerminalPlan::Blocked(shown) => {
+                let line = state::get_signal_text(TERMINAL_SIGNAL);
                 refuse_terminal_without_grant(session, &line, &shown);
-            } else {
-                open_process_permission(session);
             }
-        }
+            TerminalPlan::Allowlisted => open_process_permission(session),
+            TerminalPlan::Sandbox => open_sandbox_permission(session),
+        },
         OP_PERM_ONCE => {
-            if !session.identity_unlocked() {
+            if state::get_signal(SANDBOX_SIGNAL) != 0 {
+                accept_sandbox(session);
+            } else if !session.identity_unlocked() {
                 sync_session(
                     session,
                     state::get_signal(PHASE_SIGNAL),
@@ -726,7 +736,17 @@ fn on_shell_intent(code: u8, draft: &str) {
             }
         }
         OP_PERM_DENY => {
-            if session.identity_unlocked() {
+            if state::get_signal(SANDBOX_SIGNAL) != 0 {
+                if session.identity_unlocked() {
+                    deny_sandbox(session);
+                } else {
+                    sync_session(
+                        session,
+                        state::get_signal(PHASE_SIGNAL),
+                        &locale::t("sandbox-locked"),
+                    );
+                }
+            } else if session.identity_unlocked() {
                 deny_process_permission(session);
                 restore_after_dialog();
             } else {
@@ -735,6 +755,16 @@ fn on_shell_intent(code: u8, draft: &str) {
                     state::get_signal(PHASE_SIGNAL),
                     &locale::t("perm-locked"),
                 );
+            }
+        }
+        OP_SANDBOX_FS => {
+            if state::get_signal(SANDBOX_SIGNAL) != 0 {
+                toggle_sandbox_cap(SANDBOX_FS_SIGNAL);
+            }
+        }
+        OP_SANDBOX_NET => {
+            if state::get_signal(SANDBOX_SIGNAL) != 0 {
+                toggle_sandbox_cap(SANDBOX_NET_SIGNAL);
             }
         }
         OP_SIGN_PROPOSE => open_sign_permission(session, draft),
@@ -1102,24 +1132,29 @@ fn terminal_has_metacharacters(line: &str) -> bool {
     })
 }
 
-/// Whether this line can reach the process grant. The bridge remains the
-/// authority at execution time; this only avoids asking for a grant that
-/// cannot run.
-fn explain_terminal_block(line: &str) -> Option<String> {
+enum TerminalPlan {
+    Blocked(String),
+    Allowlisted,
+    Sandbox,
+}
+
+/// `echo`, `pwd`, and `help` still ask for the one-shot process grant.
+/// Anything else opens the sandbox sheet. A shell metacharacter never runs.
+fn terminal_plan(line: &str) -> TerminalPlan {
     let line = line.trim();
     if line.is_empty() {
-        return Some(locale::t("terminal-empty"));
+        return TerminalPlan::Blocked(locale::t("terminal-empty"));
     }
     if terminal_has_metacharacters(line) {
-        return Some(locale::t("terminal-meta"));
+        return TerminalPlan::Blocked(locale::t("terminal-meta"));
     }
     let mut parts = line.split_whitespace();
     let command = parts.next().unwrap_or("");
     let has_args = parts.next().is_some();
     match command {
-        "echo" => None,
-        "pwd" | "help" if !has_args => None,
-        other => Some(locale::t_args("terminal-refused", &[("command", other)])),
+        "echo" => TerminalPlan::Allowlisted,
+        "pwd" | "help" if !has_args => TerminalPlan::Allowlisted,
+        _ => TerminalPlan::Sandbox,
     }
 }
 
@@ -1634,6 +1669,7 @@ fn open_notice_target(draft: &str) {
 }
 
 fn open_process_permission(session: &mut IntentSession) {
+    clear_sandbox_sheet();
     state::set_signal(PERM_SIGNAL, 1);
     state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "deny");
     if session.identity_unlocked() {
@@ -1940,6 +1976,147 @@ fn deny_chain_read(session: &mut IntentSession) {
     }
 }
 
+fn clear_sandbox_sheet() {
+    state::set_signal(SANDBOX_SIGNAL, 0);
+    state::set_signal(SANDBOX_FS_SIGNAL, 0);
+    state::set_signal(SANDBOX_NET_SIGNAL, 0);
+}
+
+fn toggle_sandbox_cap(signal: usize) {
+    let next = i64::from(state::get_signal(signal) == 0);
+    state::set_signal(signal, next);
+}
+
+fn open_sandbox_permission(session: &mut IntentSession) {
+    state::set_signal(PERM_SIGNAL, 0);
+    state::set_signal(SANDBOX_FS_SIGNAL, 0);
+    state::set_signal(SANDBOX_NET_SIGNAL, 0);
+    state::set_signal(SANDBOX_SIGNAL, 1);
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "sandbox-deny");
+    if session.identity_unlocked() {
+        state::request_focus_label(&locale::t("sandbox-deny"));
+    } else {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("sandbox-locked"),
+        );
+    }
+}
+
+fn sandbox_command_label() -> String {
+    let line = state::get_signal_text(TERMINAL_SIGNAL);
+    let token = line.split_whitespace().next().unwrap_or("");
+    let name = token
+        .rsplit('/')
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(token);
+    truncate_middle(name, 24)
+}
+
+fn split_sandbox_line(line: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = line.split_whitespace().map(str::to_string);
+    let program = parts.next()?;
+    Some((program, parts.collect()))
+}
+
+fn accept_sandbox(session: &mut IntentSession) {
+    if !session.identity_unlocked() {
+        sync_session(
+            session,
+            state::get_signal(PHASE_SIGNAL),
+            &locale::t("sandbox-locked"),
+        );
+        return;
+    }
+    let caps = w3cos_ai_bridge::sandbox::SandboxCaps {
+        filesystem: state::get_signal(SANDBOX_FS_SIGNAL) != 0,
+        network: state::get_signal(SANDBOX_NET_SIGNAL) != 0,
+    };
+    clear_sandbox_sheet();
+    let line = state::get_signal_text(TERMINAL_SIGNAL);
+    let Some((program, args)) = split_sandbox_line(&line) else {
+        state::set_text_signal(TERM_OUT_SIGNAL, &locale::t("sandbox-missing"));
+        record_sandbox(session, &line, false, "Denied: the program was not found.");
+        restore_after_dialog();
+        return;
+    };
+    match w3cos_ai_bridge::sandbox::run(&program, &args, caps) {
+        Ok(output) => {
+            let shown = if output.is_empty() {
+                locale::t("sandbox-empty")
+            } else {
+                output
+            };
+            state::set_text_signal(TERM_OUT_SIGNAL, &shown);
+            record_sandbox(session, &line, true, "Allowed: the sandbox ran once.");
+        }
+        Err(code) => {
+            let (shown, outcome) = match code.as_str() {
+                "missing" => (
+                    locale::t("sandbox-missing"),
+                    "Denied: the program was not found.",
+                ),
+                "no-file" => (
+                    locale::t("sandbox-no-disk"),
+                    "Denied: the sandbox has no files.",
+                ),
+                "timeout" => (
+                    locale::t("sandbox-timeout"),
+                    "Denied: the sandbox timed out.",
+                ),
+                _ => (
+                    locale::t("sandbox-failed"),
+                    "Denied: the sandbox did not finish.",
+                ),
+            };
+            state::set_text_signal(TERM_OUT_SIGNAL, &shown);
+            record_sandbox(session, &line, false, outcome);
+        }
+    }
+    restore_after_dialog();
+}
+
+fn deny_sandbox(session: &mut IntentSession) {
+    clear_sandbox_sheet();
+    let line = state::get_signal_text(TERMINAL_SIGNAL);
+    state::set_text_signal(TERM_OUT_SIGNAL, &locale::t("sandbox-denied-notice"));
+    record_sandbox(
+        session,
+        &line,
+        false,
+        "Denied: the sandbox run was refused. Nothing was changed.",
+    );
+    restore_after_dialog();
+}
+
+fn record_sandbox(session: &mut IntentSession, line: &str, allowed: bool, outcome: &str) {
+    let decision = if allowed {
+        w3cos_ai_bridge::intent::Decision::Allowed
+    } else {
+        w3cos_ai_bridge::intent::Decision::Denied
+    };
+    session.record_external(
+        line,
+        "l2:run",
+        decision,
+        true,
+        outcome,
+        if allowed {
+            IntentTier::L2
+        } else {
+            IntentTier::L0
+        },
+    );
+    let notice = if allowed {
+        locale::t("sandbox-ran")
+    } else {
+        locale::t("sandbox-denied-notice")
+    };
+    sync_session(session, 2, &notice);
+}
+
 fn deny_process_permission(session: &mut IntentSession) {
     state::set_signal(PERM_SIGNAL, 0);
     let line = state::get_signal_text(TERMINAL_SIGNAL);
@@ -2142,6 +2319,10 @@ fn dismiss_top_layer() -> bool {
         with_session(deny_broadcast);
         return true;
     }
+    if state::get_signal(SANDBOX_SIGNAL) != 0 {
+        with_session(deny_sandbox);
+        return true;
+    }
     if state::get_signal(SIGN_SIGNAL) != 0 {
         with_session(deny_sign_permission);
         return true;
@@ -2188,6 +2369,7 @@ fn restore_after_dialog() {
         || state::get_signal(BROADCAST_SIGNAL) != 0
         || state::get_signal(PERM_SIGNAL) != 0
         || state::get_signal(CHAIN_SIGNAL) != 0
+        || state::get_signal(SANDBOX_SIGNAL) != 0
     {
         return;
     }
@@ -2218,7 +2400,8 @@ fn on_shell_swipe(x0: f32, y0: f32, dx: f32, dy: f32) -> bool {
         state::get_signal(PERM_SIGNAL) != 0
             || state::get_signal(SIGN_SIGNAL) != 0
             || state::get_signal(BROADCAST_SIGNAL) != 0
-            || state::get_signal(CHAIN_SIGNAL) != 0,
+            || state::get_signal(CHAIN_SIGNAL) != 0
+            || state::get_signal(SANDBOX_SIGNAL) != 0,
         state::get_signal(SWITCHER_SIGNAL) != 0,
     );
     match action {
@@ -2250,6 +2433,7 @@ fn edge_back() -> bool {
         || state::get_signal(SIGN_SIGNAL) != 0
         || state::get_signal(BROADCAST_SIGNAL) != 0
         || state::get_signal(CHAIN_SIGNAL) != 0
+        || state::get_signal(SANDBOX_SIGNAL) != 0
         || state::get_signal(PHASE_SIGNAL) == 1
     {
         return false;
@@ -2765,14 +2949,12 @@ fn apply_screen_override() {
                 }
             });
         }
-        Some("terminal-refused") => {
+        Some("terminal-refused") | Some("sandbox") => {
             focus_app(2);
             state::set_text_signal(TERMINAL_SIGNAL, "ls");
             with_session(|session| {
                 if session.identity_unlocked() {
-                    if let Some(shown) = explain_terminal_block("ls") {
-                        refuse_terminal_without_grant(session, "ls", &shown);
-                    }
+                    open_sandbox_permission(session);
                 }
             });
         }
@@ -3156,6 +3338,9 @@ fn build_shell() -> Component {
     if state::get_signal(PERM_SIGNAL) != 0 {
         column.push(permission_layer(build_permission_sheet()));
     }
+    if state::get_signal(SANDBOX_SIGNAL) != 0 {
+        column.push(place_modal(build_sandbox_sheet(), false, 680.0));
+    }
     if state::get_signal(SIGN_SIGNAL) != 0 {
         let tall = state::get_signal_text(SIGN_MESSAGE_SIGNAL).contains('\n');
         column.push(place_modal(
@@ -3229,6 +3414,8 @@ fn trap_modal_focus(root: &mut Component) {
     }
     let role = if state::get_signal(BROADCAST_SIGNAL) != 0 {
         "broadcast"
+    } else if state::get_signal(SANDBOX_SIGNAL) != 0 {
+        "sandbox"
     } else if state::get_signal(SIGN_SIGNAL) != 0 {
         "sign"
     } else if state::get_signal(CHAIN_SIGNAL) != 0 {
@@ -4939,6 +5126,131 @@ fn build_permission_sheet() -> Component {
     ));
     let mut card = permission_shell(rows);
     mark_dialog(&mut card, "permission");
+    card
+}
+
+fn sandbox_scope_key() -> &'static str {
+    match (
+        state::get_signal(SANDBOX_FS_SIGNAL) != 0,
+        state::get_signal(SANDBOX_NET_SIGNAL) != 0,
+    ) {
+        (false, false) => "sandbox-scope-none",
+        (true, false) => "sandbox-scope-fs",
+        (false, true) => "sandbox-scope-net",
+        (true, true) => "sandbox-scope-both",
+    }
+}
+
+fn build_sandbox_sheet() -> Component {
+    let unlocked = state::get_signal(UNLOCKED_SIGNAL) != 0;
+    let command = sandbox_command_label();
+    let mut rows = vec![
+        Component::text(
+            locale::t("sandbox-cap-title"),
+            Style {
+                font_size: 12.0,
+                font_weight: 700,
+                color: Color::from_hex("#e2a45c"),
+                align_self: AlignSelf::FlexStart,
+                ..Style::default()
+            },
+        ),
+        Component::text(
+            locale::t_args("sandbox-sheet-title", &[("command", &command)]),
+            Style {
+                font_size: 22.0,
+                font_weight: 700,
+                color: Color::from_hex("#fff4e5"),
+                ..Style::default()
+            },
+        ),
+    ];
+    rows.push(Component::text(
+        if unlocked {
+            locale::t("sandbox-sheet-detail")
+        } else {
+            locale::t("sandbox-locked")
+        },
+        Style {
+            font_size: 14.0,
+            font_weight: if unlocked { 400 } else { 700 },
+            color: if unlocked {
+                Color::from_hex("#f0d7b4")
+            } else {
+                Color::from_hex("#ffe08a")
+            },
+            ..Style::default()
+        },
+    ));
+    rows.push(Component::text(
+        locale::t(sandbox_scope_key()),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#fff4e5"),
+            background: Color::rgba(226, 164, 92, 28),
+            border_radius: 12.0,
+            padding: Edges::all(12.0),
+            ..Style::default()
+        },
+    ));
+    let fs_key = if state::get_signal(SANDBOX_FS_SIGNAL) != 0 {
+        "sandbox-fs-on"
+    } else {
+        "sandbox-fs-off"
+    };
+    let net_key = if state::get_signal(SANDBOX_NET_SIGNAL) != 0 {
+        "sandbox-net-on"
+    } else {
+        "sandbox-net-off"
+    };
+    let fs = if unlocked {
+        sheet_button(locale::t(fs_key), OP_SANDBOX_FS, SheetKind::Ghost)
+    } else {
+        disabled_choice(locale::t(fs_key))
+    };
+    let net = if unlocked {
+        sheet_button(locale::t(net_key), OP_SANDBOX_NET, SheetKind::Ghost)
+    } else {
+        disabled_choice(locale::t(net_key))
+    };
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            ..Style::default()
+        },
+        vec![fs, net],
+    ));
+    let mut deny = if unlocked {
+        sheet_button(locale::t("sandbox-deny"), OP_PERM_DENY, SheetKind::Danger)
+    } else {
+        disabled_choice(locale::t("sandbox-deny"))
+    };
+    let once = if unlocked {
+        sheet_button(locale::t("sandbox-once"), OP_PERM_ONCE, SheetKind::Warm)
+    } else {
+        disabled_choice(locale::t("sandbox-once"))
+    };
+    if unlocked {
+        mark_initial_focus(&mut deny);
+    }
+    rows.push(Component::row(
+        Style {
+            gap: 8.0,
+            justify_content: JustifyContent::FlexEnd,
+            ..Style::default()
+        },
+        vec![deny, once],
+    ));
+    rows.push(Component::text(
+        locale::t("sandbox-footnote"),
+        Style {
+            font_size: 12.0,
+            color: Color::from_hex("#e2a45c"),
+            ..Style::default()
+        },
+    ));
+    let mut card = permission_shell(rows);
+    mark_dialog(&mut card, "sandbox");
     card
 }
 
@@ -9864,8 +10176,11 @@ mod shell_ux_tests {
         state::set_text_signal(TERMINAL_SIGNAL, "");
         let app = build_terminal_app();
         let blob = text_blob(&app);
-        assert!(blob.contains("这里只运行 echo、pwd、help。"), "{blob}");
-        assert!(blob.contains("其他命令不会执行。"), "{blob}");
+        assert!(
+            blob.contains("这里直接运行的只有 echo、pwd、help。"),
+            "{blob}"
+        );
+        assert!(blob.contains("其他程序走沙箱。"), "{blob}");
         assert!(blob.contains("命令"), "{blob}");
         assert!(!blob.contains("命令还不会执行"), "{blob}");
         assert!(!blob.contains("w3cos-process"), "{blob}");
@@ -9874,7 +10189,11 @@ mod shell_ux_tests {
         state::set_text_signal(TERM_OUT_SIGNAL, "");
         let english = text_blob(&build_terminal_app());
         assert!(
-            english.contains("Only echo, pwd, and help run here."),
+            english.contains("Only echo, pwd, and help run directly here."),
+            "{english}"
+        );
+        assert!(
+            english.contains("Anything else opens the sandbox."),
             "{english}"
         );
         assert!(!english.contains("Shell ready"), "{english}");
@@ -9918,12 +10237,18 @@ mod shell_ux_tests {
         state::set_text_signal(TERMINAL_SIGNAL, "ls");
         on_shell_intent(OP_RUN_TERMINAL, "");
         assert_eq!(state::get_signal(PERM_SIGNAL), 0);
+        assert_eq!(state::get_signal(SANDBOX_SIGNAL), 1);
+        assert_eq!(state::get_signal(SANDBOX_FS_SIGNAL), 0);
+        assert_eq!(state::get_signal(SANDBOX_NET_SIGNAL), 0);
+        let sheet = text_blob(&build_sandbox_sheet());
+        assert!(sheet.contains("在沙箱里运行 ls"), "{sheet}");
+        assert!(sheet.contains("没有磁盘"), "{sheet}");
+        assert!(sheet.contains("没有网络"), "{sheet}");
+        assert!(!sheet.contains("/bin/ls"), "{sheet}");
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(SANDBOX_SIGNAL), 0);
         let refused = state::get_signal_text(TERM_OUT_SIGNAL);
-        assert!(refused.contains("没有运行 ls。"), "{refused}");
-        assert!(
-            refused.contains("这里只接受 echo、pwd、help。"),
-            "{refused}"
-        );
+        assert!(refused.contains("没有运行"), "{refused}");
         assert!(!refused.to_lowercase().contains("bin/ls"), "{refused}");
         assert!(
             state::get_signal_text(RECEIPT_SIGNAL).contains("Denied"),
@@ -9935,6 +10260,7 @@ mod shell_ux_tests {
         state::set_text_signal(TERMINAL_SIGNAL, "echo 你好");
         on_shell_intent(OP_RUN_TERMINAL, "");
         assert_eq!(state::get_signal(PERM_SIGNAL), 1);
+        assert_eq!(state::get_signal(SANDBOX_SIGNAL), 0);
         assert_eq!(state::get_signal_text(TERM_OUT_SIGNAL), refused);
         let sheet = text_blob(&build_permission_sheet());
         assert!(sheet.contains("允许运行这一次 echo"), "{sheet}");
@@ -9978,10 +10304,156 @@ mod shell_ux_tests {
 
         locale::set_locale("zh-CN");
         state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(SANDBOX_SIGNAL, 0);
         state::set_signal(UNLOCKED_SIGNAL, 0);
         state::set_signal(PHASE_SIGNAL, 0);
         state::set_text_signal(TERMINAL_SIGNAL, "");
         state::set_text_signal(TERM_OUT_SIGNAL, "");
+        drop(isolated);
+    }
+
+    #[test]
+    fn sandbox_sheet_starts_closed_and_a_grant_is_one_run() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        let dir = std::env::temp_dir().join(format!(
+            "w3cos-sb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker.txt");
+        std::fs::write(&marker, "marker-not-a-seed").unwrap();
+        let isolated = IsolatedSession {
+            session: SESSION.with(|slot| slot.borrow_mut().take()),
+            booted: SESSION_BOOTED.with(|flag| flag.replace(false)),
+            receipt_dir: std::env::var_os("W3COS_RECEIPT_DIR"),
+            lexicon_path: std::env::var_os("W3COS_LEXICON_PATH"),
+            dir: dir.clone(),
+        };
+        struct HideSeed;
+        impl Drop for HideSeed {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("W3COS_DEVICE_SEED");
+                }
+            }
+        }
+        let _hide_seed = HideSeed;
+        unsafe {
+            std::env::set_var("W3COS_RECEIPT_DIR", &dir);
+            std::env::set_var("W3COS_LEXICON_PATH", dir.join("lexicon.w3p1"));
+            std::env::set_var("W3COS_DEVICE_SEED", "seed-should-stay-in-the-window");
+        }
+        locale::set_locale("zh-CN");
+        state::note_shell_viewport(1200.0, 800.0);
+        state::note_pointer_coarse(false);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        clear_sandbox_sheet();
+        state::set_text_signal(TERMINAL_SIGNAL, "printenv");
+        state::set_text_signal(TERM_OUT_SIGNAL, "");
+        on_shell_intent(OP_UNLOCK, "device-pass");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(SANDBOX_SIGNAL), 1);
+        assert!(!edge_back());
+        let sheet = text_blob(&build_sandbox_sheet());
+        assert!(sheet.contains("在沙箱里运行 printenv"), "{sheet}");
+        assert!(sheet.contains("默认没有磁盘，也没有网络。"), "{sheet}");
+        assert!(sheet.contains("设备钥匙和钱包留在这个窗口里"), "{sheet}");
+        assert!(sheet.contains("允许读文件"), "{sheet}");
+        assert!(sheet.contains("允许联网"), "{sheet}");
+        assert!(!sheet.contains("seed-should-stay-in-the-window"), "{sheet}");
+        assert!(!sheet.contains("wallet_sign"), "{sheet}");
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        let phone = build_sandbox_sheet();
+        let (_, _, _, height) = button_face(&phone, "运行这一次");
+        assert!(height >= 48.0, "{height}");
+        locale::set_locale("en");
+        let english = text_blob(&build_sandbox_sheet());
+        assert!(english.contains("Run printenv in the sandbox"), "{english}");
+        assert!(
+            english.contains("Files and the network stay closed."),
+            "{english}"
+        );
+        assert!(
+            english.contains("The device key and the wallet stay in this window"),
+            "{english}"
+        );
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+
+        on_shell_intent(OP_PERM_DENY, "");
+        assert_eq!(state::get_signal(SANDBOX_SIGNAL), 0);
+        let denied = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(denied.contains("没有运行"), "{denied}");
+        assert!(
+            !denied.contains("seed-should-stay-in-the-window"),
+            "{denied}"
+        );
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("Denied"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+
+        state::set_text_signal(TERMINAL_SIGNAL, "printenv");
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        on_shell_intent(OP_PERM_ONCE, "");
+        assert_eq!(state::get_signal(SANDBOX_SIGNAL), 0);
+        assert_eq!(state::get_signal(SANDBOX_FS_SIGNAL), 0);
+        assert_eq!(state::get_signal(SANDBOX_NET_SIGNAL), 0);
+        let hidden = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(
+            !hidden.contains("seed-should-stay-in-the-window"),
+            "{hidden}"
+        );
+        assert!(
+            state::get_signal_text(RECEIPT_SIGNAL).contains("Allowed"),
+            "{}",
+            state::get_signal_text(RECEIPT_SIGNAL)
+        );
+
+        let cat = format!("cat {}", marker.display());
+        state::set_text_signal(TERMINAL_SIGNAL, &cat);
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        on_shell_intent(OP_PERM_ONCE, "");
+        let closed = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(
+            closed.contains("没有这块磁盘") || closed.contains("没有读到文件"),
+            "{closed}"
+        );
+        assert!(!closed.contains("marker-not-a-seed"), "{closed}");
+
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        on_shell_intent(OP_SANDBOX_FS, "");
+        assert_eq!(state::get_signal(SANDBOX_FS_SIGNAL), 1);
+        assert!(text_blob(&build_sandbox_sheet()).contains("这一次可以读文件。仍然没有网络。"));
+        on_shell_intent(OP_PERM_ONCE, "");
+        let opened = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(opened.contains("marker-not-a-seed"), "{opened}");
+        assert_eq!(state::get_signal(SANDBOX_FS_SIGNAL), 0);
+
+        on_shell_intent(OP_RUN_TERMINAL, "");
+        assert_eq!(state::get_signal(SANDBOX_FS_SIGNAL), 0);
+        on_shell_intent(OP_PERM_ONCE, "");
+        let again = state::get_signal_text(TERM_OUT_SIGNAL);
+        assert!(!again.contains("marker-not-a-seed"), "{again}");
+
+        unsafe {
+            std::env::remove_var("W3COS_DEVICE_SEED");
+        }
+        locale::set_locale("zh-CN");
+        clear_sandbox_sheet();
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::note_shell_viewport(1200.0, 800.0);
         drop(isolated);
     }
 
