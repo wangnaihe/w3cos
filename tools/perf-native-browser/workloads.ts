@@ -16,6 +16,13 @@ var MEMORY_NODES = 4000;
 var CSS_LIST_NODES = 1000;
 var FLEX_LIST_NODES = 400;
 var EVENT_NODES = 400;
+var TABLE_ROWS = 24;
+var TABLE_COLS = 6;
+var TABLE_PASSES = 4;
+var STYLED_NODES = 800;
+var SCROLL_STEPS = 30;
+var TEXT_PARAS = 80;
+var TEXT_PASSES = 6;
 var WARMUP = 2;
 var SAMPLES = 5;
 
@@ -363,6 +370,114 @@ function runMemory() {
         count: root.childNodes.length
     });
 }
+function runTableRepaint() {
+    resetPage();
+    var table = document.createElement("table");
+    table.style.borderCollapse = "collapse";
+    table.style.tableLayout = "fixed";
+    table.style.width = "720px";
+    document.body.appendChild(table);
+    var cells = [];
+    for (var r = 0; r < TABLE_ROWS; r++) {
+        var row = document.createElement("tr");
+        row.style.height = "22px";
+        for (var c = 0; c < TABLE_COLS; c++) {
+            var cell = document.createElement("td");
+            cell.style.width = "120px";
+            cell.style.height = "22px";
+            cell.textContent = "c " + r + "-" + c;
+            row.appendChild(cell);
+            cells.push(cell);
+        }
+        table.appendChild(row);
+    }
+    var t0 = performance.now();
+    var checksum = 0;
+    var textSum = 0;
+    for (var pass = 0; pass < TABLE_PASSES; pass++) {
+        for (var i = 0; i < cells.length; i++) {
+            var text = "v " + pass + "-" + i;
+            cells[i].textContent = text;
+            textSum = textSum + text.length;
+        }
+        checksum = checksum + table.offsetHeight;
+    }
+    var elapsed = performance.now() - t0;
+    check(table.childNodes.length === TABLE_ROWS, "table rows");
+    check(cells.length === TABLE_ROWS * TABLE_COLS, "table cells");
+    check(checksum > 0, "table height");
+    emit({
+        workload: "table-repaint",
+        elapsed_ms: elapsed,
+        checksum: checksum + textSum,
+        count: cells.length
+    });
+}
+function runStyledScroll() {
+    resetPage();
+    var style = document.createElement("style");
+    style.textContent = "#styled-scroll{width:420px;height:360px;overflow:auto}#styled-scroll div{height:24px;font-size:14px;line-height:24px;background:#eef3ff;margin:0 0 2px 0}";
+    document.head.appendChild(style);
+    var scroller = document.createElement("div");
+    scroller.id = "styled-scroll";
+    document.body.appendChild(scroller);
+    for (var i = 0; i < STYLED_NODES; i++) {
+        var row = document.createElement("div");
+        row.textContent = "styled " + (i % 50);
+        scroller.appendChild(row);
+    }
+    var probe = scroller.childNodes[STYLED_NODES - 1];
+    var t0 = performance.now();
+    var checksum = 0;
+    var scrollSum = 0;
+    for (var step = 0; step < SCROLL_STEPS; step++) {
+        scroller.scrollTop = (step * 37) % 4000;
+        checksum = checksum + scroller.offsetHeight + probe.offsetTop;
+        scrollSum = scrollSum + scroller.scrollTop;
+    }
+    var elapsed = performance.now() - t0;
+    check(scroller.childNodes.length === STYLED_NODES, "styled count");
+    check(checksum > 0, "styled scroll height");
+    emit({
+        workload: "styled-scroll",
+        elapsed_ms: elapsed,
+        checksum: checksum + scrollSum,
+        count: scroller.childNodes.length
+    });
+}
+function runTextLayout() {
+    resetPage();
+    var wrap = document.createElement("div");
+    document.body.appendChild(wrap);
+    for (var i = 0; i < TEXT_PARAS; i++) {
+        var para = document.createElement("p");
+        para.style.margin = "0";
+        para.style.fontSize = "16px";
+        para.style.lineHeight = "22px";
+        para.style.width = "640px";
+        var sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
+        var copies = (i % 4) + 1;
+        var text = "";
+        for (var c = 0; c < copies; c++) text = text + sentence;
+        para.textContent = text + i;
+        wrap.appendChild(para);
+    }
+    var t0 = performance.now();
+    var checksum = 0;
+    for (var pass = 0; pass < TEXT_PASSES; pass++) {
+        wrap.style.width = pass % 2 === 0 ? "640px" : "360px";
+        checksum = checksum + wrap.offsetHeight;
+    }
+    var elapsed = performance.now() - t0;
+    check(wrap.childNodes.length === TEXT_PARAS, "text paragraphs");
+    check(checksum > 0, "text layout height");
+    emit({
+        workload: "text-layout",
+        elapsed_ms: elapsed,
+        checksum: checksum,
+        count: wrap.childNodes.length
+    });
+}
 try {
     var workload = globalThis.W3COS_PERF_WORKLOAD;
     if (workload === "startup") runStartup();
@@ -375,6 +490,9 @@ try {
     else if (workload === "css-list") runCssList();
     else if (workload === "flex-list") runFlexList();
     else if (workload === "events") runEvents();
+    else if (workload === "table-repaint") runTableRepaint();
+    else if (workload === "styled-scroll") runStyledScroll();
+    else if (workload === "text-layout") runTextLayout();
     else emit({workload: String(workload), status: "error", error: "unknown workload"});
 } catch (error) {
     console.log("W3COS_PERF_RESULT " + JSON.stringify({

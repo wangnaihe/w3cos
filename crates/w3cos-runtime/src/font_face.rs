@@ -430,7 +430,7 @@ pub(crate) struct HostUiFont {
     pub(crate) family: String,
     pub(crate) data: Arc<Vec<u8>>,
     pub(crate) index: u32,
-    pub(crate) font: fontdue::Font,
+    pub(crate) font: Arc<fontdue::Font>,
 }
 
 static HOST_UI_FONT: OnceLock<HostUiFont> = OnceLock::new();
@@ -474,14 +474,22 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
         let (data, index) = database
             .with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))
             .expect("selected system font must remain readable");
-        let font = fontdue::Font::from_bytes(
-            data.as_slice(),
-            fontdue::FontSettings {
-                collection_index: index,
-                ..fontdue::FontSettings::default()
-            },
-        )
-        .expect("selected system font must be valid");
+        // Collection index 0 shares `cached_parsed_font` with `@font-face`,
+        // so a page that names the host face does not parse those bytes twice.
+        let font = if index == 0 {
+            cached_parsed_font(data.as_slice()).expect("selected system font must be valid")
+        } else {
+            Arc::new(
+                fontdue::Font::from_bytes(
+                    data.as_slice(),
+                    fontdue::FontSettings {
+                        collection_index: index,
+                        ..fontdue::FontSettings::default()
+                    },
+                )
+                .expect("selected system font must be valid"),
+            )
+        };
         HostUiFont {
             family,
             data,
@@ -1551,6 +1559,17 @@ mod tests {
         assert_eq!(FontWeight::from_str("700"), FontWeight::BOLD);
         assert_eq!(FontWeight::from_str("normal"), FontWeight::NORMAL);
         assert_eq!(FontWeight::from_str("400"), FontWeight::NORMAL);
+    }
+
+    #[test]
+    fn parsed_font_cache_reuses_one_face_for_the_same_bytes() {
+        let host = host_ui_font();
+        let first = cached_parsed_font(host.data.as_slice()).expect("host font parses");
+        let second = cached_parsed_font(host.data.as_slice()).expect("host font parses again");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        if host.index == 0 {
+            assert!(std::sync::Arc::ptr_eq(&host.font, &first));
+        }
     }
 
     #[test]

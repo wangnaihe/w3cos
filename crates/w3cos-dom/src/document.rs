@@ -1125,6 +1125,59 @@ impl Document {
         Some(child)
     }
 
+    /// Replace the single text child without a dirty or structure note.
+    ///
+    /// The caller has already refused observers, custom elements, and
+    /// structural selectors, and must finish the batch with one
+    /// `note_batched_child_edits`. A missing or non-singular text child
+    /// returns false and writes nothing.
+    pub fn set_inline_text_unnoted(&mut self, parent: NodeId, text: &str) -> bool {
+        if text.len() > 22 {
+            let _span = self.bump_page_str(text);
+        }
+        let Some(child) = self.get_node(parent).first_child else {
+            return false;
+        };
+        let child_node = self.get_node(child);
+        if child_node.node_type != NodeType::Text || child_node.next_sibling != 0 {
+            return false;
+        }
+        self.get_node_mut(child).text_content = Some(crate::node::CompactStr::from(text));
+        true
+    }
+
+    /// Move `child` to the end of `parent` when it is already parented there.
+    ///
+    /// Same-parent order changes still update sibling links. Dirty notes are
+    /// deferred so a fused loop does not bump structure generation per item.
+    pub fn move_child_to_end_unnoted(&mut self, parent: NodeId, child: NodeId) -> bool {
+        if self.get_node(child).parent != Some(parent) {
+            return false;
+        }
+        if self.get_node(parent).last_child == Some(child) {
+            return true;
+        }
+        self.unlink_from_parent(child);
+        let parent_last = self.get_node(parent).last_child;
+        if let Some(last) = parent_last {
+            self.get_node_mut(last).next_sibling = child.as_u32();
+            self.get_node_mut(child).prev_sibling = last.as_u32();
+        } else {
+            self.get_node_mut(parent).first_child = Some(child);
+            self.get_node_mut(child).prev_sibling = 0;
+        }
+        self.get_node_mut(child).next_sibling = 0;
+        self.get_node_mut(child).parent = Some(parent);
+        self.get_node_mut(parent).last_child = Some(child);
+        true
+    }
+
+    /// One layout invalidation for a batch of unnoted text writes and moves.
+    pub fn note_batched_child_edits(&mut self, parent: NodeId) {
+        self.mark_dirty(parent);
+        self.note_structure_change();
+    }
+
     /// Create a repeated block row: one element, one text child, one inline
     /// declaration, appended without a per-node style walk.
     ///

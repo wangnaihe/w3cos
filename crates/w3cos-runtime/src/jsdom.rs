@@ -1928,19 +1928,33 @@ fn fast_rewrite_indexed_text(
     }
     let mut sum = 0usize;
     let mut buf = [0u8; 96];
+    let mut applied = true;
     dom::with_document_mut(|doc| {
         let parent = w3cos_dom::NodeId::from_u32(parent_id);
         for k in start..limit {
             let index = js_positive_mod(k.wrapping_mul(stride), modulus) as usize;
             let child = w3cos_dom::NodeId::from_u32(ids[index]);
-            // Prefix length and the integer range were checked above.
+            // Prefix length and the integer range were checked above. The
+            // prefix is ASCII and the suffix is decimal digits, so the
+            // UTF-16 length is the byte length.
             let text = w3cos_core::intrinsics::format_prefix_index(prefix, k as f64, &mut buf)
                 .expect("indexed text format");
-            sum += text.encode_utf16().count();
-            let _ = doc.set_inline_text_child(child, text);
-            doc.append_child(parent, child);
+            if !doc.set_inline_text_unnoted(child, text)
+                || !doc.move_child_to_end_unnoted(parent, child)
+            {
+                applied = false;
+                break;
+            }
+            sum += text.len();
+        }
+        if applied {
+            doc.note_batched_child_edits(parent);
         }
     });
+    assert!(
+        applied,
+        "indexed text rewrite preconditions passed but a node refused the batch"
+    );
     dom::mark_dom_dirty();
     Value::Number(sum as f64)
 }
@@ -21530,10 +21544,9 @@ fn raster_checksum(width: u32, height: u32) -> Result<(u64, f64), String> {
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     {
         let started = Instant::now();
-        let frame = crate::headless::render_document_rgba(width, height)
+        let checksum = crate::headless::render_document_checksum(width, height)
             .map_err(|error| error.to_string())?;
         let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let checksum = crate::headless::frame_byte_checksum(&frame.rgba);
         return Ok((checksum, paint_ms));
     }
     #[cfg(not(any(feature = "skia", feature = "cpu-render")))]
@@ -22561,6 +22574,7 @@ mod tests {
             nodes.call_method("push", vec![el]);
         }
         let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let generation = dom::with_document(|doc| doc.structure_generation());
         let rewritten = w3cos_core::intrinsics::dom_rewrite_indexed_text_guarded(
             &nodes, &root, "upd ", 17.0, 4.0, 0.0, 6.0, epoch,
         );
@@ -22568,6 +22582,12 @@ mod tests {
         let (sum, texts) = simulate_indexed_rewrite(4, 17, 0, 6);
         assert_eq!(rewritten.to_number(), sum);
         assert_eq!(child_texts(&root), texts);
+        let generation_after = dom::with_document(|doc| doc.structure_generation());
+        assert_eq!(
+            generation_after.wrapping_sub(generation),
+            1,
+            "the fused rewrite dirties the tree once"
+        );
         assert_eq!(
             root.get_property("childNodes")
                 .get_property("length")
