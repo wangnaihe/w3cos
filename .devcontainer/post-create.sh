@@ -9,7 +9,11 @@ sudo apt-get install -y --no-install-recommends \
     libfontconfig1-dev \
     fonts-dejavu-core \
     fonts-droid-fallback \
-    qemu-system-x86
+    qemu-system-x86 \
+    libclang-dev \
+    cmake \
+    g++ \
+    libasound2-dev
 
 # Build the project
 echo "=== Building W3C OS ==="

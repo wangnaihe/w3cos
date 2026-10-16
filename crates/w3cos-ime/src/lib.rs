@@ -14,6 +14,9 @@ mod lexicon;
 mod modality;
 mod pinyin;
 mod speech;
+mod speech_engine;
+mod speech_model;
+mod speech_wav;
 
 pub use commands::command_utterance;
 pub use context::{
@@ -37,5 +40,10 @@ pub use pinyin::{
 };
 pub use speech::{
     LocalSpeech, NoLocalSpeech, SpeechChunk, SpeechManifest, SpeechOff, SpeechStart, VOICE_LIMIT,
-    poll_speech, press_speech, release_speech, voice_state,
+    flush_speech, poll_speech, press_speech, release_speech, voice_state,
+};
+pub use speech_engine::{WhisperSpeech, whisper_language};
+pub use speech_model::{
+    MODEL_FILE, MODEL_LEN, MODEL_SHA256, MODEL_URL, ModelError, default_speech_dir, download_from,
+    download_speech_model, install_checked, model_ready, sha256_hex,
 };

@@ -6,7 +6,10 @@ license.workspace = true
 description = "IME Hub and the bundled on-device pinyin engine."
 
 [dependencies]
+cpal = "0.15"
 getrandom = "0.2"
 ring = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
+ureq = { workspace = true }
+whisper-rs = { version = "0.16", default-features = false }

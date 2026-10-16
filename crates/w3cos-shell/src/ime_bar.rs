@@ -4,13 +4,14 @@
 //! looks the spelling up. Secure fields and direct (EN) mode never call the
 //! engine. L2 is not consulted: the lookup hub is constructed with L2 off.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use w3cos_ime::{
     ClipboardDecision, ImeHub, InputIntent, IntentHint, IntentPayload, LocalSpeech, Modality,
-    ModalityBlock, NoLocalSpeech, PinyinEngine, Proposal, Purpose, SpeechOff, SpeechStart,
-    clipboard_decision, poll_speech, press_speech, release_speech,
+    ModalityBlock, ModelError, NoLocalSpeech, PinyinEngine, Proposal, Purpose, SpeechOff,
+    SpeechStart, WhisperSpeech, clipboard_decision, download_speech_model, flush_speech,
+    model_ready, poll_speech, press_speech, release_speech,
 };
 use w3cos_runtime::state::{self, ImeFieldNote};
 use w3cos_std::Component;
@@ -112,7 +113,9 @@ impl Default for Session {
 thread_local! {
     static SESSION: RefCell<Session> = RefCell::new(Session::default());
     static SPEECH: RefCell<Box<dyn LocalSpeech>> =
-        RefCell::new(Box::new(NoLocalSpeech::default()));
+        RefCell::new(Box::new(WhisperSpeech::open_default()));
+    static SPEECH_DIR: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    static MODEL_CONSENT: Cell<bool> = const { Cell::new(false) };
 }
 
 fn with_session<R>(body: impl FnOnce(&mut Session) -> R) -> R {
@@ -714,17 +717,66 @@ pub(crate) fn voice_recording() -> bool {
 pub(crate) fn voice_tap_key() -> &'static str {
     if voice_engine_ready() {
         "ime-toast-voice-hold"
+    } else if model_ready(&speech_dir()) {
+        "ime-toast-voice-mic"
     } else {
-        "ime-toast-voice"
+        "ime-toast-voice-offer"
     }
 }
 
 pub(crate) fn voice_off_key(reason: SpeechOff) -> &'static str {
     match reason {
         SpeechOff::NoLocalModel => "ime-toast-voice",
+        SpeechOff::NoMicrophone => "ime-toast-voice-mic",
         SpeechOff::NetworkRefused => "ime-toast-voice-net",
         SpeechOff::SecureField => "ime-toast-voice-secure",
         SpeechOff::NoSession => "ime-toast-voice-closed",
+    }
+}
+
+fn speech_dir() -> std::path::PathBuf {
+    SPEECH_DIR.with(|slot| {
+        slot.borrow()
+            .clone()
+            .unwrap_or_else(w3cos_ime::default_speech_dir)
+    })
+}
+
+pub(crate) fn speech_model_status_key() -> &'static str {
+    if model_ready(&speech_dir()) {
+        "ime-voice-model-ready"
+    } else {
+        "ime-voice-model-off"
+    }
+}
+
+/// `None` once the verified model is already on disk. The button never downloads then.
+pub(crate) fn speech_model_button_key() -> Option<&'static str> {
+    if model_ready(&speech_dir()) {
+        None
+    } else if MODEL_CONSENT.with(Cell::get) {
+        Some("ime-voice-model-confirm")
+    } else {
+        Some("ime-voice-model-get")
+    }
+}
+
+/// First press only arms consent. The second press downloads. Recognition does not call this.
+pub(crate) fn confirm_speech_model() -> &'static str {
+    if model_ready(&speech_dir()) {
+        MODEL_CONSENT.with(|flag| flag.set(false));
+        return "ime-toast-voice-saved";
+    }
+    if !MODEL_CONSENT.with(Cell::get) {
+        MODEL_CONSENT.with(|flag| flag.set(true));
+        return "ime-toast-voice-confirm";
+    }
+    MODEL_CONSENT.with(|flag| flag.set(false));
+    match download_speech_model(&speech_dir(), true) {
+        Ok(_) => "ime-toast-voice-saved",
+        Err(ModelError::ChecksumMismatch { .. }) => "ime-toast-voice-checksum",
+        Err(ModelError::ConsentRequired) => "ime-toast-voice-confirm",
+        Err(_) => "ime-toast-voice-download-fail",
     }
 }
 
@@ -787,6 +839,10 @@ pub(crate) enum VoiceRelease {
 pub(crate) fn voice_release() -> VoiceRelease {
     with_session(|session| {
         let was = session.voice_recording;
+        if was && let Some(chunk) = SPEECH.with(|slot| flush_speech(&mut **slot.borrow_mut(), true))
+        {
+            session.voice_preview = chunk.text;
+        }
         let text = std::mem::take(&mut session.voice_preview);
         close_microphone(session);
         if !was {
@@ -1386,12 +1442,20 @@ pub(crate) fn candidate_texts() -> Vec<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn set_speech_dir_for_tests(dir: Option<std::path::PathBuf>) {
+    SPEECH_DIR.with(|slot| *slot.borrow_mut() = dir);
+    MODEL_CONSENT.with(|flag| flag.set(false));
+}
+
+#[cfg(test)]
 pub(crate) fn reset_for_tests() {
     SESSION.with(|slot| *slot.borrow_mut() = Session::default());
     SPEECH.with(|slot| {
         release_speech(&mut **slot.borrow_mut(), true);
         *slot.borrow_mut() = Box::new(NoLocalSpeech::default());
     });
+    SPEECH_DIR.with(|slot| *slot.borrow_mut() = None);
+    MODEL_CONSENT.with(|flag| flag.set(false));
     state::note_shell_poll_soon(false);
     let _ = state::take_ime_replacements();
     state::clear_ime_field();
