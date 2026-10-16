@@ -1,9 +1,9 @@
 //! Multi-step shell agent.
 //!
 //! The UI thread owns [`AgentLoop`]. A worker thread only calls the planner.
-//! Read tools run immediately. `click`, `type`, and `propose_intent` stop for
-//! confirm. The caller checks `capability_gate` (and the bridge permission
-//! bits) before [`AgentLoop::confirm`] performs the step.
+//! Every tool, including a read, stops for confirm. Nothing touches the view
+//! until [`AgentLoop::confirm`]. The caller checks `capability_gate` there.
+//! L2 stays off unless `W3COS_L2` is set.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,8 +232,8 @@ impl AgentLoop {
         self.pending.is_some()
     }
 
-    fn drain(&mut self, view: &mut ShellView, gate: &dyn Fn(&str) -> bool) -> Drive {
-        let mut effects = Vec::new();
+    fn drain(&mut self, view: &mut ShellView, _gate: &dyn Fn(&str) -> bool) -> Drive {
+        let effects = Vec::new();
         let mut receipts = Vec::new();
         while let Some(call) = self.queue.pop_front() {
             if self.acted >= MAX_STEPS {
@@ -251,57 +251,24 @@ impl AgentLoop {
                     continue;
                 }
             };
-            if prepared.mutating {
-                self.note(&format!(
-                    "{} · awaiting confirm {}",
-                    prepared.name, self.timing
-                ));
-                let summary = prepared.summary.clone();
-                let impact = prepared.impact.clone();
-                self.pending = Some(Pending {
-                    id: call.id,
-                    tool: prepared,
-                });
-                return self.drive(
-                    DriveKind::AwaitConfirm,
-                    effects,
-                    receipts,
-                    summary,
-                    impact,
-                    "确认后才会执行 · Confirm to run".into(),
-                );
-            }
-            if !prepared.capability.is_empty() && !gate(prepared.capability) {
-                let outcome = format!(
-                    "Denied: {} is not granted. Nothing was changed.",
-                    prepared.capability
-                );
-                self.messages
-                    .push(ChatMessage::tool(call.id, outcome.clone()));
-                receipts.push(self.receipt(&prepared.name, Decision::Denied, false, &outcome));
-                self.note(&format!(
-                    "{} · denied {}",
-                    prepared.name, prepared.capability
-                ));
-                continue;
-            }
-            match shell_tools::perform(&prepared, view) {
-                Ok((body, step_effects)) => {
-                    shell_tools::apply_effects(view, &step_effects);
-                    effects.extend(step_effects);
-                    self.messages
-                        .push(ChatMessage::tool(call.id, truncate(&body)));
-                    receipts.push(self.receipt(&prepared.name, Decision::Allowed, false, &body));
-                    self.note(&format!("{} · read", prepared.name));
-                }
-                Err(err) => {
-                    let outcome = format!("tool error: {err}");
-                    self.messages
-                        .push(ChatMessage::tool(call.id, outcome.clone()));
-                    receipts.push(self.receipt(&prepared.name, Decision::Denied, false, &outcome));
-                    self.note(&format!("{} · {err}", prepared.name));
-                }
-            }
+            self.note(&format!(
+                "{} · awaiting confirm {}",
+                prepared.name, self.timing
+            ));
+            let summary = prepared.summary.clone();
+            let impact = prepared.impact.clone();
+            self.pending = Some(Pending {
+                id: call.id,
+                tool: prepared,
+            });
+            return self.drive(
+                DriveKind::AwaitConfirm,
+                effects,
+                receipts,
+                summary,
+                impact,
+                "确认后才会执行 · Confirm to run".into(),
+            );
         }
         self.plan_drive(effects, receipts)
     }
@@ -633,7 +600,7 @@ pub fn drive_until_done(planner: &dyn Planner, utterance: &str) -> SessionTrace 
     let mut view = ShellView::default();
     let mut trace = SessionTrace::default();
     let mut drive = agent.start(utterance);
-    for _ in 0..16 {
+    for _ in 0..32 {
         note_trace(&mut trace, &drive, &view);
         match drive.kind {
             DriveKind::Plan(turn) => {
@@ -757,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn read_tools_do_not_wait_and_cancel_drops_the_pending_step() {
+    fn read_tools_wait_for_confirm_and_cancel_drops_the_pending_step() {
         let mut agent = AgentLoop::default();
         let mut view = ShellView::default();
         let completion = PlannerCompletion {
@@ -771,10 +738,15 @@ mod tests {
         };
         let _ = agent.start("look");
         let drive = agent.on_completion(completion, &mut view, &read_gate);
+        assert!(matches!(drive.kind, DriveKind::AwaitConfirm));
+        assert!(drive.effects.is_empty());
+        assert!(drive.receipts.is_empty());
+        assert!(drive.steps.contains("a11y_index"));
+        let drive = agent.confirm(&mut view, &read_gate);
         assert!(matches!(drive.kind, DriveKind::Plan(_)));
         assert_eq!(drive.receipts[0].decision, Decision::Allowed);
-        assert!(!drive.receipts[0].confirmed);
-        assert!(drive.steps.contains("a11y_index"));
+        assert!(drive.receipts[0].confirmed);
+        assert!(drive.receipts[0].outcome.contains("index"));
 
         let completion = PlannerCompletion {
             step: PlannerStep::Calls(vec![PlannedCall {

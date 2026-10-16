@@ -4,10 +4,10 @@
 //! W3COS_AI_PORT=9222 W3COS_AI_TOKEN=... w3cos-ai-mcp
 //! ```
 //!
-//! The process speaks MCP `initialize`, `tools/list`, and `tools/call` on
-//! stdin. Each tool is one loopback HTTP call. Permissions and the bearer
-//! token stay on the bridge: an observer token can read `a11y_index`, and
-//! `propose_intent` returns the bridge's 403 until the token is interactive.
+//! The process speaks MCP `initialize`, `tools/list`, `tools/call`, and
+//! `w3cos/result` on stdin. `tools/call` posts `/mcp/propose` and polls
+//! `/mcp/result`. It does not send the tool's own bridge request. The window
+//! is the only place that confirms. There is no `w3cos/confirm` method.
 
 use std::io::{self, Read, Write};
 
@@ -31,19 +31,53 @@ fn main() {
         let Ok(message) = serde_json::from_str::<Value>(&message) else {
             continue;
         };
-        let Some(response) = mcp::dispatch(
-            &message,
-            &mut |call: &BridgeCall| match mcp::http_bridge(port, &token, call) {
-                Ok(result) => result,
-                Err(err) => (502, err),
-            },
-        ) else {
+        let Some(response) = respond(&message, port, &token) else {
             continue;
         };
         if write_message(&mut stdout, &response.to_string()).is_err() {
             break;
         }
     }
+}
+
+fn bridge(port: u16, token: &str, call: &BridgeCall) -> (u16, String) {
+    match mcp::http_bridge(port, token, call) {
+        Ok(result) => result,
+        Err(err) => (502, err),
+    }
+}
+
+fn respond(message: &Value, port: u16, token: &str) -> Option<Value> {
+    let method = message
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if method == "tools/call" {
+        let id = message.get("id").cloned()?;
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let result = match mcp::drive_tool_call(
+            &params,
+            &mut |call| bridge(port, token, call),
+            &mut pause_for_confirm,
+            150,
+        ) {
+            Ok(text) => mcp_content(&text, false),
+            Err(text) => mcp_content(&text, true),
+        };
+        return Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}));
+    }
+    mcp::dispatch(message, &mut |call| bridge(port, token, call))
+}
+
+fn pause_for_confirm() {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+fn mcp_content(text: &str, is_error: bool) -> Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error
+    })
 }
 
 fn read_message(input: &mut impl Read) -> Option<String> {

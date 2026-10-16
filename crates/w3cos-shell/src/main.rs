@@ -79,6 +79,7 @@ const SIGN_SIGNAL: usize = 39;
 const SIGN_MESSAGE_SIGNAL: usize = 40;
 const SIGN_SUMMARY_SIGNAL: usize = 41;
 const SIGN_IMPACT_SIGNAL: usize = 42;
+const TOOL_SIGNAL: usize = 43;
 
 const OP_PROPOSE: u8 = 1;
 const OP_CONFIRM: u8 = 2;
@@ -245,6 +246,7 @@ pub(crate) fn shell_main() {
     handoff::ensure_listener();
     agent_host::install_wake();
     w3cos_ai_bridge::server::set_intent_hooks(bridge_propose, bridge_confirm);
+    w3cos_ai_bridge::server::set_mcp_hook(bridge_mcp_propose);
     #[cfg(feature = "desktop")]
     let launched = crate::run_app(build_shell);
     #[cfg(not(feature = "desktop"))]
@@ -268,6 +270,26 @@ fn bridge_confirm() -> String {
         return notice;
     }
     state::get_signal_text(SUMMARY_SIGNAL)
+}
+
+fn bridge_mcp_propose(name: &str) {
+    show_tool_confirm(name);
+    if state::get_signal(UNLOCKED_SIGNAL) != 0 {
+        state::request_focus_label(&locale::t("confirm"));
+    }
+}
+
+fn show_tool_confirm(name: &str) {
+    ensure_shell_signals();
+    state::set_signal(PHASE_SIGNAL, 1);
+    state::set_signal(TOOL_SIGNAL, 1);
+    state::set_text_signal(TIER_SIGNAL, "L2");
+    state::set_text_signal(CONFIRM_FOCUS_SIGNAL, "confirm");
+    state::set_text_signal(
+        SUMMARY_SIGNAL,
+        locale::t_args("mcp-tool-summary", &[("name", name)]),
+    );
+    state::set_text_signal(IMPACT_SIGNAL, locale::t("mcp-tool-impact"));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,6 +357,7 @@ fn ensure_shell_signals() {
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
         let _ = state::create_text_signal("");
+        let _ = state::create_signal(0);
     });
 }
 
@@ -457,6 +480,10 @@ fn on_shell_intent(code: u8, draft: &str) {
             }
         }
         OP_CANCEL => {
+            if state::get_signal(TOOL_SIGNAL) != 0 {
+                cancel_tool_proposal(session);
+                return;
+            }
             let pending = state::get_signal_text(PENDING_LOCALE_SIGNAL);
             if !pending.is_empty()
                 && state::get_signal(PHASE_SIGNAL) != 1
@@ -669,6 +696,42 @@ fn apply_propose(session: &mut IntentSession, utterance: &str, ctx: &ShellContex
     }
 }
 
+fn cancel_tool_proposal(session: &mut IntentSession) {
+    let summary = state::get_signal_text(SUMMARY_SIGNAL);
+    let name = w3cos_ai_bridge::mcp::cancel().unwrap_or_else(|| "mcp".to_string());
+    session.record_external(
+        &summary,
+        &name,
+        Decision::Cancelled,
+        false,
+        &locale::t("tool-cancelled-notice"),
+        IntentTier::L2,
+    );
+    state::set_signal(TOOL_SIGNAL, 0);
+    state::set_text_signal(SUMMARY_SIGNAL, "");
+    state::set_text_signal(IMPACT_SIGNAL, "");
+    sync_session(session, 0, &locale::t("tool-cancelled-notice"));
+    restore_after_dialog();
+}
+
+fn record_tool_outcome(session: &mut IntentSession, done: &w3cos_ai_bridge::mcp::ToolOutcome) {
+    let decision = if (200..300).contains(&done.status) {
+        Decision::Allowed
+    } else {
+        Decision::Denied
+    };
+    session.record_external(
+        &done.summary,
+        &done.name,
+        decision,
+        true,
+        &done.note,
+        IntentTier::L2,
+    );
+    let phase = state::get_signal(PHASE_SIGNAL);
+    sync_session(session, phase, &done.note);
+}
+
 fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
     if !session.identity_unlocked() {
         sync_session(
@@ -676,6 +739,17 @@ fn apply_confirm(session: &mut IntentSession, ctx: &ShellContext) {
             state::get_signal(PHASE_SIGNAL),
             &locale::t("locked-hint"),
         );
+        return;
+    }
+    if state::get_signal(TOOL_SIGNAL) != 0 {
+        if w3cos_ai_bridge::mcp::arm() {
+            state::set_signal(TOOL_SIGNAL, 0);
+            sync_session(session, 0, &locale::t("tool-armed-notice"));
+        } else {
+            state::set_signal(TOOL_SIGNAL, 0);
+            sync_session(session, 0, &locale::t("mcp-nothing"));
+        }
+        restore_after_dialog();
         return;
     }
     if w3cos_ai_bridge::agent_loop::has_pending() {
@@ -736,6 +810,9 @@ fn confirm_impact(command: &ShellCommand, shared: bool) -> String {
 
 fn on_agent_poll() {
     ensure_shell_signals();
+    if let Some(done) = w3cos_ai_bridge::mcp::take_done() {
+        with_session(|session| record_tool_outcome(session, &done));
+    }
     let (can_read, can_shot) = session_read_flags();
     let mut view = current_shell_view();
     let Some(update) = agent_host::poll(&mut view, &|name| match name {
@@ -750,6 +827,14 @@ fn on_agent_poll() {
 
 fn confirm_agent_step(session: &mut IntentSession) {
     let name = w3cos_ai_bridge::agent_loop::pending_capability();
+    if name == shell_tools::CAP_A11Y || name == shell_tools::CAP_CAPTURE {
+        let mut view = current_shell_view();
+        let update = agent_host::confirm(&mut view, &|capability| {
+            capability_gate::is_granted(capability)
+        });
+        apply_host_update(session, update);
+        return;
+    }
     let tool_name = if name == shell_tools::CAP_PROCESS {
         "click"
     } else {
@@ -2324,6 +2409,7 @@ fn apply_screen_override() {
             state::set_signal(RECEIPTS_OPEN_SIGNAL, 1);
             state::set_text_signal(RECEIPT_SIGNAL, "");
         }
+        Some("tool-confirm") => show_tool_confirm("a11y_index"),
         Some("confirm") => {
             focus_app(1);
             state::set_signal(PHASE_SIGNAL, 1);
@@ -8547,6 +8633,32 @@ mod shell_ux_tests {
         assert_eq!(state::get_signal(LAUNCHER_SIGNAL), 1);
         state::set_signal(UNLOCKED_SIGNAL, 1);
         state::set_signal(LAUNCHER_SIGNAL, 0);
+    }
+
+    #[test]
+    fn tool_confirm_card_is_the_confirm_dialog_and_does_not_run() {
+        ensure_shell_signals();
+        w3cos_ai_bridge::mcp::reset_gate();
+        locale::set_locale("zh-CN");
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        show_tool_confirm("a11y_index");
+        let dialog = build_confirm_dialog();
+        assert_eq!(dialog_role(&dialog), Some("confirm"));
+        let blob = text_blob(&dialog);
+        assert!(blob.contains("提议 a11y_index"), "{blob}");
+        assert!(blob.contains("确认后才会执行"), "{blob}");
+        assert!(blob.contains("现在不会读取"), "{blob}");
+        assert!(w3cos_ai_bridge::mcp::take_armed().is_none());
+        assert!(!w3cos_ai_bridge::mcp::arm());
+        locale::set_locale("en");
+        show_tool_confirm("a11y_index");
+        let blob = text_blob(&build_confirm_dialog());
+        assert!(blob.contains("Propose a11y_index"), "{blob}");
+        assert!(blob.contains("Nothing runs until you confirm"), "{blob}");
+        assert!(w3cos_ai_bridge::mcp::take_armed().is_none());
+        locale::set_locale("zh-CN");
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(TOOL_SIGNAL, 0);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! In-process execution of the MCP tool catalog against shell state.
 //!
 //! Tool names stay the ones `w3cos-ai-mcp` already exposes. This module does
-//! not open a socket: the UI thread runs a call only after the capability
-//! gate and, for mutations, a confirm. Process spawn is an allowlist
-//! (`echo`, `pwd`, `help`) behind `w3cos-process`, not a shell.
+//! not open a socket. The UI thread runs a call, including a read, only after
+//! confirm. Process spawn is an allowlist (`echo`, `pwd`, `help`) behind
+//! `w3cos-process`, not a shell.
 
 use serde_json::{Value, json};
 

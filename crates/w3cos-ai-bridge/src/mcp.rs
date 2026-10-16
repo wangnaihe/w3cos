@@ -1,9 +1,12 @@
-//! Minimal MCP adapter over the existing AI Bridge HTTP API.
+//! MCP adapter over the existing AI Bridge HTTP API.
 //!
-//! This is not a second DOM or permission model. Tool calls become the same
-//! loopback requests the bridge already authorizes. An observer token can
-//! read the a11y index. Propose, confirm, click, and type need interaction
-//! permission, which the bridge enforces.
+//! `tools/call` proposes. It does not read the DOM, click, or type. The
+//! window arms the one stored call, and the UI thread performs it later.
+//! Direct HTTP routes are a different path and still run when the token
+//! allows them. Confirm is not a tool and `w3cos/confirm` is not a method.
+
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
 
@@ -84,20 +87,22 @@ pub fn tool_to_bridge(name: &str, arguments: &Value) -> Result<BridgeCall, Strin
 pub fn tool_list() -> Value {
     json!({
         "tools": [
-            tool("observe", "Read the accessibility summary. Observer tokens may call this.", json!({})),
-            tool("a11y_index", "Read the numbered accessibility index without a screenshot.", json!({})),
-            tool("query", "Query one DOM selector.", json!({"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]})),
-            tool("click", "Click by CSS selector or a11y index. Requires interaction permission.", json!({"type":"object","properties":{"selector":{"type":"string"},"index":{"type":"integer"}}})),
-            tool("type", "Type into a selector or a11y index. Requires write permission.", json!({"type":"object","properties":{"selector":{"type":"string"},"index":{"type":"integer"},"text":{"type":"string"}},"required":["text"]})),
-            tool("screenshot", "Capture the raw PNG. Requires screenshot permission.", json!({})),
-            tool("screenshot_annotated", "Capture a PNG plus the layout index map. Requires screenshot permission.", json!({})),
-            tool("propose_intent", "Propose an L0 shell intent. Requires interaction permission. Does not execute it.", json!({"type":"object","properties":{"utterance":{"type":"string"}},"required":["utterance"]})),
-            tool("confirm_intent", "Confirm the pending L0 intent. Requires interaction permission.", json!({})),
+            tool("observe", "Propose a read of the accessibility summary. Nothing is read until the window confirms.", json!({})),
+            tool("a11y_index", "Propose a read of the numbered accessibility index. Nothing is read until the window confirms.", json!({})),
+            tool("query", "Propose a DOM selector query. Nothing is read until the window confirms.", json!({"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]})),
+            tool("click", "Propose a click by CSS selector or a11y index. Nothing is clicked until the window confirms.", json!({"type":"object","properties":{"selector":{"type":"string"},"index":{"type":"integer"}}})),
+            tool("type", "Propose typing into a selector or a11y index. Nothing is typed until the window confirms.", json!({"type":"object","properties":{"selector":{"type":"string"},"index":{"type":"integer"},"text":{"type":"string"}},"required":["text"]})),
+            tool("screenshot", "Propose a PNG capture. Nothing is captured until the window confirms.", json!({})),
+            tool("screenshot_annotated", "Propose an annotated capture. Nothing is captured until the window confirms.", json!({})),
+            tool("propose_intent", "Propose an L0 shell intent. The window confirms before it runs.", json!({"type":"object","properties":{"utterance":{"type":"string"}},"required":["utterance"]})),
         ]
     })
 }
 
 /// Handle one JSON-RPC message. `None` means the client sent a notification.
+///
+/// `tools/call` does not call `exec`. `w3cos/result` reads the stored outcome.
+/// There is no confirm method.
 pub fn dispatch(
     message: &Value,
     exec: &mut dyn FnMut(&BridgeCall) -> (u16, String),
@@ -116,13 +121,15 @@ pub fn dispatch(
             "serverInfo": { "name": "w3cos-ai-mcp", "version": "0.1.0" }
         })),
         "tools/list" => Ok(tool_list()),
-        "tools/call" => match call_tool(&params, exec) {
-            Ok(body) => Ok(body),
-            Err(message) => Ok(json!({
-                "content": [{ "type": "text", "text": message }],
-                "isError": true
-            })),
+        "tools/call" => match describe_call(&params) {
+            Ok(text) => Ok(content_body(&text, false)),
+            Err(message) => Ok(content_body(&message, true)),
         },
+        "w3cos/result" => {
+            let (status, body) = exec(&result_call());
+            let is_error = !(200..300).contains(&status);
+            Ok(content_body(&format!("HTTP {status}\n{body}"), is_error))
+        }
         "ping" => Ok(json!({})),
         other => Err(format!("unknown method '{other}'")),
     };
@@ -136,22 +143,325 @@ pub fn dispatch(
     })
 }
 
-fn call_tool(
-    params: &Value,
-    exec: &mut dyn FnMut(&BridgeCall) -> (u16, String),
-) -> Result<Value, String> {
+fn describe_call(params: &Value) -> Result<String, String> {
     let name = params
         .get("name")
         .and_then(|value| value.as_str())
-        .ok_or("missing tool name")?;
+        .ok_or_else(|| say("mcp-unknown", &[("name", "")]))?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-    let call = tool_to_bridge(name, &arguments)?;
-    let (status, body) = exec(&call);
-    let is_error = !(200..300).contains(&status);
-    Ok(json!({
-        "content": [{ "type": "text", "text": format!("HTTP {status}\n{body}") }],
+    let _validated = accept_tool(name, &arguments)?;
+    Ok(say("mcp-awaiting", &[("name", name)]))
+}
+
+fn content_body(text: &str, is_error: bool) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text }],
         "isError": is_error
-    }))
+    })
+}
+
+/// stdio `tools/call`: post `/mcp/propose`, then poll `/mcp/result`.
+/// The tool's own bridge request is never passed to `http`.
+pub fn drive_tool_call(
+    params: &Value,
+    http: &mut dyn FnMut(&BridgeCall) -> (u16, String),
+    pause: &mut dyn FnMut(),
+    max_polls: u32,
+) -> Result<String, String> {
+    let name = params
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+    accept_tool(name, &arguments)?;
+    let propose = BridgeCall {
+        method: "POST",
+        path: "/mcp/propose".into(),
+        body: Some(json!({ "name": name, "arguments": arguments }).to_string()),
+    };
+    let (status, body) = http(&propose);
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}\n{body}"));
+    }
+    let mut polls = max_polls.max(1);
+    loop {
+        let (status, body) = http(&result_call());
+        if result_ready(&body) {
+            if (200..300).contains(&status) && outcome_ok(&body) {
+                return Ok(format!("HTTP {status}\n{body}"));
+            }
+            return Err(format!("HTTP {status}\n{body}"));
+        }
+        polls = polls.saturating_sub(1);
+        if polls == 0 {
+            return Ok(say("mcp-awaiting", &[("name", name)]));
+        }
+        pause();
+    }
+}
+
+fn result_call() -> BridgeCall {
+    BridgeCall {
+        method: "GET",
+        path: "/mcp/result".into(),
+        body: None,
+    }
+}
+
+fn result_ready(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value.get("pending").and_then(|item| item.as_bool()) == Some(false)
+        && value.get("status").is_some()
+}
+
+fn outcome_ok(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("status").and_then(|item| item.as_u64()))
+        .is_some_and(|status| (200..300).contains(&status))
+}
+
+/// One proposal the shell can arm. The bridge call is stored and not run.
+#[derive(Clone, Debug)]
+pub struct ProposeView {
+    pub name: String,
+    pub summary: String,
+    pub impact: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProposeError {
+    pub pending: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolOutcome {
+    pub name: String,
+    pub summary: String,
+    pub status: u16,
+    pub note: String,
+}
+
+struct PendingTool {
+    name: String,
+    summary: String,
+    call: BridgeCall,
+    armed: bool,
+}
+
+struct FinishedTool {
+    name: String,
+    summary: String,
+    status: u16,
+    note: String,
+    recorded: bool,
+}
+
+#[derive(Default)]
+struct Gate {
+    pending: Option<PendingTool>,
+    inflight: Option<(String, String)>,
+    done: VecDeque<FinishedTool>,
+}
+
+fn gate() -> &'static Mutex<Gate> {
+    static GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(Gate::default()))
+}
+
+fn lock_gate() -> std::sync::MutexGuard<'static, Gate> {
+    gate().lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub fn reset_gate() {
+    *lock_gate() = Gate::default();
+}
+
+pub fn submit_propose(body: &str) -> Result<ProposeView, ProposeError> {
+    let value: Value = serde_json::from_str(body).map_err(|_| ProposeError {
+        pending: false,
+        message: "invalid json".into(),
+    })?;
+    let name = value
+        .get("name")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    let arguments = value.get("arguments").cloned().unwrap_or(Value::Null);
+    propose(name, &arguments)
+}
+
+pub fn propose(name: &str, arguments: &Value) -> Result<ProposeView, ProposeError> {
+    let accepted = accept_tool(name, arguments).map_err(|message| ProposeError {
+        pending: false,
+        message,
+    })?;
+    let mut gate = lock_gate();
+    if gate.pending.is_some() {
+        return Err(ProposeError {
+            pending: true,
+            message: say("mcp-pending", &[]),
+        });
+    }
+    let view = ProposeView {
+        name: accepted.name,
+        summary: accepted.summary,
+        impact: accepted.impact,
+    };
+    gate.pending = Some(PendingTool {
+        name: view.name.clone(),
+        summary: view.summary.clone(),
+        call: accepted.call,
+        armed: false,
+    });
+    Ok(view)
+}
+
+/// Mark the stored call ready. Does not execute it. A read or screenshot asks
+/// the UI thread to copy layout, and pixels, before the next poll runs it.
+pub fn arm() -> bool {
+    let prep = {
+        let mut gate = lock_gate();
+        let Some(pending) = gate.pending.as_mut() else {
+            return false;
+        };
+        pending.armed = true;
+        (pending.call.method, pending.call.path.clone())
+    };
+    match prep {
+        ("GET", path) if path == "/screenshot" || path == "/screenshot/annotated" => {
+            crate::server::note_bridge_prep(true, true);
+        }
+        ("GET", path)
+            if path == "/a11y"
+                || path == "/a11y/index"
+                || path == "/a11y/json"
+                || path.starts_with("/query") =>
+        {
+            crate::server::note_bridge_prep(true, false);
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Take a call the window has armed. `None` while it is still waiting.
+pub fn take_armed() -> Option<BridgeCall> {
+    let mut gate = lock_gate();
+    let armed = gate.pending.as_ref().is_some_and(|pending| pending.armed);
+    if !armed {
+        return None;
+    }
+    let pending = gate.pending.take()?;
+    gate.inflight = Some((pending.name, pending.summary));
+    Some(pending.call)
+}
+
+/// Drop the stored call. The returned name is what the shell writes on the
+/// receipt. A later poll sees the cancellation and does not run the call.
+pub fn cancel() -> Option<String> {
+    let mut gate = lock_gate();
+    let pending = gate.pending.take()?;
+    gate.done.push_back(FinishedTool {
+        name: pending.name.clone(),
+        summary: pending.summary,
+        status: 499,
+        note: say("tool-cancelled-notice", &[]),
+        recorded: true,
+    });
+    Some(pending.name)
+}
+
+pub fn store_bridge_response(status: u16, note: &str) {
+    let mut gate = lock_gate();
+    let (name, summary) = gate
+        .inflight
+        .take()
+        .unwrap_or_else(|| ("tool".into(), String::new()));
+    let note: String = note.chars().take(240).collect();
+    gate.done.push_back(FinishedTool {
+        name,
+        summary,
+        status,
+        note,
+        recorded: false,
+    });
+    while gate.done.len() > 8 {
+        gate.done.pop_front();
+    }
+}
+
+pub fn take_done() -> Option<ToolOutcome> {
+    let mut gate = lock_gate();
+    let position = gate.done.iter().position(|item| !item.recorded)?;
+    let done = &mut gate.done[position];
+    done.recorded = true;
+    Some(ToolOutcome {
+        name: done.name.clone(),
+        summary: done.summary.clone(),
+        status: done.status,
+        note: done.note.clone(),
+    })
+}
+
+pub fn result_json() -> Value {
+    let gate = lock_gate();
+    if let Some(pending) = &gate.pending {
+        return json!({
+            "pending": true,
+            "armed": pending.armed,
+            "name": pending.name,
+            "summary": pending.summary
+        });
+    }
+    if let Some(done) = gate.done.back() {
+        return json!({
+            "pending": false,
+            "name": done.name,
+            "status": done.status,
+            "body": done.note
+        });
+    }
+    json!({
+        "pending": false,
+        "summary": say("mcp-nothing", &[])
+    })
+}
+
+struct AcceptedTool {
+    name: String,
+    summary: String,
+    impact: String,
+    call: BridgeCall,
+}
+
+fn accept_tool(name: &str, arguments: &Value) -> Result<AcceptedTool, String> {
+    if name == "confirm_intent" {
+        return Err(say("mcp-not-a-tool", &[]));
+    }
+    let call = tool_to_bridge(name, arguments).map_err(|err| {
+        if err.starts_with("unknown tool") {
+            say("mcp-unknown", &[("name", name)])
+        } else {
+            err
+        }
+    })?;
+    Ok(AcceptedTool {
+        name: name.to_string(),
+        summary: say("mcp-tool-summary", &[("name", name)]),
+        impact: say("mcp-tool-impact", &[]),
+        call,
+    })
+}
+
+fn say(key: &str, args: &[(&str, &str)]) -> String {
+    crate::copy::line(&locale_tag(), key, args)
+}
+
+fn locale_tag() -> String {
+    std::env::var("W3COS_LOCALE").unwrap_or_else(|_| "zh-CN".into())
 }
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
@@ -254,33 +564,45 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_reports_the_bridge_status() {
+    fn tools_call_does_not_execute_and_confirm_is_not_a_method() {
         let message = json!({
             "jsonrpc": "2.0",
             "id": 7,
             "method": "tools/call",
             "params": { "name": "a11y_index", "arguments": {} }
         });
-        let response = dispatch(&message, &mut |call| {
-            assert_eq!(call.path, "/a11y/index");
-            (200, "[{\"index\":1}]".into())
-        })
-        .unwrap();
+        let response = dispatch(&message, &mut |_| panic!("tools/call must not execute")).unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("HTTP 200"));
+        assert!(text.contains("a11y_index"), "{text}");
         assert_eq!(response["result"]["isError"], false);
 
-        let denied = json!({
+        let confirm = json!({
             "jsonrpc": "2.0",
             "id": 8,
             "method": "tools/call",
-            "params": { "name": "propose_intent", "arguments": { "utterance": "open files" } }
+            "params": { "name": "confirm_intent", "arguments": {} }
         });
-        let response = dispatch(&denied, &mut |_| {
-            (403, "{\"error\":\"no interact\"}".into())
-        })
-        .unwrap();
+        let response =
+            dispatch(&confirm, &mut |_| panic!("confirm_intent must not execute")).unwrap();
         assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("确认") || text.contains("Confirm"), "{text}");
+
+        let method = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "w3cos/confirm"
+        });
+        let response =
+            dispatch(&method, &mut |_| panic!("w3cos/confirm must not execute")).unwrap();
+        assert!(response.get("error").is_some(), "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("w3cos/confirm")
+        );
+
         let names = tool_list()["tools"]
             .as_array()
             .unwrap()
@@ -289,5 +611,86 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"a11y_index".to_string()));
         assert!(names.contains(&"propose_intent".to_string()));
+        assert!(!names.iter().any(|name| name == "confirm_intent"));
+    }
+
+    #[test]
+    fn propose_stores_one_call_and_confirm_runs_it_once() {
+        reset_gate();
+        let first = propose("a11y_index", &Value::Null).unwrap();
+        assert!(first.summary.contains("a11y_index"));
+        let second = propose("observe", &Value::Null).unwrap_err();
+        assert!(second.pending);
+        assert!(take_armed().is_none());
+
+        assert!(arm());
+        let mut runs = 0;
+        let call = take_armed().expect("armed call");
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.path, "/a11y/index");
+        runs += 1;
+        store_bridge_response(200, "[{\"index\":1}]");
+        assert!(take_armed().is_none());
+        assert_eq!(runs, 1);
+        let done = take_done().unwrap();
+        assert_eq!(done.name, "a11y_index");
+        assert_eq!(done.status, 200);
+        assert!(done.note.contains("index"));
+        assert!(take_done().is_none());
+
+        propose("click", &json!({"index": 3})).unwrap();
+        assert_eq!(cancel().as_deref(), Some("click"));
+        assert!(take_armed().is_none());
+        let body = result_json();
+        assert_eq!(body["pending"], false);
+        assert_eq!(body["status"], 499);
+        assert!(take_done().is_none());
+    }
+
+    #[test]
+    fn stdio_propose_polls_the_result_and_skips_the_tool_request() {
+        let params = json!({"name": "a11y_index", "arguments": {}});
+        let mut paths = Vec::new();
+        let mut polls = 0;
+        let text = drive_tool_call(
+            &params,
+            &mut |call| {
+                paths.push(call.path.clone());
+                if call.path == "/mcp/propose" {
+                    assert_eq!(call.method, "POST");
+                    (200, "{\"pending\":true}".into())
+                } else {
+                    polls += 1;
+                    if polls < 2 {
+                        (200, "{\"pending\":true,\"name\":\"a11y_index\"}".into())
+                    } else {
+                        (
+                            200,
+                            "{\"pending\":false,\"status\":200,\"body\":\"[{\\\"index\\\":1}]\"}"
+                                .into(),
+                        )
+                    }
+                }
+            },
+            &mut || {},
+            4,
+        )
+        .unwrap();
+        assert_eq!(paths, vec!["/mcp/propose", "/mcp/result", "/mcp/result"]);
+        assert!(text.contains("200"), "{text}");
+
+        let mut called = false;
+        let err = drive_tool_call(
+            &json!({"name": "confirm_intent", "arguments": {}}),
+            &mut |_| {
+                called = true;
+                (200, String::new())
+            },
+            &mut || {},
+            1,
+        )
+        .unwrap_err();
+        assert!(!called);
+        assert!(err.contains("确认") || err.contains("Confirm"), "{err}");
     }
 }
