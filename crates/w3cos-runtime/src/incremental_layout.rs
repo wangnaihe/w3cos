@@ -3,7 +3,7 @@
 //! Style-only edits patch the cached nodes and call `compute_layout` again.
 //! Tree shape, text metrics, and inherited cascades rebuild once.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
@@ -38,6 +38,7 @@ thread_local! {
 
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
+    PAINT.with(|cache| *cache.borrow_mut() = None);
 }
 
 /// Flush pending layout into stored DOM rects. Returns false when Taffy fails.
@@ -443,4 +444,362 @@ fn can_skip_projections(root: &Component) -> bool {
         component.children.iter().all(walk)
     }
     walk(root)
+}
+
+struct PaintCache {
+    component: Component,
+    engine: LayoutEngine,
+    structure: u64,
+    cascade: u64,
+    viewport_w_bits: u32,
+    viewport_h_bits: u32,
+    node_ids: Vec<u32>,
+    results: crate::layout::LayoutResults,
+}
+
+thread_local! {
+    static PAINT: RefCell<Option<PaintCache>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAINT_REBUILDS: Cell<u32> = const { Cell::new(0) };
+    static PAINT_PATCHES: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn paint_layout_stats() -> (u32, u32) {
+    (
+        PAINT_REBUILDS.with(Cell::get),
+        PAINT_PATCHES.with(Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn note_paint_rebuild() {
+    PAINT_REBUILDS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn note_paint_patch() {
+    PAINT_PATCHES.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn note_paint_rebuild() {}
+
+#[cfg(not(test))]
+fn note_paint_patch() {}
+
+/// Layout for a headless frame.
+///
+/// Scroll-only frames reuse the previous solve. Edits that change only
+/// used-box geometry patch the retained Taffy nodes. Inherited style, tree
+/// shape, and anything `style_patch_is_safe` rejects rebuild from the DOM so
+/// the painted styles stay the ones `to_component_tree` would produce.
+pub fn with_paint_layout<R>(
+    viewport_w: f32,
+    viewport_h: f32,
+    use_layout: impl FnOnce(&Component, &crate::layout::LayoutResults) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    let (structure, cascade) = crate::dom::with_document(|document| {
+        (
+            document.structure_generation(),
+            document.cascade_generation(),
+        )
+    });
+    let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+    PAINT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let reusable = slot.as_ref().is_some_and(|cache| {
+            cache.structure == structure
+                && cache.viewport_w_bits == viewport_w.to_bits()
+                && cache.viewport_h_bits == viewport_h.to_bits()
+        });
+        if reusable {
+            let cache = slot.as_mut().unwrap();
+            if sync_paint_cache(cache, &dirty, cascade, viewport_w, viewport_h) {
+                return use_layout(&cache.component, &cache.results);
+            }
+        }
+        *slot = None;
+        rebuild_paint_cache(&mut slot, structure, cascade, viewport_w, viewport_h)?;
+        let cache = slot.as_ref().expect("paint layout rebuild stores a cache");
+        use_layout(&cache.component, &cache.results)
+    })
+}
+
+fn rebuild_paint_cache(
+    slot: &mut Option<PaintCache>,
+    structure: u64,
+    cascade: u64,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> anyhow::Result<()> {
+    let component = crate::dom::to_component_tree();
+    let flat = pre_flatten(&component);
+    let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
+    let mut engine = LayoutEngine::new();
+    // Match `compute_with_scroll_details`: always measure text and run projections.
+    engine.set_skip_projections(false);
+    engine.set_measure_text(true);
+    let results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
+    write_rects(&flat, &results.layout_cache);
+    *slot = Some(PaintCache {
+        component,
+        engine,
+        structure,
+        cascade,
+        viewport_w_bits: viewport_w.to_bits(),
+        viewport_h_bits: viewport_h.to_bits(),
+        node_ids,
+        results,
+    });
+    note_paint_rebuild();
+    Ok(())
+}
+
+fn sync_paint_cache(
+    cache: &mut PaintCache,
+    dirty: &[NodeId],
+    cascade: u64,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> bool {
+    if dirty.is_empty() {
+        if cache.cascade != cascade {
+            return false;
+        }
+        note_paint_patch();
+        return true;
+    }
+    let mut styles = Vec::with_capacity(dirty.len());
+    for id in dirty {
+        let style = crate::dom::with_document(|document| document.computed_style_for(*id));
+        let Some(old) = component_style(&cache.component, id.as_u32()) else {
+            return false;
+        };
+        if !paint_geometry_edit(old, &style) || !style_patch_is_safe(&style) {
+            return false;
+        }
+        styles.push((id.as_u32(), style));
+    }
+    for (id, style) in &styles {
+        if !assign_layout_style(&mut cache.component, *id, style) {
+            return false;
+        }
+        let Some(index) = cache.node_ids.iter().position(|node| node == id) else {
+            return false;
+        };
+        if !cache
+            .engine
+            .patch_style(index, style, viewport_w, viewport_h)
+        {
+            return false;
+        }
+    }
+    let flat = pre_flatten(&cache.component);
+    if flat.len() != cache.node_ids.len()
+        || flat
+            .iter()
+            .zip(&cache.node_ids)
+            .any(|(info, id)| flat_host_id(info) != *id)
+    {
+        return false;
+    }
+    let Ok(results) = cache
+        .engine
+        .compute(&cache.component, &flat, viewport_w, viewport_h)
+    else {
+        return false;
+    };
+    write_rects(&flat, &results.layout_cache);
+    cache.results = results;
+    cache.cascade = cascade;
+    note_paint_patch();
+    true
+}
+
+fn flat_host_id(info: &crate::layout::FlatNodeInfo<'_>) -> u32 {
+    match info.on_click {
+        EventAction::NativeHost { id, .. } => u32::try_from(*id).unwrap_or(u32::MAX),
+        _ => u32::MAX,
+    }
+}
+
+/// True when `new` differs from `old` only in fields the retained Taffy
+/// style can absorb. Inherited paint fields (color, font, writing mode)
+/// stay in the comparison, so those edits rebuild the component tree.
+fn paint_geometry_edit(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    if old == new {
+        return true;
+    }
+    let mut left = old.clone();
+    let mut right = new.clone();
+    neutralize_paint_geometry(&mut left);
+    neutralize_paint_geometry(&mut right);
+    left == right
+}
+
+fn neutralize_paint_geometry(style: &mut w3cos_std::style::Style) {
+    use w3cos_std::style::{AlignSelf, Edges};
+    style.top = Dimension::Auto;
+    style.right = Dimension::Auto;
+    style.bottom = Dimension::Auto;
+    style.left = Dimension::Auto;
+    style.width = Dimension::Auto;
+    style.height = Dimension::Auto;
+    style.min_width = Dimension::Auto;
+    style.min_height = Dimension::Auto;
+    style.max_width = Dimension::Auto;
+    style.max_height = Dimension::Auto;
+    style.margin = Edges::ZERO;
+    style.padding = Edges::ZERO;
+    style.flex_grow = 0.0;
+    style.flex_shrink = 0.0;
+    style.flex_basis = Dimension::Auto;
+    style.gap = 0.0;
+    style.row_gap = None;
+    style.column_gap = None;
+    style.order = 0;
+    style.z_index = 0;
+    style.align_self = AlignSelf::Auto;
+}
+
+#[cfg(test)]
+mod paint_layout_tests {
+    use super::*;
+    use w3cos_dom::node::NodeId;
+
+    fn host_rect(
+        component: &Component,
+        results: &crate::layout::LayoutResults,
+        id: u32,
+    ) -> crate::layout::LayoutRect {
+        let flat = pre_flatten(component);
+        results
+            .layout_cache
+            .iter()
+            .find_map(|(rect, index)| {
+                let info = flat.get(*index)?;
+                (flat_host_id(info) == id).then_some(*rect)
+            })
+            .unwrap_or_else(|| panic!("node {id} has no layout rect"))
+    }
+
+    fn paint_rect(id: u32) -> crate::layout::LayoutRect {
+        with_paint_layout(1024.0, 768.0, |component, results| {
+            Ok(host_rect(component, results, id))
+        })
+        .expect("paint layout")
+    }
+
+    fn fresh_rect(id: u32) -> crate::layout::LayoutRect {
+        let component = crate::dom::to_component_tree();
+        let results = crate::layout::compute_with_scroll_details(&component, 1024.0, 768.0)
+            .expect("full layout");
+        host_rect(&component, &results, id)
+    }
+
+    fn component_color(component: &Component, id: u32) -> Option<w3cos_std::color::Color> {
+        if host_id(component) == Some(id) {
+            return Some(component.style.color);
+        }
+        component
+            .children
+            .iter()
+            .find_map(|child| component_color(child, id))
+    }
+
+    #[test]
+    fn absolute_top_patches_and_matches_full_layout() {
+        crate::dom::reset_document();
+        let layer = crate::dom::create_element("div");
+        crate::dom::set_style_property(layer, "position", "relative");
+        crate::dom::set_style_property(layer, "width", "400px");
+        crate::dom::set_style_property(layer, "height", "200px");
+        let box_node = crate::dom::create_element("div");
+        for (name, value) in [
+            ("position", "absolute"),
+            ("width", "16px"),
+            ("height", "16px"),
+            ("left", "8px"),
+            ("top", "0px"),
+            ("background", "#3366ff"),
+        ] {
+            crate::dom::set_style_property(box_node, name, value);
+        }
+        crate::dom::append_child(layer, box_node);
+        crate::dom::append_child(crate::dom::body_id(), layer);
+
+        let (rebuilds, patches) = paint_layout_stats();
+        let first = paint_rect(box_node);
+        crate::dom::set_style_property(box_node, "top", "40px");
+        let second = paint_rect(box_node);
+        let (rebuilds_after, patches_after) = paint_layout_stats();
+        assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
+        assert_eq!(
+            patches_after - patches,
+            1,
+            "absolute top must patch, not rebuild"
+        );
+        assert!(
+            second.y > first.y + 30.0,
+            "top 40px must move the box, {first:?} -> {second:?}"
+        );
+        let fresh = fresh_rect(box_node);
+        assert!(
+            (second.x - fresh.x).abs() < 0.05
+                && (second.y - fresh.y).abs() < 0.05
+                && (second.width - fresh.width).abs() < 0.05
+                && (second.height - fresh.height).abs() < 0.05,
+            "retained rect {second:?} diverges from full layout {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_color_rebuilds_descendant_style() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        crate::dom::set_style_property(parent, "color", "red");
+        let child = crate::dom::create_element("div");
+        crate::dom::set_style_property(child, "width", "20px");
+        crate::dom::set_style_property(child, "height", "20px");
+        crate::dom::append_child(parent, child);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+
+        let _ = paint_rect(child);
+        let (rebuilds, patches) = paint_layout_stats();
+        crate::dom::set_style_property(parent, "color", "blue");
+        let painted = with_paint_layout(1024.0, 768.0, |component, _| {
+            Ok(component_color(component, child).expect("child style"))
+        })
+        .expect("paint");
+        let expected = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(child)).color
+        });
+        let (rebuilds_after, patches_after) = paint_layout_stats();
+        assert_eq!(painted, expected, "descendant color must follow the parent");
+        assert_eq!(rebuilds_after - rebuilds, 1, "inherited color must rebuild");
+        assert_eq!(patches_after, patches);
+    }
+
+    #[test]
+    fn appended_box_is_in_the_next_paint_layout() {
+        crate::dom::reset_document();
+        let first = crate::dom::create_element("div");
+        crate::dom::set_style_property(first, "width", "10px");
+        crate::dom::set_style_property(first, "height", "10px");
+        crate::dom::append_child(crate::dom::body_id(), first);
+        let _ = paint_rect(first);
+        let (rebuilds, _) = paint_layout_stats();
+        let second = crate::dom::create_element("div");
+        crate::dom::set_style_property(second, "width", "12px");
+        crate::dom::set_style_property(second, "height", "14px");
+        crate::dom::append_child(crate::dom::body_id(), second);
+        let rect = paint_rect(second);
+        let (rebuilds_after, _) = paint_layout_stats();
+        assert!(rect.width > 10.0 && rect.height > 12.0, "{rect:?}");
+        assert_eq!(rebuilds_after - rebuilds, 1, "tree shape must rebuild");
+    }
 }

@@ -33,9 +33,23 @@ fn render_document_rgba_inner(width: u32, height: u32, force_cpu: bool) -> Resul
         bail!("headless viewport dimensions must be positive");
     }
 
-    let root = crate::dom::to_component_tree();
-    let flat = layout::pre_flatten(&root);
-    let layout_results = layout::compute_with_scroll_details(&root, width as f32, height as f32)?;
+    crate::incremental_layout::with_paint_layout(
+        width as f32,
+        height as f32,
+        |root, layout_results| {
+            finish_headless_frame(width, height, force_cpu, root, layout_results)
+        },
+    )
+}
+
+fn finish_headless_frame(
+    width: u32,
+    height: u32,
+    force_cpu: bool,
+    root: &w3cos_std::Component,
+    layout_results: &layout::LayoutResults,
+) -> Result<HeadlessFrame> {
+    let flat = layout::pre_flatten(root);
     let layout_cache = &layout_results.layout_cache;
     if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
         for (rect, index) in layout_cache {
