@@ -1819,9 +1819,15 @@ impl Document {
     pub fn set_layout_rect(&mut self, id: NodeId, rect: DOMRect) {
         let idx = id.0 as usize;
         if idx < self.layout_rects.len() {
+            // Relayout rewrites every rect it visits; an unchanged rect keeps
+            // the cached overflow extent of its ancestors valid (Blink only
+            // recomputes overflow for boxes whose geometry changed).
+            let moved = self.layout_rects[idx] != rect;
             self.layout_rects[idx] = rect;
             self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
-            self.mark_extent_dirty(id);
+            if moved {
+                self.mark_extent_dirty(id);
+            }
         }
     }
 
