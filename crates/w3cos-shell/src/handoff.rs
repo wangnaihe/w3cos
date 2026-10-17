@@ -337,6 +337,23 @@ pub fn local_fingerprint() -> String {
     STORE.with(|slot| slot.borrow().local.fingerprint())
 }
 
+/// Spec `did:key` of this device's Ed25519 signing key. Pairing still matches
+/// [`local_fingerprint`]; this value is only shown beside it.
+pub fn local_did_key() -> String {
+    w3cos_p2p::DeviceIdentity::from_seed(device_seed()).did_key()
+}
+
+/// Spec `did:key` for a peer's stored Ed25519 key, for the pairing screen.
+/// A record that never carried that key stays without one. Nothing here
+/// writes the fingerprint or any other stored field.
+pub fn peer_display_did(peer: &Peer) -> Option<String> {
+    if peer.ed25519 == [0; 32] {
+        None
+    } else {
+        Some(w3cos_p2p::did_key_ed25519(&peer.ed25519))
+    }
+}
+
 /// The 32-byte device seed. Pairing still spells the X25519 key; this does
 /// not change [`fingerprint`].
 pub fn device_seed() -> [u8; 32] {
@@ -877,6 +894,23 @@ pub fn demo_pending() {
         peer.fingerprint(),
         hex_key(&peer.public_bytes()),
         now_unix() + CODE_TTL_SECS
+    );
+    let _ = note_announcement(&packet, now_unix());
+}
+
+/// A current announcement: the letter fingerprint stays the pairing id, and
+/// the Ed25519 key rides along so the screen can show its `did:key`.
+pub fn demo_pending_signed() {
+    let seed = [9; 32];
+    let peer = DeviceKey::from_seed(seed);
+    let identity = w3cos_p2p::DeviceIdentity::from_seed(seed);
+    let packet = format!(
+        "W3COS1\t手机\t{}\t{}\tdemo\t{}\t{}\t{}",
+        peer.fingerprint(),
+        hex_key(&peer.public_bytes()),
+        now_unix() + CODE_TTL_SECS,
+        identity.peer_id,
+        hex_key(&identity.ed25519_public),
     );
     let _ = note_announcement(&packet, now_unix());
 }
@@ -1811,5 +1845,52 @@ mod tests {
         let svg = pairing_qr_svg();
         assert!(svg.contains("<svg"), "{svg}");
         assert!(!svg.contains("已连接"));
+    }
+
+    #[test]
+    fn showing_the_spec_did_does_not_rewrite_a_stored_peer() {
+        reset_for_tests();
+        let fingerprint = local_fingerprint();
+        let did = local_did_key();
+        assert_ne!(did, fingerprint);
+        assert!(did.starts_with("did:key:z"));
+        assert_eq!(
+            w3cos_p2p::ed25519_public_from_did(&did),
+            Some(w3cos_p2p::DeviceIdentity::from_seed(device_seed()).ed25519_public)
+        );
+        assert_eq!(local_fingerprint(), fingerprint);
+        let packet = announcement("live", now_unix() + 30);
+        assert!(packet.contains(&fingerprint), "{packet}");
+        assert!(!packet.contains(&did), "{packet}");
+
+        demo_pending();
+        let legacy = peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .unwrap();
+        let legacy_fingerprint = legacy.fingerprint.clone();
+        assert_eq!(legacy.ed25519, [0; 32]);
+        assert!(peer_display_did(&legacy).is_none());
+        assert_eq!(legacy.fingerprint, legacy_fingerprint);
+        assert_ne!(legacy.fingerprint, did);
+
+        demo_pending_signed();
+        let signed = peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .unwrap();
+        let expected = w3cos_p2p::DeviceIdentity::from_seed([9; 32]).did_key();
+        assert_eq!(signed.fingerprint, legacy_fingerprint);
+        assert_ne!(signed.fingerprint, expected);
+        assert_eq!(
+            peer_display_did(&signed).as_deref(),
+            Some(expected.as_str())
+        );
+        let again = peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .unwrap();
+        assert_eq!(again.fingerprint, legacy_fingerprint);
+        assert_eq!(again.ed25519, signed.ed25519);
     }
 }
