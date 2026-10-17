@@ -3571,6 +3571,37 @@ fn query_selector_scoped(scope: Option<u32>, selector: &str, limit: usize) -> Ve
     if runtime_parts.as_ref().is_some_and(|parts| parts.is_empty()) {
         return Vec::new();
     }
+    if runtime_parts.is_none() {
+        // Parse once, walk sibling links (Blink SelectorQuery).
+        return dom::with_document(|document| {
+            let mut matches = Vec::new();
+            let root = match scope {
+                Some(scope) => NodeId::from_u32(scope),
+                None => {
+                    let root = NodeId::from_u32(document_element_id());
+                    if document.get_node(root).node_type == w3cos_dom::node::NodeType::Element
+                        && document.matches_selector(root, selector) == Ok(true)
+                    {
+                        matches.push(root.as_u32());
+                    }
+                    root
+                }
+            };
+            if matches.len() < limit {
+                matches.extend(
+                    w3cos_dom::stylesheet::query_selector_descendants(
+                        selector,
+                        document,
+                        root,
+                        limit - matches.len(),
+                    )
+                    .into_iter()
+                    .map(|id| id.as_u32()),
+                );
+            }
+            matches
+        });
+    }
     let candidates = scope.map_or_else(
         || inclusive_descendant_elements(document_element_id()),
         descendant_elements,

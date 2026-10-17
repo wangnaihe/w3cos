@@ -1235,6 +1235,67 @@ pub fn selector_matches_node_with_target(
     }))
 }
 
+/// `querySelector[All]` over the descendants of `scope` in tree order.
+/// Like Blink's SelectorQuery the group is parsed once (not per candidate)
+/// and the walk follows sibling links without collecting the subtree.
+/// A selector that does not parse matches nothing, as per-node matching did.
+pub fn query_selector_descendants(
+    selector: &str,
+    document: &Document,
+    scope: NodeId,
+    limit: usize,
+) -> Vec<NodeId> {
+    let mut matches = Vec::new();
+    let selector = trim_css_whitespace(selector);
+    if selector.is_empty() || selector.starts_with(',') || selector.ends_with(',') {
+        return matches;
+    }
+    let Some(parsed) = split_selector_group(selector)
+        .into_iter()
+        .map(|single| parse_selector_chain_cached(&single))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return matches;
+    };
+    let next_in_subtree = |node: NodeId| -> Option<NodeId> {
+        if let Some(child) = document.get_node(node).first_child {
+            return Some(child);
+        }
+        let mut current = node;
+        while current != scope {
+            let current_node = document.get_node(current);
+            if let Some(next) = crate::node::sib(current_node.next_sibling) {
+                return Some(next);
+            }
+            current = current_node.parent?;
+        }
+        None
+    };
+    let mut cursor = document.get_node(scope).first_child;
+    while let Some(node) = cursor {
+        if document.get_node(node).node_type == NodeType::Element
+            && parsed.iter().any(|parsed| {
+                matches_chain_node(
+                    document,
+                    node,
+                    &parsed.chain,
+                    &parsed.combinators,
+                    parsed.chain.len() - 1,
+                    None,
+                    None,
+                )
+            })
+        {
+            matches.push(node);
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        cursor = next_in_subtree(node);
+    }
+    matches
+}
+
 /// Match prefixes of a relative selector under a reference element. This is
 /// the legacy Selectors API overload exercised by the upstream WPT: the
 /// reference element supplies the implicit scope, and nodes on a matching
