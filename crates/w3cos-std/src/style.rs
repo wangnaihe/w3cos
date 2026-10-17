@@ -110,7 +110,12 @@ pub struct CssClipRect {
 /// computed style for inheritance no longer deep-copies the map; the first
 /// mutation through `DerefMut` unshares it.
 #[derive(Clone, Default)]
-pub struct CustomProperties(std::sync::Arc<std::collections::HashMap<String, String>>);
+pub struct CustomProperties(std::sync::Arc<CustomPropertyMap>);
+
+/// FxHash like Blink's StringHash-keyed HashMap: keys are short CSS names, so a
+/// SipHash per lookup (layout probes `--w3cos-internal-*` markers per box) is
+/// pure overhead.
+pub type CustomPropertyMap = crate::fxhash::FxHashMap<String, String>;
 
 impl CustomProperties {
     pub fn new() -> Self {
@@ -148,7 +153,7 @@ impl CustomProperties {
 }
 
 impl std::ops::Deref for CustomProperties {
-    type Target = std::collections::HashMap<String, String>;
+    type Target = CustomPropertyMap;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -174,24 +179,30 @@ impl std::fmt::Debug for CustomProperties {
     }
 }
 
+impl From<CustomPropertyMap> for CustomProperties {
+    fn from(map: CustomPropertyMap) -> Self {
+        Self(std::sync::Arc::new(map))
+    }
+}
+
 impl From<std::collections::HashMap<String, String>> for CustomProperties {
     fn from(map: std::collections::HashMap<String, String>) -> Self {
-        Self(std::sync::Arc::new(map))
+        Self(std::sync::Arc::new(map.into_iter().collect()))
     }
 }
 
 impl From<CustomProperties> for std::collections::HashMap<String, String> {
     fn from(props: CustomProperties) -> Self {
-        std::sync::Arc::try_unwrap(props.0).unwrap_or_else(|shared| (*shared).clone())
+        std::sync::Arc::try_unwrap(props.0)
+            .unwrap_or_else(|shared| (*shared).clone())
+            .into_iter()
+            .collect()
     }
 }
 
 impl FromIterator<(String, String)> for CustomProperties {
     fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
-        Self::from(
-            iter.into_iter()
-                .collect::<std::collections::HashMap<_, _>>(),
-        )
+        Self::from(iter.into_iter().collect::<CustomPropertyMap>())
     }
 }
 
@@ -211,7 +222,7 @@ impl Serialize for CustomProperties {
 
 impl<'de> Deserialize<'de> for CustomProperties {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        std::collections::HashMap::deserialize(deserializer).map(Self::from)
+        CustomPropertyMap::deserialize(deserializer).map(Self::from)
     }
 }
 

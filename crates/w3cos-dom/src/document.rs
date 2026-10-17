@@ -291,7 +291,10 @@ impl CounterSnapshot {
     }
 }
 
-fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String>) -> String {
+fn resolve_css_variables<S: std::hash::BuildHasher>(
+    value: &str,
+    custom_properties: &HashMap<String, String, S>,
+) -> String {
     let mut current = value.to_string();
     for _ in 0..10 {
         let Some(start) = current.find("var(") else {
@@ -3412,7 +3415,7 @@ impl Document {
                 let Some(property) = crate::css_style::multicol_property_name(property) else {
                     continue;
                 };
-                let empty = HashMap::new();
+                let empty = w3cos_std::style::CustomPropertyMap::default();
                 let value = resolve_css_variables(
                     value,
                     style.custom_properties.as_deref().unwrap_or(&empty),
