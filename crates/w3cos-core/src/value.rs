@@ -3834,8 +3834,19 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
     let mut owned = String::with_capacity(total);
     owned.push_str(left_text);
     owned.push_str(right_text);
+    // V8 only internalizes strings used as keys; a concatenation result is a
+    // fresh sequential string. Interning every large result hashed and copied
+    // it into the never-freed page arena, so `s = s + token` was quadratic in
+    // time and memory. Large results stay heap strings (freed on last use).
+    if total > CONCAT_INTERN_LIMIT {
+        return Value::String(JsString::heap_owned(owned));
+    }
     Value::from_js_string(JsString::intern(&owned))
 }
+
+/// Concatenations up to this many bytes are interned (cheap equality and
+/// property-key reuse); longer ones are plain heap strings.
+const CONCAT_INTERN_LIMIT: usize = 256;
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
