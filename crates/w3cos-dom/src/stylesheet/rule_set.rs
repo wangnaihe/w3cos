@@ -17,6 +17,8 @@ pub(super) struct RuleSet {
     /// Container queries or `[style]` selectors: matching can change
     /// without a class/id/attribute/tree mutation.
     has_match_volatile_rules: bool,
+    /// Some rule declares `transition*`.
+    has_transition_rules: bool,
 }
 
 enum RuleBucket<'a> {
@@ -76,6 +78,7 @@ impl RuleSet {
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
         self.has_match_volatile_rules = false;
+        self.has_transition_rules = false;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -103,6 +106,10 @@ impl RuleSet {
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
 
+        self.has_transition_rules |= self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, _)| property.starts_with("transition"));
         self.has_match_volatile_rules |= self.rules[index]
             .declarations
             .iter()
@@ -267,6 +274,10 @@ impl RuleSet {
 
     pub(super) fn has_sibling_dependencies(&self) -> bool {
         self.has_sibling_dependencies
+    }
+
+    pub(super) fn has_transition_rules(&self) -> bool {
+        self.has_transition_rules
     }
 
     pub(super) fn has_match_volatile_rules(&self) -> bool {

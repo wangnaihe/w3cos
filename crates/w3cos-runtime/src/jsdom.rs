@@ -13271,6 +13271,16 @@ fn motion_style(node: u32, pseudo: Option<&str>) -> w3cos_std::style::Style {
 
 fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
     let mut snapshots = Vec::new();
+    // `transition` is not inherited: only a rule or this element's inline
+    // style can give it (or its pseudos) one. Blink starts transitions from
+    // the style diff in recalc; here the three-style snapshot is skipped.
+    if !w3cos_dom::stylesheet::has_transition_rules()
+        && !dom::with_document(|document| {
+            document.inline_declares_transition(NodeId::from_u32(node))
+        })
+    {
+        return snapshots;
+    }
     for pseudo in [None, Some("::before"), Some("::after")] {
         let style = motion_style(node, pseudo);
         let Some(transition) = style.transition.clone() else {

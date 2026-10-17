@@ -459,6 +459,9 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     if rules.has_match_volatile_rules() {
         flags |= 16;
     }
+    if rules.has_transition_rules() {
+        flags |= 32;
+    }
     flags
 }
 
@@ -776,6 +779,13 @@ pub(crate) fn matched_rules_survive_inline_style_edits() -> bool {
 }
 
 /// Whether any rules are registered — fast path for the DOM walk.
+/// Some registered rule declares `transition*`. Without one (and without an
+/// inline transition) a class or style edit cannot start a CSS transition,
+/// so callers skip the before/after style snapshots.
+pub fn has_transition_rules() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 32 != 0)
+}
+
 pub fn has_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 1 != 0)
 }

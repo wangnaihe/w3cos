@@ -857,6 +857,17 @@ mod replaced_table_tests;
 mod form_control_tests;
 
 impl Document {
+    /// The element's own inline style sets a transition.
+    pub fn inline_declares_transition(&self, id: NodeId) -> bool {
+        self.styles.get(id.0 as usize).is_some_and(|style| {
+            style.inner.transition.is_some()
+                || style
+                    .inline_declarations
+                    .iter()
+                    .any(|(property, _)| property.starts_with("transition"))
+        })
+    }
+
     /// Identity in [`ChildListChange`] records.
     pub fn serial(&self) -> u64 {
         self.serial
