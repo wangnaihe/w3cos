@@ -22086,6 +22086,8 @@ fn build_taffy_tree(
         );
         let mut separator_breaks = Vec::new();
         let line_prefix = std::cell::OnceCell::new();
+        // Per inline formatting context, not per child (was quadratic).
+        let simple_packet = std::cell::OnceCell::new();
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
             .children
             .iter()
@@ -22784,11 +22786,13 @@ fn build_taffy_tree(
                         separator_breaks.push((c.style.order, source_index, line_break));
                     }
                 }
-                if is_simple_wrapping_text_packet(comp, child_containing_width)
-                    && source_index > 0
+                if source_index > 0
                     && matches!(&c.kind, ComponentKind::Text { content } if content == " ")
                     && c.style.margin.left == WSpacing::Px(0.0)
                     && c.style.margin.right == WSpacing::Px(0.0)
+                    && *simple_packet.get_or_init(|| {
+                        is_simple_wrapping_text_packet(comp, child_containing_width)
+                    })
                     && inline_line_prefix_filled(
                         &line_prefix,
                         &comp.children,
