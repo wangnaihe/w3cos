@@ -176,7 +176,7 @@ struct MatchedPropertiesCache {
     entries: usize,
     styles: HashMap<
         MatchedPropertiesKey,
-        Vec<(w3cos_std::style::Style, w3cos_std::style::Style)>,
+        Vec<(SharedStyle, SharedStyle)>,
         std::hash::BuildHasherDefault<MpcHasher>,
     >,
 }
@@ -195,22 +195,22 @@ impl MatchedPropertiesCache {
         key: &MatchedPropertiesKey,
         epoch: (u64, u64),
         inherited: Option<&w3cos_std::style::Style>,
-    ) -> Option<w3cos_std::style::Style> {
+    ) -> Option<(SharedStyle, SharedStyle)> {
         self.validate(epoch);
         let inherited = inherited?;
         self.styles
             .get(key)?
             .iter()
-            .find(|(parent, _)| parent == inherited)
-            .map(|(_, style)| style.clone())
+            .find(|(parent, _)| same_style(parent, inherited))
+            .cloned()
     }
 
     fn insert(
         &mut self,
         key: MatchedPropertiesKey,
         epoch: (u64, u64),
-        inherited: Option<&w3cos_std::style::Style>,
-        style: &w3cos_std::style::Style,
+        inherited: Option<&SharedStyle>,
+        style: &SharedStyle,
     ) {
         self.validate(epoch);
         let Some(inherited) = inherited else {
@@ -230,11 +230,23 @@ struct StyleForMemo {
     styles: HashMap<u32, w3cos_std::style::Style>,
 }
 
+/// Immutable, reference-counted computed style (Blink's scoped_refptr<const
+/// ComputedStyle>): the per-node cache, the matched-properties cache and the
+/// layout walk share one allocation instead of deep-cloning `Style`.
+pub type SharedStyle = std::rc::Rc<w3cos_std::style::Style>;
+
+/// Parent-style equality with Blink's pointer fast path: styles produced by
+/// the same cache entry are the same allocation.
+#[inline]
+fn same_style(shared: &SharedStyle, other: &w3cos_std::style::Style) -> bool {
+    std::ptr::eq(&**shared, other) || **shared == *other
+}
+
 struct CachedComputedStyle {
     node_revision: u64,
     stylesheet_generation: u64,
-    inherited_style: Option<w3cos_std::style::Style>,
-    style: w3cos_std::style::Style,
+    inherited_style: Option<SharedStyle>,
+    style: SharedStyle,
 }
 
 struct SelectorContextCache {
@@ -2664,12 +2676,34 @@ impl Document {
         _ancestors: &[stylesheet::SelectorContext],
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
+        (*self.computed_style_impl(id, inherited, None)).clone()
+    }
+
+    /// Shared-style variant for walks that hold the parent's `SharedStyle`.
+    pub fn computed_style_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        self.computed_style_impl(id, inherited.map(|style| &**style), inherited)
+    }
+
+    fn computed_style_impl(
+        &self,
+        id: NodeId,
+        inherited: Option<&w3cos_std::style::Style>,
+        inherited_shared: Option<&SharedStyle>,
+    ) -> SharedStyle {
         let node_revision = self.style_revisions[id.0 as usize];
         let stylesheet_generation = stylesheet::generation();
         if let Some(cached) = self.computed_style_cache.borrow().get(&id)
             && cached.node_revision == node_revision
             && cached.stylesheet_generation == stylesheet_generation
-            && cached.inherited_style.as_ref() == inherited
+            && match (&cached.inherited_style, inherited) {
+                (None, None) => true,
+                (Some(parent), Some(inherited)) => same_style(parent, inherited),
+                _ => false,
+            }
         {
             #[cfg(test)]
             self.computed_style_cache_hits
@@ -2711,7 +2745,7 @@ impl Document {
         };
         let mpc_key = self.matched_properties_key(id, inline, &matched_rules, inherited);
         if let Some(key) = &mpc_key
-            && let Some(style) = self.matched_properties_cache.borrow_mut().get(
+            && let Some((parent, style)) = self.matched_properties_cache.borrow_mut().get(
                 key,
                 (stylesheet_generation, self.style_write_epoch),
                 inherited,
@@ -2722,7 +2756,7 @@ impl Document {
                 CachedComputedStyle {
                     node_revision,
                     stylesheet_generation,
-                    inherited_style: inherited.cloned(),
+                    inherited_style: Some(inherited_shared.cloned().unwrap_or(parent)),
                     style: style.clone(),
                 },
             );
@@ -4662,11 +4696,15 @@ impl Document {
                 style.line_height = ratio;
             }
         }
+        let style = SharedStyle::new(style);
+        let inherited_style = inherited_shared
+            .cloned()
+            .or_else(|| inherited.map(|parent| SharedStyle::new(parent.clone())));
         if let Some(key) = mpc_key {
             self.matched_properties_cache.borrow_mut().insert(
                 key,
                 (stylesheet_generation, self.style_write_epoch),
-                inherited,
+                inherited_style.as_ref(),
                 &style,
             );
         }
@@ -4675,7 +4713,7 @@ impl Document {
             CachedComputedStyle {
                 node_revision,
                 stylesheet_generation,
-                inherited_style: inherited.cloned(),
+                inherited_style,
                 style: style.clone(),
             },
         );
@@ -4780,7 +4818,7 @@ impl Document {
             return None;
         }
         Some(std::cell::Ref::map(cache, |cache| {
-            &cache.get(&id).expect("style cache entry").style
+            &*cache.get(&id).expect("style cache entry").style
         }))
     }
 
@@ -4854,6 +4892,15 @@ impl Document {
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
         self.computed_style(id, &[], inherited)
+    }
+
+    /// `computed_style_inherited` for walks that keep styles shared.
+    pub fn computed_style_inherited_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        self.computed_style_shared(id, inherited)
     }
 
     fn apply_font_size_minimums(&self, style: &mut w3cos_std::Style) {
