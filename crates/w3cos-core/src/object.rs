@@ -62,6 +62,11 @@ pub struct JsObject {
 }
 
 impl JsObject {
+    #[inline]
+    pub(crate) fn heap_allocation(&self) -> &HeapAllocation {
+        &self.heap_allocation
+    }
+
     pub fn new() -> Self {
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         Self {

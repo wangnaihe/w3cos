@@ -92,7 +92,8 @@ TS/JS（ESM + CommonJS） ─SWC parse─▶ 类型收集（tsc Program / .d.ts 
 - **调试构建的环检测器**（`--features leak-detector`，release 不编入、零开销）：周期性做试探性删除（trial deletion）扫描，发现不可达环时报告**完整的保留引用链**（源码位置：哪个闭包/字段/监听器持有），输出 JSON 供 CI 和 IDE 跳转。
 - **lint/codemod `w3cos leak-lint`**：基于 SWC 静态分析标记常见隐式环：闭包捕获 `this` 后注册到长生命周期对象、`addEventListener`/`onDidX` 无对应移除或未进入 `DisposableStore`、父↔子双向强引用、`Disposable` 未 dispose/未注册、`Map` 缓存以对象为值无淘汰。可给出 codemod（改为 `WeakRef`/`WeakMap`、补 `dispose`）。
 - **上游泄漏处理**：VS Code、扩展、npm 依赖里发现的环，fork 后用 WeakRef/显式 dispose 修复，进补丁队列，能上游的提 PR 上游（见 M1）。
-- 代价要说清：引用计数在多态热路径上有计数开销；`FinalizationRegistry` 回调时机在引用计数下是确定的（比规范更早），需在兼容报告中注明。
+- 代价要说清：引用计数在多态热路径上有计数开销；`FinalizationRegistry` 回调时机在引用计数下是确定的（比规范更早），需在兼容报告中注明。已实现：目标的最后一个强引用释放后，在下一个 job checkpoint（微任务清空后）交付，顺序见 `weak.rs` 模块文档。
+- 注意：page arena 里的普通 AOT 值目前到页面 reset 才释放，见 M1 item 4a。
 
 ### 3.3 WebAssembly
 VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。接入 `wasmtime`（Cranelift，AOT 预编译 `.cwasm` 缓存）作为 `WebAssembly.*` 的实现，与 §3.1 后端 B 共享 Cranelift。
@@ -173,7 +174,18 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 
 ### M1 编译器与内存模型地基（引用计数 + WeakRef）
 4. 确定性引用计数语义：明确释放时机规范、AOT 冗余 inc/dec 消除、大对象图延迟批量释放（避免长停顿）。
-5. `WeakRef` / `FinalizationRegistry` / `WeakMap` / `WeakSet` 完整实现 + test262 相关用例。
+   - **现状更正（M1 第一个 PR 核实）**：普通 AOT 对象字面量、数组和闭包（`Value::object`/`Value::array`/`Value::function`）分配在 page arena 里，句柄是 `Copy` 的 `u32`，**不计数，页面 reset 前不会释放**；只有宿主 `Rc` 值（DOM 包装、`Value::callable`、宿主数组等）是真正的引用计数。所以"最后一个强引用消失立即释放"目前只对宿主值成立。**4a（待做，M1 最大的一块）**：让 arena 值也计数或可回收（例如 slab 槽位 + 计数句柄，或逃逸分析证明不逃逸的才进 arena），否则 VS Code 长跑内存只增不减。
+5. ~~`WeakRef` / `FinalizationRegistry` / `WeakMap` / `WeakSet` 完整实现~~ **已完成（M1 PR 1）**：
+   - 原有基础：`w3cos-core/src/weak.rs` 早已基于 `Rc`/`Weak` 实现四个类，编译器 `unique_back_edges.rs` 会把三类常见闭包回边（自挂载、Promise 回调捕获自身、集合迭代器）自动改写成 `WeakRef`。
+   - **确定性 finalization**：每个堆分配的 `HeapAllocation` 带一个 48 位、永不复用的弱身份 id（塞进已有的对齐空洞，对象大小不变）。被弱引用过的对象在 `Drop` 时只把 id 记进死亡队列（不在 `Drop` 里跑 JS、不重入）；下一个 job checkpoint（`drain_microtasks` 清空微任务后）统一处理并按"死亡顺序 → 同一目标按注册顺序"调用 `FinalizationRegistry` 回调，每个回调独立 panic 边界，回调里排的微任务在下一批回调前清空。`cleanupSome()` 保留，可同步交付本 registry 的待处理项；`unregister()` 同时取消已死但未交付的项；registry 自身死亡后不再回调。`FinalizationRegistry.cleanupMode` 现在是 `"automatic"`。
+   - **O(1) `WeakMap`/`WeakSet`**：以弱身份 id 为键的哈希表，无线性扫描；键死亡时通过反向索引立即删除条目并释放值（O(持有者数)）。集合实例自己死亡时（包括 page reset）释放整张表——修掉了旧实现里 `WeakRef`/`WeakMap` 状态表永不释放的泄漏（AOT 每个弱化捕获都会建一个 `WeakRef`）。
+   - 基准（`cargo run --release -p w3cos-core --example weakmap_bench`，100k 个宿主 `Rc` 键，x86_64 Linux，release）：
+     | | set ×100k | get ×100k |
+     |---|---|---|
+     | 旧（`Vec` 线性查找 + 每次 retain） | 420.3 s（4.2 ms/次） | 447.9 s（4.5 ms/次） |
+     | 新（id 哈希表） | 40.6–52.2 ms（≈0.4–0.5 µs/次） | 22.4–25.3 ms（≈0.23 µs/次） |
+     旧实现是 O(n²)：10k 键时 set 2.6 s、30k 键时 25.5 s。
+   - test262 相关用例并入 item 14 的门禁。
 6. 调试构建环检测器（trial deletion），报告保留引用链与源码位置；release 构建不编入（CI 检查二进制符号）。
 7. 泄漏 CI：每个场景堆差分 + 每晚 8 小时 soak，结果入 `docs/perf/`。
 8. `w3cos leak-lint` + codemod：闭包捕获 `this`、未移除监听器、父↔子强引用、Disposable 模式。

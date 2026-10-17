@@ -148,6 +148,11 @@ impl Drop for HeapScope {
 /// Lifetime ticket embedded in a Core heap allocation.
 pub(crate) struct HeapAllocation {
     kind: HeapKind,
+    /// Low/high halves of the 48-bit weak-identity id (0 = never watched).
+    /// Split so the id packs into the padding next to `kind` and every heap
+    /// payload stays the same size.
+    watch_lo: std::cell::Cell<u32>,
+    watch_hi: std::cell::Cell<u16>,
     bytes: std::cell::Cell<usize>,
     owner: Option<Rc<RefCell<HeapCounters>>>,
 }
@@ -161,9 +166,33 @@ impl HeapAllocation {
         }
         Self {
             kind,
+            watch_lo: std::cell::Cell::new(0),
+            watch_hi: std::cell::Cell::new(0),
             bytes: std::cell::Cell::new(bytes),
             owner,
         }
+    }
+
+    /// Stable weak identity already assigned to this allocation, if any.
+    #[inline]
+    pub(crate) fn existing_watch_id(&self) -> Option<u64> {
+        let id = u64::from(self.watch_lo.get()) | (u64::from(self.watch_hi.get()) << 32);
+        (id != 0).then_some(id)
+    }
+
+    /// Stable weak identity for WeakMap/WeakSet/WeakRef/FinalizationRegistry.
+    ///
+    /// Ids are thread-local, monotonic and never reused, so a dead key can
+    /// never alias a live one. Once assigned, dropping this allocation posts
+    /// a death notice that [`crate::weak`] processes at the next checkpoint.
+    pub(crate) fn watch_id(&self) -> u64 {
+        if let Some(id) = self.existing_watch_id() {
+            return id;
+        }
+        let id = crate::weak::next_watch_id();
+        self.watch_lo.set(id as u32);
+        self.watch_hi.set((id >> 32) as u16);
+        id
     }
 
     pub(crate) fn set_bytes(&self, new_bytes: usize) {
@@ -180,6 +209,10 @@ impl HeapAllocation {
 
 impl Drop for HeapAllocation {
     fn drop(&mut self) {
+        if let Some(id) = self.existing_watch_id() {
+            // Only records the id: never runs JS or touches weak tables here.
+            crate::weak::note_death(id);
+        }
         let bytes = self.bytes.get();
         let _ = GLOBAL_HEAP.try_with(|heap| heap.borrow_mut().deallocate(self.kind, bytes));
         if let Some(owner) = &self.owner {
