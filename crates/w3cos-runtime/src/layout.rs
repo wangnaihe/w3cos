@@ -987,6 +987,10 @@ pub struct FlatNodeInfo<'a> {
     pub on_click: &'a EventAction,
     pub sticky_counter_signal: Option<usize>,
     pub parent: Option<usize>,
+    /// One past the last preorder descendant (LayoutNG walks children via
+    /// box-tree links; here a node's subtree is the contiguous range
+    /// `index + 1..subtree_end`, so child scans need not reach `flat.len()`).
+    pub subtree_end: usize,
 }
 
 pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
@@ -4334,6 +4338,7 @@ fn pre_flatten_recursive<'a>(
         on_click: &comp.on_click,
         sticky_counter_signal: comp.sticky_counter_signal,
         parent,
+        subtree_end: my_idx + 1,
     });
     for (child_index, child) in comp.children.iter().enumerate() {
         // FNV-1a over the child ordinal gives each persistent tree slot an
@@ -4345,6 +4350,7 @@ fn pre_flatten_recursive<'a>(
         }
         pre_flatten_recursive(child, Some(my_idx), child_id, out);
     }
+    out[my_idx].subtree_end = out.len();
 }
 
 // ---------------------------------------------------------------------------
@@ -6410,6 +6416,12 @@ fn project_collapsed_table_row_rects(
         }
         false
     };
+    // Every container below only acts when one of its rows collapses.
+    if !flat.iter().any(|node| {
+        node.style.display == WDisplay::TableRow && node.style.visibility == WVisibility::Collapse
+    }) {
+        return;
+    }
     for container in 0..flat.len() {
         if !matches!(
             flat[container].style.display,
@@ -6424,6 +6436,8 @@ fn project_collapsed_table_row_rects(
         let rows = flat
             .iter()
             .enumerate()
+            .take(flat[container].subtree_end)
+            .skip(container + 1)
             .filter(|(index, node)| {
                 node.style.display == WDisplay::TableRow && is_descendant_of(*index, container)
             })
@@ -11999,7 +12013,7 @@ fn project_float_followed_by_clearing_block_height(
             let last_rect = layouts[last_position].0;
             layouts[parent_position].0.height = (last_rect.y - parent_rect.y).max(0.0);
             if let Some(parent_of_parent) = flat[index].parent {
-                let outer_children = (parent_of_parent + 1..flat.len())
+                let outer_children = (parent_of_parent + 1..flat[parent_of_parent].subtree_end)
                     .filter(|child| flat[*child].parent == Some(parent_of_parent))
                     .collect::<Vec<_>>();
                 if let Some(slot) = outer_children.iter().position(|child| *child == index) {
@@ -12067,7 +12081,7 @@ fn project_float_followed_by_clearing_block_height(
         {
             continue;
         }
-        let direct = (parent + 1..flat.len())
+        let direct = (parent + 1..flat[parent].subtree_end)
             .filter(|child| flat[*child].parent == Some(parent))
             .collect::<Vec<_>>();
         let Some(clear_slot) = direct.iter().position(|child| {
@@ -12113,7 +12127,7 @@ fn project_float_followed_by_clearing_block_height(
         let target_height = (target_bottom - parent_rect.y + 1.0).max(0.0);
         layouts[parent_position].0.height = target_height;
         if let Some(parent_of_parent) = flat[parent].parent {
-            let outer_children = (parent_of_parent + 1..flat.len())
+            let outer_children = (parent_of_parent + 1..flat[parent_of_parent].subtree_end)
                 .filter(|child| flat[*child].parent == Some(parent_of_parent))
                 .collect::<Vec<_>>();
             if let Some(slot) = outer_children.iter().position(|child| *child == parent) {
@@ -13722,7 +13736,7 @@ fn project_bottom_aligned_float_inline_rows(
             continue;
         };
         let rect = layouts[container_position].0;
-        let children = (container + 1..flat.len())
+        let children = (container + 1..flat[container].subtree_end)
             .filter(|child| flat[*child].parent == Some(container))
             .collect::<Vec<_>>();
         let floats = children
@@ -13883,7 +13897,7 @@ fn project_staggered_float_inline_bands(
         let Some(container_position) = positions[container] else {
             continue;
         };
-        let children = (container + 1..flat.len())
+        let children = (container + 1..flat[container].subtree_end)
             .filter(|child| flat[*child].parent == Some(container))
             .collect::<Vec<_>>();
         let floats = children
@@ -19210,6 +19224,8 @@ fn project_table_column_background_rects(
         let mut rows = flat
             .iter()
             .enumerate()
+            .take(table_node.subtree_end)
+            .skip(table + 1)
             .filter(|(index, node)| {
                 node.style.display == WDisplay::TableRow
                     && node.style.visibility != WVisibility::Collapse
@@ -19220,6 +19236,8 @@ fn project_table_column_background_rects(
                 let cells = flat
                     .iter()
                     .enumerate()
+                    .take(flat[index].subtree_end)
+                    .skip(index + 1)
                     .filter(|(_, node)| {
                         node.parent == Some(index) && node.style.display == WDisplay::TableCell
                     })

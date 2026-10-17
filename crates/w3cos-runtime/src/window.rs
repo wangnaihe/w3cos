@@ -6958,7 +6958,7 @@ fn paint_nodes_as_flat<'a>(
     nodes: &'a [PaintNode],
     dummy_action: &'a EventAction,
 ) -> Vec<layout::FlatNodeInfo<'a>> {
-    nodes
+    let mut flat: Vec<layout::FlatNodeInfo<'a>> = nodes
         .iter()
         .filter(|node| !node.is_paint_only())
         .map(|node| layout::FlatNodeInfo {
@@ -6968,8 +6968,16 @@ fn paint_nodes_as_flat<'a>(
             on_click: dummy_action,
             sticky_counter_signal: node.sticky_counter_signal,
             parent: node.parent,
+            subtree_end: 0,
         })
-        .collect()
+        .collect();
+    // Paint-only filtering does not keep preorder ranges; scans stay
+    // bounded by the whole list here.
+    let len = flat.len();
+    for node in &mut flat {
+        node.subtree_end = len;
+    }
+    flat
 }
 
 #[cfg(test)]
