@@ -422,8 +422,96 @@ pub(super) fn preferred_host_face() -> Option<PreferredHostFace> {
         let (path, _) = fontconfig_match_named(
             "PingFang SC,Microsoft YaHei,Noto Sans CJK SC,Noto Sans SC,Noto Sans,Roboto,sans-serif:weight=regular:slant=0",
         )?;
+        return single_file_host_face(&[path]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_pingfang_files().and_then(|files| single_file_host_face(&files));
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos"
+    )))]
+    {
+        None
+    }
+}
+
+/// macOS ships PingFang SC, the first host UI family, as a downloadable
+/// asset. fontdb's `load_system_fonts` walks `/Library/Fonts`,
+/// `/System/Library/Fonts`, every `AssetsV2/com_apple_MobileAsset_Font*`
+/// and `~/Library/Fonts`; its query picks the first listed family that has
+/// faces. When PingFang only lives in the asset directories, loading just
+/// those files selects the same face without parsing every installed font.
+#[cfg(target_os = "macos")]
+fn macos_pingfang_files() -> Option<Vec<std::path::PathBuf>> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, any_pingfang: &mut bool) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out, any_pingfang);
+            } else if path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("pingfang")
+            }) {
+                *any_pingfang = true;
+                out.push(path);
+            }
+        }
+    }
+    // A PingFang file in a directory fontdb scans first would win ties.
+    let home_fonts = std::env::var("HOME")
+        .map(|home| std::path::Path::new(&home).join("Library/Fonts"))
+        .ok();
+    for dir in [
+        "/Library/Fonts",
+        "/System/Library/Fonts",
+        "/Network/Library/Fonts",
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .chain(home_fonts)
+    {
+        let mut found = Vec::new();
+        let mut any = false;
+        walk(&dir, &mut found, &mut any);
+        if any {
+            return None;
+        }
+    }
+    let mut files = Vec::new();
+    let mut any = false;
+    for entry in std::fs::read_dir("/System/Library/AssetsV2")
+        .ok()?
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("com_apple_MobileAsset_Font")
+        {
+            walk(&entry.path(), &mut files, &mut any);
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+/// Accept a one-file match only when its query selects a regular face of a
+/// named host UI family — the same face the full database query returns.
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos"
+))]
+fn single_file_host_face(paths: &[std::path::PathBuf]) -> Option<PreferredHostFace> {
+    {
         let mut database = fontdb::Database::new();
-        database.load_font_file(&path).ok()?;
+        for path in paths {
+            database.load_font_file(path).ok()?;
+        }
         let families = [
             fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[0]),
             fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[1]),
@@ -454,15 +542,11 @@ pub(super) fn preferred_host_face() -> Option<PreferredHostFace> {
             .clone();
         let index = face.index;
         let bytes = database.with_face_data(id, |data, _| Arc::new(data.to_vec()))?;
-        return Some(PreferredHostFace {
+        Some(PreferredHostFace {
             bytes,
             index,
             family,
-        });
-    }
-    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
-    {
-        None
+        })
     }
 }
 
@@ -705,6 +789,28 @@ fn fontconfig_match(character: char) -> Option<(std::path::PathBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_single_file_host_face_matches_the_full_database_query() {
+        let Some(files) = macos_pingfang_files() else {
+            return;
+        };
+        let fast = single_file_host_face(&files).expect("PingFang regular face");
+        let database = database();
+        let id = database
+            .query(&fontdb::Query {
+                families: &host_ui_families(),
+                ..fontdb::Query::default()
+            })
+            .expect("full query");
+        let face = database.face(id).unwrap();
+        let family = &face.families.first().unwrap().0;
+        assert_eq!(family, &fast.family);
+        assert_eq!(face.index, fast.index);
+        let bytes = database.with_face_data(id, |data, _| data.len()).unwrap();
+        assert_eq!(bytes, fast.bytes.len());
+    }
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     #[test]
