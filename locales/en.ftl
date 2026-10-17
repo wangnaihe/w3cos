@@ -202,6 +202,14 @@ l2-endpoint = Endpoint
 l2-endpoint-default = Not set, not connected
 l2-turn-off = Turn L2 off
 l2-turn-on = Turn L2 on
+infer-backend = Inference
+infer-backend-inferd = Separate process (w3cos-inferd)
+infer-backend-in-process = In this process
+infer-backend-toggle = Run inference in this process
+infer-backend-detail = The default is a separate w3cos-inferd process. A model crash stays there, and that process can be sandboxed away from this window's files and network. In-process inference runs only when this build includes it and this switch is on. That skips the extra process, so a step can start sooner, and the weights use this process's memory. A fault in the engine takes this window with it. This switch does not download weights. A download waits for consent, then keeps the file only when the SHA-256 matches.
+infer-backend-unavailable = This build keeps inference in w3cos-inferd. The in-process engine was not compiled in.
+toast-infer-inferd = Inference stays in w3cos-inferd, a separate process.
+toast-infer-in-process = Inference will run in this process. Weights load only after consent and a matching SHA-256.
 
 open-count = { $count ->
     [one] { $count } open

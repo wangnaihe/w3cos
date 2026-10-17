@@ -5,6 +5,7 @@ pub mod chain;
 mod copy;
 pub mod dom_access;
 pub mod identity;
+pub mod infer;
 pub mod intent;
 #[cfg(feature = "l1")]
 pub mod l1;

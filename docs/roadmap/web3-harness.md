@@ -38,7 +38,7 @@ local signing tool that cannot sign on its own.
 | Permissions | `permissions`, shell permission sheet | Separate from the confirm card. `w3cos-agent-act` and `w3cos-process` are one-shot. The process allowlist is `echo`, `pwd`, and `help`. |
 | Shell receipts | `ActionReceipt`, `ReceiptLedger` | Encrypted file (`W3R1`, ChaCha20-Poly1305). The drawer pages them. They record actor, tier, decision, and time. The device key does not sign these. |
 | Harness receipts | `tool_host::SignedReceipt` | In memory. Confirm, deny, and cancel each append one. The device Ed25519 key signs the canonical JSON. |
-| Model | `docs/AI_HARNESS.md` | Not linked. `w3cos-inferd.sh` starts llama-server. Weights are not in git. |
+| Model | `docs/AI_HARNESS.md`, `w3cos-ai-bridge::infer` | Default is still out of process. `w3cos-inferd.sh` starts llama-server. Weights are not in git. `in-process-infer` plus `W3COS_INFER_BACKEND=in-process` is the only way into the in-process engine. |
 | Gated tool host | `tool_host::ToolHost` | `device_did`, `wallet_address`, `wallet_sign`. `tools/call` proposes. Confirm is not a tool and not a JSON-RPC method. |
 | Sandbox | `sandbox::run`, shell permission sheet | `echo`, `pwd`, and `help` still use the one-shot process grant. Anything else runs in a new user and mount namespace, with an empty environment. Files and the network stay closed until the sheet grants that one run. The wallet stays in the host process. |
 
@@ -51,7 +51,7 @@ L2 stays off in a normal boot. Confirm does not travel with handoff (#94). Unloc
 3. Direct HTTP, the DOM MCP, and the in-process shell tools all propose first. A read does not touch the view until the window confirms. `POST /intent/confirm` is refused. `confirm_intent` is not a tool and `w3cos/confirm` is not a method.
 4. There is no local account and no signing tool. There is also no chain client, which should stay true until a later slice asks for one.
 5. Passkey enrollment checks `clientDataJSON` and the assertion, then installs the canonical `did:key`. The pairing fingerprint and the P2P seed stay where they were. Old receipt actors are not rewritten.
-6. The model cannot be kept in-process without pulling an inference stack into the shell. That split is deliberate and should stay.
+6. The default model stays in `w3cos-inferd`, outside the window process. An in-process engine is compiled only with `in-process-infer` and selected only with `W3COS_INFER_BACKEND=in-process` or the settings switch. It does not link `mistral.rs`, `candle`, or `llama-cpp-2`.
 7. Anything beyond `echo`, `pwd`, and `help` runs in a separate process. Files and the network stay closed unless the permission sheet grants them for that one run. The device key and the wallet stay in the window process.
 8. Host receipts used to live only in memory. The shell sheet now writes them beside the older action rows, and the drawer shows the decision, the `did:key`, and that the device key signed the row. Action receipts written earlier stay unsigned.
 
@@ -97,7 +97,9 @@ Each slice is one review. Later slices do not start inside this one.
 8. **Sign a transaction.** Done. `wallet_sign_tx` proposes decoded fields. Confirm signs a legacy transaction on the device and writes a receipt that does not contain the signed bytes. A second sheet is the only path to `eth_sendRawTransaction`, and only for that signed transaction, and only to the endpoint the person saved. No custodian and no hosted signer.
 9. **Show the spec `did:key` next to the pairing fingerprint.** Keep the letter fingerprint until paired devices can match the new identifier. Do not silently replace stored peer records.
 10. **Sandbox untrusted tools.** Done. Anything beyond `echo`, `pwd`, and `help` opens a permission sheet and runs in another process with an empty environment. A user namespace is used when the kernel allows it. Otherwise Landlock keeps files and TCP closed. Either way, files and the network stay closed unless that sheet grants them for the one run. The wallet is not in the sandbox and is still only reached from confirm.
-11. **Inference stays out of process.** Keep `w3cos-inferd`. Revisit `mistral.rs`, `candle`, or `llama-cpp-2` only when a GPU or NPU backend is actually linked.
+11. **Inference stays out of process by default.** Done. `w3cos-inferd` is the backend when `W3COS_INFER_BACKEND` is unset, `inferd`, or any value other than `in-process`. The `in-process-infer` cargo feature compiles a second backend behind the same `InferenceBackend` trait. `OpenAiPlanner::complete` is still what the agent loop calls. The runtime switch has to ask for in-process as well. A build without the feature refuses that switch and does not load weights into the window. A download runs only after consent, and the file is kept only when its SHA-256 matches.
+
+    A separate process keeps a model crash inside `w3cos-inferd`. That process can be sandboxed so the weights do not see the window's files or network. In-process inference drops the HTTP hop and the second resident runtime, so a step can start with less delay, and the weights sit in the window's memory. A fault in that engine takes the shell with it, and the model is no longer a sandbox boundary. `mistral.rs`, `candle`, and `llama-cpp-2` stay unlinked until a GPU or NPU backend is actually linked. The opt-in engine is a small CPU weight table, not those crates, and it does not run the GGUF.
 
 ## Out of scope here
 

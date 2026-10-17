@@ -25,6 +25,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test workspace libraries and tools
         run: cargo test --workspace --exclude w3cos-compiler --exclude w3cos-runtime
+      - name: Test opt-in in-process inference
+        run: cargo test -p w3cos-ai-bridge --features in-process-infer
       - name: Test required compiler suites
         run: cargo test -p w3cos-compiler --lib --tests
       - name: Test required runtime suites

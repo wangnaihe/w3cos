@@ -14,6 +14,8 @@ default = ["gpu"]
 gpu = ["w3cos-runtime/gpu"]
 cpu-render = ["w3cos-runtime/cpu-render"]
 ai-bridge = ["w3cos-runtime/ai-bridge"]
+# Pass-through. The shell still starts on w3cos-inferd until the runtime switch.
+in-process-infer = ["w3cos-ai-bridge/in-process-infer"]
 
 [dependencies]
 chrono = { workspace = true, features = ["clock"] }

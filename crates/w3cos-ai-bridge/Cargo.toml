@@ -16,6 +16,8 @@ path = "src/bin/w3cos-tool-host.rs"
 [features]
 default = []
 l1 = []
+# Off unless a build asks for it. The default backend stays w3cos-inferd.
+in-process-infer = []
 
 [[bin]]
 name = "w3cos-l2-bench"

@@ -47,6 +47,11 @@ An exact L0 command such as `open files` never calls the model. A `#` selector n
 | `W3COS_L2_API_KEY` | unset | Optional bearer token. |
 | `W3COS_L2_TIMEOUT_SECS` | 120 | Whole-request timeout. |
 | `W3COS_L2_SERVER_PID` | unset | Bench reads this process's `VmRSS`. |
+| `W3COS_INFER_BACKEND` | `inferd` | `inferd` calls `w3cos-inferd`. `in-process` selects the in-process engine only when the crate was built with `in-process-infer`. Any other value stays on `w3cos-inferd`. |
+| `W3COS_INFER_DIR` | unset | Directory for the opt-in weight file `in-process.w3iw`. |
+| `W3COS_INFER_SHA256` | unset | SHA-256 pin. The in-process engine will not score a file that does not match. |
+| `W3COS_INFER_LEN` | unset | Exact byte length of that file. |
+| `W3COS_INFER_MODEL_URL` | unset | Download URL. Nothing is fetched until a caller passes consent. |
 
 `W3COS_L2=script` is a developer fixture with no weights. It is how the unit suite drives the same confirm path.
 
@@ -83,5 +88,5 @@ Ollama is the same HTTP client (`scripts/w3cos-inferd.sh ollama-0.5b`). It was n
 - Streaming tokens into the task center. Steps are appended as each tool finishes. First-token time is measured in the bench.
 - Pixel screenshots as model input. `screenshot` returns a note, not PNG bytes.
 - Arbitrary process spawn. The allowlist is the whole of `w3cos-process` for this harness.
-- Loading and unloading the GGUF from inside the shell. `w3cos-inferd.sh` is the stand-in for a future `w3cos-inferd` daemon.
-- mistral.rs, candle, and llama-cpp-2.
+- Loading the GGUF inside the shell. `w3cos-inferd.sh` still owns those weights. The `in-process-infer` feature scores a separate verified `W3IW` table in-process; it does not parse GGUF. Leaving inference in another process keeps crash isolation and a sandbox boundary. Running it in-process trades those for a shorter hop and one less resident runtime, and the weights then live in the window's memory.
+- mistral.rs, candle, and llama-cpp-2, until a GPU or NPU backend is actually linked.
