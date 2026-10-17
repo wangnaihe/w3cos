@@ -449,6 +449,49 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
     }
 }
 
+/// Per-node subtree extent cache (see `Document::extent`).
+#[derive(Default)]
+struct ExtentCache {
+    /// `true` (or out of range) = must recompute.
+    dirty: Vec<bool>,
+    value: Vec<(f32, f32)>,
+}
+
+impl ExtentCache {
+    /// Mark dirty; false when it already was (the chain above is dirty too).
+    fn mark(&mut self, idx: usize) -> bool {
+        match self.dirty.get_mut(idx) {
+            Some(slot) if !*slot => {
+                *slot = true;
+                true
+            }
+            Some(_) => false,
+            // Never computed: nothing above can be clean because of it, but
+            // keep walking so a clean ancestor learns about this child.
+            None => true,
+        }
+    }
+
+    fn forget(&mut self, idx: usize) {
+        if let Some(slot) = self.dirty.get_mut(idx) {
+            *slot = true;
+        }
+    }
+
+    fn clean(&self, idx: usize) -> Option<(f32, f32)> {
+        (self.dirty.get(idx) == Some(&false)).then(|| self.value[idx])
+    }
+
+    fn store(&mut self, idx: usize, value: (f32, f32)) {
+        if self.dirty.len() <= idx {
+            self.dirty.resize(idx + 1, true);
+            self.value.resize(idx + 1, (0.0, 0.0));
+        }
+        self.dirty[idx] = false;
+        self.value[idx] = value;
+    }
+}
+
 /// W3C Document — the root of the DOM tree.
 ///
 /// Performance characteristics (Chrome/Blink inspired):
@@ -463,6 +506,12 @@ pub struct Document {
     /// is reserved up front so the create loop does not malloc.
     page_strings: Vec<u8>,
     styles: Vec<Arc<CSSStyleDeclaration>>,
+    /// Cached max right/bottom edge of each node's subtree for scrollWidth /
+    /// scrollHeight. Blink keeps scrollable overflow on the layout box and
+    /// only recomputes it for boxes whose subtree laid out again; here a
+    /// rect write or child-list edit marks the ancestor chain dirty
+    /// (stopping at an already-dirty ancestor, like ChildNeedsLayout).
+    extent: std::cell::RefCell<ExtentCache>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
     layout_rects: Vec<DOMRect>,
@@ -620,6 +669,7 @@ impl Document {
             free_list: Vec::new(),
             dirty: Vec::new(),
             precise_dirty: Vec::new(),
+            extent: std::cell::RefCell::new(ExtentCache::default()),
             precise_epoch: 1,
             precise_stamp: Vec::new(),
             scope_epoch: 1,
@@ -1424,6 +1474,7 @@ impl Document {
             self.layout_rects[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
             self.style_revisions[idx] = style_revision;
+            self.extent.get_mut().forget(idx);
             NodeId(slot)
         } else {
             let id = NodeId(self.nodes.len() as u32);
@@ -1465,7 +1516,58 @@ impl Document {
         if idx < self.layout_rects.len() {
             self.layout_rects[idx] = rect;
             self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+            self.mark_extent_dirty(id);
         }
+    }
+
+    fn mark_extent_dirty(&mut self, id: NodeId) {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if !self.extent.get_mut().mark(node.0 as usize) {
+                break;
+            }
+            current = self
+                .nodes
+                .get(node.0 as usize)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|node| node.parent);
+        }
+    }
+
+    /// Max (right, bottom) layout edge over the descendants of `id`, or None
+    /// without descendants. Clean subtrees answer from the cache.
+    pub fn descendant_extent(&self, id: NodeId) -> Option<(f32, f32)> {
+        let mut cache = self.extent.borrow_mut();
+        let mut out: Option<(f32, f32)> = None;
+        let mut child = self.get_node(id).first_child;
+        while let Some(cid) = child {
+            let (right, bottom) = self.subtree_extent(cid, &mut cache);
+            out = Some(match out {
+                Some((r, b)) => (r.max(right), b.max(bottom)),
+                None => (right, bottom),
+            });
+            child = crate::node::sib(self.get_node(cid).next_sibling);
+        }
+        out
+    }
+
+    fn subtree_extent(&self, id: NodeId, cache: &mut ExtentCache) -> (f32, f32) {
+        let idx = id.0 as usize;
+        if let Some(hit) = cache.clean(idx) {
+            return hit;
+        }
+        let rect = self.get_layout_rect(id);
+        let mut right = rect.x + rect.width;
+        let mut bottom = rect.y + rect.height;
+        let mut child = self.get_node(id).first_child;
+        while let Some(cid) = child {
+            let (r, b) = self.subtree_extent(cid, cache);
+            right = right.max(r);
+            bottom = bottom.max(b);
+            child = crate::node::sib(self.get_node(cid).next_sibling);
+        }
+        cache.store(idx, (right, bottom));
+        (right, bottom)
     }
 
     pub fn geometry_epoch(&self) -> u64 {
@@ -1851,6 +1953,8 @@ impl Document {
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
+        // A child-list edit changes the subtree extent without a rect write.
+        self.mark_extent_dirty(id);
         let scope = self.find_layout_scope(id);
         remember_dirty(
             &mut self.scope_stamp,
@@ -28519,5 +28623,39 @@ mod tree_mutation_tests {
         }
         assert_eq!(document.nodes.capacity(), capacity);
         assert!(document.nodes.len() <= capacity);
+    }
+}
+
+#[cfg(test)]
+mod extent_cache_tests {
+    use super::*;
+    use crate::dom_rect::DOMRect;
+
+    #[test]
+    fn cached_scroll_extent_follows_rect_writes_and_removals() {
+        let mut document = Document::new();
+        let scroller = document.create_element("div");
+        document.body().append_child(&mut document, scroller);
+        document.set_layout_rect(scroller.id, DOMRect::new(0.0, 0.0, 100.0, 50.0));
+        let mut rows = Vec::new();
+        for index in 0..4 {
+            let row = document.create_element("div");
+            scroller.append_child(&mut document, row);
+            document.set_layout_rect(row.id, DOMRect::new(0.0, index as f32 * 40.0, 100.0, 40.0));
+            rows.push(row);
+        }
+        assert_eq!(scroller.scroll_height(&document), 160.0);
+        // Cached: a second read without changes returns the same value.
+        assert_eq!(scroller.scroll_height(&document), 160.0);
+        document.set_layout_rect(rows[3].id, DOMRect::new(0.0, 120.0, 100.0, 90.0));
+        assert_eq!(scroller.scroll_height(&document), 210.0);
+        let inner = document.create_element("span");
+        rows[1].append_child(&mut document, inner);
+        document.set_layout_rect(inner.id, DOMRect::new(0.0, 300.0, 250.0, 10.0));
+        assert_eq!(scroller.scroll_height(&document), 310.0);
+        assert_eq!(scroller.scroll_width(&document), 250.0);
+        rows[1].remove_child(&mut document, &inner);
+        assert_eq!(scroller.scroll_height(&document), 210.0);
+        assert_eq!(scroller.scroll_width(&document), 100.0);
     }
 }
