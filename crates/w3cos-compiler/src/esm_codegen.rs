@@ -2369,10 +2369,34 @@ fn emit_w3ir_sync_symbol(
             class_names,
             namespace_names,
         );
-        let state_machine = crate::w3ir_aot::with_direct_call_targets(targets, || {
+        let state_machine = crate::w3ir_aot::with_direct_call_targets(targets.clone(), || {
             crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
         })
         .map_err(|error| error.to_string())?;
+        // Number-parameter entry for known-target sites passing only Numbers
+        // (parameters become bare f64 slots). Falls back to the generic
+        // completion entry when the specialization does not apply.
+        let number_factory = format!("{factory}__num");
+        let number_entry = (std::env::var_os("W3COS_NO_DIRECT_CALLS").is_none()
+            && crate::w3ir_aot::number_specializable(function))
+        .then(|| {
+            crate::w3ir_aot::with_direct_call_targets(targets, || {
+                crate::w3ir_aot::with_number_params(function, || {
+                    crate::w3ir_aot::generate_sync_function_from_module(
+                        w3ir_module,
+                        function,
+                        &number_factory,
+                    )
+                })
+            })
+            .ok()
+        })
+        .flatten()
+        .filter(|code| code.contains("__w3cos_frame.num_bindings["));
+        let (state_machine, number_target) = match number_entry {
+            Some(code) => (format!("{state_machine}\n{code}"), number_factory),
+            None => (state_machine, factory.clone()),
+        };
         let captures = generator_capture_map(
             bundle,
             module,
@@ -2383,17 +2407,17 @@ fn emit_w3ir_sync_symbol(
             namespace_names,
         )
         .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
-        Ok::<_, String>((state_machine, captures))
+        Ok::<_, String>((state_machine, captures, number_target))
     })();
-    let (state_machine, captures) = match emitted {
+    let (state_machine, captures, number_target) = match emitted {
         Ok(emitted) => emitted,
         Err(error) => return Some(Err(error)),
     };
     let mut output = String::new();
     output.push_str(&state_machine);
     output.push_str(&format!(
-        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n    /// Known-target entry for direct calls from this module (no Value dispatch).\n    #[allow(dead_code)]\n    fn {}_call_slice(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
-        symbol.original_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name,
+        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n    /// Known-target entry for direct calls from this module (no Value dispatch).\n    #[allow(dead_code)]\n    fn {}_call_slice(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n    #[allow(dead_code)]\n    fn {}_call_result(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> Result<w3cos_core::Value, w3cos_core::Value> {{ {factory}__result(__this, __args, &{captures}) }}\n    /// Known-target entry for call sites passing exactly the declared number of Number arguments.\n    #[allow(dead_code)]\n    fn {}_call_num(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> Result<w3cos_core::Value, w3cos_core::Value> {{ {number_target}__result(__this, __args, &{captures}) }}\n",
+        symbol.original_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name,
     ));
     // Same code-entry form as generators above (FunctionBody::Aot).
     let value_body = if (captures.starts_with("(*__w3cos_site_captures(")
@@ -2507,7 +2531,14 @@ fn direct_call_targets(
             {
                 continue;
             }
-            targets.insert(binding.id.0, bundled.to_string());
+            // `#arity` marks a Number-parameter entry (`_call_num`).
+            let target = match select_w3ir_function(w3ir_module, &binding.name, false, false) {
+                Some(function) if crate::w3ir_aot::number_specializable(function) => {
+                    format!("{bundled}#{}", function.parameters.len())
+                }
+                _ => bundled.to_string(),
+            };
+            targets.insert(binding.id.0, target);
         }
     }
     DIRECT_CALL_TARGET_CACHE.with(|cache| {
@@ -4065,9 +4096,14 @@ export function result() {
         let code = try_generate_with_bodies(&bundle).unwrap();
         // `add` is a never-reassigned ordinary declaration: native entry.
         assert!(
-            code.contains("catch_js(|| m0_add_call_slice("),
-            "known-target call missing"
+            code.contains("m0_add_call_num("),
+            "known-target Number call missing"
         );
+        // `add(3, 4)` passes two Number registers: the Number-parameter entry
+        // keeps both parameters as bare f64 slots.
+        assert!(code.contains("pub fn m0_add__w3ir_sync_factory__num__result("));
+        assert!(code.contains("__w3cos_frame.num_bindings["));
+        assert!(code.contains("fn m0_add_call_result("));
         // `alias` is a binding to a value (not a declaration) and `gen` is a
         // generator: both keep the generic [[Call]] dispatch.
         assert!(!code.contains("m0_alias_call_slice"));

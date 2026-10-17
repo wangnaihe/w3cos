@@ -101,6 +101,71 @@ impl Drop for SharedNumberGuard {
     }
 }
 
+thread_local! {
+    /// Parameter binding ids a number-specialized entry may assume hold a
+    /// Number on entry (static analogue of V8 feedback-driven parameter
+    /// representation selection). Only set while emitting `__num` entries,
+    /// which known-target call sites reach with exactly that many Number
+    /// arguments.
+    static ASSUMED_NUMBER_PARAMS: std::cell::RefCell<HashSet<u32>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn assumed_number_params() -> HashSet<u32> {
+    ASSUMED_NUMBER_PARAMS.with(|params| params.borrow().clone())
+}
+
+/// Run `f` with every parameter of `function` assumed to be a Number.
+pub(crate) fn with_number_params<T>(function: &Function, f: impl FnOnce() -> T) -> T {
+    struct Restore(HashSet<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            ASSUMED_NUMBER_PARAMS.with(|params| *params.borrow_mut() = previous);
+        }
+    }
+    let assumed = function
+        .parameters
+        .iter()
+        .map(|binding| binding.0)
+        .collect();
+    let previous =
+        ASSUMED_NUMBER_PARAMS.with(|params| std::mem::replace(&mut *params.borrow_mut(), assumed));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Whether a Number-parameter entry of `function` keeps every parameter as a
+/// bare f64: a leaf ordinary function (no nested closures/classes, so the
+/// entry can be emitted twice), with no `arguments` object or rest parameter
+/// aliasing the parameters, and whose parameters are only ever assigned
+/// numbers.
+pub(crate) fn number_specializable(function: &Function) -> bool {
+    if function.is_async
+        || function.is_generator
+        || function.parameters.is_empty()
+        || function.arguments_binding.is_some()
+        || function.rest_parameter.is_some()
+        || function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::CreateClosure { .. } | Instruction::CreateClass { .. }
+                )
+            })
+        })
+    {
+        return false;
+    }
+    with_number_params(function, || {
+        let numeric = numeric_local_bindings(function, &HashMap::new());
+        function
+            .parameters
+            .iter()
+            .all(|binding| numeric.contains(&binding.0))
+    })
+}
+
 fn is_shared_number(id: u32) -> bool {
     SHARED_NUMBERS.with(|numbers| numbers.borrow().contains(&id))
 }
@@ -531,8 +596,19 @@ fn captured_binding_ids(function: &Function) -> HashSet<u32> {
 
 fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) -> HashSet<u32> {
     let captured = captured_binding_ids(function);
+    let assumed = if function.arguments_binding.is_none() && function.rest_parameter.is_none() {
+        assumed_number_params()
+    } else {
+        HashSet::new()
+    };
     let mut reserved = HashSet::new();
-    reserved.extend(function.parameters.iter().map(|binding| binding.0));
+    reserved.extend(
+        function
+            .parameters
+            .iter()
+            .map(|binding| binding.0)
+            .filter(|id| !assumed.contains(id)),
+    );
     reserved.extend(function.captures.iter().map(|binding| binding.0));
     if let Some(binding) = function.rest_parameter {
         reserved.insert(binding.0);
@@ -547,10 +623,11 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
         .bindings
         .iter()
         .filter(|binding| {
-            matches!(
+            (matches!(
                 binding.kind,
                 BindingKind::Var | BindingKind::Let | BindingKind::Const
-            ) && !captured.contains(&binding.id.0)
+            ) || assumed.contains(&binding.id.0))
+                && !captured.contains(&binding.id.0)
                 && !reserved.contains(&binding.id.0)
         })
         .map(|binding| binding.id.0)
@@ -567,7 +644,11 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
         let dominated = loads_after_numeric_store(function, &numeric, &number_regs);
         let mut next = HashSet::new();
         for id in &eligible {
-            if dominated.contains(id) && stores_are_numbers(function, *id, &number_regs) {
+            if dominated.contains(id)
+                && (stores_are_numbers(function, *id, &number_regs)
+                    || (assumed.contains(id)
+                        && stores_are_numbers_or_none(function, *id, &number_regs)))
+            {
                 next.insert(*id);
             }
         }
@@ -625,6 +706,29 @@ fn stores_are_numbers(function: &Function, binding: u32, number_regs: &HashSet<u
     saw_store
 }
 
+/// Parameters start with their (Number) argument, so no explicit store is
+/// required; any explicit store must still be a Number.
+fn stores_are_numbers_or_none(
+    function: &Function,
+    binding: u32,
+    number_regs: &HashSet<u32>,
+) -> bool {
+    function.blocks.iter().all(|block| {
+        block
+            .instructions
+            .iter()
+            .all(|instruction| match instruction {
+                Instruction::InitializeBinding { binding: id, value }
+                | Instruction::StoreBinding { binding: id, value }
+                    if id.0 == binding =>
+                {
+                    number_regs.contains(&value.0)
+                }
+                _ => true,
+            })
+    })
+}
+
 fn loads_after_numeric_store(
     function: &Function,
     candidates: &HashSet<u32>,
@@ -653,13 +757,22 @@ fn loads_after_numeric_store(
             preds.entry(target).or_default().push(block.id);
         }
     }
+    // Assumed-Number parameters are initialized by the entry itself.
+    let entry_state = if function.arguments_binding.is_none() && function.rest_parameter.is_none() {
+        assumed_number_params()
+            .into_iter()
+            .filter(|id| candidates.contains(id))
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let mut out: HashMap<w3cos_ir::BlockId, HashSet<u32>> = HashMap::new();
     let mut changed = true;
     while changed {
         changed = false;
         for block in &function.blocks {
             let mut state = if block.id == function.entry {
-                HashSet::new()
+                entry_state.clone()
             } else {
                 let mut incoming: Option<HashSet<u32>> = None;
                 let mut saw_pred = false;
@@ -712,7 +825,7 @@ fn loads_after_numeric_store(
             continue;
         }
         let mut state = if block.id == function.entry {
-            HashSet::new()
+            entry_state.clone()
         } else {
             let mut incoming: Option<HashSet<u32>> = None;
             for pred in preds.get(&block.id).into_iter().flatten() {
@@ -1270,7 +1383,7 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
     let mut fields = String::new();
     let mut inits = String::new();
     if plan.n_num > 0 {
-        if (plan.n_num as usize) <= INLINE_FRAME {
+        if (plan.n_num as usize) <= INLINE_UNBOXED_F64 {
             fields.push_str(&format!("    num_regs: [f64; {}],\n", plan.n_num));
             inits.push_str(&format!("        num_regs: [0.0_f64; {}],\n", plan.n_num));
         } else {
@@ -1282,7 +1395,7 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
         }
     }
     if plan.n_bool > 0 {
-        if (plan.n_bool as usize) <= INLINE_FRAME {
+        if (plan.n_bool as usize) <= INLINE_UNBOXED_BOOL {
             fields.push_str(&format!("    bool_regs: [bool; {}],\n", plan.n_bool));
             inits.push_str(&format!("        bool_regs: [false; {}],\n", plan.n_bool));
         } else {
@@ -1301,7 +1414,7 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
         inits.push_str("        val_bindings,\n");
     }
     if plan.n_num_bindings > 0 {
-        if (plan.n_num_bindings as usize) <= INLINE_FRAME {
+        if (plan.n_num_bindings as usize) <= INLINE_UNBOXED_F64 {
             fields.push_str(&format!(
                 "    num_bindings: [f64; {}],\n",
                 plan.n_num_bindings
@@ -1536,6 +1649,11 @@ fn reaching_number_constants(instructions: &[Instruction]) -> Vec<HashMap<u32, f
 }
 
 const INLINE_FRAME: usize = 8;
+/// Unboxed f64 / bool banks need no drop glue, so (like V8's interpreter
+/// register file living in the native stack frame) they stay inline in the
+/// frame up to this size instead of costing a heap allocation per call.
+const INLINE_UNBOXED_F64: usize = 64;
+const INLINE_UNBOXED_BOOL: usize = 128;
 
 #[derive(Clone, Copy)]
 enum SlotStorage {
@@ -2466,7 +2584,16 @@ fn generate_sync_function_with_factories_inner(
         ));
     }
     let mut parameter_initializers = String::new();
+    let mut number_parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
+        if let Some(slot) = num_binding_slot(&plan, binding.0) {
+            // Only reachable in a Number-parameter entry: the caller passes
+            // exactly `parameters.len()` Number values.
+            number_parameter_initializers.push_str(&format!(
+                "    __w3cos_frame.num_bindings[{slot}] = __args.get({index}).map_or(f64::NAN, |value| value.to_number());\n"
+            ));
+            continue;
+        }
         if let Some(slot) = val_binding_slot(&plan, binding.0) {
             val_initializers.push_str(&format!(
                 "    val_bindings[{slot}] = Some(__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined));\n"
@@ -2523,20 +2650,37 @@ impl {type_name} {{
     }}
 }}
 
-pub fn {rust_name}(
+/// Completion-returning entry: a JS `throw` comes back as `Err` instead of
+/// unwinding, so known-target callers propagate it without a landing pad.
+#[allow(dead_code)]
+pub fn {rust_name}__result(
     __this: w3cos_core::Value,
     __args: &[w3cos_core::Value],
     __captures: &w3cos_core::AotCaptureMap,
-) -> w3cos_core::Value {{
-{fast_prefix}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{val_initializers}{slot_capture_init}    {type_name} {{
+) -> Result<w3cos_core::Value, w3cos_core::Value> {{
+{fast_prefix_result}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{val_initializers}{slot_capture_init}    #[allow(unused_mut)]
+    let mut __w3cos_frame = {type_name} {{
 {registers_init}
 {num_init}        bindings,
         capture_getters,
         capture_setters,
 {num_cells_init}{block_initializer}
-    }}.run().unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
+    }};
+{number_parameter_initializers}    __w3cos_frame.run()
+}}
+
+pub fn {rust_name}(
+    __this: w3cos_core::Value,
+    __args: &[w3cos_core::Value],
+    __captures: &w3cos_core::AotCaptureMap,
+) -> w3cos_core::Value {{
+    {rust_name}__result(__this, __args, __captures).unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
 }}
 "#,
+        fast_prefix_result = fast_prefix.replace(
+            "return w3cos_core::Value::Undefined;",
+            "return Ok(w3cos_core::Value::Undefined);"
+        ),
         registers_field = emit_registers_field(plan.n_val),
         registers_init = emit_registers_init(plan.n_val),
     );
@@ -7076,6 +7220,20 @@ fn emit_instruction(
             arguments,
         } if direct_call_target(function, instruction).is_some() => {
             let target = direct_call_target(function, instruction).expect("checked");
+            // `name#arity`: the target also has a Number-parameter entry.
+            let (target, number_arity) = match target.split_once('#') {
+                Some((name, arity)) => (name.to_string(), arity.parse::<usize>().ok()),
+                None => (target, None),
+            };
+            let entry = if number_arity == Some(arguments.len())
+                && arguments
+                    .iter()
+                    .all(|argument| num_slot(plan, argument.0).is_some())
+            {
+                "call_num"
+            } else {
+                "call_result"
+            };
             // Known-target call (TurboFan JSCallReducer on a constant
             // function): the callee register was just loaded from a
             // never-reassigned module function declaration, so call its
@@ -7086,11 +7244,21 @@ fn emit_instruction(
             let mut reads = vec![this_value.0];
             reads.extend(arguments.iter().map(|argument| argument.0));
             let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-            let expr = format!(
-                "w3cos_core::catch_js(|| {target}_call_slice({}, &[{}]))",
+            let call = format!(
+                "{target}_{entry}({}, &[{}])",
                 uses.emit(this_value.0),
                 emit_arguments_from(&mut uses, arguments)
             );
+            // The callee hands a JS throw back as `Err`. Outside a try region
+            // of a synchronous frame, a host exception unwinding out of the
+            // callee leaves this frame exactly like one raised by this frame's
+            // own statements, so no landing pad is needed; inside one, it must
+            // still be caught here.
+            let expr = if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
+                call
+            } else {
+                format!("w3cos_core::catch_js_result(|| {call})")
+            };
             emit_completion_match(
                 &expr,
                 &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
