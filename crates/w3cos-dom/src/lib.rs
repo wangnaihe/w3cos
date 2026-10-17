@@ -3785,6 +3785,38 @@ mod tests {
     }
 
     #[test]
+    fn test_text_runs_share_matched_properties_by_parent_style() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".a", &[("color", "#123456")]);
+        crate::stylesheet::register_rule(".b", &[("color", "#654321")]);
+
+        let mut doc = Document::new();
+        let mut texts = Vec::new();
+        for class in ["a", "a", "b"] {
+            let p = doc.create_element("p");
+            p.set_class_name(&mut doc, class);
+            doc.body().append_child(&mut doc, p);
+            let text = doc.create_text_node("run");
+            p.append_child(&mut doc, text);
+            texts.push((p, text));
+        }
+        let styles = texts
+            .iter()
+            .map(|(p, text)| {
+                let parent = doc.computed_style_shared(p.id, None);
+                doc.computed_style_shared(text.id, Some(&parent))
+            })
+            .collect::<Vec<_>>();
+        // Equal parent styles share one text style (Blink LayoutText reuses
+        // its parent's ComputedStyle); a different parent does not.
+        assert!(std::rc::Rc::ptr_eq(&styles[0], &styles[1]));
+        assert!(!std::rc::Rc::ptr_eq(&styles[0], &styles[2]));
+        assert_eq!(styles[0].color, w3cos_std::Color::from_hex("#123456"));
+        assert_eq!(styles[2].color, w3cos_std::Color::from_hex("#654321"));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_color_from_custom_property_is_declared_not_inherited() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(":root", &[("--c", "rgb(10, 20, 30)")]);

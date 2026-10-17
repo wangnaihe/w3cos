@@ -198,10 +198,12 @@ impl MatchedPropertiesCache {
     ) -> Option<(SharedStyle, SharedStyle)> {
         self.validate(epoch);
         let inherited = inherited?;
-        self.styles
-            .get(key)?
-            .iter()
-            .find(|(parent, _)| same_style(parent, inherited))
+        let slot = self.styles.get(key)?;
+        // Pointer hits first (parents produced by this cache), then deep
+        // equality, so a long text slot stays cheap.
+        slot.iter()
+            .find(|(parent, _)| std::ptr::eq(&**parent, inherited))
+            .or_else(|| slot.iter().find(|(parent, _)| **parent == *inherited))
             .cloned()
     }
 
@@ -216,8 +218,14 @@ impl MatchedPropertiesCache {
         let Some(inherited) = inherited else {
             return;
         };
+        // Text runs sit under every distinct inline parent style.
+        let limit = if key.attributes.is_empty() && key.matched.is_empty() {
+            64
+        } else {
+            8
+        };
         let slot = self.styles.entry(key).or_default();
-        if slot.len() < 8 {
+        if slot.len() < limit {
             slot.push((inherited.clone(), style.clone()));
             self.entries += 1;
         }
@@ -4767,6 +4775,25 @@ impl Document {
     ) -> Option<MatchedPropertiesKey> {
         let node = self.get_node(id);
         let inherited = inherited?;
+        // Text nodes have no own declarations: like Blink's LayoutText, which
+        // shares its parent's ComputedStyle, their style is a function of the
+        // parent style alone, so every text run under an equal parent shares
+        // one entry (a markdown history has tens of thousands of them).
+        if node.node_type == NodeType::Text {
+            if !node.attributes.is_empty()
+                || !node.attribute_namespaces.is_empty()
+                || !matched.is_empty()
+                || inherited.display == w3cos_std::style::Display::Contents
+                || !Arc::ptr_eq(inline, &shared_ua_style(node.tag))
+            {
+                return None;
+            }
+            return Some(MatchedPropertiesKey {
+                tag: node.tag.as_u32(),
+                attributes: Vec::new(),
+                matched: Vec::new(),
+            });
+        }
         if node.node_type != NodeType::Element
             || !node.is_html_element
             || !node.attribute_namespaces.is_empty()
