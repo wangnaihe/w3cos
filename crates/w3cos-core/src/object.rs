@@ -251,6 +251,12 @@ impl JsObject {
         self.refresh_heap_accounting();
     }
 
+    /// True when `f` holds for any own string key, in insertion order,
+    /// without allocating the key list.
+    pub fn any_own_key(&self, mut f: impl FnMut(&str) -> bool) -> bool {
+        self.properties.any_key(|key| f(key.as_str()))
+    }
+
     /// V8 boilerplate copy (object-literal AllocationSite): give an empty
     /// ordinary object the exact own properties, in the same insertion
     /// order, of a template object. Returns false (and changes nothing)

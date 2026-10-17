@@ -1,7 +1,7 @@
 //! Value-level implementations of the core Web Events constructors.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -980,8 +980,55 @@ fn install_pointer_fields(this: &Value, init: &Value) {
 thread_local! {
     /// Per-realm MouseEvent / PointerEvent boilerplates: the default member
     /// slots plus the dictionary member names in conversion order.
-    static EVENT_TEMPLATES: RefCell<[Option<(Value, Rc<[String]>)>; 2]> =
+    static EVENT_TEMPLATES: RefCell<[Option<EventTemplate>; 2]> =
         const { RefCell::new([None, None]) };
+}
+
+type EventTemplate = (Value, Rc<[String]>, Rc<HashSet<String>>);
+
+/// The own data members of a plain init dictionary, when reading members
+/// one [[Get]] at a time is unobservable: an ordinary object with no own
+/// accessors whose only prototype is an ordinary root (Object.prototype)
+/// that defines none of the members. Absent members then read as
+/// undefined, so only the supplied entries need to be visited.
+fn plain_init_entries(init: &Value, members: &HashSet<String>) -> Option<Vec<(String, Value)>> {
+    let object = init.as_object()?;
+    let object = object.borrow();
+    if object.is_proxy() {
+        return None;
+    }
+    let is_member = |key: &str| key == "sourceCapabilities" || members.contains(key);
+    let prototype = object.get_prototype_of();
+    let no_prototype = |value: &Value| value.is_null() || value.is_undefined();
+    if !no_prototype(&prototype) {
+        let root = prototype.as_object()?;
+        let root = root.borrow();
+        if root.is_proxy() || !no_prototype(&root.get_prototype_of()) {
+            return None;
+        }
+        let shadows = root.any_own_key(|key| {
+            is_member(key)
+                || key
+                    .strip_prefix("__w3cos_getter_")
+                    .is_some_and(|name| is_member(name))
+        });
+        if shadows {
+            return None;
+        }
+    }
+    let mut entries = Vec::new();
+    let mut accessor = false;
+    object.any_own_key(|key| {
+        if key.starts_with("__w3cos_getter_") {
+            accessor = true;
+            return true;
+        }
+        if is_member(key) {
+            entries.push((key.to_string(), object.get_direct(key)));
+        }
+        false
+    });
+    (!accessor).then_some(entries)
 }
 
 /// Construct a MouseEvent (0) or PointerEvent (1) by copying a per-realm
@@ -999,7 +1046,7 @@ fn install_from_template(this: &Value, init: &Value, kind: usize) -> bool {
             return false;
         }
     }
-    let (template, members) = EVENT_TEMPLATES.with(|slot| {
+    let (template, members, member_set) = EVENT_TEMPLATES.with(|slot| {
         slot.borrow_mut()[kind]
             .get_or_insert_with(|| {
                 let template = Value::object(HashMap::new());
@@ -1022,7 +1069,8 @@ fn install_from_template(this: &Value, init: &Value, kind: usize) -> bool {
                         )
                     })
                     .collect::<Vec<_>>();
-                (template, Rc::from(members))
+                let member_set = members.iter().cloned().collect::<HashSet<_>>();
+                (template, Rc::from(members), Rc::new(member_set))
             })
             .clone()
     });
@@ -1033,6 +1081,28 @@ fn install_from_template(this: &Value, init: &Value, kind: usize) -> bool {
         return false;
     }
     if !init.is_object() {
+        return true;
+    }
+    if let Some(entries) = plain_init_entries(init, &member_set) {
+        // Data-only dictionary: the template already holds every default,
+        // and overwriting an existing key keeps its insertion position.
+        for (name, value) in entries {
+            if value.is_undefined() {
+                continue;
+            }
+            if name == "sourceCapabilities" {
+                let source = if value.is_object()
+                    && !w3cos_core::class::instance_of(&value, &input_device_capabilities_class())
+                {
+                    w3cos_core::class::construct(&input_device_capabilities_class(), vec![value])
+                } else {
+                    value
+                };
+                put_field(this, "sourceCapabilities", source);
+            } else {
+                put_field(this, &name, value);
+            }
+        }
         return true;
     }
     let source = init.get_property("sourceCapabilities");
@@ -2143,6 +2213,22 @@ mod tests {
         );
         assert_eq!(mouse.get_property("clientX"), Value::Number(7.0));
         assert!(mouse.get_property("pointerType").is_undefined());
+
+        // Members inherited by the dictionary still convert ([[Get]] walks
+        // the chain), and accessor members still run.
+        let base = Value::object(HashMap::from([("clientY".to_string(), Value::Number(5.0))]));
+        let derived = Value::object(HashMap::new());
+        w3cos_core::class::set_prototype_of(&derived, &base);
+        derived.set_property(
+            "__w3cos_getter_clientX",
+            realm_event_function(|_, _| Value::Number(11.0)),
+        );
+        let inherited = w3cos_core::class::construct(
+            &event_subclass_class("PointerEvent"),
+            vec![Value::string("pointermove"), derived],
+        );
+        assert_eq!(inherited.get_property("clientY"), Value::Number(5.0));
+        assert_eq!(inherited.get_property("clientX"), Value::Number(11.0));
     }
 
     #[test]
