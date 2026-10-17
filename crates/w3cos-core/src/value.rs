@@ -2650,8 +2650,14 @@ impl Value {
             }
             (this, "slice") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                let ascii = value.is_ascii();
+                // ASCII: UTF-16 units are bytes, so skip re-encoding the string.
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let normalize = |argument: Option<&Value>, fallback: i64| {
                     let raw = argument
                         .map(Value::to_number)
@@ -2666,6 +2672,9 @@ impl Value {
                 };
                 let start = normalize(args.first(), 0);
                 let end = normalize(args.get(1), length).max(start);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "substr") if this.is_string() => {
@@ -2759,10 +2768,14 @@ impl Value {
                 if !index.is_finite() || index < 0.0 {
                     return Value::from(String::new());
                 }
+                let index = index as usize;
+                if index < value.len() && value.as_bytes()[..=index].is_ascii() {
+                    return Value::from(&value[index..=index]);
+                }
                 return Value::from(
                     value
                         .chars()
-                        .nth(index as usize)
+                        .nth(index)
                         .map(|character| character.to_string())
                         .unwrap_or_default(),
                 );
@@ -3264,6 +3277,12 @@ fn array_index(value: Option<&Value>, len: usize, default: usize) -> usize {
 }
 
 fn string_index_to_byte(value: &str, index: usize) -> usize {
+    // An ASCII prefix maps chars to bytes one-to-one; checking it is a
+    // vectorized byte scan instead of decoding every char up to `index`.
+    let prefix = index.min(value.len());
+    if value.as_bytes()[..prefix].is_ascii() {
+        return prefix;
+    }
     value
         .char_indices()
         .nth(index)
@@ -5773,5 +5792,50 @@ mod string_last_index_of_tests {
             4.0
         );
         assert_eq!(last("aaa", vec![Value::from("aa")]), 1.0);
+    }
+
+    fn text(value: &str, method: &str, args: Vec<Value>) -> String {
+        Value::from(value)
+            .call_method(method, args)
+            .to_js_string()
+            .to_string()
+    }
+
+    #[test]
+    fn ascii_fast_paths_match_the_general_paths() {
+        assert_eq!(
+            text(
+                "hello",
+                "slice",
+                vec![Value::Number(1.0), Value::Number(3.0)]
+            ),
+            "el"
+        );
+        assert_eq!(text("hello", "slice", vec![Value::Number(-3.0)]), "llo");
+        assert_eq!(text("hello", "slice", vec![Value::Number(9.0)]), "");
+        assert_eq!(
+            text(
+                "héllo",
+                "slice",
+                vec![Value::Number(1.0), Value::Number(3.0)]
+            ),
+            "él"
+        );
+        assert_eq!(text("hello", "charAt", vec![Value::Number(4.0)]), "o");
+        assert_eq!(text("hello", "charAt", vec![Value::Number(5.0)]), "");
+        assert_eq!(text("héllo", "charAt", vec![Value::Number(1.0)]), "é");
+        assert_eq!(text("héllo", "charAt", vec![Value::Number(2.0)]), "l");
+        assert_eq!(
+            Value::from("héllo")
+                .call_method("indexOf", vec![Value::from("l"), Value::Number(3.0)])
+                .to_number(),
+            3.0
+        );
+        assert_eq!(
+            Value::from("hello")
+                .call_method("indexOf", vec![Value::from("l"), Value::Number(3.0)])
+                .to_number(),
+            3.0
+        );
     }
 }
