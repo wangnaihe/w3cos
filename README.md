@@ -180,6 +180,57 @@ $ w3cos build app.tsx -o myapp --release
 | Installable OS | ❌                | ❌               | ❌           | **✅**                |
 
 
+## Memory model: no GC, reference counting + WeakRef
+
+> **w3cos has no garbage collector.** Heap values are reference-counted and freed deterministically. A reference cycle is never collected, so **cycles must be broken with `WeakRef` / `WeakMap` / `WeakSet` / `FinalizationRegistry`.**
+
+**Why:** with no GC pauses, latency and memory stay predictable (no collector stalls while typing), and the runtime stays close to native Rust (`Rc`/`Weak`) behavior and cost.
+
+**What you must do:** make back-references weak and dispose what you subscribe to.
+- Back-references should be weak: child → parent, listener → emitter, cache → value, DOM node → JS wrapper.
+- A closure that captures `this` and is registered on a longer-lived object should hold `this` through a `WeakRef`, or be removed in `dispose()`.
+- Pair every `addEventListener` / `onDidX` subscription with a removal (`Disposable` / `DisposableStore` pattern).
+
+```ts
+class Child {
+  #parent: WeakRef<Parent>;               // back-edge is weak
+  constructor(parent: Parent) { this.#parent = new WeakRef(parent); }
+  get parent() { return this.#parent.deref(); }
+}
+
+class View {
+  #off: () => void;
+  constructor(emitter: Emitter) {
+    const self = new WeakRef(this);       // listener does not own the view
+    const onChange = () => self.deref()?.render();
+    emitter.on("change", onChange);
+    this.#off = () => emitter.off("change", onChange);
+  }
+  render() {}
+  dispose() { this.#off(); }               // explicit teardown
+}
+
+const meta = new WeakMap<object, Info>(); // side tables keyed by object: WeakMap
+```
+
+**What the compiler does for you** (`crates/w3cos-compiler/src/unique_back_edges.rs`). AOT automatically rewrites three unambiguous closure back-edges to `WeakRef`:
+1. self-install: `obj.fn = () => obj.x`, `this.fn = () => this.x`
+2. promise reactions that capture their own promise binding: `p.then(() => p...)`
+3. iterator-on-collection: `coll.iter = { next: () => coll.pop() }`
+
+For ambiguous cases it **only warns** and never rewrites, because guessing could free live data. These cases are mutual properties (`a.b = b; b.a = a`), computed or dynamic keys (`obj[k] = ...`), and cross-file cycles.
+
+**FinalizationRegistry is deterministic.** The cleanup callback runs at the first job checkpoint after the target's last strong reference is dropped, once the microtask queue is empty. It never runs inside `Drop` or during the job that released the target. `WeakMap` and `WeakSet` are O(1), and an entry is removed (and its value released) when its key dies. See [`crates/w3cos-core/src/weak.rs`](crates/w3cos-core/src/weak.rs) for ordering details.
+
+> **Current limitation:** ordinary AOT object literals, arrays, and closures are allocated in a page arena and freed on page reset, not at their last reference. Making arena values reference-counted too is roadmap item M1-4a (planned). Host values (DOM wrappers, native objects) are already freed immediately.
+
+**Tooling (planned):**
+- A cycle detector for debug builds only, which reports the full retaining chain with source locations. It is not compiled into release builds.
+- `w3cos leak-lint` with codemods for `this`-capturing closures, listeners that are never removed, parent ↔ child strong references, and un-disposed `Disposable`s.
+- Leak CI: per-scenario heap diffs plus a nightly 8-hour soak test.
+
+**Upstream policy:** when a cycle leaks in upstream code (e.g. VS Code, extensions, npm packages), we fork it and fix it with `WeakRef` or an explicit `dispose`, keeping the fix in a patch queue. Fixes that make sense upstream are sent upstream as PRs. Details are in [`docs/roadmap/aot-port.md`](docs/roadmap/aot-port.md) §3.2 and M1.
+
 ## AI-Native: Why This Matters
 
 Traditional operating systems are **opaque to AI** — an AI agent must take screenshots and guess what's on screen (slow, expensive, fragile).
