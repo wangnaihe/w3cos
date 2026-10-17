@@ -9,3 +9,5 @@ Cargo.lock
 /build
 w3cos.iso
 node_modules
+__pycache__/
+*.pyc

@@ -201,6 +201,10 @@ the consolidated main changes plus Location cache were tested with the recorded
 locks. Native-only improvements and remaining correctness failures are documented
 in [performance-validation.md](../../docs/performance-validation.md).
 
+The Code-OSS A-side harness (cold start, open file, typing, memory) lives next
+to this DOM fixture and does not change its manifest. See
+[VSCODE-BASELINE.zh-CN.md](VSCODE-BASELINE.zh-CN.md).
+
 Actual Chromium launch is blocked in that cloud execution environment by denied
 process-singleton Unix sockets. No paired native/browser result has been produced.
 The macOS runner has unit/contract validation only; a real macOS end-to-end build

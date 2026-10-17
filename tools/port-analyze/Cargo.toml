@@ -1,0 +1,14 @@
+[package]
+name = "w3cos-port-analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inventory Electron, Node, native modules, and dynamic code for the AOT port"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

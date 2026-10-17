@@ -1,0 +1,94 @@
+name: AOT M0
+
+on:
+  pull_request:
+    branches: [aot-port]
+  push:
+    branches: [aot-port]
+  workflow_dispatch:
+    inputs:
+      build_code_oss:
+        description: Compile the pinned official Code-OSS Electron binary
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  m0-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the port analyzer and baseline harness
+        run: |
+          python3 -m unittest discover -s tools/vscode-baseline -p 'test_*.py' -v
+          python3 -m unittest discover -s tools/perf-paired -p 'test_*.py' -v
+          cargo fmt -p w3cos-port-analyze -- --check
+          cargo test -p w3cos-port-analyze
+
+  m0-code-oss-inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pinned Code-OSS
+        run: |
+          commit="$(python3 -c 'import json; print(json.load(open("tools/vscode-baseline/CODE_OSS.lock.json"))["commit"])')"
+          repo="$(python3 -c 'import json; print(json.load(open("tools/vscode-baseline/CODE_OSS.lock.json"))["repository"])')"
+          dest="$RUNNER_TEMP/vscode"
+          git init "$dest"
+          git -C "$dest" remote add origin "$repo"
+          git -C "$dest" fetch --depth 1 origin "$commit"
+          git -C "$dest" checkout --detach FETCH_HEAD
+      - name: Dependency inventory must match the lock
+        run: |
+          python3 tools/vscode-baseline/inventory.py \
+            --root "$RUNNER_TEMP/vscode" \
+            --lock tools/vscode-baseline/CODE_OSS.lock.json \
+            --check \
+            --output "$RUNNER_TEMP/dependency-inventory.json"
+      - name: Smoke-test w3cos port analyze, then scan the pinned tree
+        run: |
+          cargo run -p w3cos-cli -- port analyze tools/vscode-baseline/fixtures/mini --output "$RUNNER_TEMP/mini-analyze.json"
+          python3 -c 'import json,sys; report=json.load(open(sys.argv[1])); assert "electron:app" in report["clearance_list"]' "$RUNNER_TEMP/mini-analyze.json"
+          cargo run -p w3cos-cli -- port analyze "$RUNNER_TEMP/vscode" --output "$RUNNER_TEMP/port-analyze.json"
+          python3 tools/vscode-baseline/check_analyze_report.py "$RUNNER_TEMP/port-analyze.json"
+      - name: Upload baseline inventory and clearance list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-m0-baseline
+          path: |
+            ${{ runner.temp }}/dependency-inventory.json
+            ${{ runner.temp }}/port-analyze.json
+            ${{ runner.temp }}/mini-analyze.json
+
+  code-oss-binary:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_code_oss }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+      - name: Install Code-OSS native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev python3
+      - name: Compile pinned Code-OSS
+        env:
+          W3COS_BUILD_CODE_OSS: "1"
+        run: tools/vscode-baseline/build_code_oss.sh --dest "$RUNNER_TEMP/code-oss"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-official-binary-manifest
+          path: ${{ runner.temp }}/code-oss-baseline-manifest.json

@@ -1,0 +1,41 @@
+{
+  "schema": "w3cos-vscode-baseline-manifest-v1",
+  "side": "A",
+  "reference": "stock-electron-code-oss",
+  "samples_for_complete": 20,
+  "percentiles": ["median", "p95"],
+  "launch_args": ["--disable-extensions", "--skip-release-notes", "--disable-workspace-trust"],
+  "workbench_marker": "code/didStartMain-code/didStartWorkbench",
+  "scenarios": [
+    {
+      "id": "cold-start-window-visible",
+      "metric": "exec-to-first-frame-ms",
+      "evidence": "compositor-or-pixel-probe",
+      "allows_application_report": false
+    },
+    {
+      "id": "cold-start-workbench-ready",
+      "metric": "exec-to-did-start-workbench-ms",
+      "evidence": "vscode-prof-duration-markers",
+      "allows_application_report": true
+    },
+    {
+      "id": "open-file",
+      "metric": "quick-open-to-first-text-frame-ms",
+      "evidence": "compositor-or-pixel-probe",
+      "allows_application_report": false
+    },
+    {
+      "id": "typing-latency",
+      "metric": "key-to-pixel-ms",
+      "evidence": "evdev-pixel-probe",
+      "allows_application_report": false
+    },
+    {
+      "id": "memory-pss",
+      "metric": "process-tree-pss-bytes",
+      "evidence": "proc-smaps-rollup",
+      "allows_application_report": false
+    }
+  ]
+}

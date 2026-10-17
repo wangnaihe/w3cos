@@ -108,6 +108,11 @@ enum Commands {
         #[arg(long)]
         own_only: bool,
     },
+    /// Inventory a tree for the AOT port (Electron, Node, native modules, dynamic code).
+    Port {
+        #[command(subcommand)]
+        command: PortCommands,
+    },
     /// Compare Chromium's live window Web API surface with the w3cos runtime.
     WebApiAudit {
         /// Chrome/Chromium executable. Auto-detected when omitted.
@@ -119,6 +124,18 @@ enum Commands {
         /// Exit unsuccessfully when browser API globals are missing.
         #[arg(long)]
         fail_on_missing: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PortCommands {
+    /// List Electron APIs, Node built-ins, native modules, and dynamic code sites.
+    Analyze {
+        /// Source tree, usually a Code-OSS checkout.
+        path: PathBuf,
+        /// Write the JSON report here instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -333,6 +350,32 @@ fn main() -> Result<()> {
                 print!("{generated}");
             }
         }
+        Commands::Port { command } => match command {
+            PortCommands::Analyze { path, output } => {
+                let report = w3cos_port_analyze::analyze(&path)?;
+                let json = serde_json::to_string_pretty(&report)?;
+                if let Some(output) = output {
+                    if let Some(parent) = output
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                    {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("Could not create output directory {}", parent.display())
+                        })?;
+                    }
+                    fs::write(&output, json + "\n")
+                        .with_context(|| format!("Could not write {}", output.display()))?;
+                    eprintln!(
+                        "port analyze: {} files, {} clearance items -> {}",
+                        report.files_scanned,
+                        report.clearance_list.len(),
+                        output.display()
+                    );
+                } else {
+                    println!("{json}");
+                }
+            }
+        },
         Commands::WebApiAudit {
             chrome,
             json,
