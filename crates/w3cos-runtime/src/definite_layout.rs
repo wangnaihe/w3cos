@@ -769,11 +769,14 @@ fn try_apply_authored(viewport_w: f32) -> bool {
             reuse: !w3cos_dom::stylesheet::has_position_dependent_rules(),
             styles: HashMap::new(),
         };
-        if layout_authored(
-            document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects,
-        )
-        .is_none()
-        {
+        let laid_out = {
+            let document: &w3cos_dom::Document = document;
+            let _filter = w3cos_dom::stylesheet::StyleRecalcScope::enter(document);
+            layout_authored(
+                document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects,
+            )
+        };
+        if laid_out.is_none() {
             return false;
         }
         for (id, rect) in &rects {

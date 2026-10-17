@@ -28,6 +28,7 @@ mod selector_filter;
 mod selector_parse_cache;
 
 use rule_set::RuleSet;
+pub use selector_filter::StyleRecalcScope;
 use selector_filter::{AncestorBloom, LazyAncestorBloom};
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
