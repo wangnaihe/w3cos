@@ -4639,15 +4639,7 @@ impl LayoutEngine {
         // built at most once per compute: the Taffy build and the fixed
         // table cell projection read the same used table geometry (LayoutNG
         // computes NGTableBorders once per table and shares it).
-        let table_prepared = std::cell::OnceCell::<Component>::new();
-        let prepare_tables = || {
-            table_prepared.get_or_init(|| {
-                let mut layout_root = root.clone();
-                resolve_collapsed_table_layout_borders(&mut layout_root);
-                crate::table_grid::annotate(&mut layout_root);
-                layout_root
-            })
-        };
+        let mut table_prepared = None::<Component>;
         if self.viewport != Some((viewport_w, viewport_h)) {
             self.tree_valid = false;
             self.viewport = Some((viewport_w, viewport_h));
@@ -4656,7 +4648,7 @@ impl LayoutEngine {
             self.tree.clear();
             let mut idx = 0;
             let layout_root = if component_needs_table_prep(root) {
-                prepare_tables()
+                &*prepared_table_tree(&mut table_prepared, root)
             } else {
                 root
             };
@@ -4826,7 +4818,7 @@ impl LayoutEngine {
                             edge.width > 0.0 || edge.hidden
                         }))
             })
-            .then(prepare_tables);
+            .then(|| &*prepared_table_tree(&mut table_prepared, root));
         project_fixed_table_cell_rects(
             &mut results,
             projection_root.unwrap_or(root),
@@ -4836,7 +4828,20 @@ impl LayoutEngine {
         project_inline_block_atomic_line_descent(&mut results, root);
         project_single_baseline_replaced_image(&mut results, root);
         project_forced_break_inline_block_alignment(&mut results, root);
-        project_forced_break_lines_with_constraints(&mut results, root, &inline_height_constraints);
+        // With collapsed tables and no row spans the prepared tree is the
+        // border-resolved tree the forced-break pass needs; it edits it in
+        // place and restores it instead of cloning the whole document.
+        let forced_break_tree = (has_collapsed_table_root(flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1))
+        .then(|| prepared_table_tree(&mut table_prepared, root));
+        project_forced_break_lines_with_shared_tree(
+            &mut results,
+            root,
+            forced_break_tree,
+            &inline_height_constraints,
+        );
         project_inline_continuation_after_wrapped_row(&mut results, root);
         crate::inline_whitespace::project(&mut results, root);
         project_forced_break_inline_block_alignment(&mut results, root);
@@ -4964,7 +4969,7 @@ impl LayoutEngine {
                 .iter()
                 .any(|node| crate::table_grid::row_span(node.style) != 1)
         {
-            prepared_flat = pre_flatten(prepare_tables());
+            prepared_flat = pre_flatten(prepared_table_tree(&mut table_prepared, root));
             Some(prepared_flat.as_slice())
         } else {
             None
@@ -5210,7 +5215,17 @@ pub fn compute_with_scroll_details(
     project_inline_block_atomic_line_descent(&mut results, root);
     project_single_baseline_replaced_image(&mut results, root);
     project_forced_break_inline_block_alignment(&mut results, root);
-    project_forced_break_lines_with_constraints(&mut results, root, &inline_height_constraints);
+    let forced_break_tree = (has_collapsed_table_root(&flat)
+        && !flat
+            .iter()
+            .any(|node| crate::table_grid::row_span(node.style) != 1))
+    .then_some(&mut layout_root);
+    project_forced_break_lines_with_shared_tree(
+        &mut results,
+        root,
+        forced_break_tree,
+        &inline_height_constraints,
+    );
     project_inline_continuation_after_wrapped_row(&mut results, root);
     crate::inline_whitespace::project(&mut results, root);
     project_forced_break_inline_block_alignment(&mut results, root);
@@ -6151,6 +6166,18 @@ fn assert_layouts_unchanged(
                 && a.height.to_bits() == b.height.to_bits()
         });
     assert!(same, "gated projection pass changed layout: {pass}");
+}
+
+/// The table-prepared tree (collapsed borders resolved + grid annotated),
+/// built at most once per compute and shared by every table-aware pass, as
+/// LayoutNG computes NGTableBorders once per table.
+fn prepared_table_tree<'a>(slot: &'a mut Option<Component>, root: &Component) -> &'a mut Component {
+    slot.get_or_insert_with(|| {
+        let mut layout_root = root.clone();
+        resolve_collapsed_table_layout_borders(&mut layout_root);
+        crate::table_grid::annotate(&mut layout_root);
+        layout_root
+    })
 }
 
 fn has_collapsed_table_root(flat: &[FlatNodeInfo<'_>]) -> bool {
@@ -16588,7 +16615,94 @@ fn project_forced_break_lines_with_constraints(
             use_resolved_padding(&mut resolved, &mut 0, constraints);
             resolved
         });
-    let root = resolved.as_ref().unwrap_or(root);
+    project_forced_break_lines_on_used_tree(
+        layouts,
+        resolved.as_ref().unwrap_or(root),
+        constraints,
+    );
+}
+
+/// `project_forced_break_lines_with_constraints` on a caller-owned tree whose
+/// collapsed table borders are already resolved (the table-prepared tree).
+/// The half-border and used-padding edits are applied in place and undone
+/// afterwards, so the shared tree is unchanged for later passes.
+fn project_forced_break_lines_with_shared_tree(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    shared: Option<&mut Component>,
+    constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
+) {
+    let Some(tree) = shared else {
+        project_forced_break_lines_with_constraints(layouts, root, constraints);
+        return;
+    };
+    fn apply(
+        component: &mut Component,
+        index: &mut usize,
+        constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
+        saved: &mut Vec<(usize, w3cos_std::style::Style)>,
+    ) {
+        let own_index = *index;
+        *index += 1;
+        let half =
+            component.style.display == WDisplay::TableCell && component.style.border_collapse;
+        let padding = constraints.get(&own_index).and_then(|used| used.padding);
+        if half || padding.is_some() {
+            saved.push((own_index, component.style.clone()));
+        }
+        if half {
+            for side in 0..4 {
+                let width = collapsed_layout_edge_width(&component.style, side) * 0.5;
+                set_collapsed_layout_edge_width(&mut component.style, side, width);
+            }
+        }
+        if let Some(padding) = padding {
+            component.style.padding = w3cos_std::style::Edges {
+                top: WSpacing::Px(padding.top),
+                right: WSpacing::Px(padding.right),
+                bottom: WSpacing::Px(padding.bottom),
+                left: WSpacing::Px(padding.left),
+            };
+        }
+        for child in &mut component.children {
+            apply(child, index, constraints, saved);
+        }
+    }
+    fn restore(
+        component: &mut Component,
+        index: &mut usize,
+        saved: &mut std::iter::Peekable<std::vec::IntoIter<(usize, w3cos_std::style::Style)>>,
+    ) {
+        if saved.peek().is_none() {
+            return;
+        }
+        if saved.peek().is_some_and(|(at, _)| *at == *index) {
+            component.style = saved.next().unwrap().1;
+        }
+        *index += 1;
+        for child in &mut component.children {
+            restore(child, index, saved);
+        }
+    }
+    let expected = projection_verify_enabled().then(|| {
+        let mut expected = layouts.to_vec();
+        project_forced_break_lines_with_constraints(&mut expected, root, constraints);
+        expected
+    });
+    let mut saved = Vec::new();
+    apply(tree, &mut 0, constraints, &mut saved);
+    project_forced_break_lines_on_used_tree(layouts, tree, constraints);
+    restore(tree, &mut 0, &mut saved.into_iter().peekable());
+    if let Some(expected) = expected {
+        assert_layouts_unchanged(&expected, layouts, "shared-tree forced-break projection");
+    }
+}
+
+fn project_forced_break_lines_on_used_tree(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
+) {
     /// The content box a forced break continues into.
     ///
     /// A forced break opens a new line box of the inline formatting context
