@@ -382,6 +382,52 @@ pub fn for_in_keys(value: &Value) -> Value {
     Value::array(keys)
 }
 
+/// Headroom kept below the JS stack limit for the error path and host code
+/// called from the last admitted frame.
+const STACK_RED_ZONE: usize = 256 * 1024;
+
+thread_local! {
+    /// Lowest stack address a JS frame may start at on this thread
+    /// (`usize::MAX` until first measured, 0 when the platform cannot tell).
+    static JS_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// V8 StackGuard / Isolate::StackOverflow: every compiled function entry
+/// compares the stack pointer with a per-thread limit and throws
+/// `RangeError: Maximum call stack size exceeded` instead of overflowing the
+/// native stack. The fast path is a thread-local load and one compare.
+#[inline(always)]
+pub fn check_stack() -> Result<(), Value> {
+    let marker = 0u8;
+    let sp = std::ptr::addr_of!(marker) as usize;
+    if sp > JS_STACK_LIMIT.with(|limit| limit.get()) {
+        return Ok(());
+    }
+    check_stack_slow(sp)
+}
+
+#[cold]
+#[inline(never)]
+fn check_stack_slow(sp: usize) -> Result<(), Value> {
+    let limit = JS_STACK_LIMIT.with(|limit| {
+        if limit.get() == usize::MAX {
+            let measured = stacker::remaining_stack()
+                .map(|remaining| sp.saturating_sub(remaining).saturating_add(STACK_RED_ZONE))
+                .unwrap_or(0);
+            limit.set(measured);
+        }
+        limit.get()
+    });
+    if sp > limit {
+        Ok(())
+    } else {
+        Err(crate::error_instance(
+            "RangeError",
+            vec![Value::string("Maximum call stack size exceeded")],
+        ))
+    }
+}
+
 /// ECMA-262 Call(F, V, args) step 2: a non-callable callee throws a
 /// TypeError (V8 Builtins::Call -> CallNonCallable) instead of producing
 /// undefined.
@@ -1084,6 +1130,30 @@ pub fn await_value(value: &Value) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn unbounded_recursion_throws_range_error_instead_of_overflowing() {
+        fn recurse(depth: usize) -> Result<usize, Value> {
+            check_stack()?;
+            let pad = std::hint::black_box([0u8; 512]);
+            recurse(depth + 1).map(|d| d + pad[0] as usize)
+        }
+        let handle = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let error = recurse(0).expect_err("recursion must hit the guard");
+                (
+                    get_property(&error, &Value::string("name")).to_js_string(),
+                    get_property(&error, &Value::string("message")).to_js_string(),
+                )
+            })
+            .unwrap();
+        let (name, message) = handle.join().unwrap();
+        assert_eq!(name, "RangeError");
+        assert_eq!(message, "Maximum call stack size exceeded");
+        // The guard keeps working after a caught overflow.
+        assert!(check_stack().is_ok());
+    }
 
     #[test]
     fn calling_a_non_callable_value_throws_type_error() {

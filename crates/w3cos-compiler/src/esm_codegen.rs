@@ -4276,6 +4276,8 @@ export function result() {
         assert!(code.contains("pub fn m0_add__w3ir_sync_factory__num__result("));
         assert!(code.contains("__w3cos_frame.num_bindings["));
         assert!(code.contains("fn m0_add_call_result("));
+        // StackGuard check at every compiled function entry.
+        assert!(code.contains("w3cos_core::intrinsics::check_stack()?;"));
         // SetFunctionName / SetFunctionLength on the declaration's value.
         assert!(code.contains("set_name_and_length(\"add\", 2)"));
         assert!(code.contains("set_name_and_length(\"gen\", 0)"));

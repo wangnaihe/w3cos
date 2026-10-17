@@ -2680,6 +2680,7 @@ pub fn {rust_name}__result(
     __args: &[w3cos_core::Value],
     __captures: &w3cos_core::AotCaptureMap,
 ) -> Result<w3cos_core::Value, w3cos_core::Value> {{
+    w3cos_core::intrinsics::check_stack()?;
 {fast_prefix_result}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{val_initializers}{slot_capture_init}    #[allow(unused_mut)]
     let mut __w3cos_frame = {type_name} {{
 {registers_init}
