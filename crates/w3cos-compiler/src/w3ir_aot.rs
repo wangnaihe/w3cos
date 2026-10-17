@@ -6993,7 +6993,7 @@ fn emit_instruction(
             reads.extend(arguments.iter().map(|argument| argument.0));
             let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
             let expr = format!(
-                "w3cos_core::intrinsics::call_completion(&{}, {}, vec![{}])",
+                "w3cos_core::intrinsics::call_completion_slice(&{}, {}, &[{}])",
                 uses.emit(callee.0),
                 uses.emit(this_value.0),
                 emit_arguments_from(&mut uses, arguments)
@@ -9896,6 +9896,8 @@ fn main() {{
                 "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
             ) || generated.contains(
                 "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
+            ) || generated.contains(
+                "&[std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
             ),
             "last-use Call argument must be taken, not cloned: {generated}"
         );
@@ -10018,6 +10020,7 @@ fn main() {{
         let generated = emit_slice(&function);
         assert!(
             generated.contains("call_completion(&self.registers[0].clone()")
+                || generated.contains("call_completion_slice(&self.registers[0]")
                 || generated.contains("call(&self.registers[0].clone()")
                 || generated.contains("call_completion(&self.registers[0]")
                 || generated.contains("call(&self.registers[0]"),
@@ -10033,6 +10036,9 @@ fn main() {{
             )
                 && !generated.contains(
                     "call_completion(&std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
+                )
+                && !generated.contains(
+                    "call_completion_slice(&std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
                 ),
             "must not take a callee that is returned later: {generated}"
         );

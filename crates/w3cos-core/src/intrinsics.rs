@@ -395,6 +395,17 @@ pub fn call_completion(
     crate::catch_js(|| call(callee, this_value, arguments))
 }
 
+/// [`call_completion`] with borrowed arguments: AOT callees and slice-aware
+/// host closures take the slice directly, so a JS call site no longer
+/// allocates an argument `Vec` per call (V8 passes arguments on the stack).
+pub fn call_completion_slice(
+    callee: &Value,
+    this_value: Value,
+    arguments: &[Value],
+) -> crate::Completion {
+    crate::catch_js(|| callee.call_slice(this_value, arguments))
+}
+
 fn try_materialized_arguments(arguments: &Value) -> Result<Vec<Value>, Value> {
     let Some(arguments) = arguments.as_array() else {
         return Err(crate::value::type_error(
