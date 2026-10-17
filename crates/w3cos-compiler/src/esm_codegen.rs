@@ -2223,11 +2223,26 @@ fn emit_w3ir_generator_symbol(
         "\n    /// generator {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
+    // A stateless (cached or empty) capture map lets the function value
+    // carry the factory itself (FunctionBody::Aot, V8's code entry on the
+    // JSFunction): a call jumps to the factory without a boxed closure, a
+    // `_call` shim and a per-call capture-map lookup.
+    let value_body = if captures.starts_with("(*__w3cos_site_captures(")
+        || captures == "w3cos_core::AotCaptureMap::new()"
+    {
+        format!(
+            "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
+        )
+    } else {
+        format!(
+            "w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args))",
+            symbol.bundled_name
+        )
+    };
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || {value_body})\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
-        symbol.bundled_name,
     ));
     if symbol.kind == SymbolKind::Variable {
         output.push_str(&format!(
@@ -2480,6 +2495,40 @@ std::thread_local! {
         std::cell::RefCell::new((std::path::PathBuf::new(), HashSet::new()));
 }
 
+/// Whether `binding` (an entry-scope binding id) is written anywhere besides
+/// its single hoisted declaration store in the module entry: any write from
+/// another function, or more than one store in the entry.
+fn binding_is_reassigned(
+    module: &w3cos_ir::Module,
+    entry: w3cos_ir::FunctionId,
+    binding: w3cos_ir::BindingId,
+) -> bool {
+    let mut entry_stores = 0usize;
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let target = match instruction {
+                    w3cos_ir::Instruction::StoreBinding {
+                        binding: target, ..
+                    }
+                    | w3cos_ir::Instruction::InitializeBinding {
+                        binding: target, ..
+                    } => target,
+                    _ => continue,
+                };
+                if *target != binding {
+                    continue;
+                }
+                if function.id != entry {
+                    return true;
+                }
+                entry_stores += 1;
+            }
+        }
+    }
+    entry_stores > 1
+}
+
 fn owns_binding_cell(module: &BundledModule, name: &str) -> bool {
     OWN_CELL_BINDINGS.with(|own| {
         let own = own.borrow();
@@ -2562,6 +2611,25 @@ fn generator_capture_map_with_synthetic(
                         })
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
+            // A function declaration of this module that is never
+            // reassigned anywhere in the module is a constant once hoisted:
+            // capture its function value directly (V8 treats such script
+            // context slots as constant and calls the known target) instead
+            // of calling a getter closure on every reference.
+            if let Some(bundled) = module.lookup(&binding.name)
+                && load.ends_with("_value()")
+                && bundle.symbols.iter().any(|symbol| {
+                    symbol.bundled_name == bundled
+                        && symbol.module == module.path
+                        && symbol.kind == SymbolKind::Function
+                })
+                && !binding_is_reassigned(w3ir_module, entry.id, *capture)
+            {
+                return Some(format!(
+                    "({}, w3cos_core::AotCapture::Cell(::std::rc::Rc::new(::std::cell::RefCell::new(({load}, true)))))",
+                    capture.0
+                ));
+            }
             // A mutable module variable of this module captured by a
             // function reads/writes its BindingCell slot directly (V8
             // ScriptContext slot load) instead of calling getter/setter
@@ -9246,6 +9314,68 @@ export function main() { return total; }"#,
             String::from_utf8_lossy(&output.stdout).contains("W3COS_MODULE_INIT_W3IR_CLOSURE_OK"),
             "live module cell assertion should pass: {}",
             String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_function_declaration_captures_are_constant_slots() {
+        let root = fixture_root("w3cos_esm_codegen_fn_snapshot");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"function stable(x) { return x + 1; }
+function swapped(x) { return x * 10; }
+function useBoth(x) { return stable(x) + swapped(x); }
+export function main() { return useBoth(2) * 1000 + useBoth(3); }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("RefCell::new((stable_value(), true))")
+                && code.contains("RefCell::new((swapped_value(), true))"),
+            "never-reassigned declarations are captured as constant slots: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3cos_fn_snapshot_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{ assert_eq!(run_entry().to_u32(), 23034); println!(\"W3COS_FN_SNAPSHOT_OK\"); }}\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("W3COS_FN_SNAPSHOT_OK"),
+            "snapshotted function captures must call the declared functions.\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
         std::fs::remove_dir_all(root).ok();
     }
