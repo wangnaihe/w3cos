@@ -34,6 +34,69 @@ struct CounterSnapshot {
     scopes: Vec<HashMap<String, i32>>,
 }
 
+/// One component-tree build is a read-only pass over the document, so the
+/// `::marker` counter state of every list item can be collected in a single
+/// document-order traversal instead of one full traversal per marker (which
+/// made `ol > li` quadratic). The memo lives only for the outermost
+/// `to_component_subtree` call on this document and is dropped on return.
+struct CounterMemo {
+    document: usize,
+    depth: u32,
+    filled: bool,
+    recording: bool,
+    markers: HashMap<NodeId, CounterSnapshot>,
+}
+
+thread_local! {
+    static COUNTER_MEMO: RefCell<Option<CounterMemo>> = const { RefCell::new(None) };
+}
+
+struct CounterMemoScope {
+    active: bool,
+}
+
+impl CounterMemoScope {
+    fn enter(document: *const Document) -> Self {
+        COUNTER_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            match memo.as_mut() {
+                Some(existing) if existing.document == document as usize => {
+                    existing.depth += 1;
+                    Self { active: true }
+                }
+                Some(_) => Self { active: false },
+                None => {
+                    *memo = Some(CounterMemo {
+                        document: document as usize,
+                        depth: 1,
+                        filled: false,
+                        recording: false,
+                        markers: HashMap::new(),
+                    });
+                    Self { active: true }
+                }
+            }
+        })
+    }
+}
+
+impl Drop for CounterMemoScope {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        COUNTER_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if let Some(existing) = memo.as_mut() {
+                existing.depth -= 1;
+                if existing.depth == 0 {
+                    *memo = None;
+                }
+            }
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GeneratedContentItem {
     Text(String),
@@ -2093,6 +2156,7 @@ impl Document {
 
     /// Lower one connected DOM subtree while preserving selector ancestry.
     pub fn to_component_subtree(&self, id: NodeId) -> w3cos_std::Component {
+        let _counter_memo = CounterMemoScope::enter(self as *const Document);
         let mut lineage = Vec::new();
         let mut current = self.get_node(id).parent;
         while let Some(parent) = current {
@@ -5397,6 +5461,20 @@ impl Document {
                 scopes: scopes.clone(),
             });
         }
+        if target_pseudo == "::marker"
+            && Self::counter_memo_recording(self)
+            && self.computed_style_for(id).display == w3cos_std::style::Display::ListItem
+        {
+            // Same traversal state the targeted walk would return for `id`.
+            let snapshot = CounterSnapshot {
+                scopes: scopes.clone(),
+            };
+            COUNTER_MEMO.with(|memo| {
+                if let Some(memo) = memo.borrow_mut().as_mut() {
+                    memo.markers.insert(id, snapshot);
+                }
+            });
+        }
         let sibling_scope_base = scopes.len();
         if let Some(snapshot) =
             self.visit_pseudo_counters(id, "::before", target, target_pseudo, scopes, true)
@@ -5456,7 +5534,63 @@ impl Document {
         None
     }
 
+    fn counter_memo_recording(document: &Document) -> bool {
+        COUNTER_MEMO.with(|memo| {
+            memo.borrow().as_ref().is_some_and(|memo| {
+                memo.recording && memo.document == document as *const _ as usize
+            })
+        })
+    }
+
     fn counter_snapshot_at(&self, target: NodeId, pseudo_element: &str) -> CounterSnapshot {
+        if pseudo_element == "::marker" {
+            let me = self as *const Document as usize;
+            let state = COUNTER_MEMO.with(|memo| {
+                let memo = memo.borrow();
+                match memo.as_ref() {
+                    Some(memo) if memo.document == me && !memo.recording => {
+                        Some((memo.filled, memo.markers.get(&target).cloned()))
+                    }
+                    _ => None,
+                }
+            });
+            match state {
+                Some((_, Some(snapshot))) => return snapshot,
+                Some((false, None)) => {
+                    COUNTER_MEMO.with(|memo| {
+                        if let Some(memo) = memo.borrow_mut().as_mut() {
+                            memo.recording = true;
+                        }
+                    });
+                    // A target that never matches: walk the whole document once.
+                    let mut scopes = vec![HashMap::new()];
+                    for child in self.children_ids(NodeId(0)) {
+                        let _ = self.visit_counter_tree(
+                            child,
+                            NodeId(u32::MAX),
+                            "::marker",
+                            &mut scopes,
+                            false,
+                        );
+                    }
+                    let hit = COUNTER_MEMO.with(|memo| {
+                        let mut memo = memo.borrow_mut();
+                        let memo = memo.as_mut().expect("counter memo");
+                        memo.recording = false;
+                        memo.filled = true;
+                        memo.markers.get(&target).cloned()
+                    });
+                    if let Some(snapshot) = hit {
+                        return snapshot;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.counter_snapshot_uncached(target, pseudo_element)
+    }
+
+    fn counter_snapshot_uncached(&self, target: NodeId, pseudo_element: &str) -> CounterSnapshot {
         let mut scopes = vec![HashMap::new()];
         for child in self.children_ids(NodeId(0)) {
             if let Some(snapshot) =
@@ -17012,6 +17146,62 @@ mod generated_counter_format_tests {
                 .value("list-item"),
             1
         );
+    }
+
+    #[test]
+    fn memoized_marker_counters_match_the_targeted_walk() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".skip", &[("counter-increment", "list-item 3")]);
+        let mut document = Document::new();
+        let mut items = Vec::new();
+        for outer in 0..3 {
+            let list = document.create_element("ol");
+            for index in 0..4 {
+                let item = document.create_element("li");
+                if index == 2 {
+                    item.class_list_add(&mut document, "skip");
+                }
+                list.append_child(&mut document, item);
+                items.push(item.id);
+                if outer == 1 && index == 1 {
+                    let nested = document.create_element("ol");
+                    for _ in 0..2 {
+                        let inner = document.create_element("li");
+                        nested.append_child(&mut document, inner);
+                        items.push(inner.id);
+                    }
+                    item.append_child(&mut document, nested);
+                }
+            }
+            document.body().append_child(&mut document, list);
+        }
+        let expected: Vec<i32> = items
+            .iter()
+            .map(|id| {
+                document
+                    .counter_snapshot_uncached(*id, "::marker")
+                    .value("list-item")
+            })
+            .collect();
+        // Inside one component-tree build every marker reads the single
+        // document-order traversal.
+        let _scope = CounterMemoScope::enter(&document as *const Document);
+        let memoized: Vec<i32> = items
+            .iter()
+            .map(|id| {
+                document
+                    .counter_snapshot_at(*id, "::marker")
+                    .value("list-item")
+            })
+            .collect();
+        assert_eq!(memoized, expected);
+        assert_eq!(&expected[..4], &[1, 2, 5, 6]);
+        COUNTER_MEMO.with(|memo| {
+            assert!(memo.borrow().as_ref().is_some_and(|memo| memo.filled));
+        });
+        drop(_scope);
+        COUNTER_MEMO.with(|memo| assert!(memo.borrow().is_none()));
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
