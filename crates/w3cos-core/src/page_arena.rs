@@ -867,6 +867,8 @@ thread_local! {
 /// let a later release free a slot that is still referenced.
 #[inline(always)]
 pub(crate) fn retain(kind: SlotKind, handle: u32) {
+    #[cfg(feature = "rc-stats")]
+    RC_OPS.with(|ops| ops[0].set(ops[0].get() + 1));
     let fast = FAST.try_with(|fast| match fast[kind as usize].live(handle) {
         Some(meta) => {
             let strong = meta.strong.get();
@@ -898,6 +900,8 @@ fn retain_slow(kind: SlotKind, handle: u32) {
 /// risking a free of a referenced slot.
 #[inline(always)]
 pub(crate) fn release(kind: SlotKind, handle: u32) {
+    #[cfg(feature = "rc-stats")]
+    RC_OPS.with(|ops| ops[1].set(ops[1].get() + 1));
     // Fast path: a live slot that keeps at least one count. The zero
     // transition (generation bump, live count, payload drop) stays on the
     // slow path under the arena borrow.
@@ -1639,4 +1643,24 @@ mod tests {
         .join()
         .expect("teardown");
     }
+}
+
+#[cfg(feature = "rc-stats")]
+thread_local! {
+    static RC_OPS: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
+}
+
+/// `(retains, releases)` of arena slots on this thread since start (or the
+/// last [`reset_rc_op_counts`]). Only with the `rc-stats` feature.
+#[cfg(feature = "rc-stats")]
+pub fn rc_op_counts() -> (u64, u64) {
+    RC_OPS.with(|ops| (ops[0].get(), ops[1].get()))
+}
+
+#[cfg(feature = "rc-stats")]
+pub fn reset_rc_op_counts() {
+    RC_OPS.with(|ops| {
+        ops[0].set(0);
+        ops[1].set(0);
+    });
 }

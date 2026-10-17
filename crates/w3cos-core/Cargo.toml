@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "W3C OS core — JS value types, Proxy, and reactive primitives"
 
+[features]
+# Count arena slot retain/release calls (`page_arena::rc_op_counts`), for
+# measuring refcount traffic. Off by default; costs one TLS add per op.
+rc-stats = []
+
 [dependencies]
 serde_json = { workspace = true }
 chrono = { workspace = true }

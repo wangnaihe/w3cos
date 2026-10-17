@@ -1355,6 +1355,51 @@ fn emit_boxed_value(plan: &EscapePlan, register: u32) -> String {
     }
 }
 
+/// Operand for a `&Value` parameter. A boxed register is borrowed in place
+/// (`self.registers[i]`, written after a `&` or as a method receiver)
+/// instead of cloned into a temporary: the clone was one slot retain plus
+/// one release per use. Rust's borrow checker rejects any emission where
+/// the register could change while borrowed, so this cannot free early.
+/// Unboxed numbers / booleans still build a temporary `Value`.
+fn emit_boxed_ref(plan: &EscapePlan, register: u32) -> String {
+    if let Some(slot) = val_slot(plan, register) {
+        format!("self.registers[{slot}]")
+    } else {
+        emit_boxed_value(plan, register)
+    }
+}
+
+/// Operand for a by-value `Value` parameter: on the register's last use,
+/// when no other operand of the instruction reads it, the value is moved
+/// out (into a `let` hoisted before the statement, so it never overlaps a
+/// borrow of `self.registers`); otherwise cloned. Returns `(hoist, expr)`.
+fn emit_owned_operand(
+    plan: &EscapePlan,
+    last_uses: &HashSet<u32>,
+    reads: &[u32],
+    register: u32,
+) -> (String, String) {
+    let once = reads.iter().filter(|read| **read == register).count() == 1;
+    match val_slot(plan, register) {
+        Some(slot) if once && last_uses.contains(&register) => (
+            format!(
+                "let __w3cos_owned_{register} = std::mem::replace(&mut self.registers[{slot}], w3cos_core::Value::Undefined); "
+            ),
+            format!("__w3cos_owned_{register}"),
+        ),
+        _ => (String::new(), emit_boxed_value(plan, register)),
+    }
+}
+
+/// Wrap `statement` in a block after its hoisted moves, if any.
+fn with_hoisted(hoisted: &str, statement: String) -> String {
+    if hoisted.is_empty() {
+        statement
+    } else {
+        format!("{{ {hoisted}{statement} }}")
+    }
+}
+
 fn emit_boxed_use(plan: &EscapePlan, register: u32, take: bool) -> String {
     if take {
         if let Some(slot) = val_slot(plan, register) {
@@ -1384,6 +1429,22 @@ impl<'a> ValueUseEmitter<'a> {
             }
         }
         Self { plan, remaining }
+    }
+
+    /// No operand of this instruction is moved out, so `&`-positions may
+    /// borrow registers in place without conflicting with a `&mut`.
+    fn takes_nothing(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    /// Operand in a `&Value` position: borrowed in place when the
+    /// instruction moves nothing out, else as [`Self::emit`].
+    fn emit_ref(&mut self, register: u32) -> String {
+        if self.takes_nothing() {
+            emit_boxed_ref(self.plan, register)
+        } else {
+            self.emit(register)
+        }
     }
 
     fn emit(&mut self, register: u32) -> String {
@@ -6431,16 +6492,18 @@ fn emit_instruction(
         {
             emit_numeric_binding_store(plan, binding.0, value.0)
         }
-        Instruction::InitializeBinding { binding, value } => format!(
-            "if let Some(binding) = {} {{ *binding.borrow_mut() = ({}, true); }} else {{ {} }}",
-            emit_binding_get(storage, binding.0),
-            emit_boxed_value(plan, value.0),
-            emit_binding_store_value(
-                storage,
-                binding.0,
-                &format!("({}, true)", emit_boxed_value(plan, value.0)),
-            ),
-        ),
+        Instruction::InitializeBinding { binding, value } => {
+            // Both branches are alternatives, so one hoisted move serves both.
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &[value.0], value.0);
+            with_hoisted(
+                &hoisted,
+                format!(
+                    "if let Some(binding) = {} {{ *binding.borrow_mut() = ({value_expr}, true); }} else {{ {} }}",
+                    emit_binding_get(storage, binding.0),
+                    emit_binding_store_value(storage, binding.0, &format!("({value_expr}, true)")),
+                ),
+            )
+        }
         Instruction::StoreBinding { binding, value } if is_shared_number(binding.0) => {
             emit_shared_number_store(plan, binding.0, value.0)
         }
@@ -6452,12 +6515,14 @@ fn emit_instruction(
         Instruction::StoreBinding { binding, value } => {
             let setter = emit_capture_setter_get(storage, binding.0);
             let cell = emit_binding_get(storage, binding.0);
-            let value_expr = emit_boxed_value(plan, value.0);
+            // The setter and local branches are alternatives: one hoisted
+            // move serves both.
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &[value.0], value.0);
             let propagate = emit_exception_propagation(exception_target, mode, plan);
             let local = format!(
                 "if let Some(binding) = {cell} {{ let mut binding = binding.borrow_mut(); if !binding.1 {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} binding.0 = {value_expr}; }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"missing binding\"); {propagate} }}"
             );
-            if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
+            let statement = if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
                 format!(
                     "if let Some(setter) = {setter} {{ if !setter.is_callable() {{ let __w3cos_exception = w3cos_core::intrinsics::type_error(\"captured binding is immutable\"); {propagate} }} let __w3cos_stored = {value_expr}; setter.call_slice(w3cos_core::Value::Undefined, std::slice::from_ref(&__w3cos_stored)); }} else {{ {local} }}"
                 )
@@ -6465,7 +6530,8 @@ fn emit_instruction(
                 format!(
                     "if let Some(setter) = {setter} {{ if !setter.is_callable() {{ let __w3cos_exception = w3cos_core::intrinsics::type_error(\"captured binding is immutable\"); {propagate} }} let __w3cos_stored = {value_expr}; match w3cos_core::catch_js(|| setter.call_slice(w3cos_core::Value::Undefined, std::slice::from_ref(&__w3cos_stored))) {{ Ok(_) => {{}} Err(__w3cos_exception) => {propagate} }} }} else {{ {local} }}"
                 )
-            }
+            };
+            with_hoisted(&hoisted, statement)
         }
         Instruction::RefreshBinding { binding } if num_binding_slot(plan, binding.0).is_some() => {
             String::new()
@@ -6492,8 +6558,8 @@ fn emit_instruction(
         Instruction::Add { dst, lhs, rhs } => format!(
             "self.registers[{}] = w3cos_core::intrinsics::add(&{}, &{});",
             register(*dst),
-            emit_boxed_value(plan, lhs.0),
-            emit_boxed_value(plan, rhs.0)
+            emit_boxed_ref(plan, lhs.0),
+            emit_boxed_ref(plan, rhs.0)
         ),
         Instruction::Binary {
             dst,
@@ -6504,26 +6570,26 @@ fn emit_instruction(
             BinaryOperator::AbstractNotEqual => format!(
                 "self.registers[{}] = w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::abstract_equal(&{}, &{}));",
                 register(*dst),
-                emit_boxed_value(plan, lhs.0),
-                emit_boxed_value(plan, rhs.0)
+                emit_boxed_ref(plan, lhs.0),
+                emit_boxed_ref(plan, rhs.0)
             ),
             BinaryOperator::StrictNotEqual => format!(
                 "self.registers[{}] = w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::strict_equal(&{}, &{}));",
                 register(*dst),
-                emit_boxed_value(plan, lhs.0),
-                emit_boxed_value(plan, rhs.0)
+                emit_boxed_ref(plan, lhs.0),
+                emit_boxed_ref(plan, rhs.0)
             ),
             BinaryOperator::InstanceOf => format!(
                 "self.registers[{}] = w3cos_core::intrinsics::instance_of(&{}, &{});",
                 register(*dst),
-                emit_boxed_value(plan, lhs.0),
-                emit_boxed_value(plan, rhs.0)
+                emit_boxed_ref(plan, lhs.0),
+                emit_boxed_ref(plan, rhs.0)
             ),
             BinaryOperator::In => format!(
                 "self.registers[{}] = w3cos_core::intrinsics::in_operator(&{}, &{});",
                 register(*dst),
-                emit_boxed_value(plan, lhs.0),
-                emit_boxed_value(plan, rhs.0)
+                emit_boxed_ref(plan, lhs.0),
+                emit_boxed_ref(plan, rhs.0)
             ),
             operator => emit_binary_operator(plan, reaching_nums, dst.0, *operator, lhs.0, rhs.0),
         },
@@ -6544,22 +6610,26 @@ fn emit_instruction(
             "self.registers[{}] = w3cos_core::intrinsics::{}(&{});",
             register(*dst),
             unary_intrinsic(*operator),
-            emit_boxed_value(plan, value.0)
+            emit_boxed_ref(plan, value.0)
         ),
         Instruction::GetProperty { dst, object, key } => {
             if let Some(literal) = proven_strings.get(&key.0) {
                 format!(
                     "self.registers[{}] = {}.get_property({literal:?});",
                     register(*dst),
-                    emit_boxed_use(plan, object.0, last_uses.contains(&object.0)),
+                    if last_uses.contains(&object.0) {
+                        emit_boxed_use(plan, object.0, true)
+                    } else {
+                        emit_boxed_ref(plan, object.0)
+                    },
                 )
             } else {
                 let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0]);
                 format!(
                     "self.registers[{}] = w3cos_core::intrinsics::get_property(&{}, &{});",
                     register(*dst),
-                    uses.emit(object.0),
-                    uses.emit(key.0)
+                    uses.emit_ref(object.0),
+                    uses.emit_ref(key.0)
                 )
             }
         }
@@ -6567,12 +6637,12 @@ fn emit_instruction(
             let key_expr = if let Some(literal) = proven_strings.get(&key.0) {
                 format!("w3cos_core::Value::from({literal:?})")
             } else {
-                emit_boxed_value(plan, key.0)
+                emit_boxed_ref(plan, key.0)
             };
             format!(
                 "self.registers[{}] = w3cos_core::intrinsics::delete_property(&{}, &{key_expr});",
                 register(*dst),
-                emit_boxed_value(plan, object.0),
+                emit_boxed_ref(plan, object.0),
             )
         }
         Instruction::SetProperty {
@@ -6581,9 +6651,10 @@ fn emit_instruction(
             value,
             strict,
         } => {
-            if let Some(literal) = proven_strings.get(&key.0) {
-                let object_expr = emit_boxed_value(plan, object.0);
-                let value_expr = emit_boxed_value(plan, value.0);
+            let reads = [object.0, key.0, value.0];
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &reads, value.0);
+            let object_expr = emit_boxed_ref(plan, object.0);
+            let statement = if let Some(literal) = proven_strings.get(&key.0) {
                 if *strict {
                     format!(
                         "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), {value_expr});"
@@ -6593,26 +6664,29 @@ fn emit_instruction(
                 }
             } else if *strict {
                 format!(
-                    "w3cos_core::intrinsics::set_property_strict(&{}, &{}, {});",
-                    emit_boxed_value(plan, object.0),
-                    emit_boxed_value(plan, key.0),
-                    emit_boxed_value(plan, value.0)
+                    "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &{}, {value_expr});",
+                    emit_boxed_ref(plan, key.0),
                 )
             } else {
                 format!(
-                    "w3cos_core::intrinsics::set_property(&{}, &{}, {});",
-                    emit_boxed_value(plan, object.0),
-                    emit_boxed_value(plan, key.0),
-                    emit_boxed_value(plan, value.0)
+                    "w3cos_core::intrinsics::set_property(&{object_expr}, &{}, {value_expr});",
+                    emit_boxed_ref(plan, key.0),
                 )
-            }
+            };
+            with_hoisted(&hoisted, statement)
         }
-        Instruction::DefineField { object, key, value } => format!(
-            "w3cos_core::intrinsics::define_field(&{}, &{}, {});",
-            emit_boxed_value(plan, object.0),
-            emit_boxed_value(plan, key.0),
-            emit_boxed_value(plan, value.0)
-        ),
+        Instruction::DefineField { object, key, value } => {
+            let reads = [object.0, key.0, value.0];
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &reads, value.0);
+            with_hoisted(
+                &hoisted,
+                format!(
+                    "w3cos_core::intrinsics::define_field(&{}, &{}, {value_expr});",
+                    emit_boxed_ref(plan, object.0),
+                    emit_boxed_ref(plan, key.0),
+                ),
+            )
+        }
         Instruction::DefinePrivate {
             object,
             brand,
@@ -6679,34 +6753,51 @@ fn emit_instruction(
                 emit_boxed_value(plan, name.0)
             )
         }
-        Instruction::CreateArray { dst, elements } => format!(
-            "self.registers[{}] = w3cos_core::Value::{}(vec![{}]);",
-            register(*dst),
-            if plan.local_allocs.contains(&dst.0) {
-                "local_array"
-            } else {
-                "array"
-            },
-            elements
+        Instruction::CreateArray { dst, elements } => {
+            let reads: Vec<u32> = elements.iter().map(|element| element.0).collect();
+            let mut hoisted = String::new();
+            let items = reads
                 .iter()
-                .map(|element| emit_boxed_value(plan, element.0))
+                .map(|element| {
+                    let (hoist, expr) = emit_owned_operand(plan, last_uses, &reads, *element);
+                    hoisted.push_str(&hoist);
+                    expr
+                })
                 .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Instruction::AppendArrayElement { array, value } => format!(
-            "w3cos_core::intrinsics::append_array_element(&{}, {});",
-            emit_boxed_value(plan, array.0),
-            emit_boxed_value(plan, value.0)
-        ),
+                .join(", ");
+            with_hoisted(
+                &hoisted,
+                format!(
+                    "self.registers[{}] = w3cos_core::Value::{}(vec![{items}]);",
+                    register(*dst),
+                    if plan.local_allocs.contains(&dst.0) {
+                        "local_array"
+                    } else {
+                        "array"
+                    },
+                ),
+            )
+        }
+        Instruction::AppendArrayElement { array, value } => {
+            let reads = [array.0, value.0];
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &reads, value.0);
+            with_hoisted(
+                &hoisted,
+                format!(
+                    "w3cos_core::intrinsics::append_array_element(&{}, {value_expr});",
+                    emit_boxed_ref(plan, array.0),
+                ),
+            )
+        }
         Instruction::AppendIterable { array, iterable } => format!(
             "w3cos_core::intrinsics::append_iterable(&{}, &{});",
-            emit_boxed_value(plan, array.0),
-            emit_boxed_value(plan, iterable.0)
+            emit_boxed_ref(plan, array.0),
+            emit_boxed_ref(plan, iterable.0)
         ),
         Instruction::ArrayRest { dst, value, start } => format!(
             "self.registers[{}] = w3cos_core::intrinsics::array_rest(&{}, {});",
             register(*dst),
-            emit_boxed_value(plan, value.0),
+            emit_boxed_ref(plan, value.0),
             *start as usize
         ),
         Instruction::ObjectRest {
@@ -6716,7 +6807,7 @@ fn emit_instruction(
         } => format!(
             "self.registers[{}] = w3cos_core::intrinsics::object_rest(&{}, &[{}]);",
             register(*dst),
-            emit_boxed_value(plan, value.0),
+            emit_boxed_ref(plan, value.0),
             excluded
                 .iter()
                 .map(|key| emit_boxed_value(plan, key.0))
@@ -6729,6 +6820,11 @@ fn emit_instruction(
             } else {
                 "object"
             };
+            let reads: Vec<u32> = properties
+                .iter()
+                .flat_map(|(key, value)| [key.0, value.0])
+                .collect();
+            let mut hoisted = String::new();
             let object = if properties.is_empty() {
                 format!("w3cos_core::Value::{constructor}(std::collections::HashMap::new())")
             } else {
@@ -6736,21 +6832,28 @@ fn emit_instruction(
                     "w3cos_core::Value::{constructor}(std::collections::HashMap::from([{}]))",
                     properties
                         .iter()
-                        .map(|(key, value)| format!(
-                            "({}.to_js_string(), {})",
-                            emit_boxed_value(plan, key.0),
-                            emit_boxed_value(plan, value.0)
-                        ))
+                        .map(|(key, value)| {
+                            let (hoist, value_expr) =
+                                emit_owned_operand(plan, last_uses, &reads, value.0);
+                            hoisted.push_str(&hoist);
+                            format!(
+                                "({}.to_js_string(), {value_expr})",
+                                emit_boxed_ref(plan, key.0),
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
             };
-            format!("self.registers[{}] = {object};", register(*dst))
+            with_hoisted(
+                &hoisted,
+                format!("self.registers[{}] = {object};", register(*dst)),
+            )
         }
         Instruction::CopyDataProperties { target, source } => format!(
             "w3cos_core::intrinsics::copy_data_properties(&{}, &{});",
-            emit_boxed_value(plan, target.0),
-            emit_boxed_value(plan, source.0)
+            emit_boxed_ref(plan, target.0),
+            emit_boxed_ref(plan, source.0)
         ),
         Instruction::CreateClosure {
             dst,
@@ -7129,12 +7232,15 @@ fn emit_instruction(
         Instruction::Return { value } => match mode {
             EmissionMode::Generator | EmissionMode::AsyncGenerator => format!(
                 "self.state = __W3COS_STATE__::Completed; return Self::result({}, true);",
-                emit_boxed_value(plan, value.0)
+                emit_boxed_use(plan, value.0, last_uses.contains(&value.0))
             ),
-            EmissionMode::Sync => format!("return Ok({});", emit_boxed_value(plan, value.0)),
+            EmissionMode::Sync => format!(
+                "return Ok({});",
+                emit_boxed_use(plan, value.0, last_uses.contains(&value.0))
+            ),
             EmissionMode::Async => format!(
                 "return Ok(__W3COS_ASYNC_FRAME__::completed({}));",
-                emit_boxed_value(plan, value.0)
+                emit_boxed_use(plan, value.0, last_uses.contains(&value.0))
             ),
         },
         Instruction::Throw { value } => {
@@ -7240,8 +7346,8 @@ fn emit_binary_operator(
             write_bool(plan, dst, &format!("{left} == {right}"))
         }
         operator => {
-            let boxed_lhs = emit_boxed_value(plan, lhs);
-            let boxed_rhs = emit_boxed_value(plan, rhs);
+            let boxed_lhs = emit_boxed_ref(plan, lhs);
+            let boxed_rhs = emit_boxed_ref(plan, rhs);
             let call = format!(
                 "w3cos_core::intrinsics::{}(&{boxed_lhs}, &{boxed_rhs})",
                 binary_intrinsic(operator)
