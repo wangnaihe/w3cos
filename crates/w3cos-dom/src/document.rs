@@ -117,14 +117,68 @@ enum GeneratedContentItem {
 struct MatchedPropertiesKey {
     tag: u32,
     attributes: Vec<(u32, &'static str)>,
-    matched: Vec<(u8, bool, u32, String, String)>,
+    /// Matched rule indices (Blink MatchedPropertiesCache hashes the matched
+    /// rule list). Valid within one stylesheet generation, which the cache
+    /// epoch enforces.
+    matched: Vec<u32>,
+}
+
+/// FxHasher (rustc-hash): MPC keys are small integer lists hashed per
+/// restyled element; SipHash dominated the lookup.
+#[derive(Default, Clone, Copy)]
+struct MpcHasher(u64);
+
+impl std::hash::Hasher for MpcHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut tail = 0u64;
+        for (shift, byte) in chunks.remainder().iter().enumerate() {
+            tail |= (*byte as u64) << (shift * 8);
+        }
+        self.add(tail ^ bytes.len() as u64);
+    }
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl MpcHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
 }
 
 #[derive(Default)]
 struct MatchedPropertiesCache {
     epoch: Option<(u64, u64)>,
     entries: usize,
-    styles: HashMap<MatchedPropertiesKey, Vec<(w3cos_std::style::Style, w3cos_std::style::Style)>>,
+    styles: HashMap<
+        MatchedPropertiesKey,
+        Vec<(w3cos_std::style::Style, w3cos_std::style::Style)>,
+        std::hash::BuildHasherDefault<MpcHasher>,
+    >,
 }
 
 impl MatchedPropertiesCache {
@@ -2604,12 +2658,12 @@ impl Document {
 
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
-        let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            stylesheet::matching_cascade_declarations_for_node(self, id)
+        let matched_rules = if stylesheet::has_rules() && node.node_type == NodeType::Element {
+            stylesheet::matching_rule_indices_for_node(self, id)
         } else {
             Vec::new()
         };
-        let mpc_key = self.matched_properties_key(id, inline, &matched, inherited);
+        let mpc_key = self.matched_properties_key(id, inline, &matched_rules, inherited);
         if let Some(key) = &mpc_key
             && let Some(style) = self.matched_properties_cache.borrow_mut().get(
                 key,
@@ -2628,6 +2682,7 @@ impl Document {
             );
             return style;
         }
+        let matched = stylesheet::cascade_declarations_for_rules(&matched_rules);
         let mut author_declarations =
             Vec::with_capacity(matched.len() + inline.inline_declarations.len());
         let mut important = Vec::new();
@@ -4592,7 +4647,7 @@ impl Document {
         &self,
         id: NodeId,
         inline: &Arc<CSSStyleDeclaration>,
-        matched: &[stylesheet::CascadeDeclaration],
+        matched: &[u32],
         inherited: Option<&w3cos_std::style::Style>,
     ) -> Option<MatchedPropertiesKey> {
         let node = self.get_node(id);
@@ -4626,18 +4681,7 @@ impl Document {
                 .iter()
                 .map(|(name, value)| (name.as_u32(), value.as_str()))
                 .collect(),
-            matched: matched
-                .iter()
-                .map(|declaration| {
-                    (
-                        declaration.origin as u8,
-                        declaration.important,
-                        declaration.specificity,
-                        declaration.property.clone(),
-                        declaration.value.clone(),
-                    )
-                })
-                .collect(),
+            matched: matched.to_vec(),
         })
     }
 

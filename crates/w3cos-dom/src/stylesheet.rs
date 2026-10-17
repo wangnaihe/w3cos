@@ -1019,15 +1019,23 @@ pub(crate) fn matching_cascade_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<CascadeDeclaration> {
+    cascade_declarations_for_rules(&matching_rule_indices_for_node(document, node))
+}
+
+/// Indices of the principal-box rules matching `node`, in (specificity,
+/// order) order. Blink's ElementRuleCollector produces the same list of
+/// matched rules; the MatchedPropertiesCache is keyed by it, so a cache hit
+/// never materializes declaration strings.
+pub(crate) fn matching_rule_indices_for_node(document: &Document, node: NodeId) -> Vec<u32> {
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
-        let mut matched: Vec<&Rule> = rules
+        let mut matched: Vec<u32> = rules
             .candidate_indices_for_node(document, node)
             .into_iter()
-            .map(|index| &rules.rules[index])
-            .filter(|rule| {
+            .filter(|&index| {
+                let rule = &rules.rules[index];
                 rule.pseudo_element.is_none()
                     && rule_matches_document_scope(rule, document_scope)
                     && ancestor_bloom.might_contain(rule.ancestor_filter)
@@ -1046,10 +1054,26 @@ pub(crate) fn matching_cascade_declarations_for_node(
                         .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
                         .all(|(_, query)| container_query_matches(&rules, document, node, query))
             })
+            .map(|index| index as u32)
             .collect();
-        matched.sort_by_key(|rule| (rule.specificity, rule.order));
+        matched.sort_by_key(|&index| {
+            let rule = &rules.rules[index as usize];
+            (rule.specificity, rule.order)
+        });
+        matched
+    })
+}
+
+/// Cascade-ordered declarations of rules from [`matching_rule_indices_for_node`].
+pub(crate) fn cascade_declarations_for_rules(matched: &[u32]) -> Vec<CascadeDeclaration> {
+    if matched.is_empty() {
+        return Vec::new();
+    }
+    RULES.with(|rules| {
+        let rules = rules.borrow();
         let mut buckets: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
-        for rule in matched {
+        for &index in matched {
+            let rule = &rules.rules[index as usize];
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
                     let (value, is_important) = declaration_value_and_importance(value);
@@ -1480,34 +1504,39 @@ fn pseudo_matches_node(
     target_id: Option<&str>,
 ) -> bool {
     let dom_node = document.get_node(node);
-    let element_siblings = || {
-        dom_node.parent.map_or_else(Vec::new, |parent| {
-            document
-                .children_ids(parent)
-                .into_iter()
-                .filter(|sibling| document.get_node(*sibling).node_type == NodeType::Element)
-                .collect::<Vec<_>>()
-        })
+    // Structural pseudo-classes walk the sibling chain in place (Blink
+    // SelectorChecker counts siblings via ElementTraversal / NthIndexCache)
+    // instead of collecting the parent's children into a Vec per check.
+    let same_type = |sibling: &crate::node::DomNode| {
+        sibling
+            .tag
+            .as_str()
+            .eq_ignore_ascii_case(&dom_node.tag.as_str())
     };
-    let type_siblings = || {
-        element_siblings()
-            .into_iter()
-            .filter(|sibling| {
-                document
-                    .get_node(*sibling)
-                    .tag
-                    .as_str()
-                    .eq_ignore_ascii_case(&dom_node.tag.as_str())
-            })
-            .collect::<Vec<_>>()
-    };
+    let has_parent = dom_node.parent.is_some();
     match pseudo {
-        PseudoClass::FirstChild => element_siblings().first().copied() == Some(node),
-        PseudoClass::LastChild => element_siblings().last().copied() == Some(node),
-        PseudoClass::FirstOfType => type_siblings().first().copied() == Some(node),
-        PseudoClass::LastOfType => type_siblings().last().copied() == Some(node),
-        PseudoClass::OnlyChild => element_siblings().as_slice() == [node],
-        PseudoClass::OnlyOfType => type_siblings().as_slice() == [node],
+        PseudoClass::FirstChild => {
+            has_parent && count_element_siblings(document, node, false, |_| true, 1) == 0
+        }
+        PseudoClass::LastChild => {
+            has_parent && count_element_siblings(document, node, true, |_| true, 1) == 0
+        }
+        PseudoClass::FirstOfType => {
+            has_parent && count_element_siblings(document, node, false, same_type, 1) == 0
+        }
+        PseudoClass::LastOfType => {
+            has_parent && count_element_siblings(document, node, true, same_type, 1) == 0
+        }
+        PseudoClass::OnlyChild => {
+            has_parent
+                && count_element_siblings(document, node, false, |_| true, 1) == 0
+                && count_element_siblings(document, node, true, |_| true, 1) == 0
+        }
+        PseudoClass::OnlyOfType => {
+            has_parent
+                && count_element_siblings(document, node, false, same_type, 1) == 0
+                && count_element_siblings(document, node, true, same_type, 1) == 0
+        }
         PseudoClass::Empty => document.children_ids(node).into_iter().all(|child| {
             let child = document.get_node(child);
             match child.node_type {
@@ -1568,16 +1597,32 @@ fn pseudo_matches_node(
                 .is_ok_and(|matched| !matched)
         }
         PseudoClass::NthChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, false)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, false, |_| true, usize::MAX),
+                    expression,
+                )
         }
         PseudoClass::NthLastChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, true)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, true, |_| true, usize::MAX),
+                    expression,
+                )
         }
         PseudoClass::NthOfType(expression) => {
-            matches_nth_position(&type_siblings(), node, expression, false)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, false, same_type, usize::MAX),
+                    expression,
+                )
         }
         PseudoClass::NthLastOfType(expression) => {
-            matches_nth_position(&type_siblings(), node, expression, true)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, true, same_type, usize::MAX),
+                    expression,
+                )
         }
     }
 }
@@ -1713,20 +1758,42 @@ fn node_direction(document: &Document, mut node: NodeId) -> String {
     }
 }
 
-fn matches_nth_position(
-    siblings: &[NodeId],
+/// Element siblings before (`from_end == false`) or after `node` accepted by
+/// `filter`, stopping once `limit` are counted.
+fn count_element_siblings(
+    document: &Document,
     node: NodeId,
-    expression: &str,
     from_end: bool,
-) -> bool {
-    let Some(index) = siblings.iter().position(|sibling| *sibling == node) else {
-        return false;
+    filter: impl Fn(&crate::node::DomNode) -> bool,
+    limit: usize,
+) -> usize {
+    let step = |id: NodeId| {
+        let current = document.get_node(id);
+        crate::node::sib(if from_end {
+            current.next_sibling
+        } else {
+            current.prev_sibling
+        })
     };
-    let position = if from_end {
-        siblings.len() - index
-    } else {
-        index + 1
-    } as i64;
+    let mut count = 0;
+    let mut sibling = step(node);
+    while let Some(candidate) = sibling {
+        let candidate_node = document.get_node(candidate);
+        if candidate_node.node_type == NodeType::Element && filter(candidate_node) {
+            count += 1;
+            if count >= limit {
+                break;
+            }
+        }
+        sibling = step(candidate);
+    }
+    count
+}
+
+/// `preceding` = matching siblings before the node (or after, for the
+/// `-last-` variants); the 1-based position is `preceding + 1`.
+fn matches_nth_position(preceding: usize, expression: &str) -> bool {
+    let position = preceding as i64 + 1;
     let Some((a, b)) = parse_an_plus_b(expression) else {
         return false;
     };
@@ -1738,12 +1805,36 @@ fn matches_nth_position(
 }
 
 fn parse_an_plus_b(expression: &str) -> Option<(i64, i64)> {
-    let expression = expression
-        .chars()
-        .filter(|character| !is_css_whitespace(*character))
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match expression.as_str() {
+    // Compact (whitespace-free, lowercase) form in a stack buffer; the
+    // An+B grammar is ASCII, so longer or non-ASCII input takes the slow path.
+    let mut buffer = [0u8; 32];
+    let mut len = 0;
+    let mut compact_ok = expression.is_ascii();
+    if compact_ok {
+        for byte in expression.bytes() {
+            if is_css_whitespace(byte as char) {
+                continue;
+            }
+            if len == buffer.len() {
+                compact_ok = false;
+                break;
+            }
+            buffer[len] = byte.to_ascii_lowercase();
+            len += 1;
+        }
+    }
+    let owned;
+    let expression: &str = if compact_ok {
+        std::str::from_utf8(&buffer[..len]).ok()?
+    } else {
+        owned = expression
+            .chars()
+            .filter(|character| !is_css_whitespace(*character))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        owned.as_str()
+    };
+    match expression {
         "odd" => return Some((2, 1)),
         "even" => return Some((2, 0)),
         _ => {}
