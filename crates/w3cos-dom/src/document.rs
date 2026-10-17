@@ -584,6 +584,10 @@ struct ExtentCache {
     /// `true` (or out of range) = must recompute.
     dirty: Vec<bool>,
     value: Vec<(f32, f32)>,
+    /// Descendants-only extent, valid while `dirty[idx]` is false and the
+    /// slot was written by `descendant_extent` (scrollWidth/Height of a
+    /// container with thousands of clean children answers in O(1)).
+    descendants: Vec<Option<Option<(f32, f32)>>>,
 }
 
 impl ExtentCache {
@@ -615,9 +619,19 @@ impl ExtentCache {
         if self.dirty.len() <= idx {
             self.dirty.resize(idx + 1, true);
             self.value.resize(idx + 1, (0.0, 0.0));
+            self.descendants.resize(idx + 1, None);
         }
         self.dirty[idx] = false;
         self.value[idx] = value;
+        self.descendants[idx] = None;
+    }
+
+    fn clean_descendants(&self, idx: usize) -> Option<Option<(f32, f32)>> {
+        if self.dirty.get(idx) == Some(&false) {
+            self.descendants.get(idx).copied().flatten()
+        } else {
+            None
+        }
     }
 }
 
@@ -1691,6 +1705,10 @@ impl Document {
     /// without descendants. Clean subtrees answer from the cache.
     pub fn descendant_extent(&self, id: NodeId) -> Option<(f32, f32)> {
         let mut cache = self.extent.borrow_mut();
+        let idx = id.0 as usize;
+        if let Some(hit) = cache.clean_descendants(idx) {
+            return hit;
+        }
         let mut out: Option<(f32, f32)> = None;
         let mut child = self.get_node(id).first_child;
         while let Some(cid) = child {
@@ -1701,6 +1719,16 @@ impl Document {
             });
             child = crate::node::sib(self.get_node(cid).next_sibling);
         }
+        // Children are clean now, so this node's own subtree entry can be
+        // stored too (a dirty mark below will reach it again).
+        let rect = self.get_layout_rect(id);
+        let (mut right, mut bottom) = (rect.x + rect.width, rect.y + rect.height);
+        if let Some((r, b)) = out {
+            right = right.max(r);
+            bottom = bottom.max(b);
+        }
+        cache.store(idx, (right, bottom));
+        cache.descendants[idx] = Some(out);
         out
     }
 

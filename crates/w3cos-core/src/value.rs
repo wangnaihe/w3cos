@@ -2781,7 +2781,14 @@ impl Value {
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
-                    .map(|byte| value[..byte].chars().count() as f64)
+                    .map(|byte| {
+                        let prefix = &value.as_bytes()[..byte];
+                        if prefix.is_ascii() {
+                            byte as f64
+                        } else {
+                            value[..byte].chars().count() as f64
+                        }
+                    })
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
@@ -2791,6 +2798,24 @@ impl Value {
                 // follow indexOf above.
                 let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                if value.is_ascii() && needle.is_ascii() {
+                    // One-byte strings (V8's SeqOneByteString): indices are
+                    // byte offsets, no char counting over the whole string.
+                    let length = value.len();
+                    let position = match args.get(1).map(Value::to_number) {
+                        Some(number) if !number.is_nan() => {
+                            number.trunc().clamp(0.0, length as f64) as usize
+                        }
+                        _ => length,
+                    };
+                    let end = (position + needle.len()).min(length);
+                    return Value::Number(
+                        value[..end]
+                            .rfind(needle.as_str())
+                            .map(|byte| byte as f64)
+                            .unwrap_or(-1.0),
+                    );
+                }
                 let length = value.chars().count();
                 let position = match args.get(1).map(Value::to_number) {
                     Some(number) if !number.is_nan() => {
