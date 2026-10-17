@@ -1328,6 +1328,16 @@ fn module_init_external_bindings(
     bindings
 }
 
+/// Module-binding accessors capture nothing, so one function object per
+/// call site is enough. Building them per call allocated two functions on
+/// every invocation of a function that reads a module global, and the
+/// arena keeps them (no tracing GC).
+fn cached_stateless_function(function: &str) -> String {
+    format!(
+        "{{ ::std::thread_local! {{ static __W3COS_CACHED_FN: ::std::cell::OnceCell<w3cos_core::Value> = const {{ ::std::cell::OnceCell::new() }}; }} __W3COS_CACHED_FN.with(|cell| cell.get_or_init(|| {function}).clone()) }}"
+    )
+}
+
 fn module_init_capture_map(
     bundle: &EsmBundle,
     module: &BundledModule,
@@ -1380,15 +1390,18 @@ fn module_init_capture_map(
                                 && symbol.kind == SymbolKind::Variable
                         })
                         .map(|_| {
-                            format!(
+                            cached_stateless_function(&format!(
                                 "w3cos_core::Value::function(move |_, arguments| {bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
-                            )
+                            ))
                         })
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
             Ok(format!(
-                "({}, w3cos_core::AotCapture::Accessors(w3cos_core::Value::function(move |_, _| {getter}), {setter}))",
-                import.local.0
+                "({}, w3cos_core::AotCapture::Accessors({}, {setter}))",
+                import.local.0,
+                cached_stateless_function(&format!(
+                    "w3cos_core::Value::function(move |_, _| {getter})"
+                ))
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2459,15 +2472,18 @@ fn generator_capture_map_with_synthetic(
                                 && symbol.kind == SymbolKind::Variable
                         })
                         .map(|_| {
-                            format!(
+                            cached_stateless_function(&format!(
                                 "w3cos_core::Value::function(move |_, arguments| {bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
-                            )
+                            ))
                         })
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
             Some(format!(
-                "({}, w3cos_core::AotCapture::Accessors(w3cos_core::Value::function(move |_, _| {load}), {setter}))",
-                capture.0
+                "({}, w3cos_core::AotCapture::Accessors({}, {setter}))",
+                capture.0,
+                cached_stateless_function(&format!(
+                    "w3cos_core::Value::function(move |_, _| {load})"
+                ))
             ))
         })
         .collect::<Option<Vec<_>>>()?;
