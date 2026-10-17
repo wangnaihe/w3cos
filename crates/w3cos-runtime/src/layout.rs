@@ -14246,11 +14246,20 @@ fn project_cleared_descendant_bfc_heights(
     layouts: &mut [(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
 ) {
+    // Only in-flow cleared boxes can extend a BFC here; most trees have none.
+    if !flat
+        .iter()
+        .any(|node| node.style.clear != WClear::None && node.style.float == WFloat::None)
+    {
+        return;
+    }
     let positions = layouts
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
+    // Pre-order: the descendants of `ancestor` are `ancestor + 1..ends[ancestor]`.
+    let ends = subtree_ends(flat);
     for ancestor in 0..flat.len() {
         let style = flat[ancestor].style;
         if !matches!(style.height, WDim::Auto)
@@ -14262,7 +14271,7 @@ fn project_cleared_descendant_bfc_heights(
             continue;
         };
         let ancestor_rect = layouts[ancestor_position].0;
-        let Some(bottom) = (ancestor + 1..flat.len())
+        let Some(bottom) = (ancestor + 1..ends[ancestor])
             .filter(|candidate| {
                 positions.contains_key(candidate)
                     && flat[*candidate].style.clear != WClear::None
@@ -14272,16 +14281,6 @@ fn project_cleared_descendant_bfc_heights(
                         flat[*candidate].style.position,
                         WPos::Absolute | WPos::Fixed
                     )
-            })
-            .filter(|candidate| {
-                let mut parent = flat[*candidate].parent;
-                while let Some(index) = parent {
-                    if index == ancestor {
-                        return true;
-                    }
-                    parent = flat[index].parent;
-                }
-                false
             })
             .filter_map(|candidate| {
                 let rect = layouts[*positions.get(&candidate)?].0;
@@ -25394,6 +25393,41 @@ fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subtree_ends_cover_exactly_each_pre_order_subtree() {
+        use w3cos_std::style::Style;
+        let leaf = |text: &str| Component::text(text, Style::default());
+        let tree = Component::boxed(
+            Style::default(),
+            vec![
+                Component::boxed(Style::default(), vec![leaf("a"), leaf("b")]),
+                leaf("c"),
+                Component::boxed(
+                    Style::default(),
+                    vec![Component::boxed(Style::default(), vec![leaf("d")])],
+                ),
+            ],
+        );
+        let flat = pre_flatten(&tree);
+        let ends = subtree_ends(&flat);
+        assert_eq!(ends, vec![8, 4, 3, 4, 5, 8, 8, 8]);
+        // Range membership equals the ancestor walk for every pair.
+        for ancestor in 0..flat.len() {
+            for node in 0..flat.len() {
+                let mut walk = flat[node].parent;
+                let mut is_descendant = false;
+                while let Some(parent) = walk {
+                    if parent == ancestor {
+                        is_descendant = true;
+                        break;
+                    }
+                    walk = flat[parent].parent;
+                }
+                assert_eq!(is_descendant, ancestor < node && node < ends[ancestor]);
+            }
+        }
+    }
+
     use std::io::Cursor;
 
     use super::*;
