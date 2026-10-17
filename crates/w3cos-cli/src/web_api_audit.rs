@@ -195,7 +195,7 @@ fn runtime_inventory() -> JsonValue {
     for name in &globals {
         let constructor = window.get_property(name);
         let prototype = constructor.get_property("prototype");
-        let members = match prototype {
+        let members = match &prototype {
             Value::Object(object) => {
                 let mut keys = object.borrow().keys();
                 keys.sort();
