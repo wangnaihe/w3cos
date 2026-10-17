@@ -104,7 +104,14 @@ fn edge_blocks_margin_collapse(component: &Component, top: bool) -> bool {
     }
     // Only inline content: there is no child margin to collapse.
     component.children.iter().all(|child| {
-        matches!(child.kind, ComponentKind::Text { .. })
+        // A block element whose only content is text is lowered to a Text
+        // component carrying the element's style; that is still a block.
+        (matches!(child.kind, ComponentKind::Text { .. })
+            && host_id(child).is_none_or(|id| {
+                crate::dom::with_document(|document| {
+                    document.get_node(NodeId::from_u32(id)).node_type == NodeType::Text
+                })
+            }))
             || matches!(
                 child.style.display,
                 Display::Inline
@@ -404,6 +411,22 @@ fn try_tail(
         }
         tail.push(component);
     }
+    if debug_enabled() {
+        let mut hosts = Vec::new();
+        for component in &tail {
+            collect_hosts(component, &mut hosts);
+        }
+        eprintln!(
+            "[splice] tail plan node {node}: keep {keep}, tail {} ({} boxes), anchor boxes {}",
+            tail.len(),
+            hosts.len(),
+            {
+                let mut anchor_hosts = Vec::new();
+                collect_hosts(anchor, &mut anchor_hosts);
+                anchor_hosts.len()
+            }
+        );
+    }
     Some(Plan {
         path,
         node,
@@ -498,7 +521,13 @@ fn solve(
 )> {
     let flat = pre_flatten(wrapper);
     let mut engine = LayoutEngine::new();
-    engine.set_skip_projections(skip_projections);
+    // Projections repair floats, tables, inline-block and RTL boxes. A
+    // subtree with none of them gets nothing from them even when the rest
+    // of the document needs them (checked by W3COS_SPLICE_VERIFY).
+    // Projections repair floats, tables, inline-block and RTL boxes. A
+    // subtree with none of them gets nothing from them even when the rest
+    // of the document needs them (checked by W3COS_SPLICE_VERIFY).
+    engine.set_skip_projections(skip_projections || can_skip_projections(wrapper));
     engine.set_measure_text(measure_text);
     let results = engine
         .compute(wrapper, &flat, viewport_w, viewport_h)
@@ -525,6 +554,36 @@ fn rect_of(
         .iter()
         .find(|(host, _)| *host == id)
         .map(|(_, rect)| *rect)
+}
+
+/// The kept child before a tail only seeds sibling margin collapsing. When
+/// its bottom margin cannot collapse with a descendant's, a childless block
+/// of the same used height and margins is equivalent and costs one box
+/// instead of re-solving its whole subtree (LayoutNG reuses the clean
+/// child's result; only its margin strut matters to what follows).
+fn anchor_stand_in(source: &Component) -> Component {
+    let height = host_id(source).map(|id| {
+        crate::dom::with_document(|document| document.get_layout_rect(NodeId::from_u32(id)).height)
+    });
+    match height {
+        Some(height) if height > 0.0 && edge_blocks_margin_collapse(source, false) => {
+            let mut style = Style {
+                display: Display::Block,
+                ..Style::default()
+            };
+            style.height = Dimension::Px(height);
+            style.margin = source.style.margin;
+            style.font_size = source.style.font_size;
+            Component {
+                kind: ComponentKind::Box,
+                style,
+                children: Vec::new(),
+                on_click: source.on_click.clone(),
+                sticky_counter_signal: None,
+            }
+        }
+        _ => source.clone(),
+    }
 }
 
 /// `can_skip_projections` of the spliced tree without walking all of it.
@@ -637,7 +696,7 @@ pub(super) fn try_splice(
             let tail = target.children.split_off(keep);
             target.children.extend(removed);
             let target = at_path(&cache.component, &plan.path);
-            let anchor = target.children[keep - 1].clone();
+            let anchor = anchor_stand_in(&target.children[keep - 1]);
             let Some(anchor_id) = host_id(&anchor) else {
                 return bail("solve 599");
             };
@@ -962,6 +1021,32 @@ mod tests {
         crate::dom::append_child(reply, p);
         assert!(crate::incremental_layout::flush());
         assert_matches_full("sibling after reply");
+    }
+
+    #[test]
+    fn text_only_block_child_still_collapses_through_the_parent_edge() {
+        let (_chat, reply) = chat_page();
+        let holder = crate::dom::create_element("div");
+        let p = crate::dom::create_element("p");
+        style(p, &[("margin", "6px 0")]);
+        crate::dom::append_child(p, crate::dom::create_text_node("only text"));
+        crate::dom::append_child(holder, p);
+        crate::dom::append_child(reply, holder);
+        let inline = crate::dom::create_element("div");
+        crate::dom::append_child(inline, crate::dom::create_text_node("inline text"));
+        crate::dom::append_child(reply, inline);
+        let (holder_c, inline_c) = crate::dom::with_document(|document| {
+            (
+                document.to_component_subtree(NodeId::from_u32(holder)),
+                document.to_component_subtree(NodeId::from_u32(inline)),
+            )
+        });
+        // <p> with only text is lowered to a Text component carrying the
+        // block style; its margin still collapses through the holder.
+        assert!(!edge_blocks_margin_collapse(&holder_c, false));
+        assert!(!edge_blocks_margin_collapse(&holder_c, true));
+        // Anonymous inline text has no margin to collapse.
+        assert!(edge_blocks_margin_collapse(&inline_c, false));
     }
 
     #[test]
