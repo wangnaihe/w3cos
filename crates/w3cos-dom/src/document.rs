@@ -13181,33 +13181,58 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     if left == right {
         return true;
     }
-    let mut left = left.clone();
-    let mut right = right.clone();
-    for style in [&mut left, &mut right] {
-        // Source identity is not a CSS paint difference. Coalescing carries
-        // its boundaries separately rather than keeping transparent wrappers.
-        if let Some(properties) = style.custom_properties.as_mut() {
-            // Probe first: removing through the copy-on-write handle would
-            // deep-copy a shared map even when neither key is present.
-            if properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-                || properties.contains_key(w3cos_std::inline_text::FRAGMENT_ENDS)
-            {
-                properties.remove(w3cos_std::inline_text::SOURCE_RUN);
-                properties.remove(w3cos_std::inline_text::FRAGMENT_ENDS);
-            }
-            if properties.is_empty() {
-                style.custom_properties = None;
-            }
+    // Source identity is not a CSS paint difference. Coalescing carries its
+    // boundaries separately rather than keeping transparent wrappers.
+    fn source_key(key: &str) -> bool {
+        key == w3cos_std::inline_text::SOURCE_RUN || key == w3cos_std::inline_text::FRAGMENT_ENDS
+    }
+    fn custom_without_source_eq(
+        left: Option<&w3cos_std::style::CustomProperties>,
+        right: Option<&w3cos_std::style::CustomProperties>,
+    ) -> bool {
+        let count = |map: Option<&w3cos_std::style::CustomProperties>| {
+            map.map_or(0, |map| map.keys().filter(|key| !source_key(key)).count())
+        };
+        if count(left) != count(right) {
+            return false;
         }
-        if style
+        let (Some(left), Some(right)) = (left, right) else {
+            return true;
+        };
+        left.iter()
+            .filter(|(key, _)| !source_key(key))
+            .all(|(key, value)| right.get(key) == Some(value))
+    }
+    fn background(style: &w3cos_std::style::Style) -> Option<&str> {
+        style
             .background_image
             .as_deref()
-            .is_some_and(|image| image.eq_ignore_ascii_case("none"))
-        {
-            style.background_image = None;
-        }
+            .filter(|image| !image.eq_ignore_ascii_case("none"))
     }
-    left == right
+    if background(left) != background(right)
+        || !custom_without_source_eq(
+            left.custom_properties.as_ref(),
+            right.custom_properties.as_ref(),
+        )
+    {
+        return false;
+    }
+    // Compare every other field without deep-copying the 1 KB Style (the
+    // old path cloned both sides on each probe): bitwise views whose two
+    // excluded fields are blanked, never dropped, so the shared heap data
+    // stays owned by `left` / `right`.
+    // SAFETY: the views are only read through `PartialEq` and are wrapped in
+    // ManuallyDrop; the overwritten fields are replaced without dropping and
+    // the replacement `None`s own nothing.
+    unsafe {
+        let mut left_view = std::mem::ManuallyDrop::new(std::ptr::read(left));
+        let mut right_view = std::mem::ManuallyDrop::new(std::ptr::read(right));
+        for view in [&mut *left_view, &mut *right_view] {
+            std::ptr::write(&mut view.custom_properties, None);
+            std::ptr::write(&mut view.background_image, None);
+        }
+        *left_view == *right_view
+    }
 }
 
 fn equivalent_text_paint_style(
