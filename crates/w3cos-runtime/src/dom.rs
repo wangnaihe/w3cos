@@ -616,6 +616,11 @@ pub fn tag_name(node: u32) -> String {
     with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str())
 }
 
+/// Interned tag bytes; the atom arena never frees, so no copy is needed.
+pub fn tag_static(node: u32) -> &'static str {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_static())
+}
+
 pub fn tag_is(node: u32, expected: &str) -> bool {
     with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str() == expected)
 }

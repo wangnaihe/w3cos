@@ -1341,18 +1341,30 @@ fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
 // object borrows before user code so it can redefine the receiver/prototype.
 fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Option<Value> {
     let mut current = prototype.clone();
-    let mut seen = std::collections::HashSet::new();
+    // A cycle can only come from a proxy-free chain mutated behind
+    // setPrototypeOf's back; bound the walk instead of hashing identities
+    // per level (the old HashSet allocated on every DOM property miss).
+    let mut depth = 0u32;
     while let Some(object) = current.as_object() {
-        if !seen.insert(object.identity()) {
+        depth += 1;
+        if depth > 4096 {
             return None;
         }
         let (proxy, getter, data, accessor, next) = {
             let object = object.borrow();
+            // One combined probe (data, getter or setter slot) decides the
+            // level; the separate getter/data reads run only on a hit.
+            let accessor = object.has_own_property(key);
+            let (getter, data) = if accessor {
+                (object.own_getter(key), object.own_data(key))
+            } else {
+                (None, None)
+            };
             (
                 object.has_get_trap(),
-                object.own_getter(key),
-                object.own_data(key),
-                object.has_own_property(key),
+                getter,
+                data,
+                accessor,
                 object.get_prototype_of(),
             )
         };
@@ -1382,7 +1394,7 @@ fn inherited_prototype_value(node: u32, key: &str, receiver: &Value) -> Option<V
 fn cached_node_prototype(node: u32) -> Value {
     thread_local! {
         static DIV_PROTO: RefCell<Option<(u32, Value)>> = const { RefCell::new(None) };
-        static OTHER: RefCell<(u32, HashMap<(u16, String), Value>)> =
+        static OTHER: RefCell<(u32, HashMap<(u16, &'static str), Value>)> =
             RefCell::new((0, HashMap::new()));
     }
     // Namespaces/local names choose a different prototype even for identical
@@ -1405,9 +1417,9 @@ fn cached_node_prototype(node: u32) -> Value {
         });
     }
     let tag = if node_type == 1 {
-        dom::tag_name(node)
+        dom::tag_static(node)
     } else {
-        String::new()
+        ""
     };
     let key = (node_type, tag);
     OTHER.with(|cache| {
