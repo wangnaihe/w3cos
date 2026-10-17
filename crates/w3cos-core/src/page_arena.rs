@@ -24,8 +24,6 @@
 //! padding would not reclaim holes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
@@ -385,10 +383,31 @@ impl PageArena {
     }
 }
 
+/// Interning hash, the analogue of WTF::StringHasher behind Blink's
+/// AtomicStringTable: the table is private to this thread, so a fast
+/// word-at-a-time multiply/rotate (FxHash) replaces SipHash. The murmur3
+/// fmix64 finaliser spreads entropy into the low bits the open-addressed
+/// table masks with.
+#[inline]
 fn hash_str(s: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut bytes = s.as_bytes();
+    let mut hash = (bytes.len() as u64).wrapping_mul(SEED);
+    while bytes.len() >= 8 {
+        let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+        bytes = &bytes[8..];
+    }
+    if !bytes.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..bytes.len()].copy_from_slice(bytes);
+        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(tail)).wrapping_mul(SEED);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ (hash >> 33)
 }
 
 thread_local! {
