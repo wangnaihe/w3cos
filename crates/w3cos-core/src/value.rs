@@ -1850,6 +1850,13 @@ impl Value {
 
     /// ECMAScript `ToBoolean`.
     pub fn to_bool(&self) -> bool {
+        // V8 ToBoolean fast path for Numbers and Booleans.
+        if let Some(n) = self.as_number() {
+            return n != 0.0 && !n.is_nan();
+        }
+        if let Some(b) = self.as_bool() {
+            return b;
+        }
         if self.live_dom_node().is_some() {
             return true;
         }
@@ -1867,6 +1874,9 @@ impl Value {
 
     /// ECMAScript `ToNumber`.
     pub fn to_number(&self) -> f64 {
+        if let Some(n) = self.as_number() {
+            return n;
+        }
         if self.live_dom_node().is_some() {
             return f64::NAN;
         }
@@ -4042,6 +4052,9 @@ impl Value {
 
     /// ECMAScript `===` (strict equality).
     pub fn strict_eq(&self, other: &Value) -> bool {
+        if let (Some(x), Some(y)) = (self.as_number(), other.as_number()) {
+            return x == y; // NaN !== NaN
+        }
         if let Some(equal) = crate::intrinsics::dom_nodes_equal(self, other) {
             return equal;
         }
@@ -4122,6 +4135,10 @@ impl Value {
     }
 
     pub fn js_lt(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs < rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return ordering.is_lt();
         }
@@ -4134,6 +4151,10 @@ impl Value {
     }
 
     pub fn js_gt(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs > rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return ordering.is_gt();
         }
@@ -4146,6 +4167,10 @@ impl Value {
     }
 
     pub fn js_le(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs <= rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return !ordering.is_gt();
         }
@@ -4158,6 +4183,10 @@ impl Value {
     }
 
     pub fn js_ge(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs >= rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return !ordering.is_lt();
         }
