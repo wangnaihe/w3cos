@@ -1606,8 +1606,14 @@ fn slot_ids_literal(ids: &[u32]) -> String {
     format!("[{list}]")
 }
 
+/// Register files up to this many Values live inline in the frame (V8
+/// Ignition keeps the register file in the interpreter's stack frame), so
+/// small hot functions don't pay a heap allocation per call. 32 Values is
+/// 512 bytes of stack.
+const INLINE_REGISTERS: usize = 32;
+
 fn emit_registers_field(n: u32) -> String {
-    if (n as usize) <= INLINE_FRAME {
+    if (n as usize) <= INLINE_REGISTERS {
         format!("    registers: [w3cos_core::Value; {n}],\n")
     } else {
         "    registers: Vec<w3cos_core::Value>,\n".to_string()
@@ -1615,7 +1621,7 @@ fn emit_registers_field(n: u32) -> String {
 }
 
 fn emit_registers_init(n: u32) -> String {
-    if (n as usize) <= INLINE_FRAME {
+    if (n as usize) <= INLINE_REGISTERS {
         "        registers: std::array::from_fn(|_| w3cos_core::Value::Undefined),\n".to_string()
     } else {
         format!("        registers: vec![w3cos_core::Value::Undefined; {n}],\n")
