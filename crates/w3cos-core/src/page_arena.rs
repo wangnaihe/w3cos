@@ -89,16 +89,74 @@ fn decode_handle(handle: u32) -> Option<(usize, u32)> {
 
 /// Per-slot bookkeeping, kept beside (not inside) the payload so a count
 /// change never touches payload bytes.
-#[derive(Clone, Copy, Default)]
+///
+/// Fields are `Cell`s: the count fast path ([`retain`] / [`release`])
+/// updates them through the published [`FAST`] pointer without borrowing
+/// the arena, so they must tolerate shared access.
+#[derive(Default)]
 struct SlotMeta {
     /// Strong references: `Value` handles plus resolved `JsObjectRef` /
     /// `JsArrayRef` / `JsFunction` handles. Weak references do not count.
-    strong: u32,
+    strong: Cell<u32>,
     /// Bumped when the strong count reaches zero. Weak references store the
     /// full value; handles store its low byte.
-    generation: u32,
+    generation: Cell<u32>,
     /// The payload is initialized (live, or dead but not yet dropped).
-    init: bool,
+    init: Cell<bool>,
+}
+
+impl SlotMeta {
+    /// Live (counted) and its generation byte matches the handle's.
+    #[inline(always)]
+    fn is_live(&self, generation_byte: u32) -> bool {
+        self.strong.get() > 0 && (self.generation.get() & 0xFF) == generation_byte
+    }
+}
+
+/// Where the current page's slot metadata for one [`SlotKind`] lives, so a
+/// count change on a live handle needs no arena borrow and no lazily
+/// initialized thread-local (both cost more than the count itself).
+///
+/// Invariants (upheld by [`SizeClassSlab`]):
+/// - `ptr[..len]` is the `meta` buffer of the arena's *current* slab of that
+///   kind. It is republished after every `meta.push` (the only operation
+///   that can move the buffer) and cleared before a slab drops its payloads
+///   or its buffer, so it never dangles.
+/// - Only the `Cell` fields are touched through it, and never while a
+///   `&mut SlotMeta` exists (slab code only uses `&SlotMeta`).
+/// - Handles from a previous page never get here: `Immediate::arena_slot`
+///   and the ref types check the epoch first.
+struct FastMeta {
+    ptr: Cell<*const SlotMeta>,
+    len: Cell<usize>,
+}
+
+impl FastMeta {
+    const EMPTY: Self = Self {
+        ptr: Cell::new(std::ptr::null()),
+        len: Cell::new(0),
+    };
+
+    /// Metadata of a live current-page slot, or `None` (stale generation,
+    /// dead, or not published), in which case callers take the slow path.
+    #[inline(always)]
+    fn live(&self, handle: u32) -> Option<&SlotMeta> {
+        let index = handle & INDEX_MASK;
+        let idx = index.wrapping_sub(1) as usize;
+        if idx >= self.len.get() {
+            return None;
+        }
+        // Safety: `idx < len` and `ptr[..len]` is the current slab's live
+        // meta buffer (see the type invariants).
+        let meta = unsafe { &*self.ptr.get().add(idx) };
+        meta.is_live(handle >> INDEX_BITS).then_some(meta)
+    }
+}
+
+thread_local! {
+    /// Indexed by `SlotKind as usize`. `const` and drop-free, so access is a
+    /// plain TLS offset with no lazy-init or destructor-state check.
+    static FAST: [FastMeta; 3] = const { [FastMeta::EMPTY, FastMeta::EMPTY, FastMeta::EMPTY] };
 }
 
 /// Same-size payload slab. One malloc per chunk; pointers stay stable
@@ -115,6 +173,7 @@ struct SlotMeta {
 /// - `RefCell<ArrayStorage>` = 56 → 73 slots / 4K chunk
 /// - `FunctionData` = 64 → 64 slots / 4K chunk (compact PropertyMap)
 struct SizeClassSlab<T> {
+    kind: SlotKind,
     chunks: Vec<Box<[UnsafeCell<MaybeUninit<T>>]>>,
     meta: Vec<SlotMeta>,
     free: Vec<u32>,
@@ -131,13 +190,39 @@ impl<T> SizeClassSlab<T> {
         if n < 8 { 8 } else { n }
     }
 
-    fn new() -> Self {
-        Self {
+    fn new(kind: SlotKind) -> Self {
+        let slab = Self {
+            kind,
             chunks: Vec::new(),
             meta: Vec::new(),
             free: Vec::new(),
             live: 0,
-        }
+        };
+        // An empty slab: nothing to reach through the fast path.
+        let _ = FAST.try_with(|fast| fast[kind as usize].len.set(0));
+        slab
+    }
+
+    /// Point the count fast path at this slab's (possibly moved) meta buffer.
+    #[inline]
+    fn publish(&self) {
+        let _ = FAST.try_with(|fast| {
+            let fast = &fast[self.kind as usize];
+            fast.ptr.set(self.meta.as_ptr());
+            fast.len.set(self.meta.len());
+        });
+    }
+
+    /// Stop the fast path from reaching this slab (before its payloads or
+    /// buffer are dropped). A retired slab is no longer published, unless
+    /// both buffers are empty, where `len` is already zero.
+    fn unpublish(&self) {
+        let _ = FAST.try_with(|fast| {
+            let fast = &fast[self.kind as usize];
+            if fast.ptr.get() == self.meta.as_ptr() {
+                fast.len.set(0);
+            }
+        });
     }
 
     fn new_chunk() -> Box<[UnsafeCell<MaybeUninit<T>>]> {
@@ -167,17 +252,18 @@ impl<T> SizeClassSlab<T> {
                     self.chunks.push(Self::new_chunk());
                 }
                 self.meta.push(SlotMeta::default());
+                self.publish();
                 idx
             }
         };
         // Safety: `idx` is a free slot (never written, or dropped by
         // `begin_drop` and returned by `finish_drop`).
         unsafe { self.slot_ptr(idx).write(value) };
-        let meta = &mut self.meta[idx];
-        meta.strong = 1;
-        meta.init = true;
+        let meta = &self.meta[idx];
+        meta.strong.set(1);
+        meta.init.set(true);
         self.live += 1;
-        Ok(encode_handle(idx, meta.generation))
+        Ok(encode_handle(idx, meta.generation.get()))
     }
 
     /// Slot index of a live handle whose generation byte matches.
@@ -185,7 +271,7 @@ impl<T> SizeClassSlab<T> {
     fn live_index(&self, handle: u32) -> Option<usize> {
         let (idx, generation) = decode_handle(handle)?;
         let meta = self.meta.get(idx)?;
-        (meta.strong > 0 && (meta.generation & 0xFF) == generation).then_some(idx)
+        meta.is_live(generation).then_some(idx)
     }
 
     #[inline]
@@ -195,12 +281,13 @@ impl<T> SizeClassSlab<T> {
     }
 
     fn generation(&self, handle: u32) -> Option<u32> {
-        self.live_index(handle).map(|idx| self.meta[idx].generation)
+        self.live_index(handle)
+            .map(|idx| self.meta[idx].generation.get())
     }
 
     fn upgrade(&self, handle: u32, generation: u32) -> Option<*const T> {
         let idx = self.live_index(handle)?;
-        (self.meta[idx].generation == generation).then(|| self.slot_ptr(idx) as *const T)
+        (self.meta[idx].generation.get() == generation).then(|| self.slot_ptr(idx) as *const T)
     }
 
     #[inline]
@@ -208,9 +295,10 @@ impl<T> SizeClassSlab<T> {
         let Some(idx) = self.live_index(handle) else {
             return false;
         };
-        let meta = &mut self.meta[idx];
-        if meta.strong != PINNED {
-            meta.strong += 1;
+        let meta = &self.meta[idx];
+        let strong = meta.strong.get();
+        if strong != PINNED {
+            meta.strong.set(strong + 1);
         }
         true
     }
@@ -221,15 +309,16 @@ impl<T> SizeClassSlab<T> {
     #[inline]
     fn release(&mut self, handle: u32) -> Option<usize> {
         let idx = self.live_index(handle)?;
-        let meta = &mut self.meta[idx];
-        if meta.strong == PINNED {
+        let meta = &self.meta[idx];
+        let strong = meta.strong.get();
+        if strong == PINNED {
             return None;
         }
-        meta.strong -= 1;
-        if meta.strong > 0 {
+        meta.strong.set(strong - 1);
+        if strong > 1 {
             return None;
         }
-        meta.generation = meta.generation.wrapping_add(1);
+        meta.generation.set(meta.generation.get().wrapping_add(1));
         self.live -= 1;
         Some(idx)
     }
@@ -237,18 +326,18 @@ impl<T> SizeClassSlab<T> {
     /// Hand out a dead slot's payload pointer for an in-place drop. The
     /// slot is not reusable until [`Self::finish_drop`].
     fn begin_drop(&mut self, idx: usize) -> Option<*mut T> {
-        let meta = self.meta.get_mut(idx)?;
-        if meta.strong != 0 || !meta.init {
+        let meta = self.meta.get(idx)?;
+        if meta.strong.get() != 0 || !meta.init.get() {
             return None;
         }
-        meta.init = false;
+        meta.init.set(false);
         Some(self.slot_ptr(idx))
     }
 
     fn finish_drop(&mut self, idx: usize) {
         if let Some(meta) = self.meta.get(idx)
-            && meta.strong == 0
-            && !meta.init
+            && meta.strong.get() == 0
+            && !meta.init.get()
         {
             self.free.push(idx as u32);
         }
@@ -270,11 +359,12 @@ impl<T> SizeClassSlab<T> {
     /// then the chunks. Only called on a slab already detached from the
     /// arena, so payload drops may re-enter the (new) arena freely.
     fn clear(&mut self) {
+        self.unpublish();
         for idx in 0..self.meta.len() {
-            if !self.meta[idx].init {
+            if !self.meta[idx].init.get() {
                 continue;
             }
-            self.meta[idx].init = false;
+            self.meta[idx].init.set(false);
             // Safety: `init` slots hold a value written by `alloc` and not
             // yet dropped.
             unsafe { std::ptr::drop_in_place(self.slot_ptr(idx)) };
@@ -295,10 +385,11 @@ impl<T> Drop for SizeClassSlab<T> {
 
 /// Which slab a handle names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub(crate) enum SlotKind {
-    Object,
-    Array,
-    Function,
+    Object = 0,
+    Array = 1,
+    Function = 2,
 }
 
 /// Slabs detached by [`reset`]; dropping it drops the old page's payloads.
@@ -364,9 +455,9 @@ impl PageArena {
             hash_mask: 32767,
             hash_len: 0,
             allocated: 0,
-            objects: SizeClassSlab::new(),
-            arrays: SizeClassSlab::new(),
-            functions: SizeClassSlab::new(),
+            objects: SizeClassSlab::new(SlotKind::Object),
+            arrays: SizeClassSlab::new(SlotKind::Array),
+            functions: SizeClassSlab::new(SlotKind::Function),
         }
     }
 
@@ -486,9 +577,12 @@ impl PageArena {
         self.hash_len = 0;
         self.allocated = 0;
         RetiredSlabs {
-            _objects: std::mem::replace(&mut self.objects, SizeClassSlab::new()),
-            _arrays: std::mem::replace(&mut self.arrays, SizeClassSlab::new()),
-            _functions: std::mem::replace(&mut self.functions, SizeClassSlab::new()),
+            _objects: std::mem::replace(&mut self.objects, SizeClassSlab::new(SlotKind::Object)),
+            _arrays: std::mem::replace(&mut self.arrays, SizeClassSlab::new(SlotKind::Array)),
+            _functions: std::mem::replace(
+                &mut self.functions,
+                SizeClassSlab::new(SlotKind::Function),
+            ),
         }
     }
 
@@ -631,7 +725,7 @@ impl PageArena {
 
     #[cfg(test)]
     fn strong_count(&self, kind: SlotKind, handle: u32) -> Option<u32> {
-        let meta = |slab_meta: &[SlotMeta], idx: usize| slab_meta[idx].strong;
+        let meta = |slab_meta: &[SlotMeta], idx: usize| slab_meta[idx].strong.get();
         match kind {
             SlotKind::Object => self
                 .objects
@@ -771,8 +865,26 @@ thread_local! {
 ///
 /// Panics if the arena is mutably borrowed: skipping the increment would
 /// let a later release free a slot that is still referenced.
-#[inline]
+#[inline(always)]
 pub(crate) fn retain(kind: SlotKind, handle: u32) {
+    let fast = FAST.try_with(|fast| match fast[kind as usize].live(handle) {
+        Some(meta) => {
+            let strong = meta.strong.get();
+            if strong != PINNED {
+                meta.strong.set(strong + 1);
+            }
+            true
+        }
+        None => false,
+    });
+    if fast != Ok(true) {
+        retain_slow(kind, handle);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn retain_slow(kind: SlotKind, handle: u32) {
     let _ = ARENA.try_with(|arena| arena.borrow_mut().retain(kind, handle));
 }
 
@@ -784,8 +896,31 @@ pub(crate) fn retain(kind: SlotKind, handle: u32) {
 /// A release that cannot reach the arena (thread teardown, or an arena
 /// borrow that should not exist) leaks the slot until reset rather than
 /// risking a free of a referenced slot.
-#[inline]
+#[inline(always)]
 pub(crate) fn release(kind: SlotKind, handle: u32) {
+    // Fast path: a live slot that keeps at least one count. The zero
+    // transition (generation bump, live count, payload drop) stays on the
+    // slow path under the arena borrow.
+    let fast = FAST.try_with(|fast| match fast[kind as usize].live(handle) {
+        Some(meta) => {
+            let strong = meta.strong.get();
+            if strong > 1 && strong != PINNED {
+                meta.strong.set(strong - 1);
+                true
+            } else {
+                false
+            }
+        }
+        None => false,
+    });
+    if fast != Ok(true) {
+        release_slow(kind, handle);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn release_slow(kind: SlotKind, handle: u32) {
     let freed = ARENA
         .try_with(|arena| {
             arena
@@ -1429,5 +1564,79 @@ mod tests {
         drop(other);
         assert_eq!(live_objects(), 0);
         reset();
+    }
+
+    fn slot_of(value: &crate::Value) -> (SlotKind, u32) {
+        match value {
+            crate::Value::Imm(imm) => imm.arena_slot().expect("arena object"),
+            _ => panic!("expected an arena handle"),
+        }
+    }
+
+    #[test]
+    fn fast_count_path_follows_meta_buffer_growth() {
+        reset();
+        let value = object_value(&[]);
+        let (kind, handle) = slot_of(&value);
+        let first = value.clone();
+        // Grow (and so reallocate) the meta buffer many times while counts
+        // are held; every later clone/drop must use the moved buffer.
+        let many: Vec<crate::Value> = (0..20_000).map(|_| object_value(&[])).collect();
+        let second = value.clone();
+        assert_eq!(strong_count_of(kind, handle), Some(3));
+        drop(first);
+        drop(second);
+        assert_eq!(strong_count_of(kind, handle), Some(1));
+        let other = many[12_345].clone();
+        let (other_kind, other_handle) = slot_of(&other);
+        assert_eq!(strong_count_of(other_kind, other_handle), Some(2));
+        drop(many);
+        assert_eq!(strong_count_of(other_kind, other_handle), Some(1));
+        assert_eq!(live_objects(), 2);
+        drop(other);
+        drop(value);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn fast_count_path_ignores_previous_page_handles() {
+        reset();
+        let stale = object_value(&[]);
+        assert_eq!(slot_of(&stale).1, 1);
+        let stale_copy = stale.clone();
+        reset();
+        // Same slot index and generation byte on the new page.
+        let fresh = object_value(&[]);
+        let (kind, handle) = slot_of(&fresh);
+        // Both pages handed out slot 0 with generation 0 first.
+        assert_eq!(handle, 1);
+        let again = stale.clone();
+        drop(again);
+        drop(stale_copy);
+        drop(stale);
+        assert_eq!(strong_count_of(kind, handle), Some(1));
+        assert_eq!(live_objects(), 1);
+        drop(fresh);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn thread_teardown_with_counted_children_does_not_touch_freed_meta() {
+        std::thread::spawn(|| {
+            let parent = object_value(&[]);
+            let child = object_value(&[]);
+            parent.set_property("child", child.clone());
+            // A self-cycle keeps `parent` alive until the arena itself is
+            // destroyed with the thread; its payload then releases `child`
+            // while the slab is being torn down.
+            parent.set_property("self", parent.clone());
+            drop(child);
+            drop(parent);
+            assert_eq!(live_objects(), 2);
+        })
+        .join()
+        .expect("teardown");
     }
 }
