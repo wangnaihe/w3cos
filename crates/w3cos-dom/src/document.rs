@@ -113,6 +113,12 @@ enum GeneratedContentItem {
     Image(String),
 }
 
+#[derive(Default)]
+struct StyleForMemo {
+    key: Option<(u64, u64, u64)>,
+    styles: HashMap<u32, w3cos_std::style::Style>,
+}
+
 struct CachedComputedStyle {
     node_revision: u64,
     stylesheet_generation: u64,
@@ -549,6 +555,13 @@ pub struct Document {
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    /// `computed_style_for` results keyed by (style clock, stylesheet
+    /// generation, style-write epoch). Any style-affecting mutation moves one
+    /// of them, so within an unchanged document the ancestor chain is
+    /// resolved once instead of per query (Blink keeps ComputedStyle on the
+    /// element until StyleRecalc; this is the same lifetime).
+    style_for_memo: RefCell<StyleForMemo>,
+    style_write_epoch: u64,
     /// Sibling selector contexts are rebuilt for every node during a tree walk.
     /// Caching one pass, and skipping the sibling chain when no rule needs it,
     /// keeps that walk linear.
@@ -631,6 +644,7 @@ impl Document {
             self.minimum_font_size = hard;
             self.minimum_logical_font_size = logical;
             self.computed_style_cache.borrow_mut().clear();
+            self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
         }
     }
 
@@ -651,6 +665,7 @@ impl Document {
         }
         self.normal_line_height_provider = Some((provider, revision));
         self.computed_style_cache.borrow_mut().clear();
+        self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
     }
 
     /// Query host-decoded CSS images when lowering generated marker content.
@@ -686,6 +701,8 @@ impl Document {
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
+            style_for_memo: RefCell::new(StyleForMemo::default()),
+            style_write_epoch: 0,
             selector_context_cache: RefCell::new(SelectorContextCache {
                 style_clock: 0,
                 stylesheet_generation: 0,
@@ -1716,6 +1733,7 @@ impl Document {
     }
 
     pub fn get_style_mut(&mut self, id: NodeId) -> &mut CSSStyleDeclaration {
+        self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
         Arc::make_mut(&mut self.styles[id.0 as usize])
     }
 
@@ -4510,12 +4528,36 @@ impl Document {
     }
 
     pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+        let key = (
+            self.style_revision_clock,
+            stylesheet::generation(),
+            self.style_write_epoch,
+        );
+        {
+            let mut memo = self.style_for_memo.borrow_mut();
+            if memo.key != Some(key) || memo.styles.len() > 65_536 {
+                memo.key = Some(key);
+                memo.styles.clear();
+            }
+            if let Some(style) = memo.styles.get(&id.0) {
+                #[cfg(test)]
+                self.computed_style_cache_hits
+                    .set(self.computed_style_cache_hits.get() + 1);
+                return style.clone();
+            }
+        }
         let mut ancestor_ids = Vec::new();
         let document_element = self.document_element_id();
         let mut current = (Some(id) != document_element)
             .then(|| self.get_node(id).parent)
             .flatten();
+        let mut inherited = None;
         while let Some(parent) = current {
+            // Resume from the nearest ancestor already resolved this epoch.
+            if let Some(style) = self.style_for_memo.borrow().styles.get(&parent.0) {
+                inherited = Some(style.clone());
+                break;
+            }
             ancestor_ids.push(parent);
             if Some(parent) == document_element {
                 break;
@@ -4523,17 +4565,25 @@ impl Document {
             current = self.get_node(parent).parent;
         }
         ancestor_ids.reverse();
-        let mut ancestors = Vec::new();
-        let mut inherited = None;
+        // `computed_style` ignores the selector contexts (matching walks the
+        // tree itself); do not build them.
         for ancestor in ancestor_ids {
             if self.get_node(ancestor).node_type != NodeType::Element {
                 continue;
             }
-            let style = self.computed_style(ancestor, &ancestors, inherited.as_ref());
+            let style = self.computed_style(ancestor, &[], inherited.as_ref());
+            self.style_for_memo
+                .borrow_mut()
+                .styles
+                .insert(ancestor.0, style.clone());
             inherited = Some(style);
-            ancestors.push(self.selector_context(ancestor));
         }
-        self.computed_style(id, &ancestors, inherited.as_ref())
+        let style = self.computed_style(id, &[], inherited.as_ref());
+        self.style_for_memo
+            .borrow_mut()
+            .styles
+            .insert(id.0, style.clone());
+        style
     }
 
     /// Cascade one element from an already-computed parent style.
@@ -28666,4 +28716,3 @@ mod extent_cache_tests {
         assert_eq!(scroller.scroll_width(&document), 100.0);
     }
 }
-
