@@ -1,0 +1,125 @@
+{
+  "schema": "w3cos-vscode-native-modules-v1",
+  "modules": [
+    {
+      "name": "node-pty",
+      "role": "rewrite",
+      "plan": "Rust pty with the same API. Not N-API."
+    },
+    {
+      "name": "@vscode/sqlite3",
+      "role": "rewrite",
+      "plan": "rusqlite with the same API, or the N-API subset later."
+    },
+    {
+      "name": "@vscode/spdlog",
+      "role": "rewrite",
+      "plan": "Rust rolling file log with the same API."
+    },
+    {
+      "name": "@vscode/native-watchdog",
+      "role": "rewrite",
+      "plan": "Rust thread watchdog."
+    },
+    {
+      "name": "@parcel/watcher",
+      "role": "rewrite",
+      "plan": "Same API on runtime fs_watch (inotify/fanotify)."
+    },
+    {
+      "name": "@vscode/policy-watcher",
+      "role": "stub",
+      "plan": "Linux reads a JSON policy file."
+    },
+    {
+      "name": "native-keymap",
+      "role": "rewrite",
+      "plan": "xkbcommon or winit keyboard layout."
+    },
+    {
+      "name": "native-is-elevated",
+      "role": "stub",
+      "plan": "Small Rust implementation or stub."
+    },
+    {
+      "name": "@vscode/deviceid",
+      "role": "stub",
+      "plan": "Small Rust implementation or stub."
+    },
+    {
+      "name": "@vscode/fs-copyfile",
+      "role": "stub",
+      "plan": "Small Rust implementation or stub."
+    },
+    {
+      "name": "@vscode/sudo-prompt",
+      "role": "stub",
+      "plan": "Small Rust implementation or stub."
+    },
+    {
+      "name": "kerberos",
+      "role": "defer",
+      "plan": "Deferred. Not on the first Code-OSS path."
+    },
+    {
+      "name": "@vscode/windows-mutex",
+      "role": "windows-only",
+      "plan": "Not required for the Linux baseline."
+    },
+    {
+      "name": "@vscode/windows-process-tree",
+      "role": "windows-only",
+      "plan": "Not required for the Linux baseline."
+    },
+    {
+      "name": "@vscode/windows-registry",
+      "role": "windows-only",
+      "plan": "Not required for the Linux baseline."
+    },
+    {
+      "name": "@vscode/ripgrep-universal",
+      "role": "ship-binary",
+      "plan": "Ship the rg binary and spawn it. Not a JS port."
+    },
+    {
+      "name": "@vscode/tree-sitter-wasm",
+      "role": "wasm",
+      "plan": "WebAssembly runtime (wasmtime or equivalent)."
+    },
+    {
+      "name": "vscode-oniguruma",
+      "role": "wasm",
+      "plan": "WebAssembly runtime for the TextMate scanner."
+    },
+    {
+      "name": "keytar",
+      "role": "replaced",
+      "plan": "Replaced upstream by safeStorage. Map that to the w3cos keyring."
+    },
+    {
+      "name": "@vscode/os-proxy-resolver",
+      "role": "review",
+      "plan": "Present in the pinned Code-OSS tree and not classified by the roadmap table."
+    },
+    {
+      "name": "@vscode/sandbox-runtime",
+      "role": "review",
+      "plan": "Present in the pinned Code-OSS tree and not classified by the roadmap table."
+    },
+    {
+      "name": "node-addon-api",
+      "role": "build-tool",
+      "plan": "Headers for native addons. Not a runtime API to reimplement."
+    },
+    {
+      "name": "ssh2",
+      "role": "review",
+      "plan": "Optional native bindings. Review before claiming it is pure JS."
+    },
+    {
+      "name": "@vscode/vscode-languagedetection",
+      "role": "review",
+      "plan": "Present in the pinned Code-OSS tree and not classified by the roadmap table."
+    }
+  ]
+}

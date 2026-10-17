@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "tools/port-analyze",
     "tools/size-audit",
     "tools/size-probes",
     "tools/wpt-runner",
@@ -38,6 +39,7 @@ w3cos-vm = { path = "crates/w3cos-vm" }
 w3cos-core = { path = "crates/w3cos-core" }
 w3cos-runtime = { path = "crates/w3cos-runtime", default-features = false }
 w3cos-compiler = { path = "crates/w3cos-compiler" }
+w3cos-port-analyze = { path = "tools/port-analyze" }
 w3cos-std = { path = "crates/w3cos-std" }
 w3cos-dom = { path = "crates/w3cos-dom" }
 w3cos-a11y = { path = "crates/w3cos-a11y" }

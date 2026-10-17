@@ -1,0 +1,26 @@
+{
+  "schema": "w3cos-code-oss-baseline-lock-v1",
+  "repository": "https://github.com/microsoft/vscode",
+  "commit": "e97039dd9293ef2b9df8876d0bc8c0c8ff87f871",
+  "commit_date": "2026-10-17T00:51:13Z",
+  "node": "24.18.0",
+  "package_json": {
+    "name": "code-oss-dev",
+    "version": "1.143.0",
+    "main": "./out/main.js",
+    "sha256": "8d87410a73db48009b194f900ff1bf724bda8d6807b9d8e5ede7b8ac550814b3"
+  },
+  "npmrc": {
+    "runtime": "electron",
+    "target": "43.7.7",
+    "build_from_source": "true",
+    "sha256": "1419a5a428cba55ab85460fb94ba27e1dec8ebd61b5337dbe02f56ea68d7125e"
+  },
+  "product_json": {
+    "applicationName": "code-oss",
+    "nameShort": "Code - OSS",
+    "sha256": "104a252a18d584b91176d24d20a12b7e08ce9225cf0cb176906928c068c1a945"
+  },
+  "nvmrc_sha256": "55075b5ec4e8b31936cbbc282b8829116d1fd48f2f2f1856dee592a6650700ce",
+  "notes": "Side A of the M0 baseline is this Code-OSS commit (Electron 43.7.7). PR CI checks the lock, writes the dependency inventory, and runs port analyze. It does not compile Electron."
+}

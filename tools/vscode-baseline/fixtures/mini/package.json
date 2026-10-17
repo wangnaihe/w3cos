@@ -1,0 +1,8 @@
+{
+  "name": "mini-port",
+  "version": "0.0.1",
+  "main": "./out/main.js",
+  "dependencies": {
+    "node-pty": "1.2.0"
+  }
+}

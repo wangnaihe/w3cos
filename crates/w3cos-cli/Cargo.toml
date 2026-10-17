@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 w3cos-compiler = { workspace = true }
+w3cos-port-analyze = { workspace = true }
 w3cos-core = { workspace = true }
 w3cos-runtime = { workspace = true, default-features = false }
 anyhow = { workspace = true }
