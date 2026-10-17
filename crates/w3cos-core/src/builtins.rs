@@ -689,6 +689,17 @@ impl BuiltinObject {
 /// Direct calls and extracted methods must share the same generic builtin
 /// implementation (`const clz32 = Math.clz32` is common in library code).
 pub fn math_value() -> Value {
+    // `Math` is one ordinary object per realm (ECMA-262 §21.3), not a fresh
+    // object per reference: `Math === Math`, and authored properties stick.
+    // Rebuilding it allocated 20 function objects per `Math.x` access that
+    // the arena never reclaims (~130 MB on md-stream).
+    thread_local! {
+        static MATH: std::cell::OnceCell<Value> = const { std::cell::OnceCell::new() };
+    }
+    MATH.with(|math| math.get_or_init(build_math_value).clone())
+}
+
+fn build_math_value() -> Value {
     let mut properties = HashMap::new();
     for method in [
         "min", "max", "abs", "floor", "ceil", "round", "f16round", "trunc", "sqrt", "log", "log2",
@@ -1573,6 +1584,9 @@ mod tests {
             26.0
         );
         let math = math_value();
+        // One Math object per realm: authored properties persist.
+        math.set_property("w3cosProbe", Value::Number(7.0));
+        assert_eq!(math_value().get_property("w3cosProbe").to_number(), 7.0);
         assert_eq!(
             math.get_property("hypot")
                 .call(
