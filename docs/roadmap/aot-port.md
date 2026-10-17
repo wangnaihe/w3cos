@@ -93,7 +93,7 @@ TS/JS（ESM + CommonJS） ─SWC parse─▶ 类型收集（tsc Program / .d.ts 
 - **lint/codemod `w3cos leak-lint`**：基于 SWC 静态分析标记常见隐式环：闭包捕获 `this` 后注册到长生命周期对象、`addEventListener`/`onDidX` 无对应移除或未进入 `DisposableStore`、父↔子双向强引用、`Disposable` 未 dispose/未注册、`Map` 缓存以对象为值无淘汰。可给出 codemod（改为 `WeakRef`/`WeakMap`、补 `dispose`）。
 - **上游泄漏处理**：VS Code、扩展、npm 依赖里发现的环，fork 后用 WeakRef/显式 dispose 修复，进补丁队列，能上游的提 PR 上游（见 M1）。
 - 代价要说清：引用计数在多态热路径上有计数开销；`FinalizationRegistry` 回调时机在引用计数下是确定的（比规范更早），需在兼容报告中注明。已实现：目标的最后一个强引用释放后，在下一个 job checkpoint（微任务清空后）交付，顺序见 `weak.rs` 模块文档。
-- 注意：page arena 里的普通 AOT 值目前到页面 reset 才释放；编译器证明不逃逸的对象/数组字面量例外，已改为引用计数的局部值，函数返回即释放（M1 item 4a 第 1 部分）。逃逸值的回收见 4a 第 2 部分。
+- 注意：page arena 里的普通 AOT 值（对象、数组、闭包）现在也是严格引用计数，最后一个强引用消失即释放（M1 item 4a）；编译器证明不逃逸的字面量直接是引用计数的局部值。只有引用环要等页面 reset，或者用 WeakRef 断开。
 
 ### 3.3 WebAssembly
 VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。接入 `wasmtime`（Cranelift，AOT 预编译 `.cwasm` 缓存）作为 `WebAssembly.*` 的实现，与 §3.1 后端 B 共享 Cranelift。
@@ -174,9 +174,35 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 
 ### M1 编译器与内存模型地基（引用计数 + WeakRef）
 4. 确定性引用计数语义：明确释放时机规范、AOT 冗余 inc/dec 消除、大对象图延迟批量释放（避免长停顿）。
-   - **现状更正（M1 第一个 PR 核实）**：普通 AOT 对象字面量、数组和闭包（`Value::object`/`Value::array`/`Value::function`）分配在 page arena 里，句柄是 `Copy` 的 `u32`，**不计数，页面 reset 前不会释放**；只有宿主 `Rc` 值（DOM 包装、`Value::callable`、宿主数组等）是真正的引用计数。所以"最后一个强引用消失立即释放"目前只对宿主值成立。**4a（M1 最大的一块）**：让 arena 值也能回收，否则 VS Code 长跑内存只增不减。分两部分：
+   - **现状更正（M1 第一个 PR 核实）**：当时普通 AOT 对象字面量、数组和闭包（`Value::object`/`Value::array`/`Value::function`）分配在 page arena 里，句柄是 `Copy` 的 `u32`，不计数，页面 reset 前不会释放；只有宿主 `Rc` 值是真正的引用计数。**4a（M1 最大的一块，已完成）**：让 arena 值也能回收，否则 VS Code 长跑内存只增不减。分两部分：
      - **第 1 部分（已完成）**：`crates/w3cos-compiler/src/alloc_escape.rs` 在 W3IR 上做函数内逃逸分析（基于合一的指向分析，覆盖寄存器和局部绑定，并跟踪"对象里装了什么"）。能证明不逃逸的对象/数组字面量，AOT 生成 `Value::local_object` / `Value::local_array`，即引用计数的宿主值，最后一个引用消失就释放，最晚在函数返回时。逃逸条件全部从严：返回、抛出、作为任何调用/构造的参数或接收者、被闭包捕获、存进参数/外层/全局绑定、`await`/`yield` 跨挂起点、可能触发用户代码的强制转换、计算键、访问字面量形状之外的键（避免原型链上的 getter/setter 拿到 `this`）、自引用环、出现 `eval`。即使误判，宿主 `Rc` 值放在哪里都合法，只影响回收时机，不影响正确性。实测（probe：`work(10000)` 调 5 / 10 轮）：arena 存活对象从 102809 / 202809 降到 2809（与空跑一致），slab 从 31.4 MB / 61.8 MB 降到 0.98 MB，RSS 从 60.1 MB / 103.9 MB 降到 16.1 MB / 16.2 MB。逃逸的 `workEscape` 不变，对象照常存活。
-     - **第 2 部分（待做）**：逃逸值的 arena 槽位引用计数 + free list（以及闭包），让逃逸后不再被引用的值也能在页面 reset 前释放。第 1 部分没做标量替换（把字面量拆成 Rust 局部变量/栈结构），也没做跨过程分析；不逃逸的闭包仍走 arena。
+     - **第 2 部分（已完成）**：arena 槽位严格引用计数（对象、数组、闭包含 `aot_function`，即 Immediate 标签 6/7/8）。
+       - `Value` 改为手写 `Clone`/`Drop`：clone/存入时槽位计数 +1，drop/覆盖时 −1；`JsObjectRef`/`JsArrayRef`/`JsFunction` 的 interned 句柄同样持有一个强计数。
+       - 计数归零：槽位立刻对句柄和弱引用失效（generation +1），payload 进线程局部的 LIFO 待释放队列，在不持有 arena 借用的情况下原地 drop；子值的释放只入队，不递归（20 万层链表在 2 MiB 测试栈上释放）。drop 完的槽位进 free list 复用。
+       - 句柄 = 24 位槽号 + 8 位 generation 低字节；弱引用保存完整 32 位 generation，所以槽位复用 256 次以后也不会升级到新占用者。`identity()` / `object_identity_bits()` 改用"槽种类 + epoch + generation + 槽号"，不再用槽地址，按身份做键的旁路表（事件槽、IDB/结构化克隆的图编码、JSON 环检测等）不会因槽位复用而串号。
+       - slab 句柄空间用满时回退成宿主 `Rc`；线程退出、arena 被借用等无法安全释放的情况一律泄漏到 reset，不冒释放仍被引用的槽位的风险。`page_arena::reset()` 仍是批量释放：先推进 epoch（旧句柄的 inc/dec 变成空操作），再在 arena 借用之外 drop 旧 slab；如果 reset 发生在某个 payload 的 drop 过程中，旧 slab 先暂存，等这一轮释放结束再 drop。
+       - 接入 #112 的弱身份 + 死亡队列：arena payload drop 时 `HeapAllocation` 照常记死亡，`WeakRef.deref()` 返回 `undefined`，`FinalizationRegistry`/`WeakMap`/`WeakSet` 在下一个 checkpoint 生效。弱引用不持有计数。
+       - 编译器配合：`unique_back_edges` 弱化的捕获只属于"挂到目标上的那个闭包"。嵌套在它里面的闭包如果继承了弱 getter，现在改为在创建时强持有目标（`weak::strong_capture_target`），否则像 IDB `request.onsuccess` 里再挂 `put.onsuccess` 这种写法，`request` 会在仍可达时被释放（以前 arena 值不释放，这个问题被掩盖了）。
+       - 环仍然泄漏到页面 reset，除非用 WeakRef 断开（自动弱化覆盖的三种回边除外）。
+       - 实测（box x86_64，release；probe 每轮跑 `workEscapeDrop`（工厂函数返回的对象，逃逸）+ `workClosures`（每次迭代新建闭包）+ `workBatch`（局部数组装 1 万个对象），各 10000 次）：
+
+         | | arena 存活对象 | 存活函数 | slab | RSS |
+         |---|---|---|---|---|
+         | 空跑 前 → 后 | 2,812 → 1,911 | 1,813 → 1,788 | 0.98 MB → 0.71 MB | 16.0 MB → 15.3 MB |
+         | 5 轮 前 → 后 | 302,826 → 1,915 | 101,827 → 1,792 | 98.6 MB → 3.75 MB | 187.4 MB → 20.6 MB |
+         | 10 轮 前 → 后 | 602,836 → 1,915 | 201,837 → 1,792 | 196.2 MB → 3.75 MB | 358.2 MB → 20.6 MB |
+         | 全局数组保留 1000 个 | 增量 +2,000 → +2,000（仍存活） | | | |
+
+         微基准（`cargo run --release -p w3cos-core --example arena_rc_bench`，n = 100 万，3 次取中位）：
+
+         | | 前 | 后 |
+         |---|---|---|
+         | 逃逸对象分配后立即丢弃 | 1050 ns/次，丢弃后仍存活 1,000,000 个，slab 304 MB | 794 ns/次，存活 0，slab 3.9 KB |
+         | `get_property` | 22.1 ns | 22.8 ns |
+         | `set_property` | 1530 ns | 1311 ns（噪声范围） |
+         | 句柄 clone + drop | 2.2 ns | 6.9 ns（每次 clone/drop 多一次线程局部的槽位计数） |
+         | 10 万个对象装进数组再丢弃 | 798 ns/个，丢弃后存活 100,000 | 944 ns/个，存活 0 |
+       - 还没做的：AOT 冗余 inc/dec 消除（item 4）、句柄 clone 的计数开销优化、标量替换和跨过程逃逸分析、环检测器（item 6）。
 5. ~~`WeakRef` / `FinalizationRegistry` / `WeakMap` / `WeakSet` 完整实现~~ **已完成（M1 PR 1）**：
    - 原有基础：`w3cos-core/src/weak.rs` 早已基于 `Rc`/`Weak` 实现四个类，编译器 `unique_back_edges.rs` 会把三类常见闭包回边（自挂载、Promise 回调捕获自身、集合迭代器）自动改写成 `WeakRef`。
    - **确定性 finalization**：每个堆分配的 `HeapAllocation` 带一个 48 位、永不复用的弱身份 id（塞进已有的对齐空洞，对象大小不变）。被弱引用过的对象在 `Drop` 时只把 id 记进死亡队列（不在 `Drop` 里跑 JS、不重入）；下一个 job checkpoint（`drain_microtasks` 清空微任务后）统一处理并按"死亡顺序 → 同一目标按注册顺序"调用 `FinalizationRegistry` 回调，每个回调独立 panic 边界，回调里排的微任务在下一批回调前清空。`cleanupSome()` 保留，可同步交付本 registry 的待处理项；`unregister()` 同时取消已死但未交付的项；registry 自身死亡后不再回调。`FinalizationRegistry.cleanupMode` 现在是 `"automatic"`。

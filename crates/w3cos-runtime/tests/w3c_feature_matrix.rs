@@ -302,8 +302,8 @@ fn ecma_proxy_get_trap() {
         .build();
     let obj = JsObject::with_proxy(props, handler);
     let receiver = Value::Undefined;
-    match obj.get("x", &receiver) {
-        Value::String(s) => assert_eq!(s, "proxy:x"),
+    match &obj.get("x", &receiver) {
+        Value::String(s) => assert_eq!(s.as_str(), "proxy:x"),
         other => panic!("unexpected {other:?}"),
     }
 }

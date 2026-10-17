@@ -6288,15 +6288,26 @@ fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool
     )
 }
 
-fn emit_capture_pair_store(capture_id: u32, weaken: bool) -> String {
+/// `inherited`: the pair came from this frame's own capture accessors (not a
+/// local cell), so it may be a weak back-edge getter.
+fn emit_capture_pair_store(capture_id: u32, weaken: bool, inherited: bool) -> String {
     let live = format!(
         "__w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(__w3cos_pair.0, __w3cos_pair.1));"
     );
-    if !weaken {
+    if !weaken && !inherited {
         return live;
     }
+    if !weaken {
+        // Only the self-installed closure owns the weakened back-edge. A
+        // closure nested inside it that inherits the weak getter captures
+        // the target strongly, as the JS scope chain would: it may be
+        // stored elsewhere and outlive every other strong reference.
+        return format!(
+            "if let Some(__w3cos_target) = w3cos_core::weak::strong_capture_target(&__w3cos_pair.0) {{ __w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(w3cos_core::weak::strong_capture_getter(__w3cos_target), w3cos_core::Value::Undefined)); }} else {{ {live} }}"
+        );
+    }
     format!(
-        "let __w3cos_target = __w3cos_pair.0.call(w3cos_core::Value::Undefined, Vec::new()); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_weak = w3cos_core::intrinsics::construct(&w3cos_core::weak::weak_ref_class(), vec![__w3cos_target]); let __w3cos_getter = w3cos_core::Value::function(move |_, _| __w3cos_weak.call_method(\"deref\", Vec::new())); __w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ {live} }}"
+        "let __w3cos_target = __w3cos_pair.0.call(w3cos_core::Value::Undefined, Vec::new()); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_getter = w3cos_core::weak::weak_capture_getter(__w3cos_target); __w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ {live} }}"
     )
 }
 
@@ -6759,7 +6770,7 @@ fn emit_instruction(
                 let cell_store = if mutable {
                     if weaken {
                         format!(
-                            "let __w3cos_target = cell.borrow().0.clone(); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_weak = w3cos_core::intrinsics::construct(&w3cos_core::weak::weak_ref_class(), vec![__w3cos_target]); let __w3cos_getter = w3cos_core::Value::function(move |_, _| __w3cos_weak.call_method(\"deref\", Vec::new())); __w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ __w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Cell(cell)); }}",
+                            "let __w3cos_target = cell.borrow().0.clone(); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_getter = w3cos_core::weak::weak_capture_getter(__w3cos_target); __w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ __w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Cell(cell)); }}",
                             capture.0, capture.0
                         )
                     } else {
@@ -6771,14 +6782,14 @@ fn emit_instruction(
                 } else {
                     format!(
                         "{const_getter} {}",
-                        emit_capture_pair_store(capture.0, weaken)
+                        emit_capture_pair_store(capture.0, weaken, false)
                     )
                 };
                 let adapter = format!(
                     "if let Some(getter) = {} {{ let __w3cos_pair = (getter, {}.unwrap_or(w3cos_core::Value::Undefined)); {} }} else if let Some(cell) = {} {{ {cell_store} }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; ",
                     emit_capture_get_cloned(storage, capture.0),
                     emit_capture_setter_get_cloned(storage, capture.0),
-                    emit_capture_pair_store(capture.0, weaken),
+                    emit_capture_pair_store(capture.0, weaken, true),
                     emit_binding_get_cloned(storage, capture.0),
                 );
                 if is_shared_number(capture.0) {

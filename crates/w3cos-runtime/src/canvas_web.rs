@@ -292,7 +292,7 @@ pub fn offscreen_canvas_rendering_context_2d_class() -> Value {
         class.set_property("name", Value::string("OffscreenCanvasRenderingContext2D"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
-        if let Value::Object(object) = base.get_property("prototype") {
+        if let Value::Object(object) = &base.get_property("prototype") {
             for key in object.borrow().keys() {
                 if !matches!(key.as_str(), "constructor" | "drawFocusIfNeeded") {
                     prototype.set_property(&key, Value::Undefined);

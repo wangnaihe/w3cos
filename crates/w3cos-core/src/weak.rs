@@ -39,9 +39,11 @@
 //! cells that are pending but not yet delivered. A registry that is itself
 //! dropped never calls back.
 //!
-//! Page-arena values (ordinary AOT object literals and closures) are pinned
-//! until the page resets, so their death notices arrive at `reset`; host
-//! `Rc` values die as soon as their last strong reference is released.
+//! Page-arena values (ordinary AOT object literals, arrays and closures) are
+//! strictly reference counted like host `Rc` values: each dies, and queues
+//! its death notice, as soon as its last strong reference is released. Weak
+//! references never hold a count. Only values kept alive by a reference
+//! cycle wait for the page `reset`, which drops them in bulk.
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
@@ -689,6 +691,39 @@ fn finalization_cleanup_some(this: Value, args: Vec<Value>) -> Value {
     Value::Undefined
 }
 
+// ── AOT back-edge captures ─────────────────────────────────────────────
+
+/// Hidden property on a weak capture getter naming its `WeakRef`.
+const WEAK_CAPTURE_KEY: &str = "__w3cos_weak_capture";
+
+/// Getter for a closure capture the compiler weakened as a unique back-edge
+/// (`w3cos_compiler::unique_back_edges`): it dereferences a `WeakRef` to
+/// `target`, so the closure stored on `target` does not keep it alive.
+pub fn weak_capture_getter(target: Value) -> Value {
+    let reference = crate::intrinsics::construct(&weak_ref_class(), vec![target]);
+    let for_getter = reference.clone();
+    let getter = Value::function(move |_, _| for_getter.call_method("deref", Vec::new()));
+    getter.set_property(WEAK_CAPTURE_KEY, reference);
+    getter
+}
+
+/// The current target of a [`weak_capture_getter`], or `None` for any other
+/// getter. A closure nested inside the weakening closure captures this
+/// strongly: only the self-installed closure owns the weakened edge.
+pub fn strong_capture_target(getter: &Value) -> Option<Value> {
+    let function = getter.as_function()?;
+    let reference = function.get_property(WEAK_CAPTURE_KEY);
+    if reference.is_undefined() {
+        return None;
+    }
+    Some(reference.call_method("deref", Vec::new()))
+}
+
+/// Immutable capture getter that holds `target` strongly.
+pub fn strong_capture_getter(target: Value) -> Value {
+    Value::function(move |_, _| target.clone())
+}
+
 pub fn weak_map_class() -> Value {
     WEAK_MAP_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
@@ -784,7 +819,7 @@ mod tests {
     fn weak_map_and_set_do_not_keep_object_keys_alive() {
         let map = construct(&weak_map_class(), vec![]);
         let set = construct(&weak_set_class(), vec![]);
-        // Host Rc object: page-local arena objects stay pinned until reset.
+        // Host Rc object (arena objects: see the arena_targets_* tests).
         let key = Value::Object(Rc::new(RefCell::new(crate::JsObject::new())));
         let weak = match &key {
             Value::Object(value) => Rc::downgrade(value),
@@ -805,7 +840,7 @@ mod tests {
 
     #[test]
     fn weak_ref_deref_releases_target() {
-        // Host Rc array: page-local arena arrays stay pinned until reset.
+        // Host Rc array (arena arrays: see the arena_* tests).
         let target = Value::Array(Rc::new(RefCell::new(ArrayStorage::new(vec![
             Value::Number(1.0),
         ]))));
@@ -971,6 +1006,52 @@ mod tests {
             value_weak.upgrade().is_none(),
             "value released with its key"
         );
+    }
+
+    #[test]
+    fn arena_targets_die_at_their_last_release_without_a_reset() {
+        let (registry, seen) = recording_registry();
+        let map = construct(&weak_map_class(), vec![]);
+        let set = construct(&weak_set_class(), vec![]);
+        let entries_before = debug_table_sizes().1;
+        let target = Value::object(HashMap::new());
+        assert!(target.object_handle().is_some(), "page-arena object");
+        let reference = construct(&weak_ref_class(), vec![target.clone()]);
+        registry.call_method("register", vec![target.clone(), Value::string("object")]);
+        map.call_method("set", vec![target.clone(), Value::string("v")]);
+        set.call_method("add", vec![target.clone()]);
+        assert_eq!(debug_table_sizes().1, entries_before + 1);
+        assert!(set.call_method("has", vec![target.clone()]).to_bool());
+        // A WeakRef (or a deref result that was dropped) holds no count.
+        assert_eq!(reference.call_method("deref", vec![]), target);
+        drop(target);
+        assert!(reference.call_method("deref", vec![]).is_undefined());
+        assert_eq!(
+            debug_table_sizes().1,
+            entries_before,
+            "WeakMap entry released with its arena key"
+        );
+        assert!(seen.borrow().is_empty(), "never inside Drop");
+        crate::promise::drain_microtasks();
+        assert_eq!(&*seen.borrow(), &["object"]);
+    }
+
+    #[test]
+    fn arena_closures_and_arrays_fire_finalizers() {
+        let (registry, seen) = recording_registry();
+        let closure = Value::function(|_, _| Value::Undefined);
+        let array = Value::array(vec![Value::Number(1.0)]);
+        assert!(closure.function_handle().is_some() && array.array_handle().is_some());
+        let closure_ref = construct(&weak_ref_class(), vec![closure.clone()]);
+        let array_ref = construct(&weak_ref_class(), vec![array.clone()]);
+        registry.call_method("register", vec![closure.clone(), Value::string("closure")]);
+        registry.call_method("register", vec![array.clone(), Value::string("array")]);
+        drop(array);
+        drop(closure);
+        assert!(closure_ref.call_method("deref", vec![]).is_undefined());
+        assert!(array_ref.call_method("deref", vec![]).is_undefined());
+        crate::promise::drain_microtasks();
+        assert_eq!(&*seen.borrow(), &["array", "closure"]);
     }
 
     #[test]
