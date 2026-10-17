@@ -251,6 +251,20 @@ impl JsObject {
         self.refresh_heap_accounting();
     }
 
+    /// V8 boilerplate copy (object-literal AllocationSite): give an empty
+    /// ordinary object the exact own properties, in the same insertion
+    /// order, of a template object. Returns false (and changes nothing)
+    /// when `self` already has own properties or is a proxy.
+    pub fn copy_properties_from(&mut self, template: &JsObject) -> bool {
+        if !self.properties.is_empty() || self.proxy_handler.is_some() {
+            return false;
+        }
+        self.properties = template.properties.clone();
+        self.has_getter_properties |= template.has_getter_properties;
+        self.refresh_heap_accounting();
+        true
+    }
+
     pub fn may_have_getter_properties(&self) -> bool {
         self.has_getter_properties
             || self.prototype.as_ref().is_some_and(|prototype| {
