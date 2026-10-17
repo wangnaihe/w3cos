@@ -283,12 +283,12 @@ impl JsObject {
 
     pub fn has_own_property(&self, key: &str) -> bool {
         self.properties.contains_key(key)
-            || self
-                .properties
-                .contains_key(format!("__w3cos_getter_{key}").as_str())
-            || self
-                .properties
-                .contains_key(format!("__w3cos_setter_{key}").as_str())
+            || with_prefixed_key("__w3cos_getter_", key, |accessor| {
+                self.properties.contains_key(accessor)
+            })
+            || with_prefixed_key("__w3cos_setter_", key, |accessor| {
+                self.properties.contains_key(accessor)
+            })
     }
 
     /// `[[Delete]]` — the `delete` operator.
@@ -819,5 +819,21 @@ mod tests {
         assert_eq!(child.get_direct("own").to_number(), 1.0);
         assert_eq!(child.get_direct("inherited").to_number(), 99.0);
         assert!(child.get_direct("missing").is_undefined());
+    }
+}
+
+/// Run `probe` on `prefix + key` without a heap allocation for short keys
+/// (accessor probes on every own-property check used to `format!` twice).
+#[inline]
+fn with_prefixed_key<R>(prefix: &str, key: &str, probe: impl FnOnce(&str) -> R) -> R {
+    let mut buffer = [0u8; 96];
+    let total = prefix.len() + key.len();
+    if total <= buffer.len() {
+        buffer[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        buffer[prefix.len()..total].copy_from_slice(key.as_bytes());
+        // SAFETY: the concatenation of two `str`s is valid UTF-8.
+        probe(unsafe { std::str::from_utf8_unchecked(&buffer[..total]) })
+    } else {
+        probe(&format!("{prefix}{key}"))
     }
 }
