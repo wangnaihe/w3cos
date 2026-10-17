@@ -620,6 +620,18 @@ fn generate_module_with_bodies(
             error.replace(['\r', '\n'], " ")
         ));
     }
+    OWN_CELL_BINDINGS.with(|own| {
+        *own.borrow_mut() = (
+            module.path.clone(),
+            functions
+                .iter()
+                .filter_map(|item| match item {
+                    TopLevelItem::Variable { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
+    });
     let mut value_bindings: HashSet<String> = functions
         .iter()
         .filter_map(|item| match item {
@@ -2460,6 +2472,21 @@ fn entry_bound_w3ir_function<'a>(
     None
 }
 
+std::thread_local! {
+    /// Top-level `var`/`let`/`const` items of the module being generated:
+    /// these own a `{bundled}:cell` BindingCell in that module's registry
+    /// (the `find_variable` accessor branch).
+    static OWN_CELL_BINDINGS: std::cell::RefCell<(std::path::PathBuf, HashSet<String>)> =
+        std::cell::RefCell::new((std::path::PathBuf::new(), HashSet::new()));
+}
+
+fn owns_binding_cell(module: &BundledModule, name: &str) -> bool {
+    OWN_CELL_BINDINGS.with(|own| {
+        let own = own.borrow();
+        own.0 == module.path && own.1.contains(name)
+    })
+}
+
 fn generator_capture_map_with_synthetic(
     bundle: &EsmBundle,
     module: &BundledModule,
@@ -2535,6 +2562,27 @@ fn generator_capture_map_with_synthetic(
                         })
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
+            // A mutable module variable of this module captured by a
+            // function reads/writes its BindingCell slot directly (V8
+            // ScriptContext slot load) instead of calling getter/setter
+            // closures. The frame's Cell path keeps TDZ checks.
+            if binding.mutable
+                && owns_binding_cell(module, &binding.name)
+                && let Some(bundled) = module.lookup(&binding.name)
+                && load == format!("{bundled}_get()")
+                && bundle.symbols.iter().any(|symbol| {
+                    symbol.bundled_name == bundled
+                        && symbol.module == module.path
+                        && symbol.kind == SymbolKind::Variable
+                })
+            {
+                return Some(format!(
+                    "({}, w3cos_core::AotCapture::Cell(__w3cos_site_binding({}, {:?}).shared_slot()))",
+                    capture.0,
+                    next_site_index(),
+                    format!("{bundled}:cell")
+                ));
+            }
             Some(format!(
                 "({}, w3cos_core::AotCapture::Accessors({}, {setter}))",
                 capture.0,
