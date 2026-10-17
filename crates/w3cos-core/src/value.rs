@@ -1363,11 +1363,15 @@ pub type AotFactory = fn(Value, &[Value], &AotCaptureMap) -> Value;
 
 /// Callable body stored inside [`FunctionData`].
 ///
-/// Host / DOM / capture-adapter closures keep [`FunctionBody::Dyn`]. AOT
-/// `CreateClosure` uses [`FunctionBody::Aot`] so the page slab holds a fn
-/// pointer + captures without an extra `Box<dyn Fn>` allocation per closure.
+/// Host / DOM / capture-adapter closures use [`FunctionBody::Dyn`] or the
+/// borrowed-argument [`FunctionBody::DynSlice`]. AOT `CreateClosure` uses
+/// [`FunctionBody::Aot`] so the page slab holds a fn pointer + captures
+/// without an extra `Box<dyn Fn>` allocation per closure.
 enum FunctionBody {
     Dyn(Box<dyn Fn(Value, Vec<Value>) -> Value>),
+    /// Host callable that can consume borrowed arguments without first
+    /// materializing a temporary `Vec`.
+    DynSlice(Box<dyn Fn(Value, &[Value]) -> Value>),
     Aot {
         factory: AotFactory,
         captures: Box<AotCaptureMap>,
@@ -1440,6 +1444,11 @@ impl FunctionData {
         Self::finish(FunctionBody::Dyn(inner))
     }
 
+    #[inline(never)]
+    fn from_erased_slice(inner: Box<dyn Fn(Value, &[Value]) -> Value>) -> Self {
+        Self::finish(FunctionBody::DynSlice(inner))
+    }
+
     /// Build a page-local function whose body is an AOT factory + captures.
     ///
     /// No `Box<dyn Fn>`: the factory is a thin fn pointer and captures live in
@@ -1459,7 +1468,7 @@ impl FunctionData {
     #[inline(never)]
     fn finish(body: FunctionBody) -> Self {
         let captures_ref = match &body {
-            FunctionBody::Dyn(_) | FunctionBody::Bump { .. } => None,
+            FunctionBody::Dyn(_) | FunctionBody::DynSlice(_) | FunctionBody::Bump { .. } => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         };
         let mut props = PropertyMap::new();
@@ -1482,16 +1491,19 @@ impl FunctionData {
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match &self.body {
             FunctionBody::Dyn(inner) => inner(this, args),
+            FunctionBody::DynSlice(inner) => inner(this, &args),
             FunctionBody::Aot { factory, captures } => factory(this, &args, captures),
             FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
     }
 
-    /// Invoke without allocating an argument vector. Host closures still
-    /// collect a `Vec`; AOT factories receive the slice directly.
+    /// Invoke without allocating an argument vector. Ordinary host closures
+    /// still collect a `Vec`; slice-aware host closures and AOT factories
+    /// receive the slice directly.
     pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
         match &self.body {
             FunctionBody::Dyn(inner) => inner(this, args.to_vec()),
+            FunctionBody::DynSlice(inner) => inner(this, args),
             FunctionBody::Aot { factory, captures } => factory(this, args, captures),
             FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
@@ -1540,7 +1552,7 @@ impl FunctionData {
     #[inline]
     fn captures_for_heap(&self) -> Option<&AotCaptureMap> {
         match &self.body {
-            FunctionBody::Dyn(_) | FunctionBody::Bump { .. } => None,
+            FunctionBody::Dyn(_) | FunctionBody::DynSlice(_) | FunctionBody::Bump { .. } => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         }
     }
@@ -2381,6 +2393,13 @@ impl Value {
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
+    /// Create a host callable whose implementation borrows its arguments.
+    pub fn function_slice(f: impl Fn(Value, &[Value]) -> Value + 'static) -> Self {
+        let handle =
+            crate::page_arena::alloc_function(FunctionData::from_erased_slice(Box::new(f)));
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
     /// Intern an AOT `CreateClosure` body without boxing a `dyn Fn`.
     ///
     /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
@@ -2955,6 +2974,12 @@ impl Value {
     pub fn call_method_slice(&self, key: &str, args: &[Value]) -> Value {
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
+        }
+        if matches!(
+            key,
+            "createElement" | "appendChild" | "removeChild" | "matches" | "webkitMatchesSelector"
+        ) {
+            return self.get_property(key).call_slice(self.clone(), args);
         }
         self.call_method(key, args.to_vec())
     }
@@ -5660,6 +5685,59 @@ mod tests {
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_functions(), 0);
         assert!(weak.upgrade_value().is_none());
+    }
+
+    #[test]
+    fn slice_host_function_accepts_owned_and_borrowed_arguments() {
+        crate::page_arena::reset();
+        let function = Value::function_slice(|this, args| {
+            Value::Number(this.to_number() + args[0].to_number() + args.len() as f64)
+        });
+        let this = Value::Number(2.0);
+        let args = [Value::Number(3.0)];
+        assert_eq!(
+            function.call(this.clone(), args.to_vec()),
+            Value::Number(6.0)
+        );
+        assert_eq!(function.call_slice(this, &args), Value::Number(6.0));
+    }
+
+    #[test]
+    fn hot_slice_method_lookup_observes_encoded_getter_and_proxy() {
+        crate::page_arena::reset();
+        let getter_method = Value::function_slice(|this, args| {
+            Value::array(vec![
+                this,
+                args.first().cloned().unwrap_or(Value::Undefined),
+            ])
+        });
+        let getter = Value::object(HashMap::from([(
+            "__w3cos_getter_appendChild".into(),
+            Value::function(move |_, _| getter_method.clone()),
+        )]));
+        let getter_result = getter.call_method_slice("appendChild", &[Value::Number(7.0)]);
+        assert!(getter_result.get_property("0").strict_eq(&getter));
+        assert_eq!(getter_result.get_property("1"), Value::Number(7.0));
+
+        let trap_reads = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&trap_reads);
+        let proxy = Value::proxied_object(
+            &[],
+            crate::proxy::ProxyBuilder::new()
+                .get(move |_, key, _| {
+                    assert_eq!(key, "matches");
+                    observed.set(observed.get() + 1);
+                    Value::function_slice(|_, args| {
+                        args.first().cloned().unwrap_or(Value::Undefined)
+                    })
+                })
+                .build(),
+        );
+        assert_eq!(
+            proxy.call_method_slice("matches", &[Value::string("proxy")]),
+            Value::string("proxy")
+        );
+        assert_eq!(trap_reads.get(), 1);
     }
 
     #[test]
