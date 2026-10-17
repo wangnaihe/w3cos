@@ -60,12 +60,20 @@ struct EscapePlan {
     n_num_bindings: u32,
     /// Binding id → number that is stored exactly once as a literal.
     constants: HashMap<u32, f64>,
+    /// `CreateObject` / `CreateArray` destinations proven not to escape the
+    /// frame ([`crate::alloc_escape`]): allocated as refcounted host values
+    /// so they are freed at their last reference instead of page reset.
+    local_allocs: HashSet<u32>,
 }
 
 thread_local! {
     static NUMERIC_CONSTANTS: std::cell::RefCell<HashMap<u32, f64>> =
         std::cell::RefCell::new(HashMap::new());
     static MODULE_FUNCTIONS: std::cell::RefCell<Vec<Function>> = std::cell::RefCell::new(Vec::new());
+    /// Binding ids named `eval` across `MODULE_FUNCTIONS`, computed lazily
+    /// (keyed by the module function count) for allocation escape analysis.
+    static EVAL_BINDINGS: std::cell::RefCell<Option<(usize, HashSet<u32>)>> =
+        const { std::cell::RefCell::new(None) };
     static SHARED_NUMBERS: std::cell::RefCell<HashSet<u32>> = std::cell::RefCell::new(HashSet::new());
     /// Outermost `generate_function_tree` owns the thread-locals above.
     /// An empty numeric-constant map is a valid install, so emptiness cannot
@@ -83,6 +91,7 @@ impl Drop for NumericConstantGuard {
         if self.0 {
             NUMERIC_CONSTANTS.with(|constants| constants.borrow_mut().clear());
             MODULE_FUNCTIONS.with(|functions| functions.borrow_mut().clear());
+            EVAL_BINDINGS.with(|cache| *cache.borrow_mut() = None);
         }
     }
 }
@@ -337,6 +346,33 @@ fn emit_num_cells(ids: &HashSet<u32>) -> (String, String, String) {
     )
 }
 
+/// Whether outer binding `id` is named `eval`. Without module context any
+/// capture may be `eval`, so the answer is conservatively `true`.
+fn is_eval_binding(id: u32) -> bool {
+    MODULE_FUNCTIONS.with(|functions| {
+        let functions = functions.borrow();
+        if functions.is_empty() {
+            return true;
+        }
+        EVAL_BINDINGS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let stale = cache
+                .as_ref()
+                .is_none_or(|(count, _)| *count != functions.len());
+            if stale {
+                let ids = functions
+                    .iter()
+                    .flat_map(|function| &function.bindings)
+                    .filter(|binding| binding.name == "eval")
+                    .map(|binding| binding.id.0)
+                    .collect();
+                *cache = Some((functions.len(), ids));
+            }
+            cache.as_ref().is_some_and(|(_, ids)| ids.contains(&id))
+        })
+    })
+}
+
 fn analyze_function(function: &Function) -> EscapePlan {
     let constants = NUMERIC_CONSTANTS.with(|constants| constants.borrow().clone());
     let numeric_bindings = numeric_local_bindings(function, &constants);
@@ -390,7 +426,6 @@ fn analyze_function(function: &Function) -> EscapePlan {
         n_num_bindings += 1;
     }
     EscapePlan {
-        number,
         bools,
         num_of,
         bool_of,
@@ -398,9 +433,16 @@ fn analyze_function(function: &Function) -> EscapePlan {
         n_num,
         n_bool,
         n_val,
+        local_allocs: crate::alloc_escape::analyze(
+            function,
+            &|register| number.contains(&register),
+            &is_eval_binding,
+        )
+        .local_registers,
         num_binding_of,
         n_num_bindings,
         constants,
+        number,
     }
 }
 
@@ -1675,6 +1717,10 @@ fn emit_binding_store_value(storage: SlotStorage, id: u32, rust_expr: &str) -> S
     }
 }
 
+pub(crate) fn written_register_id(instruction: &Instruction) -> Option<u32> {
+    written_register(instruction).map(|register| register.0)
+}
+
 fn written_register(instruction: &Instruction) -> Option<Register> {
     match instruction {
         Instruction::LoadConstant { dst, .. }
@@ -1723,7 +1769,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
     }
 }
 
-fn read_registers(instruction: &Instruction) -> Vec<u32> {
+pub(crate) fn read_registers(instruction: &Instruction) -> Vec<u32> {
     match instruction {
         Instruction::LoadConstant { .. }
         | Instruction::LoadBinding { .. }
@@ -2065,6 +2111,7 @@ fn generate_function_tree(
         NUMERIC_CONSTANTS
             .with(|slot| *slot.borrow_mut() = module_numeric_constants(&module.functions));
         MODULE_FUNCTIONS.with(|slot| *slot.borrow_mut() = module.functions.clone());
+        EVAL_BINDINGS.with(|cache| *cache.borrow_mut() = None);
     }
     let _constant_guard = NumericConstantGuard(install_constants);
 
@@ -6622,8 +6669,13 @@ fn emit_instruction(
             )
         }
         Instruction::CreateArray { dst, elements } => format!(
-            "self.registers[{}] = w3cos_core::Value::array(vec![{}]);",
+            "self.registers[{}] = w3cos_core::Value::{}(vec![{}]);",
             register(*dst),
+            if plan.local_allocs.contains(&dst.0) {
+                "local_array"
+            } else {
+                "array"
+            },
             elements
                 .iter()
                 .map(|element| emit_boxed_value(plan, element.0))
@@ -6661,11 +6713,16 @@ fn emit_instruction(
                 .join(", ")
         ),
         Instruction::CreateObject { dst, properties } => {
+            let constructor = if plan.local_allocs.contains(&dst.0) {
+                "local_object"
+            } else {
+                "object"
+            };
             let object = if properties.is_empty() {
-                "w3cos_core::Value::object(std::collections::HashMap::new())".into()
+                format!("w3cos_core::Value::{constructor}(std::collections::HashMap::new())")
             } else {
                 format!(
-                    "w3cos_core::Value::object(std::collections::HashMap::from([{}]))",
+                    "w3cos_core::Value::{constructor}(std::collections::HashMap::from([{}]))",
                     properties
                         .iter()
                         .map(|(key, value)| format!(

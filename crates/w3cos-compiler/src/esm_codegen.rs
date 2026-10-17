@@ -4951,6 +4951,117 @@ fn main() {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// AOT M1-4a part 1: non-escaping literals are refcounted locals freed on
+    /// return; escaping literals still live in the page arena and stay valid.
+    #[test]
+    fn generated_bundle_frees_non_escaping_literals_on_return() {
+        let root = fixture_root("w3cos_esm_codegen_arena_escape");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"export function work(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const p = { x: i, y: i + 1 };
+    const pair = [p.x, p.y];
+    sum += pair[0] + pair[1];
+  }
+  return sum;
+}
+const kept: any[] = [];
+export function workEscape(n: number): number {
+  for (let i = 0; i < n; i++) {
+    kept.push({ x: i });
+  }
+  return kept.length;
+}
+export function keptSum(): number {
+  let sum = 0;
+  for (let i = 0; i < kept.length; i++) sum += kept[i].x;
+  return sum;
+}
+export function makePoint(v: number) {
+  const p = { x: v, y: v * 2 };
+  return p;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("w3cos_core::Value::local_object("),
+            "non-escaping literal should be a refcounted local:\n{code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::{page_arena, Value};
+    let _ = run_entry();
+    let live = || page_arena::live_objects() + page_arena::live_arrays();
+    let r = m0::m0_work(vec![Value::Number(10000.0)]);
+    assert_eq!(r.to_number(), 100000000.0, "work: {r:?}");
+    let base = live();
+    let slab_base = page_arena::slab_bytes();
+    for _ in 0..5 {
+        let r = m0::m0_work(vec![Value::Number(10000.0)]);
+        assert_eq!(r.to_number(), 100000000.0, "work: {r:?}");
+    }
+    let after = live();
+    println!("PROBE work x5 (n=10000): live_arena {base} -> {after}, slab_bytes {slab_base} -> {}", page_arena::slab_bytes());
+    assert!(after <= base + 8, "non-escaping literals must not accumulate in the arena: {base} -> {after}");
+
+    let r = m0::m0_workEscape(vec![Value::Number(1000.0)]);
+    assert_eq!(r.to_number(), 1000.0);
+    let r = m0::m0_workEscape(vec![Value::Number(1000.0)]);
+    assert_eq!(r.to_number(), 2000.0);
+    let escaped = live() - after;
+    println!("PROBE workEscape 2x1000: live_arena +{escaped}");
+    assert!(escaped >= 2000, "escaping literals stay allocated: +{escaped}");
+    let r = m0::m0_keptSum(vec![]);
+    assert_eq!(r.to_number(), 2.0 * 499500.0, "escaped objects survive intact: {r:?}");
+
+    let p = m0::m0_makePoint(vec![Value::Number(21.0)]);
+    let _ = m0::m0_work(vec![Value::Number(100.0)]);
+    assert_eq!(p.get_property("x").to_number(), 21.0);
+    assert_eq!(p.get_property("y").to_number(), 42.0);
+    println!("W3COS_ARENA_ESCAPE_E2E_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}");
+        assert!(
+            output.status.success() && stdout.contains("W3COS_ARENA_ESCAPE_E2E_OK"),
+            "arena escape bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn generated_bundle_runs_jsdom_globals() {
         let root = fixture_root("w3cos_esm_codegen_globals_jsdom");
