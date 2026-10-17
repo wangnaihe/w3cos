@@ -2275,6 +2275,7 @@ pub fn generate_generator_from_module(
     function: &Function,
     rust_name: &str,
 ) -> Result<String> {
+    let _closure_meta = note_closure_meta(module);
     let mut factories = HashMap::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -2286,6 +2287,48 @@ pub fn generate_generator_from_module(
         &mut emitted,
         &mut visiting,
     )
+}
+
+thread_local! {
+    /// Own name/length of every closure of the module being emitted (set by
+    /// each public module-level emission entry).
+    static CLOSURE_META: std::cell::RefCell<((), HashMap<FunctionId, (String, u32)>)> =
+        std::cell::RefCell::new(((), HashMap::new()));
+}
+
+struct ClosureMetaScope(HashMap<FunctionId, (String, u32)>);
+
+impl Drop for ClosureMetaScope {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        CLOSURE_META.with(|meta| meta.borrow_mut().1 = previous);
+    }
+}
+
+#[must_use]
+fn note_closure_meta(module: &Module) -> ClosureMetaScope {
+    let table = module
+        .functions
+        .iter()
+        .filter_map(|function| Some((function.id, function.own_name_length.clone()?)))
+        .collect();
+    ClosureMetaScope(CLOSURE_META.with(|meta| std::mem::replace(&mut meta.borrow_mut().1, table)))
+}
+
+/// `; set_name_and_length(..)` for a closure stored in `self.registers[dst]`
+/// (SetFunctionName + SetFunctionLength in InstantiateOrdinaryFunctionExpression).
+fn emit_closure_name_and_length(nested: FunctionId, dst: usize) -> String {
+    CLOSURE_META.with(|meta| {
+        meta.borrow()
+            .1
+            .get(&nested)
+            .map(|(name, length)| {
+                format!(
+                    " if let Some(__w3cos_f) = self.registers[{dst}].as_function() {{ __w3cos_f.set_name_and_length({name:?}, {length}); }}"
+                )
+            })
+            .unwrap_or_default()
+    })
 }
 
 fn generate_function_tree(
@@ -2384,6 +2427,7 @@ pub fn generate_async_function_from_module(
     if function.is_generator || !function.is_async {
         bail!("async W3IR AOT emission requires a non-generator async function");
     }
+    let _closure_meta = note_closure_meta(module);
     let mut factories = HashMap::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -2408,6 +2452,7 @@ pub fn generate_sync_function_from_module(
     if function.is_generator || function.is_async {
         bail!("sync W3IR AOT emission requires a non-async ordinary function");
     }
+    let _closure_meta = note_closure_meta(module);
     let mut factories = HashMap::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -7213,8 +7258,9 @@ fn emit_instruction(
                 )
             } else {
                 format!(
-                    "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);",
-                    register(*dst)
+                    "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);{}",
+                    register(*dst),
+                    emit_closure_name_and_length(*nested, register(*dst) as usize)
                 )
             }
         }
@@ -8650,6 +8696,7 @@ fn main() {{
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         };
 
@@ -10137,6 +10184,7 @@ fn main() {{
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         }
     }

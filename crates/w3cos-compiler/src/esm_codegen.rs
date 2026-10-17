@@ -2227,7 +2227,7 @@ fn emit_shared_module_registration(
 /// ExpectedArgumentCount (ECMA-262 15.1.5): formals before the first one
 /// with an initializer or a rest element. A TypeScript `this` parameter is
 /// type-only and not a formal.
-fn expected_argument_count<'a>(params: impl Iterator<Item = &'a Pat>) -> u32 {
+pub(crate) fn expected_argument_count<'a>(params: impl Iterator<Item = &'a Pat>) -> u32 {
     let mut count = 0;
     for pat in params {
         match pat {
@@ -4216,7 +4216,8 @@ function twice() { return "b"; }
 export function result() {
   const first = caller(1);
   inner = function (x) { return x + 2; };
-  return before + swap() + first + caller(1) + twice();
+  const thunk = [0].map(() => 1);
+  return before + swap() + first + caller(1) + twice() + thunk[0];
 }
 "#;
         std::fs::write(root.join("src/app.js"), source).unwrap();
@@ -4238,6 +4239,10 @@ export function result() {
         assert_eq!(code.matches("m0_inner_call_result(").count(), 1);
         assert_eq!(code.matches("m0_swap_call_num(").count(), 1);
         assert_eq!(code.matches("m0_swap_call_result(").count(), 1);
+        // NamedEvaluation + SetFunctionLength on closures created inside
+        // functions: `inner = function (x) {}` is named "inner", length 1.
+        assert!(code.contains("__w3cos_f.set_name_and_length(\"inner\", 1)"));
+        assert!(code.contains("__w3cos_f.set_name_and_length(\"\", 0)"));
         // Duplicate declarations bind once; the last one wins (spec order).
         assert_eq!(code.matches("pub fn m0_twice(").count(), 1);
         assert_eq!(code.matches("pub fn m0_swap(").count(), 1);

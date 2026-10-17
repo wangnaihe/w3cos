@@ -2399,6 +2399,7 @@ mod tests {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         }
     }
@@ -2878,6 +2879,7 @@ mod tests {
                 generator_suspension_points: Vec::new(),
                 is_async: true,
                 is_generator: false,
+                own_name_length: None,
                 source_span: None,
             }],
         );
@@ -3298,6 +3300,7 @@ mod tests {
             }],
             is_async: false,
             is_generator: true,
+            own_name_length: None,
             source_span: None,
         };
         let module = Module::new("app:///generator.w3ir", FunctionId(0), vec![entry]);
@@ -3379,6 +3382,7 @@ mod tests {
             }],
             is_async: true,
             is_generator: true,
+            own_name_length: None,
             source_span: None,
         };
         let generator = Vm::new(

@@ -512,6 +512,7 @@ fn finish_module(mut builder: Builder, specifier: &str, name: &str) -> Result<Mo
         generator_suspension_points: builder.generator_suspension_points,
         is_async: builder.is_async,
         is_generator: builder.is_generator,
+        own_name_length: None,
         source_span: None,
     }];
     functions.extend(builder.functions);
@@ -841,6 +842,9 @@ struct Builder {
     /// field initializers and async/generator bodies are never
     /// [[Construct]]ed, and arrows inherit that from their scope.
     new_target_undefined: bool,
+    /// NamedEvaluation name for the anonymous function/arrow about to be
+    /// lowered (`x = function () {}`, `{ x: () => 0 }`).
+    pending_function_name: Option<String>,
 }
 
 impl Builder {
@@ -895,6 +899,7 @@ impl Builder {
             superseded_function_declarations: HashSet::new(),
             new_target: None,
             new_target_undefined: false,
+            pending_function_name: None,
         }
     }
 
@@ -953,6 +958,7 @@ impl Builder {
             superseded_function_declarations: HashSet::new(),
             new_target: None,
             new_target_undefined: false,
+            pending_function_name: None,
         }
     }
 
@@ -2215,6 +2221,11 @@ impl Builder {
                                         function.function.body.as_ref().ok_or_else(|| {
                                             anyhow!("runtime function expression has no body")
                                         })?;
+                                    // A named function expression keeps its own name.
+                                    self.pending_function_name = function
+                                        .ident
+                                        .as_ref()
+                                        .map(|identifier| identifier.sym.to_string());
                                     self.lower_nested_function(
                                         parameters,
                                         &body.stmts,
@@ -3627,13 +3638,43 @@ impl Builder {
         }
     }
 
+    /// ECMA-262 NamedEvaluation: an anonymous function definition takes the
+    /// name of the binding or property it is assigned to.
+    fn lower_named_evaluation(
+        &mut self,
+        expression: &Expr,
+        name: Option<String>,
+    ) -> Result<Register> {
+        let mut inner = expression;
+        while let Expr::Paren(paren) = inner {
+            inner = &paren.expr;
+        }
+        let anonymous = match inner {
+            Expr::Fn(function) => function.ident.is_none(),
+            Expr::Arrow(_) => true,
+            _ => false,
+        };
+        if anonymous && name.is_some() {
+            self.pending_function_name = name;
+        }
+        let value = self.lower_expression(expression);
+        self.pending_function_name = None;
+        value
+    }
+
     fn lower_simple_assignment(
         &mut self,
         assignment: &swc_ecma_ast::AssignExpr,
     ) -> Result<Register> {
         let target = self.lower_assignment_target(&assignment.left)?;
         self.ensure_assignment_target_mutable(target)?;
-        let value = self.lower_expression(&assignment.right)?;
+        let name = match &assignment.left {
+            AssignTarget::Simple(SimpleAssignTarget::Ident(identifier)) => {
+                Some(identifier.id.sym.to_string())
+            }
+            _ => None,
+        };
+        let value = self.lower_named_evaluation(&assignment.right, name)?;
         self.store_assignment_target(target, value);
         Ok(value)
     }
@@ -3747,7 +3788,10 @@ impl Builder {
                             let (key, value) = match property.as_ref() {
                                 Prop::KeyValue(property) => (
                                     self.lower_property_name(&property.key)?,
-                                    self.lower_expression(&property.value)?,
+                                    self.lower_named_evaluation(
+                                        &property.value,
+                                        object_property_name(&property.key),
+                                    )?,
                                 ),
                                 Prop::Shorthand(identifier) => (
                                     self.constant(Constant::String(identifier.sym.to_string())),
@@ -5013,6 +5057,7 @@ impl Builder {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         };
         self.functions.extend(child.functions);
@@ -5095,6 +5140,7 @@ impl Builder {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         };
         self.functions.extend(child.functions);
@@ -5119,6 +5165,17 @@ impl Builder {
         bind_this: bool,
         class_super_is_static: Option<bool>,
     ) -> Result<Register> {
+        let named_evaluation = self.pending_function_name.take();
+        // SetFunctionName / SetFunctionLength for the closure object; class
+        // members get theirs from the class definition.
+        let own_name_length = class_super_is_static.is_none().then(|| {
+            (
+                named_evaluation
+                    .or_else(|| name.clone())
+                    .unwrap_or_default(),
+                crate::esm_codegen::expected_argument_count(parameters.iter()),
+            )
+        });
         let function_id = FunctionId(self.next_function);
         self.next_function += 1;
         let strict_mode = self.strict_mode
@@ -5240,6 +5297,7 @@ impl Builder {
             generator_suspension_points: child.generator_suspension_points,
             is_async: child.is_async,
             is_generator: child.is_generator,
+            own_name_length,
             source_span: None,
         };
         self.functions.extend(child.functions);

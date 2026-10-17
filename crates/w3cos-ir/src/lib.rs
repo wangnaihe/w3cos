@@ -410,6 +410,10 @@ pub struct Function {
     pub is_async: bool,
     #[serde(default)]
     pub is_generator: bool,
+    /// Own `name` and `length` of the function object a `CreateClosure`
+    /// produces (SetFunctionName / SetFunctionLength), when known statically.
+    #[serde(default)]
+    pub own_name_length: Option<(String, u32)>,
     pub source_span: Option<SourceSpan>,
 }
 
@@ -1047,6 +1051,7 @@ mod tests {
                 generator_suspension_points: Vec::new(),
                 is_async: false,
                 is_generator: false,
+                own_name_length: None,
                 source_span: None,
             }],
         )
@@ -1208,6 +1213,7 @@ mod tests {
                     generator_suspension_points: Vec::new(),
                     is_async: true,
                     is_generator: false,
+                    own_name_length: None,
                     source_span: Some(SourceSpan {
                         source: "app:///main.js".into(),
                         start: 0,
@@ -1240,6 +1246,7 @@ mod tests {
                     generator_suspension_points: Vec::new(),
                     is_async: false,
                     is_generator: false,
+                    own_name_length: None,
                     source_span: None,
                 },
             ],
@@ -1339,6 +1346,7 @@ mod tests {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         });
         assert_eq!(
