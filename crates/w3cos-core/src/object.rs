@@ -282,13 +282,8 @@ impl JsObject {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.properties.contains_key(key)
-            || self
-                .properties
-                .contains_key(format!("__w3cos_getter_{key}").as_str())
-            || self
-                .properties
-                .contains_key(format!("__w3cos_setter_{key}").as_str())
+        self.properties
+            .contains_key_or_prefixed(key, "__w3cos_getter_", "__w3cos_setter_")
     }
 
     /// `[[Delete]]` — the `delete` operator.
@@ -636,6 +631,25 @@ mod tests {
         assert!(obj.has_own_property("length"));
         assert!(!obj.has_own_property("inherited"));
         assert!(obj.has_direct("inherited"));
+    }
+
+    #[test]
+    fn own_property_check_matches_unicode_and_long_accessor_keys() {
+        let mut obj = JsObject::new();
+        obj.set_direct(
+            "__w3cos_getter_值",
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+
+        let long = "x".repeat(128);
+        obj.set_direct(
+            &format!("__w3cos_setter_{long}"),
+            Value::function(|_, _| Value::Undefined),
+        );
+
+        assert!(obj.has_own_property("值"));
+        assert!(obj.has_own_property(&long));
+        assert!(!obj.has_own_property("missing"));
     }
 
     #[test]

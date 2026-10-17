@@ -288,17 +288,21 @@ impl CompoundSelector {
 }
 
 fn attribute_name_eq(ctx: &SelectorContext, actual: &str, expected: &str) -> bool {
+    attribute_name_eq_for(ctx.html_element, actual, expected)
+}
+
+fn attribute_name_eq_for(html_element: bool, actual: &str, expected: &str) -> bool {
     if let Some(local_name) = expected.strip_prefix("*|") {
         let actual_local_name = actual
             .rsplit_once(':')
             .map_or(actual, |(_, actual_local_name)| actual_local_name);
-        return if ctx.html_element {
+        return if html_element {
             actual_local_name.eq_ignore_ascii_case(local_name)
         } else {
             actual_local_name == local_name
         };
     }
-    if ctx.html_element {
+    if html_element {
         actual.eq_ignore_ascii_case(expected)
     } else {
         actual == expected
@@ -312,7 +316,23 @@ fn attribute_value_eq(
     expected: &str,
     insensitive: bool,
 ) -> bool {
-    if insensitive || ctx.html_document && attribute_name.eq_ignore_ascii_case("lang") {
+    attribute_value_eq_for(
+        ctx.html_document,
+        attribute_name,
+        actual,
+        expected,
+        insensitive,
+    )
+}
+
+fn attribute_value_eq_for(
+    html_document: bool,
+    attribute_name: &str,
+    actual: &str,
+    expected: &str,
+    insensitive: bool,
+) -> bool {
+    if insensitive || html_document && attribute_name.eq_ignore_ascii_case("lang") {
         actual.eq_ignore_ascii_case(expected)
     } else {
         actual == expected
@@ -326,10 +346,26 @@ fn attribute_value_dash_prefix(
     expected: &str,
     insensitive: bool,
 ) -> bool {
+    attribute_value_dash_prefix_for(
+        ctx.html_document,
+        attribute_name,
+        actual,
+        expected,
+        insensitive,
+    )
+}
+
+fn attribute_value_dash_prefix_for(
+    html_document: bool,
+    attribute_name: &str,
+    actual: &str,
+    expected: &str,
+    insensitive: bool,
+) -> bool {
     let Some(prefix) = actual.get(..expected.len()) else {
         return false;
     };
-    attribute_value_eq(ctx, attribute_name, prefix, expected, insensitive)
+    attribute_value_eq_for(html_document, attribute_name, prefix, expected, insensitive)
         && actual
             .get(expected.len()..)
             .is_some_and(|suffix| suffix.starts_with('-'))
@@ -1277,6 +1313,135 @@ fn compound_matches_node(
     compound: &CompoundSelector,
     target_id: Option<&str>,
 ) -> bool {
+    if !compound_matches_node_basic(document, node, compound) {
+        return false;
+    }
+    compound
+        .pseudo_classes
+        .iter()
+        .all(|pseudo| pseudo_matches_node(document, node, pseudo, target_id))
+}
+
+fn compound_matches_node_basic(
+    document: &Document,
+    node: NodeId,
+    compound: &CompoundSelector,
+) -> bool {
+    if compound.unsupported {
+        return false;
+    }
+    let node = document.get_node(node);
+    let html_document = document.is_html_document();
+    let html_element = html_document && node.is_html_element;
+    if let Some(tag) = &compound.tag {
+        let actual_tag = node.tag.as_static();
+        let actual_tag = if compound.any_namespace || !tag.contains(':') {
+            actual_tag
+                .rsplit_once(':')
+                .map_or(actual_tag, |(_, local)| local)
+        } else {
+            actual_tag
+        };
+        let tag_matches = if html_element {
+            tag.eq_ignore_ascii_case(actual_tag)
+        } else {
+            tag == actual_tag
+        };
+        if !tag_matches {
+            return false;
+        }
+    }
+    if let Some(id) = &compound.id
+        && !node
+            .attributes
+            .iter()
+            .any(|(name, value)| name.as_static() == "id" && value.as_str() == id)
+    {
+        return false;
+    }
+    if !compound.classes.iter().all(|class| {
+        node.class_list
+            .iter()
+            .any(|actual| actual.as_static() == class)
+    }) {
+        return false;
+    }
+    compound.attributes.iter().all(|selector| match selector {
+        AttributeSelector::Present(name) => node
+            .attributes
+            .iter()
+            .any(|(actual, _)| attribute_name_eq_for(html_element, actual.as_static(), name)),
+        AttributeSelector::Equals(name, value, insensitive) => {
+            node.attributes.iter().any(|(actual_name, actual)| {
+                attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                    && attribute_value_eq_for(
+                        html_document,
+                        name,
+                        actual.as_str(),
+                        value,
+                        *insensitive,
+                    )
+            })
+        }
+        AttributeSelector::Includes(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && actual.as_str().split_ascii_whitespace().any(|token| {
+                            attribute_value_eq_for(html_document, name, token, value, *insensitive)
+                        })
+                })
+        }
+        AttributeSelector::DashMatch(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && (attribute_value_eq_for(
+                            html_document,
+                            name,
+                            actual.as_str(),
+                            value,
+                            *insensitive,
+                        ) || attribute_value_dash_prefix_for(
+                            html_document,
+                            name,
+                            actual.as_str(),
+                            value,
+                            *insensitive,
+                        ))
+                })
+        }
+        AttributeSelector::Prefix(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && attribute_value_starts_with(actual.as_str(), value, *insensitive)
+                })
+        }
+        AttributeSelector::Suffix(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && attribute_value_ends_with(actual.as_str(), value, *insensitive)
+                })
+        }
+        AttributeSelector::Substring(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && attribute_value_contains(actual.as_str(), value, *insensitive)
+                })
+        }
+    })
+}
+
+#[cfg(test)]
+fn compound_matches_node_via_owned_context(
+    document: &Document,
+    node: NodeId,
+    compound: &CompoundSelector,
+    target_id: Option<&str>,
+) -> bool {
     let mut basic = compound.clone();
     basic.pseudo_classes.clear();
     if !basic.matches(&selector_context_for_node(document, node)) {
@@ -1589,7 +1754,10 @@ fn previous_element_sibling(document: &Document, node: NodeId) -> Option<NodeId>
     None
 }
 
+#[cfg(test)]
 fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext {
+    #[cfg(test)]
+    NODE_SELECTOR_CONTEXT_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     let node = document.get_node(id);
     let id_attribute = node
         .attributes
@@ -1627,6 +1795,21 @@ fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext
         )
         .with_html_document(document.is_html_document())
         .with_html_element(document.is_html_document() && node.is_html_element)
+}
+
+#[cfg(test)]
+thread_local! {
+    static NODE_SELECTOR_CONTEXT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_node_selector_context_constructions() {
+    NODE_SELECTOR_CONTEXT_CONSTRUCTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn node_selector_context_constructions() -> usize {
+    NODE_SELECTOR_CONTEXT_CONSTRUCTIONS.with(Cell::get)
 }
 
 fn rule_matches(rule: &Rule, ctx: &SelectorContext, ancestors: &[SelectorContext]) -> bool {
@@ -2679,6 +2862,236 @@ mod tests {
             ("name", "User"),
         ]);
         assert_eq!(matching_declarations_for_context(&element, &[]).len(), 7);
+    }
+
+    #[test]
+    fn node_matcher_stays_equivalent_to_owned_context_reference() {
+        setup();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let target = document.create_element("span");
+        let child = document.create_element("em");
+        let sibling = document.create_element("strong");
+        parent.set_attribute(&mut document, "class", "outer");
+        target.set_attribute(&mut document, "id", "target");
+        target.set_attribute(&mut document, "class", "button active");
+        target.set_attribute(&mut document, "lang", "en-GB");
+        target.set_attribute(&mut document, "data-id", "pre-middle-post");
+        target.set_attribute(&mut document, "name", "User");
+        child.set_attribute(&mut document, "class", "child");
+        document.append_child(document.body().id, parent.id);
+        document.append_child(parent.id, target.id);
+        document.append_child(target.id, child.id);
+        document.append_child(parent.id, sibling.id);
+        document.set_focus_state(Some(target.id), true);
+
+        for (selector, target_id, expected) in [
+            ("span", None, true),
+            ("SPAN", None, true),
+            ("#target", None, true),
+            (".active", None, true),
+            (".missing", None, false),
+            ("[CLASS]", None, true),
+            ("[class~=active]", None, true),
+            ("[lang|=EN]", None, true),
+            ("[data-id^=pre]", None, true),
+            ("[data-id$=post]", None, true),
+            ("[data-id*=middle]", None, true),
+            ("[name*=user i]", None, true),
+            ("[name=User s]", None, true),
+            ("[name=user s]", None, false),
+            ("[class~=ACTIVE i]", None, true),
+            ("[class~=ACTIVE s]", None, false),
+            ("[data-id|=PRE i]", None, true),
+            ("[data-id|=PRE s]", None, false),
+            ("[data-id^=PRE i]", None, true),
+            ("[data-id^=PRE s]", None, false),
+            ("[data-id$=POST i]", None, true),
+            ("[data-id$=POST s]", None, false),
+            ("[data-id*=MIDDLE i]", None, true),
+            ("[data-id*=MIDDLE s]", None, false),
+            (r#".\61 ctive"#, None, true),
+            ("span:first-child", None, true),
+            ("span:last-child", None, false),
+            ("span:first-of-type", None, true),
+            ("span:last-of-type", None, true),
+            ("span:only-child", None, false),
+            ("span:only-of-type", None, true),
+            ("span:empty", None, false),
+            ("span:nth-child(1)", None, true),
+            ("span:nth-last-child(2)", None, true),
+            ("span:nth-of-type(1)", None, true),
+            ("span:nth-last-of-type(1)", None, true),
+            ("span:root", None, false),
+            ("span:focus", None, true),
+            ("span:focus-visible", None, true),
+            ("span:focus-within", None, true),
+            ("span:target", Some("target"), true),
+            ("span:not(.missing)", None, true),
+            ("span:has(> .child)", None, true),
+        ] {
+            let parsed = parse_selector_chain_cached(selector).expect("valid selector");
+            assert_eq!(parsed.chain.len(), 1, "selector={selector}");
+            let compound = &parsed.chain[0];
+            assert_eq!(
+                compound_matches_node_via_owned_context(&document, target.id, compound, target_id,),
+                expected,
+                "owned reference selector={selector}",
+            );
+            assert_eq!(
+                compound_matches_node(&document, target.id, compound, target_id),
+                expected,
+                "candidate selector={selector}",
+            );
+        }
+
+        for (selector, expected) in [
+            ("div > span.active", Ok(true)),
+            ("body span.active", Ok(true)),
+            ("span.active + em", Ok(false)),
+            ("span.active ~ strong", Ok(false)),
+            (".missing, span.active", Ok(true)),
+            (r#"[data-id='pre,middle'], span.active"#, Ok(true)),
+            ("span,,em", Err(())),
+        ] {
+            assert_eq!(
+                selector_matches_node(selector, &document, target.id),
+                expected,
+                "selector={selector}",
+            );
+        }
+        assert_eq!(
+            selector_matches_node("span.active ~ strong", &document, sibling.id),
+            Ok(true),
+        );
+        assert_eq!(
+            selector_matches_node(":root", &document, document.body().id),
+            Ok(true),
+        );
+        assert_eq!(
+            selector_matches_node_relative_to_scope(
+                ".active", &document, target.id, parent.id, None,
+            ),
+            Ok(true),
+        );
+    }
+
+    #[test]
+    fn node_matcher_keeps_foreign_and_xml_case_semantics() {
+        setup();
+        let mut document = Document::new();
+        document.set_html_document(false);
+        let target = document.create_element("svg:linearGradient");
+        document.set_html_element(target.id, false);
+        target.set_attribute_ns(
+            &mut document,
+            Some("http://www.w3.org/1999/xlink"),
+            "xlink:href",
+            Some("xlink"),
+            "href",
+            "Value",
+        );
+        document.append_child(document.body().id, target.id);
+
+        for (selector, expected) in [
+            ("linearGradient", true),
+            ("lineargradient", false),
+            ("*|linearGradient", true),
+            ("[*|href]", true),
+            ("[*|href=Value]", true),
+            ("[*|href=value]", false),
+            ("[*|HREF]", false),
+        ] {
+            let parsed = parse_selector_chain_cached(selector).expect("valid selector");
+            let compound = parsed.chain.last().expect("selector compound");
+            assert_eq!(
+                compound_matches_node_via_owned_context(&document, target.id, compound, None),
+                expected,
+                "owned reference selector={selector}",
+            );
+            assert_eq!(
+                compound_matches_node(&document, target.id, compound, None),
+                expected,
+                "candidate selector={selector}",
+            );
+        }
+    }
+
+    #[test]
+    fn node_matcher_keeps_foreign_element_case_semantics_in_html_documents() {
+        setup();
+        let mut document = Document::new();
+        let target = document.create_element("svg:linearGradient");
+        document.set_html_element(target.id, false);
+        target.set_attribute_ns(
+            &mut document,
+            Some("http://www.w3.org/1999/xlink"),
+            "xlink:href",
+            Some("xlink"),
+            "href",
+            "Value",
+        );
+        document.append_child(document.body().id, target.id);
+
+        for (selector, expected) in [
+            ("linearGradient", true),
+            ("lineargradient", false),
+            ("[*|href=Value s]", true),
+            ("[*|href=value s]", false),
+            ("[*|href=value i]", true),
+        ] {
+            let parsed = parse_selector_chain_cached(selector).expect("valid selector");
+            let compound = parsed.chain.last().expect("selector compound");
+            assert_eq!(
+                compound_matches_node_via_owned_context(&document, target.id, compound, None),
+                expected,
+                "owned reference selector={selector}",
+            );
+            assert_eq!(
+                compound_matches_node(&document, target.id, compound, None),
+                expected,
+                "candidate selector={selector}",
+            );
+        }
+    }
+
+    #[test]
+    fn node_matcher_reads_live_class_and_attribute_state() {
+        setup();
+        let mut document = Document::new();
+        let target = document.create_element("span");
+        document.append_child(document.body().id, target.id);
+        reset_node_selector_context_constructions();
+
+        target.set_class_name(&mut document, "active");
+        assert_eq!(
+            selector_matches_node(".active", &document, target.id),
+            Ok(true)
+        );
+        target.set_class_name(&mut document, "inactive");
+        assert_eq!(
+            selector_matches_node(".active", &document, target.id),
+            Ok(false)
+        );
+        assert_eq!(
+            selector_matches_node(".inactive", &document, target.id),
+            Ok(true)
+        );
+        target.set_attribute(&mut document, "data-state", "ready");
+        assert_eq!(
+            selector_matches_node("[data-state=ready]", &document, target.id),
+            Ok(true),
+        );
+        target.remove_attribute(&mut document, "data-state");
+        assert_eq!(
+            selector_matches_node("[data-state=ready]", &document, target.id),
+            Ok(false),
+        );
+        assert_eq!(
+            node_selector_context_constructions(),
+            0,
+            "node selector matching must not materialize owned SelectorContext values",
+        );
     }
 
     #[test]
