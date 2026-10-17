@@ -943,6 +943,25 @@ fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
 }
 
+/// Pass a prefixed property key without allocating for the short DOM names
+/// used by the bridge. Long keys keep the ordinary owned fallback.
+fn with_prefixed_key<R>(prefix: &str, key: &str, f: impl FnOnce(&str) -> R) -> R {
+    const STACK_KEY_BYTES: usize = 64;
+    let total = prefix.len().saturating_add(key.len());
+    if total <= STACK_KEY_BYTES {
+        let mut bytes = [0_u8; STACK_KEY_BYTES];
+        bytes[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        bytes[prefix.len()..total].copy_from_slice(key.as_bytes());
+        // Concatenating two valid UTF-8 strings is valid UTF-8.
+        let combined = unsafe { std::str::from_utf8_unchecked(&bytes[..total]) };
+        return f(combined);
+    }
+    let mut combined = String::with_capacity(total);
+    combined.push_str(prefix);
+    combined.push_str(key);
+    f(&combined)
+}
+
 fn warn_host_api(name: &'static str, fallback: &'static str) {
     HOST_API_WARNINGS.with(|warned| {
         if warned.borrow_mut().insert(name) {
@@ -1242,10 +1261,10 @@ fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
         wrapper.set_property(key, value);
         return true;
     }
-    let setter_key = format!("__w3cos_setter_{key}");
     let receiver = Value::dom_node(node, realm_generation());
-    if let Some(setter) = inherited_prototype_value(node, &setter_key, &receiver)
-        && setter.is_callable()
+    if let Some(setter) = with_prefixed_key("__w3cos_setter_", key, |setter_key| {
+        inherited_prototype_value(node, setter_key, &receiver)
+    }) && setter.is_callable()
     {
         setter.call(receiver, vec![value]);
         return true;
@@ -24723,6 +24742,100 @@ mod tests {
             child.call_method_slice("matches", &[Value::string("cached-override")]),
             Value::string("cached-override"),
             "an own override must still win after the builtin method was cached"
+        );
+    }
+
+    #[test]
+    fn prefixed_dom_keys_preserve_short_unicode_and_long_names() {
+        let prefix = "__w3cos_setter_";
+        assert_eq!(
+            with_prefixed_key(prefix, "className", str::to_owned),
+            "__w3cos_setter_className"
+        );
+        assert_eq!(
+            with_prefixed_key(prefix, "值", str::to_owned),
+            "__w3cos_setter_值"
+        );
+        let boundary_64 = format!("{}值", "a".repeat(64 - prefix.len() - "值".len()));
+        let boundary_65 = format!("{}值", "b".repeat(65 - prefix.len() - "值".len()));
+        for key in [&boundary_64, &boundary_65] {
+            assert_eq!(
+                with_prefixed_key(prefix, key, str::to_owned),
+                format!("{prefix}{key}")
+            );
+        }
+        let long = "x".repeat(128);
+        assert_eq!(
+            with_prefixed_key(prefix, &long, str::to_owned),
+            format!("__w3cos_setter_{long}")
+        );
+    }
+
+    #[test]
+    fn immediate_setter_proxy_observes_exact_key_receiver_and_reentry() {
+        struct PrototypeRestore {
+            object: Value,
+            prototype: Value,
+        }
+
+        impl Drop for PrototypeRestore {
+            fn drop(&mut self) {
+                w3cos_core::class::set_prototype_of(&self.object, &self.prototype);
+            }
+        }
+
+        setup();
+        let element = document_value().call_method("createElement", vec![Value::string("span")]);
+        assert!(element.live_dom_node().is_some());
+        let expected = element.clone();
+        let setter_calls = Rc::new(Cell::new(0_u32));
+        let setter_calls_cb = Rc::clone(&setter_calls);
+        let setter = Value::function(move |this, args| {
+            assert!(this.strict_eq(&expected));
+            assert_eq!(args.first(), Some(&Value::string("proxied")));
+            setter_calls_cb.set(setter_calls_cb.get() + 1);
+            Value::Undefined
+        });
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let observations_cb = Rc::clone(&observations);
+        let expected_receiver = element.clone();
+        let handler = ProxyBuilder::new()
+            .get(move |_, key, receiver| {
+                observations_cb
+                    .borrow_mut()
+                    .push((key.to_string(), receiver.strict_eq(&expected_receiver)));
+                if key == "__w3cos_setter_className" {
+                    assert!(receiver.get_property("nodeType").is_undefined());
+                    setter.clone()
+                } else {
+                    assert_eq!(key, "nodeType");
+                    Value::Undefined
+                }
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        let prototype = window_value()
+            .get_property("Element")
+            .get_property("prototype");
+        let old_parent = w3cos_core::class::get_prototype_of(&prototype);
+        w3cos_core::class::set_prototype_of(&prototype, &proxy);
+        let _restore = PrototypeRestore {
+            object: prototype,
+            prototype: old_parent,
+        };
+
+        element.set_property("className", Value::string("proxied"));
+
+        assert_eq!(setter_calls.get(), 1);
+        assert_eq!(
+            observations.borrow().as_slice(),
+            &[
+                ("__w3cos_setter_className".to_string(), true),
+                ("nodeType".to_string(), true),
+            ]
         );
     }
 
