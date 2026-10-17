@@ -195,9 +195,9 @@ impl JsObject {
         if !self.has_getter_properties {
             return None;
         }
-        self.properties
-            .get(format!("__w3cos_getter_{key}").as_str())
-            .cloned()
+        let mut buf = [0u8; 96];
+        let getter_key = crate::value::accessor_key(&mut buf, "__w3cos_getter_", key);
+        self.properties.get(&getter_key).cloned()
     }
 
     /// Own data only, without invoking accessors, traps, or prototype lookup.

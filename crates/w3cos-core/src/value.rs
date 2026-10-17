@@ -2123,10 +2123,9 @@ impl Value {
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
-                let getter = o
-                    .borrow()
-                    .get(&format!("__w3cos_getter_{key}"), receiver)
-                    .clone();
+                let mut buf = [0u8; 96];
+                let getter_key = accessor_key(&mut buf, "__w3cos_getter_", key);
+                let getter = o.borrow().get(&getter_key, receiver).clone();
                 getter.call(receiver.clone(), vec![])
             };
         }
