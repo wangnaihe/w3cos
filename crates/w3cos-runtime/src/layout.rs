@@ -5781,6 +5781,40 @@ fn align_table_cell_baselines_with_resolved_borders(
     }
 }
 
+/// Exclusive end of each node's pre-order subtree in `flat`.
+pub(crate) fn subtree_ends(flat: &[FlatNodeInfo<'_>]) -> Vec<usize> {
+    let mut sizes = vec![1usize; flat.len()];
+    for index in (0..flat.len()).rev() {
+        if let Some(parent) = flat[index].parent {
+            sizes[parent] += sizes[index];
+        }
+    }
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(index, size)| index + size)
+        .collect()
+}
+
+/// Move the in-flow descendants of `root` (the range `root + 1..end`) by `delta`.
+fn shift_subtree(
+    layouts: &mut [(LayoutRect, usize)],
+    positions: &HashMap<usize, usize>,
+    flat: &[FlatNodeInfo<'_>],
+    root: usize,
+    end: usize,
+    delta: f32,
+) {
+    for index in root + 1..end {
+        if matches!(flat[index].style.position, WPos::Absolute | WPos::Fixed) {
+            continue;
+        }
+        if let Some(position) = positions.get(&index) {
+            layouts[*position].0.y += delta;
+        }
+    }
+}
+
 fn align_table_cell_baselines(
     layouts: &mut [(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
@@ -5826,21 +5860,15 @@ fn align_table_cell_baselines(
         false
     }
 
-    fn descendant_of(flat: &[FlatNodeInfo<'_>], mut index: usize, ancestor: usize) -> bool {
-        while let Some(parent) = flat[index].parent {
-            if parent == ancestor {
-                return true;
-            }
-            index = parent;
-        }
-        false
-    }
-
     let positions = layouts
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
+    // `flat` is pre-order, so a subtree is the contiguous range
+    // `index + 1..ends[index]`. Scanning only that range keeps each cell
+    // linear in its own subtree instead of in the whole document.
+    let ends = subtree_ends(flat);
     for (cell, node) in flat
         .iter()
         .enumerate()
@@ -5854,7 +5882,7 @@ fn align_table_cell_baselines(
             continue;
         };
         let cell_rect = layouts[cell_position].0;
-        let inline_cell = flat
+        let inline_cell = flat[cell + 1..ends[cell]]
             .iter()
             .filter(|child| {
                 child.parent == Some(cell)
@@ -5871,9 +5899,10 @@ fn align_table_cell_baselines(
                         | WDisplay::InlineTable
                 )
             });
-        let content_bounds = flat
+        let content_bounds = flat[cell + 1..ends[cell]]
             .iter()
             .enumerate()
+            .map(|(offset, child)| (cell + 1 + offset, child))
             .filter(|(index, child)| {
                 cell_content_box(flat, *index, cell)
                     && !matches!(child.style.position, WPos::Fixed)
@@ -6021,22 +6050,17 @@ fn align_table_cell_baselines(
         if delta.abs() <= f32::EPSILON {
             continue;
         }
-        for (rect, index) in layouts.iter_mut() {
-            if descendant_of(flat, *index, cell)
-                && !matches!(flat[*index].style.position, WPos::Absolute | WPos::Fixed)
-            {
-                rect.y += delta;
-            }
-        }
+        shift_subtree(layouts, &positions, flat, cell, ends[cell], delta);
     }
     for (row, _) in flat
         .iter()
         .enumerate()
         .filter(|(_, node)| node.style.display == WDisplay::TableRow)
     {
-        let cells = flat
+        let cells = flat[row + 1..ends[row]]
             .iter()
             .enumerate()
+            .map(|(offset, node)| (row + 1 + offset, node))
             .filter(|(_, node)| {
                 node.parent == Some(row)
                     && node.style.display == WDisplay::TableCell
@@ -6053,9 +6077,11 @@ fn align_table_cell_baselines(
         let baselines = cells
             .iter()
             .filter_map(|cell| {
-                let text = flat.iter().enumerate().find(|(index, node)| {
-                    descendant_of(flat, *index, *cell)
-                        && !matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+                let text = flat[*cell + 1..ends[*cell]]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, node)| (*cell + 1 + offset, node))
+                    .find(|(_, node)| { !matches!(node.style.position, WPos::Absolute | WPos::Fixed)
                         && matches!(node.kind, ComponentKind::Text { content } if content.chars().any(|character| !character.is_whitespace()))
                 })?;
                 let rect = layouts[*positions.get(&text.0)?].0;
@@ -6086,13 +6112,7 @@ fn align_table_cell_baselines(
             if delta <= 0.0 {
                 continue;
             }
-            for (rect, index) in layouts.iter_mut() {
-                if descendant_of(flat, *index, cell)
-                    && !matches!(flat[*index].style.position, WPos::Absolute | WPos::Fixed)
-                {
-                    rect.y += delta;
-                }
-            }
+            shift_subtree(layouts, &positions, flat, cell, ends[cell], delta);
         }
     }
 }
