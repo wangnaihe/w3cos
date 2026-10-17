@@ -16,6 +16,9 @@ thread_local! {
     static TOUCH_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static TOUCH_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static INPUT_DEVICE_CAPABILITIES_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// One `getModifierState` per realm, like a prototype method in Blink
+    /// (it reads `this`), instead of a fresh closure per event.
+    static GET_MODIFIER_STATE: RefCell<Option<Value>> = const { RefCell::new(None) };
     static EVENT_TARGET_INSTANCES: RefCell<Vec<EventTargetBinding>> = const { RefCell::new(Vec::new()) };
     static EVENT_SLOTS: RefCell<HashMap<u64, EventSlot>> = RefCell::new(HashMap::new());
     /// The hot `new Event(type)` object. Its slot lives beside it so dispatch
@@ -869,19 +872,23 @@ fn install_modifier_fields(this: &Value, init: &Value) {
             ("metaKey", Value::Bool(false)),
         ],
     );
-    this.set_property(
-        "getModifierState",
-        realm_event_function(|this, args| {
-            let property = match arg(&args, 0).to_js_string().as_str() {
-                "Alt" => "altKey",
-                "Control" => "ctrlKey",
-                "Meta" => "metaKey",
-                "Shift" => "shiftKey",
-                _ => return Value::Bool(false),
-            };
-            Value::Bool(this.get_property(property).to_bool())
-        }),
-    );
+    let get_modifier_state = GET_MODIFIER_STATE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                realm_event_function(|this, args| {
+                    let property = match arg(&args, 0).to_js_string().as_str() {
+                        "Alt" => "altKey",
+                        "Control" => "ctrlKey",
+                        "Meta" => "metaKey",
+                        "Shift" => "shiftKey",
+                        _ => return Value::Bool(false),
+                    };
+                    Value::Bool(this.get_property(property).to_bool())
+                })
+            })
+            .clone()
+    });
+    this.set_property("getModifierState", get_modifier_state);
 }
 
 fn install_mouse_fields(this: &Value, init: &Value) {
@@ -1886,6 +1893,7 @@ fn make_event_target_class() -> Value {
 }
 
 pub(crate) fn reset_realm() {
+    GET_MODIFIER_STATE.with(|slot| *slot.borrow_mut() = None);
     EVENT_SLOTS.with(|slots| slots.borrow_mut().clear());
     EVENT_POOL.with(|pool| *pool.borrow_mut() = None);
     FAST_EVENT_HANDLE.with(|cell| cell.set(u32::MAX));

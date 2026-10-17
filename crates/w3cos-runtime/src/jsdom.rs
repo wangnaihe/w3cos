@@ -14681,9 +14681,45 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     // [target, parent, ..., root], crossing shadow boundaries only for
     // composed events.
     let chain = shadow_event_chain(target, ev.composed);
-    let stopped = |v: &Value| v.get_property("__sp").to_bool();
-    let immediate = |v: &Value| v.get_property("__sip").to_bool();
+    // Blink keeps target/currentTarget/eventPhase in the Event's own fields
+    // and the bindings read them through prototype accessors. Without shadow
+    // trees there is nothing to retarget, so a slotted event updates its slot
+    // per path node instead of writing four own properties per listener hop.
+    // The stop flags are mirrored into the slot by every writer of `__sp`.
+    let slot_path = slotted
+        && SHADOW_ROOTS.with(|roots| roots.borrow().is_empty())
+        && js_ev.as_object().is_some_and(|object| {
+            let object = object.borrow();
+            [
+                "target",
+                "srcElement",
+                "currentTarget",
+                "eventPhase",
+                "__sp",
+                "__sip",
+            ]
+            .iter()
+            .all(|key| !object.has_own_property(key))
+        });
+    let stopped = |v: &Value| {
+        if slot_path {
+            crate::web_events::event_stopped(v)
+        } else {
+            v.get_property("__sp").to_bool()
+        }
+    };
+    let immediate = |v: &Value| {
+        if slot_path {
+            crate::web_events::event_stopped_immediate(v)
+        } else {
+            v.get_property("__sip").to_bool()
+        }
+    };
     let set_current_target = |event: &Value, id: u32, phase: f64| {
+        if slot_path {
+            let _ = crate::web_events::set_dispatch_nodes(event, target, id, phase as u8);
+            return;
+        }
         event.set_property("target", element_value(retarget_shadow_event(target, id)));
         event.set_property("srcElement", event.get_property("target"));
         event.set_property("currentTarget", element_value(id));
