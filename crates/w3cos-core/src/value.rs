@@ -2718,6 +2718,27 @@ impl Value {
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
+            (this, "lastIndexOf") if this.is_string() => {
+                // ECMA-262 String.prototype.lastIndexOf: a NaN position means
+                // +Infinity; the match must start at or before it. Indices
+                // follow indexOf above.
+                let value = this.as_js_string().expect("string");
+                let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                let length = value.chars().count();
+                let position = match args.get(1).map(Value::to_number) {
+                    Some(number) if !number.is_nan() => {
+                        number.trunc().clamp(0.0, length as f64) as usize
+                    }
+                    _ => length,
+                };
+                let end = (position + needle.chars().count()).min(length);
+                let end_byte = string_index_to_byte(&value, end);
+                let index = value[..end_byte]
+                    .rfind(needle.as_str())
+                    .map(|byte| value[..byte].chars().count() as f64)
+                    .unwrap_or(-1.0);
+                return Value::Number(index);
+            }
             (this, "charCodeAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
@@ -5707,5 +5728,50 @@ mod tests {
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_handles(), 0);
         assert_eq!(JsString::interned_table_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod string_last_index_of_tests {
+    use super::*;
+
+    fn last(value: &str, args: Vec<Value>) -> f64 {
+        Value::from(value)
+            .call_method("lastIndexOf", args)
+            .to_number()
+    }
+
+    #[test]
+    fn last_index_of_follows_ecma262() {
+        assert_eq!(last("ab\ncd\nef", vec![Value::from("\n")]), 5.0);
+        assert_eq!(last("abc", vec![Value::from("\n")]), -1.0);
+        assert_eq!(last("canal", vec![Value::from("a")]), 3.0);
+        assert_eq!(
+            last("canal", vec![Value::from("a"), Value::Number(2.0)]),
+            1.0
+        );
+        assert_eq!(
+            last("canal", vec![Value::from("a"), Value::Number(0.0)]),
+            -1.0
+        );
+        assert_eq!(last("canal", vec![Value::from("x")]), -1.0);
+        assert_eq!(
+            last("canal", vec![Value::from("c"), Value::Number(-5.0)]),
+            0.0
+        );
+        assert_eq!(
+            last("canal", vec![Value::from("c"), Value::Number(0.0)]),
+            0.0
+        );
+        assert_eq!(last("canal", vec![Value::from("")]), 5.0);
+        assert_eq!(
+            last("canal", vec![Value::from(""), Value::Number(2.0)]),
+            2.0
+        );
+        assert_eq!(
+            last("canal", vec![Value::from("l"), Value::Number(f64::NAN)]),
+            4.0
+        );
+        assert_eq!(last("aaa", vec![Value::from("aa")]), 1.0);
     }
 }
