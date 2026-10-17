@@ -282,13 +282,8 @@ impl JsObject {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.properties.contains_key(key)
-            || with_prefixed_key("__w3cos_getter_", key, |accessor| {
-                self.properties.contains_key(accessor)
-            })
-            || with_prefixed_key("__w3cos_setter_", key, |accessor| {
-                self.properties.contains_key(accessor)
-            })
+        self.properties
+            .contains_key_or_prefixed(key, "__w3cos_getter_", "__w3cos_setter_")
     }
 
     /// `[[Delete]]` — the `delete` operator.
@@ -639,6 +634,25 @@ mod tests {
     }
 
     #[test]
+    fn own_property_check_matches_unicode_and_long_accessor_keys() {
+        let mut obj = JsObject::new();
+        obj.set_direct(
+            "__w3cos_getter_值",
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+
+        let long = "x".repeat(128);
+        obj.set_direct(
+            &format!("__w3cos_setter_{long}"),
+            Value::function(|_, _| Value::Undefined),
+        );
+
+        assert!(obj.has_own_property("值"));
+        assert!(obj.has_own_property(&long));
+        assert!(!obj.has_own_property("missing"));
+    }
+
+    #[test]
     fn define_property_can_clear_enumerable() {
         let mut obj =
             JsObject::from_map(HashMap::from([("hidden".to_string(), Value::Number(1.0))]));
@@ -819,21 +833,5 @@ mod tests {
         assert_eq!(child.get_direct("own").to_number(), 1.0);
         assert_eq!(child.get_direct("inherited").to_number(), 99.0);
         assert!(child.get_direct("missing").is_undefined());
-    }
-}
-
-/// Run `probe` on `prefix + key` without a heap allocation for short keys
-/// (accessor probes on every own-property check used to `format!` twice).
-#[inline]
-fn with_prefixed_key<R>(prefix: &str, key: &str, probe: impl FnOnce(&str) -> R) -> R {
-    let mut buffer = [0u8; 96];
-    let total = prefix.len() + key.len();
-    if total <= buffer.len() {
-        buffer[..prefix.len()].copy_from_slice(prefix.as_bytes());
-        buffer[prefix.len()..total].copy_from_slice(key.as_bytes());
-        // SAFETY: the concatenation of two `str`s is valid UTF-8.
-        probe(unsafe { std::str::from_utf8_unchecked(&buffer[..total]) })
-    } else {
-        probe(&format!("{prefix}{key}"))
     }
 }

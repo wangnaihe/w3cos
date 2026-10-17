@@ -842,6 +842,19 @@ fn func(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
     realm_function(generation, f)
 }
 
+fn func_slice(f: impl Fn(Value, &[Value]) -> Value + 'static) -> Value {
+    let generation = realm_generation();
+    let function = Value::function_slice(move |this, args| {
+        if bridge_realm_is_current(generation) {
+            f(this, args)
+        } else {
+            Value::Undefined
+        }
+    });
+    function.set_property("length", Value::Number(0.0));
+    function
+}
+
 pub(crate) fn realm_function(
     generation: u32,
     f: impl Fn(Value, Vec<Value>) -> Value + 'static,
@@ -4399,6 +4412,8 @@ fn tree_method_slot(key: &str) -> Option<u8> {
         "removeChild" => Some(1),
         "insertBefore" => Some(2),
         "replaceChild" => Some(3),
+        "matches" => Some(4),
+        "webkitMatchesSelector" => Some(5),
         _ => None,
     }
 }
@@ -5594,7 +5609,7 @@ fn parsed_document_value(
     );
     props.insert(
         "createElement".to_string(),
-        func({
+        func_slice({
             let is_html = content_type == "text/html";
             let element_namespace = match content_type {
                 "text/html" => None,
@@ -6136,7 +6151,7 @@ pub(crate) fn empty_document_value(content_type: &str, prototype_name: &str) -> 
     ]);
     props.insert(
         "createElement".to_string(),
-        func(|document, args| {
+        func_slice(|document, args| {
             let tag = arg(&args, 0).to_js_string();
             if !valid_element_name(&tag) {
                 dom_exception("The element name is not valid", "InvalidCharacterError");
@@ -10472,7 +10487,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }
 
         // ── Tree mutation ──
-        "appendChild" => func(move |_, args| {
+        "appendChild" => func_slice(move |_, args| {
             let child = arg(&args, 0);
             let Some(cid) = node_id_of(&child) else {
                 if child.get_property("nodeType").to_u32() == 9 {
@@ -10483,7 +10498,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             insert_child_or_fragment(node, cid, None);
             child
         }),
-        "removeChild" => func(move |_, args| {
+        "removeChild" => func_slice(move |_, args| {
             let child = arg(&args, 0);
             let Some(cid) = node_id_of(&child) else {
                 if child.get_property("nodeType").to_u32() == 9 {
@@ -10918,7 +10933,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
 
         // ── Selectors ──
-        "matches" | "webkitMatchesSelector" => func(move |_, args| {
+        "matches" | "webkitMatchesSelector" => func_slice(move |_, args| {
             if args.is_empty() {
                 type_error("matches requires one argument");
             }
@@ -18087,7 +18102,7 @@ fn build_document_value() -> Value {
 
     props.insert(
         "createElement".to_string(),
-        func(|_, args| {
+        func_slice(|_, args| {
             let mut tag = arg(&args, 0).to_js_string();
             if !valid_element_name(&tag) {
                 dom_exception("The element name is not valid", "InvalidCharacterError");
@@ -25468,6 +25483,51 @@ mod tests {
             2,
             "even simple selectors must retain observable property reads"
         );
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&order);
+        document.set_property(
+            "location",
+            Value::object(HashMap::from([(
+                "__w3cos_getter_hash".into(),
+                func(move |_, _| {
+                    observed.borrow_mut().push("hash");
+                    Value::string("")
+                }),
+            )])),
+        );
+        let observed = Rc::clone(&order);
+        let selector = Value::object(HashMap::from([(
+            "toString".into(),
+            func(move |_, _| {
+                observed.borrow_mut().push("selector");
+                Value::string(".active")
+            }),
+        )]));
+        assert_eq!(
+            element.call_method("matches", vec![selector]),
+            Value::Bool(true)
+        );
+        assert_eq!(&*order.borrow(), &["selector", "hash"]);
+
+        order.borrow_mut().clear();
+        let observed = Rc::clone(&order);
+        let throwing_selector = Value::object(HashMap::from([(
+            "toString".into(),
+            func(move |_, _| {
+                observed.borrow_mut().push("selector");
+                w3cos_core::throw_value(Value::string("selector conversion"))
+            }),
+        )]));
+        let error =
+            w3cos_core::catch_js(|| element.call_method("matches", vec![throwing_selector]))
+                .unwrap_err();
+        assert_eq!(error, Value::string("selector conversion"));
+        assert_eq!(
+            &*order.borrow(),
+            &["selector"],
+            "a throwing selector conversion must precede location/hash access"
+        );
     }
 
     #[test]
@@ -25553,6 +25613,117 @@ mod tests {
         assert_eq!(dom::children(div_id), vec![span_id]);
         assert_eq!(dom::tag_name(span_id), "span");
         assert_eq!(dom::parent_node(span_id), Some(div_id));
+    }
+
+    #[test]
+    fn borrowed_hot_dom_methods_preserve_lookup_and_results() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method_slice("createElement", &[Value::string("div")]);
+        let child = document.call_method_slice("createElement", &[Value::string("span")]);
+        child.set_property("className", Value::string("active"));
+
+        let cached_matches = child.get_property("matches");
+        assert!(
+            cached_matches.strict_eq(&child.get_property("matches")),
+            "the builtin matches function should be reused for the same node"
+        );
+        let cached_webkit = child.get_property("webkitMatchesSelector");
+        assert!(
+            cached_webkit.strict_eq(&child.get_property("webkitMatchesSelector")),
+            "the builtin webkitMatchesSelector function should be reused for the same node"
+        );
+
+        assert!(
+            parent
+                .call_method_slice("appendChild", std::slice::from_ref(&child))
+                .strict_eq(&child)
+        );
+        assert_eq!(
+            child.call_method_slice("matches", &[Value::string(".active")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            child.call_method_slice("webkitMatchesSelector", &[Value::string(".active")]),
+            Value::Bool(true)
+        );
+        assert!(
+            parent
+                .call_method_slice("removeChild", std::slice::from_ref(&child))
+                .strict_eq(&child)
+        );
+        let missing = w3cos_core::catch_js(|| child.call_method_slice("matches", &[]))
+            .expect_err("missing selector must throw");
+        assert_eq!(missing.get_property("name"), Value::string("TypeError"));
+        let invalid =
+            w3cos_core::catch_js(|| child.call_method_slice("matches", &[Value::string("[")]))
+                .expect_err("invalid selector must throw");
+        assert_eq!(invalid.get_property("name"), Value::string("SyntaxError"));
+        let not_child = document.call_method_slice("createElement", &[Value::string("i")]);
+        let not_found = w3cos_core::catch_js(|| {
+            parent.call_method_slice("removeChild", std::slice::from_ref(&not_child))
+        })
+        .expect_err("removing a non-child must throw");
+        assert_eq!(
+            not_found.get_property("name"),
+            Value::string("NotFoundError")
+        );
+        let hierarchy = w3cos_core::catch_js(|| {
+            parent.call_method_slice("appendChild", std::slice::from_ref(&document))
+        })
+        .expect_err("inserting a document must throw");
+        assert_eq!(
+            hierarchy.get_property("name"),
+            Value::string("HierarchyRequestError")
+        );
+
+        let empty = empty_document_value("application/xml", "XMLDocument");
+        assert_eq!(
+            empty
+                .call_method_slice("createElement", &[Value::string("EmptyNode")])
+                .get_property("localName"),
+            Value::string("EmptyNode")
+        );
+        let parsed_root = dom::create_element("parsed-root");
+        let parsed = parsed_document_value(parsed_root, "application/xml", None, None);
+        assert_eq!(
+            parsed
+                .call_method_slice("createElement", &[Value::string("ParsedNode")])
+                .get_property("localName"),
+            Value::string("ParsedNode")
+        );
+
+        document.set_property(
+            "createElement",
+            Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined)),
+        );
+        assert_eq!(
+            document.call_method_slice("createElement", &[Value::string("override")]),
+            Value::string("override"),
+            "the borrowed route must retain an authored own override"
+        );
+
+        for key in ["appendChild", "removeChild", "matches"] {
+            parent.set_property(
+                key,
+                Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined)),
+            );
+            assert_eq!(
+                parent.call_method_slice(key, &[Value::string(key)]),
+                Value::string(key),
+                "the borrowed route must retain an authored element method override"
+            );
+        }
+
+        child.set_property(
+            "matches",
+            Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined)),
+        );
+        assert_eq!(
+            child.call_method_slice("matches", &[Value::string("cached-override")]),
+            Value::string("cached-override"),
+            "an own override must still win after the builtin method was cached"
+        );
     }
 
     #[test]
