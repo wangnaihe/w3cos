@@ -52,6 +52,24 @@ pub struct SelectorContext {
 }
 
 impl SelectorContext {
+    /// Only the HTML-ness flags; empty strings and vectors do not allocate.
+    fn flags_only(html_document: bool, html_element: bool) -> Self {
+        Self {
+            tag: String::new(),
+            id: None,
+            classes: Vec::new(),
+            attributes: Vec::new(),
+            is_first_child: false,
+            is_root: false,
+            is_focused: false,
+            is_focus_visible: false,
+            is_focus_within: false,
+            previous_siblings: Vec::new(),
+            html_document,
+            html_element,
+        }
+    }
+
     pub fn new(tag: &str, id: Option<&str>, classes: &[&str]) -> Self {
         Self {
             tag: tag.to_string(),
@@ -212,62 +230,13 @@ impl CompoundSelector {
         self.classes
             .iter()
             .all(|c| ctx.classes.iter().any(|have| have == c))
-            && self.attributes.iter().all(|selector| match selector {
-                AttributeSelector::Present(name) => ctx
-                    .attributes
+            && attribute_selectors_match(
+                ctx,
+                &self.attributes,
+                ctx.attributes
                     .iter()
-                    .any(|(have, _)| attribute_name_eq(ctx, have, name)),
-                AttributeSelector::Equals(name, value, insensitive) => {
-                    ctx.attributes.iter().any(|(have, actual)| {
-                        attribute_name_eq(ctx, have, name)
-                            && attribute_value_eq(ctx, name, actual, value, *insensitive)
-                    })
-                }
-                AttributeSelector::Includes(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && actual.split_ascii_whitespace().any(|token| {
-                                    attribute_value_eq(ctx, name, token, value, *insensitive)
-                                })
-                        })
-                }
-                AttributeSelector::DashMatch(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && (attribute_value_eq(ctx, name, actual, value, *insensitive)
-                                    || attribute_value_dash_prefix(
-                                        ctx,
-                                        name,
-                                        actual,
-                                        value,
-                                        *insensitive,
-                                    ))
-                        })
-                }
-                AttributeSelector::Prefix(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && attribute_value_starts_with(actual, value, *insensitive)
-                        })
-                }
-                AttributeSelector::Suffix(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && attribute_value_ends_with(actual, value, *insensitive)
-                        })
-                }
-                AttributeSelector::Substring(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && attribute_value_contains(actual, value, *insensitive)
-                        })
-                }
-            })
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
             && self.pseudo_classes.iter().all(|pseudo| match pseudo {
                 PseudoClass::FirstChild => ctx.is_first_child,
                 PseudoClass::Root => ctx.is_root,
@@ -285,6 +254,64 @@ impl CompoundSelector {
         let tags = u32::from(self.tag.is_some());
         ids * 1_000_000 + classes * 1_000 + tags
     }
+}
+
+/// Attribute selectors against any `(name, value)` view of an element, so
+/// matching against a live DOM node needs no SelectorContext allocation.
+fn attribute_selectors_match<'a>(
+    ctx: &SelectorContext,
+    selectors: &[AttributeSelector],
+    attributes: impl Iterator<Item = (&'a str, &'a str)> + Clone,
+) -> bool {
+    selectors.iter().all(|selector| match selector {
+        AttributeSelector::Present(name) => attributes
+            .clone()
+            .any(|(have, _)| attribute_name_eq(ctx, have, name)),
+        AttributeSelector::Equals(name, value, insensitive) => {
+            attributes.clone().any(|(have, actual)| {
+                attribute_name_eq(ctx, have, name)
+                    && attribute_value_eq(ctx, name, actual, value, *insensitive)
+            })
+        }
+        AttributeSelector::Includes(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && actual
+                            .split_ascii_whitespace()
+                            .any(|token| attribute_value_eq(ctx, name, token, value, *insensitive))
+                })
+        }
+        AttributeSelector::DashMatch(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && (attribute_value_eq(ctx, name, actual, value, *insensitive)
+                            || attribute_value_dash_prefix(ctx, name, actual, value, *insensitive))
+                })
+        }
+        AttributeSelector::Prefix(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && attribute_value_starts_with(actual, value, *insensitive)
+                })
+        }
+        AttributeSelector::Suffix(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && attribute_value_ends_with(actual, value, *insensitive)
+                })
+        }
+        AttributeSelector::Substring(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && attribute_value_contains(actual, value, *insensitive)
+                })
+        }
+    })
 }
 
 fn attribute_name_eq(ctx: &SelectorContext, actual: &str, expected: &str) -> bool {
@@ -1282,15 +1309,75 @@ fn node_is_descendant_of(document: &Document, node: NodeId, ancestor: NodeId) ->
     false
 }
 
+/// `CompoundSelector::matches` minus pseudo-classes, read straight off the
+/// DOM node (Blink SelectorChecker matches against the Element, not a
+/// copied context). Same semantics; no per-check allocation.
+fn basic_compound_matches_node(
+    document: &Document,
+    node: NodeId,
+    compound: &CompoundSelector,
+) -> bool {
+    if compound.unsupported {
+        return false;
+    }
+    let dom_node = document.get_node(node);
+    let html_document = document.is_html_document();
+    let html_element = html_document && dom_node.is_html_element;
+    if let Some(tag) = &compound.tag {
+        let full = dom_node.tag.as_static();
+        let actual_tag = if compound.any_namespace || !tag.contains(':') {
+            full.rsplit_once(':').map_or(full, |(_, local)| local)
+        } else {
+            full
+        };
+        let tag_matches = if html_element {
+            tag.eq_ignore_ascii_case(actual_tag)
+        } else {
+            tag == actual_tag
+        };
+        if !tag_matches {
+            return false;
+        }
+    }
+    if let Some(id) = &compound.id {
+        let actual = dom_node
+            .attributes
+            .iter()
+            .find(|(name, _)| name.as_static() == "id")
+            .map(|(_, value)| value.as_str());
+        if actual != Some(id.as_str()) {
+            return false;
+        }
+    }
+    if !compound.classes.iter().all(|class| {
+        dom_node
+            .class_list
+            .iter()
+            .any(|have| have.as_static() == class)
+    }) {
+        return false;
+    }
+    if compound.attributes.is_empty() {
+        return true;
+    }
+    let flags = SelectorContext::flags_only(html_document, html_element);
+    attribute_selectors_match(
+        &flags,
+        &compound.attributes,
+        dom_node
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.as_static(), value.as_str())),
+    )
+}
+
 fn compound_matches_node(
     document: &Document,
     node: NodeId,
     compound: &CompoundSelector,
     target_id: Option<&str>,
 ) -> bool {
-    let mut basic = compound.clone();
-    basic.pseudo_classes.clear();
-    if !basic.matches(&selector_context_for_node(document, node)) {
+    if !basic_compound_matches_node(document, node, compound) {
         return false;
     }
     compound

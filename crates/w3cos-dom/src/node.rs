@@ -488,6 +488,7 @@ impl AttrList {
     }
 }
 
+#[derive(Clone)]
 pub struct AttrIter<'a> {
     list: &'a AttrList,
     index: usize,
