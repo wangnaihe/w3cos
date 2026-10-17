@@ -2559,12 +2559,12 @@ impl Document {
         }
         author_declarations.extend(important);
         let mut merged =
-            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_static()));
         // Textfield UA borders remain inset when author backgrounds disable
         // automatic theme painting. Do not apply textfield geometry to other
         // input types; author border declarations below still take precedence.
         if user_agent::control_appearance(
-            &node.tag.as_str(),
+            &node.tag.as_static(),
             node.get_attribute("type"),
             std::iter::empty(),
         ) == "textfield"
@@ -2573,7 +2573,7 @@ impl Document {
         }
         if node.is_html_element {
             table_presentation::inherit_section_colors(
-                &node.tag.as_str(),
+                &node.tag.as_static(),
                 &mut merged.inner,
                 inherited,
             );
@@ -2582,11 +2582,11 @@ impl Document {
         // HTML's nested-list UA rule is a descendant selector, not a
         // direct-parent rule. Apply it before user/author declarations so
         // explicit margins still win, including through an intervening box.
-        if node.is_html_element && matches!(node.tag.as_str().as_str(), "ul" | "ol") {
+        if node.is_html_element && matches!(node.tag.as_static(), "ul" | "ol") {
             let mut ancestor = node.parent;
             while let Some(parent) = ancestor {
                 let parent = self.get_node(parent);
-                if parent.is_html_element && matches!(parent.tag.as_str().as_str(), "ul" | "ol") {
+                if parent.is_html_element && matches!(parent.tag.as_static(), "ul" | "ol") {
                     merged.inner.margin.top = w3cos_std::style::Spacing::Px(0.0);
                     merged.inner.margin.bottom = w3cos_std::style::Spacing::Px(0.0);
                     break;
@@ -2598,11 +2598,11 @@ impl Document {
         // is not a hyperlink; visited styling is not inferred from history.
         let ua_link = node.node_type == NodeType::Element
             && node.is_html_element
-            && matches!(node.tag.as_str().as_str(), "a" | "area")
+            && matches!(node.tag.as_static(), "a" | "area")
             && node
                 .attributes
                 .iter()
-                .any(|(name, _)| name.as_str().eq_ignore_ascii_case("href"));
+                .any(|(name, _)| name.as_static().eq_ignore_ascii_case("href"));
         if ua_link {
             merged.set_property("color", "#0000ee");
             merged.set_property("text-decoration", "underline");
@@ -2612,11 +2612,11 @@ impl Document {
         // generated-content tests still exercise this behavior for XHTML
         // serialization as well as text/html.
         let body_text_hint = if node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("body")
+            && node.tag.as_static().eq_ignore_ascii_case("body")
         {
             node.attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("text"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("text"))
                 .map(|(_, value)| value.as_str())
         } else {
             None
@@ -2625,12 +2625,12 @@ impl Document {
             user_normal.push(("color".to_string(), value.to_string(), 0));
         }
         let font_color_hint = (node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("font")
+            && node.tag.as_static().eq_ignore_ascii_case("font")
             && node.is_html_element)
             .then(|| {
                 node.attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("color"))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case("color"))
                     .map(|(_, value)| value.as_str())
             })
             .flatten()
@@ -2639,12 +2639,12 @@ impl Document {
             user_normal.push(("color".to_string(), value.to_string(), 0));
         }
         let font_size_hint = (node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("font")
+            && node.tag.as_static().eq_ignore_ascii_case("font")
             && node.is_html_element)
             .then(|| {
                 node.attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("size"))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case("size"))
                     .and_then(|(_, value)| parse_html_font_size_attribute(value.as_str()))
             })
             .flatten();
@@ -2652,11 +2652,11 @@ impl Document {
             user_normal.push(("font-size".to_string(), value.to_string(), 0));
         }
         let body_background_hint = if node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("body")
+            && node.tag.as_static().eq_ignore_ascii_case("body")
         {
             node.attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("bgcolor"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("bgcolor"))
                 .map(|(_, value)| value.as_str())
         } else {
             None
@@ -2669,34 +2669,34 @@ impl Document {
             .then(|| {
                 node.attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("dir"))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case("dir"))
                     .map(|(_, value)| value.trim().to_ascii_lowercase())
             })
             .flatten()
             .filter(|value| matches!(value.as_str(), "ltr" | "rtl"));
         if let Some(value) = &direction_hint {
             user_normal.push(("direction".to_string(), value.to_string(), 0));
-            if node.is_html_element && !matches!(node.tag.as_str().as_str(), "bdi" | "bdo") {
+            if node.is_html_element && !matches!(node.tag.as_static(), "bdi" | "bdo") {
                 user_normal.push(("unicode-bidi".to_string(), "isolate".to_string(), 0));
             }
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && matches!(node.tag.as_str().as_str(), "td" | "th")
+            && matches!(node.tag.as_static(), "td" | "th")
             && node
                 .attributes
                 .iter()
-                .any(|(name, _)| name.as_str().eq_ignore_ascii_case("nowrap"))
+                .any(|(name, _)| name.as_static().eq_ignore_ascii_case("nowrap"))
         {
             user_normal.push(("white-space".to_string(), "nowrap".to_string(), 0));
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && matches!(node.tag.as_str().as_str(), "td" | "th")
+            && matches!(node.tag.as_static(), "td" | "th")
             && let Some(value) = node
                 .attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("valign"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("valign"))
                 .map(|(_, value)| value.trim().to_ascii_lowercase())
                 .filter(|value| matches!(value.as_str(), "top" | "middle" | "bottom" | "baseline"))
         {
@@ -2708,11 +2708,11 @@ impl Document {
         // stylesheets, not UA defaults that normal user rules can override.
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && node.tag.as_str().eq_ignore_ascii_case("br")
+            && node.tag.as_static().eq_ignore_ascii_case("br")
             && let Some(value) = node
                 .attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("clear"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("clear"))
                 .and_then(|(_, value)| {
                     let value = value.as_str();
                     if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("both") {
@@ -2732,7 +2732,7 @@ impl Document {
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && node.tag.as_str().eq_ignore_ascii_case("table")
+            && node.tag.as_static().eq_ignore_ascii_case("table")
         {
             // HTML table dimensions are cascaded presentational hints.
             // Keep it inside the cascade so authored auto/percent/important
@@ -2741,7 +2741,7 @@ impl Document {
                 let Some(dimension) = node
                     .attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case(property))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case(property))
                     .and_then(|(_, value)| parse_html_dimension_attribute(value))
                 else {
                     continue;
@@ -2849,7 +2849,7 @@ impl Document {
             (!custom_properties.is_empty()).then_some(custom_properties);
         let mut style = merged.to_style();
 
-        let control_tag = node.tag.as_str();
+        let control_tag = node.tag.as_static();
         let control_appearance = user_agent::control_appearance(
             &control_tag,
             node.get_attribute("type"),
@@ -2863,7 +2863,7 @@ impl Document {
                 .custom_properties
                 .as_ref()
                 .is_some_and(|p| p.contains_key(user_agent::CONTROL_APPEARANCE_PROPERTY))
-            || matches!(control_tag.as_str(), "input" | "button")
+            || matches!(control_tag, "input" | "button")
         {
             style
                 .custom_properties
@@ -2905,25 +2905,25 @@ impl Document {
                 // declaration exists. Explicit author inherit/unset still
                 // requests inheritance rather than keeping the UA default.
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "table"
+                    && node.tag.as_static() == "table"
                     && css_property_eq(property, "border-spacing")
                 {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && (ua_link || node.tag.as_str() == "hr")
+                    && (ua_link || node.tag.as_static() == "hr")
                     && css_property_eq(property, "color")
                 {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "nobr"
+                    && node.tag.as_static() == "nobr"
                     && css_property_eq(property, "white-space")
                 {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "pre"
+                    && node.tag.as_static() == "pre"
                     && matches!(property, "white-space" | "font-family")
                     && !(font_shorthand_inherits && css_property_eq(property, "font-family"))
                 {
@@ -2933,7 +2933,7 @@ impl Document {
                 // inherited alignment, and explicit inherit/unset bypasses
                 // the UA default even when the parent alignment is start.
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "th"
+                    && node.tag.as_static() == "th"
                     && css_property_eq(property, "text-align")
                     && parent.text_align == w3cos_std::style::TextAlign::Start
                 {
@@ -2942,7 +2942,7 @@ impl Document {
                 // Caption has its own UA center declaration, independent of
                 // table alignment. Author inherit/unset still bypasses it.
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "caption"
+                    && node.tag.as_static() == "caption"
                     && css_property_eq(property, "text-align")
                 {
                     return true;
@@ -2955,7 +2955,7 @@ impl Document {
                         && value.trim().eq_ignore_ascii_case("currentcolor"))
                 })
             };
-            inherit_text_style(&mut style, parent, &node.tag.as_str(), declares);
+            inherit_text_style(&mut style, parent, &node.tag.as_static(), declares);
             // Explicit inheritance is an author declaration, not merely the
             // absence of a font declaration. It overrides UA font defaults
             // on strong/em/headings, while later winning longhands remain.
@@ -3085,7 +3085,7 @@ impl Document {
         let mut font_parent = inherited.cloned().unwrap_or_default();
         font_parent.font_size = specified_font_size(&font_parent);
         let ua_font_size_override = matches!(
-            node.tag.as_str().as_str(),
+            node.tag.as_static(),
             "button" | "input" | "select" | "textarea" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
         );
         if font_size_token.is_some_and(|value| {
