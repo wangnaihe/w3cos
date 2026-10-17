@@ -516,9 +516,10 @@ fn generate_module_with_bodies(
     // Android's pthread-key limit is small. Emitting one `thread_local!` for
     // every lowered JS binding exhausts it before `android_main` can start, so
     // keep per-thread ESM values, binding cells and flags in three
-    // module-level registries.
+    // module-level registries, keyed with FxHash (WTF StringHasher analogue)
+    // since every module-binding read goes through them.
     out.push_str(
-        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str>> = std::cell::RefCell::new(::std::collections::HashSet::new());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
+        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashSet::default());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
     );
     let namespace_names: HashSet<String> = module
         .namespace_imports
@@ -1408,11 +1409,21 @@ fn module_init_capture_map(
     if entries.is_empty() {
         Ok("w3cos_core::AotCaptureMap::new()".into())
     } else {
-        Ok(format!(
+        Ok(cached_capture_map(&format!(
             "w3cos_core::AotCaptureMap::from([{}])",
             entries.join(", ")
-        ))
+        )))
     }
+}
+
+/// A capture map whose entries are all stateless module-binding accessors
+/// is the same on every call, so build it once per call site (a deref of a
+/// cached `Rc<AotCaptureMap>`, so `&(...)` borrows the shared map). Building it per
+/// call hashed and allocated a HashMap on every invocation.
+fn cached_capture_map(map: &str) -> String {
+    format!(
+        "(*{{ ::std::thread_local! {{ static __W3COS_CACHED_CAPTURES: ::std::cell::OnceCell<::std::rc::Rc<w3cos_core::AotCaptureMap>> = const {{ ::std::cell::OnceCell::new() }}; }} __W3COS_CACHED_CAPTURES.with(|cell| ::std::rc::Rc::clone(cell.get_or_init(|| ::std::rc::Rc::new({map})))) }})"
+    )
 }
 
 /// One emission chunk of a module init, in source order.
@@ -2428,6 +2439,7 @@ fn generator_capture_map_with_synthetic(
         .with_namespaces(namespace_names.clone());
     let mut ordered_captures = function.captures.clone();
     ordered_captures.sort_by_key(|capture| capture.0);
+    let stateful = std::cell::Cell::new(false);
     let entries = ordered_captures
         .iter()
         .map(|capture| {
@@ -2440,6 +2452,7 @@ fn generator_capture_map_with_synthetic(
                 .iter()
                 .find(|binding| binding.id == *capture)?;
             if let Some((getter, setter)) = synthetic.get(&binding.name) {
+                stateful.set(true);
                 return Some(format!(
                     "({}, w3cos_core::AotCapture::Accessors({getter}, {setter}))",
                     capture.0
@@ -2487,10 +2500,11 @@ fn generator_capture_map_with_synthetic(
             ))
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(format!(
+    let map = format!(
         "w3cos_core::AotCaptureMap::from([{}])",
         entries.join(", ")
-    ))
+    );
+    Some(if stateful.get() { map } else { cached_capture_map(&map) })
 }
 
 fn find_variable<'a>(items: &'a [TopLevelItem], name: &str) -> Option<&'a Expr> {
@@ -2919,7 +2933,7 @@ fn emit_class(
         out.push_str(&state_machine);
         if w3ir_name.ends_with(".<instance_fields>") {
             instance_initializer = Some(format!(
-                "w3cos_core::Value::aot_function({factory}, {captures})"
+                "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
             ));
         } else {
             static_initializers.push(format!("{factory}(__class.clone(), &[], &{captures});"));

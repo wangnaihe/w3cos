@@ -4,6 +4,7 @@ pub mod binary;
 mod builtins;
 pub mod class;
 pub mod collections;
+pub mod fxhash;
 pub mod heap;
 pub mod host;
 pub mod host_modules;
@@ -28,6 +29,7 @@ pub use builtins::{
     error_instance, json_value, math_value, object_value, parseFloat, parseInt, reset_constructors,
 };
 pub use aot_slots::SparseSlots;
+pub use fxhash::{FxBuildHasher, FxHashMap};
 pub use js_string::JsString;
 pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
