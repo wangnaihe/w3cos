@@ -261,7 +261,7 @@ pub fn try_generate_with_bodies_and_css(
         if generated.has_async_init {
             async_init_namespaces.insert(module.namespace.clone());
         }
-        out.push_str(&generated.code);
+        out.push_str(&number_site_slots(&generated.code));
         out.push('\n');
     }
     let has_async_init = !async_init_namespaces.is_empty();
@@ -519,7 +519,7 @@ fn generate_module_with_bodies(
     // module-level registries, keyed with FxHash (WTF StringHasher analogue)
     // since every module-binding read goes through them.
     out.push_str(
-        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashSet::default());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
+        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashSet::default());\n        static __W3COS_SITE_CACHE: std::cell::RefCell<(Vec<Option<w3cos_core::Value>>, Vec<Option<::std::rc::Rc<w3cos_core::AotCaptureMap>>>, Vec<Option<w3cos_core::module_registry::BindingCell>>)> = std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new()));\n    }\n    #[allow(dead_code)]\n    fn __w3cos_site_value(index: usize, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __W3COS_SITE_CACHE.with(|cache| cache.borrow().0.get(index).and_then(|slot| slot.clone())) { return value; } let value = init(); __W3COS_SITE_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.0.len() <= index { cache.0.resize(index + 1, None); } cache.0[index] = Some(value.clone()); }); value }\n    #[allow(dead_code)]\n    fn __w3cos_site_captures(index: usize, init: impl FnOnce() -> w3cos_core::AotCaptureMap) -> ::std::rc::Rc<w3cos_core::AotCaptureMap> { if let Some(map) = __W3COS_SITE_CACHE.with(|cache| cache.borrow().1.get(index).and_then(|slot| slot.clone())) { return map; } let map = ::std::rc::Rc::new(init()); __W3COS_SITE_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.1.len() <= index { cache.1.resize(index + 1, None); } cache.1[index] = Some(::std::rc::Rc::clone(&map)); }); map }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    #[allow(dead_code)]\n    fn __w3cos_site_binding(index: usize, key: &'static str) -> w3cos_core::module_registry::BindingCell { if let Some(cell) = __W3COS_SITE_CACHE.with(|cache| cache.borrow().2.get(index).and_then(|slot| slot.clone())) { return cell; } let cell = __w3cos_esm_binding(key); __W3COS_SITE_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.2.len() <= index { cache.2.resize(index + 1, None); } cache.2[index] = Some(cell.clone()); }); cell }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
     );
     let namespace_names: HashSet<String> = module
         .namespace_imports
@@ -874,8 +874,10 @@ fn generate_module_with_bodies(
                         // normal module binding. Its initializer executes in
                         // source order inside the W3IR module-init segment.
                         out.push_str(&format!(
-                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
+                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_site_binding({}, {:?}).read_named({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                             sym.bundled_name,
+                            next_site_index(),
+                            format!("{}:cell", sym.bundled_name),
                             format!("{}:cell", sym.bundled_name),
                             sym.bundled_name,
                             format!("{}:cell", sym.bundled_name),
@@ -890,8 +892,10 @@ fn generate_module_with_bodies(
                     }
                 } else if find_variable(&functions, &sym.original_name).is_some() {
                     out.push_str(&format!(
-                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
+                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_site_binding({}, {:?}).read_named({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                         sym.bundled_name,
+                        next_site_index(),
+                        format!("{}:cell", sym.bundled_name),
                         format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
                         format!("{}:cell", sym.bundled_name),
@@ -912,9 +916,11 @@ fn generate_module_with_bodies(
                     // (Event = {}));`) assign the namespace object later, and
                     // the write must stick (see emit_module_init).
                     out.push_str(&format!(
-                        "\n    /// variable {} (from ESM) — instantiated before module evaluation\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
+                        "\n    /// variable {} (from ESM) — instantiated before module evaluation\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_site_binding({}, {:?}).read_named({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                         sym.original_name,
                         sym.bundled_name,
+                        next_site_index(),
+                        format!("{}:cell", sym.bundled_name),
                         format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
                         format!("{}:cell", sym.bundled_name),
@@ -1334,9 +1340,49 @@ fn module_init_external_bindings(
 /// every invocation of a function that reads a module global, and the
 /// arena keeps them (no tracing GC).
 fn cached_stateless_function(function: &str) -> String {
+    format!("__w3cos_site_value({}, || {function})", next_site_index())
+}
+
+/// Call-site cache slot. All sites of a module share one thread-local
+/// registry (`__W3COS_SITE_CACHE`): a `thread_local!` per site would use a
+/// pthread key each on Android, whose key limit is small. Init runs without
+/// the registry borrowed, so nested cached sites are fine.
+///
+/// Returns a unique placeholder; [`number_site_slots`] renumbers them densely
+/// per module so the output is reproducible and each module's registry only
+/// holds its own sites.
+fn next_site_index() -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     format!(
-        "{{ ::std::thread_local! {{ static __W3COS_CACHED_FN: ::std::cell::OnceCell<w3cos_core::Value> = const {{ ::std::cell::OnceCell::new() }}; }} __W3COS_CACHED_FN.with(|cell| cell.get_or_init(|| {function}).clone()) }}"
+        "{SITE_SLOT_PREFIX}{}__",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
+}
+
+const SITE_SLOT_PREFIX: &str = "__W3COS_SITE_SLOT_";
+
+/// Replace site placeholders in one module's code with dense indices in
+/// first-appearance order (the same placeholder keeps the same index).
+fn number_site_slots(code: &str) -> String {
+    if !code.contains(SITE_SLOT_PREFIX) {
+        return code.to_string();
+    }
+    let mut numbers: HashMap<&str, usize> = HashMap::new();
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(start) = rest.find(SITE_SLOT_PREFIX) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + SITE_SLOT_PREFIX.len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let end = start + SITE_SLOT_PREFIX.len() + digits + 2;
+        let token = &rest[start..end];
+        let next = numbers.len();
+        let index = *numbers.entry(token).or_insert(next);
+        out.push_str(&index.to_string());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn module_init_capture_map(
@@ -1421,9 +1467,7 @@ fn module_init_capture_map(
 /// cached `Rc<AotCaptureMap>`, so `&(...)` borrows the shared map). Building it per
 /// call hashed and allocated a HashMap on every invocation.
 fn cached_capture_map(map: &str) -> String {
-    format!(
-        "(*{{ ::std::thread_local! {{ static __W3COS_CACHED_CAPTURES: ::std::cell::OnceCell<::std::rc::Rc<w3cos_core::AotCaptureMap>> = const {{ ::std::cell::OnceCell::new() }}; }} __W3COS_CACHED_CAPTURES.with(|cell| ::std::rc::Rc::clone(cell.get_or_init(|| ::std::rc::Rc::new({map})))) }})"
-    )
+    format!("(*__w3cos_site_captures({}, || {map}))", next_site_index())
 }
 
 /// One emission chunk of a module init, in source order.
