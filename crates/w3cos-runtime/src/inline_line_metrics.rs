@@ -1,10 +1,10 @@
 //! Single-line metrics with authored inline struts and parent font context.
+use crate::layout::HashMap;
 use crate::layout::{
     LayoutRect, count_nodes, inline_font_baseline_from_line_top, inline_font_content_ascent,
     inline_font_height, inline_leaf_alignment_keyword, inline_leaf_baseline_offset,
     inline_used_line_height,
 };
-use std::collections::HashMap;
 use w3cos_std::style::{Dimension, Display, Float, Overflow, Position, TextDirection};
 use w3cos_std::{Component, ComponentKind, Style};
 
@@ -1226,7 +1226,7 @@ mod tests {
             &tree,
             0,
             &mut layouts,
-            &HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)])
+            &HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)])
         ));
         assert_eq!(layouts[0].0.height, 104.0);
         assert_eq!(layouts[3].0.y, 84.0);
@@ -1279,7 +1279,12 @@ mod tests {
             ),
         ];
         assert!(
-            project(&root, 0, &mut layouts, &HashMap::from([(0, 0), (1, 1)])),
+            project(
+                &root,
+                0,
+                &mut layouts,
+                &HashMap::from_iter([(0, 0), (1, 1)])
+            ),
             "horizontal decoration must not disable the containing line's vertical strut: font={}, used={}, wrap={}",
             inline_font_height(&root.children[0].style),
             crate::layout::inline_style_line_height(&root.children[0].style),
@@ -1363,7 +1368,7 @@ mod tests {
             &root,
             0,
             &mut layouts,
-            &HashMap::from([(0, 0), (1, 1), (2, 2)])
+            &HashMap::from_iter([(0, 0), (1, 1), (2, 2)])
         ));
         assert_eq!(
             layouts[1].0, marker,
@@ -1505,7 +1510,7 @@ mod tests {
             (rect(161.625, 263.0, 24.0, 18.0), 2),
             (rect(185.625, 224.0, 153.625, 72.0), 3),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
         let projected = project(&root, 0, &mut layouts, &positions);
         registry.clear_owner(OWNER);
         assert!(projected);
@@ -1611,7 +1616,7 @@ mod tests {
                 &root,
                 0,
                 &mut layouts,
-                &HashMap::from([(0, 0), (1, 1)])
+                &HashMap::from_iter([(0, 0), (1, 1)])
             ));
             assert_eq!(
                 layouts[1].0.x,
@@ -1699,7 +1704,7 @@ mod tests {
                     1,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1)]);
+            let positions = HashMap::from_iter([(0, 0), (1, 1)]);
             let used = UsedHeightConstraints {
                 minimum: (root.style.min_height != Dimension::Auto).then_some(used_height),
                 maximum: (root.style.max_height != Dimension::Auto).then_some(used_height),
@@ -1913,7 +1918,7 @@ mod tests {
                         3,
                     ),
                 ];
-                let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+                let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
                 assert!(
                     project(&root, 0, &mut layouts, &positions),
                     "one line with empty atomic {keyword} box, inline padding={decorated}"
@@ -1981,7 +1986,7 @@ mod tests {
                     1,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1)]);
+            let positions = HashMap::from_iter([(0, 0), (1, 1)]);
             assert!(
                 project(&root, 0, &mut layouts, &positions),
                 "fractional single line must not be rejected as wrapped"
@@ -2030,7 +2035,7 @@ mod tests {
             height: 14.0,
         };
         let mut layouts = vec![(rect, 0), (rect, 1)];
-        let positions = HashMap::from([(0, 0), (1, 1)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1)]);
         assert!(project(&root, 0, &mut layouts, &positions));
         assert_eq!(
             layouts[1].0.y, 11.0,
@@ -2162,7 +2167,7 @@ mod tests {
             (rect(8.0, 8.0, 57.78125, 92.0), 1),
             (rect(65.78125, 82.0, 12.0, 18.0), 2),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2)]);
         assert!(
             project(&root, 0, &mut layouts, &positions),
             "outer top alignment does not disable its internal baseline"
@@ -2214,7 +2219,12 @@ mod tests {
         ];
         let before = layouts.clone();
         assert!(
-            !project(&root, 0, &mut layouts, &HashMap::from([(0, 0), (1, 1)])),
+            !project(
+                &root,
+                0,
+                &mut layouts,
+                &HashMap::from_iter([(0, 0), (1, 1)])
+            ),
             "a font-sized projected rect does not prove the text fits on one line"
         );
         assert_eq!(layouts, before);
@@ -2265,7 +2275,7 @@ mod tests {
             (rect(24.0, 26.4, 24.0, 28.0), 3),
             (rect(48.0, 40.8, 24.0, 28.0), 4),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
         assert!(
             project(&root, 0, &mut layouts, &positions),
             "nested text-only lines need the same shared strut solver as nested image/text lines"
@@ -2326,7 +2336,7 @@ mod tests {
             width: 100.0,
             height,
         };
-        let positions = HashMap::from([(0, 0), (1, 1)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1)]);
         let mut plain = vec![(rect(50.0, 24.0), 0), (rect(14.4, 28.0), 1)];
         assert!(project(
             &Component::row(parent.clone(), vec![Component::text("abc", child.clone())]),
@@ -2427,7 +2437,7 @@ mod tests {
                     (rect(30.0, 16.0, 18.0), 3),
                     (rect(46.0, 32.0, 36.0), 4),
                 ];
-                let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+                let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
                 assert!(project(&root, 0, &mut layouts, &positions));
                 let baseline = layouts[1].0.y + 30.0;
                 let large_ascent = inline_font_content_ascent(&large);

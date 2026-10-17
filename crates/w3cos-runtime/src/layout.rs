@@ -1,6 +1,9 @@
 use anyhow::Result;
 use std::cell::RefCell;
-use std::collections::HashMap;
+/// Layout-pass side tables (address/position keyed) are private to the
+/// layout thread: hash them with Fx + fmix64 instead of SipHash, as Blink's
+/// LayoutNG uses WTF::HashMap with integer hashing for its per-pass maps.
+pub(crate) type HashMap<K, V> = w3cos_std::fxhash::FxHashMap<K, V>;
 use taffy::prelude::*;
 use taffy::util::ResolveOrZero;
 use w3cos_std::component::EventAction;
@@ -3653,7 +3656,7 @@ struct FontUnitKey {
 }
 
 thread_local! {
-    static CH_ADVANCE_CACHE: RefCell<HashMap<FontUnitKey, f32>> = RefCell::new(HashMap::new());
+    static CH_ADVANCE_CACHE: RefCell<HashMap<FontUnitKey, f32>> = RefCell::new(HashMap::default());
     #[cfg(test)]
     static CH_ADVANCE_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -3692,7 +3695,7 @@ pub(crate) fn install_font_unit_provider() {
         // Standard-face and language metadata still select the actual font;
         // strip fragment metadata without replacing HTML's face by the host
         // embedding font. These contexts also belong to the cache identity.
-        let mut font_context = HashMap::new();
+        let mut font_context = HashMap::default();
         if standard {
             font_context.insert(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
@@ -6336,7 +6339,7 @@ fn align_inline_table_first_row_baselines(
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
-    let mut line_baselines = HashMap::<usize, Vec<(LayoutRect, f32)>>::new();
+    let mut line_baselines = HashMap::<usize, Vec<(LayoutRect, f32)>>::default();
     for (table, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::InlineTable
             || matches!(node.style.position, WPos::Absolute | WPos::Fixed)
@@ -12764,8 +12767,8 @@ fn project_shared_bfc_float_collisions(
         }
         stack.push(index);
     }
-    let mut groups = HashMap::<usize, Vec<(FloatExclusion, Option<usize>)>>::new();
-    let mut clear_break_floors = HashMap::<usize, f32>::new();
+    let mut groups = HashMap::<usize, Vec<(FloatExclusion, Option<usize>)>>::default();
+    let mut clear_break_floors = HashMap::<usize, f32>::default();
     for index in 0..flat.len() {
         let node = &flat[index];
         if !visible[index] || matches!(node.style.position, WPos::Absolute | WPos::Fixed) {
@@ -16051,7 +16054,7 @@ fn used_inline_height_constraints(
         .iter()
         .map(|(rect, index)| (*index, *rect))
         .collect::<HashMap<_, _>>();
-    let mut output = HashMap::new();
+    let mut output = HashMap::default();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         pending.extend(tree.children(node)?);
@@ -16187,7 +16190,7 @@ fn project_image_text_lines_with_constraints(
         let mut descent = strut_height - strut_ascent;
         let mut top_height = 0.0_f32;
         let mut bottom_height = 0.0_f32;
-        let mut item_tops = HashMap::new();
+        let mut item_tops = HashMap::default();
         for (child, index) in &line {
             let rect = layouts[positions[index]].0;
             let margin = child.style.margin_lengths();
@@ -16261,7 +16264,7 @@ fn project_image_text_lines_with_constraints(
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
-    project_forced_break_lines_with_constraints(layouts, root, &HashMap::new());
+    project_forced_break_lines_with_constraints(layouts, root, &HashMap::default());
 }
 
 fn project_forced_break_lines_with_constraints(
@@ -19298,8 +19301,8 @@ fn project_table_column_background_rects(
             height: max_y - y,
         }
     };
-    let mut table_columns = HashMap::<usize, Vec<LayoutRect>>::new();
-    let mut projected_rows = HashMap::<usize, LayoutRect>::new();
+    let mut table_columns = HashMap::<usize, Vec<LayoutRect>>::default();
+    let mut projected_rows = HashMap::<usize, LayoutRect>::default();
     for (table, table_node) in flat
         .iter()
         .enumerate()
@@ -19380,8 +19383,8 @@ fn project_table_column_background_rects(
         table_columns.insert(table, bounds.into_iter().flatten().collect());
     }
 
-    let mut projected = HashMap::<usize, LayoutRect>::new();
-    let mut next_column = HashMap::<usize, usize>::new();
+    let mut projected = HashMap::<usize, LayoutRect>::default();
+    let mut next_column = HashMap::<usize, usize>::default();
     for (index, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::TableColumn {
             continue;
@@ -33316,7 +33319,7 @@ mod tests {
                 2,
             ),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2)]);
         assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
         // Chrome's Arial 15px/15px inline has a 17px font box whose top is
         // 1px above the line top; the 15px baseline image is at the line top.
@@ -51214,7 +51217,7 @@ mod tests {
             (40.0, Some(20.0), 57.0),
             (-40.0, Some(-40.0), 127.0),
         ] {
-            let mut properties = HashMap::from([(
+            let mut properties = HashMap::from_iter([(
                 "--w3cos-internal-vertical-align-length".into(),
                 format!("{offset} 40"),
             )]);
@@ -52560,7 +52563,7 @@ mod tests {
             (rect(30.0, 15.0, 15.0, 18.0), 3),
             (rect(45.0, 15.0, 15.0, 18.0), 4),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
         assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
         assert_eq!(layouts[0].0.height, 30.0 + descent);
         assert_eq!(layouts[3].0.y, leading);
@@ -52658,7 +52661,7 @@ mod tests {
                     3,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+            let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
             assert!(
                 project_image_text_lines(&root, 0, &mut layouts, &positions),
                 "offset={offset}"
@@ -52750,7 +52753,7 @@ mod tests {
                     3,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+            let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
             assert!(
                 project_image_text_lines(&root, 0, &mut layouts, &positions),
                 "{display:?}"

@@ -1,6 +1,6 @@
 //! Baselines exported by the first row of an atomic inline table.
+use crate::layout::HashMap;
 use crate::layout::{LayoutRect, count_nodes, inline_font_content_ascent};
-use std::collections::HashMap;
 use w3cos_std::style::{Display, Float, Position};
 use w3cos_std::{Component, ComponentKind};
 
