@@ -26,8 +26,14 @@ thread_local! {
     static SPLICES: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+/// `W3COS_SPLICE_DEBUG=1` prints why a flush fell back to a full rebuild.
+pub(super) fn debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_SPLICE_DEBUG").is_some())
+}
+
 fn bail(reason: &str) -> bool {
-    if std::env::var_os("W3COS_SPLICE_DEBUG").is_some() {
+    if debug_enabled() {
         eprintln!("[splice] rebuild: {reason}");
     }
     false
@@ -244,7 +250,10 @@ struct Plan {
 
 fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
     let root = host_id(&cache.component).ok_or(())?;
-    let lift = w3cos_dom::stylesheet::tree_order_affects_matching();
+    // Child-list edits record the parent, whose subtree holds every sibling
+    // a structural pseudo-class can observe. Only `+`/`~` let an attribute
+    // edit on one element restyle its following siblings.
+    let lift = w3cos_dom::stylesheet::has_sibling_selectors();
     crate::dom::with_document(|document| {
         let mut lca: Option<Vec<u32>> = None;
         let mut chains = Vec::new();
@@ -276,10 +285,7 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
         let Some(mut chain) = lca else {
             return Ok(None);
         };
-        if let Some(plan) = try_tail(cache, document, &chain, &chains) {
-            return Ok(Some(plan));
-        }
-        if std::env::var_os("W3COS_SPLICE_DEBUG").is_some() {
+        if debug_enabled() {
             let last = *chain.last().unwrap();
             eprintln!(
                 "[splice] lca depth {} node {last} <{}> dirty {}",
@@ -290,8 +296,13 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
         }
         // Walk up until the subtree root is a safe block box (the relayout
         // boundary of Blink's MarkContainerChainForLayout walk).
-        while chain.len() > 2 {
+        // The root and body keep document-level margin rules; never splice them.
+        let body = crate::dom::body_id();
+        while chain.len() > 1 && *chain.last().unwrap() != body {
             let node = *chain.last().unwrap();
+            if let Some(plan) = try_tail(cache, document, &chain, &chains) {
+                return Ok(Some(plan));
+            }
             if let Some(plan) = try_candidate(cache, document, &chain, node) {
                 return Ok(Some(plan));
             }
@@ -317,7 +328,7 @@ fn try_tail(
     chain: &[u32],
     chains: &[Vec<u32>],
 ) -> Option<Plan> {
-    if chain.len() <= 2 {
+    if chain.len() <= 1 || chain.last() == Some(&crate::dom::body_id()) {
         return None;
     }
     let node = *chain.last()?;
@@ -326,12 +337,16 @@ fn try_tail(
     let style = &old.style;
     let bottom_closed =
         px_spacing(style.padding.bottom).is_some_and(|px| px > 0.0) || border_side(style, 2) > 0.0;
+    // A definite height (a scroller such as a chat log) keeps its own box;
+    // only its scrollable overflow changes.
+    let definite = matches!(style.height, Dimension::Px(_));
     if !is_block_flow(style.display)
         || !in_flow_static(style)
-        || !bottom_closed
-        || !matches!(style.height, Dimension::Auto)
-        || !matches!(style.min_height, Dimension::Auto)
-        || !matches!(style.max_height, Dimension::Auto)
+        || !(definite
+            || (bottom_closed
+                && matches!(style.height, Dimension::Auto)
+                && matches!(style.min_height, Dimension::Auto)
+                && matches!(style.max_height, Dimension::Auto)))
         || *style != document.computed_style_for(NodeId::from_u32(node))
     {
         return None;
@@ -367,7 +382,11 @@ fn try_tail(
         return None;
     }
     let anchor = &old.children[keep - 1];
-    if !ordinary_block_child(anchor)
+    let anchor_height = host_id(anchor)
+        .map(|id| document.get_layout_rect(NodeId::from_u32(id)).height)
+        .unwrap_or(0.0);
+    if !(anchor_height > 0.0)
+        || !ordinary_block_child(anchor)
         || !matches!(anchor.style.width, Dimension::Auto)
         || px_spacing(anchor.style.margin.left).is_none()
         || px_spacing(anchor.style.margin.right).is_none()
@@ -409,6 +428,9 @@ fn try_candidate(
         || px_spacing(style.margin.left).is_none()
         || px_spacing(style.margin.right).is_none()
         || matches!(style.height, Dimension::Percent(_))
+        // A zero-height block may be self-collapsing: its margins collapse
+        // through it, so its position depends on its content. Go up.
+        || !(document.get_layout_rect(NodeId::from_u32(node)).height > 0.0)
     {
         return None;
     }
@@ -549,7 +571,7 @@ pub(super) fn try_splice(
             let margins = old.style.margin_lengths();
             let width = node_rect.width + margins.left + margins.right;
             if !(node_rect.height > 0.0) || !width.is_finite() || width <= 0.0 {
-                return false;
+                return bail("solve 555");
             }
             // Engine flags are whole-tree properties: a full rebuild would
             // derive them from the spliced tree, so the subtree uses those.
@@ -562,13 +584,13 @@ pub(super) fn try_splice(
             let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
             let mut wrapper = wrapper_for(parent, width, vec![fresh]);
             let Some((rects, _)) = solve(&wrapper, skip, measure, viewport_w, viewport_h) else {
-                return false;
+                return bail("solve 568");
             };
             let Some(new_rect) = rect_of(&rects, plan.node) else {
-                return false;
+                return bail("solve 571");
             };
             if !(new_rect.height > 0.0) || (new_rect.width - node_rect.width).abs() > 0.01 {
-                return false;
+                return bail("solve 574");
             }
             let fresh = wrapper.children.pop().expect("wrapper child");
             (
@@ -593,7 +615,7 @@ pub(super) fn try_splice(
             let target = at_path(&cache.component, &plan.path);
             let anchor = target.children[keep - 1].clone();
             let Some(anchor_id) = host_id(&anchor) else {
-                return false;
+                return bail("solve 599");
             };
             let anchor_old = crate::dom::with_document(|document| {
                 document.get_layout_rect(NodeId::from_u32(anchor_id))
@@ -601,7 +623,7 @@ pub(super) fn try_splice(
             let margins = anchor.style.margin_lengths();
             let width = anchor_old.width + margins.left + margins.right;
             if !(anchor_old.height > 0.0) || !width.is_finite() || width <= 0.0 {
-                return false;
+                return bail("solve 607");
             }
             let padding_bottom = target.style.padding_lengths().bottom;
             let border_bottom = border_side(&target.style, 2);
@@ -610,24 +632,28 @@ pub(super) fn try_splice(
             children.extend(tail);
             let mut wrapper = wrapper_for(target, width, children);
             let Some((rects, own)) = solve(&wrapper, skip, measure, viewport_w, viewport_h) else {
-                return false;
+                return bail("solve 616");
             };
             let Some(anchor_new) = rect_of(&rects, anchor_id) else {
-                return false;
+                return bail("solve 619");
             };
             if (anchor_new.height - anchor_old.height).abs() > 0.01
                 || (anchor_new.width - anchor_old.width).abs() > 0.01
             {
-                return false;
+                return bail("solve 624");
             }
             let dx = anchor_old.x - anchor_new.x;
             let dy = anchor_old.y - anchor_new.y;
             // The wrapper is a BFC root, so its auto height ends at the last
             // child's bottom margin edge, as the padded parent's content does.
             let content_end = own.y + own.height + dy;
-            let new_height = content_end + padding_bottom + border_bottom - node_rect.y;
+            let new_height = if matches!(target.style.height, Dimension::Px(_)) {
+                node_rect.height
+            } else {
+                content_end + padding_bottom + border_bottom - node_rect.y
+            };
             if !new_height.is_finite() || new_height <= 0.0 {
-                return false;
+                return bail("solve 633");
             }
             let mut tail = std::mem::take(&mut wrapper.children);
             tail.remove(0);
@@ -912,5 +938,30 @@ mod tests {
         crate::dom::append_child(reply, p);
         assert!(crate::incremental_layout::flush());
         assert_matches_full("sibling after reply");
+    }
+
+    #[test]
+    fn message_appended_to_definite_scroller_splices() {
+        let (chat, _reply) = chat_page();
+        let before = splice_counts();
+        for index in 0..5 {
+            let msg = crate::dom::create_element("div");
+            style(msg, &[("padding", "8px 12px"), ("margin", "0 0 8px 0")]);
+            let p = crate::dom::create_element("p");
+            style(p, &[("margin", "4px 0")]);
+            crate::dom::append_child(
+                p,
+                crate::dom::create_text_node(&"new message ".repeat(index + 1)),
+            );
+            crate::dom::append_child(msg, p);
+            crate::dom::append_child(chat, msg);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("message {index}"));
+        }
+        assert_eq!(
+            splice_counts().1 - before.1,
+            5,
+            "appends under a px-height scroller splice"
+        );
     }
 }

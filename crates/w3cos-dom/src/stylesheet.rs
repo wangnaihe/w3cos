@@ -439,6 +439,12 @@ pub fn has_relational_selectors() -> bool {
     has_relational_dependencies()
 }
 
+/// `+`/`~` combinators: an attribute edit can restyle following siblings
+/// (Blink's sibling invalidation sets). `:nth-child` alone cannot.
+pub fn has_sibling_selectors() -> bool {
+    has_sibling_dependencies()
+}
+
 /// Sibling, structural, and relational selectors can change when a node moves.
 pub fn tree_order_affects_matching() -> bool {
     has_sibling_dependencies() || has_structural_dependencies() || has_relational_dependencies()

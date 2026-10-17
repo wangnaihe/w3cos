@@ -98,12 +98,18 @@ pub fn flush() -> bool {
             return false;
         };
         if !cache.splice_ok || cache.structure == layout_gen {
+            if !cache.splice_ok && splice::debug_enabled() {
+                eprintln!("[splice] retained tree is not spliceable");
+            }
             return false;
         }
         let (before, dirty, after) = take();
         let complete = cache.drain_epoch == before;
         cache.drain_epoch = after;
         if !complete {
+            if splice::debug_enabled() {
+                eprintln!("[splice] dirty list drained elsewhere");
+            }
             cache.splice_ok = false;
             taken = Some((after, dirty, after));
             return false;
@@ -149,7 +155,7 @@ pub fn flush() -> bool {
             // Glyphs changed and a used box may now depend on them. Rebuild
             // from the DOM instead of patching the stale component tree.
             let text_stale = cache.source_structure != structure && !dirty.is_empty();
-            if std::env::var_os("W3COS_SPLICE_DEBUG").is_some() && !dirty.is_empty() {
+            if splice::debug_enabled() && !dirty.is_empty() {
                 eprintln!(
                     "[splice] patch path: {} dirty, text_stale {text_stale}, first {:?}",
                     dirty.len(),
@@ -168,13 +174,13 @@ pub fn flush() -> bool {
                 ok = true;
                 return;
             }
-        } else if let Some(cache) = slot.as_mut()
-            && splice::try_splice(cache, &dirty, viewport_w, viewport_h)
-        {
-            cache.structure = layout_gen;
-            cache.cascade = cascade;
-            ok = true;
-            return;
+        }
+        if splice::debug_enabled() {
+            eprintln!(
+                "[splice] full rebuild: cached {} structure_matches {structure_matches} dirty {}",
+                slot.is_some(),
+                dirty.len()
+            );
         }
         ok = rebuild(
             &mut slot,
