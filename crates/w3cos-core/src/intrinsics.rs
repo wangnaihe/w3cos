@@ -118,10 +118,25 @@ pub fn negate(value: &Value) -> Value {
 }
 
 pub fn get_property(object: &Value, key: &Value) -> Value {
-    if let Some(index) = canonical_number_index(key)
-        && let Some(value) = crate::fast_collection_get(object, Some(index))
-    {
-        return value;
+    if let Some(index) = canonical_number_index(key) {
+        if let Some(value) = crate::fast_collection_get(object, Some(index)) {
+            return value;
+        }
+        // `array[i]` with a number key: read the element directly instead of
+        // formatting the index to a string and parsing it back (V8 keyed
+        // element load). Same result as the string path: holes and
+        // out-of-range indices read as undefined; typed-array views keep the
+        // byte-backed path.
+        if let Some(array) = object.as_array()
+            && !crate::binary::is_typed_array_view(object)
+        {
+            return array
+                .borrow()
+                .get(index)
+                .cloned()
+                .map(crate::value::array_slot_value)
+                .unwrap_or(Value::Undefined);
+        }
     }
     object.get_property(&key.to_js_string())
 }
@@ -1374,6 +1389,20 @@ mod tests {
 
 #[cfg(test)]
 mod call_completion_tests {
+    #[test]
+    fn numeric_array_index_matches_the_string_key_path() {
+        let array = super::create_array(vec![
+            crate::Value::Number(1.0),
+            crate::value::array_hole(),
+            crate::Value::from("x"),
+        ]);
+        for index in [0.0, 1.0, 2.0, 3.0, 1.5, -1.0] {
+            let fast = super::get_property(&array, &crate::Value::Number(index));
+            let slow = array.get_property(&crate::Value::Number(index).to_js_string());
+            assert!(fast.strict_eq(&slow), "index {index}: {fast:?} vs {slow:?}");
+        }
+    }
+
     use super::*;
     use crate::Value;
 

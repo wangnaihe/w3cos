@@ -806,6 +806,15 @@ pub fn shared_array_buffer_class() -> Value {
     })
 }
 
+/// Whether `value` is the storage of a live typed-array view. Cheap when no
+/// typed array exists in the realm.
+pub(crate) fn is_typed_array_view(value: &Value) -> bool {
+    if VIEWS.with(|views| views.borrow().is_empty()) {
+        return false;
+    }
+    view_for(value).is_some()
+}
+
 fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, Value)> {
     let Some(candidate) = value.as_array() else {
         return None;
