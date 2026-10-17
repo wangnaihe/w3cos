@@ -368,6 +368,22 @@ impl PartialEq for Immediate {
     }
 }
 
+/// `prefix + key` without a heap allocation for ordinary property names.
+pub(crate) fn accessor_key<'a>(
+    buf: &'a mut [u8; 96],
+    prefix: &str,
+    key: &str,
+) -> std::borrow::Cow<'a, str> {
+    let total = prefix.len() + key.len();
+    if total > buf.len() {
+        return std::borrow::Cow::Owned(format!("{prefix}{key}"));
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    buf[prefix.len()..total].copy_from_slice(key.as_bytes());
+    // Both halves are valid UTF-8 and concatenation preserves that.
+    std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
+}
+
 impl Value {
     /// Unit-like constructor kept so AOT / host code can write `Value::Undefined`.
     #[allow(non_upper_case_globals)]
@@ -2212,21 +2228,36 @@ impl Value {
             crate::intrinsics::bump_dom_shape();
         }
         if let Some(o) = self.as_object() {
-            let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
-            let canonical_index = key
-                .parse::<u32>()
-                .is_ok_and(|index| index.to_string() == key);
-            if rejects_indexed_set && canonical_index {
+            // Only canonical array indices can hit the indexed-set guard; test
+            // the cheap shape before probing the object.
+            let canonical_index = key.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && key
+                    .parse::<u32>()
+                    .is_ok_and(|index| index.to_string() == key);
+            if canonical_index && o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool() {
                 return false;
             }
-            let descriptor = o.borrow().get_own_property_descriptor(key);
-            let writable = descriptor.get_property("writable");
-            if writable.is_bool() && !writable.to_bool() {
-                return false;
+            // Ordinary own data properties are always writable here (there is
+            // no non-writable attribute outside a proxy), so the descriptor is
+            // only consulted when a getOwnPropertyDescriptor trap can say no.
+            // Building it allocated a descriptor object per [[Set]].
+            let trapped_descriptor = o
+                .borrow()
+                .proxy_handler
+                .as_ref()
+                .is_some_and(|handler| handler.get_own_property_descriptor.is_some());
+            if trapped_descriptor {
+                let descriptor = o.borrow().get_own_property_descriptor(key);
+                let writable = descriptor.get_property("writable");
+                if writable.is_bool() && !writable.to_bool() {
+                    return false;
+                }
             }
             let has_own = o.borrow().properties.contains_key(key);
             if !has_own {
-                let setter_key = format!("__w3cos_setter_{key}");
+                let mut setter_buf = [0u8; 96];
+                let setter_key = accessor_key(&mut setter_buf, "__w3cos_setter_", key);
+                let setter_key: &str = &setter_key;
                 let setter = {
                     let object = o.borrow();
                     if object
