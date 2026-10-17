@@ -434,6 +434,11 @@ pub(crate) fn has_relational_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 4 != 0)
 }
 
+/// `:has()`-style selectors: a mutation can restyle any ancestor.
+pub fn has_relational_selectors() -> bool {
+    has_relational_dependencies()
+}
+
 /// Sibling, structural, and relational selectors can change when a node moves.
 pub fn tree_order_affects_matching() -> bool {
     has_sibling_dependencies() || has_structural_dependencies() || has_relational_dependencies()

@@ -12,6 +12,9 @@ use w3cos_std::{Component, ComponentKind};
 
 use crate::layout::{LayoutEngine, pre_flatten};
 
+#[path = "incremental_layout_splice.rs"]
+mod splice;
+
 struct WidthMemo {
     structure: u64,
     node: u32,
@@ -37,6 +40,20 @@ struct Cache {
     /// Full rect snapshots keyed by one node's px width. Repeat flushes of
     /// the same width restore the rects instead of solving Taffy again.
     width_memos: Vec<WidthMemo>,
+    /// `Document::precise_drain_epoch` after this cache took the dirty list.
+    /// Any other drain means a structural splice could miss a mutation.
+    drain_epoch: u32,
+    /// `stylesheet::generation` at the last build or splice.
+    sheet_generation: u64,
+    /// No float, out-of-flow (except outside list markers), sticky, or
+    /// multicol box anywhere: a block subtree's used box cannot depend on
+    /// anything but its containing block width.
+    splice_ok: bool,
+    /// Engine flags of the whole tree, reused for a spliced subtree.
+    skip_projections: bool,
+    measure_text: bool,
+    /// The component tree was spliced; `node_ids` and the Taffy tree are stale.
+    node_ids_stale: bool,
 }
 
 thread_local! {
@@ -69,10 +86,22 @@ pub fn flush() -> bool {
             document.cascade_generation(),
         )
     });
-    let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+    let (drain_before, dirty, drain_after) = crate::dom::with_document_mut(|document| {
+        let before = document.precise_drain_epoch();
+        let dirty = document.take_precise_dirty();
+        (before, dirty, document.precise_drain_epoch())
+    });
     let mut ok = false;
     CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
+        if let Some(cache) = slot.as_mut() {
+            let complete = cache.drain_epoch == drain_before;
+            cache.drain_epoch = drain_after;
+            if !complete {
+                // Another consumer drained mutations this cache never saw.
+                cache.splice_ok = false;
+            }
+        }
         let structure_matches = slot
             .as_ref()
             .is_some_and(|cache| cache.structure == layout_gen);
@@ -89,9 +118,22 @@ pub fn flush() -> bool {
                 ok = true;
                 return;
             }
+        } else if let Some(cache) = slot.as_mut()
+            && splice::try_splice(cache, &dirty, viewport_w, viewport_h)
+        {
+            cache.structure = layout_gen;
+            cache.cascade = cascade;
+            ok = true;
+            return;
         }
         ok = rebuild(
-            &mut slot, layout_gen, structure, cascade, viewport_w, viewport_h,
+            &mut slot,
+            layout_gen,
+            structure,
+            cascade,
+            viewport_w,
+            viewport_h,
+            drain_after,
         );
     });
     if ok {
@@ -107,6 +149,7 @@ fn rebuild(
     cascade: u64,
     viewport_w: f32,
     viewport_h: f32,
+    drain_epoch: u32,
 ) -> bool {
     let component = crate::dom::to_component_tree();
     let flat = pre_flatten(&component);
@@ -124,7 +167,17 @@ fn rebuild(
     };
     let snaps = write_rects(&flat, &results.layout_cache);
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
+    let splice_ok = splice::tree_is_spliceable(&component);
+    let skip_projections = can_skip_projections(&component);
+    let measure_text = needs_text_metric(&component);
+    drop(flat);
     *slot = Some(Cache {
+        drain_epoch,
+        sheet_generation: w3cos_dom::stylesheet::generation(),
+        splice_ok,
+        skip_projections,
+        measure_text,
+        node_ids_stale: false,
         component,
         engine,
         structure: layout_gen,
@@ -206,6 +259,11 @@ fn patch_and_compute(
         return true;
     }
     let flat = pre_flatten(&cache.component);
+    if cache.node_ids_stale {
+        cache.node_ids = flat.iter().map(flat_host_id).collect();
+        cache.engine.invalidate();
+        cache.node_ids_stale = false;
+    }
     if flat.len() != cache.node_ids.len() {
         return false;
     }
@@ -238,6 +296,11 @@ fn patch_and_compute(
 
 fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     let flat = pre_flatten(&cache.component);
+    if cache.node_ids_stale {
+        cache.node_ids = flat.iter().map(flat_host_id).collect();
+        cache.engine.invalidate();
+        cache.node_ids_stale = false;
+    }
     configure_engine(&mut cache.engine, &cache.component);
     let Ok(results) = cache
         .engine

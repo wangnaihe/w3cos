@@ -45,6 +45,10 @@ struct CounterMemo {
     filled: bool,
     recording: bool,
     markers: HashMap<NodeId, CounterSnapshot>,
+    /// Set while a walk covers only one list-item counter root.
+    partial: bool,
+    /// `list-item` values recorded by those partial walks.
+    list_items: HashMap<NodeId, i32>,
 }
 
 thread_local! {
@@ -72,6 +76,8 @@ impl CounterMemoScope {
                         filled: false,
                         recording: false,
                         markers: HashMap::new(),
+                        partial: false,
+                        list_items: HashMap::new(),
                     });
                     Self { active: true }
                 }
@@ -1892,6 +1898,12 @@ impl Document {
     pub fn take_precise_dirty(&mut self) -> Vec<NodeId> {
         bump_dirty_epoch(&mut self.precise_epoch, &mut self.precise_stamp);
         std::mem::take(&mut self.precise_dirty)
+    }
+
+    /// Changes on every `take_precise_dirty`. A retained layout that saw the
+    /// previous value knows no other consumer drained mutations it missed.
+    pub fn precise_drain_epoch(&self) -> u32 {
+        self.precise_epoch
     }
 
     pub fn precise_dirty_contains(&self, id: NodeId) -> bool {
@@ -5021,8 +5033,10 @@ impl Document {
             "square" => "▪".to_string(),
             "decimal" => format!(
                 "{}. ",
-                self.counter_snapshot_at(id, pseudo_element.unwrap_or("::marker"))
-                    .value("list-item")
+                match pseudo_element.unwrap_or("::marker") {
+                    "::marker" => self.list_item_marker_value(id),
+                    pseudo => self.counter_snapshot_at(id, pseudo).value("list-item"),
+                }
             ),
             "none" => return None,
             "string" => strings.into_iter().next()?,
@@ -5466,12 +5480,22 @@ impl Document {
             && self.computed_style_for(id).display == w3cos_std::style::Display::ListItem
         {
             // Same traversal state the targeted walk would return for `id`.
-            let snapshot = CounterSnapshot {
-                scopes: scopes.clone(),
-            };
             COUNTER_MEMO.with(|memo| {
                 if let Some(memo) = memo.borrow_mut().as_mut() {
-                    memo.markers.insert(id, snapshot);
+                    if memo.partial {
+                        let value = CounterSnapshot {
+                            scopes: scopes.clone(),
+                        }
+                        .value("list-item");
+                        memo.list_items.insert(id, value);
+                    } else {
+                        memo.markers.insert(
+                            id,
+                            CounterSnapshot {
+                                scopes: scopes.clone(),
+                            },
+                        );
+                    }
                 }
             });
         }
@@ -5540,6 +5564,82 @@ impl Document {
                 memo.recording && memo.document == document as *const _ as usize
             })
         })
+    }
+
+    /// `list-item` value for an outside `::marker`.
+    ///
+    /// Each `ol`/`ul` resets `list-item` in its own scope, so no box outside
+    /// that element can change the value seen by its descendants. Inside a
+    /// component-tree build, walk just that list root once and memoize every
+    /// item in it, instead of a document-wide counter walk (which made every
+    /// subtree rebuild under an ordered list O(document)).
+    fn list_item_marker_value(&self, target: NodeId) -> i32 {
+        let me = self as *const Document as usize;
+        let (hit, can_walk) = COUNTER_MEMO.with(|memo| {
+            let memo = memo.borrow();
+            match memo.as_ref() {
+                Some(memo) if memo.document == me && !memo.recording => (
+                    memo.list_items.get(&target).copied().or_else(|| {
+                        memo.markers
+                            .get(&target)
+                            .map(|snapshot| snapshot.value("list-item"))
+                    }),
+                    !memo.filled,
+                ),
+                _ => (None, false),
+            }
+        });
+        if let Some(value) = hit {
+            return value;
+        }
+        if can_walk && let Some(root) = self.list_item_counter_root(target) {
+            let set = |recording: bool| {
+                COUNTER_MEMO.with(|memo| {
+                    if let Some(memo) = memo.borrow_mut().as_mut() {
+                        memo.recording = recording;
+                        memo.partial = recording;
+                    }
+                })
+            };
+            set(true);
+            let mut scopes = vec![HashMap::new()];
+            let _ = self.visit_counter_tree(root, NodeId(u32::MAX), "::marker", &mut scopes, false);
+            set(false);
+            let hit = COUNTER_MEMO.with(|memo| {
+                memo.borrow()
+                    .as_ref()
+                    .and_then(|memo| memo.list_items.get(&target).copied())
+            });
+            if let Some(value) = hit {
+                return value;
+            }
+        }
+        self.counter_snapshot_at(target, "::marker")
+            .value("list-item")
+    }
+
+    /// Nearest ancestor that resets `list-item`, when `target` itself does not.
+    fn list_item_counter_root(&self, target: NodeId) -> Option<NodeId> {
+        let resets_list_item = |id: NodeId| {
+            self.element_counter_reset_names(id)
+                .iter()
+                .any(|name| name == "list-item")
+        };
+        if resets_list_item(target) {
+            return None;
+        }
+        let mut current = self.get_node(target).parent;
+        while let Some(id) = current {
+            let node = self.get_node(id);
+            if node.node_type != NodeType::Element {
+                return None;
+            }
+            if resets_list_item(id) {
+                return Some(id);
+            }
+            current = node.parent;
+        }
+        None
     }
 
     fn counter_snapshot_at(&self, target: NodeId, pseudo_element: &str) -> CounterSnapshot {
@@ -17199,6 +17299,18 @@ mod generated_counter_format_tests {
         COUNTER_MEMO.with(|memo| {
             assert!(memo.borrow().as_ref().is_some_and(|memo| memo.filled));
         });
+        drop(_scope);
+        // A subtree build walks only each item's list root.
+        let _scope = CounterMemoScope::enter(&document as *const Document);
+        let per_list: Vec<i32> = items
+            .iter()
+            .rev()
+            .map(|id| document.list_item_marker_value(*id))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(per_list, expected);
         drop(_scope);
         COUNTER_MEMO.with(|memo| assert!(memo.borrow().is_none()));
         crate::stylesheet::clear_rules();
