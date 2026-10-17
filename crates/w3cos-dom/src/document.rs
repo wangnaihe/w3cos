@@ -480,6 +480,9 @@ pub struct Document {
     scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
+    /// Bumps only for text edits that keep every used box (repaint-only).
+    /// A retained component tree compares it to know its text is stale.
+    repaint_text_generation: u64,
     /// Bumps only when used geometry can change. A definite box can repaint
     /// new text without solving layout again.
     layout_generation: u64,
@@ -622,6 +625,7 @@ impl Document {
             scope_epoch: 1,
             scope_stamp: Vec::new(),
             structure_generation: 0,
+            repaint_text_generation: 0,
             layout_generation: 0,
             geometry_epoch: 1,
             cascade_generation: 0,
@@ -1875,6 +1879,11 @@ impl Document {
     /// The next paint must read new text, and the used boxes stay valid.
     pub fn note_repaint_without_layout(&mut self) {
         self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.repaint_text_generation = self.repaint_text_generation.wrapping_add(1);
+    }
+
+    pub fn repaint_text_generation(&self) -> u64 {
+        self.repaint_text_generation
     }
 
     /// Inherited or selector-matched styles may have changed below `id`.

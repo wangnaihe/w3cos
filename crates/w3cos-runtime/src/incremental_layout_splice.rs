@@ -26,6 +26,13 @@ thread_local! {
     static SPLICES: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+fn bail(reason: &str) -> bool {
+    if std::env::var_os("W3COS_SPLICE_DEBUG").is_some() {
+        eprintln!("[splice] rebuild: {reason}");
+    }
+    false
+}
+
 pub(crate) fn splice_counts() -> (u32, u32) {
     SPLICES.with(std::cell::Cell::get)
 }
@@ -272,6 +279,15 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
         if let Some(plan) = try_tail(cache, document, &chain, &chains) {
             return Ok(Some(plan));
         }
+        if std::env::var_os("W3COS_SPLICE_DEBUG").is_some() {
+            let last = *chain.last().unwrap();
+            eprintln!(
+                "[splice] lca depth {} node {last} <{}> dirty {}",
+                chain.len(),
+                document.get_node(NodeId::from_u32(last)).tag.as_str(),
+                dirty.len()
+            );
+        }
         // Walk up until the subtree root is a safe block box (the relayout
         // boundary of Blink's MarkContainerChainForLayout walk).
         while chain.len() > 2 {
@@ -502,16 +518,16 @@ pub(super) fn try_splice(
         || dirty.is_empty()
         || w3cos_dom::stylesheet::has_relational_selectors()
     {
-        return false;
+        return bail("precondition");
     }
     let plan = match plan_splice(cache, dirty) {
         Ok(Some(plan)) => plan,
         // Every mutation was off-document: the used boxes are unchanged.
         Ok(None) => return true,
-        Err(()) => return false,
+        Err(()) => return bail("no safe subtree root"),
     };
     let Some(levels) = ancestor_levels(&cache.component, &plan.path) else {
-        return false;
+        return bail("ancestors");
     };
     let node = NodeId::from_u32(plan.node);
     let node_rect = crate::dom::with_document(|document| document.get_layout_rect(node));

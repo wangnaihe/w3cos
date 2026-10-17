@@ -29,7 +29,7 @@ struct Cache {
     engine: LayoutEngine,
     /// `Document::layout_generation`. Repaint-only text does not bump it.
     structure: u64,
-    /// `Document::structure_generation` at the last build. A later text edit
+    /// `Document::repaint_text_generation` at the last build. A later text edit
     /// can leave these rects valid while the component text is stale, so the
     /// next geometry edit rebuilds from the DOM.
     source_structure: u64,
@@ -70,27 +70,66 @@ pub fn invalidate() {
 
 /// Flush pending layout into stored DOM rects. Returns false when Taffy fails.
 pub fn flush() -> bool {
+    let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
+    let viewport_w = viewport_w as f32;
+    let viewport_h = viewport_h as f32;
+    // `structure` here is the repaint-only text generation: a splice leaves
+    // it alone, so text edited without layout elsewhere stays detectable.
+    let (layout_gen, structure, cascade) = crate::dom::with_document(|document| {
+        (
+            document.layout_generation(),
+            document.repaint_text_generation(),
+            document.cascade_generation(),
+        )
+    });
+    let take = || {
+        crate::dom::with_document_mut(|document| {
+            let before = document.precise_drain_epoch();
+            let dirty = document.take_precise_dirty();
+            (before, dirty, document.precise_drain_epoch())
+        })
+    };
+    // A retained tree that only needs a structural splice skips the
+    // document-wide definite-layout fingerprint below.
+    let mut taken = None;
+    let spliced = CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(cache) = slot.as_mut() else {
+            return false;
+        };
+        if !cache.splice_ok || cache.structure == layout_gen {
+            return false;
+        }
+        let (before, dirty, after) = take();
+        let complete = cache.drain_epoch == before;
+        cache.drain_epoch = after;
+        if !complete {
+            cache.splice_ok = false;
+            taken = Some((after, dirty, after));
+            return false;
+        }
+        if splice::try_splice(cache, &dirty, viewport_w, viewport_h) {
+            cache.structure = layout_gen;
+            cache.cascade = cascade;
+            return true;
+        }
+        taken = Some((after, dirty, after));
+        false
+    });
+    if spliced {
+        crate::dom::clear_document_dirty();
+        return true;
+    }
     if crate::definite_layout::try_apply() {
         let _ = crate::dom::with_document_mut(|document| document.take_precise_dirty());
         crate::dom::clear_document_dirty();
         invalidate();
         return true;
     }
-    let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
-    let viewport_w = viewport_w as f32;
-    let viewport_h = viewport_h as f32;
-    let (layout_gen, structure, cascade) = crate::dom::with_document(|document| {
-        (
-            document.layout_generation(),
-            document.structure_generation(),
-            document.cascade_generation(),
-        )
-    });
-    let (drain_before, dirty, drain_after) = crate::dom::with_document_mut(|document| {
-        let before = document.precise_drain_epoch();
-        let dirty = document.take_precise_dirty();
-        (before, dirty, document.precise_drain_epoch())
-    });
+    let (drain_before, dirty, drain_after) = match taken {
+        Some(taken) => taken,
+        None => take(),
+    };
     let mut ok = false;
     CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -110,6 +149,17 @@ pub fn flush() -> bool {
             // Glyphs changed and a used box may now depend on them. Rebuild
             // from the DOM instead of patching the stale component tree.
             let text_stale = cache.source_structure != structure && !dirty.is_empty();
+            if std::env::var_os("W3COS_SPLICE_DEBUG").is_some() && !dirty.is_empty() {
+                eprintln!(
+                    "[splice] patch path: {} dirty, text_stale {text_stale}, first {:?}",
+                    dirty.len(),
+                    crate::dom::with_document(|document| document
+                        .get_node(dirty[0])
+                        .tag
+                        .as_str()
+                        .to_string())
+                );
+            }
             let geometry_only = cache.cascade != cascade;
             if !text_stale
                 && patch_and_compute(cache, &dirty, viewport_w, viewport_h, geometry_only)
