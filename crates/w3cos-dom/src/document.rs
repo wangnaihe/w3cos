@@ -2449,7 +2449,10 @@ impl Document {
         lineage.reverse();
         let mut ancestors = lineage
             .into_iter()
-            .map(|ancestor| self.selector_context(ancestor))
+            .map(|ancestor| {
+                let _ = ancestor;
+                stylesheet::SelectorContext::default()
+            })
             .collect();
         let inherited = (Some(id) != self.document_element_id())
             .then(|| self.get_node(id).parent)
@@ -2655,6 +2658,9 @@ impl Document {
     fn computed_style(
         &self,
         id: NodeId,
+        // Kept for call-site shape only: matching walks the live tree
+        // (SelectorChecker on the Element), so the component walk passes
+        // empty placeholder contexts instead of building per-ancestor copies.
         _ancestors: &[stylesheet::SelectorContext],
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
@@ -6659,7 +6665,7 @@ impl Document {
                 .collect();
         }
         let mut child_ancestors = ancestors.to_vec();
-        child_ancestors.push(self.selector_context(parent_id));
+        child_ancestors.push(stylesheet::SelectorContext::default());
         let participates_in_inline_flow = child_ids
             .iter()
             .map(|child_id| {
@@ -6742,7 +6748,7 @@ impl Document {
                                 return None;
                             }
                             let mut grandchild_ancestors = child_ancestors.clone();
-                            grandchild_ancestors.push(self.selector_context(*child_id));
+                            grandchild_ancestors.push(stylesheet::SelectorContext::default());
                             let contains_in_flow_block =
                                 self.children_ids(*child_id).iter().any(|grandchild_id| {
                                     let grandchild = self.get_node(*grandchild_id);
@@ -6940,7 +6946,7 @@ impl Document {
             if child.node_type == NodeType::Element {
                 let child_style = self.computed_style(child_id, ancestors, Some(parent_style));
                 if child_style.display == w3cos_std::style::Display::Contents {
-                    ancestors.push(self.selector_context(child_id));
+                    ancestors.push(stylesheet::SelectorContext::default());
                     let nested_ids = self.render_child_ids(
                         child_id,
                         self.children_ids(child_id),
@@ -8012,7 +8018,7 @@ impl Document {
                         if grandchild_ids.len() == 1 {
                             let grandchild = self.get_node(grandchild_ids[0]);
                             if grandchild.node_type == NodeType::Text {
-                                ancestors.push(self.selector_context(id));
+                                ancestors.push(stylesheet::SelectorContext::default());
                                 let child_style =
                                     self.computed_style(child_ids[0], ancestors, Some(&style));
                                 ancestors.pop();
@@ -8036,7 +8042,7 @@ impl Document {
                     }
                 }
                 let pushed = if node.node_type == NodeType::Element {
-                    ancestors.push(self.selector_context(id));
+                    ancestors.push(stylesheet::SelectorContext::default());
                     true
                 } else {
                     false
