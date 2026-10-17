@@ -4788,9 +4788,21 @@ export function weakShape() {
   const ref = new WeakRef(key);
   const registry = new FinalizationRegistry(() => {});
   registry.register(key, "held", token);
+  const other = {};
+  map.set(other, 1);
+  map.set(other, 2);
+  const replaced = map.get(other);
+  const deleted = map.delete(other) + "," + map.delete(other) + "," + map.has(other);
+  map.set(other, 3);
+  let calls = 0;
+  const counted = new FinalizationRegistry(() => { calls += 1; });
+  counted.register({}, "temp");
+  counted.register(other, "other", undefined);
   return map.get(key) + ":" + map.has(key) + ":" + set.has(key) + ":" +
     (ref.deref() === key) + ":" + registry.unregister(token) + ":" +
-    typeof registry.cleanupSome;
+    typeof registry.cleanupSome + ":" + replaced + ":" + deleted + ":" +
+    map.get(other) + ":" + map.get(1) + ":" + map.has({}) + ":" +
+    FinalizationRegistry.cleanupMode + ":" + calls;
 }
 export function atomicsShape() {
   const buffer = new SharedArrayBuffer(16);
@@ -4905,7 +4917,7 @@ fn main() {
     let r = m0::m0_urlParts(vec![]);
     assert_eq!(r.to_js_string(), "example.com", "URL: {r:?}");
     let r = m0::m0_weakShape(vec![]);
-    assert_eq!(r.to_js_string(), "7:true:true:true:true:function", "WeakMap, WeakSet, WeakRef, and FinalizationRegistry: {r:?}");
+    assert_eq!(r.to_js_string(), "7:true:true:true:true:function:2:true,false,false:3:undefined:false:automatic:0", "WeakMap, WeakSet, WeakRef, and FinalizationRegistry: {r:?}");
     let r = m0::m0_atomicsShape(vec![]);
     assert_eq!(r.to_js_string(), "function:object:16:true:5:8:11:not-equal:true", "SharedArrayBuffer and Atomics: {r:?}");
     let r = m0::m0_bigintShape(vec![]);

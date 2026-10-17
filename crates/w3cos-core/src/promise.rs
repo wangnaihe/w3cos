@@ -499,7 +499,8 @@ pub fn queue_microtask(callback: Value) {
 }
 
 /// Run every queued reaction job until the queue is empty (jobs may
-/// enqueue more jobs). Returns the number of jobs run. Panics crossing a
+/// enqueue more jobs), then any pending `FinalizationRegistry` cleanups
+/// (see [`crate::weak`] for ordering). Returns the number of jobs run. Panics crossing a
 /// job boundary are contained so one bad job cannot abort the drain.
 pub fn drain_microtasks() -> usize {
     let mut ran = 0;
@@ -507,7 +508,14 @@ pub fn drain_microtasks() -> usize {
         let batch: Vec<MicrotaskJob> =
             PROMISE_MICROTASKS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
         if batch.is_empty() {
-            break;
+            // Job checkpoint: deliver FinalizationRegistry cleanups for
+            // targets released so far, then drain whatever they queued.
+            let finalized = crate::weak::run_pending_finalizers();
+            if finalized == 0 {
+                break;
+            }
+            ran += finalized;
+            continue;
         }
         let current_generation = MICROTASK_REALM_GENERATION.with(Cell::get);
         for job in batch {

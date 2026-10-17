@@ -586,6 +586,11 @@ impl ArrayStorage {
         Self { values, allocation }
     }
 
+    #[inline]
+    pub(crate) fn heap_allocation(&self) -> &HeapAllocation {
+        &self.allocation
+    }
+
     pub(crate) fn refresh_heap_accounting(&self) {
         self.allocation.set_bytes(
             std::mem::size_of::<Self>().saturating_add(
@@ -1548,6 +1553,11 @@ impl FunctionData {
     pub fn identity(&self) -> usize {
         self as *const FunctionData as usize
     }
+
+    #[inline]
+    pub(crate) fn heap_allocation(&self) -> &HeapAllocation {
+        &self.allocation
+    }
 }
 
 impl Clone for JsFunction {
@@ -1617,6 +1627,11 @@ impl JsFunction {
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         self.data().call(this, args)
+    }
+
+    #[inline]
+    pub(crate) fn heap_allocation(&self) -> &HeapAllocation {
+        self.data().heap_allocation()
     }
 
     pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
