@@ -4789,6 +4789,24 @@ impl LayoutEngine {
         project_empty_painted_inline_boxes(&mut results, flat);
         project_mixed_inline_block_definite_widths(&mut results, flat, viewport_w, viewport_h);
         project_inline_background_widths(&mut results, root);
+        // Blink only runs a layout algorithm for boxes whose formatting
+        // context needs it (NeedsLayout bits + LayoutNG algorithm dispatch).
+        // Summarize the tree's features once and skip projection passes
+        // that are no-ops without them. Kill switch:
+        // W3COS_PROJECTION_GATES=0. W3COS_PROJECTION_VERIFY=1 runs the
+        // skipped pass anyway and panics if it would have moved any box.
+        let features = LayoutFeatures::of(flat);
+        macro_rules! gated_projection {
+            ($need:expr, $call:expr) => {
+                if features.has($need) || !projection_gates_enabled() {
+                    $call;
+                } else if projection_verify_enabled() {
+                    let before = results.clone();
+                    $call;
+                    assert_layouts_unchanged(&before, &results, stringify!($call));
+                }
+            };
+        }
         let projection_root = flat
             .iter()
             .any(|node| {
@@ -4834,26 +4852,98 @@ impl LayoutEngine {
             viewport_w,
             viewport_h,
         );
-        project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h);
-        project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
-        project_table_into_float_band(&mut results, flat);
-        project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h);
-        project_adjoining_clearance_auto_heights(&mut results, flat, viewport_w, viewport_h);
-        project_empty_clear_margin_past_float(&mut results, flat);
-        project_shared_bfc_float_collisions(&mut results, flat, viewport_w, viewport_h);
-        project_nonadjoining_bfc_margin_separation(&mut results, flat, viewport_w, viewport_h);
-        project_float_text_layouts(&mut results, flat, viewport_w, viewport_h);
-        project_anonymous_float_group_following_image(&mut results, flat, viewport_w, viewport_h);
-        project_bottom_aligned_float_inline_rows(&mut results, flat, viewport_w, viewport_h);
-        project_staggered_float_inline_bands(&mut results, flat, viewport_w, viewport_h);
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_table_into_float_band(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_adjoining_clearance_auto_heights(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_empty_clear_margin_past_float(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_shared_bfc_float_collisions(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nonadjoining_bfc_margin_separation(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_float_text_layouts(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_anonymous_float_group_following_image(
+                &mut results,
+                flat,
+                viewport_w,
+                viewport_h
+            )
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_bottom_aligned_float_inline_rows(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_staggered_float_inline_bands(&mut results, flat, viewport_w, viewport_h)
+        );
         project_inline_block_atomic_line_descent(&mut results, root);
-        project_indented_inline_after_leading_float(&mut results, flat, viewport_w, viewport_h);
-        project_block_after_floated_inline_line(&mut results, flat);
-        project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
-        project_float_followed_by_clearing_block_height(&mut results, flat, viewport_w, viewport_h);
-        project_nested_margin_inline_float_band(&mut results, flat, viewport_w, viewport_h);
-        project_clearance_empty_margin_collapse(&mut results, flat, viewport_w, viewport_h);
-        project_self_collapsing_clear_following_block(&mut results, flat, viewport_w, viewport_h);
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_indented_inline_after_leading_float(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_block_after_floated_inline_line(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_float_followed_by_clearing_block_height(
+                &mut results,
+                flat,
+                viewport_w,
+                viewport_h
+            )
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nested_margin_inline_float_band(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_clearance_empty_margin_collapse(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_self_collapsing_clear_following_block(
+                &mut results,
+                flat,
+                viewport_w,
+                viewport_h
+            )
+        );
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         table_replaced_baseline::project(&mut results, root, flat, viewport_w, viewport_h);
@@ -4891,10 +4981,22 @@ impl LayoutEngine {
         align_inline_table_first_row_baselines(&mut results, flat);
         align_empty_inline_table_baselines(&mut results, flat);
         project_top_table_captions_outside_border(&mut results, root, flat);
-        project_zero_width_float_bfc_clearance(&mut results, flat, viewport_w, viewport_h);
-        project_right_float_text_containment(&mut results, flat, viewport_w, viewport_h);
-        project_cleared_descendant_bfc_heights(&mut results, flat);
-        project_negative_clearance_after_bottom_margin(&mut results, flat);
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_zero_width_float_bfc_clearance(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_right_float_text_containment(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_cleared_descendant_bfc_heights(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_negative_clearance_after_bottom_margin(&mut results, flat)
+        );
         project_absolute_insets_from_final_containing_blocks(
             &mut results,
             flat,
@@ -5990,6 +6092,65 @@ fn project_table_cell_inline_vertical_padding(
             }
         }
     }
+}
+
+/// Tree-wide layout feature bits (OR of every box's bits), computed once per
+/// compute from the flat tree.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LayoutFeatures(u32);
+
+impl LayoutFeatures {
+    pub(crate) const FLOAT: u32 = 1 << 0;
+    pub(crate) const CLEAR: u32 = 1 << 1;
+    pub(crate) const FLOAT_OR_CLEAR: u32 = Self::FLOAT | Self::CLEAR;
+
+    pub(crate) fn node_bits(style: &w3cos_std::style::Style) -> u32 {
+        let mut bits = 0;
+        if style.float != WFloat::None {
+            bits |= Self::FLOAT;
+        }
+        if style.clear != WClear::None {
+            bits |= Self::CLEAR;
+        }
+        bits
+    }
+
+    pub(crate) fn of(flat: &[FlatNodeInfo<'_>]) -> Self {
+        Self(
+            flat.iter()
+                .fold(0, |bits, node| bits | Self::node_bits(node.style)),
+        )
+    }
+
+    pub(crate) fn has(self, bits: u32) -> bool {
+        self.0 & bits != 0
+    }
+}
+
+fn projection_gates_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PROJECTION_GATES").map_or(true, |value| value != "0"))
+}
+
+fn projection_verify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_PROJECTION_VERIFY").is_some())
+}
+
+fn assert_layouts_unchanged(
+    before: &[(LayoutRect, usize)],
+    after: &[(LayoutRect, usize)],
+    pass: &str,
+) {
+    let same = before.len() == after.len()
+        && before.iter().zip(after).all(|((a, ai), (b, bi))| {
+            ai == bi
+                && a.x.to_bits() == b.x.to_bits()
+                && a.y.to_bits() == b.y.to_bits()
+                && a.width.to_bits() == b.width.to_bits()
+                && a.height.to_bits() == b.height.to_bits()
+        });
+    assert!(same, "gated projection pass changed layout: {pass}");
 }
 
 fn has_collapsed_table_root(flat: &[FlatNodeInfo<'_>]) -> bool {
