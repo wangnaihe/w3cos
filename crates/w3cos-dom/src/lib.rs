@@ -3760,6 +3760,31 @@ mod tests {
     }
 
     #[test]
+    fn test_structural_selectors_with_shared_matched_properties() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("height", "4px")]);
+        crate::stylesheet::register_rule(".cell:nth-child(2n)", &[("height", "9px")]);
+
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let mut cells = Vec::new();
+        for _ in 0..4 {
+            let cell = doc.create_element("div");
+            cell.set_class_name(&mut doc, "cell");
+            parent.append_child(&mut doc, cell);
+            cells.push(cell);
+        }
+        let heights = cells
+            .iter()
+            .map(|cell| doc.computed_style_for(cell.id).height)
+            .collect::<Vec<_>>();
+        use w3cos_std::style::Dimension::Px;
+        assert_eq!(heights, vec![Px(4.0), Px(9.0), Px(4.0), Px(9.0)]);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_color_from_custom_property_is_declared_not_inherited() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(":root", &[("--c", "rgb(10, 20, 30)")]);

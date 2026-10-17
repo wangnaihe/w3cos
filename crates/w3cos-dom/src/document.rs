@@ -4602,11 +4602,10 @@ impl Document {
             || !node.attribute_namespaces.is_empty()
             // Display: contents makes blockification walk further ancestors.
             || inherited.display == w3cos_std::style::Display::Contents
-            // Selectors observing siblings or descendants are not captured
-            // by the element's own declarations alone.
+            // Sibling and structural selectors (:nth-child, +, ~) only decide
+            // which declarations matched, and the key is those declarations
+            // (Blink's MPC is keyed the same way). :has() stays conservative.
             || stylesheet::has_relational_dependencies()
-            || stylesheet::has_sibling_dependencies()
-            || stylesheet::has_structural_dependencies()
             // Inline style edits and per-tag UA rules that look at
             // ancestors (nested lists, table hints, form controls) opt out.
             || !Arc::ptr_eq(inline, &shared_ua_style(node.tag))
