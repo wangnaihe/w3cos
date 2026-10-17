@@ -19,6 +19,8 @@ thread_local! {
     /// One `getModifierState` per realm, like a prototype method in Blink
     /// (it reads `this`), instead of a fresh closure per event.
     static GET_MODIFIER_STATE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Per-realm `getCoalescedEvents` / `getPredictedEvents` (stateless).
+    static POINTER_EVENT_METHODS: RefCell<Option<[Value; 2]>> = const { RefCell::new(None) };
     static EVENT_TARGET_INSTANCES: RefCell<Vec<EventTargetBinding>> = const { RefCell::new(Vec::new()) };
     static EVENT_SLOTS: RefCell<HashMap<u64, EventSlot>> = RefCell::new(HashMap::new());
     /// The hot `new Event(type)` object. Its slot lives beside it so dispatch
@@ -804,9 +806,25 @@ fn init_value(init: &Value, name: &str, default: Value) -> Value {
     if value.is_undefined() { default } else { value }
 }
 
+/// Store an event-init member on the event itself. Blink keeps these in C++
+/// members filled by the generated dictionary conversion; no JS setter on
+/// the prototype chain runs during construction. An ordinary object (the
+/// only kind `new XEvent()` produces) therefore takes the own-slot write
+/// directly instead of a [[Set]] that probes `__w3cos_setter_*` on every
+/// prototype level per field.
+fn put_field(this: &Value, name: &str, value: Value) {
+    if let Some(object) = this.as_object()
+        && !object.borrow().is_proxy()
+    {
+        object.borrow_mut().set_direct(name, value);
+        return;
+    }
+    this.set_property(name, value);
+}
+
 fn install_fields(this: &Value, init: &Value, fields: &[(&str, Value)]) {
     for (name, default) in fields {
-        this.set_property(name, init_value(init, name, default.clone()));
+        put_field(this, name, init_value(init, name, default.clone()));
     }
 }
 
@@ -829,7 +847,7 @@ fn install_ui_fields(this: &Value, init: &Value) {
             ("pseudoTarget", Value::Null),
         ],
     );
-    this.set_property("sourceCapabilities", source);
+    put_field(this, "sourceCapabilities", source);
 }
 
 pub fn input_device_capabilities_class() -> Value {
@@ -888,7 +906,7 @@ fn install_modifier_fields(this: &Value, init: &Value) {
             })
             .clone()
     });
-    this.set_property("getModifierState", get_modifier_state);
+    put_field(this, "getModifierState", get_modifier_state);
 }
 
 fn install_mouse_fields(this: &Value, init: &Value) {
@@ -1014,8 +1032,21 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                     ("persistentDeviceId", Value::Number(0.0)),
                 ],
             );
-            for method in ["getCoalescedEvents", "getPredictedEvents"] {
-                this.set_property(method, realm_event_function(|_, _| Value::array(vec![])));
+            let methods = POINTER_EVENT_METHODS.with(|slot| {
+                slot.borrow_mut()
+                    .get_or_insert_with(|| {
+                        [
+                            realm_event_function(|_, _| Value::array(vec![])),
+                            realm_event_function(|_, _| Value::array(vec![])),
+                        ]
+                    })
+                    .clone()
+            });
+            for (method, function) in ["getCoalescedEvents", "getPredictedEvents"]
+                .into_iter()
+                .zip(methods)
+            {
+                put_field(this, method, function);
             }
         }
         EventSubclass::Wheel => {
@@ -1894,6 +1925,7 @@ fn make_event_target_class() -> Value {
 
 pub(crate) fn reset_realm() {
     GET_MODIFIER_STATE.with(|slot| *slot.borrow_mut() = None);
+    POINTER_EVENT_METHODS.with(|slot| *slot.borrow_mut() = None);
     EVENT_SLOTS.with(|slots| slots.borrow_mut().clear());
     EVENT_POOL.with(|pool| *pool.borrow_mut() = None);
     FAST_EVENT_HANDLE.with(|cell| cell.set(u32::MAX));
