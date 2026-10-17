@@ -14972,6 +14972,35 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     if component.children.len() < 2 && style_bidi_control.is_none() {
         return false;
     }
+    // Blink's BidiParagraph is only run when the inline formatting context
+    // needs bidi (NGInlineNode::IsBidiEnabled: an RTL paragraph, a bidi
+    // control/embedding, or strong RTL / Arabic number text). Decide that on
+    // the borrowed children before building owned units below; every path
+    // past this point returns `false` when no such content exists.
+    let is_bidi_character = |character: char| {
+        is_bidi_control(character)
+            || matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R
+                    | unicode_bidi::BidiClass::AL
+                    | unicode_bidi::BidiClass::AN
+            )
+    };
+    let bidi_text = |content: &str| !content.is_ascii() && content.chars().any(is_bidi_character);
+    if style_bidi_control.is_none()
+        && component.style.direction != TextDirection::Rtl
+        && !component.children.iter().any(|child| {
+            bidi_control_for(&child.style).is_some()
+                || match &child.kind {
+                    ComponentKind::Text { content } => bidi_text(content),
+                    _ => child.children.iter().any(|text| {
+                        matches!(&text.kind, ComponentKind::Text { content } if bidi_text(content))
+                    }),
+                }
+        })
+    {
+        return false;
+    }
 
     struct InlineUnit {
         content: String,
