@@ -219,7 +219,10 @@ enum OneListener {
 }
 
 struct ListenerStore {
-    items: Vec<JsListener>,
+    /// Removed listeners leave a `None` tombstone so `index` positions stay
+    /// valid; `retain`/compaction squeezes them out.
+    items: Vec<Option<JsListener>>,
+    dead: usize,
     /// Built on the first mutation. `None` keeps the thread-local initializer const.
     index: Option<HashMap<(u32, EventType), Vec<u32>>>,
     /// Node id to a single non-capture listener. Misses fall back to `index`.
@@ -231,6 +234,7 @@ impl ListenerStore {
     const fn new() -> Self {
         Self {
             items: Vec::new(),
+            dead: 0,
             index: None,
             ones: Vec::new(),
             capture_count: 0,
@@ -249,7 +253,72 @@ impl ListenerStore {
             .or_default()
             .push(idx);
         Self::note_one(&mut self.ones, &listener);
-        self.items.push(listener);
+        self.items.push(Some(listener));
+    }
+
+    /// DOM `addEventListener` dedupe: the same (type, callback, capture)
+    /// on one target is registered once.
+    fn contains(&self, node: u32, event_type: EventType, handler: &Value, capture: bool) -> bool {
+        let Some(idxs) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.get(&(node, event_type)))
+        else {
+            return false;
+        };
+        idxs.iter().any(|&idx| {
+            self.items[idx as usize].as_ref().is_some_and(|listener| {
+                !listener.inline
+                    && listener.capture == capture
+                    && Value::function_identity_eq(&listener.handler, handler)
+            })
+        })
+    }
+
+    /// DOM `removeEventListener`: drop the one listener whose type, callback
+    /// identity and capture flag match. Inline handlers are not matched.
+    fn remove_one(
+        &mut self,
+        node: u32,
+        event_type: EventType,
+        handler: &Value,
+        capture: bool,
+    ) -> bool {
+        let Some(idxs) = self
+            .index
+            .as_mut()
+            .and_then(|index| index.get_mut(&(node, event_type)))
+        else {
+            return false;
+        };
+        let Some(slot) = idxs.iter().position(|&idx| {
+            self.items[idx as usize].as_ref().is_some_and(|listener| {
+                !listener.inline
+                    && listener.capture == capture
+                    && Value::function_identity_eq(&listener.handler, handler)
+            })
+        }) else {
+            return false;
+        };
+        let idx = idxs.remove(slot) as usize;
+        if idxs.is_empty() {
+            self.index.as_mut().unwrap().remove(&(node, event_type));
+        }
+        let removed = self.items[idx].take().expect("indexed listener is live");
+        if removed.capture {
+            self.capture_count = self.capture_count.saturating_sub(1);
+        }
+        // `Many` is always safe: dispatch then reads the exact index.
+        if let Some(one) = self.ones.get_mut(node as usize) {
+            if one.is_some() {
+                *one = Some(OneListener::Many);
+            }
+        }
+        self.dead += 1;
+        if self.dead > 64 && self.dead * 2 > self.items.len() {
+            self.retain(|_| true);
+        }
+        true
     }
 
     fn note_one(ones: &mut Vec<Option<OneListener>>, listener: &JsListener) {
@@ -281,19 +350,22 @@ impl ListenerStore {
     }
 
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
-        self.items.retain(|listener| pred(listener));
+        self.items
+            .retain(|listener| listener.as_ref().is_some_and(|listener| pred(listener)));
+        self.dead = 0;
         self.reindex();
     }
 
     fn clear(&mut self) {
         self.items.clear();
+        self.dead = 0;
         self.index = None;
         self.ones.clear();
         self.capture_count = 0;
     }
 
     fn iter(&self) -> impl Iterator<Item = &JsListener> {
-        self.items.iter()
+        self.items.iter().flatten()
     }
 
     fn has_capture(&self) -> bool {
@@ -309,7 +381,7 @@ impl ListenerStore {
         };
         idxs.iter()
             .filter_map(|&idx| {
-                let listener = &self.items[idx as usize];
+                let listener = self.items[idx as usize].as_ref()?;
                 capture
                     .is_none_or(|flag| listener.capture == flag)
                     .then(|| listener.handler.clone())
@@ -335,7 +407,9 @@ impl ListenerStore {
         };
         let mut total = 0usize;
         for &idx in idxs {
-            let listener = &self.items[idx as usize];
+            let Some(listener) = self.items[idx as usize].as_ref() else {
+                continue;
+            };
             if !capture.is_none_or(|flag| listener.capture == flag) {
                 continue;
             }
@@ -351,6 +425,9 @@ impl ListenerStore {
         let mut index: HashMap<(u32, EventType), Vec<u32>> = HashMap::new();
         self.capture_count = 0;
         for (idx, listener) in self.items.iter().enumerate() {
+            let Some(listener) = listener else {
+                continue;
+            };
             if listener.capture {
                 self.capture_count = self.capture_count.saturating_add(1);
             }
@@ -361,7 +438,7 @@ impl ListenerStore {
         }
         self.index = Some(index);
         self.ones.clear();
-        for listener in &self.items {
+        for listener in self.items.iter().flatten() {
             Self::note_one(&mut self.ones, listener);
         }
     }
@@ -9283,6 +9360,12 @@ pub(crate) fn invalidate_scroll_size_cache() {
 }
 
 fn forced_scroll_size(node: u32) -> (f64, f64) {
+    // scrollWidth/scrollHeight flush pending style and layout like every
+    // other geometry getter. Without this an appended child was invisible to
+    // scrollHeight (and to the scrollTop clamp) until something else flushed.
+    if dom::is_document_dirty() {
+        let _ = crate::incremental_layout::flush();
+    }
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
@@ -10996,7 +11079,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "removeEventListener" => func(move |_, args| {
-            js_remove_event_listener(node, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                node,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
         "dispatchEvent" => func(move |_, args| Value::Bool(js_dispatch_event(node, arg(&args, 0)))),
@@ -13886,16 +13974,23 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
         false
     };
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().push(JsListener {
+    let added = LISTENERS.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.contains(node, et, &handler, capture) {
+            return false;
+        }
+        l.push(JsListener {
             node,
             event_type: et,
             handler,
             capture,
             inline: false,
-        })
+        });
+        true
     });
-    ensure_native_registration(node, et);
+    if added {
+        ensure_native_registration(node, et);
+    }
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -13941,14 +14036,19 @@ fn ensure_native_registration(node: u32, et: EventType) {
     });
 }
 
-/// v1 limitation: removes ALL bridge listeners for (node, type) — individual
-/// JS function identity cannot be compared (`Value` equality on functions is
-/// always false).
-fn js_remove_event_listener(node: u32, type_name: &str) {
+/// Removes the listener matching (type, callback identity, capture), as the
+/// DOM "remove an event listener" steps require. Other callbacks stay.
+fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
+    let capture = if let Some(b) = options.as_bool() {
+        b
+    } else if options.is_object() {
+        options.get_property("capture").to_bool()
+    } else {
+        false
+    };
     let et = event_type_for(type_name);
     LISTENERS.with(|l| {
-        l.borrow_mut()
-            .retain(|jl| !(jl.node == node && jl.event_type == et));
+        l.borrow_mut().remove_one(node, et, &handler, capture);
     });
 }
 
@@ -14387,9 +14487,10 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     };
 
     // Phase 1: capture, root → parent (skip target). Ancestors with no
-    // capture listeners are not wrapped.
+    // capture listeners are not wrapped. `chain[0]` is the target, so drop
+    // it before reversing; the target's capture listeners run in phase 2.
     if has_capture {
-        for &id in chain.iter().rev().skip(1) {
+        for &id in chain.iter().skip(1).rev() {
             if stopped(&js_ev) {
                 break;
             }
@@ -18115,7 +18216,12 @@ fn build_document_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -21444,7 +21550,12 @@ fn build_window_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -21615,6 +21726,7 @@ thread_local! {
     static HEADLESS_ENTRY_MARK: Cell<Option<HeadlessEntryMark>> = const { Cell::new(None) };
 }
 
+#[cfg(not(target_os = "macos"))]
 fn process_cpu_ms() -> f64 {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
@@ -21639,6 +21751,7 @@ fn process_cpu_ms() -> f64 {
     (utime + stime) as f64 * 1000.0 / ticks as f64
 }
 
+#[cfg(not(target_os = "macos"))]
 fn process_rss_kb() -> (u64, u64) {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return (0, 0);
@@ -21661,6 +21774,45 @@ fn process_rss_kb() -> (u64, u64) {
         }
     }
     (rss, hwm)
+}
+
+// macOS has no /proc. getrusage gives user+system CPU and the peak RSS
+// (bytes on Darwin); proc_pidinfo(PROC_PIDTASKINFO) gives the current RSS.
+#[cfg(target_os = "macos")]
+fn process_cpu_ms() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0.0;
+    }
+    let tv = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+    tv(usage.ru_utime) + tv(usage.ru_stime)
+}
+
+#[cfg(target_os = "macos")]
+fn process_rss_kb() -> (u64, u64) {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    let rss = if got == size {
+        info.pti_resident_size / 1024
+    } else {
+        0
+    };
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let hwm = if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+        usage.ru_maxrss as u64 / 1024
+    } else {
+        0
+    };
+    (rss, hwm.max(rss))
 }
 
 fn headless_viewport() -> (u32, u32) {
@@ -22886,6 +23038,34 @@ mod tests {
         );
         assert_eq!(child_texts(&root), before);
         w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn scroll_height_flushes_appended_children() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let doc = document_value();
+        let scroller = create_in_body("div");
+        let style = scroller.get_property("style");
+        style.set_property("width", Value::string("300px"));
+        style.set_property("height", Value::string("200px"));
+        style.set_property("overflow", Value::string("auto"));
+        let add_rows = |count: usize| {
+            for _ in 0..count {
+                let row = doc.call_method("createElement", vec![Value::string("div")]);
+                row.get_property("style")
+                    .set_property("height", Value::string("20px"));
+                scroller.call_method("appendChild", vec![row]);
+            }
+        };
+        add_rows(20);
+        assert_eq!(scroller.get_property("scrollHeight").to_number(), 400.0);
+        add_rows(20);
+        // The appended rows are part of the scrollable overflow immediately.
+        assert_eq!(scroller.get_property("scrollHeight").to_number(), 800.0);
+        scroller.set_property("scrollTop", Value::Number(100000.0));
+        assert_eq!(scroller.get_property("scrollTop").to_number(), 600.0);
     }
 
     #[test]
@@ -28668,23 +28848,89 @@ try {
         let btn_id = node_id_of(&btn).unwrap();
         let count = Rc::new(Cell::new(0));
         let count2 = count.clone();
+        let handler = func(move |_, _| {
+            count2.set(count2.get() + 1);
+            Value::Undefined
+        });
         btn.call_method(
             "addEventListener",
-            vec![
-                Value::string("click"),
-                func(move |_, _| {
-                    count2.set(count2.get() + 1);
-                    Value::Undefined
-                }),
-            ],
+            vec![Value::string("click"), handler.clone()],
         );
-        btn.call_method("removeEventListener", vec![Value::string("click")]);
+        btn.call_method("removeEventListener", vec![Value::string("click"), handler]);
         dom::with_document_mut(|doc| {
             let mut ev = Event::click(NodeId::from_u32(btn_id), 0.0, 0.0);
             doc.dispatch_event_bubbling(&mut ev);
         });
         drain_microtasks();
         assert_eq!(count.get(), 0);
+    }
+
+    #[test]
+    fn remove_event_listener_matches_callback_and_capture() {
+        setup();
+        let target = create_in_body("div");
+        let hits = Rc::new(Cell::new(0));
+        let make = |weight: i32| {
+            let hits = hits.clone();
+            func(move |_, _| {
+                hits.set(hits.get() + weight);
+                Value::Undefined
+            })
+        };
+        let first = make(1);
+        let second = make(10);
+        let add = |handler: &Value, capture: bool| {
+            target.call_method(
+                "addEventListener",
+                vec![Value::string("ping"), handler.clone(), Value::Bool(capture)],
+            );
+        };
+        add(&first, false);
+        // Same (type, callback, capture) is registered once.
+        add(&first, false);
+        add(&second, false);
+        let third = make(100);
+        add(&third, true);
+        let fire = || {
+            let event = w3cos_core::class::construct(
+                &crate::web_events::event_class(),
+                vec![Value::string("ping")],
+            );
+            target.call_method("dispatchEvent", vec![event]);
+            drain_microtasks();
+        };
+        fire();
+        assert_eq!(hits.get(), 111);
+        hits.set(0);
+        // No callback matches nothing; the capture flag must match too.
+        target.call_method("removeEventListener", vec![Value::string("ping")]);
+        target.call_method(
+            "removeEventListener",
+            vec![Value::string("ping"), third.clone(), Value::Bool(false)],
+        );
+        fire();
+        assert_eq!(hits.get(), 111);
+        hits.set(0);
+        target.call_method(
+            "removeEventListener",
+            vec![Value::string("ping"), third.clone(), Value::Bool(true)],
+        );
+        fire();
+        assert_eq!(hits.get(), 11);
+        hits.set(0);
+        for _ in 0..200 {
+            add(&first, true);
+            target.call_method(
+                "removeEventListener",
+                vec![Value::string("ping"), first.clone(), Value::Bool(true)],
+            );
+        }
+        target.call_method(
+            "removeEventListener",
+            vec![Value::string("ping"), first.clone()],
+        );
+        fire();
+        assert_eq!(hits.get(), 10);
     }
 
     #[test]

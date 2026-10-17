@@ -553,7 +553,8 @@ impl Value {
         }
     }
 
-    fn function_identity_eq(left: &Value, right: &Value) -> bool {
+    /// Same callable (handle or Rc identity). Used for listener matching.
+    pub fn function_identity_eq(left: &Value, right: &Value) -> bool {
         match (left.function_handle(), right.function_handle()) {
             (Some(a), Some(b)) => a == b,
             _ => match (left.as_function(), right.as_function()) {
