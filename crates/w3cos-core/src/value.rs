@@ -2045,6 +2045,13 @@ impl Value {
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        // String length without the object/array/DOM probes and the
+        // index parse below.
+        if key == "length"
+            && let Some(string) = self.as_js_string()
+        {
+            return Value::Number(utf16_length(string.as_str()) as f64);
+        }
         if let Some(value) = fast_known_collection_key(self, key) {
             return value;
         }
@@ -2125,7 +2132,7 @@ impl Value {
                         .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(s.encode_utf16().count() as f64)
+                    Value::Number(utf16_length(&s) as f64)
                 } else {
                     Value::Undefined
                 }
@@ -2320,6 +2327,38 @@ impl Value {
         }
         Value::Bool(deleted)
     }
+}
+
+/// UTF-16 length of a UTF-8 string: one unit per scalar below U+10000, two
+/// above. ASCII (the common case) is the byte length.
+#[inline]
+fn utf16_length(value: &str) -> usize {
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.encode_utf16().count()
+    }
+}
+
+/// `String.prototype.charCodeAt` with an ASCII-prefix fast path.
+#[inline]
+fn string_char_code_at(value: &str, index: Option<&Value>) -> Value {
+    let index = index.map(Value::to_number).unwrap_or(0.0);
+    if !index.is_finite() || index < 0.0 {
+        return Value::Number(f64::NAN);
+    }
+    let index = index as usize;
+    let bytes = value.as_bytes();
+    if index < bytes.len() && bytes[..=index].is_ascii() {
+        return Value::Number(f64::from(bytes[index]));
+    }
+    Value::Number(
+        value
+            .encode_utf16()
+            .nth(index)
+            .map(f64::from)
+            .unwrap_or(f64::NAN),
+    )
 }
 
 // ── Constructors ───────────────────────────────────────────────────────
@@ -2769,17 +2808,7 @@ impl Value {
             }
             (this, "charCodeAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let index = args.first().map(Value::to_number).unwrap_or(0.0);
-                if !index.is_finite() || index < 0.0 {
-                    return Value::Number(f64::NAN);
-                }
-                return Value::Number(
-                    value
-                        .encode_utf16()
-                        .nth(index as usize)
-                        .map(f64::from)
-                        .unwrap_or(f64::NAN),
-                );
+                return string_char_code_at(value.as_str(), args.first());
             }
             (this, "charAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -3007,6 +3036,14 @@ impl Value {
     /// Other methods still collect a `Vec`. `dispatchEvent` on a live DOM node
     /// does not.
     pub fn call_method_slice(&self, key: &str, args: &[Value]) -> Value {
+        // String.prototype.charCodeAt has no override hook in call_method
+        // either; answer it without the method-dispatch chain and the
+        // argument Vec (V8 inlines it as a StringCharCodeAt node).
+        if key == "charCodeAt"
+            && let Some(string) = self.as_js_string()
+        {
+            return string_char_code_at(string.as_str(), args.first());
+        }
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
         }
@@ -3851,6 +3888,10 @@ const CONCAT_INTERN_LIMIT: usize = 256;
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
     pub fn js_add(&self, other: &Value) -> Value {
+        // Number + Number first (V8's Smi/HeapNumber feedback fast path).
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs + rhs);
+        }
         if self.is_string() || other.is_string() {
             concat_js_values(self, other)
         } else if let Some(value) = crate::bigint::add(self, other) {
@@ -3861,6 +3902,9 @@ impl Value {
     }
 
     pub fn js_sub(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs - rhs);
+        }
         if let Some(value) = crate::bigint::sub(self, other) {
             return value;
         }
@@ -3868,6 +3912,9 @@ impl Value {
     }
 
     pub fn js_mul(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs * rhs);
+        }
         if let Some(value) = crate::bigint::mul(self, other) {
             return value;
         }
@@ -3875,6 +3922,9 @@ impl Value {
     }
 
     pub fn js_div(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs / rhs);
+        }
         if let Some(value) = crate::bigint::div(self, other) {
             return value;
         }
@@ -3882,6 +3932,9 @@ impl Value {
     }
 
     pub fn js_rem(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs % rhs);
+        }
         if let Some(value) = crate::bigint::rem(self, other) {
             return value;
         }
