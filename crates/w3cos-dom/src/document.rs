@@ -14645,6 +14645,28 @@ fn empty_inline_box_has_no_area(
         .all(|width| width.unwrap_or(0.0) == 0.0)
 }
 
+/// Necessary condition for `coalesce_passive_inline_text_children` to leave
+/// exactly one Text child: every surviving child must unwrap (through
+/// single-child Row/Box wrappers, or the anonymous-table text shortcut) to a
+/// Text leaf. Looser than the real unwrap, so `false` is exact and lets the
+/// caller skip deep-cloning the whole subtree (block containers such as a
+/// chat log of thousands of messages fail on the first child).
+fn may_coalesce_to_single_text(component: &w3cos_std::Component) -> bool {
+    use w3cos_std::component::ComponentKind;
+    component.children.iter().all(|child| {
+        let mut fragment = child;
+        while matches!(fragment.kind, ComponentKind::Row | ComponentKind::Box)
+            && fragment.children.len() == 1
+        {
+            fragment = &fragment.children[0];
+        }
+        matches!(fragment.kind, ComponentKind::Text { .. })
+            || child.style.display == w3cos_std::style::Display::None
+            || empty_inline_box_has_no_area(child, &component.style)
+            || plain_anonymous_inline_table_text(child).is_some()
+    })
+}
+
 fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool {
     use unicode_bidi::BidiInfo;
     use w3cos_std::component::ComponentKind;
@@ -14772,7 +14794,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             );
         return true;
     }
-    if style_bidi_control.is_none() {
+    if style_bidi_control.is_none() && may_coalesce_to_single_text(component) {
         // Keep a coalescible plain-text run in logical order. The font backend
         // applies Unicode Bidi to the resulting single run; converting it to
         // visual order here would make that backend reorder it a second time.

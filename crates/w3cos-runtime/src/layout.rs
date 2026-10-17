@@ -5227,11 +5227,17 @@ fn project_mixed_inline_block_definite_widths(
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
     let mut parent_has_float = vec![false; flat.len()];
-    for node in flat {
-        if node.style.float != WFloat::None
-            && let Some(parent) = node.parent
-        {
-            parent_has_float[parent] = true;
+    // Previous sibling of each preorder entry, in one pass (was a backward
+    // scan per node that ran to the start of the list for first children).
+    let mut previous_sibling = vec![None; flat.len()];
+    let mut last_child: Vec<Option<usize>> = vec![None; flat.len()];
+    for (index, node) in flat.iter().enumerate() {
+        if let Some(parent) = node.parent {
+            if node.style.float != WFloat::None {
+                parent_has_float[parent] = true;
+            }
+            previous_sibling[index] = last_child[parent];
+            last_child[parent] = Some(index);
         }
     }
     for (index, node) in flat.iter().enumerate() {
@@ -5255,9 +5261,7 @@ fn project_mixed_inline_block_definite_widths(
         if parent.style.display != WDisplay::Block || !matches!(parent.kind, ComponentKind::Row) {
             continue;
         }
-        let previous_index = (0..index)
-            .rev()
-            .find(|candidate| flat[*candidate].parent == Some(parent_index));
+        let previous_index = previous_sibling[index];
         let after_inline_fragment = previous_index.is_some_and(|previous_index| {
             let previous = &flat[previous_index];
             let previous_has_children = flat
