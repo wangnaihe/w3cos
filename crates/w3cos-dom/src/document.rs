@@ -2894,6 +2894,27 @@ impl Document {
                 custom_properties.insert(prop.clone(), value.clone());
             }
         }
+        // Blink resolves var() references (CSSVariableResolver) before any
+        // longhand is applied, so validity checks that decide inheritance
+        // (e.g. whether `color` is declared) see the substituted value.
+        let author_declarations = if author_declarations
+            .iter()
+            .any(|(prop, value, _)| !prop.starts_with("--") && value.contains("var("))
+        {
+            author_declarations
+                .into_iter()
+                .map(|(prop, value, specificity)| {
+                    if !prop.starts_with("--") && value.contains("var(") {
+                        let value = resolve_css_variables(&value, &custom_properties);
+                        (prop, value, specificity)
+                    } else {
+                        (prop, value, specificity)
+                    }
+                })
+                .collect()
+        } else {
+            author_declarations
+        };
         for (prop, value, _specificity) in &author_declarations {
             if !prop.starts_with("--") {
                 let value = resolve_css_variables(value, &custom_properties);

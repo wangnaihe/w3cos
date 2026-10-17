@@ -3760,6 +3760,22 @@ mod tests {
     }
 
     #[test]
+    fn test_color_from_custom_property_is_declared_not_inherited() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(":root", &[("--c", "rgb(10, 20, 30)")]);
+        crate::stylesheet::register_rule(".cell", &[("color", "var(--c)")]);
+
+        let mut doc = Document::new();
+        let cell = doc.create_element("div");
+        cell.set_class_name(&mut doc, "cell");
+        doc.body().append_child(&mut doc, cell);
+
+        let style = doc.computed_style_for(cell.id);
+        assert_eq!(style.color, w3cos_std::Color::rgb(10, 20, 30));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_current_color_background_uses_inherited_text_color() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".status", &[("color", "#1677ff")]);
