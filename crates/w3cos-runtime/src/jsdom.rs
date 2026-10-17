@@ -3456,22 +3456,47 @@ fn cached_subtree_id_matches(root: u32, include_root: bool, id: &str) -> Vec<u32
 }
 
 fn query_selector_all_scoped(scope: Option<u32>, selector: &str) -> Vec<u32> {
+    query_selector_scoped(scope, selector, usize::MAX)
+}
+
+/// `querySelector`: the first match in tree order, without testing the rest
+/// of the subtree.
+fn query_selector_first_scoped(scope: Option<u32>, selector: &str) -> Option<u32> {
+    query_selector_scoped(scope, selector, 1).into_iter().next()
+}
+
+fn query_selector_scoped(scope: Option<u32>, selector: &str, limit: usize) -> Vec<u32> {
     let selector = w3cos_dom::stylesheet::trim_css_whitespace(selector);
     if let Some(id) = simple_id_selector(selector) {
         let root = scope.unwrap_or_else(document_element_id);
-        return cached_subtree_id_matches(root, scope.is_none(), &id);
+        let mut matches = cached_subtree_id_matches(root, scope.is_none(), &id);
+        matches.truncate(limit);
+        return matches;
     }
-    if selector_uses_runtime_state(selector) && selector_chain_parts(selector).is_empty() {
+    // The selector text is the same for every candidate: classify it once.
+    let runtime_parts =
+        selector_uses_runtime_state(selector).then(|| selector_chain_parts(selector));
+    if runtime_parts.as_ref().is_some_and(|parts| parts.is_empty()) {
         return Vec::new();
     }
     let candidates = scope.map_or_else(
         || inclusive_descendant_elements(document_element_id()),
         descendant_elements,
     );
-    candidates
-        .into_iter()
-        .filter(|candidate| query_selector_matches(*candidate, selector, scope))
-        .collect()
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let matched = match &runtime_parts {
+            Some(parts) => matches_selector_chain_in_scope(candidate, parts, scope),
+            None => dom::matches_selector(candidate, selector).is_ok_and(|matched| matched),
+        };
+        if matched {
+            matches.push(candidate);
+            if matches.len() >= limit {
+                break;
+            }
+        }
+    }
+    matches
 }
 
 fn query_selector_argument(args: &[Value], validation_node: u32) -> String {
@@ -5494,11 +5519,7 @@ fn parsed_document_value(
             if query_selector_matches(root, &selector, Some(root)) {
                 return element_value(root);
             }
-            element_or_null(
-                query_selector_all_scoped(Some(root), &selector)
-                    .into_iter()
-                    .next(),
-            )
+            element_or_null(query_selector_first_scoped(Some(root), &selector))
         }),
     );
     props.insert(
@@ -10939,11 +10960,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "querySelector" => func(move |_, args| {
             let sel = query_selector_argument(&args, node);
-            element_or_null(
-                query_selector_all_scoped(Some(node), &sel)
-                    .into_iter()
-                    .next(),
-            )
+            element_or_null(query_selector_first_scoped(Some(node), &sel))
         }),
         "querySelectorAll" => func(move |_, args| {
             let sel = query_selector_argument(&args, node);
@@ -26130,6 +26147,31 @@ mod tests {
         assert_eq!(doctype.get_property("name"), Value::string("foo"));
         assert!(document.get_property("firstChild") == doctype);
         assert!(doctype.get_property("nextSibling") == document.get_property("documentElement"));
+    }
+
+    #[test]
+    fn query_selector_returns_the_first_tree_order_match() {
+        setup();
+        let doc = document_value();
+        let host = create_in_body("div");
+        host.set_property(
+            "innerHTML",
+            Value::string(
+                "<p class=\"x\"><b class=\"y\" data-i=\"1\"></b></p><b class=\"y\" data-i=\"2\"></b><i class=\"y\" data-i=\"3\"></i>",
+            ),
+        );
+        for selector in [".y", "b.y", "p > .y", "[data-i]", "i, b", ".missing, i"] {
+            let first = host.call_method("querySelector", vec![Value::string(selector)]);
+            let all = host.call_method("querySelectorAll", vec![Value::string(selector)]);
+            assert!(first == all.get_property("0"), "{selector}");
+            let first_doc = doc.call_method("querySelector", vec![Value::string(selector)]);
+            let all_doc = doc.call_method("querySelectorAll", vec![Value::string(selector)]);
+            assert!(first_doc == all_doc.get_property("0"), "{selector}");
+        }
+        assert!(
+            host.call_method("querySelector", vec![Value::string(".missing")])
+                .is_null()
+        );
     }
 
     #[test]
