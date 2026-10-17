@@ -524,9 +524,6 @@ fn solve(
     // Projections repair floats, tables, inline-block and RTL boxes. A
     // subtree with none of them gets nothing from them even when the rest
     // of the document needs them (checked by W3COS_SPLICE_VERIFY).
-    // Projections repair floats, tables, inline-block and RTL boxes. A
-    // subtree with none of them gets nothing from them even when the rest
-    // of the document needs them (checked by W3COS_SPLICE_VERIFY).
     engine.set_skip_projections(skip_projections || can_skip_projections(wrapper));
     engine.set_measure_text(measure_text);
     let results = engine
@@ -556,23 +553,92 @@ fn rect_of(
         .map(|(_, rect)| *rect)
 }
 
-/// The kept child before a tail only seeds sibling margin collapsing. When
-/// its bottom margin cannot collapse with a descendant's, a childless block
-/// of the same used height and margins is equivalent and costs one box
-/// instead of re-solving its whole subtree (LayoutNG reuses the clean
-/// child's result; only its margin strut matters to what follows).
+/// The margin a block's bottom edge contributes to the following sibling's
+/// margin strut (CSS 2.1 §8.3.1; LayoutNG NGMarginStrut). `None` when this
+/// cannot be read off the retained tree cheaply and exactly: negative margins
+/// (the strut keeps positive and negative parts apart), self-collapsing or
+/// non-pixel boxes, floats and other formatting-context subtleties.
+fn end_margin_strut(component: &Component) -> Option<f32> {
+    let style = &component.style;
+    let own = px_spacing(style.margin.bottom)?;
+    if own < 0.0 {
+        return None;
+    }
+    if matches!(style.display, Display::FlowRoot) || edge_blocks_margin_collapse(component, false) {
+        return Some(own);
+    }
+    let overflow_visible = |overflow: Option<Overflow>| {
+        overflow.is_none_or(|overflow| matches!(overflow, Overflow::Visible))
+    };
+    if !matches!(style.display, Display::Block | Display::ListItem)
+        || !matches!(style.overflow, Overflow::Visible)
+        || !overflow_visible(style.overflow_x)
+        || !overflow_visible(style.overflow_y)
+        || !matches!(style.height, Dimension::Auto)
+        || !matches!(style.min_height, Dimension::Auto | Dimension::Px(0.0))
+        || component
+            .children
+            .iter()
+            .any(|child| child.style.float != Float::None)
+    {
+        return None;
+    }
+    let last = component.children.iter().rev().find(|child| {
+        !matches!(child.style.display, Display::None)
+            && !matches!(child.style.position, Position::Absolute | Position::Fixed)
+    })?;
+    let inline = matches!(
+        last.style.display,
+        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+    ) || (matches!(last.kind, ComponentKind::Text { .. })
+        && host_id(last).is_none_or(|id| {
+            crate::dom::with_document(|document| {
+                document.get_node(NodeId::from_u32(id)).node_type == NodeType::Text
+            })
+        }));
+    if inline {
+        // The last line box separates the child margins from this edge.
+        return Some(own);
+    }
+    if !ordinary_block_child(last) {
+        return None;
+    }
+    // A self-collapsing last child lets earlier margins through. Bail.
+    let last_id = host_id(last)?;
+    let height = crate::dom::with_document(|document| {
+        document.get_layout_rect(NodeId::from_u32(last_id)).height
+    });
+    if !(height > 0.0) {
+        return None;
+    }
+    Some(own.max(end_margin_strut(last)?))
+}
+
+/// The kept child before a tail only seeds sibling margin collapsing. A
+/// childless block of the same used height whose bottom margin is the
+/// anchor's end margin strut is equivalent, and costs one box instead of
+/// re-solving its whole subtree (LayoutNG reuses the clean child's layout
+/// result; only its NGMarginStrut matters to what follows).
 fn anchor_stand_in(source: &Component) -> Component {
     let height = host_id(source).map(|id| {
         crate::dom::with_document(|document| document.get_layout_rect(NodeId::from_u32(id)).height)
     });
-    match height {
-        Some(height) if height > 0.0 && edge_blocks_margin_collapse(source, false) => {
+    let strut = || {
+        if edge_blocks_margin_collapse(source, false) {
+            Some(source.style.margin.bottom)
+        } else {
+            end_margin_strut(source).map(Spacing::Px)
+        }
+    };
+    match (height, strut()) {
+        (Some(height), Some(bottom)) if height > 0.0 => {
             let mut style = Style {
                 display: Display::Block,
                 ..Style::default()
             };
             style.height = Dimension::Px(height);
             style.margin = source.style.margin;
+            style.margin.bottom = bottom;
             style.font_size = source.style.font_size;
             Component {
                 kind: ComponentKind::Box,
@@ -1021,6 +1087,53 @@ mod tests {
         crate::dom::append_child(reply, p);
         assert!(crate::incremental_layout::flush());
         assert_matches_full("sibling after reply");
+    }
+
+    #[test]
+    fn nested_anchor_margin_strut_matches_full_layout() {
+        let (_chat, reply) = chat_page();
+        // anchor: div(mb 3) > div(mb 2) > p(mb 10): end strut is 10px.
+        let anchor = crate::dom::create_element("div");
+        style(anchor, &[("margin", "0 0 3px 0")]);
+        let inner = crate::dom::create_element("div");
+        style(inner, &[("margin", "0 0 2px 0")]);
+        let p = crate::dom::create_element("p");
+        style(p, &[("margin", "1px 0 10px 0")]);
+        crate::dom::append_child(p, crate::dom::create_text_node("anchor text"));
+        crate::dom::append_child(inner, p);
+        crate::dom::append_child(anchor, inner);
+        crate::dom::append_child(reply, anchor);
+        assert!(crate::incremental_layout::flush());
+        let component = crate::dom::with_document(|document| {
+            document.to_component_subtree(NodeId::from_u32(anchor))
+        });
+        assert_eq!(end_margin_strut(&component), Some(10.0));
+        let mut tail: Option<u32> = None;
+        for step in 0..6 {
+            if let Some(old) = tail.take() {
+                crate::dom::remove_child(reply, old);
+            }
+            let open = crate::dom::create_element("div");
+            style(
+                open,
+                &[("margin", format!("{}px 0 0 0", step * 3).as_str())],
+            );
+            crate::dom::append_child(
+                open,
+                crate::dom::create_text_node(&"open ".repeat(step + 1)),
+            );
+            crate::dom::append_child(reply, open);
+            tail = Some(open);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("strut step {step}"));
+        }
+        // A negative margin anywhere in the strut keeps the full subtree.
+        style(p, &[("margin", "1px 0 -4px 0")]);
+        assert!(crate::incremental_layout::flush());
+        let component = crate::dom::with_document(|document| {
+            document.to_component_subtree(NodeId::from_u32(anchor))
+        });
+        assert_eq!(end_margin_strut(&component), None);
     }
 
     #[test]
