@@ -492,7 +492,9 @@ fn promoted_binding_leaks(code: &str, plan: &EscapePlan, storage: SlotStorage) -
             patterns.push(format!("capture_getters.get({index})"));
             patterns.push(format!("capture_setters.get({index})"));
         }
-        patterns.iter().any(|pattern| code.contains(pattern.as_str()))
+        patterns
+            .iter()
+            .any(|pattern| code.contains(pattern.as_str()))
     })
 }
 
@@ -1596,7 +1598,11 @@ fn slot_storage(function: &Function) -> SlotStorage {
 }
 
 fn slot_ids_literal(ids: &[u32]) -> String {
-    let list = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    let list = ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("[{list}]")
 }
 
@@ -2293,14 +2299,22 @@ fn generate_sync_function_with_factories(
     factories: &HashMap<FunctionId, String>,
     module_specifier: Option<&str>,
 ) -> Result<String> {
-    let promoted =
-        generate_sync_function_with_factories_inner(function, rust_name, factories, module_specifier);
+    let promoted = generate_sync_function_with_factories_inner(
+        function,
+        rust_name,
+        factories,
+        module_specifier,
+    );
     if let Ok((code, false)) = promoted {
         return Ok(code);
     }
     let previous = VALUE_BINDING_PROMOTION.with(|flag| flag.replace(false));
-    let fallback =
-        generate_sync_function_with_factories_inner(function, rust_name, factories, module_specifier);
+    let fallback = generate_sync_function_with_factories_inner(
+        function,
+        rust_name,
+        factories,
+        module_specifier,
+    );
     VALUE_BINDING_PROMOTION.with(|flag| flag.set(previous));
     fallback.map(|(code, _)| code)
 }
@@ -2522,7 +2536,11 @@ pub fn {rust_name}(
     );
     let leaked = promoted_binding_leaks(&code, &plan, storage);
     if std::env::var_os("W3COS_AOT_PROMOTE_DEBUG").is_some() {
-        eprintln!("[promote] {rust_name}: {} slots, leaked {leaked}, ids {:?}", plan.n_val_bindings, plan.val_binding_of.keys().collect::<Vec<_>>());
+        eprintln!(
+            "[promote] {rust_name}: {} slots, leaked {leaked}, ids {:?}",
+            plan.n_val_bindings,
+            plan.val_binding_of.keys().collect::<Vec<_>>()
+        );
     }
     Ok((code, leaked))
 }
@@ -6499,7 +6517,9 @@ fn emit_instruction(
         Instruction::LoadBinding { dst, binding } if is_shared_number(binding.0) => {
             emit_shared_number_load(plan, dst.0, binding.0)
         }
-        Instruction::LoadBinding { dst, binding } if val_binding_slot(plan, binding.0).is_some() => {
+        Instruction::LoadBinding { dst, binding }
+            if val_binding_slot(plan, binding.0).is_some() =>
+        {
             let slot = val_binding_slot(plan, binding.0).unwrap();
             let propagate = emit_exception_propagation(exception_target, mode, plan);
             format!(

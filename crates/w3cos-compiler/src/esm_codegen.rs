@@ -2500,11 +2500,12 @@ fn generator_capture_map_with_synthetic(
             ))
         })
         .collect::<Option<Vec<_>>>()?;
-    let map = format!(
-        "w3cos_core::AotCaptureMap::from([{}])",
-        entries.join(", ")
-    );
-    Some(if stateful.get() { map } else { cached_capture_map(&map) })
+    let map = format!("w3cos_core::AotCaptureMap::from([{}])", entries.join(", "));
+    Some(if stateful.get() {
+        map
+    } else {
+        cached_capture_map(&map)
+    })
 }
 
 fn find_variable<'a>(items: &'a [TopLevelItem], name: &str) -> Option<&'a Expr> {

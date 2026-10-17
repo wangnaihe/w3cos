@@ -1955,7 +1955,9 @@ mod tests {
         assert!(toml.contains("strip = \"symbols\""), "{toml}");
         for engine in ["w3cos-core", "w3cos-std", "w3cos-dom", "w3cos-runtime"] {
             assert!(
-                toml.contains(&format!("[profile.release.package.{engine}]\nopt-level = 2")),
+                toml.contains(&format!(
+                    "[profile.release.package.{engine}]\nopt-level = 2"
+                )),
                 "{engine} must be speed-optimized inside the size profile: {toml}"
             );
         }
