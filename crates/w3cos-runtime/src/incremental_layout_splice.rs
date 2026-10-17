@@ -21,6 +21,15 @@ use w3cos_std::{Component, ComponentKind};
 use super::{Cache, can_skip_projections, flat_host_id, host_id, needs_text_metric};
 use crate::layout::{LayoutEngine, pre_flatten};
 
+thread_local! {
+    /// (subtree splices, tail splices) since thread start.
+    static SPLICES: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+pub(crate) fn splice_counts() -> (u32, u32) {
+    SPLICES.with(std::cell::Cell::get)
+}
+
 const LIST_MARKER: &str = "--w3cos-internal-outside-list-marker";
 
 fn is_outside_list_marker(component: &Component) -> bool {
@@ -212,10 +221,18 @@ fn is_table_like(component: &Component) -> bool {
     super::is_table(component.style.display)
 }
 
+enum PlanKind {
+    /// Rebuild the whole subtree rooted at the plan node.
+    Subtree(Component),
+    /// Keep the first `keep` children of the plan node and rebuild the
+    /// rest (a streamed tail block replaced or appended).
+    Tail { keep: usize, tail: Vec<Component> },
+}
+
 struct Plan {
     path: Vec<usize>,
     node: u32,
-    fresh: Component,
+    kind: PlanKind,
 }
 
 fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
@@ -223,6 +240,7 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
     let lift = w3cos_dom::stylesheet::tree_order_affects_matching();
     crate::dom::with_document(|document| {
         let mut lca: Option<Vec<u32>> = None;
+        let mut chains = Vec::new();
         for &id in dirty {
             if document.get_node(id).node_type == NodeType::Document {
                 return Err(());
@@ -243,14 +261,19 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
                 continue;
             };
             match lca.as_mut() {
-                None => lca = Some(chain),
+                None => lca = Some(chain.clone()),
                 Some(prefix) => common_prefix(prefix, &chain),
             }
+            chains.push(chain);
         }
         let Some(mut chain) = lca else {
             return Ok(None);
         };
-        // Walk up until the subtree root is a safe block box.
+        if let Some(plan) = try_tail(cache, document, &chain, &chains) {
+            return Ok(Some(plan));
+        }
+        // Walk up until the subtree root is a safe block box (the relayout
+        // boundary of Blink's MarkContainerChainForLayout walk).
         while chain.len() > 2 {
             let node = *chain.last().unwrap();
             if let Some(plan) = try_candidate(cache, document, &chain, node) {
@@ -259,6 +282,97 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
             chain.pop();
         }
         Err(())
+    })
+}
+
+fn ordinary_block_child(component: &Component) -> bool {
+    matches!(
+        component.style.display,
+        Display::Block | Display::FlowRoot | Display::ListItem
+    ) && in_flow_static(&component.style)
+}
+
+/// Only the trailing children of a block changed. The kept prefix keeps its
+/// cached results (LayoutNG reuses a clean child's layout result); the last
+/// kept child is solved again only to seed sibling margin collapsing.
+fn try_tail(
+    cache: &Cache,
+    document: &w3cos_dom::document::Document,
+    chain: &[u32],
+    chains: &[Vec<u32>],
+) -> Option<Plan> {
+    if chain.len() <= 2 {
+        return None;
+    }
+    let node = *chain.last()?;
+    let path = component_path(&cache.component, chain)?;
+    let old = at_path(&cache.component, &path);
+    let style = &old.style;
+    let bottom_closed =
+        px_spacing(style.padding.bottom).is_some_and(|px| px > 0.0) || border_side(style, 2) > 0.0;
+    if !is_block_flow(style.display)
+        || !in_flow_static(style)
+        || !bottom_closed
+        || !matches!(style.height, Dimension::Auto)
+        || !matches!(style.min_height, Dimension::Auto)
+        || !matches!(style.max_height, Dimension::Auto)
+        || *style != document.computed_style_for(NodeId::from_u32(node))
+    {
+        return None;
+    }
+    ancestor_levels(&cache.component, &path)?;
+    let depth = chain.len();
+    let touched: Vec<u32> = chains
+        .iter()
+        .filter(|other| other.len() > depth)
+        .map(|other| other[depth])
+        .collect();
+    let mut dom_children = Vec::new();
+    let mut child = document.get_node(NodeId::from_u32(node)).first_child;
+    while let Some(id) = child {
+        let dom = document.get_node(id);
+        if dom.node_type != NodeType::Element {
+            return None;
+        }
+        dom_children.push(id.as_u32());
+        child = w3cos_dom::node::sib(dom.next_sibling);
+    }
+    let cached = old
+        .children
+        .iter()
+        .map(host_id)
+        .collect::<Option<Vec<_>>>()?;
+    let keep = cached
+        .iter()
+        .zip(&dom_children)
+        .take_while(|(cached, live)| cached == live && !touched.contains(cached))
+        .count();
+    if keep == 0 || (keep == cached.len() && keep == dom_children.len()) {
+        return None;
+    }
+    let anchor = &old.children[keep - 1];
+    if !ordinary_block_child(anchor)
+        || !matches!(anchor.style.width, Dimension::Auto)
+        || px_spacing(anchor.style.margin.left).is_none()
+        || px_spacing(anchor.style.margin.right).is_none()
+    {
+        return None;
+    }
+    let mut tail = Vec::with_capacity(dom_children.len() - keep);
+    for &id in &dom_children[keep..] {
+        let component = document.to_component_subtree(NodeId::from_u32(id));
+        if host_id(&component) != Some(id)
+            || !ordinary_block_child(&component)
+            || !tree_is_spliceable(&component)
+        {
+            return None;
+        }
+        tail.push(component);
+    }
+    Some(Plan {
+        path,
+        node,
+        kind: PlanKind::Tail { keep, tail },
     })
 }
 
@@ -294,10 +408,14 @@ fn try_candidate(
     {
         return None;
     }
-    Some(Plan { path, node, fresh })
+    Some(Plan {
+        path,
+        node,
+        kind: PlanKind::Subtree(fresh),
+    })
 }
 
-fn wrapper_for(parent: &Component, width: f32, child: Component) -> Component {
+fn wrapper_for(parent: &Component, width: f32, children: Vec<Component>) -> Component {
     let mut style = parent.style.clone();
     style.display = Display::Block;
     style.position = Position::Static;
@@ -322,10 +440,53 @@ fn wrapper_for(parent: &Component, width: f32, child: Component) -> Component {
     Component {
         kind: parent.kind.clone(),
         style,
-        children: vec![child],
+        children,
         on_click: w3cos_std::EventAction::None,
         sticky_counter_signal: None,
     }
+}
+
+/// Lay out `wrapper` alone. Returns host rects in flat order and the
+/// wrapper's own rect.
+fn solve(
+    wrapper: &Component,
+    skip_projections: bool,
+    measure_text: bool,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(
+    Vec<(u32, crate::layout::LayoutRect)>,
+    crate::layout::LayoutRect,
+)> {
+    let flat = pre_flatten(wrapper);
+    let mut engine = LayoutEngine::new();
+    engine.set_skip_projections(skip_projections);
+    engine.set_measure_text(measure_text);
+    let results = engine
+        .compute(wrapper, &flat, viewport_w, viewport_h)
+        .ok()?;
+    let mut rects = Vec::with_capacity(results.layout_cache.len());
+    let mut own = None;
+    for (rect, index) in &results.layout_cache {
+        if *index == 0 {
+            own = Some(*rect);
+        }
+        let id = flat.get(*index).map(flat_host_id).unwrap_or(u32::MAX);
+        if id != u32::MAX {
+            rects.push((id, *rect));
+        }
+    }
+    Some((rects, own?))
+}
+
+fn rect_of(
+    rects: &[(u32, crate::layout::LayoutRect)],
+    id: u32,
+) -> Option<crate::layout::LayoutRect> {
+    rects
+        .iter()
+        .find(|(host, _)| *host == id)
+        .map(|(_, rect)| *rect)
 }
 
 pub(super) fn try_splice(
@@ -353,43 +514,129 @@ pub(super) fn try_splice(
         return false;
     };
     let node = NodeId::from_u32(plan.node);
-    let old_rect = crate::dom::with_document(|document| document.get_layout_rect(node));
-    let old = at_path(&cache.component, &plan.path);
-    let margins = old.style.margin_lengths();
-    let width = old_rect.width + margins.left + margins.right;
-    if !(old_rect.height > 0.0) || !width.is_finite() || width <= 0.0 {
-        return false;
-    }
-    // Engine flags are whole-tree properties: a full rebuild would derive
-    // them from the spliced tree, so the subtree solve uses exactly those.
-    let old_subtree = std::mem::replace(at_path_mut(&mut cache.component, &plan.path), plan.fresh);
-    let skip_projections = can_skip_projections(&cache.component);
-    let measure_text = needs_text_metric(&cache.component);
-    let fresh = std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
-    let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
-    let wrapper = wrapper_for(parent, width, fresh);
-    let flat = pre_flatten(&wrapper);
-    let mut engine = LayoutEngine::new();
-    engine.set_skip_projections(skip_projections);
-    engine.set_measure_text(measure_text);
-    let Ok(results) = engine.compute(&wrapper, &flat, viewport_w, viewport_h) else {
-        return false;
+    let node_rect = crate::dom::with_document(|document| document.get_layout_rect(node));
+    // Solved rects to store, offset to apply to them, height change of the
+    // plan node's border box, and the first path level whose following
+    // siblings shift (0: the plan node's siblings; the Tail plan grows the
+    // plan node itself and starts there too).
+    let (rects, dx, dy, dh, skip_projections, measure_text, commit): (
+        Vec<(u32, crate::layout::LayoutRect)>,
+        f32,
+        f32,
+        f32,
+        bool,
+        bool,
+        PlanKind,
+    ) = match plan.kind {
+        PlanKind::Subtree(fresh) => {
+            let old = at_path(&cache.component, &plan.path);
+            let margins = old.style.margin_lengths();
+            let width = node_rect.width + margins.left + margins.right;
+            if !(node_rect.height > 0.0) || !width.is_finite() || width <= 0.0 {
+                return false;
+            }
+            // Engine flags are whole-tree properties: a full rebuild would
+            // derive them from the spliced tree, so the subtree uses those.
+            let old_subtree =
+                std::mem::replace(at_path_mut(&mut cache.component, &plan.path), fresh);
+            let skip = can_skip_projections(&cache.component);
+            let measure = needs_text_metric(&cache.component);
+            let fresh =
+                std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
+            let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
+            let mut wrapper = wrapper_for(parent, width, vec![fresh]);
+            let Some((rects, _)) = solve(&wrapper, skip, measure, viewport_w, viewport_h) else {
+                return false;
+            };
+            let Some(new_rect) = rect_of(&rects, plan.node) else {
+                return false;
+            };
+            if !(new_rect.height > 0.0) || (new_rect.width - node_rect.width).abs() > 0.01 {
+                return false;
+            }
+            let fresh = wrapper.children.pop().expect("wrapper child");
+            (
+                rects,
+                node_rect.x - new_rect.x,
+                node_rect.y - new_rect.y,
+                new_rect.height - node_rect.height,
+                skip,
+                measure,
+                PlanKind::Subtree(fresh),
+            )
+        }
+        PlanKind::Tail { keep, tail } => {
+            let target = at_path_mut(&mut cache.component, &plan.path);
+            let removed = target.children.split_off(keep);
+            target.children.extend(tail);
+            let skip = can_skip_projections(&cache.component);
+            let measure = needs_text_metric(&cache.component);
+            let target = at_path_mut(&mut cache.component, &plan.path);
+            let tail = target.children.split_off(keep);
+            target.children.extend(removed);
+            let target = at_path(&cache.component, &plan.path);
+            let anchor = target.children[keep - 1].clone();
+            let Some(anchor_id) = host_id(&anchor) else {
+                return false;
+            };
+            let anchor_old = crate::dom::with_document(|document| {
+                document.get_layout_rect(NodeId::from_u32(anchor_id))
+            });
+            let margins = anchor.style.margin_lengths();
+            let width = anchor_old.width + margins.left + margins.right;
+            if !(anchor_old.height > 0.0) || !width.is_finite() || width <= 0.0 {
+                return false;
+            }
+            let padding_bottom = target.style.padding_lengths().bottom;
+            let border_bottom = border_side(&target.style, 2);
+            let mut children = Vec::with_capacity(tail.len() + 1);
+            children.push(anchor);
+            children.extend(tail);
+            let mut wrapper = wrapper_for(target, width, children);
+            let Some((rects, own)) = solve(&wrapper, skip, measure, viewport_w, viewport_h) else {
+                return false;
+            };
+            let Some(anchor_new) = rect_of(&rects, anchor_id) else {
+                return false;
+            };
+            if (anchor_new.height - anchor_old.height).abs() > 0.01
+                || (anchor_new.width - anchor_old.width).abs() > 0.01
+            {
+                return false;
+            }
+            let dx = anchor_old.x - anchor_new.x;
+            let dy = anchor_old.y - anchor_new.y;
+            // The wrapper is a BFC root, so its auto height ends at the last
+            // child's bottom margin edge, as the padded parent's content does.
+            let content_end = own.y + own.height + dy;
+            let new_height = content_end + padding_bottom + border_bottom - node_rect.y;
+            if !new_height.is_finite() || new_height <= 0.0 {
+                return false;
+            }
+            let mut tail = std::mem::take(&mut wrapper.children);
+            tail.remove(0);
+            let rects = rects
+                .into_iter()
+                .filter(|(id, _)| *id != anchor_id)
+                .collect();
+            (
+                rects,
+                dx,
+                dy,
+                new_height - node_rect.height,
+                skip,
+                measure,
+                PlanKind::Tail { keep, tail },
+            )
+        }
     };
-    let Some(new_rect) = results.layout_cache.iter().find_map(|(rect, index)| {
-        (flat.get(*index).map(flat_host_id) == Some(plan.node)).then_some(*rect)
-    }) else {
-        return false;
-    };
-    if !(new_rect.height > 0.0) || (new_rect.width - old_rect.width).abs() > 0.01 {
-        return false;
-    }
-    let dx = old_rect.x - new_rect.x;
-    let dy = old_rect.y - new_rect.y;
-    let dh = new_rect.height - old_rect.height;
 
     // Boxes after the subtree move down by `dh`; auto-height ancestors grow.
     let mut shifted = Vec::new();
     let mut grown = Vec::new();
+    if matches!(commit, PlanKind::Tail { .. }) {
+        grown.push(plan.node);
+    }
     if dh != 0.0 {
         for level in 0..levels {
             let depth = plan.path.len() - 1 - level;
@@ -403,18 +650,13 @@ pub(super) fn try_splice(
                 grown.push(id);
             }
         }
+    } else {
+        grown.clear();
     }
     crate::dom::with_document_mut(|document| {
-        for (rect, index) in &results.layout_cache {
-            let Some(info) = flat.get(*index) else {
-                continue;
-            };
-            let id = flat_host_id(info);
-            if id == u32::MAX {
-                continue;
-            }
+        for (id, rect) in &rects {
             document.set_layout_rect(
-                NodeId::from_u32(id),
+                NodeId::from_u32(*id),
                 w3cos_dom::DOMRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
             );
         }
@@ -433,12 +675,23 @@ pub(super) fn try_splice(
             document.set_layout_rect(id, rect);
         }
     });
-    drop(flat);
-    let mut wrapper = wrapper;
-    let fresh = wrapper.children.pop().expect("wrapper child");
     cache.skip_projections = skip_projections;
     cache.measure_text = measure_text;
-    *at_path_mut(&mut cache.component, &plan.path) = fresh;
+    let target = at_path_mut(&mut cache.component, &plan.path);
+    SPLICES.with(|count| {
+        let (subtree, tail) = count.get();
+        count.set(match commit {
+            PlanKind::Subtree(_) => (subtree + 1, tail),
+            PlanKind::Tail { .. } => (subtree, tail + 1),
+        });
+    });
+    match commit {
+        PlanKind::Subtree(fresh) => *target = fresh,
+        PlanKind::Tail { keep, tail } => {
+            target.children.truncate(keep);
+            target.children.extend(tail);
+        }
+    }
     cache.node_ids_stale = true;
     cache.width_memos.clear();
     if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() {
@@ -585,10 +838,63 @@ mod tests {
         crate::dom::append_child(reply, p);
         assert!(crate::incremental_layout::flush());
         assert_matches_full("tail block");
+        let before = splice_counts();
         for step in 0..40 {
             crate::dom::set_text_content(text, &"streamed words ".repeat(step + 1));
             assert!(crate::incremental_layout::flush());
             assert_matches_full(&format!("step {step}"));
         }
+        assert_eq!(splice_counts().0 - before.0, 40, "text edits must splice");
+    }
+
+    #[test]
+    fn replaced_tail_blocks_match_full_layout() {
+        let (chat, reply) = chat_page();
+        let mut tail: Option<u32> = None;
+        let before = splice_counts();
+        for step in 0..30 {
+            if let Some(old) = tail.take() {
+                crate::dom::remove_child(reply, old);
+            }
+            // A finished line stays; the open block is replaced each chunk.
+            if step % 4 == 0 {
+                let done = crate::dom::create_element("div");
+                let p = crate::dom::create_element("p");
+                style(p, &[("margin", "6px 0")]);
+                crate::dom::append_child(
+                    p,
+                    crate::dom::create_text_node(&"done line ".repeat(step + 1)),
+                );
+                crate::dom::append_child(done, p);
+                crate::dom::append_child(reply, done);
+            }
+            let open = crate::dom::create_element("div");
+            let p = crate::dom::create_element("p");
+            style(p, &[("margin", "4px 0")]);
+            crate::dom::append_child(
+                p,
+                crate::dom::create_text_node(&"open ".repeat(step * 3 + 1)),
+            );
+            crate::dom::append_child(open, p);
+            crate::dom::append_child(reply, open);
+            tail = Some(open);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("tail step {step}"));
+        }
+        assert!(
+            splice_counts().1 - before.1 >= 28,
+            "tail edits must splice: {:?}",
+            splice_counts()
+        );
+        // A sibling after the reply moves with it.
+        let after = crate::dom::create_element("div");
+        style(after, &[("height", "10px")]);
+        crate::dom::append_child(chat, after);
+        assert!(crate::incremental_layout::flush());
+        let p = crate::dom::create_element("p");
+        crate::dom::append_child(p, crate::dom::create_text_node("late"));
+        crate::dom::append_child(reply, p);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("sibling after reply");
     }
 }
